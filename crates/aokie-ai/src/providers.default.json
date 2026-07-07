@@ -1,0 +1,37 @@
+{
+  "llm": {
+    "id": "gemma4-onnx",
+    "display_name": "Gemma 4 E4B-it (ONNX)",
+    "kind": "onnx-genai",
+    "audio_input": true,
+    "streaming": true,
+    "max_context_tokens": 32000,
+    "audio_inline_before_text": true,
+    "chat_template": {
+      "start_of_turn": "<|turn>",
+      "end_of_turn": "<turn|>",
+      "end_of_sentence": "<eos>",
+      "audio_token": "<|audio|>",
+      "begin_of_sentence": "<bos>"
+    }
+  },
+  "tts": {
+    "id": "pocket-tts-onnx",
+    "display_name": "Pocket TTS (ONNX)",
+    "kind": "onnx-tts"
+  },
+  "stt": {
+    "id": "sherpa-onnx-whisper-stt",
+    "display_name": "Whisper (Sherpa-onnx, on-device)",
+    "kind": "sherpa-onnx-stt",
+    "sherpa_onnx": {
+      "engine": "whisper",
+      "encoder_path": "",
+      "decoder_path": "",
+      "tokens_path": "",
+      "language": "en",
+      "num_threads": 4,
+      "tail_paddings": 0
+    }
+  }
+}

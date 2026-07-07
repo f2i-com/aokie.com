@@ -1,0 +1,25 @@
+[package]
+name = "aokie-receptionist"
+description = "Tauri-free receptionist business logic: appointment calendar + orders (typed CRUD, prompt building, verbal date/intent parsing, tool-call envelopes) and the EventSink-driven call-orchestration scaffolding. Depends on aokie-core, aokie-db, aokie-ai."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aokie-core = { path = "../aokie-core" }
+aokie-db = { path = "../aokie-db" }
+aokie-ai = { path = "../aokie-ai" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+# Appointment calendar timezone handling: convert UTC-stored slots to
+# the operator's configured IANA zone (DST-correct).
+chrono-tz = "0.10"
+# Resolve the host's IANA timezone at runtime for the "host local time"
+# calendar fallback.
+iana-time-zone = "0.1"
+# calendar/orders use rusqlite directly (typed CRUD, transactional
+# writes). Same 0.31 bundled-SQLite line as aokie-db so a side-by-side
+# build shares one bundled-SQLite version.
+rusqlite = { version = "0.31", features = ["bundled"] }

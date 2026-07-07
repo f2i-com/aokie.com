@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://formlogic.com/schemas/connector-request.schema.json",
+  "title": "Connector command request",
+  "description": "Body of POST /api/connectors/{connectorId}/request on FormLogic Desktop, and the params of the desktop->plugin JSON-RPC method \"connector.request\". Canonical copy: formlogic-app/docs/contracts/.",
+  "type": "object",
+  "required": ["connectorId", "command"],
+  "properties": {
+    "connectorId": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+    "command": {
+      "type": "string",
+      "description": "Dot-namespaced command, e.g. \"call.answer\", \"dongle.installDriver\".",
+      "pattern": "^[a-z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+$",
+      "maxLength": 96
+    },
+    "payload": { "description": "Command-specific JSON payload." },
+    "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 120000 },
+    "requestId": {
+      "type": "string",
+      "description": "Optional caller-supplied id echoed back for tracing.",
+      "maxLength": 128
+    }
+  },
+  "additionalProperties": false
+}

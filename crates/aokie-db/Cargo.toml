@@ -1,0 +1,19 @@
+[package]
+name = "aokie-db"
+description = "Aokie's SQLite layer: migration ladder, call-log/transcript/contacts/SMS schema, FTS5 search, and retention/delete operations. Tauri-free via the DbHost trait; depends on aokie-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# retention.rs (window config) lives in aokie-core.
+aokie-core = { path = "../aokie-core" }
+# Row/DTO structs derive Serialize/Deserialize (e.g. DeleteCounts,
+# call-log rows) via full-path `serde::Serialize` derives.
+serde = { workspace = true }
+# Bundled SQLite is compiled with FTS5 enabled, so the transcript
+# free-text index (CREATE VIRTUAL TABLE ... USING fts5) needs no extra
+# feature flag. Same 0.31 line the legacy app and aokie-plugin pin, so
+# a side-by-side build shares one bundled-SQLite version.
+rusqlite = { version = "0.31", features = ["bundled"] }

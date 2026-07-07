@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://formlogic.com/schemas/connector-response.schema.json",
+  "title": "Connector command response",
+  "description": "Response of POST /api/connectors/{connectorId}/request and of the JSON-RPC \"connector.request\" result. Error codes are the SAME typed set FormLogic's ConnectorError already parses (form-builder/ui/src/client-runtime/connectors/connectorTypes.ts), so browser fallback semantics apply unchanged: only ipc_unavailable and connector_missing are fallbackable. Canonical copy: formlogic-app/docs/contracts/.",
+  "type": "object",
+  "oneOf": [
+    {
+      "required": ["ok"],
+      "properties": {
+        "ok": { "const": true },
+        "data": { "description": "Command-specific result payload." },
+        "requestId": { "type": "string", "maxLength": 128 }
+      },
+      "additionalProperties": false
+    },
+    {
+      "required": ["ok", "error"],
+      "properties": {
+        "ok": { "const": false },
+        "error": {
+          "type": "object",
+          "required": ["code", "message"],
+          "properties": {
+            "code": {
+              "enum": [
+                "origin_denied",
+                "capability_denied",
+                "connector_missing",
+                "connector_unavailable",
+                "command_failed",
+                "ipc_unavailable",
+                "auth_required"
+              ],
+              "description": "auth_required is desktop-transport-only (missing/expired pairing token); it must be handled by the desktop client before the connector layer and never surfaces as a ConnectorError."
+            },
+            "message": { "type": "string", "maxLength": 500 }
+          },
+          "additionalProperties": false
+        },
+        "requestId": { "type": "string", "maxLength": 128 }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

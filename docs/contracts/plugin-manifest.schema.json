@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://formlogic.com/schemas/plugin-manifest.schema.json",
+  "title": "FormLogic Desktop plugin manifest",
+  "description": "manifest.json at the root of a FormLogic Desktop plugin directory (e.g. plugins/aokie/manifest.json). Canonical copy: formlogic-app/docs/contracts/.",
+  "type": "object",
+  "required": ["schemaVersion", "id", "name", "version", "entry"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": {
+      "type": "string",
+      "description": "Stable plugin id. Also the default connector namespace.",
+      "pattern": "^[a-z][a-z0-9-]{1,63}$"
+    },
+    "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "version": {
+      "type": "string",
+      "description": "Semver.",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?$"
+    },
+    "publisher": { "type": "string", "maxLength": 120 },
+    "description": { "type": "string", "maxLength": 500 },
+    "pluginApiVersion": {
+      "type": "integer",
+      "description": "JSON-RPC protocol version the plugin speaks. Desktop refuses to start a plugin with a version it does not support.",
+      "minimum": 1
+    },
+    "minDesktopVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "entry": {
+      "type": "object",
+      "required": ["kind", "command"],
+      "properties": {
+        "kind": { "const": "process" },
+        "command": {
+          "type": "string",
+          "description": "Executable path RELATIVE to the plugin directory. Absolute paths, drive letters and '..' segments are rejected by the loader.",
+          "minLength": 1,
+          "maxLength": 260
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 260 },
+          "maxItems": 16
+        }
+      },
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "array",
+      "description": "Permission strings the plugin's commands map to, e.g. \"connector.aokie.call.answer\". Desktop denies connector commands not covered by a declared capability.",
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*(\\.[a-zA-Z0-9_*-]+)+$", "maxLength": 128 },
+      "maxItems": 128,
+      "uniqueItems": true
+    },
+    "connectors": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "commands"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "commands": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[a-z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+$", "maxLength": 96 },
+            "maxItems": 128,
+            "uniqueItems": true
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "events": {
+      "type": "array",
+      "description": "Event names this plugin may emit. Desktop drops events whose name is not declared here.",
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_]+)+$", "maxLength": 128 },
+      "maxItems": 256,
+      "uniqueItems": true
+    }
+  },
+  "additionalProperties": false
+}

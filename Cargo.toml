@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aokie-core",
+    "crates/aokie-bluetooth",
+    "crates/aokie-dongle",
+    "crates/aokie-audio",
+    "crates/aokie-db",
+    "crates/aokie-ai",
+    "crates/aokie-receptionist",
+    "crates/aokie-plugin",
+    # Vendored fork of andrewleech/transcribe-rs — the ONNX ASR engines
+    # (Moonshine, Qwen3-ASR, …). A member so the workspace shares one
+    # lock + bundled-SQLite/ort version; kept out of default-members
+    # because it only builds under aokie-ai's opt-in `onnx` feature.
+    "crates/transcribe-rs",
+]
+
+# `aokie-plugin` (the FormLogic Desktop JSON-RPC process) is a member
+# but is intentionally kept out of `default-members`: a later task
+# wires its runtime up against these crates. `default-members` keeps a
+# bare `cargo build` scoped to the five native library crates that are
+# known-green so the not-yet-wired plugin can't break the default build.
+default-members = [
+    "crates/aokie-core",
+    "crates/aokie-bluetooth",
+    "crates/aokie-dongle",
+    "crates/aokie-audio",
+    "crates/aokie-db",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }

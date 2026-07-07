@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://formlogic.com/schemas/desktop-event.schema.json",
+  "title": "FormLogic Desktop event envelope",
+  "description": "Every event flowing plugin -> FormLogic Desktop -> FormLogic Web uses this envelope. Canonical copy: formlogic-app/docs/contracts/. Consumers must ignore unknown OPTIONAL fields from newer minor revisions, but producers must not add fields without bumping schemaVersion.",
+  "type": "object",
+  "required": ["schemaVersion", "source", "name", "correlationId", "idempotencyKey", "occurredAt", "data"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "source": {
+      "type": "string",
+      "description": "Origin subsystem: plugin id (e.g. \"aokie\") or \"desktop\" | \"flows\" | \"models\".",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "name": {
+      "type": "string",
+      "description": "Dot-namespaced event name, e.g. \"aokie.call.incoming\".",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_]+)+$",
+      "maxLength": 128
+    },
+    "correlationId": {
+      "type": "string",
+      "description": "Call/session/run id shared by all events of one logical interaction.",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "description": "Stable unique key for THIS event occurrence, e.g. \"aokie:call_abc:incoming:v1\". Consumers dedupe on it.",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "occurredAt": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp.",
+      "format": "date-time"
+    },
+    "data": {
+      "description": "Event-specific payload. May be any JSON value; PII must already be minimised by the producer."
+    },
+    "pluginId": { "type": "string", "maxLength": 64 },
+    "connectorId": { "type": "string", "maxLength": 64 },
+    "severity": { "enum": ["debug", "info", "warning", "error"] }
+  },
+  "additionalProperties": false
+}
