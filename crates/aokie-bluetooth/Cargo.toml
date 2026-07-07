@@ -1,0 +1,38 @@
+[package]
+name = "aokie-bluetooth"
+description = "Aokie's from-scratch Bluetooth stack: WinUSB/libusb transport, HCI/L2CAP/RFCOMM/SDP core, HFP/SCO voice, MAP/PBAP, and the pure-Rust mSBC codec. Tauri-free; depends only on aokie-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aokie-core = { path = "../aokie-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rand = "0.8"
+# Only the async channel type is used (runtime.rs event fan-out).
+tokio = { version = "1.0", features = ["sync"] }
+
+# Windows transport: the WinUSB DLL surface + device enumeration.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Usb",
+    "Win32_Foundation",
+    # CreateFileW (winusb.rs) references SECURITY_ATTRIBUTES.
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+# Linux transport: rusb (libusb-1.0 wrapper) for HCI command/event +
+# ACL bulk; libusb1-sys + libc for the raw isochronous SCO path rusb
+# 0.9 doesn't expose.
+[target.'cfg(target_os = "linux")'.dependencies]
+rusb = "0.9"
+libusb1-sys = "0.7"
+libc = "0.2"

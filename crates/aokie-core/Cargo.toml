@@ -1,0 +1,36 @@
+[package]
+name = "aokie-core"
+description = "Tauri-free native foundation shared by the Aokie crates (bluetooth/dongle/audio/db) and the FormLogic Desktop plugin. NO tauri dependency is allowed here — enforced by the no_tauri unit test."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+# Cross-platform data/config dir resolution (paths.rs, crashlog.rs).
+dirs = "5.0"
+# consent.rs adds a small random jitter to grace-window timestamps.
+rand = "0.8"
+# OS-native secret store for provider API keys (secrets.rs). Windows
+# path stays on Win32 APIs (Credential Manager / DPAPI) only.
+keyring = { version = "3", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "linux-native",
+] }
+
+# crashlog.rs redirects native stderr/stdout to a forensic log file via
+# SetStdHandle; all of it is `#[cfg(windows)]`-gated internally.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    # CreateFileW's signature references SECURITY_ATTRIBUTES, so the
+    # Storage_FileSystem binding needs Win32_Security enabled too.
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }

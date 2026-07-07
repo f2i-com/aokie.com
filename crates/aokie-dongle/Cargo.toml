@@ -1,0 +1,38 @@
+[package]
+name = "aokie-dongle"
+description = "Aokie USB-dongle setup: device enumeration, the self-signed WinUSB driver package + PKI, the Linux udev-rule counterpart, and the radio→app Bluetooth event bridge. Tauri-free; depends on aokie-core and aokie-bluetooth."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aokie-core = { path = "../aokie-core" }
+aokie-bluetooth = { path = "../aokie-bluetooth" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+# pki.rs hashes cert bytes (thumbprints) with SHA-256.
+sha2 = "0.10"
+
+# Windows driver-signing + install surface. The crypto/catalog/sip/
+# certificate/wintrust features mirror the legacy app's set: we mirror
+# libwdi's CreateCat / SelfSignFile / signing in pure Rust so the
+# dongle install survives Win10/11's signed-cat requirement.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Certificates",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
