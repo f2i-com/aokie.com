@@ -1,0 +1,111 @@
+[package]
+name = "aokie-ai"
+description = "Aokie's swappable AI provider stack: LlmProvider/TtsProvider/SttProvider traits + registry + config, the OpenAI-compatible HTTP LLM adapter and llama-server sidecar (light, always compiled), and the in-process ONNX/Candle/sherpa engines behind opt-in features. Tauri-free; depends on aokie-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# secrets (keyring-backed provider API keys) + paths (atomic_write) +
+# redact (audit log) all live in aokie-core.
+aokie-core = { path = "../aokie-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Async provider-trait shape (LlmProvider / TtsProvider / SttProvider)
+# and every adapter impl.
+async-trait = "0.1"
+# HTTP LLM adapter (streaming SSE) + the llama-server readiness probe.
+# rustls-tls keeps it off system OpenSSL; `stream` powers the SSE body.
+reqwest = { version = "0.11", default-features = false, features = ["stream", "rustls-tls"] }
+# `futures::StreamExt` over the reqwest byte stream in the HTTP adapter.
+futures = "0.3"
+# `tokio::time` for the sidecar readiness poll; `sync::Mutex` for the
+# runtime-handle registry entry points (feature-gated).
+tokio = { version = "1.0", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+# llama-server per-session bearer token (CSPRNG) — also used by the
+# onnx-tts sampler under the `onnx` feature.
+rand = "0.8"
+
+# ============== onnx feature: ONNX-Runtime engines ==============
+# Gemma-4 GenAI LLM, Pocket-TTS ONNX voice, Parakeet, and (via the
+# vendored transcribe-rs) Moonshine + Qwen3-ASR. `load-dynamic` pulls
+# the ORT DLL at runtime — no CMake in the build. Off by default.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "half"], optional = true }
+ndarray = { version = "0.17", optional = true }
+half = { version = "2", features = ["num-traits"], optional = true }
+safetensors = { version = "0.4", optional = true }
+rubato = { version = "0.14", optional = true }
+hound = { version = "3.5", optional = true }
+rand_distr = { version = "0.4", optional = true }
+# Vendored fork of transcribe-rs at ../transcribe-rs — the Moonshine /
+# Qwen3-ASR ONNX engines. Only pulled by the `onnx` feature.
+transcribe-rs = { path = "../transcribe-rs", default-features = false, features = ["onnx", "qwen3-asr"], optional = true }
+
+# ============== candle feature: Candle Whisper STT ==============
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+# candle_whisper holds the model behind a parking_lot::Mutex.
+parking_lot = { version = "0.12", optional = true }
+
+# Shared by both `onnx` (Gemma tokenizer) and `candle` (Whisper
+# tokenizer); the Gemma-4 mel front-end and the Whisper mel helper both
+# use rustfft.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
+rustfft = { version = "6", optional = true }
+
+# ============== sherpa feature: sherpa-onnx STT/TTS ==============
+# Silero VAD + sherpa-onnx TTS/STT. Heavy `sherpa-rs-sys` CMake build,
+# so strictly opt-in.
+sherpa-rs = { version = "0.6", default-features = false, features = ["tts"], optional = true }
+
+[dev-dependencies]
+# config.rs tests mint a temp path with a random suffix.
+uuid = { version = "1.0", features = ["v4"] }
+
+[features]
+# Light by default: traits + registry + config + the HTTP LLM adapter +
+# the llama-server sidecar. No ort/candle/sherpa → no CMake, no ORT DLL
+# fetch. `cargo build -p aokie-ai` must stay green with this set.
+default = []
+
+# ONNX-Runtime engines (Gemma-4 LLM, Pocket-TTS, Parakeet, and the
+# transcribe-rs Moonshine/Qwen3-ASR engines).
+onnx = [
+    "dep:ort",
+    "dep:ndarray",
+    "dep:half",
+    "dep:safetensors",
+    "dep:rubato",
+    "dep:hound",
+    "dep:rand_distr",
+    "dep:tokenizers",
+    "dep:rustfft",
+    "dep:transcribe-rs",
+]
+
+# Candle-based Whisper STT.
+candle = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:parking_lot",
+    "dep:tokenizers",
+    "dep:rustfft",
+]
+
+# sherpa-onnx STT/TTS via sherpa-rs (needs CMake).
+sherpa = ["dep:sherpa-rs"]
+
+# GPU execution providers. Turns on the ML stack it accelerates, then
+# flips the CUDA feature on ort + candle. Requires the CUDA toolkit +
+# matching VS integration; opt-in only.
+cuda = [
+    "onnx",
+    "candle",
+    "ort/cuda",
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+]

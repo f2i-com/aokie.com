@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "id": "aokie",
+  "name": "Aokie Phone Bridge",
+  "version": "0.1.0",
+  "publisher": "Aokie",
+  "description": "Bluetooth dongle / phone bridge (WinUSB, HFP/SCO, MAP SMS, PBAP contacts) packaged as a FormLogic Desktop plugin. Emits aokie.* call/SMS/dongle events and serves the aokie connector command surface.",
+  "pluginApiVersion": 1,
+  "minDesktopVersion": "0.1.0",
+  "entry": {
+    "kind": "process",
+    "command": "aokie-plugin.exe",
+    "args": ["--stdio"]
+  },
+  "capabilities": [
+    "flow.run",
+    "connector.aokie.dongle.list",
+    "connector.aokie.dongle.getPreferred",
+    "connector.aokie.dongle.setPreferred",
+    "connector.aokie.dongle.installDriver",
+    "connector.aokie.dongle.diagnostics",
+    "connector.aokie.phone.status",
+    "connector.aokie.phone.startPairing",
+    "connector.aokie.phone.stopPairing",
+    "connector.aokie.phone.listPaired",
+    "connector.aokie.call.current",
+    "connector.aokie.call.answer",
+    "connector.aokie.call.reject",
+    "connector.aokie.call.hangup",
+    "connector.aokie.call.operatorSpeak",
+    "connector.aokie.sms.threads",
+    "connector.aokie.sms.thread",
+    "connector.aokie.sms.send",
+    "connector.aokie.settings.get",
+    "connector.aokie.settings.set"
+  ],
+  "connectors": [
+    {
+      "id": "aokie",
+      "name": "Aokie Phone Bridge",
+      "commands": [
+        "dongle.list",
+        "dongle.getPreferred",
+        "dongle.setPreferred",
+        "dongle.installDriver",
+        "dongle.diagnostics",
+        "phone.status",
+        "phone.startPairing",
+        "phone.stopPairing",
+        "phone.listPaired",
+        "call.current",
+        "call.answer",
+        "call.reject",
+        "call.hangup",
+        "call.operatorSpeak",
+        "sms.threads",
+        "sms.thread",
+        "sms.send",
+        "settings.get",
+        "settings.set"
+      ]
+    }
+  ],
+  "events": [
+    "aokie.dongle.detected",
+    "aokie.dongle.driver_required",
+    "aokie.dongle.ready",
+    "aokie.dongle.error",
+    "aokie.phone.pairing_started",
+    "aokie.phone.paired",
+    "aokie.phone.disconnected",
+    "aokie.call.incoming",
+    "aokie.call.answered",
+    "aokie.call.rejected",
+    "aokie.call.turn.partial",
+    "aokie.call.turn.final",
+    "aokie.call.ended",
+    "aokie.sms.received",
+    "aokie.sms.sent",
+    "aokie.sms.failed",
+    "aokie.hardware.error"
+  ]
+}
