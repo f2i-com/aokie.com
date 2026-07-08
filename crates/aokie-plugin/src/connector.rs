@@ -116,6 +116,11 @@ pub struct Plugin {
     pub store: ConfigStore,
     pub outbox: Outbox,
     pub mock: MockState,
+    /// The live Bluetooth radio, present in real (non-dev) mode once a
+    /// dongle is available. `None` = dev/mock mode or no radio (e.g. a
+    /// non-Windows build). When `Some`, the `call.* / phone.* / sms.*`
+    /// handlers drive the real radio instead of the scripted mock.
+    pub radio: Option<crate::radio::RadioHandle>,
     pub initialized: bool,
     pub shutdown_requested: bool,
 }
@@ -136,6 +141,7 @@ impl Plugin {
             store,
             outbox,
             mock: MockState::default(),
+            radio: None,
             initialized: false,
             shutdown_requested: false,
         })
@@ -156,8 +162,53 @@ impl Plugin {
             store: ConfigStore::load(&dir),
             outbox: Outbox::open_in_memory().expect("in-memory outbox"),
             mock: MockState::default(),
+            radio: None,
             initialized: false,
             shutdown_requested: false,
+        }
+    }
+
+    /// Best-effort: bring the live radio up in real (non-dev) mode so the
+    /// dongle broadcasts "Aokie AI Assistant" and incoming calls flow
+    /// through. Idempotent — a running radio is left alone; dev mode keeps
+    /// the scripted mock path; a start failure (no dongle / driver not
+    /// bound / non-Windows) is logged and simply leaves `radio = None`.
+    pub fn ensure_radio_started(&mut self) {
+        // Unit tests run on developer/CI machines that may have a real dongle
+        // attached; never grab hardware from a `cargo test` process. Live
+        // behaviour is verified by the E2E harness, not the unit suite.
+        if cfg!(test) || self.dev_mode || self.radio.is_some() {
+            return;
+        }
+        // HFP-codec override (settings.hfpCodec: "auto" | "cvsd" | "wbs").
+        // Some dongles (e.g. Broadcom BCM20702) need CVSD-only — mSBC's SCO
+        // path is non-functional on them. The aokie_radio runtime reads the
+        // AOKIE_HFP_CODEC env var; set it (in-process, before the radio thread
+        // spawns) from the setting so the desktop-spawned plugin honours it
+        // without the operator having to set an env var.
+        if let Some(codec) = self.store.config.settings.get("hfpCodec").and_then(|v| v.as_str()) {
+            let codec = codec.trim().to_ascii_lowercase();
+            if !codec.is_empty() && codec != "auto" {
+                std::env::set_var("AOKIE_HFP_CODEC", &codec);
+                eprintln!("[aokie-plugin] hfpCodec setting → AOKIE_HFP_CODEC={codec}");
+            }
+        }
+
+        // Auto-answer incoming calls by default (receptionist behaviour);
+        // a stored `autoAnswer: false` setting turns it off.
+        let auto_answer = self
+            .store
+            .config
+            .settings
+            .get("autoAnswer")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        match crate::radio::spawn(self.data_dir.clone(), None, auto_answer) {
+            Ok(handle) => {
+                eprintln!("[aokie-plugin] live radio starting (real mode, auto_answer={auto_answer})");
+                self.radio = Some(handle);
+            }
+            Err(e) => eprintln!("[aokie-plugin] live radio unavailable: {e}"),
         }
     }
 
@@ -170,6 +221,9 @@ impl Plugin {
             "plugin.health" => Some(rpc::success_line(&id, json!({"status": "ok"}))),
             "plugin.shutdown" => {
                 self.shutdown_requested = true;
+                if let Some(radio) = self.radio.as_ref() {
+                    let _ = radio.send(crate::radio::RadioControl::Shutdown);
+                }
                 Some(rpc::success_line(&id, json!({"ok": true})))
             }
             "connector.request" => Some(self.handle_connector_request(&id, &msg.params, sink)),
@@ -221,6 +275,10 @@ impl Plugin {
             }
         }
         self.initialized = true;
+        // Arm the live radio at handshake time (real mode) so a call ringing
+        // before any command still reaches the flow. Non-blocking: init
+        // status surfaces asynchronously via aokie.dongle.ready / hardware.error.
+        self.ensure_radio_started();
         rpc::success_line(id, json!({"ok": true}))
     }
 
@@ -343,6 +401,20 @@ impl Plugin {
                     ))),
                     None => {
                         let c = self.outbox_counts()?;
+                        if let Some(radio) = self.radio.as_ref() {
+                            return Ok(json!({
+                                "radio": {
+                                    "initialized": radio.is_initialized(),
+                                    "connected": radio.is_connected(),
+                                    "callActive": radio.is_call_active(),
+                                    "localAddress": radio.local_address(),
+                                    "connectedPhone": radio.connected_address(),
+                                    "deviceName": "Aokie AI Assistant",
+                                    "error": radio.last_error(),
+                                },
+                                "outbox": {"pending": c.pending, "failed": c.failed, "dead": c.dead},
+                            }));
+                        }
                         Err(CmdError::failed(format!(
                             "dongle.diagnostics is not yet wired to hardware (outbox: {} pending, {} failed, {} dead)",
                             c.pending, c.failed, c.dead
@@ -352,6 +424,20 @@ impl Plugin {
             }
             "phone.status" => {
                 expect_fields(payload, &[])?;
+                if let Some(radio) = self.radio.as_ref() {
+                    let addr = radio.connected_address();
+                    return Ok(json!({
+                        "paired": addr.is_some(),
+                        "device": addr.as_ref().map(|a| json!({"address": a, "name": "Paired phone"})),
+                        "connected": radio.is_connected(),
+                        "initialized": radio.is_initialized(),
+                        "callActive": radio.is_call_active(),
+                        "localAddress": radio.local_address(),
+                        "caller": radio.current_caller(),
+                        "error": radio.last_error(),
+                        "source": "radio",
+                    }));
+                }
                 let device = self.store.config.paired_devices.first();
                 Ok(json!({
                     "paired": device.is_some(),
@@ -361,6 +447,21 @@ impl Plugin {
             }
             "phone.startPairing" => {
                 expect_fields(payload, &[])?;
+                // Real mode: the radio is discoverable as "Aokie AI Assistant"
+                // the moment it initialises — there is no separate pairing
+                // step. Ensure it's up and report readiness.
+                self.ensure_radio_started();
+                if let Some(radio) = self.radio.as_ref() {
+                    let status = if radio.is_initialized() { "discoverable" } else { "starting" };
+                    return Ok(json!({
+                        "status": status,
+                        "deviceName": "Aokie AI Assistant",
+                        "initialized": radio.is_initialized(),
+                        "localAddress": radio.local_address(),
+                        "error": radio.last_error(),
+                        "note": "Open your phone's Bluetooth and pair with \"Aokie AI Assistant\".",
+                    }));
+                }
                 let session_id = format!("pair_{}", uuid::Uuid::new_v4().simple());
                 let ev = aokie_event(
                     "aokie.phone.pairing_started",
@@ -376,14 +477,29 @@ impl Plugin {
             }
             "phone.listPaired" => {
                 expect_fields(payload, &[])?;
+                if let Some(radio) = self.radio.as_ref() {
+                    return Ok(json!({"devices": radio.paired()}));
+                }
                 Ok(json!({"devices": self.store.config.paired_devices}))
             }
             "call.current" => {
                 expect_fields(payload, &[])?;
+                if let Some(radio) = self.radio.as_ref() {
+                    let call = radio.current_caller().map(|from| {
+                        json!({"from": from, "active": radio.is_call_active()})
+                    });
+                    return Ok(json!({"call": call}));
+                }
                 Ok(json!({"call": self.mock.current_call.as_ref().map(call_json)}))
             }
             "call.answer" => {
                 expect_fields(payload, &[])?;
+                if let Some(radio) = self.radio.as_ref() {
+                    radio
+                        .send(crate::radio::RadioControl::Answer)
+                        .map_err(CmdError::failed)?;
+                    return Ok(json!({"answered": true, "via": "radio"}));
+                }
                 let call = self.require_call(&[MockCallState::Incoming], "call.answer")?;
                 call.state = MockCallState::Active;
                 let (corr, snapshot) = {
@@ -396,6 +512,12 @@ impl Plugin {
             }
             "call.reject" => {
                 expect_fields(payload, &[])?;
+                if let Some(radio) = self.radio.as_ref() {
+                    radio
+                        .send(crate::radio::RadioControl::Reject)
+                        .map_err(CmdError::failed)?;
+                    return Ok(json!({"rejected": true, "via": "radio"}));
+                }
                 let call = self.require_call(&[MockCallState::Incoming], "call.reject")?;
                 call.state = MockCallState::Ended;
                 let corr = call.correlation_id.clone();
@@ -405,6 +527,12 @@ impl Plugin {
             }
             "call.hangup" => {
                 expect_fields(payload, &[])?;
+                if let Some(radio) = self.radio.as_ref() {
+                    radio
+                        .send(crate::radio::RadioControl::Hangup)
+                        .map_err(CmdError::failed)?;
+                    return Ok(json!({"ended": true, "via": "radio"}));
+                }
                 let call = self.require_call(
                     &[MockCallState::Incoming, MockCallState::Active],
                     "call.hangup",
@@ -424,6 +552,12 @@ impl Plugin {
                 let text = require_str(&obj, "text")?;
                 if text.trim().is_empty() {
                     return Err(CmdError::failed("text is empty"));
+                }
+                if let Some(radio) = self.radio.as_ref() {
+                    radio
+                        .send(crate::radio::RadioControl::Speak { text: text.clone() })
+                        .map_err(CmdError::failed)?;
+                    return Ok(json!({"spoken": true, "via": "radio"}));
                 }
                 let call = self.require_call(&[MockCallState::Active], "call.operatorSpeak")?;
                 call.turns += 1;
@@ -472,6 +606,15 @@ impl Plugin {
                 let body = require_str(&obj, "body")?;
                 let to = validate_sms_recipient(&to).map_err(CmdError::failed)?;
                 let body = validate_sms_body(&body).map_err(CmdError::failed)?;
+                if let Some(radio) = self.radio.as_ref() {
+                    // The runtime builds the bMessage + PushMessage; the
+                    // aokie.sms.sent event (with its handle) is emitted by the
+                    // radio thread when the AG acks the PUT.
+                    radio
+                        .send(crate::radio::RadioControl::SendSms { to: to.clone(), body })
+                        .map_err(CmdError::failed)?;
+                    return Ok(json!({"to": to, "status": "queued", "via": "radio"}));
+                }
                 let message_id = format!("sms_{}", uuid::Uuid::new_v4().simple());
                 let at = now_iso8601();
                 // Essential event: outboxed before emission. The

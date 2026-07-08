@@ -18,6 +18,9 @@
 //!   idempotency_key; pending → sent | failed → dead).
 //! * [`config`] — JSON settings persisted under
 //!   `FORMLOGIC_PLUGIN_DATA_DIR`.
+//! * [`radio`] — the live Bluetooth radio: runs the real `aokie_radio`
+//!   runtime on a background thread and bridges its call/SMS events +
+//!   control onto the same contract as the mock (Windows-only).
 //!
 //! Hard rule from the SDK: **never write non-protocol output to
 //! stdout** — diagnostics go to stderr or `log.emit`.
@@ -26,4 +29,5 @@ pub mod config;
 pub mod connector;
 pub mod event_bridge;
 pub mod outbox;
+pub mod radio;
 pub mod rpc;

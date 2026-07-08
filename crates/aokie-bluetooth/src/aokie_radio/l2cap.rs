@@ -541,7 +541,7 @@ impl L2capState {
             if now.saturating_duration_since(sent_at) < timeout {
                 continue;
             }
-            println!(
+            eprintln!(
                 "[AokieRadio] L2CAP ConfigureRequest stalled on cid 0x{:04x} (PSM 0x{:04x}) — tearing down",
                 channel.local_cid, channel.psm
             );
@@ -672,7 +672,7 @@ impl L2capState {
         frame: BasicFrame<'_>,
     ) -> Result<Vec<Vec<u8>>, String> {
         let Some(channel) = self.channels.get_mut(&frame.cid) else {
-            println!(
+            eprintln!(
                 "[AokieRadio] L2CAP inbound on unknown cid 0x{:04x} ({} bytes) — dropped",
                 frame.cid,
                 frame.payload.len()
@@ -680,7 +680,7 @@ impl L2capState {
             return Ok(Vec::new());
         };
         if channel.connection_handle != connection_handle || channel.state != ChannelState::Open {
-            println!(
+            eprintln!(
                 "[AokieRadio] L2CAP inbound on cid 0x{:04x} dropped — handle 0x{:04x} expected 0x{:04x}, state {:?}",
                 frame.cid, connection_handle, channel.connection_handle, channel.state
             );
@@ -771,7 +771,7 @@ impl L2capState {
                 // channel is normally already gone (we tear down
                 // locally on send), so this is just a courtesy
                 // acknowledgement — log it once and drop.
-                println!(
+                eprintln!(
                     "[AokieRadio] L2CAP DisconnectionResponse for src_cid 0x{:04x}",
                     source_cid
                 );
@@ -789,7 +789,7 @@ impl L2capState {
                 // got accepted, ConfigureRequest never came back, the
                 // 5s ConfigureRequest watchdog tore the channel down,
                 // and SDP / RFCOMM / HFP never came up.
-                println!(
+                eprintln!(
                     "[AokieRadio] L2CAP InformationRequest type 0x{:04x} — replying",
                     info_type
                 );
@@ -805,7 +805,7 @@ impl L2capState {
             SignalingCommand::Unknown {
                 identifier, code, ..
             } => {
-                println!(
+                eprintln!(
                     "[AokieRadio] L2CAP unknown signaling code 0x{:02x} ident 0x{:02x} — sending CommandReject",
                     code, identifier
                 );
@@ -825,7 +825,7 @@ impl L2capState {
         source_cid: u16,
     ) -> Vec<Vec<u8>> {
         if !self.psm_handlers.contains_key(&psm) {
-            println!(
+            eprintln!(
                 "[AokieRadio] L2CAP ConnectionRequest PSM 0x{:04x} REJECTED (no registered handler)",
                 psm
             );
@@ -837,7 +837,7 @@ impl L2capState {
                 CONNECTION_STATUS_NO_FURTHER_INFORMATION,
             )];
         }
-        println!(
+        eprintln!(
             "[AokieRadio] L2CAP ConnectionRequest PSM 0x{:04x} (handle 0x{:04x}, src_cid 0x{:04x}) — accepting",
             psm, connection_handle, source_cid
         );
@@ -908,7 +908,7 @@ impl L2capState {
         let now_open = channel.local_configured && channel.remote_configured;
         if now_open {
             channel.state = ChannelState::Open;
-            println!(
+            eprintln!(
                 "[AokieRadio] L2CAP channel cid 0x{:04x} (PSM 0x{:04x}) OPEN (remote ConfigureRequest received)",
                 destination_cid, psm
             );
@@ -936,14 +936,14 @@ impl L2capState {
         let Some(channel) = self.channels.values_mut().find(|channel| {
             channel.local_cid == source_cid && channel.local_config_identifier == Some(identifier)
         }) else {
-            println!(
+            eprintln!(
                 "[AokieRadio] L2CAP ConfigureResponse for unknown source_cid 0x{:04x} ident 0x{:02x} result 0x{:04x}",
                 source_cid, identifier, result
             );
             return;
         };
         if result != CONFIG_RESULT_SUCCESS {
-            println!(
+            eprintln!(
                 "[AokieRadio] L2CAP ConfigureResponse REFUSED (PSM 0x{:04x}, result 0x{:04x}) — channel will stall",
                 channel.psm, result
             );
@@ -957,12 +957,12 @@ impl L2capState {
         let now_open = channel.remote_configured;
         if now_open {
             channel.state = ChannelState::Open;
-            println!(
+            eprintln!(
                 "[AokieRadio] L2CAP channel cid 0x{:04x} (PSM 0x{:04x}) OPEN (our ConfigureRequest acked)",
                 local_cid, psm
             );
         } else {
-            println!(
+            eprintln!(
                 "[AokieRadio] L2CAP channel cid 0x{:04x} (PSM 0x{:04x}) local-configured (waiting for remote ConfigureRequest)",
                 local_cid, psm
             );
@@ -1026,7 +1026,7 @@ impl L2capState {
                 upper_handler,
             },
         );
-        println!(
+        eprintln!(
             "[AokieRadio] L2CAP outbound ConnectionRequest PSM 0x{:04x} (handle 0x{:04x}, src_cid 0x{:04x}, ident 0x{:02x})",
             psm, connection_handle, local_cid, identifier
         );
@@ -1134,7 +1134,7 @@ impl L2capState {
         };
         match outcome {
             Outcome::Unknown => {
-                println!(
+                eprintln!(
                     "[AokieRadio] L2CAP ConnectionResponse for unknown src_cid 0x{:04x} ident 0x{:02x} result 0x{:04x}",
                     source_cid, identifier, result
                 );
@@ -1144,7 +1144,7 @@ impl L2capState {
                 // Peer is still bonding/authorizing. Spec: wait for
                 // a final response. Don't refresh the watchdog —
                 // total time-to-open is still bounded.
-                println!(
+                eprintln!(
                     "[AokieRadio] L2CAP ConnectionResponse PENDING for src_cid 0x{:04x}",
                     source_cid
                 );
@@ -1155,7 +1155,7 @@ impl L2capState {
                 psm,
                 result,
             } => {
-                println!(
+                eprintln!(
                     "[AokieRadio] L2CAP outbound ConnectionRequest REFUSED (PSM 0x{:04x}, result 0x{:04x}) — tearing down local channel",
                     psm, result
                 );
@@ -1179,7 +1179,7 @@ impl L2capState {
                     .expect("channel was just borrowed mutably above");
                 channel.local_config_identifier = Some(config_id);
                 channel.local_config_sent_at = Some(Instant::now());
-                println!(
+                eprintln!(
                     "[AokieRadio] L2CAP outbound ConnectionResponse SUCCESS (PSM 0x{:04x}, local 0x{:04x}, remote 0x{:04x}) — sending ConfigureRequest id 0x{:02x}",
                     psm, local_cid, remote_cid, config_id
                 );

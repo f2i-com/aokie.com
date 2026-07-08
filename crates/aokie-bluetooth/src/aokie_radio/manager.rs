@@ -248,7 +248,7 @@ pub fn initialize_first_controller() -> Result<Option<ControllerInitReport>, Str
         match initialize_controller(&interface.path) {
             Ok(report) => return Ok(Some(report)),
             Err(e) => {
-                println!(
+                eprintln!(
                     "[AokieRadio] Could not initialize controller at {}: {}",
                     interface.path, e
                 );
@@ -271,7 +271,7 @@ pub fn listen_first_controller(
         match listen_controller(&interface.path, duration, pairing_store) {
             Ok(report) => return Ok(Some(report)),
             Err(e) => {
-                println!(
+                eprintln!(
                     "[AokieRadio] Could not listen on controller at {}: {}",
                     interface.path, e
                 );
@@ -326,7 +326,7 @@ pub fn listen_acl_first_controller(
         match listen_acl_controller(&interface.path, duration) {
             Ok(report) => return Ok(Some(report)),
             Err(e) => {
-                println!(
+                eprintln!(
                     "[AokieRadio] Could not listen for ACL on controller at {}: {}",
                     interface.path, e
                 );
@@ -411,7 +411,7 @@ pub fn listen_runtime_first_controller_with_options(
         ) {
             Ok(report) => return Ok(Some(report)),
             Err(e) => {
-                println!(
+                eprintln!(
                     "[AokieRadio] Could not run runtime diagnostic on controller at {}: {}",
                     interface.path, e
                 );
@@ -650,7 +650,7 @@ pub(crate) fn initialize_transport(
     // family that worked under BTStack-bridge but went silent on our port
     // until we discovered this missing init step (2026-04-29).
     if version.manufacturer_name == hci::BLUETOOTH_COMPANY_ID_BROADCOM {
-        println!(
+        eprintln!(
             "[AokieRadio] Broadcom controller detected (manufacturer 0x{:04x}) — routing SCO via HCI iso (BCM_WRITE_SCO_PCM_INT 1,0,0,0,0)",
             version.manufacturer_name,
         );
@@ -702,7 +702,7 @@ pub(crate) fn initialize_transport(
     // first inquiry response we emit already advertises MAP/PBAP UUIDs.
     let eir_command =
         hci::write_extended_inquiry_response_command(false, AOKIE_CLASSIC_NAME, AOKIE_EIR_UUIDS);
-    println!(
+    eprintln!(
         "[AokieRadio] Write EIR — name={:?} uuids={:?} (first 24 bytes={:02x?})",
         AOKIE_CLASSIC_NAME,
         AOKIE_EIR_UUIDS,

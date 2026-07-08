@@ -626,7 +626,7 @@ impl MasMceSession {
         if let Some(Header::Byte { value, .. }) = response.header(obex::HDR_SRM) {
             if *value == 0x01 {
                 self.srm_active = true;
-                println!(
+                eprintln!(
                     "[AokieRadio] MAS SRM=enable confirmed by PSE — pausing GET continuations \
                      for this op"
                 );
