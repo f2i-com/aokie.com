@@ -12,10 +12,14 @@ default = []
 # the live SCO audio. HEAVY — pulls ort/ndarray/rubato/etc. and needs the ORT DLL
 # + speech models at runtime. Off by default so the base plugin stays light;
 # build the voice plugin with `--features voice`.
-voice = ["dep:aokie-ai"]
+voice = ["dep:aokie-ai", "dep:reqwest"]
 
 [dependencies]
 aokie-core = { path = "../aokie-core" }
+# Streaming LLM client for the in-plugin real-time reply (voice feature). Blocking
+# API read line-by-line = SSE streaming without a tokio runtime. rustls to match
+# aokie-ai and avoid a native-TLS build.
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 # WinUSB driver install (dongle.installDriver) + dongle enumeration. Windows-only surface behind
 # cfg(target_os = "windows") inside the crate; on other targets the plugin returns an unsupported error.
 aokie-dongle = { path = "../aokie-dongle" }
