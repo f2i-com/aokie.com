@@ -213,7 +213,31 @@ impl Plugin {
             .get("answerTone")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        match crate::radio::spawn(self.data_dir.clone(), None, auto_answer, answer_tone) {
+        // Software virtual-replug at startup to fix the post-boot dead-SCO-iso
+        // state (some dongles' iso endpoint is dead until re-enumerated). Set
+        // settings.reenumerateHwid to the dongle's hardware id
+        // (e.g. "USB\\VID_0A5C&PID_21EC"); unset = skip (safe default).
+        let reenumerate_hwid = self
+            .store
+            .config
+            .settings
+            .get("reenumerateHwid")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string());
+        // Spoken greeting the receptionist plays on answer (voice build). Empty /
+        // unset = no greeting. Default a friendly line so the voice plugin greets
+        // out of the box.
+        let greeting = self
+            .store
+            .config
+            .settings
+            .get("greeting")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| Some("Hello, thanks for calling. How can I help you today?".to_string()))
+            .filter(|s| !s.trim().is_empty());
+        match crate::radio::spawn(self.data_dir.clone(), None, auto_answer, answer_tone, reenumerate_hwid, greeting) {
             Ok(handle) => {
                 eprintln!("[aokie-plugin] live radio starting (real mode, auto_answer={auto_answer})");
                 self.radio = Some(handle);

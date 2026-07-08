@@ -6,11 +6,21 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# In-process voice receptionist: STT/TTS via aokie-ai + ONNX Runtime, driven on
+# the live SCO audio. HEAVY — pulls ort/ndarray/rubato/etc. and needs the ORT DLL
+# + speech models at runtime. Off by default so the base plugin stays light;
+# build the voice plugin with `--features voice`.
+voice = ["dep:aokie-ai"]
+
 [dependencies]
 aokie-core = { path = "../aokie-core" }
 # WinUSB driver install (dongle.installDriver) + dongle enumeration. Windows-only surface behind
 # cfg(target_os = "windows") inside the crate; on other targets the plugin returns an unsupported error.
 aokie-dongle = { path = "../aokie-dongle" }
+# Optional in-process speech (TTS greeting + STT), behind the `voice` feature.
+aokie-ai = { path = "../aokie-ai", features = ["onnx"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Same major as the legacy app (aokie-desktop pins 0.31) so the two
