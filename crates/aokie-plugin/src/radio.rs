@@ -308,10 +308,12 @@ fn tts_speak(
         // Stream each chunk straight to the SCO queue as it's synthesized, so the
         // caller hears the reply start on the first chunk (~0.3 s) instead of after
         // the whole utterance is synthesized (~1-2 s) — the big perceived-latency win.
+        // Voice from AOKIE_TTS_VOICE (ttsVoice setting); empty = bundle default.
+        let voice = std::env::var("AOKIE_TTS_VOICE").unwrap_or_default();
         let t0 = std::time::Instant::now();
         let mut first = true;
         let mut samples = 0usize;
-        match engine.synthesize_streaming(text, "", sample_rate as u32, |pcm| {
+        match engine.synthesize_streaming(text, &voice, sample_rate as u32, |pcm| {
             if first {
                 eprintln!("[aokie-plugin] speaking (first audio in {:?})", t0.elapsed());
                 first = false;
