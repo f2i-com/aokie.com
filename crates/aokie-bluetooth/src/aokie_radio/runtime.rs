@@ -1172,6 +1172,12 @@ fn run_runtime(
     let mut acl_partial_since: Option<Instant> = None;
     let mut loop_iter: u64 = 0;
     let mut last_heartbeat = Instant::now();
+    // ACL keepalive: during a call the SCO link monopolises the air and the AG
+    // stops sending ACL, so if nothing is received the controller hits the
+    // link-supervision timeout (Disconnection reason 0x08) and drops the whole
+    // connection mid-call. We poll AT+CIND? when the ACL goes quiet to elicit a
+    // response and reset the supervision timer.
+    let mut last_hfp_keepalive = Instant::now();
 
     // ── Auto-reconnect to paired devices ─────────────────────────────────
     //
@@ -1281,6 +1287,30 @@ fn run_runtime(
                 sco_tx_queue.len(),
                 map_diag,
             );
+            // ACL keepalive (see decl above): once the ACL has been quiet for a
+            // few seconds while connected, send AT+CIND? to draw a +CIND reply,
+            // which resets the link-supervision timer and holds the call up.
+            if active_acl_handle.is_some()
+                && last_acl_inbound_at.elapsed() >= Duration::from_secs(6)
+                && last_hfp_keepalive.elapsed() >= Duration::from_secs(4)
+            {
+                match l2cap_state
+                    .build_hfp_call_control_packets(HfpAtCommand::RetrieveIndicatorStatus)
+                {
+                    Ok(packets) if !packets.is_empty() => {
+                        for packet in &packets {
+                            let _ = transport.write_acl(packet);
+                        }
+                        last_hfp_keepalive = Instant::now();
+                        eprintln!(
+                            "[AokieRadio] ACL idle {}s — sent AT+CIND? keepalive to hold the link-supervision timer",
+                            last_acl_inbound_at.elapsed().as_secs()
+                        );
+                    }
+                    // No HFP SLC yet (pre-pair) or nothing to send — skip quietly.
+                    _ => {}
+                }
+            }
             // SCO RX liveness check. If the link is up but we've never
             // received a single byte (or it's been >2 s since the last
             // one), surface that — once per silent period, not every
