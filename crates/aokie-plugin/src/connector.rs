@@ -235,6 +235,14 @@ impl Plugin {
                 std::env::set_var("AOKIE_AI_PERSONA", p.trim());
             }
         }
+        // TTS voice (pocket-tts predefined: alba/azelma/cosette/eponine/fantine/
+        // javert/jean/marius, or a .wav path to clone). Empty = bundle default.
+        if let Some(v) = self.store.config.settings.get("ttsVoice").and_then(|v| v.as_str()) {
+            if !v.trim().is_empty() {
+                std::env::set_var("AOKIE_TTS_VOICE", v.trim());
+                eprintln!("[aokie-plugin] ttsVoice setting → AOKIE_TTS_VOICE={}", v.trim());
+            }
+        }
 
         // Auto-answer incoming calls by default (receptionist behaviour);
         // a stored `autoAnswer: false` setting turns it off.
