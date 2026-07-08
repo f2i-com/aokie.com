@@ -323,9 +323,7 @@ impl Plugin {
                 self.save_config()?;
                 Ok(json!({"preferred": {"vid": vid, "pid": pid}}))
             }
-            "dongle.installDriver" => Err(CmdError::failed(
-                "dongle.installDriver is not yet wired to hardware in the plugin; use the legacy Aokie desktop app to bind the WinUSB driver.",
-            )),
+            "dongle.installDriver" => self.install_driver(payload),
             "dongle.diagnostics" => {
                 let obj = expect_fields(payload, &["simulate"])?;
                 match obj.get("simulate").and_then(Value::as_str) {
@@ -667,6 +665,42 @@ impl Plugin {
             .map_err(|e| CmdError::failed(format!("cannot persist settings: {e}")))
     }
 
+    /// Bind the WinUSB driver to a Bluetooth dongle so the aokie radio stack can claim it. vid/pid
+    /// come from the payload (`{vid, pid}`), else the configured preferred dongle. Windows-only
+    /// (WinUSB); the elevated `aokie-driver-helper.exe` performs the install, so a UAC prompt appears
+    /// on the machine running FormLogic Desktop. Missing helper / cancelled elevation / absent dongle
+    /// surface as a typed command_failed the web caller sees — no panic.
+    #[cfg(target_os = "windows")]
+    fn install_driver(&self, payload: &Value) -> Result<Value, CmdError> {
+        let obj = payload.as_object().cloned().unwrap_or_default();
+        let (vid, pid) = if obj.contains_key("vid") || obj.contains_key("pid") {
+            (require_u16(&obj, "vid")?, require_u16(&obj, "pid")?)
+        } else if let Some(pref) = &self.store.config.preferred_dongle {
+            (pref.vid, pref.pid)
+        } else {
+            return Err(CmdError::failed(
+                "dongle.installDriver needs vid + pid (or set a preferred dongle via dongle.setPreferred first)",
+            ));
+        };
+        let work_dir = self.data_dir.join("winusb-install");
+        match aokie_dongle::installer::install_winusb(vid, pid, &work_dir) {
+            Ok(_) => Ok(json!({
+                "installed": true,
+                "vid": vid,
+                "pid": pid,
+                "backend": "aokie-helper",
+            })),
+            Err(e) => Err(CmdError::failed(format!("WinUSB driver install failed: {e}"))),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn install_driver(&self, _payload: &Value) -> Result<Value, CmdError> {
+        Err(CmdError::failed(
+            "dongle.installDriver is only supported on Windows (WinUSB)",
+        ))
+    }
+
     fn outbox_counts(&self) -> Result<crate::outbox::OutboxCounts, CmdError> {
         self.outbox
             .counts()
@@ -975,11 +1009,16 @@ mod tests {
     fn hardware_commands_fail_typed_not_fake_success() {
         let mut plugin = Plugin::ephemeral(false);
         let mut sink = VecSink::default();
+        // dongle.installDriver is wired to the WinUSB installer now. With no vid/pid and no preferred
+        // dongle it fails TYPED asking for them (never a fake success); off-Windows it's unsupported.
         let err = plugin
             .dispatch_command("dongle.installDriver", &Value::Null, &mut sink)
             .unwrap_err();
         assert_eq!(err.code, "command_failed");
-        assert!(err.message.contains("not yet wired to hardware"));
+        #[cfg(target_os = "windows")]
+        assert!(err.message.contains("vid"), "got: {}", err.message);
+        #[cfg(not(target_os = "windows"))]
+        assert!(err.message.contains("Windows"), "got: {}", err.message);
 
         let err = plugin
             .dispatch_command("dongle.diagnostics", &Value::Null, &mut sink)
