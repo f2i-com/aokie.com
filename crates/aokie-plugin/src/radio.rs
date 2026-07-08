@@ -155,6 +155,31 @@ fn emit_turn(
     );
 }
 
+/// Heuristic self-echo guard for the in-plugin agent: true when `caller` (a fresh
+/// transcript) is mostly the same words as Aokie's last spoken reply `bot` — i.e.
+/// Aokie's own TTS leaked back into the mic and STT transcribed it. Keeps Aokie
+/// from answering itself if any audio escapes the half-duplex mute.
+#[cfg(feature = "voice")]
+fn looks_like_echo(caller: &str, bot: &str) -> bool {
+    fn words(s: &str) -> Vec<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_string())
+            .collect()
+    }
+    let c = words(caller);
+    if c.len() < 3 {
+        return false; // too short to judge (e.g. "yes", "ok")
+    }
+    let b: std::collections::HashSet<String> = words(bot).into_iter().collect();
+    if b.is_empty() {
+        return false;
+    }
+    let overlap = c.iter().filter(|w| b.contains(*w)).count();
+    (overlap as f32 / c.len() as f32) >= 0.7
+}
+
 // ── Windows: the real radio ──────────────────────────────────────────────
 
 /// Start the live radio on a background thread. Returns immediately with a
@@ -426,6 +451,9 @@ fn run_loop(
     // Conversation history for the agent (OpenAI chat messages), reset per call.
     #[cfg(feature = "voice")]
     let mut history: Vec<serde_json::Value> = Vec::new();
+    // Aokie's last spoken line (greeting or reply) — for the self-echo guard.
+    #[cfg(feature = "voice")]
+    let mut last_bot_reply = String::new();
     // Half-duplex gate: while Aokie is speaking (+ a short tail) inbound audio is
     // discarded so we never transcribe our own TTS echoing back over the line.
     #[cfg(feature = "voice")]
@@ -554,6 +582,7 @@ fn run_loop(
                         emit_turn(outbox, sink, corr, turn_index, "bot", text);
                         turn_index += 1;
                         history.push(serde_json::json!({ "role": "assistant", "content": text }));
+                        last_bot_reply = text.to_string();
                     }
                     greeted_corr = Some(corr.to_string());
                     idle = false;
@@ -565,6 +594,7 @@ fn run_loop(
                 {
                     turn_index = 1;
                     history.clear();
+                    last_bot_reply.clear();
                 }
             }
             _ => {}
@@ -620,6 +650,13 @@ fn run_loop(
             while let Ok(text) = stt_result_rx.try_recv() {
                 idle = false;
                 if let Some(corr) = current_corr.clone() {
+                    // Drop a transcript that's really Aokie's own reply echoing back
+                    // (belt-and-suspenders over the half-duplex mute) so it never
+                    // records it as a caller turn or answers itself.
+                    if agent_enabled && looks_like_echo(&text, &last_bot_reply) {
+                        eprintln!("[aokie-plugin] ignored self-echo: {text:?}");
+                        continue;
+                    }
                     eprintln!("[aokie-plugin] heard [turn {turn_index}]: {text:?}");
                     emit_turn(outbox, sink, &corr, turn_index, "caller", &text);
                     turn_index += 1;
@@ -652,22 +689,32 @@ fn run_loop(
                             let mut messages =
                                 vec![serde_json::json!({ "role": "system", "content": agent_persona })];
                             messages.extend(history.iter().cloned());
+                            // Mute STT for the WHOLE reply as it streams. Sentences
+                            // synthesize faster than they play, so the audio keeps
+                            // playing (queued) after synthesis finishes; muting only
+                            // the last sentence let the tail echo back and Aokie
+                            // answered itself. Track cumulative playback from t0.
                             let t0 = Instant::now();
+                            let mut reply_dur = Duration::ZERO;
                             eprintln!("[aokie-plugin] agent replying (streaming)…");
                             let outcome = client.stream_reply(serde_json::json!(messages), |sentence| {
                                 eprintln!("[aokie-plugin] agent sentence (+{:?}): {sentence:?}", t0.elapsed());
-                                let dur = tts_speak(bt, &mut tts, sentence, sr);
-                                mute_stt_until =
-                                    Some(Instant::now() + dur + Duration::from_millis(400));
+                                reply_dur += tts_speak(bt, &mut tts, sentence, sr);
+                                let plays_until = (t0 + reply_dur).max(Instant::now());
+                                mute_stt_until = Some(plays_until + Duration::from_millis(600));
                                 true
                             });
+                            // Cover audio still queued after the last chunk synthesized.
+                            let plays_until = (t0 + reply_dur).max(Instant::now());
+                            mute_stt_until = Some(plays_until + Duration::from_millis(800));
                             match outcome {
                                 Ok(full) if !full.trim().is_empty() => {
                                     let full = full.trim().to_string();
                                     history.push(serde_json::json!({ "role": "assistant", "content": full }));
                                     emit_turn(outbox, sink, &corr, turn_index, "bot", &full);
                                     turn_index += 1;
-                                    // Discard anything the caller said while we replied.
+                                    last_bot_reply = full;
+                                    // Discard anything captured while we replied.
                                     stt_buf.clear();
                                     stt_had_speech = false;
                                     stt_silence = Duration::ZERO;
