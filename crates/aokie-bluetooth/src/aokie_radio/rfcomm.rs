@@ -333,7 +333,7 @@ impl RfcommState {
         // command has cr=0. Sending cr=1 here makes Bluedroid log
         // "Bad UIH - response" and silently drop the frame.
         let frame = build_uih(RFCOMM_DLCI_MULTIPLEXER, false, None, &pn);
-        println!(
+        eprintln!(
             "[AokieRadio] RFCOMM client DLCI {} attached — PN frame={:02x?}",
             target_dlci, frame
         );
@@ -486,7 +486,7 @@ impl RfcommState {
 
     pub fn handle_packet(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         let frame = parse_frame(packet)?;
-        println!(
+        eprintln!(
             "[AokieRadio] RFCOMM frame in: kind={:?} dlci={} cr={} pf={} payload={}B",
             frame.kind,
             frame.dlci,
@@ -527,14 +527,14 @@ impl RfcommState {
                 if let Some(handlers) = self.extra_channel_handlers.get(&frame.dlci).cloned() {
                     return (handlers.on_uih)(frame.payload);
                 }
-                println!(
+                eprintln!(
                     "[AokieRadio] RFCOMM UIH ignored — dlci {} not multiplexer (0), HFP ({}), or in extra-channel registry",
                     frame.dlci, self.hfp_dlci
                 );
                 Ok(Vec::new())
             }
             _ => {
-                println!(
+                eprintln!(
                     "[AokieRadio] RFCOMM frame ignored — kind {:?} on dlci {}",
                     frame.kind, frame.dlci
                 );
@@ -552,7 +552,7 @@ impl RfcommState {
             return Vec::new();
         };
         if !matches!(client.phase, ClientDlciPhase::AwaitingTargetUa) {
-            println!(
+            eprintln!(
                 "[AokieRadio] RFCOMM client UA on dlci {} ignored — phase {:?}",
                 dlci, client.phase
             );
@@ -562,7 +562,7 @@ impl RfcommState {
         client.msc_local_pending = true;
         client.msc_remote_received = false;
         let msc = build_modem_status_command(dlci, RFCOMM_LOCAL_MODEM_STATUS);
-        println!(
+        eprintln!(
             "[AokieRadio] RFCOMM client DLCI {} UA acked — sending MSC CMD",
             dlci
         );
@@ -576,7 +576,7 @@ impl RfcommState {
         if let Some(client) = self.client_dlcis.get_mut(&dlci) {
             client.phase = ClientDlciPhase::Failed(reason.clone());
         }
-        println!(
+        eprintln!(
             "[AokieRadio] RFCOMM client DLCI {} FAILED: {}",
             dlci, reason
         );
@@ -593,14 +593,14 @@ impl RfcommState {
             && client.msc_remote_received
         {
             client.phase = ClientDlciPhase::Open;
-            println!("[AokieRadio] RFCOMM client DLCI {} OPEN", dlci);
+            eprintln!("[AokieRadio] RFCOMM client DLCI {} OPEN", dlci);
             self.client_events.push(ClientDlciEvent::Opened { dlci });
         }
     }
 
     fn handle_sabm(&mut self, dlci: u8) -> Vec<Vec<u8>> {
         if dlci == RFCOMM_DLCI_MULTIPLEXER {
-            println!("[AokieRadio] RFCOMM SABM on multiplexer DLCI 0 — opening session");
+            eprintln!("[AokieRadio] RFCOMM SABM on multiplexer DLCI 0 — opening session");
             self.multiplexer_open = true;
             return vec![build_ua(dlci, true)];
         }
@@ -611,7 +611,7 @@ impl RfcommState {
         // "send DM" fallback.
         if self.multiplexer_open {
             if let Some(handlers) = self.extra_channel_handlers.get(&dlci).cloned() {
-                println!(
+                eprintln!(
                     "[AokieRadio] RFCOMM SABM on DLCI {} — registered extra channel",
                     dlci
                 );
@@ -620,7 +620,7 @@ impl RfcommState {
         }
 
         if self.multiplexer_open && dlci == self.hfp_dlci {
-            println!(
+            eprintln!(
                 "[AokieRadio] RFCOMM SABM on HFP DLCI {} — channel open, sending MSC CMD before SLC",
                 dlci
             );
@@ -648,7 +648,7 @@ impl RfcommState {
                 ),
             ]
         } else {
-            println!(
+            eprintln!(
                 "[AokieRadio] RFCOMM SABM on unexpected DLCI {} (multiplexer_open={}, hfp_dlci={}) — sending DM",
                 dlci, self.multiplexer_open, self.hfp_dlci
             );
@@ -665,7 +665,7 @@ impl RfcommState {
             return Vec::new();
         }
         self.msc_at_kicked = true;
-        println!("[AokieRadio] RFCOMM MSC exchange complete — kicking HFP SLC sequence");
+        eprintln!("[AokieRadio] RFCOMM MSC exchange complete — kicking HFP SLC sequence");
         if let Some(command) = self.next_hfp_command_frame() {
             return vec![command];
         }
@@ -691,7 +691,7 @@ impl RfcommState {
 
     fn handle_multiplexer_payload(&mut self, payload: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         if !self.multiplexer_open {
-            println!(
+            eprintln!(
                 "[AokieRadio] RFCOMM multiplexer payload received but mux not open — dropping"
             );
             return Ok(Vec::new());
@@ -723,14 +723,14 @@ impl RfcommState {
                             // sending cr=1 from a mux-responder yields
                             // Bluedroid's "Bad SABME" parser rejection.
                             let sabm = build_sabm(dlci, false);
-                            println!(
+                            eprintln!(
                                 "[AokieRadio] RFCOMM client DLCI {} PN acked (frame_type=0x{:02x}, max_frame_size={}, credits={}) — sending target SABM bytes={:02x?}",
                                 dlci, frame_type, self.max_frame_size, credits, sabm
                             );
                             out.push(sabm);
                         }
                     } else {
-                        println!(
+                        eprintln!(
                             "[AokieRadio] RFCOMM PN response received in server mode for dlci {} — ignoring",
                             dlci
                         );
@@ -739,7 +739,7 @@ impl RfcommState {
                 } else if dlci != self.hfp_dlci && !self.extra_channel_handlers.contains_key(&dlci)
                 {
                     let registered: Vec<u8> = self.extra_channel_handlers.keys().copied().collect();
-                    println!(
+                    eprintln!(
                         "[AokieRadio] RFCOMM PN target dlci {} not registered — replying NSC (hfp_dlci={}, registered_extras={:?})",
                         dlci, self.hfp_dlci, registered
                     );
@@ -767,14 +767,14 @@ impl RfcommState {
             } => {
                 if is_response {
                     if dlci == self.hfp_dlci {
-                        println!(
+                        eprintln!(
                             "[AokieRadio] RFCOMM MSC RSP for dlci {} — our MSC CMD acknowledged",
                             dlci
                         );
                         self.msc_local_pending = false;
                     } else if let Some(client) = self.client_dlcis.get_mut(&dlci) {
                         client.msc_local_pending = false;
-                        println!(
+                        eprintln!(
                             "[AokieRadio] RFCOMM client DLCI {} MSC RSP — local pending cleared",
                             dlci
                         );
@@ -782,7 +782,7 @@ impl RfcommState {
                     }
                     None
                 } else if dlci == self.hfp_dlci {
-                    println!(
+                    eprintln!(
                         "[AokieRadio] RFCOMM MSC CMD for dlci {} signals 0x{:02x} — replying MSC RSP",
                         dlci, signals
                     );
@@ -792,7 +792,7 @@ impl RfcommState {
                     // Peer's MSC CMD on our outbound DLCI. Reply MSC
                     // RSP and remember we did so — `maybe_open_client_dlci`
                     // promotes to Open if our own MSC has also been acked.
-                    println!(
+                    eprintln!(
                         "[AokieRadio] RFCOMM client DLCI {} MSC CMD signals 0x{:02x} — replying MSC RSP",
                         dlci, signals
                     );
@@ -809,7 +809,7 @@ impl RfcommState {
                     // extras (we don't proactively send MSC CMD on
                     // their behalf today), so this is purely
                     // protocol-correctness.
-                    println!(
+                    eprintln!(
                         "[AokieRadio] RFCOMM MSC CMD for registered dlci {} signals 0x{:02x} — replying MSC RSP",
                         dlci, signals
                     );
@@ -1058,7 +1058,7 @@ impl RfcommClientState {
     /// / Payload / Closed / Failed) are observable via `take_events`.
     pub fn handle_packet(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         let frame = parse_frame(packet)?;
-        println!(
+        eprintln!(
             "[AokieRadio] RFCOMM client frame in: kind={:?} dlci={} target={} payload={}B (phase {:?})",
             frame.kind,
             frame.dlci,
@@ -1088,7 +1088,7 @@ impl RfcommClientState {
                     self.pending_events
                         .push(RfcommClientEvent::Payload(frame.payload.to_vec()));
                 } else {
-                    println!(
+                    eprintln!(
                         "[AokieRadio] RFCOMM client UIH on dlci {} ignored — channel not yet Open (phase {:?})",
                         dlci, self.phase
                     );
@@ -1096,7 +1096,7 @@ impl RfcommClientState {
                 Ok(Vec::new())
             }
             _ => {
-                println!(
+                eprintln!(
                     "[AokieRadio] RFCOMM client ignored frame kind {:?} on dlci {}",
                     frame.kind, frame.dlci
                 );
@@ -1168,7 +1168,7 @@ impl RfcommClientState {
                 Ok(vec![build_uih(RFCOMM_DLCI_MULTIPLEXER, false, None, &rsp)])
             }
             _ => {
-                println!(
+                eprintln!(
                     "[AokieRadio] RFCOMM client ignored mux command (phase {:?})",
                     self.phase
                 );

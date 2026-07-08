@@ -431,7 +431,7 @@ impl MapRuntime {
                             {
                                 Ok((target_dlci, pn_acl)) => {
                                     out.push(pn_acl);
-                                    println!(
+                                    eprintln!(
                                         "[AokieRadio] MAP SDP done — MAS server_channel={} → target dlci={} on shared mux cid 0x{:04x}",
                                         server_channel, target_dlci, shared_cid
                                     );
@@ -459,7 +459,7 @@ impl MapRuntime {
                                 Some(self.make_handler()),
                             );
                         out.push(conn_req);
-                        println!(
+                        eprintln!(
                             "[AokieRadio] MAP SDP done — MAS RFCOMM channel {} on cid 0x{:04x} (no shared mux)",
                             server_channel, rfcomm_cid
                         );
@@ -496,7 +496,7 @@ impl MapRuntime {
                 for ev in client.take_events() {
                     match ev {
                         RfcommClientEvent::Opened => {
-                            println!(
+                            eprintln!(
                                 "[AokieRadio] MAP RFCOMM opened (cid 0x{:04x}) — sending OBEX CONNECT",
                                 local_cid
                             );
@@ -527,7 +527,7 @@ impl MapRuntime {
                             }
                         }
                         RfcommClientEvent::Closed => {
-                            println!("[AokieRadio] MAP RFCOMM closed before session opened");
+                            eprintln!("[AokieRadio] MAP RFCOMM closed before session opened");
                             self.fail(
                                 "RFCOMM closed before MAP session opened".to_string(),
                                 Some(local_cid),
@@ -537,7 +537,7 @@ impl MapRuntime {
                             return Ok(());
                         }
                         RfcommClientEvent::Failed(reason) => {
-                            println!("[AokieRadio] MAP RFCOMM client failed: {}", reason);
+                            eprintln!("[AokieRadio] MAP RFCOMM client failed: {}", reason);
                             self.fail(
                                 format!("RFCOMM client failed: {}", reason),
                                 Some(local_cid),
@@ -594,14 +594,14 @@ impl MapRuntime {
                                         return Ok(());
                                     }
                                 };
-                                println!(
+                                eprintln!(
                                     "[AokieRadio] MAP OBEX response opcode 0x{:02x} (state before: {:?})",
                                     parsed.opcode, session.state()
                                 );
                                 if let Some(next_req) = session.handle_response(&parsed) {
                                     let uih = client.build_outbound_uih(&next_req)?;
                                     out.push(l2cap_state.send_on_channel(local_cid, &uih)?);
-                                    println!(
+                                    eprintln!(
                                         "[AokieRadio] MAP MAS sent next request — new state {:?}",
                                         session.state()
                                     );
@@ -741,7 +741,7 @@ impl MapRuntime {
                     &connect_req,
                 )?;
                 out.push(acl);
-                println!(
+                eprintln!(
                     "[AokieRadio] MAP shared DLCI {} OPEN — sending OBEX CONNECT",
                     target_dlci
                 );
@@ -817,7 +817,7 @@ impl MapRuntime {
                             return Ok(());
                         }
                     };
-                    println!(
+                    eprintln!(
                         "[AokieRadio] MAP OBEX response opcode 0x{:02x} (state before: {:?})",
                         parsed.opcode,
                         session.state()
@@ -829,7 +829,7 @@ impl MapRuntime {
                             &next_req,
                         )?;
                         out.push(acl);
-                        println!(
+                        eprintln!(
                             "[AokieRadio] MAP MAS sent next request — new state {:?}",
                             session.state()
                         );
@@ -922,7 +922,7 @@ impl MapRuntime {
                         let sabm = client.kickoff()?;
                         let acl = l2cap_state.send_on_channel(cid, &sabm)?;
                         out.push(acl);
-                        println!(
+                        eprintln!(
                             "[AokieRadio] MAP RFCOMM L2CAP open (cid 0x{:04x}) — sent multiplexer SABM for channel {}",
                             cid, channel_num
                         );

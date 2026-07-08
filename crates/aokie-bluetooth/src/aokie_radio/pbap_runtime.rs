@@ -252,7 +252,7 @@ impl PbapRuntime {
                 | PbapRuntimePhase::DrivingRfcomm { .. }
         );
         if in_obex_phase && self.last_progress_at.elapsed() >= PBAP_INACTIVITY_TIMEOUT {
-            println!(
+            eprintln!(
                 "[AokieRadio] PBAP inactivity watchdog fired after {:?} — failing PBAP so MAP can proceed",
                 self.last_progress_at.elapsed()
             );
@@ -272,7 +272,7 @@ impl PbapRuntime {
             };
             if let Some((cid, dlci)) = shared_dlci {
                 if let Ok(disc) = l2cap_state.rfcomm_disc_client_dlci(cid, dlci) {
-                    println!(
+                    eprintln!(
                         "[AokieRadio] PBAP watchdog — sending DISC for stuck DLCI {} on shared cid 0x{:04x}",
                         dlci, cid
                     );
@@ -367,7 +367,7 @@ impl PbapRuntime {
                             {
                                 Ok((target_dlci, pn_acl)) => {
                                     out.push(pn_acl);
-                                    println!(
+                                    eprintln!(
                                         "[AokieRadio] PBAP SDP done — PSE server_channel={} → target dlci={} on shared mux cid 0x{:04x}",
                                         server_channel, target_dlci, shared_cid
                                     );
@@ -395,7 +395,7 @@ impl PbapRuntime {
                                 Some(self.make_handler()),
                             );
                         out.push(conn_req);
-                        println!(
+                        eprintln!(
                             "[AokieRadio] PBAP SDP done — PSE RFCOMM channel {} on cid 0x{:04x} (no shared mux)",
                             server_channel, rfcomm_cid
                         );
@@ -703,7 +703,7 @@ impl PbapRuntime {
                     &connect_req,
                 )?;
                 out.push(acl);
-                println!(
+                eprintln!(
                     "[AokieRadio] PBAP shared DLCI {} OPEN — sending OBEX CONNECT",
                     target_dlci
                 );
@@ -760,7 +760,7 @@ impl PbapRuntime {
                                 && obex_buffer.len() / 1024 != prior_buf_len / 1024
                             {
                                 let declared = u16::from_be_bytes([obex_buffer[1], obex_buffer[2]]);
-                                println!(
+                                eprintln!(
                                     "[AokieRadio] PBAP OBEX reassembling on dlci {} — buffered {}B / declared {}B (opcode 0x{:02x})",
                                     target_dlci,
                                     obex_buffer.len(),
@@ -794,7 +794,7 @@ impl PbapRuntime {
                             return Ok(());
                         }
                     };
-                    println!(
+                    eprintln!(
                         "[AokieRadio] PBAP OBEX response opcode 0x{:02x} ({}B) — state before: {:?}",
                         parsed.opcode,
                         packet_bytes.len(),
@@ -807,7 +807,7 @@ impl PbapRuntime {
                             &next_req,
                         )?;
                         out.push(uih);
-                        println!(
+                        eprintln!(
                             "[AokieRadio] PBAP outbound on dlci {} — {}B (state after: {:?})",
                             target_dlci,
                             next_req.len(),
