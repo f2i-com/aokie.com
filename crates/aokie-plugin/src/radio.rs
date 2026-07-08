@@ -374,6 +374,18 @@ fn run_loop(
     let mut stt_had_speech = false;
     #[cfg(feature = "voice")]
     let mut stt_silence = std::time::Duration::ZERO;
+    // End-of-utterance silence: how long the caller must pause before we treat
+    // their turn as finished and transcribe. Lower = snappier replies but risks
+    // cutting off mid-sentence pauses. Tunable via AOKIE_STT_ENDPOINT_MS (set from
+    // the `sttEndpointMs` connector setting); default 450 ms.
+    #[cfg(feature = "voice")]
+    let stt_endpoint = std::time::Duration::from_millis(
+        std::env::var("AOKIE_STT_ENDPOINT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&m| (150..=2000).contains(&m))
+            .unwrap_or(450),
+    );
     // Half-duplex gate: while Aokie is speaking (+ a short tail) inbound audio is
     // discarded so we never transcribe our own TTS echoing back over the line.
     #[cfg(feature = "voice")]
@@ -527,7 +539,7 @@ fn run_loop(
         #[cfg(feature = "voice")]
         {
             const SPEECH_RMS: f32 = 350.0;
-            let endpoint = Duration::from_millis(700);
+            let endpoint = stt_endpoint;
             let muted = mute_stt_until.is_some_and(|t| Instant::now() < t);
             while let Some(frame) = bt.try_recv_audio() {
                 idle = false;

@@ -194,6 +194,21 @@ impl Plugin {
             }
         }
 
+        // End-of-utterance silence (ms) the STT waits before treating the caller's
+        // turn as finished — lower = snappier replies. Tunable via the
+        // `sttEndpointMs` setting (150–2000; default 450). The radio reads
+        // AOKIE_STT_ENDPOINT_MS at startup.
+        if let Some(ms) = self
+            .store
+            .config
+            .settings
+            .get("sttEndpointMs")
+            .and_then(|v| v.as_u64())
+        {
+            std::env::set_var("AOKIE_STT_ENDPOINT_MS", ms.to_string());
+            eprintln!("[aokie-plugin] sttEndpointMs setting → AOKIE_STT_ENDPOINT_MS={ms}");
+        }
+
         // Auto-answer incoming calls by default (receptionist behaviour);
         // a stored `autoAnswer: false` setting turns it off.
         let auto_answer = self
