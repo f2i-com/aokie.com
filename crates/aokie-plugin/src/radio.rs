@@ -122,6 +122,39 @@ fn emit(outbox: Option<&Outbox>, sink: &mut dyn Sink, event: DesktopEvent) {
     }
 }
 
+/// Emit an `aokie.call.turn.final` transcript turn, matching the contract the
+/// Receptionist pack's app-logic + flow bindings expect: `{callId, turn,
+/// speaker, text}` with a per-turn-unique idempotency key (`turn.<n>.final`) so
+/// the app-logic dedup doesn't drop turns after the first. `speaker` is
+/// "caller" (STT) or "bot" (Aokie's own speech); a flow gates its reply on
+/// `speaker === 'caller'` so Aokie never answers itself.
+#[cfg(feature = "voice")]
+fn emit_turn(
+    outbox: Option<&Outbox>,
+    sink: &mut dyn Sink,
+    corr: &str,
+    turn_index: u32,
+    speaker: &str,
+    text: &str,
+) {
+    emit(
+        outbox,
+        sink,
+        aokie_core::events::aokie_turn_event(
+            true,
+            corr,
+            turn_index,
+            json!({
+                "callId": corr,
+                "turn": turn_index,
+                "speaker": speaker,
+                "text": text,
+                "at": aokie_core::events::now_iso8601(),
+            }),
+        ),
+    );
+}
+
 // ── Windows: the real radio ──────────────────────────────────────────────
 
 /// Start the live radio on a background thread. Returns immediately with a
@@ -345,6 +378,11 @@ fn run_loop(
     // discarded so we never transcribe our own TTS echoing back over the line.
     #[cfg(feature = "voice")]
     let mut mute_stt_until: Option<std::time::Instant> = None;
+    // Monotonic transcript turn index (caller + bot share one sequence), reset
+    // per call. 1-based to match the simulated-call convention (`turn.1.final`,
+    // `turn.2.final`, …) so real + simulated calls dedup + display identically.
+    #[cfg(feature = "voice")]
+    let mut turn_index: u32 = 1;
 
     // Per-call bookkeeping. `pending_incoming` holds a just-rung call whose
     // `aokie.call.incoming` we delay briefly so the CLIP (caller id) can be
@@ -461,12 +499,20 @@ fn run_loop(
                         stt_buf.clear();
                         stt_had_speech = false;
                         stt_silence = Duration::ZERO;
+                        emit_turn(outbox, sink, corr, turn_index, "bot", text);
+                        turn_index += 1;
                     }
                     greeted_corr = Some(corr.to_string());
                     idle = false;
                 }
             }
-            None => greeted_corr = None,
+            None => {
+                greeted_corr = None;
+                #[cfg(feature = "voice")]
+                {
+                    turn_index = 1;
+                }
+            }
             _ => {}
         }
 
@@ -518,16 +564,9 @@ fn run_loop(
             while let Ok(text) = stt_result_rx.try_recv() {
                 idle = false;
                 if let Some(corr) = current_corr.clone() {
-                    eprintln!("[aokie-plugin] heard: {text:?}");
-                    emit(
-                        outbox,
-                        sink,
-                        aokie_core::events::aokie_event(
-                            "aokie.call.turn.final",
-                            &corr,
-                            json!({ "text": text, "role": "caller", "at": aokie_core::events::now_iso8601() }),
-                        ),
-                    );
+                    eprintln!("[aokie-plugin] heard [turn {turn_index}]: {text:?}");
+                    emit_turn(outbox, sink, &corr, turn_index, "caller", &text);
+                    turn_index += 1;
                 }
             }
         }
@@ -570,6 +609,11 @@ fn run_loop(
                         stt_buf.clear();
                         stt_had_speech = false;
                         stt_silence = Duration::ZERO;
+                        // Record Aokie's spoken reply as a bot transcript turn.
+                        if let Some(corr) = current_corr.clone() {
+                            emit_turn(outbox, sink, &corr, turn_index, "bot", &text);
+                            turn_index += 1;
+                        }
                     }
                     #[cfg(not(feature = "voice"))]
                     eprintln!(
