@@ -32,4 +32,6 @@ pub mod outbox;
 pub mod radio;
 pub mod rpc;
 #[cfg(feature = "voice")]
+pub mod agent;
+#[cfg(feature = "voice")]
 pub mod voice;

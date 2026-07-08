@@ -209,6 +209,33 @@ impl Plugin {
             eprintln!("[aokie-plugin] sttEndpointMs setting → AOKIE_STT_ENDPOINT_MS={ms}");
         }
 
+        // In-plugin real-time voice agent: when `aiReceptionist` is truthy, the
+        // plugin streams the local LLM + speaks the reply itself (low latency)
+        // instead of routing through a flow. `aiEndpoint` pins the LLM URL (else
+        // it probes llama.cpp :8080 then ollama :11434); `persona` is the system
+        // prompt. The radio reads these envs at startup.
+        let ai_receptionist = self
+            .store
+            .config
+            .settings
+            .get("aiReceptionist")
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false);
+        if ai_receptionist {
+            std::env::set_var("AOKIE_AI_RECEPTIONIST", "1");
+            eprintln!("[aokie-plugin] aiReceptionist ON → in-plugin streaming agent");
+        }
+        if let Some(ep) = self.store.config.settings.get("aiEndpoint").and_then(|v| v.as_str()) {
+            if !ep.trim().is_empty() {
+                std::env::set_var("AOKIE_AI_ENDPOINT", ep.trim());
+            }
+        }
+        if let Some(p) = self.store.config.settings.get("persona").and_then(|v| v.as_str()) {
+            if !p.trim().is_empty() {
+                std::env::set_var("AOKIE_AI_PERSONA", p.trim());
+            }
+        }
+
         // Auto-answer incoming calls by default (receptionist behaviour);
         // a stored `autoAnswer: false` setting turns it off.
         let auto_answer = self
