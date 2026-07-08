@@ -134,6 +134,7 @@ pub fn spawn(
     data_dir: std::path::PathBuf,
     preferred_path: Option<String>,
     auto_answer: bool,
+    answer_tone: bool,
 ) -> Result<RadioHandle, String> {
     use aokie_dongle::bluetooth::BluetoothManager;
     use std::sync::mpsc;
@@ -148,11 +149,20 @@ pub fn spawn(
         // RFCOMM → HFP dispatch overflowed the 1 MiB Windows default.
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
+            // Raise this process's timer resolution to 1 ms for the lifetime of
+            // the radio (see Cargo.toml note). The SCO iso path services USB
+            // frames every 1 ms; at the ~15.6 ms per-process default a bare
+            // plugin's read_sco waits + TX pacing are too coarse and every iso
+            // transfer fails (empty + Win32 87). The original Tauri app gets
+            // this for free via WebView2. timeBeginPeriod is ref-counted and
+            // paired with timeEndPeriod below.
+            unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
             let mut bt = match BluetoothManager::new_with_preferred_dongle(preferred_path) {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("[aokie-plugin] radio failed to start: {e}");
                     *status_thread.last_error.lock().unwrap() = Some(e);
+                    unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
                     return;
                 }
             };
@@ -162,11 +172,32 @@ pub fn spawn(
                 eprintln!("[aokie-plugin] radio: outbox unavailable, emitting without durability");
             }
             let mut sink = crate::event_bridge::StdoutSink::new();
-            run_loop(&mut bt, outbox.as_ref(), &mut sink, control_rx, status_thread, auto_answer);
+            run_loop(&mut bt, outbox.as_ref(), &mut sink, control_rx, status_thread, auto_answer, answer_tone);
+            unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
         })
         .map_err(|e| format!("spawn radio thread: {e}"))?;
 
     Ok(RadioHandle { control_tx, status })
+}
+
+/// A short two-note chime (mono i16 at the SCO sample rate) used to verify the
+/// OUTBOUND SCO audio path actually reaches the caller on a given dongle — real
+/// TTS speech replaces it once outbound audio is confirmed. Fades each note in
+/// and out to avoid clicks.
+#[cfg(target_os = "windows")]
+fn greeting_tone(sample_rate: u16) -> Vec<i16> {
+    let sr = sample_rate.max(8000) as f32;
+    let mut out = Vec::new();
+    for &(freq, secs) in &[(660.0f32, 0.35f32), (880.0, 0.5)] {
+        let n = (sr * secs) as usize;
+        for i in 0..n {
+            let t = i as f32 / sr;
+            let env = ((i as f32 / n as f32) * std::f32::consts::PI).sin(); // 0→1→0
+            let s = (2.0 * std::f32::consts::PI * freq * t).sin() * env * 0.6;
+            out.push((s * i16::MAX as f32) as i16);
+        }
+    }
+    out
 }
 
 /// The radio poll loop: drain events → map+emit; buffer the incoming-call
@@ -181,6 +212,7 @@ fn run_loop(
     control_rx: std::sync::mpsc::Receiver<RadioControl>,
     status: Arc<RadioStatus>,
     auto_answer: bool,
+    answer_tone: bool,
 ) {
     use std::sync::mpsc::TryRecvError;
     use std::time::{Duration, Instant};
@@ -201,6 +233,9 @@ fn run_loop(
     let mut current_corr: Option<String> = None;
     let mut pending_incoming: Option<(String, Instant)> = None;
     let mut answered_corr: Option<String> = None;
+    // Stage-2 diagnostic: which call we've played the outbound-audio test chime
+    // to (verifies the SCO-OUT path reaches the caller on this dongle).
+    let mut toned_corr: Option<String> = None;
 
     loop {
         let mut idle = true;
@@ -253,6 +288,32 @@ fn run_loop(
                     idle = false;
                 }
                 None => answered_corr = None, // call cleared — ready for the next
+                _ => {}
+            }
+        }
+
+        // Stage-2 diagnostic: once the call's audio channel is up (sample rate
+        // becomes non-zero), play a short two-note chime to the caller to verify
+        // the OUTBOUND SCO path actually reaches the phone on this dongle. Real
+        // TTS speech replaces this once outbound audio is confirmed. Gated by
+        // settings.answerTone.
+        if answer_tone {
+            match current_corr.as_deref() {
+                Some(corr) if toned_corr.as_deref() != Some(corr) => {
+                    let sr = bt.get_sample_rate();
+                    if sr > 0 {
+                        let tone = greeting_tone(sr);
+                        eprintln!(
+                            "[aokie-plugin] answerTone: sending {} samples @ {}Hz to the caller",
+                            tone.len(),
+                            sr
+                        );
+                        bt.send_audio(&tone);
+                        toned_corr = Some(corr.to_string());
+                        idle = false;
+                    }
+                }
+                None => toned_corr = None,
                 _ => {}
             }
         }
@@ -485,6 +546,7 @@ pub fn spawn(
     _data_dir: std::path::PathBuf,
     _preferred_path: Option<String>,
     _auto_answer: bool,
+    _answer_tone: bool,
 ) -> Result<RadioHandle, String> {
     Err("the Aokie radio is only supported on Windows (WinUSB)".to_string())
 }
