@@ -85,7 +85,7 @@ impl ParakeetOnnxRuntime {
         }
 
         let detok = Detokenizer::open(tokenizer_path)?;
-        println!(
+        eprintln!(
             "[Parakeet] tokenizer.model: {} pieces (blank id={})",
             detok.vocab_size(),
             BLANK_ID
@@ -337,7 +337,7 @@ fn argmax(v: &Array1<f32>) -> usize {
 
 fn build_session(path: &Path, num_threads: i16, label: &str) -> Result<Session, String> {
     use std::io::Write;
-    println!(
+    eprintln!(
         "[Parakeet] build_session: {} ({} bytes) ep=CPU threads={}",
         path.display(),
         std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
@@ -355,6 +355,6 @@ fn build_session(path: &Path, num_threads: i16, label: &str) -> Result<Session, 
         .map_err(|e| format!("ort eps CPU: {}", e))?
         .commit_from_file(path)
         .map_err(|e| format!("ort commit {label}: {}", e))?;
-    println!("[Parakeet] {label} loaded");
+    eprintln!("[Parakeet] {label} loaded");
     Ok(session)
 }
