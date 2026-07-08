@@ -162,6 +162,7 @@ name = "aokie-plugin"
 version = "0.1.0"
 dependencies = [
  "aokie-core",
+ "aokie-dongle",
  "jsonschema",
  "rusqlite",
  "serde",
