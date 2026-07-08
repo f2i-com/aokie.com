@@ -760,7 +760,13 @@ fn run_loop(
                 }
                 Ok(RadioControl::Speak { text }) => {
                     #[cfg(feature = "voice")]
-                    {
+                    if agent_enabled {
+                        // The in-plugin agent owns the conversation, so ignore any
+                        // operatorSpeak the flow still emits (its binding may be a
+                        // stale enabled-copy in the desktop's runtime cache) —
+                        // otherwise the caller is answered twice.
+                        eprintln!("[aokie-plugin] ignoring operatorSpeak (agent owns replies): {text:?}");
+                    } else {
                         let dur = tts_speak(bt, &mut tts, &text, bt.get_sample_rate());
                         mute_stt_until = Some(Instant::now() + dur + Duration::from_millis(400));
                         stt_buf.clear();
