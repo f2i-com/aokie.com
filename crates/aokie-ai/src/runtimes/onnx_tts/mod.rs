@@ -213,7 +213,7 @@ impl OnnxTtsRuntime {
     pub fn open(bundle_dir: &Path) -> Result<Self, String> {
         use ort::session::builder::GraphOptimizationLevel;
 
-        println!(
+        eprintln!(
             "[pocket_tts_onnx] loading bundle from {}",
             bundle_dir.display()
         );
@@ -228,7 +228,7 @@ impl OnnxTtsRuntime {
             std::fs::read_to_string(&bundle_path).map_err(|e| format!("read bundle.json: {e}"))?;
         let cfg: BundleConfig =
             serde_json::from_str(&cfg_text).map_err(|e| format!("parse bundle.json: {e}"))?;
-        println!(
+        eprintln!(
             "[pocket_tts_onnx] bundle '{}' @ {} Hz, {} layers of flow state, {} mimi state slots",
             cfg.bundle_name,
             cfg.sample_rate,
@@ -261,7 +261,7 @@ impl OnnxTtsRuntime {
                     bundle_dir.join(format!("{stem}.onnx")).display()
                 ));
             };
-            println!("[pocket_tts_onnx] load {}", path.display());
+            eprintln!("[pocket_tts_onnx] load {}", path.display());
             ort::session::Session::builder()
                 .map_err(|e| format!("ort builder ({stem}): {e}"))?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -282,7 +282,7 @@ impl OnnxTtsRuntime {
         let mimi_encoder = match load("mimi_encoder") {
             Ok(s) => Some(s),
             Err(e) => {
-                println!("[pocket_tts_onnx] mimi_encoder skipped: {e}");
+                eprintln!("[pocket_tts_onnx] mimi_encoder skipped: {e}");
                 None
             }
         };
@@ -292,12 +292,12 @@ impl OnnxTtsRuntime {
         // rather than failing later in synthesize with an opaque message.
         let reference_wav = bundle_dir.join("reference_sample.wav");
         if !reference_wav.exists() {
-            println!(
+            eprintln!(
                 "[pocket_tts_onnx] WARNING: {} missing — synthesis needs at least one reference voice wav. Re-run Download.",
                 reference_wav.display()
             );
         } else {
-            println!(
+            eprintln!(
                 "[pocket_tts_onnx] reference voice at {}",
                 reference_wav.display()
             );
@@ -309,7 +309,7 @@ impl OnnxTtsRuntime {
             );
         }
 
-        println!("[pocket_tts_onnx] ready");
+        eprintln!("[pocket_tts_onnx] ready");
         Ok(Self {
             bundle_dir: bundle_dir.to_path_buf(),
             cfg,

@@ -221,14 +221,18 @@ fn greeting_tone(sample_rate: u16) -> Vec<i16> {
 /// lazily on first use) and play it to the caller via `send_audio`. No-op when
 /// no SCO channel is up (sample_rate 0) or the text is empty.
 #[cfg(all(target_os = "windows", feature = "voice"))]
+/// Synthesize + play `text`, returning how long the audio will take to play out
+/// (so the caller can hold STT muted for that window — half-duplex, no barge-in).
+/// Returns `Duration::ZERO` if nothing was played.
 fn tts_speak(
     bt: &aokie_dongle::bluetooth::BluetoothManager,
     tts: &mut Option<crate::voice::TtsEngine>,
     text: &str,
     sample_rate: u16,
-) {
+) -> std::time::Duration {
+    use std::time::Duration;
     if sample_rate == 0 || text.trim().is_empty() {
-        return;
+        return Duration::ZERO;
     }
     if tts.is_none() {
         match crate::voice::TtsEngine::load() {
@@ -238,7 +242,7 @@ fn tts_speak(
             }
             Err(e) => {
                 eprintln!("[aokie-plugin] TTS load failed: {e}");
-                return;
+                return Duration::ZERO;
             }
         }
     }
@@ -251,11 +255,14 @@ fn tts_speak(
                     pcm.len(),
                     sample_rate
                 );
+                let dur = Duration::from_secs_f32(pcm.len() as f32 / sample_rate.max(1) as f32);
                 bt.send_audio(&pcm);
+                return dur;
             }
             Err(e) => eprintln!("[aokie-plugin] TTS synthesis failed: {e}"),
         }
     }
+    Duration::ZERO
 }
 
 /// The radio poll loop: drain events → map+emit; buffer the incoming-call
@@ -284,6 +291,60 @@ fn run_loop(
     // Which call we've already greeted, so the greeting plays exactly once.
     let mut greeted_corr: Option<String> = None;
     let _ = &greeting; // used only in the voice build / greeting block below
+
+    // ── Speech-to-text (voice build) ──────────────────────────────────────────
+    // The caller's audio is transcribed OFF the radio loop: a worker thread owns
+    // the heavy Parakeet engine (lazy-loaded on the first utterance) so a ~300 ms
+    // transcription never stalls SCO I/O or control handling. The loop segments
+    // utterances with a simple energy VAD and ships each finished one to the
+    // worker; finished transcripts come back and become `aokie.call.turn.final`
+    // events — the hook a flow binds to drive the conversation.
+    #[cfg(feature = "voice")]
+    let (stt_tx, stt_result_rx) = {
+        let (utter_tx, utter_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name("aokie-stt".into())
+            .spawn(move || {
+                let mut engine: Option<crate::voice::SttEngine> = None;
+                while let Ok(buf) = utter_rx.recv() {
+                    if engine.is_none() {
+                        match crate::voice::SttEngine::load() {
+                            Ok(e) => {
+                                eprintln!("[aokie-plugin] STT engine loaded");
+                                engine = Some(e);
+                            }
+                            Err(e) => {
+                                eprintln!("[aokie-plugin] STT load failed: {e}");
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(eng) = engine.as_mut() {
+                        match eng.transcribe(&buf) {
+                            Ok(text) if !text.is_empty() => {
+                                let _ = res_tx.send(text);
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[aokie-plugin] STT transcribe failed: {e}"),
+                        }
+                    }
+                }
+            })
+            .ok();
+        (utter_tx, res_rx)
+    };
+    // VAD / utterance accumulator (all in 16 kHz mono f32, the STT engine's rate).
+    #[cfg(feature = "voice")]
+    let mut stt_buf: Vec<f32> = Vec::new();
+    #[cfg(feature = "voice")]
+    let mut stt_had_speech = false;
+    #[cfg(feature = "voice")]
+    let mut stt_silence = std::time::Duration::ZERO;
+    // Half-duplex gate: while Aokie is speaking (+ a short tail) inbound audio is
+    // discarded so we never transcribe our own TTS echoing back over the line.
+    #[cfg(feature = "voice")]
+    let mut mute_stt_until: Option<std::time::Instant> = None;
 
     // Per-call bookkeeping. `pending_incoming` holds a just-rung call whose
     // `aokie.call.incoming` we delay briefly so the CLIP (caller id) can be
@@ -395,7 +456,11 @@ fn run_loop(
                 if sr > 0 {
                     #[cfg(feature = "voice")]
                     if let Some(text) = greeting.as_deref() {
-                        tts_speak(bt, &mut tts, text, sr);
+                        let dur = tts_speak(bt, &mut tts, text, sr);
+                        mute_stt_until = Some(Instant::now() + dur + Duration::from_millis(400));
+                        stt_buf.clear();
+                        stt_had_speech = false;
+                        stt_silence = Duration::ZERO;
                     }
                     greeted_corr = Some(corr.to_string());
                     idle = false;
@@ -405,9 +470,66 @@ fn run_loop(
             _ => {}
         }
 
-        // Stage 1 discards captured audio; Stage 2 feeds it to STT here.
+        // Inbound caller audio.
+        #[cfg(not(feature = "voice"))]
         while bt.try_recv_audio().is_some() {
             idle = false;
+        }
+        // Voice build: energy-VAD segment the caller's speech → ship each finished
+        // utterance to the STT worker. ~350 RMS (i16 units) gates speech; ~700 ms
+        // of trailing silence ends an utterance; sub-350 ms blips are dropped.
+        #[cfg(feature = "voice")]
+        {
+            const SPEECH_RMS: f32 = 350.0;
+            let endpoint = Duration::from_millis(700);
+            let muted = mute_stt_until.is_some_and(|t| Instant::now() < t);
+            while let Some(frame) = bt.try_recv_audio() {
+                idle = false;
+                if muted || current_corr.is_none() {
+                    continue;
+                }
+                let rms = crate::voice::frame_rms(&frame.samples);
+                let f16 = crate::voice::to_f32_16k(&frame.samples, frame.sample_rate as u32);
+                let frame_dur = Duration::from_secs_f32(
+                    frame.samples.len() as f32 / frame.sample_rate.max(1) as f32,
+                );
+                if rms > SPEECH_RMS {
+                    stt_had_speech = true;
+                    stt_silence = Duration::ZERO;
+                    stt_buf.extend_from_slice(&f16);
+                } else if stt_had_speech {
+                    stt_silence += frame_dur;
+                    stt_buf.extend_from_slice(&f16); // keep trailing silence for context
+                }
+                if stt_buf.len() > 16_000 * 15 {
+                    stt_silence = endpoint; // force-flush a runaway (~15 s) utterance
+                }
+            }
+            if stt_had_speech && stt_silence >= endpoint {
+                if stt_buf.len() >= 16_000 / 3 {
+                    let _ = stt_tx.send(std::mem::take(&mut stt_buf));
+                } else {
+                    stt_buf.clear();
+                }
+                stt_had_speech = false;
+                stt_silence = Duration::ZERO;
+            }
+            // Finished transcripts → aokie.call.turn.final (the flow's conversation hook).
+            while let Ok(text) = stt_result_rx.try_recv() {
+                idle = false;
+                if let Some(corr) = current_corr.clone() {
+                    eprintln!("[aokie-plugin] heard: {text:?}");
+                    emit(
+                        outbox,
+                        sink,
+                        aokie_core::events::aokie_event(
+                            "aokie.call.turn.final",
+                            &corr,
+                            json!({ "text": text, "role": "caller", "at": aokie_core::events::now_iso8601() }),
+                        ),
+                    );
+                }
+            }
         }
 
         loop {
@@ -442,7 +564,13 @@ fn run_loop(
                 }
                 Ok(RadioControl::Speak { text }) => {
                     #[cfg(feature = "voice")]
-                    tts_speak(bt, &mut tts, &text, bt.get_sample_rate());
+                    {
+                        let dur = tts_speak(bt, &mut tts, &text, bt.get_sample_rate());
+                        mute_stt_until = Some(Instant::now() + dur + Duration::from_millis(400));
+                        stt_buf.clear();
+                        stt_had_speech = false;
+                        stt_silence = Duration::ZERO;
+                    }
                     #[cfg(not(feature = "voice"))]
                     eprintln!(
                         "[aokie-plugin] operatorSpeak ({} chars) — voice feature not built",

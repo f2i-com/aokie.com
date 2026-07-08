@@ -90,7 +90,7 @@ impl Tokenizer {
 
         // Sanity logs: vocab size, max piece bytes, and a few sample pieces
         // around common IDs so we can spot malformed/truncated parsing.
-        println!(
+        eprintln!(
             "[pocket_tts_onnx] tokenizer: {} pieces, max_piece_bytes={}, unk_id={} (piece score {:.3}, viterbi penalty {:.3})",
             pieces.len(),
             max_piece_bytes,
@@ -101,18 +101,18 @@ impl Tokenizer {
         // Print piece 260 (seen in our diagnostic output) and a few common
         // English subwords if we can find them.
         if let Some(p260) = pieces.get(260) {
-            println!(
+            eprintln!(
                 "[pocket_tts_onnx]   piece[260] = {:?} (score {:.3}, kind {})",
                 p260.text, p260.score, p260.kind
             );
         }
         for needle in ["How", "▁How", "H", "▁H", "Hello", "▁", "hello"] {
             match lookup.get(needle) {
-                Some(id) => println!(
+                Some(id) => eprintln!(
                     "[pocket_tts_onnx]   lookup({:?}) = id {} score {:.3}",
                     needle, id, pieces[*id as usize].score
                 ),
-                None => println!("[pocket_tts_onnx]   lookup({:?}) = MISSING", needle),
+                None => eprintln!("[pocket_tts_onnx]   lookup({:?}) = MISSING", needle),
             }
         }
 
