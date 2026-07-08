@@ -328,7 +328,7 @@ pub fn diagnose_first_available() -> Result<Option<InterfaceDiagnostics>, String
         match diagnose_interface_path(&interface.path) {
             Ok(diagnostics) => return Ok(Some(diagnostics)),
             Err(e) => {
-                println!(
+                eprintln!(
                     "[AokieRadio] Could not open candidate interface {}: {}",
                     interface.path, e
                 );
@@ -367,7 +367,7 @@ pub fn read_first_local_address() -> Result<Option<RadioAddress>, String> {
                 }));
             }
             Err(e) => {
-                println!(
+                eprintln!(
                     "[AokieRadio] Could not read local address from {}: {}",
                     interface.path, e
                 );
@@ -382,7 +382,7 @@ pub fn probe_first_controller() -> Result<Option<ControllerProbe>, String> {
         match probe_controller(&interface.path) {
             Ok(probe) => return Ok(Some(probe)),
             Err(e) => {
-                println!(
+                eprintln!(
                     "[AokieRadio] Could not probe controller at {}: {}",
                     interface.path, e
                 );
@@ -906,12 +906,12 @@ fn log_sco_in_failure(slot_idx: usize, err: u32) {
         let suppressed = SUPPRESSED.swap(0, Ordering::Relaxed);
         LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
         if suppressed > 0 {
-            println!(
+            eprintln!(
                 "[AokieRadio] SCO in slot {} GetOverlappedResult failed: Win32 error {} (+{} suppressed in last 2s)",
                 slot_idx, err, suppressed
             );
         } else {
-            println!(
+            eprintln!(
                 "[AokieRadio] SCO in slot {} GetOverlappedResult failed: Win32 error {}",
                 slot_idx, err
             );
@@ -970,7 +970,7 @@ fn log_sco_tx_drain_diag(transferred: u32, failed: bool) {
     let _ = AGG_TOTAL_BYTES.swap(0, Ordering::Relaxed);
     let _ = AGG_ZERO_BYTES.swap(0, Ordering::Relaxed);
     let failed = AGG_FAILED.swap(0, Ordering::Relaxed);
-    println!(
+    eprintln!(
         "[AokieRadio] SCO TX completions (last 2s): {} URBs ({} GetOverlappedResult errors). NB: WinUSB iso writes always report bytes_transferred=0 — success/failure is per-URB only.",
         cmp, failed,
     );
@@ -1006,7 +1006,7 @@ fn log_sco_rx_empty_descriptors(
             i, offset, len, status
         ));
     }
-    println!(
+    eprintln!(
         "[AokieRadio] SCO RX empty completion sample: slot={} transferred={} {}",
         slot_idx,
         transferred,
@@ -1072,7 +1072,7 @@ fn log_sco_rx_drain_diag(
     let em = AGG_EMPTY.swap(0, Ordering::Relaxed);
     let ovf = AGG_OVR_FAIL.swap(0, Ordering::Relaxed);
     let inc = AGG_IO_INCOMPLETE.swap(0, Ordering::Relaxed);
-    println!(
+    eprintln!(
         "[AokieRadio] SCO RX drain (last 2s): timeouts={} completions={} (with_data={} empty={}) ovr_fail={} io_incomplete={} pending={} drain_idx={}",
         to, cmp, wd, em, ovf, inc, in_pending, in_drain_idx
     );
@@ -1208,7 +1208,7 @@ impl AokieHciTransport {
             match Self::open(&interface.path) {
                 Ok(transport) => return Ok(Some(transport)),
                 Err(e) => {
-                    println!(
+                    eprintln!(
                         "[AokieRadio] Could not open HCI transport at {}: {}",
                         interface.path, e
                     );
@@ -1247,13 +1247,13 @@ impl AokieHciTransport {
                     Ok(diag) => {
                         available_sco_alts.push(alt);
                         if diag.pipes.is_empty() {
-                            println!(
+                            eprintln!(
                                 "[AokieRadio] SCO alt-setting probe: alt {} present, no isoch endpoints",
                                 alt,
                             );
                         } else {
                             for pipe in &diag.pipes {
-                                println!(
+                                eprintln!(
                                     "[AokieRadio] SCO alt-setting probe: alt {} ep=0x{:02x} {:?} {:?} mps={} interval={}",
                                     alt,
                                     pipe.id,
@@ -1266,7 +1266,7 @@ impl AokieHciTransport {
                         }
                     }
                     Err(e) => {
-                        println!(
+                        eprintln!(
                             "[AokieRadio] SCO alt-setting probe: alt {} unavailable ({})",
                             alt, e,
                         );
@@ -1565,14 +1565,14 @@ impl AokieHciTransport {
                 .find(|alt| self.available_sco_alts.contains(alt));
             match fallback {
                 Some(alt) => {
-                    println!(
+                    eprintln!(
                         "[AokieRadio] SCO alt {} not exposed by dongle (available={:?}); falling back to alt {}",
                         requested_alt, self.available_sco_alts, alt,
                     );
                     alt
                 }
                 None => {
-                    println!(
+                    eprintln!(
                         "[AokieRadio] SCO alt {} not exposed and no 16-bit fallback available (probe={:?}); skipping alt-config",
                         requested_alt, self.available_sco_alts,
                     );
@@ -1717,7 +1717,7 @@ impl AokieHciTransport {
         let out_packet_size = sco_out.info.max_packet_size;
         let out_slot_stride = align_up(SCO_OUT_MAX_HCI_PACKET_BYTES, out_packet_size as usize);
         let out_buffer_len = SCO_OUT_RING_SLOTS * out_slot_stride;
-        println!(
+        eprintln!(
             "[AokieRadio] SCO OUT iso buffer: out_mps={} slot_stride={} ring_slots={} buffer_len={}",
             out_packet_size, out_slot_stride, SCO_OUT_RING_SLOTS, out_buffer_len,
         );
@@ -1935,7 +1935,7 @@ impl AokieHciTransport {
             let mut submitted = 0usize;
             for slot_idx in 0..total_slots {
                 if let Err(e) = submit_sco_in_slot(parent, buffers, slot_idx, false) {
-                    println!(
+                    eprintln!(
                         "[AokieRadio] SCO in slot {} bootstrap submit failed: {}",
                         slot_idx, e
                     );
@@ -1945,7 +1945,7 @@ impl AokieHciTransport {
                     submitted += 1;
                 }
             }
-            println!(
+            eprintln!(
                 "[AokieRadio] SCO IN ring bootstrap: {}/{} slots submitted (all ContinueStream=FALSE, BTstack-parity), failed={}",
                 submitted,
                 total_slots,
@@ -1978,6 +1978,17 @@ impl AokieHciTransport {
         let mut iter_completion_empty = 0u32;
         let mut iter_failed_overlapped = 0u32;
         let mut iter_io_incomplete = 0u32;
+        // Bound how many SCO-IN slots we drain per call. On dongles whose
+        // iso SCO-IN completes slots INSTANTLY (fast-fail, e.g. Win32 87 seen
+        // on some Broadcom BCM20702 units), each re-submit completes right
+        // away too, so this loop would never reach WAIT_TIMEOUT and would spin
+        // forever — freezing the runtime's main loop, which then never drains
+        // its control channel (a queued answer/hangup never gets sent) and the
+        // call rings out / the link drops. Capping the per-call drain lets the
+        // caller loop back to service control + HCI, then re-enter to drain the
+        // next batch. 4× the ring is ample headroom for a real audio burst.
+        let max_drain_per_call = ring_len.saturating_mul(4).max(16);
+        let mut drained = 0usize;
         loop {
             // Skip past holes in the ring — slots whose re-submit
             // failed leave `in_use = false` until the ring fully
@@ -2121,6 +2132,12 @@ impl AokieHciTransport {
                                 drain_idx, e
                             );
                         }
+                    }
+                    drained += 1;
+                    if drained >= max_drain_per_call {
+                        // Bound reached — yield to the caller's main loop so it
+                        // can drain control/HCI; the next read_sco resumes here.
+                        break;
                     }
                 }
                 WAIT_TIMEOUT => {
@@ -2305,7 +2322,7 @@ impl PacketDump {
 
     fn log(&self, direction: &str, packet: &[u8]) {
         if self.enabled {
-            println!("[AokieRadio] {} {}", direction, hex_bytes(packet));
+            eprintln!("[AokieRadio] {} {}", direction, hex_bytes(packet));
         }
     }
 }

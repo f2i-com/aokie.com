@@ -833,7 +833,7 @@ fn run_runtime(
         Some(i) => {
             if let Some(wanted) = preferred_dongle_path.as_ref() {
                 if i.path == *wanted {
-                    println!("[AokieRadio] opening operator-selected dongle: {}", i.path);
+                    eprintln!("[AokieRadio] opening operator-selected dongle: {}", i.path);
                 }
             }
             i
@@ -948,13 +948,13 @@ fn run_runtime(
         .map(|s| s.trim().to_ascii_lowercase());
     let wbs_supported = match codec_override.as_deref() {
         Some("wbs") | Some("msbc") => {
-            println!(
+            eprintln!(
                 "[AokieRadio] AOKIE_HFP_CODEC=wbs — forcing mSBC + CVSD advertisement (transport probe overridden)"
             );
             true
         }
         Some("cvsd") | Some("narrowband") => {
-            println!(
+            eprintln!(
                 "[AokieRadio] AOKIE_HFP_CODEC=cvsd — forcing CVSD-only advertisement (transport probe overridden)"
             );
             false
@@ -962,7 +962,7 @@ fn run_runtime(
         _ => {
             let probed = transport.supports_msbc_alt_setting();
             if !probed {
-                println!(
+                eprintln!(
                     "[AokieRadio] transport does not expose mSBC alt-setting — advertising CVSD-only in AT+BAC (override with AOKIE_HFP_CODEC=wbs)"
                 );
             }
@@ -1237,11 +1237,13 @@ fn run_runtime(
 
     loop {
         loop_iter += 1;
-        // Flush stdout every iteration so the last log line before any
-        // crash is actually visible — saves us from "we don't know
-        // where the silent thread went" when a panic / stack overflow
-        // hits between buffer flushes.
-        let _ = std::io::stdout().flush();
+        // Flush stderr (our log stream) every iteration so the last log
+        // line before any crash is actually visible — saves us from "we
+        // don't know where the silent thread went" when a panic / stack
+        // overflow hits between buffer flushes. (Never touch stdout: when
+        // this runtime runs inside the aokie-plugin, stdout is the NDJSON
+        // protocol channel and must stay clean.)
+        let _ = std::io::stderr().flush();
         if last_heartbeat.elapsed() >= Duration::from_secs(2) {
             last_heartbeat = Instant::now();
             // Extra MAP/MNS diagnostics surface only while there's an
@@ -1272,7 +1274,7 @@ fn run_runtime(
             } else {
                 String::new()
             };
-            println!(
+            eprintln!(
                 "[AokieRadio] heartbeat iter={} sco_active={} sco_tx_queue={} samples{}",
                 loop_iter,
                 active_sco_handle.is_some(),
@@ -1296,9 +1298,9 @@ fn run_runtime(
                         .unwrap_or(true);
                 if should_log {
                     if last_sco_rx_bytes_at.is_none() {
-                        println!("[AokieRadio] SCO RX silent: 0 inbound bytes since link up");
+                        eprintln!("[AokieRadio] SCO RX silent: 0 inbound bytes since link up");
                     } else {
-                        println!(
+                        eprintln!(
                             "[AokieRadio] SCO RX silent: no inbound bytes for {:?}",
                             silent_for
                         );
@@ -1377,7 +1379,7 @@ fn run_runtime(
             if let Some(started) = auto_reconnect_pending_since {
                 if started.elapsed() >= AUTO_RECONNECT_PAGE_BUDGET {
                     if let Some(addr) = auto_reconnect_pending_addr.take() {
-                        println!(
+                        eprintln!(
                             "[AokieRadio] auto-reconnect page budget elapsed for {} — \
                              treating as page timeout, will retry on next interval",
                             addr
@@ -1410,7 +1412,7 @@ fn run_runtime(
                         match hci::create_connection_command_default(&addr) {
                             Ok(cmd) => match transport.write_command(&cmd) {
                                 Ok(()) => {
-                                    println!(
+                                    eprintln!(
                                         "[AokieRadio] auto-reconnect: paging paired \
                                          device {} (HCI Create_Connection)",
                                         addr
@@ -1424,7 +1426,7 @@ fn run_runtime(
                                         Some(Instant::now() + AUTO_RECONNECT_INTERVAL);
                                 }
                                 Err(e) => {
-                                    println!(
+                                    eprintln!(
                                         "[AokieRadio] auto-reconnect: HCI \
                                          Create_Connection write to {} failed: {}",
                                         addr, e
@@ -1434,7 +1436,7 @@ fn run_runtime(
                                 }
                             },
                             Err(e) => {
-                                println!(
+                                eprintln!(
                                     "[AokieRadio] auto-reconnect: bad BD_ADDR {} \
                                      in pairing store: {}",
                                     addr, e
@@ -1491,7 +1493,7 @@ fn run_runtime(
             if mas_recovery_attempted_at.is_some()
                 && last_acl_inbound_at.elapsed() < MAS_STALL_THRESHOLD
             {
-                println!(
+                eprintln!(
                     "[AokieRadio] MAS stall recovery: inbound ACL resumed — \
                      clearing stage-2 escalation timer"
                 );
@@ -1510,7 +1512,7 @@ fn run_runtime(
                                 .map(|b| format!("{:02x}", b))
                                 .collect::<Vec<_>>()
                                 .join(" ");
-                            println!(
+                            eprintln!(
                                 "[AokieRadio] MAS stall escalation — stage-1 \
                                  recovery {:?} ago produced no inbound ACL \
                                  (acl_buffer={}B unparsed, head=[{}]); \
@@ -1537,7 +1539,7 @@ fn run_runtime(
                             // the link cleanly down so they know to tap
                             // (or rely on Pixel's own auto-reconnect, which
                             // sometimes kicks in seconds later).
-                            println!(
+                            eprintln!(
                                 "[AokieRadio] >>> Link torn down to recover \
                                  from stuck MAP session. Tap your phone \
                                  once in Bluetooth settings to reconnect — \
@@ -1566,7 +1568,7 @@ fn run_runtime(
                         .map(|b| format!("{:02x}", b))
                         .collect::<Vec<_>>()
                         .join(" ");
-                    println!(
+                    eprintln!(
                         "[AokieRadio] MAS stall watchdog fired — no inbound ACL \
                          for {:?} with active/pending MAP work (acl_buffer={}B \
                          unparsed, head=[{}]); force-DISC dlci 11 + dlci 4 and \
@@ -1585,7 +1587,7 @@ fn run_runtime(
                             }
                         }
                         Err(e) => {
-                            println!("[AokieRadio] MAS stall recovery: dlci 11 DISC build: {}", e)
+                            eprintln!("[AokieRadio] MAS stall recovery: dlci 11 DISC build: {}", e)
                         }
                     }
                     match l2cap_state.rfcomm_force_disc_dlci(rfcomm_cid, 4) {
@@ -1598,7 +1600,7 @@ fn run_runtime(
                             }
                         }
                         Err(e) => {
-                            println!("[AokieRadio] MAS stall recovery: dlci 4 DISC build: {}", e)
+                            eprintln!("[AokieRadio] MAS stall recovery: dlci 4 DISC build: {}", e)
                         }
                     }
                     map_runtime = None;
@@ -1619,7 +1621,7 @@ fn run_runtime(
                     // No open RFCOMM mux means the link itself is
                     // probably dropping; resetting the watchdog avoids
                     // a tight retry loop while the ACL gets torn down.
-                    println!(
+                    eprintln!(
                         "[AokieRadio] MAS stall detected but no open RFCOMM cid — \
                          skipping recovery, resetting watchdog"
                     );
@@ -1637,7 +1639,7 @@ fn run_runtime(
                 Ok(ControlCommand::Answer) => {
                     let packets =
                         l2cap_state.build_hfp_call_control_packets(HfpAtCommand::Answer)?;
-                    println!(
+                    eprintln!(
                         "[AokieRadio] Answer requested — built {} ACL packet(s) for ATA",
                         packets.len()
                     );
@@ -1653,7 +1655,7 @@ fn run_runtime(
                 Ok(ControlCommand::RejectOrHangup) => {
                     let packets =
                         l2cap_state.build_hfp_call_control_packets(HfpAtCommand::RejectOrHangup)?;
-                    println!(
+                    eprintln!(
                         "[AokieRadio] Hangup requested — built {} ACL packet(s) for AT+CHUP",
                         packets.len()
                     );
@@ -1685,7 +1687,7 @@ fn run_runtime(
                         (peak, mean_sq.sqrt())
                     };
                     let accepted = sco_tx_queue.push_samples(&samples);
-                    println!(
+                    eprintln!(
                         "[AokieRadio] SCO TX: queued {}/{} samples \
                          (peak={}, rms={:.0}; queue depth {}, dropped total {})",
                         accepted,
@@ -1699,7 +1701,7 @@ fn run_runtime(
                 Ok(ControlCommand::FlushTxAudio) => {
                     let dropped = sco_tx_queue.len();
                     sco_tx_queue.clear();
-                    println!(
+                    eprintln!(
                         "[AokieRadio] SCO TX flush requested — dropped {} queued samples",
                         dropped
                     );
@@ -1729,7 +1731,7 @@ fn run_runtime(
                         recipient_phone,
                         queued_at: Instant::now(),
                     });
-                    println!(
+                    eprintln!(
                         "[AokieRadio] SendSms enqueued ({} pending MAP ops, type={})",
                         pending_map_ops.len(),
                         if is_mms { "MMS" } else { "SMS_GSM" }
@@ -1770,7 +1772,7 @@ fn run_runtime(
                         // this, an SCO accept that the controller silently fails
                         // to honor looks identical to "phone never asked for
                         // SCO" in the log. Now we can tell them apart.
-                        println!("[AokieRadio] HCI {}", action);
+                        eprintln!("[AokieRadio] HCI {}", action);
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -1833,7 +1835,7 @@ fn run_runtime(
                             0x03 => "transparent",
                             _ => "unknown",
                         };
-                        println!(
+                        eprintln!(
                             "[AokieRadio] SCO link up handle {:#06x} link_type={} codec={} rate={}Hz tx_len={} rx_len={} air_mode=0x{:02x} ({}) tx_interval={} retx_window={} alt_setting={} cfg={:?}",
                             connection_handle,
                             link_type,
@@ -1860,7 +1862,7 @@ fn run_runtime(
                         // vendors), but the user can still hang up the
                         // call cleanly.
                         if let Err(e) = &alt_result {
-                            println!(
+                            eprintln!(
                                 "[AokieRadio] SCO alt-setting configure failed: {} — \
                                  audio will be silent for this call but link stays up",
                                 e
@@ -1868,7 +1870,7 @@ fn run_runtime(
                         }
                         let _ = event_tx.send(RuntimeEvent::AudioConnected { codec, sample_rate });
                     } else {
-                        println!(
+                        eprintln!(
                             "[AokieRadio] SCO link FAILED status 0x{:02x} handle {:#06x}",
                             scstatus, connection_handle,
                         );
@@ -1899,7 +1901,7 @@ fn run_runtime(
                             && *link_type == hci::LINK_TYPE_ACL
                         {
                             if *cstatus == 0 {
-                                println!(
+                                eprintln!(
                                     "[AokieRadio] auto-reconnect: paired device {} \
                                      answered our page (handle {:#06x})",
                                     address, connection_handle
@@ -1916,26 +1918,26 @@ fn run_runtime(
                                 // dead-end we saw before this fix.
                                 match hci::switch_role_command(address, 0x01) {
                                     Ok(cmd) => match transport.write_command(&cmd) {
-                                        Ok(()) => println!(
+                                        Ok(()) => eprintln!(
                                             "[AokieRadio] auto-reconnect: \
                                              requesting role switch to slave on {} \
                                              so AG drives profile setup",
                                             address
                                         ),
-                                        Err(e) => println!(
+                                        Err(e) => eprintln!(
                                             "[AokieRadio] auto-reconnect: \
                                              Switch_Role write failed for {}: {}",
                                             address, e
                                         ),
                                     },
-                                    Err(e) => println!(
+                                    Err(e) => eprintln!(
                                         "[AokieRadio] auto-reconnect: bad BD_ADDR \
                                          in Switch_Role for {}: {}",
                                         address, e
                                     ),
                                 }
                             } else {
-                                println!(
+                                eprintln!(
                                     "[AokieRadio] auto-reconnect: page to {} failed \
                                      status 0x{:02x} — will try next addr after {:?}",
                                     address, cstatus, AUTO_RECONNECT_INTERVAL
@@ -1971,7 +1973,7 @@ fn run_runtime(
                         {
                             active_acl_handle = None;
                             if pbap_runtime.is_some() {
-                                println!(
+                                eprintln!(
                                     "[AokieRadio] ACL handle {:#06x} dropped — discarding in-flight PBAP runtime",
                                     connection_handle
                                 );
@@ -2001,7 +2003,7 @@ fn run_runtime(
                             });
                             let preserved = pending_map_ops.len();
                             if map_runtime.is_some() || pre_count > 0 {
-                                println!(
+                                eprintln!(
                                     "[AokieRadio] ACL handle {:#06x} dropped — \
                                      preserved {} fresh SendReply/FetchMessage op(s) \
                                      for retry; discarded {} stale/non-reply op(s) \
@@ -2043,7 +2045,7 @@ fn run_runtime(
                             // dead link so a partial fragment can't
                             // misalign parsing on the next ACL session.
                             if !acl_buffer.is_empty() {
-                                println!(
+                                eprintln!(
                                     "[AokieRadio] ACL handle {:#06x} dropped — discarding {} buffered ACL bytes",
                                     connection_handle,
                                     acl_buffer.len()
@@ -2175,7 +2177,7 @@ fn run_runtime(
                     buffer_len_before,
                     first32,
                 } => {
-                    println!(
+                    eprintln!(
                         "[AokieRadio] ACL accumulator: corrupt header at offset 0 \
                          declares {}B; resyncing past {}-byte garbage prefix \
                          (buffer={}B, first 32=[{}])",
@@ -2195,7 +2197,7 @@ fn run_runtime(
                     let dump = first32_hex(&first32);
                     match reason {
                         AclFlushReason::NoResyncTarget => {
-                            println!(
+                            eprintln!(
                                 "[AokieRadio] ACL accumulator: corrupt header declares {} bytes \
                                  (>{}B sanity max), no resync target in {}B buffer — flushing \
                                  (first 32=[{}])",
@@ -2203,7 +2205,7 @@ fn run_runtime(
                             );
                         }
                         AclFlushReason::PartialStall(elapsed) => {
-                            println!(
+                            eprintln!(
                                 "[AokieRadio] ACL accumulator stuck — partial frame \
                                  (declared {}B, have {}B) outstanding for {:?}; \
                                  flushing to resync (first 32=[{}])",
@@ -2229,7 +2231,7 @@ fn run_runtime(
                         .map(|b| format!("{:02x}", b))
                         .collect::<Vec<_>>()
                         .join(" ");
-                    println!(
+                    eprintln!(
                         "[AokieRadio] ACL parse/dispatch error: {} (pkt len={}, first 32 bytes=[{}])",
                         e,
                         pkt.len(),
@@ -2331,7 +2333,7 @@ fn run_runtime(
                             pbap_pending_for_acl = true;
                             pbap_pending_since = Some(Instant::now());
                         } else {
-                            println!(
+                            eprintln!(
                                 "[AokieRadio] PBAP auto-fetch disabled (avoids SRM stall \
                                  that wedges MAP). Contact lookups use the SQLite cache."
                             );
@@ -2424,7 +2426,7 @@ fn run_runtime(
                             .map(|l: Instant| l.elapsed() >= Duration::from_secs(5))
                             .unwrap_or(true)
                     {
-                        println!(
+                        eprintln!(
                             "[AokieRadio] PollInbox deferred — SendReply was {:.1}s ago \
                              (skip window {:.0}s)",
                             elapsed.as_secs_f32(),
@@ -2446,7 +2448,7 @@ fn run_runtime(
                 .unwrap_or(false);
             if mns_ready || fallback_elapsed {
                 if !mns_ready {
-                    println!(
+                    eprintln!(
                         "[AokieRadio] PBAP fallback timer fired — MNS still not Connected after 10s, starting PBAP anyway"
                     );
                 }
@@ -2623,7 +2625,7 @@ fn run_runtime(
                     }
                     let log_burst = last_err.is_some() || (written > 0 && queue_len_before > 0);
                     if log_burst {
-                        println!(
+                        eprintln!(
                             "[AokieRadio] SCO TX: wrote {} packet(s) of {} bytes (queue depth {} samples remain, codec={}, head={:02x?}){}",
                             written,
                             plan.payload_len,
@@ -2663,7 +2665,7 @@ fn forward_hci_event(
             link_type,
             ..
         } if *cstatus == 0 && *link_type == hci::LINK_TYPE_ACL => {
-            println!(
+            eprintln!(
                 "[AokieRadio] ACL Connection Complete from {} (handle {:#06x})",
                 address, connection_handle
             );
@@ -2698,7 +2700,7 @@ fn forward_hci_event(
                 .read()
                 .map(|a| a.remote.clone())
                 .unwrap_or_default();
-            println!(
+            eprintln!(
                 "[AokieRadio] Disconnection Complete handle {:#06x} reason 0x{:02x} ({}) — was {}",
                 connection_handle,
                 reason,
@@ -2753,7 +2755,7 @@ fn start_pbap_fetch_if_idle(
         return;
     }
     let Some(handle) = active_acl_handle else {
-        println!(
+        eprintln!(
             "[AokieRadio] PBAP start skipped — no active ACL handle (HFP ready before ACL ConnectionComplete?)"
         );
         return;
@@ -2761,7 +2763,7 @@ fn start_pbap_fetch_if_idle(
     let mut runtime = PbapRuntime::new(handle);
     match runtime.start(l2cap_state) {
         Ok(packets) => {
-            println!(
+            eprintln!(
                 "[AokieRadio] PBAP fetch starting on ACL handle {:#06x}",
                 handle
             );
@@ -2811,7 +2813,7 @@ fn drive_pbap_runtime(
         Err(e) => {
             // Protocol error during tick — log and stop driving.
             // PBAP is optional; we don't want it to take HFP down.
-            println!("[AokieRadio] PBAP tick error: {}", e);
+            eprintln!("[AokieRadio] PBAP tick error: {}", e);
             *pbap_runtime = None;
             return;
         }
@@ -2828,7 +2830,7 @@ fn drive_pbap_runtime(
                         })
                     })
                     .collect();
-                println!(
+                eprintln!(
                     "[AokieRadio] PBAP fetch complete — {} contacts ({} (number, name) pairs)",
                     contacts.len(),
                     total.len()
@@ -2840,7 +2842,7 @@ fn drive_pbap_runtime(
                 // is non-fatal (some phones simply don't expose PBAP
                 // PSE, or block it pending bond confirmation). The
                 // greeting path falls back to number-only.
-                println!("[AokieRadio] PBAP fetch failed: {}", reason);
+                eprintln!("[AokieRadio] PBAP fetch failed: {}", reason);
             }
         }
     }
@@ -2995,7 +2997,7 @@ fn drive_map_runtime(
             Err(e) => {
                 // Non-fatal — log and drop. SMS auto-reply degrades
                 // gracefully; HFP keeps working.
-                println!("[AokieRadio] MAP tick error: {}", e);
+                eprintln!("[AokieRadio] MAP tick error: {}", e);
                 *map_runtime = None;
                 *active_map_op = None;
                 *map_idle_since = None;
@@ -3081,7 +3083,7 @@ fn drive_map_runtime(
         .unwrap_or(false);
     if let (Some(runtime), Some(since)) = (map_runtime.as_mut(), *map_idle_since) {
         if runtime.is_resting() && since.elapsed() >= MAP_IDLE_TIMEOUT && !mns_active {
-            println!(
+            eprintln!(
                 "[AokieRadio] MAP pooled session idle for {:?} — disconnecting",
                 since.elapsed()
             );
@@ -3096,7 +3098,7 @@ fn drive_map_runtime(
                         }
                     }
                 }
-                Err(e) => println!("[AokieRadio] MAP idle-disconnect: {}", e),
+                Err(e) => eprintln!("[AokieRadio] MAP idle-disconnect: {}", e),
             }
             *map_idle_since = None;
         }
@@ -3140,7 +3142,7 @@ fn feed_pooled_next_op(
     let mas_op = pending_op_to_mas_operation(&next_op);
     match runtime.start_next_op(mas_op, l2cap_state) {
         Ok(packets) => {
-            println!(
+            eprintln!(
                 "[AokieRadio] MAP pooled op {} feeding into resting session",
                 next_op.log_summary()
             );
@@ -3157,7 +3159,7 @@ fn feed_pooled_next_op(
             *map_idle_since = None;
         }
         Err(e) => {
-            println!(
+            eprintln!(
                 "[AokieRadio] MAP start_next_op failed: {} — re-queuing {} \
                  and dropping pooled session for re-establishment",
                 e,
@@ -3272,7 +3274,7 @@ fn handle_map_runtime_event(
     match event {
         MapRuntimeEvent::OperationCompleted(output) => match (active_map_op.as_ref(), output) {
             (Some(PendingMapOp::Subscribe), _) => {
-                println!("[AokieRadio] MAP NotificationRegistration acked");
+                eprintln!("[AokieRadio] MAP NotificationRegistration acked");
                 let _ = event_tx.send(RuntimeEvent::MapNotificationsSubscribed);
             }
             (
@@ -3312,18 +3314,18 @@ fn handle_map_runtime_event(
                 );
             }
             (Some(other), unexpected) => {
-                println!(
+                eprintln!(
                     "[AokieRadio] MAP OperationCompleted with mismatched output {:?} for op {}",
                     unexpected,
                     other.log_summary()
                 );
             }
             (None, _) => {
-                println!("[AokieRadio] MAP OperationCompleted with no active op");
+                eprintln!("[AokieRadio] MAP OperationCompleted with no active op");
             }
         },
         MapRuntimeEvent::Failed(reason) => {
-            println!("[AokieRadio] MAP runtime failed: {}", reason);
+            eprintln!("[AokieRadio] MAP runtime failed: {}", reason);
             // Subscribe failures don't surface — they're best-effort
             // (the phone just won't push notifications). FetchMessage
             // and SendReply failures get logged but we don't bubble
@@ -3366,7 +3368,7 @@ fn handle_inbox_listing(
             None
         };
         if let Some(handle) = catchup_handle {
-            println!(
+            eprintln!(
                 "[AokieRadio] inbox poll seeded with {} existing handle(s) on retry attempt #{} \
                  — fetching top entry {} as catch-up for the dead session window",
                 entries.len(),
@@ -3378,7 +3380,7 @@ fn handle_inbox_listing(
                 queued_at: Instant::now(),
             });
         } else {
-            println!(
+            eprintln!(
                 "[AokieRadio] inbox poll seeded with {} existing handle(s) — only new arrivals will be fetched",
                 entries.len()
             );
@@ -3388,7 +3390,7 @@ fn handle_inbox_listing(
     let mut queued = 0;
     for entry in &entries {
         if seen_handles.insert(entry.handle.clone()) {
-            println!(
+            eprintln!(
                 "[AokieRadio] inbox poll caught new handle {} (likely a missed MNS push) — queuing fetch",
                 entry.handle
             );
@@ -3400,7 +3402,7 @@ fn handle_inbox_listing(
         }
     }
     if queued == 0 {
-        println!(
+        eprintln!(
             "[AokieRadio] inbox poll: {} handle(s) listed, all already seen",
             entries.len()
         );
@@ -3420,7 +3422,7 @@ fn start_map_operation(
     event_tx: &UnboundedSender<RuntimeEvent>,
 ) {
     let Some(handle) = active_acl_handle else {
-        println!("[AokieRadio] MAP op skipped — no active ACL handle");
+        eprintln!("[AokieRadio] MAP op skipped — no active ACL handle");
         return;
     };
     let mas_op = pending_op_to_mas_operation(&op);
@@ -3430,7 +3432,7 @@ fn start_map_operation(
     runtime.enable_pooling();
     match runtime.start(l2cap_state) {
         Ok(packets) => {
-            println!(
+            eprintln!(
                 "[AokieRadio] MAP op {} starting on ACL handle {:#06x}",
                 op.log_summary(),
                 handle
@@ -3470,13 +3472,13 @@ fn drain_mns_events(
                 handle, msg_type, ..
             } => {
                 if !seen_handles.insert(handle.clone()) {
-                    println!(
+                    eprintln!(
                         "[AokieRadio] MNS NewMessage handle={} type={:?} — already fetched via poll, skipping duplicate",
                         handle, msg_type
                     );
                     continue;
                 }
-                println!(
+                eprintln!(
                     "[AokieRadio] MNS NewMessage handle={} type={:?} — queuing fetch",
                     handle, msg_type
                 );
@@ -3486,13 +3488,13 @@ fn drain_mns_events(
                 });
             }
             MnsEvent::Other { event_type, handle } => {
-                println!(
+                eprintln!(
                     "[AokieRadio] MNS Other event {:?} handle={:?} — ignoring",
                     event_type, handle
                 );
             }
             MnsEvent::Unparseable { reason } => {
-                println!("[AokieRadio] MNS unparseable EventReport: {}", reason);
+                eprintln!("[AokieRadio] MNS unparseable EventReport: {}", reason);
             }
         }
     }
@@ -3506,26 +3508,26 @@ fn forward_hfp_event(
 ) {
     match event {
         HfpEvent::ServiceLevelConnectionReady => {
-            println!("[AokieRadio] HFP service-level connection ready");
+            eprintln!("[AokieRadio] HFP service-level connection ready");
         }
         HfpEvent::ServiceLevelConnectionFailed(reason) => {
-            println!("[AokieRadio] HFP SLC failed at {}", reason);
+            eprintln!("[AokieRadio] HFP SLC failed at {}", reason);
             let _ = event_tx.send(RuntimeEvent::Error(format!("HFP SLC failed at {}", reason)));
         }
         HfpEvent::IncomingCall => {
-            println!("[AokieRadio] HFP IncomingCall");
+            eprintln!("[AokieRadio] HFP IncomingCall");
             let _ = event_tx.send(RuntimeEvent::CallIncoming);
         }
         HfpEvent::Ringing => {
-            println!("[AokieRadio] HFP Ringing");
+            eprintln!("[AokieRadio] HFP Ringing");
             let _ = event_tx.send(RuntimeEvent::CallRinging);
         }
         HfpEvent::CallAnswered => {
-            println!("[AokieRadio] HFP CallAnswered");
+            eprintln!("[AokieRadio] HFP CallAnswered");
             let _ = event_tx.send(RuntimeEvent::CallAnswered);
         }
         HfpEvent::CallTerminated => {
-            println!("[AokieRadio] HFP CallTerminated");
+            eprintln!("[AokieRadio] HFP CallTerminated");
             status.call_active.store(false, Ordering::Relaxed);
             // Per-call telemetry summary. Goes through the structured
             // audit channel so a future support flow can grep for
@@ -3548,7 +3550,7 @@ fn forward_hfp_event(
             let _ = event_tx.send(RuntimeEvent::CallTerminated);
         }
         HfpEvent::CallerId(number) => {
-            println!(
+            eprintln!(
                 "[AokieRadio] HFP CallerId {}",
                 aokie_core::redact::Phone(&number)
             );
@@ -3560,7 +3562,7 @@ fn forward_hfp_event(
             // (no CodecSelected line = AG never sent +BCS = AC won't
             // start either, since per HFP 1.7 §4.11.2 AC requires CC
             // to have completed at least once).
-            println!(
+            eprintln!(
                 "[AokieRadio] HFP CodecSelected codec={} rate={}Hz",
                 codec, sample_rate
             );
@@ -3917,7 +3919,7 @@ fn apply_codec_voice_setting(
     };
     let cmd = hci::write_voice_setting_command(target);
     transport.write_command(&cmd)?;
-    println!(
+    eprintln!(
         "[AokieRadio] HCI Write_Voice_Setting -> {:#06x} (for codec event {:?})",
         target, event,
     );

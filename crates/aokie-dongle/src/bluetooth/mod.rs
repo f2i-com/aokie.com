@@ -103,7 +103,7 @@ impl BluetoothManager {
     /// enumeration-first with a log line so a moved-port dongle
     /// still works without a manual reset.
     pub fn new_with_preferred_dongle(preferred_path: Option<String>) -> Result<Self, String> {
-        println!(
+        eprintln!(
             "[Bluetooth] Using aokie_radio backend (preferred dongle: {})",
             preferred_path.as_deref().unwrap_or("<enumeration-first>"),
         );

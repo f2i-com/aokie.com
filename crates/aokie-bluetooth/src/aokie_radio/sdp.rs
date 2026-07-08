@@ -357,7 +357,7 @@ impl SdpServer {
                 attribute_lists.len()
             );
         }
-        println!(
+        eprintln!(
             "[AokieRadio] SDP query: pattern={:04x?}, matched {}/{} records, replying {}B",
             pattern_uuids,
             matched.len(),

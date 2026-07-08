@@ -155,7 +155,7 @@ impl MnsServer {
     /// error reply; the runtime should then tear the channel down.
     pub fn feed_bytes(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
         self.obex_buffer.extend_from_slice(bytes);
-        println!(
+        eprintln!(
             "[AokieRadio] MNS feed_bytes +{}B (buf now {}B, state={:?})",
             bytes.len(),
             self.obex_buffer.len(),
@@ -167,14 +167,14 @@ impl MnsServer {
                 Ok(Some(n)) => n,
                 Ok(None) => break,
                 Err(reason) => {
-                    println!("[AokieRadio] MNS OBEX header malformed: {}", reason);
+                    eprintln!("[AokieRadio] MNS OBEX header malformed: {}", reason);
                     self.state = MnsState::Failed(format!("OBEX header malformed: {}", reason));
                     out.push(build_simple_response(RSP_BAD_REQUEST));
                     break;
                 }
             };
             let packet_bytes: Vec<u8> = self.obex_buffer.drain(..take).collect();
-            println!(
+            eprintln!(
                 "[AokieRadio] MNS OBEX packet ready: {}B opcode=0x{:02x}",
                 packet_bytes.len(),
                 packet_bytes[0]
@@ -244,7 +244,7 @@ impl MnsServer {
                 Header::ByteSeq { value, .. } => format!("{} bytes: {:02x?}", value.len(), value),
                 _ => format!("{:?}", h),
             });
-            println!(
+            eprintln!(
                 "[AokieRadio] MNS CONNECT rejected — Target UUID mismatch (got {:?}); \
                  phone won't push notifications",
                 raw_target
@@ -258,7 +258,7 @@ impl MnsServer {
         }
         self.connection_id = Some(ASSIGNED_CONNECTION_ID);
         self.state = MnsState::Connected;
-        println!(
+        eprintln!(
             "[AokieRadio] MNS CONNECT accepted — state=Connected, ready for NewMessage pushes"
         );
         build_connect_response(
@@ -275,14 +275,14 @@ impl MnsServer {
     }
 
     fn handle_put(&mut self, packet: &Packet, is_final: bool) -> Vec<u8> {
-        println!(
+        eprintln!(
             "[AokieRadio] MNS PUT received final={} state={:?} headers={}",
             is_final,
             self.state,
             packet.headers.len()
         );
         if !matches!(self.state, MnsState::Connected | MnsState::AssemblingPut) {
-            println!(
+            eprintln!(
                 "[AokieRadio] MNS PUT rejected — state {:?} not ready",
                 self.state
             );
@@ -294,7 +294,7 @@ impl MnsServer {
             _ => None,
         });
         if conn_id != self.connection_id {
-            println!(
+            eprintln!(
                 "[AokieRadio] MNS PUT bad connection-id {:?} (issued {:?})",
                 conn_id, self.connection_id
             );
@@ -323,7 +323,7 @@ impl MnsServer {
                     Header::ByteSeq { value, .. } => String::from_utf8_lossy(value).to_string(),
                     _ => format!("{:?}", h),
                 });
-                println!(
+                eprintln!(
                     "[AokieRadio] MNS PUT type mismatch (expected '{}', got {:?}) — replying NOT_FOUND",
                     TYPE_EVENT_REPORT, raw_type
                 );
@@ -332,7 +332,7 @@ impl MnsServer {
         }
         // Reassemble the body.
         if let Err(reason) = self.body.push(packet) {
-            println!(
+            eprintln!(
                 "[AokieRadio] MNS body assembler rejected packet: {}",
                 reason
             );
@@ -341,7 +341,7 @@ impl MnsServer {
         }
         if !is_final {
             self.state = MnsState::AssemblingPut;
-            println!("[AokieRadio] MNS PUT non-final → CONTINUE (assembled body so far)");
+            eprintln!("[AokieRadio] MNS PUT non-final → CONTINUE (assembled body so far)");
             return build_simple_response(RSP_CONTINUE);
         }
         // Final packet — body must now be complete (EndOfBody seen).
@@ -350,7 +350,7 @@ impl MnsServer {
             // EndOfBody). Per spec that's malformed but we tolerate
             // it: treat the final packet's accumulated bytes as the
             // body and push the event.
-            println!("[AokieRadio] MNS PUT_FINAL without EndOfBody — accepting accumulated body");
+            eprintln!("[AokieRadio] MNS PUT_FINAL without EndOfBody — accepting accumulated body");
         }
         let body_bytes = std::mem::take(&mut self.body).into_bytes();
         // The MNS event-report XML can include sender_phone /
@@ -359,13 +359,13 @@ impl MnsServer {
         // payload itself unless the user has explicitly opted into
         // verbose logs.
         let body_str = String::from_utf8_lossy(&body_bytes);
-        println!(
+        eprintln!(
             "[AokieRadio] MNS PUT_FINAL body {}B: {}",
             body_bytes.len(),
             aokie_core::redact::Text(&body_str)
         );
         let event = parse_event_report(&body_bytes);
-        println!("[AokieRadio] MNS parsed event: {:?}", event);
+        eprintln!("[AokieRadio] MNS parsed event: {:?}", event);
         self.pending_events.push(event);
         // Body assembler reset so the next PUT starts fresh.
         self.body = BodyAssembler::new();
