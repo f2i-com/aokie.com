@@ -230,6 +230,13 @@ impl Plugin {
                 std::env::set_var("AOKIE_AI_ENDPOINT", ep.trim());
             }
         }
+        // LLM model (`aiModel`); empty = auto-detect the desktop's loaded model.
+        if let Some(m) = self.store.config.settings.get("aiModel").and_then(|v| v.as_str()) {
+            if !m.trim().is_empty() {
+                std::env::set_var("AOKIE_AI_MODEL", m.trim());
+                eprintln!("[aokie-plugin] aiModel setting → AOKIE_AI_MODEL={}", m.trim());
+            }
+        }
         if let Some(p) = self.store.config.settings.get("persona").and_then(|v| v.as_str()) {
             if !p.trim().is_empty() {
                 std::env::set_var("AOKIE_AI_PERSONA", p.trim());
@@ -242,6 +249,34 @@ impl Plugin {
                 std::env::set_var("AOKIE_TTS_VOICE", v.trim());
                 eprintln!("[aokie-plugin] ttsVoice setting → AOKIE_TTS_VOICE={}", v.trim());
             }
+        }
+        // Full-duplex / barge-in: when `bargeIn` is truthy AND the agent is on,
+        // Aokie keeps listening while it speaks (speexdsp echo-cancels its own
+        // TTS from the mic) so the caller can talk over it and cut it short.
+        // Off by default → the proven half-duplex mute path stays the norm.
+        // `bargeSensitivity` tunes the cleaned-mic RMS above which the caller
+        // counts as interrupting (lower = easier to interrupt; default 650).
+        let barge_in = self
+            .store
+            .config
+            .settings
+            .get("bargeIn")
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false);
+        if barge_in {
+            std::env::set_var("AOKIE_BARGE_IN", "1");
+            eprintln!("[aokie-plugin] bargeIn ON → full-duplex (caller can talk over Aokie)");
+        }
+        if let Some(rms) = self
+            .store
+            .config
+            .settings
+            .get("bargeSensitivity")
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .filter(|&v| v > 0.0)
+        {
+            std::env::set_var("AOKIE_BARGE_RMS", (rms as f32).to_string());
+            eprintln!("[aokie-plugin] bargeSensitivity setting → AOKIE_BARGE_RMS={rms}");
         }
 
         // Auto-answer incoming calls by default (receptionist behaviour);
@@ -742,6 +777,29 @@ impl Plugin {
                         .insert(key.clone(), value.clone());
                 }
                 self.save_config()?;
+                // Live-reconfigure a running receptionist so a flow (or the desktop)
+                // can push the Receptionist Settings — persona/greeting/voice/model —
+                // and have them take effect on the current call, no reconnect. Only
+                // the agent-shaping keys trip this; other settings just persist.
+                let agent_key = ["persona", "greeting", "ttsVoice", "aiModel", "aiEndpoint"]
+                    .iter()
+                    .any(|k| obj.contains_key(*k));
+                if agent_key {
+                    if let Some(radio) = self.radio.as_ref() {
+                        let str_of = |k: &str| {
+                            obj.get(k)
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        };
+                        let _ = radio.send(crate::radio::RadioControl::Configure {
+                            persona: str_of("persona"),
+                            greeting: str_of("greeting"),
+                            voice: str_of("ttsVoice"),
+                            model: str_of("aiModel"),
+                            endpoint: str_of("aiEndpoint"),
+                        });
+                    }
+                }
                 Ok(json!({"settings": self.store.config.settings}))
             }
             other => Err(CmdError::failed(format!("unknown command: {other}"))),
