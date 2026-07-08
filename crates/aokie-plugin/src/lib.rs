@@ -31,3 +31,5 @@ pub mod event_bridge;
 pub mod outbox;
 pub mod radio;
 pub mod rpc;
+#[cfg(feature = "voice")]
+pub mod voice;
