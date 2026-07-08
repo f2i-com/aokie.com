@@ -7,13 +7,13 @@ use std::ptr::{null, null_mut};
 use chrono::Datelike;
 
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_DevNode_Status, CM_Reenumerate_DevNode, SetupCloseInfFile, SetupCopyOEMInfW,
-    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
-    SetupDiGetDeviceRegistryPropertyW, SetupDiSetDeviceRegistryPropertyW, SetupOpenInfFileW,
-    UpdateDriverForPlugAndPlayDevicesW, CM_REENUMERATE_RETRY_INSTALLATION, CONFIGFLAG_REINSTALL,
-    CR_NO_SUCH_DEVNODE, CR_SUCCESS, DIGCF_ALLCLASSES, DIGCF_PRESENT, HDEVINFO, INF_STYLE_WIN4,
-    INSTALLFLAG_FORCE, SPDRP_CONFIGFLAGS, SPDRP_HARDWAREID, SPOST_PATH, SP_COPY_NEWER_OR_SAME,
-    SP_DEVINFO_DATA,
+    CM_Get_DevNode_Status, CM_Get_Parent, CM_Query_And_Remove_SubTreeW, CM_Reenumerate_DevNode,
+    SetupCloseInfFile, SetupCopyOEMInfW, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
+    SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW, SetupDiSetDeviceRegistryPropertyW,
+    SetupOpenInfFileW, UpdateDriverForPlugAndPlayDevicesW, CM_REENUMERATE_RETRY_INSTALLATION,
+    CM_REMOVE_NO_RESTART, CONFIGFLAG_REINSTALL, CR_NO_SUCH_DEVNODE, CR_SUCCESS, DIGCF_ALLCLASSES,
+    DIGCF_PRESENT, HDEVINFO, INF_STYLE_WIN4, INSTALLFLAG_FORCE, SPDRP_CONFIGFLAGS, SPDRP_HARDWAREID,
+    SPOST_PATH, SP_COPY_NEWER_OR_SAME, SP_DEVINFO_DATA,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, HANDLE, WAIT_FAILED,
@@ -440,6 +440,99 @@ pub fn reenumerate_device(hardware_id: &str) -> Result<(), String> {
         return Err(format!(
             "CM_Reenumerate_DevNode failed for all {} matching device(s)",
             reenum_attempts
+        ));
+    }
+    Ok(())
+}
+
+/// Full software "virtual replug": for every present USB device whose
+/// hardware-id list contains `hardware_id`, get its parent, query-and-remove
+/// the device (surprise removal), then re-enumerate the parent so PnP re-adds
+/// it fresh. This resets the isochronous endpoint state that a COLD BOOT leaves
+/// dead (SCO transfers come back empty until a physical unplug/replug) — a
+/// stronger reset than `CM_Reenumerate_DevNode` on the device alone, which some
+/// dongles reject. Best-effort: a not-present device is `Ok`, and a per-device
+/// veto is logged and skipped. MUST be called with no open handle on the device
+/// (i.e. before the WinUSB interface is opened).
+pub fn restart_device(hardware_id: &str) -> Result<(), String> {
+    let enumerator = wide_null("USB");
+    let info_set = unsafe {
+        SetupDiGetClassDevsW(
+            null(),
+            enumerator.as_ptr(),
+            null_mut(),
+            DIGCF_ALLCLASSES | DIGCF_PRESENT,
+        )
+    };
+    if info_set == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE as HDEVINFO {
+        return Err(format!(
+            "SetupDiGetClassDevsW(USB, ALLCLASSES|PRESENT) failed: Win32 error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    let _info_set_guard = DeviceInfoSetGuard(info_set);
+
+    let target_upper = hardware_id.to_ascii_uppercase();
+    let mut attempts = 0usize;
+    let mut restarted = 0usize;
+    let mut index: u32 = 0;
+    loop {
+        let mut info: SP_DEVINFO_DATA = unsafe { zeroed() };
+        info.cbSize = size_of::<SP_DEVINFO_DATA>() as u32;
+        if unsafe { SetupDiEnumDeviceInfo(info_set, index, &mut info) } == 0 {
+            if unsafe { GetLastError() } == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            index += 1;
+            continue;
+        }
+        index += 1;
+
+        let hw_ids = read_multi_sz(info_set, &info, SPDRP_HARDWAREID);
+        if !hw_ids
+            .iter()
+            .any(|id| id.to_ascii_uppercase().contains(&target_upper))
+        {
+            continue;
+        }
+
+        attempts += 1;
+        // Grab the parent first — we re-enumerate it after the child is gone.
+        let mut parent: u32 = 0;
+        let have_parent = unsafe { CM_Get_Parent(&mut parent, info.DevInst, 0) } == CR_SUCCESS;
+        // Surprise-remove the device (null veto out-params: we don't inspect the
+        // veto, a non-success return is enough to skip).
+        let cr = unsafe {
+            CM_Query_And_Remove_SubTreeW(info.DevInst, null_mut(), null_mut(), 0, CM_REMOVE_NO_RESTART)
+        };
+        if cr != CR_SUCCESS {
+            eprintln!(
+                "[AokieDongle] restart_device: query-and-remove failed/vetoed (cr={})",
+                cr
+            );
+            continue;
+        }
+        // Re-add: re-enumerate the parent hub (fallback: the node itself) so PnP
+        // rediscovers the device with fresh descriptors + iso endpoint state.
+        let reenum_target = if have_parent && parent != 0 {
+            parent
+        } else {
+            info.DevInst
+        };
+        if unsafe { CM_Reenumerate_DevNode(reenum_target, CM_REENUMERATE_RETRY_INSTALLATION) }
+            == CR_SUCCESS
+        {
+            restarted += 1;
+        }
+    }
+
+    if attempts == 0 {
+        return Ok(());
+    }
+    if restarted == 0 {
+        return Err(format!(
+            "restart_device: no matching device could be restarted ({} matched)",
+            attempts
         ));
     }
     Ok(())

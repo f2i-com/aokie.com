@@ -135,6 +135,8 @@ pub fn spawn(
     preferred_path: Option<String>,
     auto_answer: bool,
     answer_tone: bool,
+    reenumerate_hwid: Option<String>,
+    greeting: Option<String>,
 ) -> Result<RadioHandle, String> {
     use aokie_dongle::bluetooth::BluetoothManager;
     use std::sync::mpsc;
@@ -149,6 +151,21 @@ pub fn spawn(
         // RFCOMM → HFP dispatch overflowed the 1 MiB Windows default.
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
+            // Software "virtual replug": on a cold boot the dongle's SCO iso
+            // endpoint is dead until the device is re-enumerated (physically
+            // unplug/replug). CM_Reenumerate the device before opening it so a
+            // headless receptionist works after boot with no manual replug.
+            // Best-effort + gated (settings.reenumerateHwid); settle briefly so
+            // the device + WinUSB re-bind before we open it.
+            if let Some(hwid) = reenumerate_hwid.as_deref() {
+                match aokie_dongle::winusb::restart_device(hwid) {
+                    Ok(()) => {
+                        eprintln!("[aokie-plugin] restarted {hwid} (virtual replug: remove + re-add) — settling 3s");
+                        std::thread::sleep(std::time::Duration::from_millis(3000));
+                    }
+                    Err(e) => eprintln!("[aokie-plugin] virtual replug {hwid} failed (continuing): {e}"),
+                }
+            }
             // Raise this process's timer resolution to 1 ms for the lifetime of
             // the radio (see Cargo.toml note). The SCO iso path services USB
             // frames every 1 ms; at the ~15.6 ms per-process default a bare
@@ -172,7 +189,7 @@ pub fn spawn(
                 eprintln!("[aokie-plugin] radio: outbox unavailable, emitting without durability");
             }
             let mut sink = crate::event_bridge::StdoutSink::new();
-            run_loop(&mut bt, outbox.as_ref(), &mut sink, control_rx, status_thread, auto_answer, answer_tone);
+            run_loop(&mut bt, outbox.as_ref(), &mut sink, control_rx, status_thread, auto_answer, answer_tone, greeting);
             unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
         })
         .map_err(|e| format!("spawn radio thread: {e}"))?;
@@ -200,6 +217,47 @@ fn greeting_tone(sample_rate: u16) -> Vec<i16> {
     out
 }
 
+/// Voice build only: synthesize `text` with the in-process TTS engine (loaded
+/// lazily on first use) and play it to the caller via `send_audio`. No-op when
+/// no SCO channel is up (sample_rate 0) or the text is empty.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn tts_speak(
+    bt: &aokie_dongle::bluetooth::BluetoothManager,
+    tts: &mut Option<crate::voice::TtsEngine>,
+    text: &str,
+    sample_rate: u16,
+) {
+    if sample_rate == 0 || text.trim().is_empty() {
+        return;
+    }
+    if tts.is_none() {
+        match crate::voice::TtsEngine::load() {
+            Ok(e) => {
+                eprintln!("[aokie-plugin] TTS engine loaded");
+                *tts = Some(e);
+            }
+            Err(e) => {
+                eprintln!("[aokie-plugin] TTS load failed: {e}");
+                return;
+            }
+        }
+    }
+    if let Some(engine) = tts.as_mut() {
+        match engine.synthesize(text, "", sample_rate as u32) {
+            Ok(pcm) => {
+                eprintln!(
+                    "[aokie-plugin] speaking ({} chars → {} samples @ {}Hz)",
+                    text.chars().count(),
+                    pcm.len(),
+                    sample_rate
+                );
+                bt.send_audio(&pcm);
+            }
+            Err(e) => eprintln!("[aokie-plugin] TTS synthesis failed: {e}"),
+        }
+    }
+}
+
 /// The radio poll loop: drain events → map+emit; buffer the incoming-call
 /// emission until the caller id lands (or a short timeout); drain audio
 /// (Stage 2 feeds the AI here); service control requests. Runs until the
@@ -213,9 +271,19 @@ fn run_loop(
     status: Arc<RadioStatus>,
     auto_answer: bool,
     answer_tone: bool,
+    greeting: Option<String>,
 ) {
     use std::sync::mpsc::TryRecvError;
     use std::time::{Duration, Instant};
+
+    // Lazily-loaded in-process TTS (voice build only). Loaded on the first thing
+    // Aokie needs to say (greeting or operatorSpeak) so a call with no speech
+    // never pays the ~200 MB model-load cost.
+    #[cfg(feature = "voice")]
+    let mut tts: Option<crate::voice::TtsEngine> = None;
+    // Which call we've already greeted, so the greeting plays exactly once.
+    let mut greeted_corr: Option<String> = None;
+    let _ = &greeting; // used only in the voice build / greeting block below
 
     // Per-call bookkeeping. `pending_incoming` holds a just-rung call whose
     // `aokie.call.incoming` we delay briefly so the CLIP (caller id) can be
@@ -318,6 +386,25 @@ fn run_loop(
             }
         }
 
+        // Greet the caller with real TTS speech once the SCO audio channel is up
+        // (voice build). Plays exactly once per call. Without the voice feature
+        // this is a no-op (greeted_corr just tracks the call).
+        match current_corr.as_deref() {
+            Some(corr) if greeted_corr.as_deref() != Some(corr) => {
+                let sr = bt.get_sample_rate();
+                if sr > 0 {
+                    #[cfg(feature = "voice")]
+                    if let Some(text) = greeting.as_deref() {
+                        tts_speak(bt, &mut tts, text, sr);
+                    }
+                    greeted_corr = Some(corr.to_string());
+                    idle = false;
+                }
+            }
+            None => greeted_corr = None,
+            _ => {}
+        }
+
         // Stage 1 discards captured audio; Stage 2 feeds it to STT here.
         while bt.try_recv_audio().is_some() {
             idle = false;
@@ -354,11 +441,11 @@ fn run_loop(
                     }
                 }
                 Ok(RadioControl::Speak { text }) => {
-                    // Stage 2 synthesises this to SCO audio via TTS +
-                    // `send_audio`. Stage 1 acknowledges + logs so the flow's
-                    // operatorSpeak node doesn't error.
+                    #[cfg(feature = "voice")]
+                    tts_speak(bt, &mut tts, &text, bt.get_sample_rate());
+                    #[cfg(not(feature = "voice"))]
                     eprintln!(
-                        "[aokie-plugin] radio operatorSpeak ({} chars) — TTS wiring pending",
+                        "[aokie-plugin] operatorSpeak ({} chars) — voice feature not built",
                         text.chars().count()
                     );
                 }
@@ -429,11 +516,17 @@ fn handle_event(
             );
         }
         E::CallIncoming => {
-            let corr = format!("call_{}", uuid::Uuid::new_v4().simple());
-            *current_corr = Some(corr.clone());
-            *caller_id = None;
-            *status.current_caller.lock().unwrap() = None;
-            *pending_incoming = Some((corr, std::time::Instant::now()));
+            // Some phones emit the ring / callsetup indicator more than once for
+            // a single call. Only start a NEW call (fresh corr) when we aren't
+            // already handling one, so the incoming event + greeting fire exactly
+            // once per call (fixes the double greeting).
+            if current_corr.is_none() {
+                let corr = format!("call_{}", uuid::Uuid::new_v4().simple());
+                *current_corr = Some(corr.clone());
+                *caller_id = None;
+                *status.current_caller.lock().unwrap() = None;
+                *pending_incoming = Some((corr, std::time::Instant::now()));
+            }
         }
         E::CallerId(num) => {
             *caller_id = Some(num.clone());
@@ -547,6 +640,8 @@ pub fn spawn(
     _preferred_path: Option<String>,
     _auto_answer: bool,
     _answer_tone: bool,
+    _reenumerate_hwid: Option<String>,
+    _greeting: Option<String>,
 ) -> Result<RadioHandle, String> {
     Err("the Aokie radio is only supported on Windows (WinUSB)".to_string())
 }

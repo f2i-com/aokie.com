@@ -161,6 +161,7 @@ dependencies = [
 name = "aokie-plugin"
 version = "0.1.0"
 dependencies = [
+ "aokie-ai",
  "aokie-core",
  "aokie-dongle",
  "jsonschema",
