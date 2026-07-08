@@ -40,7 +40,7 @@ pub fn build_voice_state(
         .unwrap_or("")
         .to_ascii_lowercase();
     if ext == "safetensors" {
-        println!(
+        eprintln!(
             "[pocket_tts_onnx] loading preset voice state from {}",
             voice_path.display()
         );
@@ -54,7 +54,7 @@ pub fn build_voice_state(
     if samples.is_empty() {
         return Err(format!("reference wav {} is empty", wav_path.display()));
     }
-    println!(
+    eprintln!(
         "[pocket_tts_onnx] encoding voice from {} ({} samples @ {} Hz)",
         wav_path.display(),
         samples.len(),
@@ -91,7 +91,7 @@ pub fn build_voice_state(
         arr.into_dimensionality::<Ix3>()
             .map_err(|e| format!("voice emb to 3d: {e}"))?
     };
-    println!(
+    eprintln!(
         "[pocket_tts_onnx] voice embeddings: {:?}",
         voice_emb.shape()
     );
@@ -458,7 +458,7 @@ fn load_safetensors_voice_state(
         };
         slots.push(value);
     }
-    println!(
+    eprintln!(
         "[pocket_tts_onnx] voice .safetensors: {} / {} slots filled from file ({} defaulted), {} keys in file. Sample available: {:?}",
         matched,
         manifest.len(),

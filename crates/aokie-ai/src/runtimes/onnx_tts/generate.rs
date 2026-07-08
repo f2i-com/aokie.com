@@ -91,7 +91,7 @@ impl OnnxTtsRuntime {
         let ids_preview: Vec<i64> = token_ids.iter().take(16).copied().collect();
         let len_for_log = token_ids.len();
         TOKEN_LOG_ONCE.call_once(move || {
-            println!(
+            eprintln!(
                 "[pocket_tts_onnx] tokenize({:?}) → {} ids, first 16 = {:?}",
                 prepared_for_log, len_for_log, ids_preview
             );
@@ -339,12 +339,12 @@ impl OnnxTtsRuntime {
         let voices_dir = self.bundle_dir.join("voices");
         let safe = voices_dir.join(format!("{v}.safetensors"));
         if safe.exists() {
-            println!("[pocket_tts_onnx] voice '{v}' → using .safetensors (native Kyutai state)");
+            eprintln!("[pocket_tts_onnx] voice '{v}' → using .safetensors (native Kyutai state)");
             return Ok(safe);
         }
         let wav = voices_dir.join(format!("{v}.wav"));
         if wav.exists() {
-            println!("[pocket_tts_onnx] voice '{v}' → using .wav (cloned via mimi_encoder)");
+            eprintln!("[pocket_tts_onnx] voice '{v}' → using .wav (cloned via mimi_encoder)");
             return Ok(wav);
         }
 
@@ -488,7 +488,7 @@ fn run_flow_main_step(
     static OUTPUT_NAMES_LOGGED: std::sync::Once = std::sync::Once::new();
     OUTPUT_NAMES_LOGGED.call_once(|| {
         let names: Vec<String> = outputs.iter().map(|(name, _)| name.to_string()).collect();
-        println!("[pocket_tts_onnx] flow_lm_main output names: {names:?}");
+        eprintln!("[pocket_tts_onnx] flow_lm_main output names: {names:?}");
     });
 
     let mut cond: Option<Array3<f32>> = None;
