@@ -18,6 +18,16 @@ serde_json = { workspace = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1.0", features = ["v4"] }
 
+# Windows multimedia-timer API (winmm) — raise this process's timer resolution
+# to 1 ms while the radio runs. The isochronous SCO audio path services a USB
+# frame every 1 ms; since Win10 2004 / Win11 the timer resolution is PER-PROCESS,
+# so a bare stdio plugin sits at the ~15.6 ms default, which is far too coarse —
+# read_sco's waits + TX pacing miss the iso cadence and every transfer fails
+# (empty descriptors + Win32 87). The original Tauri app gets 1 ms for free via
+# WebView2/Chromium; a headless plugin must ask for it explicitly.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Media"] }
+
 [dev-dependencies]
 # Contract tests: manifest.json against plugin-manifest.schema.json,
 # mock lifecycle events against desktop-event.schema.json (local

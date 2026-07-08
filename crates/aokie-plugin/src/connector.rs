@@ -203,7 +203,17 @@ impl Plugin {
             .get("autoAnswer")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        match crate::radio::spawn(self.data_dir.clone(), None, auto_answer) {
+        // Stage-2 outbound-audio diagnostic: play a chime to the caller on
+        // answer to verify the SCO-OUT path reaches the phone on this dongle
+        // (settings.answerTone, default off; superseded by real TTS speech).
+        let answer_tone = self
+            .store
+            .config
+            .settings
+            .get("answerTone")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        match crate::radio::spawn(self.data_dir.clone(), None, auto_answer, answer_tone) {
             Ok(handle) => {
                 eprintln!("[aokie-plugin] live radio starting (real mode, auto_answer={auto_answer})");
                 self.radio = Some(handle);
