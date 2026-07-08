@@ -280,17 +280,30 @@ fn tts_speak(
         }
     }
     if let Some(engine) = tts.as_mut() {
-        match engine.synthesize(text, "", sample_rate as u32) {
-            Ok(pcm) => {
+        // Stream each chunk straight to the SCO queue as it's synthesized, so the
+        // caller hears the reply start on the first chunk (~0.3 s) instead of after
+        // the whole utterance is synthesized (~1-2 s) — the big perceived-latency win.
+        let t0 = std::time::Instant::now();
+        let mut first = true;
+        let mut samples = 0usize;
+        match engine.synthesize_streaming(text, "", sample_rate as u32, |pcm| {
+            if first {
+                eprintln!("[aokie-plugin] speaking (first audio in {:?})", t0.elapsed());
+                first = false;
+            }
+            bt.send_audio(pcm);
+            samples += pcm.len();
+            true
+        }) {
+            Ok(_) => {
                 eprintln!(
-                    "[aokie-plugin] speaking ({} chars → {} samples @ {}Hz)",
+                    "[aokie-plugin] spoke ({} chars → {} samples @ {}Hz, total synth {:?})",
                     text.chars().count(),
-                    pcm.len(),
-                    sample_rate
+                    samples,
+                    sample_rate,
+                    t0.elapsed()
                 );
-                let dur = Duration::from_secs_f32(pcm.len() as f32 / sample_rate.max(1) as f32);
-                bt.send_audio(&pcm);
-                return dur;
+                return Duration::from_secs_f32(samples as f32 / sample_rate.max(1) as f32);
             }
             Err(e) => eprintln!("[aokie-plugin] TTS synthesis failed: {e}"),
         }
@@ -386,6 +399,33 @@ fn run_loop(
             .filter(|&m| (150..=2000).contains(&m))
             .unwrap_or(450),
     );
+
+    // ── In-plugin real-time voice agent ───────────────────────────────────────
+    // When AOKIE_AI_RECEPTIONIST is set (from the `aiReceptionist` setting), the
+    // plugin answers the caller ITSELF — streaming the local LLM (reused from the
+    // desktop's llama.cpp/ollama) and speaking each sentence as it's generated —
+    // instead of routing through a flow. Far lower latency. The pack's live-reply
+    // flow binding must be disabled so the caller isn't answered twice.
+    #[cfg(feature = "voice")]
+    let agent_enabled = std::env::var_os("AOKIE_AI_RECEPTIONIST").is_some();
+    #[cfg(feature = "voice")]
+    let agent_endpoint = std::env::var("AOKIE_AI_ENDPOINT").ok().filter(|s| !s.trim().is_empty());
+    #[cfg(feature = "voice")]
+    let agent_persona = std::env::var("AOKIE_AI_PERSONA")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            "You are a warm, efficient phone receptionist for a small business. You are \
+             speaking out loud on a live phone call, so reply with ONE short, natural spoken \
+             sentence — no lists, no markdown, no emoji. If you need information, ask a single \
+             clear question."
+                .to_string()
+        });
+    #[cfg(feature = "voice")]
+    let mut agent_client: Option<crate::agent::LlmClient> = None;
+    // Conversation history for the agent (OpenAI chat messages), reset per call.
+    #[cfg(feature = "voice")]
+    let mut history: Vec<serde_json::Value> = Vec::new();
     // Half-duplex gate: while Aokie is speaking (+ a short tail) inbound audio is
     // discarded so we never transcribe our own TTS echoing back over the line.
     #[cfg(feature = "voice")]
@@ -513,6 +553,7 @@ fn run_loop(
                         stt_silence = Duration::ZERO;
                         emit_turn(outbox, sink, corr, turn_index, "bot", text);
                         turn_index += 1;
+                        history.push(serde_json::json!({ "role": "assistant", "content": text }));
                     }
                     greeted_corr = Some(corr.to_string());
                     idle = false;
@@ -523,6 +564,7 @@ fn run_loop(
                 #[cfg(feature = "voice")]
                 {
                     turn_index = 1;
+                    history.clear();
                 }
             }
             _ => {}
@@ -572,13 +614,69 @@ fn run_loop(
                 stt_had_speech = false;
                 stt_silence = Duration::ZERO;
             }
-            // Finished transcripts → aokie.call.turn.final (the flow's conversation hook).
+            // Finished transcripts → aokie.call.turn.final (the flow's conversation hook,
+            // and the recording source). If the in-plugin agent is on, also answer
+            // the caller directly here — streaming the LLM + speaking each sentence.
             while let Ok(text) = stt_result_rx.try_recv() {
                 idle = false;
                 if let Some(corr) = current_corr.clone() {
                     eprintln!("[aokie-plugin] heard [turn {turn_index}]: {text:?}");
                     emit_turn(outbox, sink, &corr, turn_index, "caller", &text);
                     turn_index += 1;
+
+                    if agent_enabled {
+                        history.push(serde_json::json!({ "role": "user", "content": text }));
+                        if history.len() > 24 {
+                            let drop = history.len() - 24;
+                            history.drain(..drop);
+                        }
+                        // Lazily connect to the local LLM on the first caller turn.
+                        if agent_client.is_none() {
+                            match crate::agent::discover_endpoint(agent_endpoint.as_deref()) {
+                                Some(ep) => {
+                                    let c = crate::agent::LlmClient::new(ep, None);
+                                    eprintln!(
+                                        "[aokie-plugin] voice agent LLM: {} (model {:?})",
+                                        c.endpoint(),
+                                        c.model()
+                                    );
+                                    agent_client = Some(c);
+                                }
+                                None => eprintln!(
+                                    "[aokie-plugin] voice agent: no local LLM reachable (:8080/:11434)"
+                                ),
+                            }
+                        }
+                        if let Some(client) = agent_client.as_ref() {
+                            let sr = bt.get_sample_rate();
+                            let mut messages =
+                                vec![serde_json::json!({ "role": "system", "content": agent_persona })];
+                            messages.extend(history.iter().cloned());
+                            let t0 = Instant::now();
+                            eprintln!("[aokie-plugin] agent replying (streaming)…");
+                            let outcome = client.stream_reply(serde_json::json!(messages), |sentence| {
+                                eprintln!("[aokie-plugin] agent sentence (+{:?}): {sentence:?}", t0.elapsed());
+                                let dur = tts_speak(bt, &mut tts, sentence, sr);
+                                mute_stt_until =
+                                    Some(Instant::now() + dur + Duration::from_millis(400));
+                                true
+                            });
+                            match outcome {
+                                Ok(full) if !full.trim().is_empty() => {
+                                    let full = full.trim().to_string();
+                                    history.push(serde_json::json!({ "role": "assistant", "content": full }));
+                                    emit_turn(outbox, sink, &corr, turn_index, "bot", &full);
+                                    turn_index += 1;
+                                    // Discard anything the caller said while we replied.
+                                    stt_buf.clear();
+                                    stt_had_speech = false;
+                                    stt_silence = Duration::ZERO;
+                                }
+                                Ok(_) => {}
+                                Err(e) => eprintln!("[aokie-plugin] agent reply failed: {e}"),
+                            }
+                        }
+                    }
                 }
             }
         }

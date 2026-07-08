@@ -90,6 +90,33 @@ impl TtsEngine {
             .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
             .collect())
     }
+
+    /// Streaming synthesis: calls `on_pcm` with mono i16 PCM at `target_rate` as
+    /// each TTS chunk is produced, so playback can start on the first chunk
+    /// (~0.3 s) instead of after the whole utterance. `on_pcm` returns `false` to
+    /// stop early (barge-in / hangup). Returns the total sample count emitted.
+    pub fn synthesize_streaming(
+        &mut self,
+        text: &str,
+        voice: &str,
+        target_rate: u32,
+        mut on_pcm: impl FnMut(&[i16]) -> bool,
+    ) -> Result<usize, String> {
+        let native = self.native_rate;
+        let mut total = 0usize;
+        self.rt.synthesize_stream(text, voice, |chunk, _rate| {
+            // Per-chunk linear resample: the one-sample boundary discontinuity is
+            // inaudible over an 8/16 kHz phone link and keeps latency minimal.
+            let resampled = resample_linear(chunk, native, target_rate);
+            let pcm: Vec<i16> = resampled
+                .iter()
+                .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                .collect();
+            total += pcm.len();
+            on_pcm(&pcm)
+        })?;
+        Ok(total)
+    }
 }
 
 /// Point `ort` at the ONNX Runtime DLL shipped next to the plugin binary, unless
