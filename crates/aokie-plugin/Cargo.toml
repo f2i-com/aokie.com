@@ -8,6 +8,9 @@ publish.workspace = true
 
 [dependencies]
 aokie-core = { path = "../aokie-core" }
+# WinUSB driver install (dongle.installDriver) + dongle enumeration. Windows-only surface behind
+# cfg(target_os = "windows") inside the crate; on other targets the plugin returns an unsupported error.
+aokie-dongle = { path = "../aokie-dongle" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Same major as the legacy app (aokie-desktop pins 0.31) so the two
