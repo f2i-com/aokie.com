@@ -298,6 +298,7 @@ impl Plugin {
         match command {
             "dongle.list" => {
                 expect_fields(payload, &[])?;
+                // The compatibility catalog: dongles Aokie is known to support (back-compat `dongles`).
                 let dongles: Vec<Value> = dongle_catalog::list_known_dongles()
                     .into_iter()
                     .map(|d| {
@@ -306,9 +307,15 @@ impl Plugin {
                         v
                     })
                     .collect();
+                // Live: actually plugged-in dongles, each flagged matchesCatalog (supported) and
+                // driverBound (WinUSB attached = ready for Aokie). Lets the UI show "your dongle is
+                // plugged in — install its driver" vs "ready".
+                let (connected, live_err) = self.list_connected_dongles();
                 Ok(json!({
                     "dongles": dongles,
-                    "note": "Live USB enumeration is not yet wired to hardware; entries come from the static compatibility catalog.",
+                    "connected": connected,
+                    "liveEnumeration": live_err.is_none(),
+                    "note": live_err.unwrap_or_else(|| "connected[] are live USB devices; driverBound=true means the WinUSB driver is attached and the dongle is ready to pair.".to_string()),
                 }))
             }
             "dongle.getPreferred" => {
@@ -701,6 +708,46 @@ impl Plugin {
         ))
     }
 
+    /// Enumerate actually-connected USB dongles: every plugged-in device that either matches the
+    /// compatibility catalog OR already has the WinUSB (aokie) driver bound, annotated so the UI can
+    /// tell the user which dongle to pick and whether its driver still needs installing. Windows-only
+    /// live enumeration; other targets return an empty list + a note.
+    #[cfg(target_os = "windows")]
+    fn list_connected_dongles(&self) -> (Vec<Value>, Option<String>) {
+        match aokie_dongle::list_devices(true) {
+            Ok(devices) => {
+                let known: std::collections::HashSet<(u16, u16)> = dongle_catalog::list_known_dongles()
+                    .iter()
+                    .map(|d| (d.vid, d.pid))
+                    .collect();
+                let out = devices
+                    .into_iter()
+                    .filter(|d| known.contains(&(d.vid, d.pid)) || d.driver.to_lowercase().contains("winusb"))
+                    .map(|d| {
+                        json!({
+                            "vid": d.vid,
+                            "pid": d.pid,
+                            "vidHex": format!("0x{:04X}", d.vid),
+                            "pidHex": format!("0x{:04X}", d.pid),
+                            "description": d.description,
+                            "driver": d.driver,
+                            "hardwareId": d.hardware_id,
+                            "matchesCatalog": known.contains(&(d.vid, d.pid)),
+                            "driverBound": d.driver.to_lowercase().contains("winusb"),
+                        })
+                    })
+                    .collect();
+                (out, None)
+            }
+            Err(e) => (Vec::new(), Some(format!("live USB enumeration failed: {e}"))),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn list_connected_dongles(&self) -> (Vec<Value>, Option<String>) {
+        (Vec::new(), Some("live USB enumeration is Windows-only".to_string()))
+    }
+
     fn outbox_counts(&self) -> Result<crate::outbox::OutboxCounts, CmdError> {
         self.outbox
             .counts()
@@ -945,6 +992,7 @@ mod tests {
         let data = plugin
             .dispatch_command("dongle.list", &Value::Null, &mut sink)
             .unwrap();
+        // Back-compat: `dongles` is still the compatibility catalog.
         let dongles = data["dongles"].as_array().unwrap();
         assert_eq!(dongles.len(), dongle_catalog::DEFAULT_CATALOG.len());
         assert_eq!(dongles[0]["source"], json!("catalog"));
@@ -952,7 +1000,11 @@ mod tests {
             dongles[0]["vid"].as_u64().unwrap() as u16,
             dongle_catalog::DEFAULT_CATALOG[0].vid
         );
-        assert!(data["note"].as_str().unwrap().contains("catalog"));
+        // New: live enumeration adds a `connected` array + a `liveEnumeration` flag. On Windows it
+        // enumerates real USB devices (empty here with no dongle attached); off-Windows it's a note.
+        assert!(data["connected"].is_array());
+        assert!(data["liveEnumeration"].is_boolean());
+        assert!(data["note"].is_string());
     }
 
     #[test]
