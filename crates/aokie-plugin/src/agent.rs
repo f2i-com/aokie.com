@@ -125,11 +125,112 @@ impl LlmClient {
 
 /// Byte index of the first sentence-ending punctuation, at least a few chars in
 /// so we don't chop a leading fragment before there's a phrase worth speaking.
+///
+/// STREAMING-SAFE (the "Mesure" live-call bug): `.`/`!`/`?` end a sentence only
+/// when the character AFTER them has already arrived and is whitespace. That
+/// keeps the dots inside "9 A.M.", decimals ("5.50"), "e.g." and web addresses
+/// from splitting a chunk mid-token — "…at 9 A." + "M. Sure…" was synthesized
+/// as "Mesure" — and it refuses to split on a period that is merely the last
+/// character received so far (the next delta may continue the token; the
+/// caller's trailing-flush speaks whatever remains at stream end). `\n` is
+/// always a boundary. The per-chunk speech normalizer can only rewrite
+/// "a.m."/"AM" it can SEE, so chunks must never end mid-abbreviation.
 fn sentence_end(s: &str) -> Option<usize> {
     const MIN: usize = 8;
-    s.char_indices()
-        .find(|&(i, c)| i >= MIN && matches!(c, '.' | '!' | '?' | '\n'))
-        .map(|(i, c)| i + c.len_utf8() - 1)
+    let mut it = s.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        if i < MIN {
+            continue;
+        }
+        match c {
+            '\n' => return Some(i),
+            '.' | '!' | '?' => {
+                if it.peek().is_some_and(|&(_, next)| next.is_whitespace()) {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sentence_end;
+
+    /// Split `text` the way stream_reply does, feeding `delta`-sized pieces —
+    /// returns the spoken chunks including the trailing flush.
+    fn chunks(text: &str, delta: usize) -> Vec<String> {
+        let mut buf = String::new();
+        let mut out = Vec::new();
+        let bytes: Vec<char> = text.chars().collect();
+        for piece in bytes.chunks(delta) {
+            buf.extend(piece);
+            while let Some(idx) = sentence_end(&buf) {
+                let done: String = buf.drain(..=idx).collect();
+                let done = done.trim();
+                if !done.is_empty() {
+                    out.push(done.to_string());
+                }
+            }
+        }
+        let rest = buf.trim();
+        if !rest.is_empty() {
+            out.push(rest.to_string());
+        }
+        out
+    }
+
+    /// The live-call bug: "…9 A.M. …" must never split between "A." and "M."
+    /// (pocket-tts voiced the "M. Sure" chunk as "Mesure"), for EVERY possible
+    /// stream-delta alignment.
+    #[test]
+    fn never_splits_inside_a_dotted_meridiem() {
+        let reply = "Sure — I have 9:30 A.M. available. Anything else?";
+        for delta in 1..=reply.chars().count() {
+            let got = chunks(reply, delta);
+            assert_eq!(
+                got,
+                vec![
+                    "Sure — I have 9:30 A.M.".to_string(),
+                    "available.".to_string(),
+                    "Anything else?".to_string(),
+                ],
+                "delta {delta} split mid-abbreviation: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimals_and_dotted_abbreviations_do_not_split() {
+        assert_eq!(
+            chunks("That will be 5.50 in total. See you then.", 3),
+            vec!["That will be 5.50 in total.", "See you then."]
+        );
+        assert_eq!(
+            chunks("We open at 10 a.m. and close at 9 p.m. every day.", 5),
+            vec!["We open at 10 a.m.", "and close at 9 p.m.", "every day."]
+        );
+        assert_eq!(
+            chunks("Our site is example.com if you need it.", 4),
+            vec!["Our site is example.com if you need it."]
+        );
+    }
+
+    #[test]
+    fn ordinary_boundaries_still_split_promptly() {
+        assert_eq!(
+            chunks("Hello there. How can I help you today?", 100),
+            vec!["Hello there.", "How can I help you today?"]
+        );
+        // Newlines are always boundaries.
+        assert_eq!(chunks("First line\nSecond line", 100), vec!["First line", "Second line"]);
+        // A period as the LAST char seen so far waits for the next delta /
+        // the trailing flush instead of splitting blind.
+        assert_eq!(sentence_end("Booked for 9 A."), None);
+        assert_eq!(chunks("Booked for 10 a.m.", 1), vec!["Booked for 10 a.m."]);
+    }
 }
 
 /// First model id advertised at `<endpoint>/../models`.
