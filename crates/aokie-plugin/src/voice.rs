@@ -44,7 +44,7 @@ impl SttEngine {
 /// Resample i16 PCM at `from` Hz to 16 kHz mono f32 (what the STT engine wants).
 pub fn to_f32_16k(samples: &[i16], from: u32) -> Vec<f32> {
     let f: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
-    resample_linear(&f, from, 16_000)
+    crate::speech_wire::resample_linear(&f, from, 16_000)
 }
 
 /// RMS amplitude of an i16 frame in i16 units (0..32767) — the VAD's speech gate.
@@ -78,13 +78,19 @@ impl TtsEngine {
     /// Synthesize `text` (with reference `voice`, empty = the bundle default) to
     /// mono i16 PCM at `target_rate` — the current SCO rate — ready to hand to
     /// `send_audio`.
-    pub fn synthesize(&mut self, text: &str, voice: &str, target_rate: u32) -> Result<Vec<i16>, String> {
+    pub fn synthesize(
+        &mut self,
+        text: &str,
+        voice: &str,
+        target_rate: u32,
+    ) -> Result<Vec<i16>, String> {
         let mut f32_samples: Vec<f32> = Vec::new();
         self.rt.synthesize_stream(text, voice, |chunk, _rate| {
             f32_samples.extend_from_slice(chunk);
             true
         })?;
-        let resampled = resample_linear(&f32_samples, self.native_rate, target_rate);
+        let resampled =
+            crate::speech_wire::resample_linear(&f32_samples, self.native_rate, target_rate);
         Ok(resampled
             .iter()
             .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
@@ -107,7 +113,7 @@ impl TtsEngine {
         self.rt.synthesize_stream(text, voice, |chunk, _rate| {
             // Per-chunk linear resample: the one-sample boundary discontinuity is
             // inaudible over an 8/16 kHz phone link and keeps latency minimal.
-            let resampled = resample_linear(chunk, native, target_rate);
+            let resampled = crate::speech_wire::resample_linear(chunk, native, target_rate);
             let pcm: Vec<i16> = resampled
                 .iter()
                 .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
@@ -138,24 +144,4 @@ fn ensure_ort_dylib() {
             }
         }
     }
-}
-
-/// Minimal linear-interpolation resampler (mono f32). Speech over an 8/16 kHz
-/// SCO link doesn't need a high-order filter; linear is clean enough and cheap.
-fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
-    if from == to || from == 0 || to == 0 || input.is_empty() {
-        return input.to_vec();
-    }
-    let ratio = to as f64 / from as f64;
-    let out_len = ((input.len() as f64) * ratio).round() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src = i as f64 / ratio;
-        let idx = src.floor() as usize;
-        let frac = (src - idx as f64) as f32;
-        let a = input.get(idx).copied().unwrap_or(0.0);
-        let b = input.get(idx + 1).copied().unwrap_or(a);
-        out.push(a + (b - a) * frac);
-    }
-    out
 }

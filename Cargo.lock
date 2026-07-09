@@ -191,6 +191,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aokie-voice-server"
+version = "0.1.0"
+dependencies = [
+ "aokie-ai",
+ "aokie-core",
+ "hound",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
