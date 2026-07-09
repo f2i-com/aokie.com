@@ -38,7 +38,7 @@ const RECEPTIONIST_CONFIG_KEYS: [&str; 7] = [
 
 /// Typed connector-level error, surfaced as a JSON-RPC error with
 /// `error.data = {code, message}` (connector-response.schema.json
-/// codes; the plugin only ever produces `command_failed` and — for
+/// codes; the plugin produces `command_failed`, `stale_call` and — for
 /// a mis-routed connector id — `connector_missing`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CmdError {
@@ -49,7 +49,17 @@ pub struct CmdError {
 impl CmdError {
     pub fn failed(message: impl Into<String>) -> Self {
         CmdError {
-            code: "command_failed",
+            code: crate::contract::errors::COMMAND_FAILED,
+            message: message.into(),
+        }
+    }
+
+    /// A call-control command named a `callId` that is not the current
+    /// call — the phone was NOT touched (contract `stale_call`; audit
+    /// C-01: a stale browser tab must never control a newer call).
+    pub fn stale_call(message: impl Into<String>) -> Self {
+        CmdError {
+            code: crate::contract::errors::STALE_CALL,
             message: message.into(),
         }
     }
@@ -69,6 +79,16 @@ impl MockCallState {
             MockCallState::Incoming => "incoming",
             MockCallState::Active => "active",
             MockCallState::Ended => "ended",
+        }
+    }
+
+    /// The canonical wire state (`contract::call_state`): the mock's
+    /// internal "incoming" is the contract's "ringing".
+    fn canonical(self) -> &'static str {
+        match self {
+            MockCallState::Incoming => crate::contract::call_state::RINGING,
+            MockCallState::Active => crate::contract::call_state::ACTIVE,
+            MockCallState::Ended => crate::contract::call_state::ENDED,
         }
     }
 }
@@ -643,7 +663,7 @@ impl Plugin {
                 }
                 let session_id = format!("pair_{}", uuid::Uuid::new_v4().simple());
                 let ev = aokie_event(
-                    "aokie.phone.pairing_started",
+                    crate::contract::events::PHONE_PAIRING_STARTED,
                     &session_id,
                     json!({"at": now_iso8601()}),
                 );
@@ -664,54 +684,77 @@ impl Plugin {
             "call.current" => {
                 expect_fields(payload, &[])?;
                 if let Some(radio) = self.radio.as_ref() {
-                    let call = radio
-                        .current_caller()
-                        .map(|from| json!({"from": from, "active": radio.is_call_active()}));
+                    // Canonical shape (audit C-02) — the SAME keys the browser
+                    // mock returns and the Live Call screen parses, so a
+                    // refreshed page recovers a real in-flight call.
+                    let call = radio.current_call_id().map(|call_id| {
+                        json!({
+                            "callId": call_id,
+                            "from": radio.current_caller(),
+                            "state": if radio.is_call_active() {
+                                crate::contract::call_state::ACTIVE
+                            } else {
+                                crate::contract::call_state::RINGING
+                            },
+                            "startedAt": radio.call_started_at(),
+                        })
+                    });
                     return Ok(json!({"call": call}));
                 }
                 Ok(json!({"call": self.mock.current_call.as_ref().map(call_json)}))
             }
             "call.answer" => {
-                expect_fields(payload, &[])?;
+                let obj = expect_fields(payload, &["callId"])?;
+                let call_id = optional_str(&obj, "callId")?;
                 if let Some(radio) = self.radio.as_ref() {
+                    check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
                     radio
                         .send(crate::radio::RadioControl::Answer)
                         .map_err(CmdError::failed)?;
-                    return Ok(json!({"answered": true, "via": "radio"}));
+                    return Ok(
+                        json!({"answered": true, "via": "radio", "callId": radio.current_call_id()}),
+                    );
                 }
+                check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
                 let call = self.require_call(&[MockCallState::Incoming], "call.answer")?;
                 call.state = MockCallState::Active;
                 let (corr, snapshot) = {
                     let c = self.mock.current_call.as_ref().unwrap();
                     (c.correlation_id.clone(), call_json(c))
                 };
-                let ev = aokie_event("aokie.call.answered", &corr, json!({"at": now_iso8601()}));
+                let ev = aokie_event(crate::contract::events::CALL_ANSWERED, &corr, json!({"at": now_iso8601()}));
                 emit_event(sink, &self.outbox, &ev, false).map_err(CmdError::failed)?;
                 Ok(json!({"answered": true, "call": snapshot}))
             }
             "call.reject" => {
-                expect_fields(payload, &[])?;
+                let obj = expect_fields(payload, &["callId"])?;
+                let call_id = optional_str(&obj, "callId")?;
                 if let Some(radio) = self.radio.as_ref() {
+                    check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
                     radio
                         .send(crate::radio::RadioControl::Reject)
                         .map_err(CmdError::failed)?;
                     return Ok(json!({"rejected": true, "via": "radio"}));
                 }
+                check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
                 let call = self.require_call(&[MockCallState::Incoming], "call.reject")?;
                 call.state = MockCallState::Ended;
                 let corr = call.correlation_id.clone();
-                let ev = aokie_event("aokie.call.rejected", &corr, json!({"at": now_iso8601()}));
+                let ev = aokie_event(crate::contract::events::CALL_REJECTED, &corr, json!({"at": now_iso8601()}));
                 emit_event(sink, &self.outbox, &ev, false).map_err(CmdError::failed)?;
                 Ok(json!({"rejected": true}))
             }
             "call.hangup" => {
-                expect_fields(payload, &[])?;
+                let obj = expect_fields(payload, &["callId"])?;
+                let call_id = optional_str(&obj, "callId")?;
                 if let Some(radio) = self.radio.as_ref() {
+                    check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
                     radio
                         .send(crate::radio::RadioControl::Hangup)
                         .map_err(CmdError::failed)?;
                     return Ok(json!({"ended": true, "via": "radio"}));
                 }
+                check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
                 let call = self.require_call(
                     &[MockCallState::Incoming, MockCallState::Active],
                     "call.hangup",
@@ -720,7 +763,7 @@ impl Plugin {
                 let (corr, turns) = (call.correlation_id.clone(), call.turns);
                 let call_from = call.caller.clone();
                 let ev = aokie_event(
-                    "aokie.call.ended",
+                    crate::contract::events::CALL_ENDED,
                     &corr,
                     json!({
                         "at": now_iso8601(),
@@ -737,17 +780,20 @@ impl Plugin {
                 Ok(json!({"ended": true}))
             }
             "call.operatorSpeak" => {
-                let obj = expect_fields(payload, &["text"])?;
+                let obj = expect_fields(payload, &["text", "callId"])?;
                 let text = require_str(&obj, "text")?;
                 if text.trim().is_empty() {
                     return Err(CmdError::failed("text is empty"));
                 }
+                let call_id = optional_str(&obj, "callId")?;
                 if let Some(radio) = self.radio.as_ref() {
+                    check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
                     radio
                         .send(crate::radio::RadioControl::Speak { text: text.clone() })
                         .map_err(CmdError::failed)?;
                     return Ok(json!({"spoken": true, "via": "radio"}));
                 }
+                check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
                 let call = self.require_call(&[MockCallState::Active], "call.operatorSpeak")?;
                 call.turns += 1;
                 // Mock: no audio path yet — acknowledge without faking
@@ -812,7 +858,7 @@ impl Plugin {
                 // Essential event: outboxed before emission. The
                 // correlation id is the SMS handle (contract §3).
                 let ev = aokie_event(
-                    "aokie.sms.sent",
+                    crate::contract::events::SMS_SENT,
                     &message_id,
                     json!({"messageId": message_id, "to": to, "at": at}),
                 );
@@ -894,7 +940,7 @@ impl Plugin {
         emit(
             self,
             aokie_event(
-                "aokie.dongle.detected",
+                crate::contract::events::DONGLE_DETECTED,
                 &corr,
                 json!({"vid": dongle.vid, "pid": dongle.pid, "tier": dongle.tier, "source": "mock"}),
             ),
@@ -902,7 +948,7 @@ impl Plugin {
         emit(
             self,
             aokie_event(
-                "aokie.dongle.ready",
+                crate::contract::events::DONGLE_READY,
                 &corr,
                 json!({"vid": dongle.vid, "pid": dongle.pid}),
             ),
@@ -910,7 +956,7 @@ impl Plugin {
         emit(
             self,
             aokie_event(
-                "aokie.call.incoming",
+                crate::contract::events::CALL_INCOMING,
                 &corr,
                 json!({"from": caller, "at": started_at}),
             ),
@@ -925,7 +971,7 @@ impl Plugin {
 
         emit(
             self,
-            aokie_event("aokie.call.answered", &corr, json!({"at": now_iso8601()})),
+            aokie_event(crate::contract::events::CALL_ANSWERED, &corr, json!({"at": now_iso8601()})),
         )?;
         if let Some(call) = self.mock.current_call.as_mut() {
             call.state = MockCallState::Active;
@@ -956,7 +1002,7 @@ impl Plugin {
         emit(
             self,
             aokie_event(
-                "aokie.call.ended",
+                crate::contract::events::CALL_ENDED,
                 &corr,
                 json!({
                     "at": now_iso8601(),
@@ -979,7 +1025,7 @@ impl Plugin {
         emit(
             self,
             aokie_event(
-                "aokie.sms.received",
+                crate::contract::events::SMS_RECEIVED,
                 &corr,
                 json!({"from": caller, "body": sms_body, "at": sms_at}),
             ),
@@ -1005,6 +1051,15 @@ impl Plugin {
                 "dead": counts.dead,
             },
         }))
+    }
+
+    /// The mock's current call id (any state) — the `callId` guard target
+    /// when no radio is present.
+    fn mock_call_id(&self) -> Option<String> {
+        self.mock
+            .current_call
+            .as_ref()
+            .map(|c| c.correlation_id.clone())
     }
 
     fn require_call(
@@ -1129,14 +1184,35 @@ impl Plugin {
     }
 }
 
+/// Canonical `call.current` call object (audit C-02): `callId`/`from`/
+/// `state`/`startedAt` — identical keys to the real radio path and the
+/// browser mock, so every consumer parses ONE shape.
 fn call_json(call: &MockCall) -> Value {
     json!({
-        "correlationId": call.correlation_id,
-        "caller": call.caller,
-        "state": call.state.as_str(),
+        "callId": call.correlation_id,
+        "from": call.caller,
+        "state": call.state.canonical(),
         "startedAt": call.started_at,
         "turns": call.turns,
     })
+}
+
+/// Verify an operator-supplied `callId` names the plugin's CURRENT call.
+/// An omitted `callId` acts on the current call (compatibility with flow /
+/// desktop callers that predate call identity). A mismatch — or a `callId`
+/// with no live call behind it — is the typed `stale_call` error and the
+/// phone is NOT touched (audit C-01).
+fn check_call_id(provided: Option<&str>, current: Option<&str>) -> Result<(), CmdError> {
+    match (provided, current) {
+        (None, _) => Ok(()),
+        (Some(p), Some(c)) if p == c => Ok(()),
+        (Some(p), Some(c)) => Err(CmdError::stale_call(format!(
+            "callId {p:?} is not the current call ({c:?})"
+        ))),
+        (Some(p), None) => Err(CmdError::stale_call(format!(
+            "callId {p:?} is stale: there is no current call"
+        ))),
+    }
 }
 
 fn connector_error_line(id: &Value, err: &CmdError) -> String {
@@ -1164,6 +1240,18 @@ fn expect_fields(payload: &Value, allowed: &[&str]) -> Result<Map<String, Value>
         }
         other => Err(CmdError::failed(format!(
             "payload must be an object, got {}",
+            json_type_name(other)
+        ))),
+    }
+}
+
+/// Optional string field: missing/null → None; a non-string is an error.
+fn optional_str(obj: &Map<String, Value>, key: &str) -> Result<Option<String>, CmdError> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(CmdError::failed(format!(
+            "field {key} must be a string, got {}",
             json_type_name(other)
         ))),
     }
@@ -1551,14 +1639,14 @@ mod tests {
 
         // Contract §4 order.
         let expected = [
-            "aokie.dongle.detected",
-            "aokie.dongle.ready",
-            "aokie.call.incoming",
-            "aokie.call.answered",
-            "aokie.call.turn.final",
-            "aokie.call.turn.final",
-            "aokie.call.ended",
-            "aokie.sms.received",
+            crate::contract::events::DONGLE_DETECTED,
+            crate::contract::events::DONGLE_READY,
+            crate::contract::events::CALL_INCOMING,
+            crate::contract::events::CALL_ANSWERED,
+            crate::contract::events::CALL_TURN_FINAL,
+            crate::contract::events::CALL_TURN_FINAL,
+            crate::contract::events::CALL_ENDED,
+            crate::contract::events::SMS_RECEIVED,
         ];
         let events: Vec<Value> = sink.lines.iter().map(|l| parse(l)).collect();
         assert_eq!(events.len(), expected.len());
@@ -1635,7 +1723,7 @@ mod tests {
         assert_eq!(data["answered"], json!(true));
         assert_eq!(data["call"]["state"], json!("active"));
         let v = parse(&sink.lines[0]);
-        assert_eq!(v["params"]["event"]["name"], json!("aokie.call.answered"));
+        assert_eq!(v["params"]["event"]["name"], json!(crate::contract::events::CALL_ANSWERED));
 
         let data = plugin
             .dispatch_command("call.current", &Value::Null, &mut sink)
@@ -1657,12 +1745,124 @@ mod tests {
             .unwrap();
         assert_eq!(data["ended"], json!(true));
         let v = parse(&sink.lines[0]);
-        assert_eq!(v["params"]["event"]["name"], json!("aokie.call.ended"));
+        assert_eq!(v["params"]["event"]["name"], json!(crate::contract::events::CALL_ENDED));
 
         // Ended call: hangup again fails.
         assert!(plugin
             .dispatch_command("call.hangup", &Value::Null, &mut sink)
             .is_err());
+    }
+
+    /// Audit C-01: call controls accept an optional `callId`; a stale one
+    /// (wrong call, or no call at all) is the typed `stale_call` error and
+    /// leaves the call state untouched.
+    #[test]
+    fn call_controls_verify_call_id() {
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink::default();
+
+        // A callId with no call behind it is stale, not "no active call".
+        let err = plugin
+            .dispatch_command("call.answer", &json!({"callId": "call_gone"}), &mut sink)
+            .unwrap_err();
+        assert_eq!(err.code, crate::contract::errors::STALE_CALL);
+
+        plugin
+            .dispatch_command(
+                "dongle.diagnostics",
+                &json!({"simulate": "call"}),
+                &mut sink,
+            )
+            .unwrap();
+        plugin.mock.current_call.as_mut().unwrap().state = MockCallState::Incoming;
+        let current = plugin.mock_call_id().unwrap();
+
+        // Wrong callId → stale_call, state untouched.
+        for command in ["call.answer", "call.reject", "call.hangup"] {
+            let err = plugin
+                .dispatch_command(command, &json!({"callId": "call_stale"}), &mut sink)
+                .unwrap_err();
+            assert_eq!(err.code, crate::contract::errors::STALE_CALL, "{command}");
+            assert_eq!(
+                plugin.mock.current_call.as_ref().unwrap().state,
+                MockCallState::Incoming,
+                "{command} must not touch a call it failed to target"
+            );
+        }
+        // Non-string callId is a validation failure, not a stale call.
+        let err = plugin
+            .dispatch_command("call.answer", &json!({"callId": 7}), &mut sink)
+            .unwrap_err();
+        assert_eq!(err.code, crate::contract::errors::COMMAND_FAILED);
+
+        // The RIGHT callId answers the call (this is the exact payload the
+        // Live Call screen sends — audit C-01's broken case).
+        let data = plugin
+            .dispatch_command("call.answer", &json!({"callId": current}), &mut sink)
+            .unwrap();
+        assert_eq!(data["answered"], json!(true));
+
+        // operatorSpeak also honours the guard.
+        let err = plugin
+            .dispatch_command(
+                "call.operatorSpeak",
+                &json!({"text": "hello", "callId": "call_stale"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, crate::contract::errors::STALE_CALL);
+        let data = plugin
+            .dispatch_command(
+                "call.operatorSpeak",
+                &json!({"text": "hello", "callId": current}),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(data["spoken"], json!(true));
+
+        // And hangup with the right id ends it.
+        let data = plugin
+            .dispatch_command("call.hangup", &json!({"callId": current}), &mut sink)
+            .unwrap();
+        assert_eq!(data["ended"], json!(true));
+    }
+
+    /// Audit C-02: `call.current` returns ONE canonical call object —
+    /// `callId`/`from`/`state`/`startedAt` with contract state values —
+    /// from the mock path (the radio path mirrors it from RadioStatus).
+    #[test]
+    fn call_current_returns_the_canonical_shape() {
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink::default();
+
+        // No call → explicit null.
+        let data = plugin
+            .dispatch_command("call.current", &Value::Null, &mut sink)
+            .unwrap();
+        assert_eq!(data["call"], Value::Null);
+
+        plugin
+            .dispatch_command(
+                "dongle.diagnostics",
+                &json!({"simulate": "call"}),
+                &mut sink,
+            )
+            .unwrap();
+        plugin.mock.current_call.as_mut().unwrap().state = MockCallState::Incoming;
+
+        let data = plugin
+            .dispatch_command("call.current", &Value::Null, &mut sink)
+            .unwrap();
+        let call = &data["call"];
+        assert!(call["callId"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(call["from"], json!("+61412345678"));
+        // Internal "incoming" maps to the contract's "ringing".
+        assert_eq!(call["state"], json!(crate::contract::call_state::RINGING));
+        assert!(call["startedAt"].as_str().is_some());
+        // The legacy keys are GONE — one shape only.
+        assert!(call.get("correlationId").is_none());
+        assert!(call.get("caller").is_none());
+        assert!(call.get("active").is_none());
     }
 
     #[test]
@@ -1700,7 +1900,7 @@ mod tests {
         assert!(message_id.starts_with("sms_"));
 
         let v = parse(&sink.lines[0]);
-        assert_eq!(v["params"]["event"]["name"], json!("aokie.sms.sent"));
+        assert_eq!(v["params"]["event"]["name"], json!(crate::contract::events::SMS_SENT));
         assert_eq!(v["params"]["event"]["correlationId"], json!(message_id));
         let key = v["params"]["event"]["idempotencyKey"].as_str().unwrap();
         assert_eq!(key, format!("aokie:{message_id}:sms.sent:v1"));
@@ -1829,7 +2029,7 @@ mod tests {
         let v = parse(&sink.lines[0]);
         assert_eq!(
             v["params"]["event"]["name"],
-            json!("aokie.phone.pairing_started")
+            json!(crate::contract::events::PHONE_PAIRING_STARTED)
         );
 
         let data = plugin

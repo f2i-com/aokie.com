@@ -96,6 +96,14 @@ pub struct RadioStatus {
     pub local_address: Mutex<Option<String>>,
     pub connected_address: Mutex<Option<String>>,
     pub current_caller: Mutex<Option<String>>,
+    /// The current call's id (the `call_…` correlation id every event for
+    /// this call carries). Set the moment a call starts ringing, cleared on
+    /// termination — this is what lets `call.current` recover a live call
+    /// after a page refresh and lets call controls verify a `callId`.
+    pub current_call_id: Mutex<Option<String>>,
+    /// ISO-8601 instant the current call started RINGING (not answered) —
+    /// the Live Call screen's timer runs from here.
+    pub call_started_at: Mutex<Option<String>>,
     /// Devices seen connected during this radio session (the durable link
     /// keys live in the aokie pairing store; this is the live view).
     pub paired: Mutex<Vec<PairedDevice>>,
@@ -135,6 +143,12 @@ impl RadioHandle {
     }
     pub fn current_caller(&self) -> Option<String> {
         self.status.current_caller.lock().unwrap().clone()
+    }
+    pub fn current_call_id(&self) -> Option<String> {
+        self.status.current_call_id.lock().unwrap().clone()
+    }
+    pub fn call_started_at(&self) -> Option<String> {
+        self.status.call_started_at.lock().unwrap().clone()
     }
     pub fn paired(&self) -> Vec<PairedDevice> {
         self.status.paired.lock().unwrap().clone()
@@ -1009,7 +1023,7 @@ fn run_loop(
                     outbox,
                     sink,
                     aokie_core::events::aokie_event(
-                        "aokie.call.incoming",
+                        crate::contract::events::CALL_INCOMING,
                         &corr,
                         json!({"from": from, "at": aokie_core::events::now_iso8601()}),
                     ),
@@ -1352,7 +1366,7 @@ fn run_loop(
                             outbox,
                             sink,
                             aokie_core::events::aokie_event(
-                                "aokie.hardware.error",
+                                crate::contract::events::HARDWARE_ERROR,
                                 "radio",
                                 json!({"message": format!("send_sms failed: {e}")}),
                             ),
@@ -1499,7 +1513,7 @@ fn handle_event(
                 outbox,
                 sink,
                 aokie_event(
-                    "aokie.dongle.ready",
+                    crate::contract::events::DONGLE_READY,
                     "radio",
                     json!({"address": addr, "source": "radio"}),
                 ),
@@ -1520,7 +1534,7 @@ fn handle_event(
             emit(
                 outbox,
                 sink,
-                aokie_event("aokie.phone.connected", "radio", json!({"address": addr})),
+                aokie_event(crate::contract::events::PHONE_CONNECTED, "radio", json!({"address": addr})),
             );
         }
         E::DeviceDisconnected(addr) => {
@@ -1530,7 +1544,7 @@ fn handle_event(
                 outbox,
                 sink,
                 aokie_event(
-                    "aokie.phone.disconnected",
+                    crate::contract::events::PHONE_DISCONNECTED,
                     "radio",
                     json!({"address": addr}),
                 ),
@@ -1546,6 +1560,11 @@ fn handle_event(
                 *current_corr = Some(corr.clone());
                 *caller_id = None;
                 *status.current_caller.lock().unwrap() = None;
+                // Shared call identity: `call.current` recovers a live call
+                // from these after a browser refresh (audit C-02), and call
+                // controls verify their `callId` against it (audit C-01).
+                *status.current_call_id.lock().unwrap() = Some(corr.clone());
+                *status.call_started_at.lock().unwrap() = Some(now_iso8601());
                 *pending_incoming = Some((corr, std::time::Instant::now()));
             }
         }
@@ -1558,7 +1577,7 @@ fn handle_event(
                 emit(
                     outbox,
                     sink,
-                    aokie_event("aokie.call.ringing", corr, json!({"at": now_iso8601()})),
+                    aokie_event(crate::contract::events::CALL_RINGING, corr, json!({"at": now_iso8601()})),
                 );
             }
         }
@@ -1569,7 +1588,7 @@ fn handle_event(
                 emit(
                     outbox,
                     sink,
-                    aokie_event("aokie.call.answered", corr, json!({"at": now_iso8601()})),
+                    aokie_event(crate::contract::events::CALL_ANSWERED, corr, json!({"at": now_iso8601()})),
                 );
             }
         }
@@ -1592,7 +1611,7 @@ fn handle_event(
                     outbox,
                     sink,
                     aokie_event(
-                        "aokie.call.ended",
+                        crate::contract::events::CALL_ENDED,
                         &corr,
                         json!({
                             "at": now_iso8601(),
@@ -1610,6 +1629,8 @@ fn handle_event(
             *caller_id = None;
             *pending_incoming = None;
             *status.current_caller.lock().unwrap() = None;
+            *status.current_call_id.lock().unwrap() = None;
+            *status.call_started_at.lock().unwrap() = None;
         }
         E::AudioConnected { codec, sample_rate } => {
             let corr = current_corr.clone().unwrap_or_else(|| "radio".to_string());
@@ -1617,7 +1638,7 @@ fn handle_event(
                 outbox,
                 sink,
                 aokie_event(
-                    "aokie.call.audio.connected",
+                    crate::contract::events::CALL_AUDIO_CONNECTED,
                     &corr,
                     json!({"codec": codec, "sampleRate": sample_rate}),
                 ),
@@ -1628,7 +1649,7 @@ fn handle_event(
             emit(
                 outbox,
                 sink,
-                aokie_event("aokie.call.audio.disconnected", &corr, json!({})),
+                aokie_event(crate::contract::events::CALL_AUDIO_DISCONNECTED, &corr, json!({})),
             );
         }
         E::SmsReceived(p) => {
@@ -1637,7 +1658,7 @@ fn handle_event(
                 outbox,
                 sink,
                 aokie_event(
-                    "aokie.sms.received",
+                    crate::contract::events::SMS_RECEIVED,
                     &corr,
                     json!({
                         "from": p.sender_phone,
@@ -1655,7 +1676,7 @@ fn handle_event(
                 outbox,
                 sink,
                 aokie_event(
-                    "aokie.sms.sent",
+                    crate::contract::events::SMS_SENT,
                     &message_id,
                     json!({"messageId": message_id, "to": recipient_phone, "at": now_iso8601()}),
                 ),
@@ -1669,7 +1690,7 @@ fn handle_event(
             emit(
                 outbox,
                 sink,
-                aokie_event("aokie.hardware.error", "radio", json!({"message": e})),
+                aokie_event(crate::contract::events::HARDWARE_ERROR, "radio", json!({"message": e})),
             );
         }
     }
@@ -1692,6 +1713,81 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit C-01/C-02: the radio publishes the current call's identity
+    /// (`callId` + `startedAt`) into the shared status the moment it rings
+    /// and clears it on termination — `call.current` and the call-control
+    /// `callId` guard read exactly these fields.
+    #[test]
+    fn handle_event_tracks_shared_call_identity() {
+        use crate::event_bridge::VecSink;
+        use aokie_dongle::bluetooth::BluetoothEvent as E;
+
+        let status = Arc::new(RadioStatus::default());
+        let mut sink = VecSink::default();
+        let mut caller_id: Option<String> = None;
+        let mut current_corr: Option<String> = None;
+        let mut pending_incoming: Option<(String, std::time::Instant)> = None;
+        let mut answered_at: Option<std::time::Instant> = None;
+
+        macro_rules! apply {
+            ($ev:expr) => {
+                handle_event(
+                    $ev,
+                    &mut caller_id,
+                    &mut current_corr,
+                    &mut pending_incoming,
+                    &mut answered_at,
+                    None,
+                    &mut sink,
+                    &status,
+                )
+            };
+        }
+
+        assert!(status.current_call_id.lock().unwrap().is_none());
+
+        apply!(E::CallIncoming);
+        let call_id = status.current_call_id.lock().unwrap().clone();
+        assert_eq!(call_id, current_corr, "shared id mirrors the corr");
+        assert!(call_id.as_deref().unwrap().starts_with("call_"));
+        assert!(status.call_started_at.lock().unwrap().is_some());
+        assert!(!status.call_active.load(Ordering::Relaxed), "ringing, not active");
+
+        // Phones re-emit the ring indicator — the id must not change mid-call.
+        apply!(E::CallIncoming);
+        assert_eq!(*status.current_call_id.lock().unwrap(), call_id);
+
+        apply!(E::CallerId("+61400000001".to_string()));
+        assert_eq!(
+            status.current_caller.lock().unwrap().as_deref(),
+            Some("+61400000001")
+        );
+
+        apply!(E::CallAnswered);
+        assert!(status.call_active.load(Ordering::Relaxed));
+        assert_eq!(*status.current_call_id.lock().unwrap(), call_id);
+
+        sink.lines.clear();
+        apply!(E::CallTerminated);
+        assert!(status.current_call_id.lock().unwrap().is_none());
+        assert!(status.call_started_at.lock().unwrap().is_none());
+        assert!(status.current_caller.lock().unwrap().is_none());
+        assert!(!status.call_active.load(Ordering::Relaxed));
+        // The ended event carried the SAME call id the whole call used.
+        let v: serde_json::Value = serde_json::from_str(&sink.lines[0]).unwrap();
+        assert_eq!(
+            v["params"]["event"]["name"],
+            json!(crate::contract::events::CALL_ENDED)
+        );
+        assert_eq!(v["params"]["event"]["data"]["callId"], json!(call_id));
+
+        // The next call gets a FRESH id.
+        apply!(E::CallIncoming);
+        let second = status.current_call_id.lock().unwrap().clone();
+        assert!(second.is_some());
+        assert_ne!(second, call_id);
+    }
 
     #[test]
     fn http_speech_fallback_is_sticky_per_call() {

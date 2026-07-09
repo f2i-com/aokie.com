@@ -9,6 +9,8 @@
 //!
 //! * [`rpc`] — JSON-RPC framing: line parse (1 MiB cap), response /
 //!   notification serialisation, error codes.
+//! * [`contract`] — the canonical event/command/error-code constants;
+//!   manifest.json + every emit site are test-locked to it.
 //! * [`connector`] — plugin state + `connector.request` command
 //!   dispatch (the `dongle.* / phone.* / call.* / sms.* / settings.*`
 //!   MVP surface, incl. the dev-mode scripted call lifecycle).
@@ -31,6 +33,7 @@ pub mod aec;
 pub mod agent;
 pub mod config;
 pub mod connector;
+pub mod contract;
 pub mod event_bridge;
 pub mod outbox;
 pub mod radio;
