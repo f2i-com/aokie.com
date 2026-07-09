@@ -77,6 +77,13 @@ lists, markdown, or emoji. Your job: greet the caller, find out their name and h
 capture the key details (what they need, and a callback number or time if relevant), and either book \
 them in or take a message. Ask only ONE clear question at a time and keep the conversation moving.";
 
+/// Spoken on answer when no greeting is configured. A BLANK greeting setting means
+/// "use the default", never "answer silently" — a desktop settings-form save (which
+/// writes the full settings bag, greeting included) or a flow push with an empty form
+/// field must not silence the receptionist. Shared by the spawn path (connector.rs)
+/// and the live `RadioControl::Configure` path below.
+pub const DEFAULT_GREETING: &str = "Hello, thanks for calling. How can I help you today?";
+
 /// Live radio status, shared (via `Arc`) between the radio thread (writer)
 /// and the main RPC thread (reader) so `phone.status` / `dongle.diagnostics`
 /// answer without round-tripping the radio thread.
@@ -1388,7 +1395,12 @@ fn run_loop(
                     #[cfg(feature = "voice")]
                     {
                         if let Some(g) = g {
-                            greeting = if g.trim().is_empty() { None } else { Some(g) };
+                            // Blank = default, never silence (see DEFAULT_GREETING).
+                            greeting = if g.trim().is_empty() {
+                                Some(DEFAULT_GREETING.to_string())
+                            } else {
+                                Some(g)
+                            };
                         }
                         if let Some(p) = persona {
                             if !p.trim().is_empty() {
