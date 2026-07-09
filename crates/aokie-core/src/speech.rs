@@ -1,20 +1,19 @@
 //! Text normalization for speech synthesis, shared by the Aokie plugin's
 //! in-call TTS and the aokie-voice-server HTTP service.
 
-/// Normalize text for speech synthesis. Two real-world TTS failure modes drive
-/// this (both heard on live receptionist calls with pocket-tts):
+/// Normalize text for speech synthesis. Real-world TTS failure modes drive
+/// this (all heard on live receptionist calls with pocket-tts):
 ///   1. dotted abbreviations butting into punctuation — "10 p.m., and…" gets
 ///      voiced as a mangled "pee-em-comma" stutter;
-///   2. the uppercase token "AM"/"PM" itself — the model reads it as a WORD
-///      (with a distinctly French flavour), not as the meridiem letters.
+///   2. the token "AM"/"PM" read as a WORD (with a French flavour);
+///   3. the spelling "ay em" read as "eye em".
 ///
-/// So `a.m` / `p.m` (any case, dotted or not, with or without a space after the
-/// hour: "10 a.m.", "2 P.M.!", "9pm", "10:30 AM") become the PHONETIC "ay em" /
-/// "pee em", which every voice pronounces correctly. Boundary-aware: "Sam.",
-/// "spam." and a shouted "I AM HERE" are untouched (bare am/pm/AM/PM only
-/// converts right after a digit — i.e. a time). Punctuation clusters left by
-/// the rewrite (".," "..", ".!") collapse to their terminal mark, and markdown
-/// residue (`*`, `` ` ``) is dropped.
+/// So meridiems become the user-tuned phonetic spellings "a em" / "pee em" —
+/// for the dotted forms ("10 a.m.", "2 P.M.!") and for bare am/pm straight
+/// after a digit ("10 AM", "10am", "10:30 PM"). Boundary-aware: "Sam.",
+/// "spam.", the word "am" and a shouted "I AM HERE" are never rewritten.
+/// Punctuation clusters left by the rewrite (".," "..", ".!") collapse to
+/// their terminal mark, and markdown residue (`*`, `` ` ``) is dropped.
 ///
 /// This runs ONLY on the text handed to the synthesizer — transcripts, history
 /// and records keep the original wording.
@@ -25,18 +24,17 @@ pub fn normalize_speech_text(input: &str) -> String {
     while i < chars.len() {
         let c = chars[i];
         let lower = c.to_ascii_lowercase();
-        // Digits are a valid left boundary ("9p.m." → "9 pee em"); letters are not ("Sam." stays).
+        // Digits are a valid left boundary ("9p.m." works); letters are not ("Sam." stays).
         let left_is_letter = i > 0 && chars[i - 1].is_ascii_alphabetic();
-        // The nearest non-space/colon character to the left — a digit there means
-        // this am/pm follows a time ("10 AM", "10:30pm").
+        // Is the nearest non-space character to the left a digit (i.e. a time)?
         let after_digit = chars[..i]
             .iter()
             .rev()
-            .find(|ch| !ch.is_whitespace() && **ch != ':')
+            .find(|ch| !ch.is_whitespace())
             .is_some_and(|ch| ch.is_ascii_digit());
 
         if !left_is_letter && (lower == 'a' || lower == 'p') {
-            let phonetic = if lower == 'a' { "ay em" } else { "pee em" };
+            let phonetic = if lower == 'a' { "a em" } else { "pee em" };
             // Dotted form `a.m` / `p.m` (optionally `a.m.`) — always a meridiem.
             if i + 2 < chars.len()
                 && chars[i + 1] == '.'
@@ -66,7 +64,7 @@ pub fn normalize_speech_text(input: &str) -> String {
         out.push(c);
         i += 1;
     }
-    // Cleanup pass: collapse the punctuation clusters left by "a.m." → "ay em.".
+    // Cleanup pass: collapse the punctuation clusters left by "a.m." → "a em.".
     let mut cleaned = out;
     loop {
         let next = cleaned
@@ -98,11 +96,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn speech_normalizer_fixes_am_pm_stutter() {
-        // The reported bug: "10 a.m., and" was voiced as a "pee-em-comma" stutter.
+    fn meridiems_become_user_tuned_phonetics() {
+        // The reported bug chain: "10 a.m.," stuttered; "AM" read as a word;
+        // "ay em" read as "eye em" — the user picked "a em".
         assert_eq!(
             normalize_speech_text("I have you booked for 10 a.m., and we'll call you."),
-            "I have you booked for 10 ay em, and we'll call you."
+            "I have you booked for 10 a em, and we'll call you."
         );
         assert_eq!(normalize_speech_text("See you at 2 p.m."), "See you at 2 pee em.");
         assert_eq!(normalize_speech_text("See you at 2 P.M.!"), "See you at 2 pee em!");
@@ -113,15 +112,14 @@ mod tests {
         // Sentence boundary after the abbreviation survives as ONE period.
         assert_eq!(
             normalize_speech_text("Booked for 10 a.m.. Anything else?"),
-            "Booked for 10 ay em. Anything else?"
+            "Booked for 10 a em. Anything else?"
         );
     }
 
     #[test]
-    fn speech_normalizer_converts_bare_am_pm_only_after_a_time() {
-        // The LLM often writes the meridiem without dots — still phonetic.
-        assert_eq!(normalize_speech_text("see you at 10 AM."), "see you at 10 ay em.");
-        assert_eq!(normalize_speech_text("booked for 10am sharp"), "booked for 10 ay em sharp");
+    fn bare_am_pm_only_converts_after_a_time() {
+        assert_eq!(normalize_speech_text("see you at 10 AM."), "see you at 10 a em.");
+        assert_eq!(normalize_speech_text("booked for 10am sharp"), "booked for 10 a em sharp");
         assert_eq!(normalize_speech_text("at 10:30 PM tonight"), "at 10:30 pee em tonight");
         // NOT times — never rewritten.
         assert_eq!(normalize_speech_text("I AM HERE"), "I AM HERE");
@@ -130,11 +128,9 @@ mod tests {
     }
 
     #[test]
-    fn speech_normalizer_leaves_words_and_strips_markdown() {
-        // Names and words containing am/pm are untouched.
+    fn words_survive_and_markdown_is_stripped() {
         assert_eq!(normalize_speech_text("Sam. said hi"), "Sam. said hi");
         assert_eq!(normalize_speech_text("the spam. filter"), "the spam. filter");
-        // Markdown residue is dropped.
         assert_eq!(normalize_speech_text("**Great** — see you `then`"), "Great — see you then");
     }
 }
