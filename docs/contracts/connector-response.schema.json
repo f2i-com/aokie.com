@@ -29,6 +29,7 @@
                 "connector_missing",
                 "connector_unavailable",
                 "command_failed",
+                "stale_call",
                 "ipc_unavailable",
                 "auth_required"
               ],
