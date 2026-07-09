@@ -3,6 +3,8 @@
 //! Kept dependency-free so the default plugin build can compile and test the
 //! parsing logic without enabling the heavy `voice` feature.
 
+pub use aokie_core::speech::normalize_speech_text;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WavPcm {
     pub samples: Vec<i16>,

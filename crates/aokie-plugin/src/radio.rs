@@ -703,6 +703,10 @@ fn tts_speak(
     if sample_rate == 0 || text.trim().is_empty() {
         return none;
     }
+    // Speech-normalize ONCE at the chokepoint (greeting, agent sentences and
+    // operatorSpeak all funnel through here): "10 a.m.," → "10 AM," — dotted
+    // abbreviations against punctuation make the TTS stutter audibly.
+    let text = &crate::speech_wire::normalize_speech_text(text);
     // Voice from AOKIE_TTS_VOICE, shared by HTTP and in-process synthesis.
     let voice = std::env::var("AOKIE_TTS_VOICE").unwrap_or_default();
     if let Some(endpoint) = http_tts.fallback.endpoint_for_call().map(str::to_string) {

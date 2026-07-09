@@ -24,6 +24,7 @@ pub mod paths;
 pub mod redact;
 pub mod retention;
 pub mod secrets;
+pub mod speech;
 pub mod url_classification;
 
 /// CI-style guard: this crate must stay tauri-free so downstream
