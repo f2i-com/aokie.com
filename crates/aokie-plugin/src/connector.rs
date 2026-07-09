@@ -718,10 +718,20 @@ impl Plugin {
                 )?;
                 call.state = MockCallState::Ended;
                 let (corr, turns) = (call.correlation_id.clone(), call.turns);
+                let call_from = call.caller.clone();
                 let ev = aokie_event(
                     "aokie.call.ended",
                     &corr,
-                    json!({"at": now_iso8601(), "turns": turns, "reason": "operator_hangup"}),
+                    json!({
+                        "at": now_iso8601(),
+                        "turns": turns,
+                        "reason": "operator_hangup",
+                        "callId": corr,
+                        "from": call_from,
+                        "callerPhone": call_from,
+                        "durationSeconds": 30,
+                        "outcome": "completed",
+                    }),
                 );
                 emit_event(sink, &self.outbox, &ev, false).map_err(CmdError::failed)?;
                 Ok(json!({"ended": true}))
@@ -948,7 +958,16 @@ impl Plugin {
             aokie_event(
                 "aokie.call.ended",
                 &corr,
-                json!({"at": now_iso8601(), "durationMs": 42_000, "turns": 2}),
+                json!({
+                    "at": now_iso8601(),
+                    "durationMs": 42_000,
+                    "turns": 2,
+                    "callId": corr,
+                    "from": caller,
+                    "callerPhone": caller,
+                    "durationSeconds": 42,
+                    "outcome": "completed",
+                }),
             ),
         )?;
         if let Some(call) = self.mock.current_call.as_mut() {
