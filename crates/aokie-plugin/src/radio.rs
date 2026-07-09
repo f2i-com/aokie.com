@@ -4,7 +4,7 @@
 //! [`aokie_dongle::bluetooth::BluetoothManager`]) on a dedicated background
 //! thread, maps its `BluetoothEvent`s onto the `aokie.*` Desktop-event
 //! contract (emitted straight to stdout **and** the durable outbox), and
-//! accepts control requests — answer / reject / hangup / send-SMS / speak —
+//! accepts control requests â€” answer / reject / hangup / send-SMS / speak â€”
 //! from the main RPC thread over an mpsc channel.
 //!
 //! ## Why a second `Outbox` + `StdoutSink` on this thread
@@ -13,7 +13,7 @@
 //! next RPC. `StdoutSink` writes one whole line under the stdout lock
 //! (line-atomic), so this thread's sink and the main thread's sink never
 //! interleave. The [`Outbox`] here is a *second* SQLite connection to the
-//! same `outbox.sqlite` file — `idempotency_key` is UNIQUE and SQLite
+//! same `outbox.sqlite` file â€” `idempotency_key` is UNIQUE and SQLite
 //! serialises writers, so essential call/SMS records survive a Desktop
 //! restart exactly as they do on the command path.
 //!
@@ -34,15 +34,20 @@ use crate::outbox::Outbox;
 /// A control request from the main RPC thread to the radio thread. Every
 /// variant is fire-and-forget: the *result* of the action arrives back as an
 /// asynchronous `aokie.*` event from the radio thread, matching the mock
-/// contract (`call.answer` → later `aokie.call.answered`, etc.).
+/// contract (`call.answer` â†’ later `aokie.call.answered`, etc.).
 pub enum RadioControl {
     Answer,
     Reject,
     Hangup,
-    SendSms { to: String, body: String },
-    /// Speak text to the caller. Stage 1 acknowledges + logs; the TTS →
+    SendSms {
+        to: String,
+        body: String,
+    },
+    /// Speak text to the caller. Stage 1 acknowledges + logs; the TTS â†’
     /// SCO audio path is wired in Stage 2.
-    Speak { text: String },
+    Speak {
+        text: String,
+    },
     /// Live-reconfigure the in-plugin voice agent without a reconnect. Each
     /// field is `Some` only when it changed; `None` leaves the current value
     /// alone. A flow (or `settings.set`) pushes this so the receptionist's
@@ -54,18 +59,20 @@ pub enum RadioControl {
         voice: Option<String>,
         model: Option<String>,
         endpoint: Option<String>,
+        stt_endpoint: Option<String>,
+        tts_endpoint: Option<String>,
     },
     Shutdown,
 }
 
 /// Default receptionist system prompt when none is configured (voice build). A
 /// goal-directed SCRIPT, not just a style: greet, get the caller's name and
-/// reason, capture the key details, and book them in or take a message — one
+/// reason, capture the key details, and book them in or take a message â€” one
 /// short spoken question at a time. Editable live via the `persona` setting /
 /// a flow push, so most deployments override this.
 #[cfg(all(target_os = "windows", feature = "voice"))]
 const DEFAULT_AGENT_PERSONA: &str = "You are a warm, efficient phone receptionist for a small \
-business, speaking out loud on a live phone call. Reply with ONE short, natural spoken sentence — no \
+business, speaking out loud on a live phone call. Reply with ONE short, natural spoken sentence â€” no \
 lists, markdown, or emoji. Your job: greet the caller, find out their name and how you can help, \
 capture the key details (what they need, and a callback number or time if relevant), and either book \
 them in or take a message. Ask only ONE clear question at a time and keep the conversation moving.";
@@ -84,7 +91,7 @@ pub struct RadioStatus {
     /// Devices seen connected during this radio session (the durable link
     /// keys live in the aokie pairing store; this is the live view).
     pub paired: Mutex<Vec<PairedDevice>>,
-    /// Last fatal reason the radio reported (no dongle, driver not bound, …).
+    /// Last fatal reason the radio reported (no dongle, driver not bound, â€¦).
     pub last_error: Mutex<Option<String>>,
 }
 
@@ -180,7 +187,7 @@ fn emit_turn(
 }
 
 /// Heuristic self-echo guard for the in-plugin agent: true when `caller` (a fresh
-/// transcript) is mostly the same words as Aokie's last spoken reply `bot` — i.e.
+/// transcript) is mostly the same words as Aokie's last spoken reply `bot` â€” i.e.
 /// Aokie's own TTS leaked back into the mic and STT transcribed it. Keeps Aokie
 /// from answering itself if any audio escapes the half-duplex mute.
 #[cfg(feature = "voice")]
@@ -204,7 +211,7 @@ fn looks_like_echo(caller: &str, bot: &str) -> bool {
     (overlap as f32 / c.len() as f32) >= 0.7
 }
 
-// ── Windows: the real radio ──────────────────────────────────────────────
+// â”€â”€ Windows: the real radio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Start the live radio on a background thread. Returns immediately with a
 /// handle; initialisation happens asynchronously and is reflected in
@@ -229,8 +236,8 @@ pub fn spawn(
 
     std::thread::Builder::new()
         .name("aokie-plugin-radio".to_string())
-        // Match the runtime thread's generous stack — the deep ACL → L2CAP →
-        // RFCOMM → HFP dispatch overflowed the 1 MiB Windows default.
+        // Match the runtime thread's generous stack â€” the deep ACL â†’ L2CAP â†’
+        // RFCOMM â†’ HFP dispatch overflowed the 1 MiB Windows default.
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             // Software "virtual replug": on a cold boot the dongle's SCO iso
@@ -242,7 +249,7 @@ pub fn spawn(
             if let Some(hwid) = reenumerate_hwid.as_deref() {
                 match aokie_dongle::winusb::restart_device(hwid) {
                     Ok(()) => {
-                        eprintln!("[aokie-plugin] restarted {hwid} (virtual replug: remove + re-add) — settling 3s");
+                        eprintln!("[aokie-plugin] restarted {hwid} (virtual replug: remove + re-add) â€” settling 3s");
                         std::thread::sleep(std::time::Duration::from_millis(3000));
                     }
                     Err(e) => eprintln!("[aokie-plugin] virtual replug {hwid} failed (continuing): {e}"),
@@ -280,7 +287,7 @@ pub fn spawn(
 }
 
 /// A short two-note chime (mono i16 at the SCO sample rate) used to verify the
-/// OUTBOUND SCO audio path actually reaches the caller on a given dongle — real
+/// OUTBOUND SCO audio path actually reaches the caller on a given dongle â€” real
 /// TTS speech replaces it once outbound audio is confirmed. Fades each note in
 /// and out to avoid clicks.
 #[cfg(target_os = "windows")]
@@ -291,7 +298,7 @@ fn greeting_tone(sample_rate: u16) -> Vec<i16> {
         let n = (sr * secs) as usize;
         for i in 0..n {
             let t = i as f32 / sr;
-            let env = ((i as f32 / n as f32) * std::f32::consts::PI).sin(); // 0→1→0
+            let env = ((i as f32 / n as f32) * std::f32::consts::PI).sin(); // 0â†’1â†’0
             let s = (2.0 * std::f32::consts::PI * freq * t).sin() * env * 0.6;
             out.push((s * i16::MAX as f32) as i16);
         }
@@ -307,12 +314,191 @@ struct SpeakOutcome {
     barged: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
+struct HttpSpeechFallback {
+    endpoint: Option<String>,
+    failed_for_call: bool,
+}
+
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
+impl HttpSpeechFallback {
+    fn new(endpoint: Option<String>) -> Self {
+        Self {
+            endpoint: normalize_endpoint(endpoint),
+            failed_for_call: false,
+        }
+    }
+
+    fn from_env(var: &str) -> Self {
+        Self::new(std::env::var(var).ok())
+    }
+
+    fn configure(&mut self, endpoint: Option<String>) {
+        let endpoint = normalize_endpoint(endpoint);
+        if endpoint != self.endpoint {
+            self.endpoint = endpoint;
+            self.failed_for_call = false;
+        }
+    }
+
+    fn reset_call(&mut self) {
+        self.failed_for_call = false;
+    }
+
+    fn endpoint_for_call(&self) -> Option<&str> {
+        if self.failed_for_call {
+            None
+        } else {
+            self.endpoint.as_deref()
+        }
+    }
+
+    fn mark_failed_for_call(&mut self) -> bool {
+        if self.endpoint.is_some() && !self.failed_for_call {
+            self.failed_for_call = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
+fn normalize_endpoint(endpoint: Option<String>) -> Option<String> {
+    endpoint
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(feature = "voice")]
+enum SttWork {
+    Utterance(Vec<f32>),
+    Configure { endpoint: Option<String> },
+    ResetCall,
+}
+
+#[cfg(feature = "voice")]
+struct HttpTtsRuntime {
+    fallback: HttpSpeechFallback,
+    client: reqwest::blocking::Client,
+}
+
+#[cfg(feature = "voice")]
+impl HttpTtsRuntime {
+    fn from_env(var: &str) -> Self {
+        Self {
+            fallback: HttpSpeechFallback::from_env(var),
+            client: http_speech_client(),
+        }
+    }
+
+    fn configure(&mut self, endpoint: Option<String>) {
+        self.fallback.configure(endpoint);
+    }
+
+    fn reset_call(&mut self) {
+        self.fallback.reset_call();
+    }
+}
+
+#[cfg(feature = "voice")]
+fn http_speech_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
+#[cfg(feature = "voice")]
+fn http_stt_transcribe(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    samples_16k: &[f32],
+) -> Result<String, String> {
+    let pcm: Vec<i16> = samples_16k
+        .iter()
+        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+        .collect();
+    let wav = crate::speech_wire::encode_wav_pcm16_mono(&pcm, 16_000);
+    let audio = format!(
+        "data:audio/wav;base64,{}",
+        crate::speech_wire::base64_encode(&wav)
+    );
+    let resp = client
+        .post(endpoint)
+        .json(&serde_json::json!({ "audio": audio }))
+        .send()
+        .map_err(|e| format!("stt http request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("stt http responded {}", resp.status()));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("stt http response was not JSON: {e}"))?;
+    Ok(v.get("text")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| "stt http response missing text".to_string())?
+        .trim()
+        .to_string())
+}
+
+#[cfg(feature = "voice")]
+fn http_tts_synthesize(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    text: &str,
+    voice: &str,
+) -> Result<crate::speech_wire::WavPcm, String> {
+    let resp = client
+        .post(endpoint)
+        .json(&serde_json::json!({ "input": text, "voice": voice }))
+        .send()
+        .map_err(|e| format!("tts http request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("tts http responded {}", resp.status()));
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let bytes = resp
+        .bytes()
+        .map_err(|e| format!("tts http response read failed: {e}"))?
+        .to_vec();
+    let looks_json = bytes.iter().find(|b| !b.is_ascii_whitespace()).copied() == Some(b'{');
+    let audio_bytes = if content_type.contains("json") || looks_json {
+        decode_tts_json_audio(&bytes)?
+    } else {
+        bytes
+    };
+    let wav = crate::speech_wire::decode_wav_mono_i16(&audio_bytes)?;
+    if wav.samples.is_empty() {
+        return Err("tts http response contained no audio samples".to_string());
+    }
+    Ok(wav)
+}
+
+#[cfg(feature = "voice")]
+fn decode_tts_json_audio(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let v: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| format!("tts http JSON response parse failed: {e}"))?;
+    let audio = v
+        .get("b64_json")
+        .or_else(|| v.get("audio"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "tts http JSON response missing b64_json/audio".to_string())?;
+    crate::speech_wire::base64_decode_text(audio)
+}
+
 /// Feed one captured mic chunk through the echo canceller and update the
 /// sustained-speech counter, returning `true` once the caller has spoken over
 /// Aokie for `need` frames straight. `armed` gates the counting so the adaptive
 /// filter has time to converge at a reply's onset (we still call
-/// `process_capture` while un-armed — to keep the reference FIFO aligned with
-/// capture — but never trip). Shared by the synth callback and the playout monitor.
+/// `process_capture` while un-armed â€” to keep the reference FIFO aligned with
+/// capture â€” but never trip). Shared by the synth callback and the playout monitor.
 #[cfg(all(target_os = "windows", feature = "voice"))]
 fn detect_barge(
     aec: &mut crate::aec::EchoCanceller,
@@ -340,11 +526,155 @@ fn detect_barge(
     false
 }
 
+#[cfg(all(target_os = "windows", feature = "voice"))]
+struct TtsChunkPlayback {
+    t0: std::time::Instant,
+    t_first: std::time::Instant,
+    first: bool,
+    samples: usize,
+    barged: bool,
+    frame: usize,
+    speech_frames: u32,
+    need: u32,
+    grace: std::time::Duration,
+}
+
+#[cfg(all(target_os = "windows", feature = "voice"))]
+impl TtsChunkPlayback {
+    fn new(sample_rate: u16) -> Self {
+        let t0 = std::time::Instant::now();
+        Self {
+            t0,
+            t_first: t0,
+            first: true,
+            samples: 0,
+            barged: false,
+            frame: (sample_rate as usize / 100).max(80),
+            speech_frames: 0,
+            need: 22,
+            grace: std::time::Duration::from_millis(350),
+        }
+    }
+
+    fn push(
+        &mut self,
+        bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+        aec: &mut Option<&mut crate::aec::EchoCanceller>,
+        barge_rms: Option<f32>,
+        pcm: &[i16],
+    ) -> bool {
+        if pcm.is_empty() {
+            return !self.barged;
+        }
+        if self.first {
+            eprintln!(
+                "[aokie-plugin] speaking (first audio in {:?})",
+                self.t0.elapsed()
+            );
+            self.first = false;
+            self.t_first = std::time::Instant::now();
+        }
+        if let Some(a) = aec.as_deref_mut() {
+            a.feed_reference(pcm);
+        }
+        bt.send_audio(pcm);
+        self.samples += pcm.len();
+
+        // Full-duplex: drain + echo-cancel the mic as we feed (keeps the
+        // reference FIFO aligned with capture) and watch for the caller talking
+        // over us.
+        if let (Some(a), Some(thr)) = (aec.as_deref_mut(), barge_rms) {
+            let armed = self.t_first.elapsed() >= self.grace;
+            while let Some(rx) = bt.try_recv_audio() {
+                if detect_barge(
+                    a,
+                    &rx.samples,
+                    self.frame,
+                    thr,
+                    armed,
+                    &mut self.speech_frames,
+                    self.need,
+                ) {
+                    self.barged = true;
+                    break;
+                }
+            }
+        }
+        !self.barged
+    }
+
+    fn finish(
+        mut self,
+        bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+        aec: &mut Option<&mut crate::aec::EchoCanceller>,
+        barge_rms: Option<f32>,
+        text: &str,
+        sample_rate: u16,
+    ) -> SpeakOutcome {
+        use std::time::Duration;
+
+        // Playout monitor (full-duplex): synthesis can outrun realtime, so a
+        // short reply may still be draining from the SCO queue after the chunks
+        // have all been queued. Keep polling the mic through the AEC until it
+        // has played out.
+        if let (Some(a), Some(thr)) = (aec.as_deref_mut(), barge_rms) {
+            if !self.barged {
+                let playout =
+                    Duration::from_secs_f32(self.samples as f32 / sample_rate.max(1) as f32);
+                let deadline = self.t_first + playout;
+                while std::time::Instant::now() < deadline {
+                    let armed = self.t_first.elapsed() >= self.grace;
+                    let mut got = false;
+                    while let Some(rx) = bt.try_recv_audio() {
+                        got = true;
+                        if detect_barge(
+                            a,
+                            &rx.samples,
+                            self.frame,
+                            thr,
+                            armed,
+                            &mut self.speech_frames,
+                            self.need,
+                        ) {
+                            self.barged = true;
+                            break;
+                        }
+                    }
+                    if self.barged {
+                        break;
+                    }
+                    if !got {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "[aokie-plugin] spoke ({} chars -> {} samples @ {}Hz, synth {:?}{})",
+            text.chars().count(),
+            self.samples,
+            sample_rate,
+            self.t0.elapsed(),
+            if self.barged { ", BARGED-IN" } else { "" }
+        );
+        SpeakOutcome {
+            dur: Duration::from_secs_f32(self.samples as f32 / sample_rate.max(1) as f32),
+            barged: self.barged,
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn http_tts_chunk_samples(sample_rate: u16) -> usize {
+    (sample_rate as usize / 50).max(160)
+}
+
 /// Voice build only: synthesize + stream `text` to SCO with the in-process TTS
 /// engine (loaded lazily on first use). When `aec`/`barge_rms` are set (full-
 /// duplex mode) it feeds each played chunk as the echo reference, echo-cancels
-/// the inbound mic, and watches for the caller starting to speak over Aokie —
-/// both while synthesizing AND through the queued playout tail — returning
+/// the inbound mic, and watches for the caller starting to speak over Aokie â€”
+/// both while synthesizing AND through the queued playout tail â€” returning
 /// `barged: true` and stopping early if so. With them `None` it's the plain
 /// half-duplex stream (caller relies on the mute). No-op with no SCO channel
 /// (sample_rate 0) or empty text.
@@ -352,15 +682,46 @@ fn detect_barge(
 fn tts_speak(
     bt: &mut aokie_dongle::bluetooth::BluetoothManager,
     tts: &mut Option<crate::voice::TtsEngine>,
+    http_tts: &mut HttpTtsRuntime,
     text: &str,
     sample_rate: u16,
     mut aec: Option<&mut crate::aec::EchoCanceller>,
     barge_rms: Option<f32>,
 ) -> SpeakOutcome {
     use std::time::Duration;
-    let none = SpeakOutcome { dur: Duration::ZERO, barged: false };
+    let none = SpeakOutcome {
+        dur: Duration::ZERO,
+        barged: false,
+    };
     if sample_rate == 0 || text.trim().is_empty() {
         return none;
+    }
+    // Voice from AOKIE_TTS_VOICE, shared by HTTP and in-process synthesis.
+    let voice = std::env::var("AOKIE_TTS_VOICE").unwrap_or_default();
+    if let Some(endpoint) = http_tts.fallback.endpoint_for_call().map(str::to_string) {
+        match http_tts_synthesize(&http_tts.client, &endpoint, text, &voice) {
+            Ok(wav) => {
+                let pcm = crate::speech_wire::resample_i16_mono(
+                    &wav.samples,
+                    wav.sample_rate,
+                    sample_rate as u32,
+                );
+                let mut playback = TtsChunkPlayback::new(sample_rate);
+                for chunk in pcm.chunks(http_tts_chunk_samples(sample_rate)) {
+                    if !playback.push(bt, &mut aec, barge_rms, chunk) {
+                        break;
+                    }
+                }
+                return playback.finish(bt, &mut aec, barge_rms, text, sample_rate);
+            }
+            Err(e) => {
+                if http_tts.fallback.mark_failed_for_call() {
+                    eprintln!(
+                        "[aokie-plugin] HTTP TTS failed at {endpoint}: {e}; falling back to in-process TTS for this call"
+                    );
+                }
+            }
+        }
     }
     if tts.is_none() {
         match crate::voice::TtsEngine::load() {
@@ -379,88 +740,19 @@ fn tts_speak(
         None => return none,
     };
     // Stream each chunk to the SCO queue as synthesized so the caller hears the
-    // reply start on the first chunk (~0.3s). Voice from AOKIE_TTS_VOICE.
-    let voice = std::env::var("AOKIE_TTS_VOICE").unwrap_or_default();
-    let t0 = std::time::Instant::now();
-    let mut first = true;
-    let mut t_first = t0;
-    let mut samples = 0usize;
-    let mut barged = false;
-    // Barge-in detection tuning (full-duplex only).
-    let frame = (sample_rate as usize / 100).max(80); // ~10ms cleaned-mic frame
-    let mut speech_frames = 0u32;
-    let need = 22u32; // ~220ms of sustained caller speech = a real interruption
-    let grace = Duration::from_millis(350); // let the AEC converge before arming
+    // reply start on the first chunk (~0.3s).
+    let mut playback = TtsChunkPlayback::new(sample_rate);
     let synth = engine.synthesize_streaming(text, &voice, sample_rate as u32, |pcm| {
-        if first {
-            eprintln!("[aokie-plugin] speaking (first audio in {:?})", t0.elapsed());
-            first = false;
-            t_first = std::time::Instant::now();
-        }
-        if let Some(a) = aec.as_deref_mut() {
-            a.feed_reference(pcm);
-        }
-        bt.send_audio(pcm);
-        samples += pcm.len();
-        // Full-duplex: drain + echo-cancel the mic as we feed (keeps the reference
-        // FIFO aligned with capture) and watch for the caller talking over us.
-        if let (Some(a), Some(thr)) = (aec.as_deref_mut(), barge_rms) {
-            let armed = t_first.elapsed() >= grace;
-            while let Some(rx) = bt.try_recv_audio() {
-                if detect_barge(a, &rx.samples, frame, thr, armed, &mut speech_frames, need) {
-                    barged = true;
-                    break;
-                }
-            }
-        }
-        !barged
+        playback.push(bt, &mut aec, barge_rms, pcm)
     });
     if let Err(e) = synth {
         eprintln!("[aokie-plugin] TTS synthesis failed: {e}");
         return none;
     }
-    // Playout monitor (full-duplex): synthesis outruns realtime, so a short reply
-    // is still draining from the SCO queue after synth returns. Keep polling the
-    // mic through the AEC until it has played out — otherwise a caller interrupting
-    // during that tail (the common case for a one-sentence reply) goes unheard.
-    if let (Some(a), Some(thr)) = (aec.as_deref_mut(), barge_rms) {
-        if !barged {
-            let playout = Duration::from_secs_f32(samples as f32 / sample_rate.max(1) as f32);
-            let deadline = t_first + playout;
-            while std::time::Instant::now() < deadline {
-                let armed = t_first.elapsed() >= grace;
-                let mut got = false;
-                while let Some(rx) = bt.try_recv_audio() {
-                    got = true;
-                    if detect_barge(a, &rx.samples, frame, thr, armed, &mut speech_frames, need) {
-                        barged = true;
-                        break;
-                    }
-                }
-                if barged {
-                    break;
-                }
-                if !got {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-        }
-    }
-    eprintln!(
-        "[aokie-plugin] spoke ({} chars → {} samples @ {}Hz, synth {:?}{})",
-        text.chars().count(),
-        samples,
-        sample_rate,
-        t0.elapsed(),
-        if barged { ", BARGED-IN" } else { "" }
-    );
-    SpeakOutcome {
-        dur: Duration::from_secs_f32(samples as f32 / sample_rate.max(1) as f32),
-        barged,
-    }
+    playback.finish(bt, &mut aec, barge_rms, text, sample_rate)
 }
 
-/// The radio poll loop: drain events → map+emit; buffer the incoming-call
+/// The radio poll loop: drain events â†’ map+emit; buffer the incoming-call
 /// emission until the caller id lands (or a short timeout); drain audio
 /// (Stage 2 feeds the AI here); service control requests. Runs until the
 /// control channel closes or a Shutdown is received.
@@ -485,26 +777,58 @@ fn run_loop(
     // never pays the ~200 MB model-load cost.
     #[cfg(feature = "voice")]
     let mut tts: Option<crate::voice::TtsEngine> = None;
+    #[cfg(feature = "voice")]
+    let mut http_tts = HttpTtsRuntime::from_env("AOKIE_TTS_ENDPOINT");
     // Which call we've already greeted, so the greeting plays exactly once.
     let mut greeted_corr: Option<String> = None;
     let _ = &greeting; // used only in the voice build / greeting block below
 
-    // ── Speech-to-text (voice build) ──────────────────────────────────────────
+    // â”€â”€ Speech-to-text (voice build) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // The caller's audio is transcribed OFF the radio loop: a worker thread owns
     // the heavy Parakeet engine (lazy-loaded on the first utterance) so a ~300 ms
     // transcription never stalls SCO I/O or control handling. The loop segments
     // utterances with a simple energy VAD and ships each finished one to the
     // worker; finished transcripts come back and become `aokie.call.turn.final`
-    // events — the hook a flow binds to drive the conversation.
+    // events â€” the hook a flow binds to drive the conversation.
     #[cfg(feature = "voice")]
     let (stt_tx, stt_result_rx) = {
-        let (utter_tx, utter_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let (utter_tx, utter_rx) = std::sync::mpsc::channel::<SttWork>();
         let (res_tx, res_rx) = std::sync::mpsc::channel::<String>();
+        let initial_stt_endpoint = std::env::var("AOKIE_STT_ENDPOINT").ok();
         std::thread::Builder::new()
             .name("aokie-stt".into())
             .spawn(move || {
                 let mut engine: Option<crate::voice::SttEngine> = None;
-                while let Ok(buf) = utter_rx.recv() {
+                let client = http_speech_client();
+                let mut http_stt = HttpSpeechFallback::new(initial_stt_endpoint);
+                while let Ok(work) = utter_rx.recv() {
+                    let buf = match work {
+                        SttWork::Utterance(buf) => buf,
+                        SttWork::Configure { endpoint } => {
+                            http_stt.configure(endpoint);
+                            continue;
+                        }
+                        SttWork::ResetCall => {
+                            http_stt.reset_call();
+                            continue;
+                        }
+                    };
+                    if let Some(endpoint) = http_stt.endpoint_for_call().map(str::to_string) {
+                        match http_stt_transcribe(&client, &endpoint, &buf) {
+                            Ok(text) if !text.is_empty() => {
+                                let _ = res_tx.send(text);
+                                continue;
+                            }
+                            Ok(_) => continue,
+                            Err(e) => {
+                                if http_stt.mark_failed_for_call() {
+                                    eprintln!(
+                                        "[aokie-plugin] HTTP STT failed at {endpoint}: {e}; falling back to in-process STT for this call"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if engine.is_none() {
                         match crate::voice::SttEngine::load() {
                             Ok(e) => {
@@ -551,20 +875,22 @@ fn run_loop(
             .unwrap_or(450),
     );
 
-    // ── In-plugin real-time voice agent ───────────────────────────────────────
+    // â”€â”€ In-plugin real-time voice agent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // When AOKIE_AI_RECEPTIONIST is set (from the `aiReceptionist` setting), the
-    // plugin answers the caller ITSELF — streaming the local LLM (reused from the
-    // desktop's llama.cpp/ollama) and speaking each sentence as it's generated —
+    // plugin answers the caller ITSELF â€” streaming the local LLM (reused from the
+    // desktop's llama.cpp/ollama) and speaking each sentence as it's generated â€”
     // instead of routing through a flow. Far lower latency. The pack's live-reply
     // flow binding must be disabled so the caller isn't answered twice.
     #[cfg(feature = "voice")]
     let agent_enabled = std::env::var_os("AOKIE_AI_RECEPTIONIST").is_some();
     #[cfg(feature = "voice")]
-    let mut agent_endpoint = std::env::var("AOKIE_AI_ENDPOINT").ok().filter(|s| !s.trim().is_empty());
+    let mut agent_endpoint = std::env::var("AOKIE_AI_ENDPOINT")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     // System prompt / script (AOKIE_AI_PERSONA from the `persona` setting, or a flow
     // push). Editable live via RadioControl::Configure. The default is a real
-    // receptionist SCRIPT — greet, get the caller's name + reason, capture details,
-    // book or take a message — not just a chat style, so it actively drives the call.
+    // receptionist SCRIPT â€” greet, get the caller's name + reason, capture details,
+    // book or take a message â€” not just a chat style, so it actively drives the call.
     #[cfg(feature = "voice")]
     let mut agent_persona = std::env::var("AOKIE_AI_PERSONA")
         .ok()
@@ -573,24 +899,26 @@ fn run_loop(
     // LLM model for the agent (AOKIE_AI_MODEL from `aiModel`, or a flow push). Empty
     // = auto-detect whatever the desktop's running LLM has loaded.
     #[cfg(feature = "voice")]
-    let mut agent_model = std::env::var("AOKIE_AI_MODEL").ok().filter(|s| !s.trim().is_empty());
+    let mut agent_model = std::env::var("AOKIE_AI_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     #[cfg(feature = "voice")]
     let mut agent_client: Option<crate::agent::LlmClient> = None;
     // Conversation history for the agent (OpenAI chat messages), reset per call.
     #[cfg(feature = "voice")]
     let mut history: Vec<serde_json::Value> = Vec::new();
-    // Aokie's last spoken line (greeting or reply) — for the self-echo guard.
+    // Aokie's last spoken line (greeting or reply) â€” for the self-echo guard.
     #[cfg(feature = "voice")]
     let mut last_bot_reply = String::new();
     // Half-duplex gate: while Aokie is speaking (+ a short tail) inbound audio is
     // discarded so we never transcribe our own TTS echoing back over the line.
     #[cfg(feature = "voice")]
     let mut mute_stt_until: Option<std::time::Instant> = None;
-    // ── Full-duplex / barge-in ────────────────────────────────────────────────
+    // â”€â”€ Full-duplex / barge-in â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // When AOKIE_BARGE_IN is set (the `bargeIn` setting) Aokie keeps LISTENING
     // while it speaks: outbound TTS is echo-cancelled from the inbound mic so the
     // caller can talk over the receptionist, which stops as soon as they do. Off
-    // by default → the proven half-duplex mute path above stays the norm. Only
+    // by default â†’ the proven half-duplex mute path above stays the norm. Only
     // meaningful with the agent on (it drives the interruptible reply loop).
     #[cfg(feature = "voice")]
     let barge_in = agent_enabled && std::env::var_os("AOKIE_BARGE_IN").is_some();
@@ -607,24 +935,26 @@ fn run_loop(
     let mut aec: Option<crate::aec::EchoCanceller> = None;
     // Monotonic transcript turn index (caller + bot share one sequence), reset
     // per call. 1-based to match the simulated-call convention (`turn.1.final`,
-    // `turn.2.final`, …) so real + simulated calls dedup + display identically.
+    // `turn.2.final`, â€¦) so real + simulated calls dedup + display identically.
     #[cfg(feature = "voice")]
     let mut turn_index: u32 = 1;
 
     // Per-call bookkeeping. `pending_incoming` holds a just-rung call whose
     // `aokie.call.incoming` we delay briefly so the CLIP (caller id) can be
-    // folded into its `from` field — matching the mock's `{from, at}` shape.
+    // folded into its `from` field â€” matching the mock's `{from, at}` shape.
     // `answered_corr` records the call we've already auto-answered so we
     // answer exactly once.
     //
-    // Auto-answer fires IMMEDIATELY when a call appears — NOT after a ring
-    // delay — because on some dongles the SCO/audio channel that comes up
+    // Auto-answer fires IMMEDIATELY when a call appears â€” NOT after a ring
+    // delay â€” because on some dongles the SCO/audio channel that comes up
     // right after the ring blocks the radio's main loop, so a late answer
     // never gets serviced. Answering in the brief pre-SCO window is what
     // gets the AT+ATA out. (Emitting `aokie.call.incoming` still waits for
     // the caller id; only the answer is hurried.)
     let mut caller_id: Option<String> = None;
     let mut current_corr: Option<String> = None;
+    #[cfg(feature = "voice")]
+    let mut voice_call_corr: Option<String> = None;
     let mut pending_incoming: Option<(String, Instant)> = None;
     let mut answered_corr: Option<String> = None;
     // Stage-2 diagnostic: which call we've played the outbound-audio test chime
@@ -647,6 +977,13 @@ fn run_loop(
             );
         }
 
+        #[cfg(feature = "voice")]
+        if voice_call_corr != current_corr {
+            voice_call_corr = current_corr.clone();
+            http_tts.reset_call();
+            let _ = stt_tx.send(SttWork::ResetCall);
+        }
+
         // Flush a buffered incoming call once the caller id is known or the
         // grace window elapses.
         if let Some((corr, since)) = pending_incoming.clone() {
@@ -666,7 +1003,7 @@ fn run_loop(
         }
 
         // Auto-answer ASAP: the instant a call is present and not yet answered,
-        // send the answer — before the audio channel comes up and freezes the
+        // send the answer â€” before the audio channel comes up and freezes the
         // loop. Answer exactly once per call (tracked by `answered_corr`).
         if auto_answer {
             match current_corr.as_deref() {
@@ -675,13 +1012,15 @@ fn run_loop(
                         && !status.call_active.load(Ordering::Relaxed) =>
                 {
                     match bt.answer_call() {
-                        Ok(()) => eprintln!("[aokie-plugin] auto-answered incoming call (immediate)"),
+                        Ok(()) => {
+                            eprintln!("[aokie-plugin] auto-answered incoming call (immediate)")
+                        }
                         Err(e) => eprintln!("[aokie-plugin] auto-answer failed: {e}"),
                     }
                     answered_corr = Some(corr.to_string());
                     idle = false;
                 }
-                None => answered_corr = None, // call cleared — ready for the next
+                None => answered_corr = None, // call cleared â€” ready for the next
                 _ => {}
             }
         }
@@ -737,7 +1076,8 @@ fn run_loop(
                             } else {
                                 (None, None)
                             };
-                            let out = tts_speak(bt, &mut tts, text, sr, aec_ref, brms);
+                            let out =
+                                tts_speak(bt, &mut tts, &mut http_tts, text, sr, aec_ref, brms);
                             if barge_in {
                                 if out.barged {
                                     bt.flush_tx_audio();
@@ -752,7 +1092,8 @@ fn run_loop(
                             stt_silence = Duration::ZERO;
                             emit_turn(outbox, sink, corr, turn_index, "bot", text);
                             turn_index += 1;
-                            history.push(serde_json::json!({ "role": "assistant", "content": text }));
+                            history
+                                .push(serde_json::json!({ "role": "assistant", "content": text }));
                             last_bot_reply = text.to_string();
                         }
                     }
@@ -780,7 +1121,7 @@ fn run_loop(
         while bt.try_recv_audio().is_some() {
             idle = false;
         }
-        // Voice build: energy-VAD segment the caller's speech → ship each finished
+        // Voice build: energy-VAD segment the caller's speech â†’ ship each finished
         // utterance to the STT worker. ~350 RMS (i16 units) gates speech; ~700 ms
         // of trailing silence ends an utterance; sub-350 ms blips are dropped.
         #[cfg(feature = "voice")]
@@ -816,9 +1157,8 @@ fn run_loop(
                 };
                 let rms = crate::voice::frame_rms(&samples);
                 let f16 = crate::voice::to_f32_16k(&samples, frame.sample_rate as u32);
-                let frame_dur = Duration::from_secs_f32(
-                    samples.len() as f32 / frame.sample_rate.max(1) as f32,
-                );
+                let frame_dur =
+                    Duration::from_secs_f32(samples.len() as f32 / frame.sample_rate.max(1) as f32);
                 if rms > SPEECH_RMS {
                     stt_had_speech = true;
                     stt_silence = Duration::ZERO;
@@ -833,16 +1173,16 @@ fn run_loop(
             }
             if stt_had_speech && stt_silence >= endpoint {
                 if stt_buf.len() >= 16_000 / 3 {
-                    let _ = stt_tx.send(std::mem::take(&mut stt_buf));
+                    let _ = stt_tx.send(SttWork::Utterance(std::mem::take(&mut stt_buf)));
                 } else {
                     stt_buf.clear();
                 }
                 stt_had_speech = false;
                 stt_silence = Duration::ZERO;
             }
-            // Finished transcripts → aokie.call.turn.final (the flow's conversation hook,
+            // Finished transcripts â†’ aokie.call.turn.final (the flow's conversation hook,
             // and the recording source). If the in-plugin agent is on, also answer
-            // the caller directly here — streaming the LLM + speaking each sentence.
+            // the caller directly here â€” streaming the LLM + speaking each sentence.
             while let Ok(text) = stt_result_rx.try_recv() {
                 idle = false;
                 if let Some(corr) = current_corr.clone() {
@@ -882,40 +1222,61 @@ fn run_loop(
                         }
                         if let Some(client) = agent_client.as_ref() {
                             let sr = bt.get_sample_rate();
-                            let mut messages =
-                                vec![serde_json::json!({ "role": "system", "content": agent_persona })];
+                            let mut messages = vec![
+                                serde_json::json!({ "role": "system", "content": agent_persona }),
+                            ];
                             messages.extend(history.iter().cloned());
                             // Half-duplex: mute STT for the WHOLE reply as it streams.
                             // Sentences synthesize faster than they play, so the audio
                             // keeps playing (queued) after synthesis finishes; muting
                             // only the last sentence let the tail echo back and Aokie
                             // answered itself. Track cumulative playback from t0.
-                            // Full-duplex (barge_in): no mute — the AEC keeps the mic
+                            // Full-duplex (barge_in): no mute â€” the AEC keeps the mic
                             // clean AND watches for the caller talking over the reply,
                             // cutting it short (flush the queued tail) the moment they do.
                             let t0 = Instant::now();
                             let mut reply_dur = Duration::ZERO;
                             let mut barged = false;
-                            eprintln!("[aokie-plugin] agent replying (streaming)…");
-                            let outcome = client.stream_reply(serde_json::json!(messages), |sentence| {
-                                eprintln!("[aokie-plugin] agent sentence (+{:?}): {sentence:?}", t0.elapsed());
-                                if barge_in {
-                                    let out =
-                                        tts_speak(bt, &mut tts, sentence, sr, aec.as_mut(), Some(barge_rms));
-                                    reply_dur += out.dur;
-                                    if out.barged {
-                                        bt.flush_tx_audio(); // stop the queued tail now
-                                        barged = true;
-                                        return false; // stop pulling from the LLM
+                            eprintln!("[aokie-plugin] agent replying (streaming)â€¦");
+                            let outcome =
+                                client.stream_reply(serde_json::json!(messages), |sentence| {
+                                    eprintln!(
+                                        "[aokie-plugin] agent sentence (+{:?}): {sentence:?}",
+                                        t0.elapsed()
+                                    );
+                                    if barge_in {
+                                        let out = tts_speak(
+                                            bt,
+                                            &mut tts,
+                                            &mut http_tts,
+                                            sentence,
+                                            sr,
+                                            aec.as_mut(),
+                                            Some(barge_rms),
+                                        );
+                                        reply_dur += out.dur;
+                                        if out.barged {
+                                            bt.flush_tx_audio(); // stop the queued tail now
+                                            barged = true;
+                                            return false; // stop pulling from the LLM
+                                        }
+                                    } else {
+                                        let out = tts_speak(
+                                            bt,
+                                            &mut tts,
+                                            &mut http_tts,
+                                            sentence,
+                                            sr,
+                                            None,
+                                            None,
+                                        );
+                                        reply_dur += out.dur;
+                                        let plays_until = (t0 + reply_dur).max(Instant::now());
+                                        mute_stt_until =
+                                            Some(plays_until + Duration::from_millis(600));
                                     }
-                                } else {
-                                    let out = tts_speak(bt, &mut tts, sentence, sr, None, None);
-                                    reply_dur += out.dur;
-                                    let plays_until = (t0 + reply_dur).max(Instant::now());
-                                    mute_stt_until = Some(plays_until + Duration::from_millis(600));
-                                }
-                                true
-                            });
+                                    true
+                                });
                             if !barge_in {
                                 // Cover audio still queued after the last chunk synthesized.
                                 let plays_until = (t0 + reply_dur).max(Instant::now());
@@ -924,7 +1285,9 @@ fn run_loop(
                             match outcome {
                                 Ok(full) if !full.trim().is_empty() => {
                                     let full = full.trim().to_string();
-                                    history.push(serde_json::json!({ "role": "assistant", "content": full }));
+                                    history.push(
+                                        serde_json::json!({ "role": "assistant", "content": full }),
+                                    );
                                     emit_turn(outbox, sink, &corr, turn_index, "bot", &full);
                                     turn_index += 1;
                                     last_bot_reply = full;
@@ -936,7 +1299,9 @@ fn run_loop(
                                         stt_had_speech = false;
                                         stt_silence = Duration::ZERO;
                                     } else {
-                                        eprintln!("[aokie-plugin] caller barged in — reply cut short");
+                                        eprintln!(
+                                            "[aokie-plugin] caller barged in â€” reply cut short"
+                                        );
                                     }
                                 }
                                 Ok(_) => {}
@@ -983,13 +1348,16 @@ fn run_loop(
                     if agent_enabled {
                         // The in-plugin agent owns the conversation, so ignore any
                         // operatorSpeak the flow still emits (its binding may be a
-                        // stale enabled-copy in the desktop's runtime cache) —
+                        // stale enabled-copy in the desktop's runtime cache) â€”
                         // otherwise the caller is answered twice.
-                        eprintln!("[aokie-plugin] ignoring operatorSpeak (agent owns replies): {text:?}");
+                        eprintln!(
+                            "[aokie-plugin] ignoring operatorSpeak (agent owns replies): {text:?}"
+                        );
                     } else {
                         let sr = bt.get_sample_rate();
-                        let out = tts_speak(bt, &mut tts, &text, sr, None, None);
-                        mute_stt_until = Some(Instant::now() + out.dur + Duration::from_millis(400));
+                        let out = tts_speak(bt, &mut tts, &mut http_tts, &text, sr, None, None);
+                        mute_stt_until =
+                            Some(Instant::now() + out.dur + Duration::from_millis(400));
                         stt_buf.clear();
                         stt_had_speech = false;
                         stt_silence = Duration::ZERO;
@@ -1001,11 +1369,19 @@ fn run_loop(
                     }
                     #[cfg(not(feature = "voice"))]
                     eprintln!(
-                        "[aokie-plugin] operatorSpeak ({} chars) — voice feature not built",
+                        "[aokie-plugin] operatorSpeak ({} chars) â€” voice feature not built",
                         text.chars().count()
                     );
                 }
-                Ok(RadioControl::Configure { persona, greeting: g, voice, model, endpoint }) => {
+                Ok(RadioControl::Configure {
+                    persona,
+                    greeting: g,
+                    voice,
+                    model,
+                    endpoint,
+                    stt_endpoint,
+                    tts_endpoint,
+                }) => {
                     // Live-reconfigure the agent from a flow / settings.set push. Each
                     // field is Some only when it changed. Greeting applies to the NEXT
                     // call; persona/voice/model take effect on the next caller turn.
@@ -1043,11 +1419,25 @@ fn run_loop(
                             // Force a reconnect with the new endpoint/model next turn.
                             agent_client = None;
                         }
-                        eprintln!("[aokie-plugin] agent reconfigured (persona/greeting/voice/model)");
+                        if let Some(e) = stt_endpoint {
+                            let _ = stt_tx.send(SttWork::Configure { endpoint: Some(e) });
+                        }
+                        if let Some(e) = tts_endpoint {
+                            http_tts.configure(Some(e));
+                        }
+                        eprintln!("[aokie-plugin] agent reconfigured (persona/greeting/voice/model/endpoints)");
                     }
                     #[cfg(not(feature = "voice"))]
                     {
-                        let _ = (persona, g, voice, model, endpoint);
+                        let _ = (
+                            persona,
+                            g,
+                            voice,
+                            model,
+                            endpoint,
+                            stt_endpoint,
+                            tts_endpoint,
+                        );
                     }
                 }
                 Ok(RadioControl::Shutdown) => return,
@@ -1086,7 +1476,11 @@ fn handle_event(
             emit(
                 outbox,
                 sink,
-                aokie_event("aokie.dongle.ready", "radio", json!({"address": addr, "source": "radio"})),
+                aokie_event(
+                    "aokie.dongle.ready",
+                    "radio",
+                    json!({"address": addr, "source": "radio"}),
+                ),
             );
         }
         E::DeviceConnected(addr) => {
@@ -1113,7 +1507,11 @@ fn handle_event(
             emit(
                 outbox,
                 sink,
-                aokie_event("aokie.phone.disconnected", "radio", json!({"address": addr})),
+                aokie_event(
+                    "aokie.phone.disconnected",
+                    "radio",
+                    json!({"address": addr}),
+                ),
             );
         }
         E::CallIncoming => {
@@ -1233,7 +1631,7 @@ fn handle_event(
     }
 }
 
-// ── Non-Windows: no radio ────────────────────────────────────────────────
+// â”€â”€ Non-Windows: no radio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[cfg(not(target_os = "windows"))]
 pub fn spawn(
@@ -1245,4 +1643,40 @@ pub fn spawn(
     _greeting: Option<String>,
 ) -> Result<RadioHandle, String> {
     Err("the Aokie radio is only supported on Windows (WinUSB)".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_speech_fallback_is_sticky_per_call() {
+        let mut state = HttpSpeechFallback::new(Some(
+            "  http://127.0.0.1:17920/v1/audio/speech  ".to_string(),
+        ));
+        assert_eq!(
+            state.endpoint_for_call(),
+            Some("http://127.0.0.1:17920/v1/audio/speech")
+        );
+
+        assert!(state.mark_failed_for_call());
+        assert_eq!(state.endpoint_for_call(), None);
+        assert!(!state.mark_failed_for_call());
+
+        state.reset_call();
+        assert_eq!(
+            state.endpoint_for_call(),
+            Some("http://127.0.0.1:17920/v1/audio/speech")
+        );
+
+        assert!(state.mark_failed_for_call());
+        state.configure(Some("http://127.0.0.1:17920/v1/audio/speech2".to_string()));
+        assert_eq!(
+            state.endpoint_for_call(),
+            Some("http://127.0.0.1:17920/v1/audio/speech2")
+        );
+
+        state.configure(Some("   ".to_string()));
+        assert_eq!(state.endpoint_for_call(), None);
+    }
 }

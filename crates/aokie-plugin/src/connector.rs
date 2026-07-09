@@ -26,6 +26,16 @@ pub const CONNECTOR_ID: &str = "aokie";
 /// Outbox DB file name inside the plugin data dir.
 pub const OUTBOX_FILE: &str = "outbox.sqlite";
 
+const RECEPTIONIST_CONFIG_KEYS: [&str; 7] = [
+    "persona",
+    "greeting",
+    "ttsVoice",
+    "aiModel",
+    "aiEndpoint",
+    "sttEndpoint",
+    "ttsEndpoint",
+];
+
 /// Typed connector-level error, surfaced as a JSON-RPC error with
 /// `error.data = {code, message}` (connector-response.schema.json
 /// codes; the plugin only ever produces `command_failed` and — for
@@ -186,7 +196,13 @@ impl Plugin {
         // AOKIE_HFP_CODEC env var; set it (in-process, before the radio thread
         // spawns) from the setting so the desktop-spawned plugin honours it
         // without the operator having to set an env var.
-        if let Some(codec) = self.store.config.settings.get("hfpCodec").and_then(|v| v.as_str()) {
+        if let Some(codec) = self
+            .store
+            .config
+            .settings
+            .get("hfpCodec")
+            .and_then(|v| v.as_str())
+        {
             let codec = codec.trim().to_ascii_lowercase();
             if !codec.is_empty() && codec != "auto" {
                 std::env::set_var("AOKIE_HFP_CODEC", &codec);
@@ -225,29 +241,65 @@ impl Plugin {
             std::env::set_var("AOKIE_AI_RECEPTIONIST", "1");
             eprintln!("[aokie-plugin] aiReceptionist ON → in-plugin streaming agent");
         }
-        if let Some(ep) = self.store.config.settings.get("aiEndpoint").and_then(|v| v.as_str()) {
-            if !ep.trim().is_empty() {
-                std::env::set_var("AOKIE_AI_ENDPOINT", ep.trim());
-            }
-        }
+        apply_endpoint_env_from_settings(
+            &self.store.config.settings,
+            "aiEndpoint",
+            "AOKIE_AI_ENDPOINT",
+        );
+        // Optional HTTP speech services. When set, the voice receptionist tries
+        // these before loading its in-process Parakeet / Pocket-TTS engines.
+        apply_endpoint_env_from_settings(
+            &self.store.config.settings,
+            "sttEndpoint",
+            "AOKIE_STT_ENDPOINT",
+        );
+        apply_endpoint_env_from_settings(
+            &self.store.config.settings,
+            "ttsEndpoint",
+            "AOKIE_TTS_ENDPOINT",
+        );
         // LLM model (`aiModel`); empty = auto-detect the desktop's loaded model.
-        if let Some(m) = self.store.config.settings.get("aiModel").and_then(|v| v.as_str()) {
+        if let Some(m) = self
+            .store
+            .config
+            .settings
+            .get("aiModel")
+            .and_then(|v| v.as_str())
+        {
             if !m.trim().is_empty() {
                 std::env::set_var("AOKIE_AI_MODEL", m.trim());
-                eprintln!("[aokie-plugin] aiModel setting → AOKIE_AI_MODEL={}", m.trim());
+                eprintln!(
+                    "[aokie-plugin] aiModel setting → AOKIE_AI_MODEL={}",
+                    m.trim()
+                );
             }
         }
-        if let Some(p) = self.store.config.settings.get("persona").and_then(|v| v.as_str()) {
+        if let Some(p) = self
+            .store
+            .config
+            .settings
+            .get("persona")
+            .and_then(|v| v.as_str())
+        {
             if !p.trim().is_empty() {
                 std::env::set_var("AOKIE_AI_PERSONA", p.trim());
             }
         }
         // TTS voice (pocket-tts predefined: alba/azelma/cosette/eponine/fantine/
         // javert/jean/marius, or a .wav path to clone). Empty = bundle default.
-        if let Some(v) = self.store.config.settings.get("ttsVoice").and_then(|v| v.as_str()) {
+        if let Some(v) = self
+            .store
+            .config
+            .settings
+            .get("ttsVoice")
+            .and_then(|v| v.as_str())
+        {
             if !v.trim().is_empty() {
                 std::env::set_var("AOKIE_TTS_VOICE", v.trim());
-                eprintln!("[aokie-plugin] ttsVoice setting → AOKIE_TTS_VOICE={}", v.trim());
+                eprintln!(
+                    "[aokie-plugin] ttsVoice setting → AOKIE_TTS_VOICE={}",
+                    v.trim()
+                );
             }
         }
         // Full-duplex / barge-in: when `bargeIn` is truthy AND the agent is on,
@@ -272,7 +324,10 @@ impl Plugin {
             .config
             .settings
             .get("bargeSensitivity")
-            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .and_then(|v| {
+                v.as_f64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
             .filter(|&v| v > 0.0)
         {
             std::env::set_var("AOKIE_BARGE_RMS", (rms as f32).to_string());
@@ -322,9 +377,18 @@ impl Plugin {
             .map(|s| s.to_string())
             .or_else(|| Some("Hello, thanks for calling. How can I help you today?".to_string()))
             .filter(|s| !s.trim().is_empty());
-        match crate::radio::spawn(self.data_dir.clone(), None, auto_answer, answer_tone, reenumerate_hwid, greeting) {
+        match crate::radio::spawn(
+            self.data_dir.clone(),
+            None,
+            auto_answer,
+            answer_tone,
+            reenumerate_hwid,
+            greeting,
+        ) {
             Ok(handle) => {
-                eprintln!("[aokie-plugin] live radio starting (real mode, auto_answer={auto_answer})");
+                eprintln!(
+                    "[aokie-plugin] live radio starting (real mode, auto_answer={auto_answer})"
+                );
                 self.radio = Some(handle);
             }
             Err(e) => eprintln!("[aokie-plugin] live radio unavailable: {e}"),
@@ -447,7 +511,9 @@ impl Plugin {
         if connector_id != CONNECTOR_ID {
             let err = CmdError {
                 code: "connector_missing",
-                message: format!("unknown connector: {connector_id:?} (this plugin serves \"aokie\")"),
+                message: format!(
+                    "unknown connector: {connector_id:?} (this plugin serves \"aokie\")"
+                ),
             };
             return connector_error_line(id, &err);
         }
@@ -571,7 +637,11 @@ impl Plugin {
                 // step. Ensure it's up and report readiness.
                 self.ensure_radio_started();
                 if let Some(radio) = self.radio.as_ref() {
-                    let status = if radio.is_initialized() { "discoverable" } else { "starting" };
+                    let status = if radio.is_initialized() {
+                        "discoverable"
+                    } else {
+                        "starting"
+                    };
                     return Ok(json!({
                         "status": status,
                         "deviceName": "Aokie AI Assistant",
@@ -604,9 +674,9 @@ impl Plugin {
             "call.current" => {
                 expect_fields(payload, &[])?;
                 if let Some(radio) = self.radio.as_ref() {
-                    let call = radio.current_caller().map(|from| {
-                        json!({"from": from, "active": radio.is_call_active()})
-                    });
+                    let call = radio
+                        .current_caller()
+                        .map(|from| json!({"from": from, "active": radio.is_call_active()}));
                     return Ok(json!({"call": call}));
                 }
                 Ok(json!({"call": self.mock.current_call.as_ref().map(call_json)}))
@@ -730,7 +800,10 @@ impl Plugin {
                     // aokie.sms.sent event (with its handle) is emitted by the
                     // radio thread when the AG acks the PUT.
                     radio
-                        .send(crate::radio::RadioControl::SendSms { to: to.clone(), body })
+                        .send(crate::radio::RadioControl::SendSms {
+                            to: to.clone(),
+                            body,
+                        })
                         .map_err(CmdError::failed)?;
                     return Ok(json!({"to": to, "status": "queued", "via": "radio"}));
                 }
@@ -781,22 +854,17 @@ impl Plugin {
                 // can push the Receptionist Settings — persona/greeting/voice/model —
                 // and have them take effect on the current call, no reconnect. Only
                 // the agent-shaping keys trip this; other settings just persist.
-                let agent_key = ["persona", "greeting", "ttsVoice", "aiModel", "aiEndpoint"]
-                    .iter()
-                    .any(|k| obj.contains_key(*k));
+                let agent_key = has_receptionist_config_key(obj);
                 if agent_key {
                     if let Some(radio) = self.radio.as_ref() {
-                        let str_of = |k: &str| {
-                            obj.get(k)
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        };
                         let _ = radio.send(crate::radio::RadioControl::Configure {
-                            persona: str_of("persona"),
-                            greeting: str_of("greeting"),
-                            voice: str_of("ttsVoice"),
-                            model: str_of("aiModel"),
-                            endpoint: str_of("aiEndpoint"),
+                            persona: string_setting(obj, "persona"),
+                            greeting: string_setting(obj, "greeting"),
+                            voice: string_setting(obj, "ttsVoice"),
+                            model: string_setting(obj, "aiModel"),
+                            endpoint: string_setting(obj, "aiEndpoint"),
+                            stt_endpoint: string_setting(obj, "sttEndpoint"),
+                            tts_endpoint: string_setting(obj, "ttsEndpoint"),
                         });
                     }
                 }
@@ -982,7 +1050,9 @@ impl Plugin {
                 "pid": pid,
                 "backend": "aokie-helper",
             })),
-            Err(e) => Err(CmdError::failed(format!("WinUSB driver install failed: {e}"))),
+            Err(e) => Err(CmdError::failed(format!(
+                "WinUSB driver install failed: {e}"
+            ))),
         }
     }
 
@@ -1001,13 +1071,17 @@ impl Plugin {
     fn list_connected_dongles(&self) -> (Vec<Value>, Option<String>) {
         match aokie_dongle::list_devices(true) {
             Ok(devices) => {
-                let known: std::collections::HashSet<(u16, u16)> = dongle_catalog::list_known_dongles()
-                    .iter()
-                    .map(|d| (d.vid, d.pid))
-                    .collect();
+                let known: std::collections::HashSet<(u16, u16)> =
+                    dongle_catalog::list_known_dongles()
+                        .iter()
+                        .map(|d| (d.vid, d.pid))
+                        .collect();
                 let out = devices
                     .into_iter()
-                    .filter(|d| known.contains(&(d.vid, d.pid)) || d.driver.to_lowercase().contains("winusb"))
+                    .filter(|d| {
+                        known.contains(&(d.vid, d.pid))
+                            || d.driver.to_lowercase().contains("winusb")
+                    })
                     .map(|d| {
                         json!({
                             "vid": d.vid,
@@ -1024,13 +1098,19 @@ impl Plugin {
                     .collect();
                 (out, None)
             }
-            Err(e) => (Vec::new(), Some(format!("live USB enumeration failed: {e}"))),
+            Err(e) => (
+                Vec::new(),
+                Some(format!("live USB enumeration failed: {e}")),
+            ),
         }
     }
 
     #[cfg(not(target_os = "windows"))]
     fn list_connected_dongles(&self) -> (Vec<Value>, Option<String>) {
-        (Vec::new(), Some("live USB enumeration is Windows-only".to_string()))
+        (
+            Vec::new(),
+            Some("live USB enumeration is Windows-only".to_string()),
+        )
     }
 
     fn outbox_counts(&self) -> Result<crate::outbox::OutboxCounts, CmdError> {
@@ -1094,6 +1174,28 @@ fn require_u16(obj: &Map<String, Value>, key: &str) -> Result<u16, CmdError> {
         .ok_or_else(|| CmdError::failed(format!("field {key} must be an integer in 0..=65535")))
 }
 
+fn apply_endpoint_env_from_settings(
+    settings: &Map<String, Value>,
+    setting_key: &str,
+    env_key: &str,
+) {
+    if let Some(ep) = settings.get(setting_key).and_then(Value::as_str) {
+        if !ep.trim().is_empty() {
+            std::env::set_var(env_key, ep.trim());
+        }
+    }
+}
+
+fn has_receptionist_config_key(obj: &Map<String, Value>) -> bool {
+    RECEPTIONIST_CONFIG_KEYS
+        .iter()
+        .any(|k| obj.contains_key(*k))
+}
+
+fn string_setting(obj: &Map<String, Value>, key: &str) -> Option<String> {
+    obj.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
 fn json_type_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -1110,6 +1212,8 @@ mod tests {
     use super::*;
     use crate::event_bridge::VecSink;
     use crate::outbox::OutboxStatus;
+
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn request(id: u64, method: &str, params: Value) -> RpcMessage {
         RpcMessage {
@@ -1203,7 +1307,10 @@ mod tests {
         let mut plugin = Plugin::ephemeral(false);
         let mut sink = VecSink::default();
         let resp = plugin
-            .handle_rpc(connector_request(1, "dongle.levitate", json!(null)), &mut sink)
+            .handle_rpc(
+                connector_request(1, "dongle.levitate", json!(null)),
+                &mut sink,
+            )
             .unwrap();
         let v = parse(&resp);
         assert_eq!(v["error"]["code"], json!(rpc::COMMAND_ERROR));
@@ -1370,7 +1477,11 @@ mod tests {
         let mut plugin = Plugin::ephemeral(false);
         let mut sink = VecSink::default();
         let err = plugin
-            .dispatch_command("dongle.diagnostics", &json!({"simulate": "call"}), &mut sink)
+            .dispatch_command(
+                "dongle.diagnostics",
+                &json!({"simulate": "call"}),
+                &mut sink,
+            )
             .unwrap_err();
         assert!(err.message.contains("dev mode"));
         assert!(sink.lines.is_empty());
@@ -1381,7 +1492,11 @@ mod tests {
         let mut plugin = Plugin::ephemeral(true);
         let mut sink = VecSink::default();
         let data = plugin
-            .dispatch_command("dongle.diagnostics", &json!({"simulate": "call"}), &mut sink)
+            .dispatch_command(
+                "dongle.diagnostics",
+                &json!({"simulate": "call"}),
+                &mut sink,
+            )
             .unwrap();
 
         // Contract §4 order.
@@ -1449,7 +1564,11 @@ mod tests {
         assert!(err.message.contains("no active call"));
 
         plugin
-            .dispatch_command("dongle.diagnostics", &json!({"simulate": "call"}), &mut sink)
+            .dispatch_command(
+                "dongle.diagnostics",
+                &json!({"simulate": "call"}),
+                &mut sink,
+            )
             .unwrap();
         // Scripted call already ended → answer fails typed.
         let err = plugin
@@ -1474,7 +1593,11 @@ mod tests {
         assert_eq!(data["call"]["state"], json!("active"));
 
         let data = plugin
-            .dispatch_command("call.operatorSpeak", &json!({"text": "One moment"}), &mut sink)
+            .dispatch_command(
+                "call.operatorSpeak",
+                &json!({"text": "One moment"}),
+                &mut sink,
+            )
             .unwrap();
         assert_eq!(data["spoken"], json!(true));
 
@@ -1498,11 +1621,19 @@ mod tests {
         let mut sink = VecSink::default();
 
         let err = plugin
-            .dispatch_command("sms.send", &json!({"to": "DROP TABLE", "body": "x"}), &mut sink)
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "DROP TABLE", "body": "x"}),
+                &mut sink,
+            )
             .unwrap_err();
         assert_eq!(err.code, "command_failed");
         let err = plugin
-            .dispatch_command("sms.send", &json!({"to": "+61432123456", "body": ""}), &mut sink)
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "+61432123456", "body": ""}),
+                &mut sink,
+            )
             .unwrap_err();
         assert!(err.message.contains("empty"));
         assert!(sink.lines.is_empty());
@@ -1566,7 +1697,10 @@ mod tests {
 
         // Persisted.
         let reloaded = ConfigStore::load(&plugin.data_dir);
-        assert_eq!(reloaded.config.settings.get("mockCalls"), Some(&json!(true)));
+        assert_eq!(
+            reloaded.config.settings.get("mockCalls"),
+            Some(&json!(true))
+        );
 
         // Invalid payloads.
         assert!(plugin
@@ -1575,6 +1709,56 @@ mod tests {
         assert!(plugin
             .dispatch_command("settings.set", &json!(null), &mut sink)
             .is_err());
+    }
+
+    #[test]
+    fn endpoint_settings_map_to_radio_env_vars() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("AOKIE_STT_ENDPOINT");
+        std::env::remove_var("AOKIE_TTS_ENDPOINT");
+
+        let mut settings = Map::new();
+        settings.insert(
+            "sttEndpoint".to_string(),
+            json!("  http://127.0.0.1:17920/v1/audio/transcriptions  "),
+        );
+        settings.insert("ttsEndpoint".to_string(), json!(""));
+
+        apply_endpoint_env_from_settings(&settings, "sttEndpoint", "AOKIE_STT_ENDPOINT");
+        apply_endpoint_env_from_settings(&settings, "ttsEndpoint", "AOKIE_TTS_ENDPOINT");
+
+        assert_eq!(
+            std::env::var("AOKIE_STT_ENDPOINT").unwrap(),
+            "http://127.0.0.1:17920/v1/audio/transcriptions"
+        );
+        assert!(std::env::var("AOKIE_TTS_ENDPOINT").is_err());
+
+        std::env::remove_var("AOKIE_STT_ENDPOINT");
+        std::env::remove_var("AOKIE_TTS_ENDPOINT");
+    }
+
+    #[test]
+    fn stt_and_tts_endpoint_settings_trigger_live_configure() {
+        let obj = json!({
+            "sttEndpoint": "http://127.0.0.1:17920/v1/audio/transcriptions",
+            "ttsEndpoint": "http://127.0.0.1:17920/v1/audio/speech"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        assert!(has_receptionist_config_key(&obj));
+        assert_eq!(
+            string_setting(&obj, "sttEndpoint").as_deref(),
+            Some("http://127.0.0.1:17920/v1/audio/transcriptions")
+        );
+        assert_eq!(
+            string_setting(&obj, "ttsEndpoint").as_deref(),
+            Some("http://127.0.0.1:17920/v1/audio/speech")
+        );
+
+        let obj = json!({"mockCalls": true}).as_object().unwrap().clone();
+        assert!(!has_receptionist_config_key(&obj));
     }
 
     #[test]

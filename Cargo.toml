@@ -7,6 +7,7 @@ members = [
     "crates/aokie-audio",
     "crates/aokie-db",
     "crates/aokie-ai",
+    "crates/aokie-voice-server",
     "crates/aokie-receptionist",
     "crates/aokie-plugin",
     # Vendored fork of andrewleech/transcribe-rs — the ONNX ASR engines

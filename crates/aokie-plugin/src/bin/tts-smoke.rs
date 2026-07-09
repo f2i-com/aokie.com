@@ -20,7 +20,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("[tts-smoke] loaded in {:?}; synthesizing {:?}", t0.elapsed(), text);
+    eprintln!(
+        "[tts-smoke] loaded in {:?}; synthesizing {:?}",
+        t0.elapsed(),
+        text
+    );
     let t1 = std::time::Instant::now();
     match eng.synthesize(&text, "", 16000) {
         Ok(pcm) => {
@@ -31,7 +35,11 @@ fn main() {
                 pcm.len() as f32 / 16000.0,
                 t1.elapsed(),
                 peak,
-                if peak > 100 { "REAL AUDIO" } else { "SILENT/near-silent" }
+                if peak > 100 {
+                    "REAL AUDIO"
+                } else {
+                    "SILENT/near-silent"
+                }
             );
         }
         Err(e) => {

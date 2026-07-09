@@ -17,8 +17,8 @@ fn contracts_dir() -> PathBuf {
 }
 
 fn load_json(path: &Path) -> Value {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
@@ -34,7 +34,10 @@ fn assert_valid(validator: &jsonschema::Validator, instance: &Value, what: &str)
             .iter_errors(instance)
             .map(|e| format!("{} at {}", e, e.instance_path))
             .collect();
-        panic!("{what} failed schema validation:\n{}\ninstance: {instance:#}", errors.join("\n"));
+        panic!(
+            "{what} failed schema validation:\n{}\ninstance: {instance:#}",
+            errors.join("\n")
+        );
     }
 }
 
@@ -119,7 +122,11 @@ fn mock_lifecycle_events_validate_against_desktop_event_schema() {
     let mut plugin = Plugin::ephemeral(true);
     let mut sink = VecSink::default();
     plugin
-        .dispatch_command("dongle.diagnostics", &json!({"simulate": "call"}), &mut sink)
+        .dispatch_command(
+            "dongle.diagnostics",
+            &json!({"simulate": "call"}),
+            &mut sink,
+        )
         .expect("simulated call runs in dev mode");
 
     // Exercise the manually-driven emitters too.
