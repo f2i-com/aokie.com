@@ -28,7 +28,11 @@ impl LlmClient {
         let model = model
             .filter(|m| !m.trim().is_empty())
             .or_else(|| discover_model(&client, &endpoint));
-        Self { client, endpoint, model }
+        Self {
+            client,
+            endpoint,
+            model,
+        }
     }
 
     pub fn endpoint(&self) -> &str {
@@ -131,7 +135,11 @@ fn sentence_end(s: &str) -> Option<usize> {
 /// First model id advertised at `<endpoint>/../models`.
 fn discover_model(client: &reqwest::blocking::Client, chat_endpoint: &str) -> Option<String> {
     let url = chat_endpoint.replace("/chat/completions", "/models");
-    let resp = client.get(&url).timeout(Duration::from_secs(4)).send().ok()?;
+    let resp = client
+        .get(&url)
+        .timeout(Duration::from_secs(4))
+        .send()
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }

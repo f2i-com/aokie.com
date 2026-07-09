@@ -110,10 +110,8 @@ mod tests {
 
     #[test]
     fn parses_request_with_id_and_params() {
-        let msg = parse_line(
-            r#"{"jsonrpc":"2.0","id":7,"method":"plugin.health","params":{}}"#,
-        )
-        .unwrap();
+        let msg =
+            parse_line(r#"{"jsonrpc":"2.0","id":7,"method":"plugin.health","params":{}}"#).unwrap();
         assert_eq!(msg.id, Some(json!(7)));
         assert_eq!(msg.method, "plugin.health");
         assert_eq!(msg.params, json!({}));
@@ -121,8 +119,7 @@ mod tests {
 
     #[test]
     fn parses_notification_without_id() {
-        let msg =
-            parse_line(r#"{"jsonrpc":"2.0","method":"event.ack","params":{"x":1}}"#).unwrap();
+        let msg = parse_line(r#"{"jsonrpc":"2.0","method":"event.ack","params":{"x":1}}"#).unwrap();
         assert_eq!(msg.id, None);
     }
 

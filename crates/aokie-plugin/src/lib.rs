@@ -25,15 +25,16 @@
 //! Hard rule from the SDK: **never write non-protocol output to
 //! stdout** — diagnostics go to stderr or `log.emit`.
 
+#[cfg(feature = "voice")]
+pub mod aec;
+#[cfg(feature = "voice")]
+pub mod agent;
 pub mod config;
 pub mod connector;
 pub mod event_bridge;
 pub mod outbox;
 pub mod radio;
 pub mod rpc;
-#[cfg(feature = "voice")]
-pub mod aec;
-#[cfg(feature = "voice")]
-pub mod agent;
+pub mod speech_wire;
 #[cfg(feature = "voice")]
 pub mod voice;
