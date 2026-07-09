@@ -365,18 +365,8 @@ impl Plugin {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string());
-        // Spoken greeting the receptionist plays on answer (voice build). Empty /
-        // unset = no greeting. Default a friendly line so the voice plugin greets
-        // out of the box.
-        let greeting = self
-            .store
-            .config
-            .settings
-            .get("greeting")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| Some("Hello, thanks for calling. How can I help you today?".to_string()))
-            .filter(|s| !s.trim().is_empty());
+        // Spoken greeting the receptionist plays on answer (voice build).
+        let greeting = greeting_from_settings(&self.store.config.settings);
         match crate::radio::spawn(
             self.data_dir.clone(),
             None,
@@ -1192,6 +1182,19 @@ fn has_receptionist_config_key(obj: &Map<String, Value>) -> bool {
         .any(|k| obj.contains_key(*k))
 }
 
+/// Resolve the spoken greeting from settings. BLANK and MISSING both mean the
+/// DEFAULT friendly line — the desktop settings form saves the full settings bag
+/// (greeting: "" when untouched) and a flow can push an empty form field; neither
+/// must silence the receptionist. Order matters: filter empties THEN default.
+fn greeting_from_settings(settings: &Map<String, Value>) -> Option<String> {
+    settings
+        .get("greeting")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| Some(crate::radio::DEFAULT_GREETING.to_string()))
+}
+
 fn string_setting(obj: &Map<String, Value>, key: &str) -> Option<String> {
     obj.get(key).and_then(Value::as_str).map(str::to_string)
 }
@@ -1214,6 +1217,34 @@ mod tests {
     use crate::outbox::OutboxStatus;
 
     static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn blank_or_missing_greeting_resolves_to_the_default_never_silence() {
+        // Missing key (fresh install) → default.
+        let empty = Map::new();
+        assert_eq!(
+            greeting_from_settings(&empty).as_deref(),
+            Some(crate::radio::DEFAULT_GREETING)
+        );
+        // Blank/whitespace (desktop settings form saved the full bag, or a flow
+        // pushed an empty form field) → STILL the default, never a silent answer.
+        for blank in ["", "   "] {
+            let mut settings = Map::new();
+            settings.insert("greeting".to_string(), json!(blank));
+            assert_eq!(
+                greeting_from_settings(&settings).as_deref(),
+                Some(crate::radio::DEFAULT_GREETING),
+                "greeting {blank:?} must fall back to the default"
+            );
+        }
+        // A real greeting wins.
+        let mut settings = Map::new();
+        settings.insert("greeting".to_string(), json!("G'day, you've reached Lance."));
+        assert_eq!(
+            greeting_from_settings(&settings).as_deref(),
+            Some("G'day, you've reached Lance.")
+        );
+    }
 
     fn request(id: u64, method: &str, params: Value) -> RpcMessage {
         RpcMessage {
