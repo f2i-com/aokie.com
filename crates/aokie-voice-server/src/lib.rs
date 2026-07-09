@@ -374,7 +374,10 @@ fn handle_speech(
     }
 
     let voice = request.voice.as_deref().unwrap_or("");
-    Ok(HttpResponse::wav(server.synthesize_wav(input, voice)?))
+    // Speech-normalize ("10 a.m.," -> "10 AM,") so every consumer of this
+    // service gets stutter-free synthesis, same rewrite as the plugin's TTS.
+    let input = aokie_core::speech::normalize_speech_text(input);
+    Ok(HttpResponse::wav(server.synthesize_wav(&input, voice)?))
 }
 
 #[derive(Debug, Deserialize)]
