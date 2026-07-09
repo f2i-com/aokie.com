@@ -21,13 +21,13 @@ use crate::rpc;
 /// Event names whose raw record must survive a Desktop restart —
 /// always routed through the outbox (contract §5).
 pub const ESSENTIAL_EVENTS: &[&str] = &[
-    "aokie.call.incoming",
-    "aokie.call.answered",
-    "aokie.call.turn.final",
-    "aokie.call.ended",
-    "aokie.sms.received",
-    "aokie.sms.sent",
-    "aokie.hardware.error",
+    crate::contract::events::CALL_INCOMING,
+    crate::contract::events::CALL_ANSWERED,
+    crate::contract::events::CALL_TURN_FINAL,
+    crate::contract::events::CALL_ENDED,
+    crate::contract::events::SMS_RECEIVED,
+    crate::contract::events::SMS_SENT,
+    crate::contract::events::HARDWARE_ERROR,
 ];
 
 pub fn is_essential(name: &str) -> bool {
@@ -148,25 +148,25 @@ mod tests {
 
     #[test]
     fn essential_set_matches_contract() {
-        assert!(is_essential("aokie.call.incoming"));
-        assert!(is_essential("aokie.sms.sent"));
-        assert!(is_essential("aokie.hardware.error"));
-        assert!(!is_essential("aokie.dongle.detected"));
-        assert!(!is_essential("aokie.call.turn.partial"));
-        assert!(!is_essential("aokie.call.rejected"));
+        assert!(is_essential(crate::contract::events::CALL_INCOMING));
+        assert!(is_essential(crate::contract::events::SMS_SENT));
+        assert!(is_essential(crate::contract::events::HARDWARE_ERROR));
+        assert!(!is_essential(crate::contract::events::DONGLE_DETECTED));
+        assert!(!is_essential(crate::contract::events::CALL_TURN_PARTIAL));
+        assert!(!is_essential(crate::contract::events::CALL_REJECTED));
     }
 
     #[test]
     fn essential_event_is_outboxed_and_marked_sent() {
         let outbox = Outbox::open_in_memory().unwrap();
         let mut sink = VecSink::default();
-        let ev = aokie_event("aokie.call.incoming", "call_a", json!({"from": "x"}));
+        let ev = aokie_event(crate::contract::events::CALL_INCOMING, "call_a", json!({"from": "x"}));
         emit_event(&mut sink, &outbox, &ev, false).unwrap();
 
         assert_eq!(sink.lines.len(), 1);
         let v: Value = serde_json::from_str(&sink.lines[0]).unwrap();
         assert_eq!(v["method"], json!("event.emit"));
-        assert_eq!(v["params"]["event"]["name"], json!("aokie.call.incoming"));
+        assert_eq!(v["params"]["event"]["name"], json!(crate::contract::events::CALL_INCOMING));
         assert_eq!(
             outbox.status_of(&ev.idempotency_key).unwrap(),
             Some(OutboxStatus::Sent)
@@ -177,7 +177,7 @@ mod tests {
     fn non_essential_event_skips_outbox_unless_forced() {
         let outbox = Outbox::open_in_memory().unwrap();
         let mut sink = VecSink::default();
-        let ev = aokie_event("aokie.dongle.detected", "call_b", json!({}));
+        let ev = aokie_event(crate::contract::events::DONGLE_DETECTED, "call_b", json!({}));
         emit_event(&mut sink, &outbox, &ev, false).unwrap();
         assert_eq!(outbox.status_of(&ev.idempotency_key).unwrap(), None);
 
@@ -195,7 +195,7 @@ mod tests {
             fail: true,
             ..Default::default()
         };
-        let ev = aokie_event("aokie.sms.sent", "sms_1", json!({}));
+        let ev = aokie_event(crate::contract::events::SMS_SENT, "sms_1", json!({}));
         let err = emit_event(&mut sink, &outbox, &ev, false).unwrap_err();
         assert!(err.contains("event.emit failed"), "got: {err}");
         assert_eq!(
