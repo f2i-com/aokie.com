@@ -964,6 +964,9 @@ fn run_loop(
     let mut voice_call_corr: Option<String> = None;
     let mut pending_incoming: Option<(String, Instant)> = None;
     let mut answered_corr: Option<String> = None;
+    // When the current call was ANSWERED — powers call.ended's durationSeconds
+    // (0 = never answered = missed), which the after-call flows gate on.
+    let mut answered_at: Option<Instant> = None;
     // Stage-2 diagnostic: which call we've played the outbound-audio test chime
     // to (verifies the SCO-OUT path reaches the caller on this dongle).
     let mut toned_corr: Option<String> = None;
@@ -978,6 +981,7 @@ fn run_loop(
                 &mut caller_id,
                 &mut current_corr,
                 &mut pending_incoming,
+                &mut answered_at,
                 outbox,
                 sink,
                 &status,
@@ -1473,6 +1477,7 @@ fn handle_event(
     caller_id: &mut Option<String>,
     current_corr: &mut Option<String>,
     pending_incoming: &mut Option<(String, std::time::Instant)>,
+    answered_at: &mut Option<std::time::Instant>,
     outbox: Option<&Outbox>,
     sink: &mut dyn Sink,
     status: &Arc<RadioStatus>,
@@ -1554,6 +1559,7 @@ fn handle_event(
         }
         E::CallAnswered => {
             status.call_active.store(true, Ordering::Relaxed);
+            *answered_at = Some(std::time::Instant::now());
             if let Some(corr) = current_corr.as_ref() {
                 emit(
                     outbox,
@@ -1565,16 +1571,37 @@ fn handle_event(
         E::CallTerminated => {
             status.call_active.store(false, Ordering::Relaxed);
             if let Some(corr) = current_corr.take() {
+                // The after-call flows key off this payload (contract §events):
+                // callId mirrors the envelope correlation (same convention as
+                // turn.final), from/callerPhone carry the caller id, and
+                // durationSeconds counts from ANSWER — so a never-answered call
+                // reads durationSeconds 0 + outcome "missed" and the pack's
+                // missed-call binding (outcome === 'missed') matches, while the
+                // after-call/summary bindings (durationSeconds > 5) skip it.
+                let duration_seconds = answered_at
+                    .take()
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0);
+                let from = caller_id.clone().unwrap_or_default();
                 emit(
                     outbox,
                     sink,
                     aokie_event(
                         "aokie.call.ended",
                         &corr,
-                        json!({"at": now_iso8601(), "reason": "remote_or_operator"}),
+                        json!({
+                            "at": now_iso8601(),
+                            "reason": "remote_or_operator",
+                            "callId": corr,
+                            "from": from,
+                            "callerPhone": from,
+                            "durationSeconds": duration_seconds,
+                            "outcome": if duration_seconds > 0 { "completed" } else { "missed" },
+                        }),
                     ),
                 );
             }
+            *answered_at = None;
             *caller_id = None;
             *pending_incoming = None;
             *status.current_caller.lock().unwrap() = None;
