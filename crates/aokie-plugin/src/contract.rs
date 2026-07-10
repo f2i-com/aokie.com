@@ -137,6 +137,39 @@ mod tests {
 
     use serde_json::Value;
 
+    /// Audit CROSS-COMPAT-001: the shared cross-repo contract fixture. A
+    /// byte-identical copy lives in the FormLogic repo, test-locked there
+    /// against the bundled manifest, flowEventCatalog and error codes —
+    /// changing the contract is a coordinated two-repo PR set by design.
+    #[test]
+    fn cross_repo_contract_fixture_matches_this_contract() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../docs/contracts/aokie-connector-contract.v1.json"
+        ))
+        .expect("contract fixture parses");
+        let arr = |key: &str| -> Vec<String> {
+            fixture[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("fixture {key} is an array"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(arr("events"), super::events::ALL, "fixture events drifted from contract.rs");
+        assert_eq!(arr("commands"), super::commands::ALL, "fixture commands drifted from contract.rs");
+        assert_eq!(
+            arr("errors"),
+            [super::errors::COMMAND_FAILED, super::errors::CONNECTOR_MISSING, super::errors::STALE_CALL],
+            "fixture errors drifted"
+        );
+        assert_eq!(
+            arr("callStates"),
+            [super::call_state::RINGING, super::call_state::ACTIVE, super::call_state::ENDED],
+            "fixture call states drifted"
+        );
+        assert_eq!(fixture["pluginApiVersion"], manifest()["pluginApiVersion"], "pluginApiVersion drifted");
+    }
+
     fn manifest() -> Value {
         serde_json::from_str(include_str!("../manifest.json")).expect("manifest.json parses")
     }
