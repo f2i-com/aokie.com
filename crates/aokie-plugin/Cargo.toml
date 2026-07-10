@@ -43,7 +43,7 @@ uuid = { version = "1.0", features = ["v4"] }
 # (empty descriptors + Win32 87). The original Tauri app gets 1 ms for free via
 # WebView2/Chromium; a headless plugin must ask for it explicitly.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Media"] }
+windows-sys = { version = "0.59", features = ["Win32_Media", "Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_Memory"] }
 
 [dev-dependencies]
 # Contract tests: manifest.json against plugin-manifest.schema.json,

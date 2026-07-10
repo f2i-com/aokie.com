@@ -934,11 +934,21 @@ impl Plugin {
                 Ok(json!({"messageId": message_id, "status": "queued"}))
             }
             "outbox.redrive" => {
-                // Operator redrive (audit OBS-001): dead-lettered events go
-                // back to pending and the replay thread re-delivers them.
+                // Operator redrive (audit OBS-001 / AOK-OUTBOX-001): TARGETED
+                // by default — one idempotencyKey revives one row; replaying
+                // the whole dead set requires an explicit {"all": true} so a
+                // casual redrive can never resurrect an entire historical
+                // queue by accident.
+                let key = payload.get("idempotencyKey").and_then(Value::as_str);
+                let all = payload.get("all").and_then(Value::as_bool) == Some(true);
+                if key.is_none() && !all {
+                    return Err(CmdError::failed(
+                        "outbox.redrive needs {idempotencyKey: \"…\"} for one event, or an explicit {all: true} for the whole dead set",
+                    ));
+                }
                 let revived = self
                     .outbox
-                    .redrive_dead()
+                    .redrive_dead(key)
                     .map_err(|e| CmdError::failed(format!("outbox redrive failed: {e}")))?;
                 if revived > 0 {
                     eprintln!("[aokie-plugin] operator redrive revived {revived} dead outbox event(s)");
