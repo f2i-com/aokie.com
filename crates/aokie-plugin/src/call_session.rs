@@ -21,6 +21,10 @@ use std::time::Instant;
 pub enum TerminationIntent {
     OperatorReject,
     OperatorHangup,
+    /// The in-plugin voice agent decided the call was fully handled and hung up
+    /// itself (user feature): after a completed conversation it says goodbye and
+    /// terminates so the caller does not have to. Outcome is a normal completion.
+    AgentHangup,
     /// The dongle/phone link vanished under a live call (audit AOK-LIF-003):
     /// the radio synthesizes termination rather than leaving the session —
     /// and the operator UI — stuck "live" on hardware that is gone.
@@ -216,9 +220,14 @@ impl SessionTracker {
             (true, Some(TerminationIntent::DeviceLost)) => ("completed", "device_lost"),
             (false, Some(TerminationIntent::DeviceLost)) => ("missed", "device_lost"),
             (true, Some(TerminationIntent::OperatorHangup)) => ("completed", "operator_hangup"),
+            // The agent hung up after handling the call: a normal completion.
+            (true, Some(TerminationIntent::AgentHangup)) => ("completed", "agent_hangup"),
             (true, _) => ("completed", "remote_or_operator"),
             (false, Some(TerminationIntent::OperatorReject)) => ("rejected", "operator_reject"),
             (false, Some(TerminationIntent::OperatorHangup)) => ("rejected", "operator_hangup"),
+            // Defensive: the agent only hangs up after answering, so this cannot
+            // normally occur — classify as missed rather than leave it unmatched.
+            (false, Some(TerminationIntent::AgentHangup)) => ("missed", "agent_hangup"),
             (false, None) => ("missed", "remote_or_operator"),
         };
         Some(EndedCall {

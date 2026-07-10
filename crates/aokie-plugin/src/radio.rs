@@ -83,6 +83,40 @@ use crate::contract::DEFAULT_AGENT_PERSONA;
 /// and the live `RadioControl::Configure` path below.
 pub const DEFAULT_GREETING: &str = "Hello, thanks for calling. How can I help you today?";
 
+/// Appended to the system prompt when `agentHangup` is on. The agent asks the LLM
+/// to emit an [[END_CALL]] marker at the very end of its farewell so the plugin
+/// knows the conversation is complete and can hang up after the goodbye plays.
+#[cfg(feature = "voice")]
+const END_CALL_INSTRUCTION: &str = "\n\nEnding the call: ONLY when the caller's request is fully handled and there is nothing left to do, give a brief, warm goodbye and then append the exact marker [[END_CALL]] at the very end of that same final message. Never write the marker mid-conversation or while a question is still open — it hangs up the call.";
+
+/// Remove any end-of-call marker the LLM emitted (tolerant to small-model
+/// variants: bracketed or bare, any case) and report whether one was present.
+/// Returns the cleaned, trimmed text so the marker is never spoken or recorded.
+#[cfg(feature = "voice")]
+fn strip_end_call_marker(s: &str) -> (String, bool) {
+    // Longest / most-bracketed variants first so the bare token never leaves a
+    // stray bracket behind.
+    const VARIANTS: [&str; 6] = [
+        "[[END_CALL]]", "[[END CALL]]", "[END_CALL]", "[END CALL]", "END_CALL", "END CALL",
+    ];
+    let mut out = s.to_string();
+    let mut found = false;
+    for v in VARIANTS {
+        let vl = v.to_lowercase();
+        loop {
+            let lower = out.to_lowercase();
+            match lower.find(&vl) {
+                Some(pos) => {
+                    out.replace_range(pos..pos + v.len(), "");
+                    found = true;
+                }
+                None => break,
+            }
+        }
+    }
+    (out.trim().to_string(), found)
+}
+
 /// Live radio status, shared (via `Arc`) between the radio thread (writer)
 /// and the main RPC thread (reader) so `phone.status` / `dongle.diagnostics`
 /// answer without round-tripping the radio thread.
@@ -1189,6 +1223,13 @@ fn run_loop(
     // meaningful with the agent on (it drives the interruptible reply loop).
     #[cfg(feature = "voice")]
     let barge_in = agent_enabled && std::env::var_os("AOKIE_BARGE_IN").is_some();
+    // When AOKIE_AGENT_HANGUP is set (the `agentHangup` setting) the agent ends
+    // the call itself once the caller's request is fully handled: it says a brief
+    // goodbye, then hangs up (AT+CHUP) so the caller doesn't have to. The LLM
+    // signals completion with an [[END_CALL]] marker, which is stripped before the
+    // farewell is spoken/recorded. Only meaningful with the agent on.
+    #[cfg(feature = "voice")]
+    let agent_hangup = agent_enabled && std::env::var_os("AOKIE_AGENT_HANGUP").is_some();
     // Cleaned-mic RMS above which the caller counts as speaking over Aokie. Set
     // above the AEC's residual echo floor; tune per handset via AOKIE_BARGE_RMS.
     #[cfg(feature = "voice")]
@@ -1638,8 +1679,16 @@ fn run_loop(
                         }
                         if let Some(client) = agent_client.as_ref() {
                             let sr = bt.get_sample_rate();
+                            // Add the end-call instruction at reply time (not by mutating
+                            // agent_persona, which a live Configure could replace) so the
+                            // agent can emit the [[END_CALL]] marker when it's done.
+                            let system_prompt = if agent_hangup {
+                                format!("{agent_persona}{END_CALL_INSTRUCTION}")
+                            } else {
+                                agent_persona.clone()
+                            };
                             let mut messages = vec![
-                                serde_json::json!({ "role": "system", "content": agent_persona }),
+                                serde_json::json!({ "role": "system", "content": system_prompt }),
                             ];
                             messages.extend(history.iter().cloned());
                             // Half-duplex: mute STT for the WHOLE reply as it streams.
@@ -1658,6 +1707,10 @@ fn run_loop(
                             // the reply, but the transcript must not label an
                             // operator action as "caller interrupted".
                             let mut operator_ended = false;
+                            // Set when the reply carried the [[END_CALL]] marker: the
+                            // agent finalized the call and should hang up after the
+                            // goodbye plays (unless the caller barged in over it).
+                            let mut hangup_requested = false;
                             // What the caller actually HEARD: sentences that
                             // reached the speaker (audit AK-008 + sweep). The
                             // history/turn record uses this, never the full
@@ -1699,23 +1752,32 @@ fn run_loop(
                                             other => pending_controls.push_back(other),
                                         }
                                     }
+                                    // Strip any [[END_CALL]] marker BEFORE synthesis so the
+                                    // caller never hears it and it never lands in the
+                                    // transcript; its presence arms the post-reply hangup.
+                                    let (spoken_text, had_marker) = strip_end_call_marker(sentence);
+                                    if had_marker {
+                                        hangup_requested = true;
+                                    }
                                     eprintln!(
                                         "[aokie-plugin] agent sentence (+{:?}): {}",
                                         t0.elapsed(),
-                                        content_for_log(sentence)
+                                        content_for_log(&spoken_text)
                                     );
                                     if barge_in {
                                         let out = tts_speak(
                                             bt,
                                             &mut tts,
                                             &mut http_tts,
-                                            sentence,
+                                            &spoken_text,
                                             sr,
                                             aec.as_mut(),
                                             Some(barge_rms),
                                         );
                                         reply_dur += out.dur;
-                                        spoken.push(sentence.trim().to_string());
+                                        if !spoken_text.is_empty() {
+                                            spoken.push(spoken_text.clone());
+                                        }
                                         if out.barged {
                                             bt.flush_tx_audio(); // stop the queued tail now
                                             barged = true;
@@ -1726,13 +1788,15 @@ fn run_loop(
                                             bt,
                                             &mut tts,
                                             &mut http_tts,
-                                            sentence,
+                                            &spoken_text,
                                             sr,
                                             None,
                                             None,
                                         );
                                         reply_dur += out.dur;
-                                        spoken.push(sentence.trim().to_string());
+                                        if !spoken_text.is_empty() {
+                                            spoken.push(spoken_text.clone());
+                                        }
                                         let plays_until = (t0 + reply_dur).max(Instant::now());
                                         mute_stt_until =
                                             Some(plays_until + Duration::from_millis(600));
@@ -1763,7 +1827,16 @@ fn run_loop(
                                             let h = spoken.join(" ").trim().to_string();
                                             if h.is_empty() { h } else { format!("{h}{tag}") }
                                         }
-                                        None => full.trim().to_string(),
+                                        // Strip the marker from the recorded reply too, and
+                                        // arm the hangup as a fallback in case a stream split
+                                        // hid it from the per-sentence strip above.
+                                        None => {
+                                            let (clean, had) = strip_end_call_marker(&full);
+                                            if had {
+                                                hangup_requested = true;
+                                            }
+                                            clean
+                                        }
                                     };
                                     if !heard.is_empty() {
                                         history.push(
@@ -1801,6 +1874,24 @@ fn run_loop(
                                         turn_index += 1;
                                         last_bot_reply = heard;
                                     }
+                                }
+                            }
+                            // Agent-initiated hangup: the reply carried the end-call
+                            // marker, so the call is fully handled. Respect a barge-in
+                            // (the caller may have more to say) and any operator action
+                            // that already ended it. The farewell played in real time via
+                            // tts_speak; give the SCO buffer a brief moment to drain its
+                            // tail before AT+CHUP cuts the channel.
+                            if hangup_requested && !barged && !operator_ended {
+                                std::thread::sleep(Duration::from_millis(900));
+                                tracker.note_intent(
+                                    crate::call_session::TerminationIntent::AgentHangup,
+                                );
+                                match bt.hangup() {
+                                    Ok(()) => eprintln!(
+                                        "[aokie-plugin] agent finalized the call — hung up (AT+CHUP)"
+                                    ),
+                                    Err(e) => eprintln!("[aokie-plugin] agent hangup failed: {e}"),
                                 }
                             }
                         }
@@ -2224,6 +2315,33 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The agent-hangup end-call marker must be stripped from spoken/recorded
+    /// text (tolerant to small-model bracket/case variants) and its presence
+    /// detected so the plugin knows to hang up after the goodbye.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn end_call_marker_stripping() {
+        let (t, f) = strip_end_call_marker("Thanks, goodbye! [[END_CALL]]");
+        assert_eq!(t, "Thanks, goodbye!");
+        assert!(f);
+        // bare + lowercase variant
+        let (t, f) = strip_end_call_marker("See you soon. end_call");
+        assert_eq!(t, "See you soon.");
+        assert!(f);
+        // single brackets, mixed case
+        let (t, f) = strip_end_call_marker("Bye now [End_Call]");
+        assert_eq!(t, "Bye now");
+        assert!(f);
+        // a marker-only sentence collapses to empty (nothing is spoken)
+        let (t, f) = strip_end_call_marker("[[END_CALL]]");
+        assert_eq!(t, "");
+        assert!(f);
+        // no marker: text is unchanged and the flag stays false
+        let (t, f) = strip_end_call_marker("How else can I help?");
+        assert_eq!(t, "How else can I help?");
+        assert!(!f);
+    }
 
     /// Audit AK-008: the continuation heuristic must hold a turn open exactly
     /// when the caller sounds mid-number — digit groups, spoken digits, and
