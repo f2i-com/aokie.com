@@ -52,6 +52,22 @@ jobs:
       - name: Check (voice)
         run: cargo check -p aokie-plugin --features voice
 
+  # Lint gate (audit FL-CI-001): clippy's deny-level lints (correctness class)
+  # block merge across the whole workspace and all targets. Style warnings
+  # remain visible but non-blocking (~178 pre-existing; burn-down tracked) —
+  # gating them today would force a blind churn through the radio crate.
+  clippy:
+    name: cargo clippy (deny-level lints)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
   # Supply-chain gate (audit AOK-CI-001): RustSec advisories fail CI — accept
   # an unavoidable one explicitly via audit.toml with a documented reason.
   supply-chain:
