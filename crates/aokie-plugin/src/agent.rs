@@ -80,8 +80,28 @@ impl LlmClient {
         let mut full = String::new();
         let mut buf = String::new();
         let mut aborted = false;
+        // Failure observability (audit AOK-LLM-001): when the stream dies,
+        // the error names WHICH phase — never produced a first token, or
+        // stalled mid-reply — instead of a bare read error. Malformed chunks
+        // are counted and, past a budget, abort instead of looping silently.
+        let started = std::time::Instant::now();
+        let mut first_delta_at: Option<std::time::Instant> = None;
+        let mut last_delta_at = std::time::Instant::now();
+        let mut deltas: u32 = 0;
+        let mut malformed: u32 = 0;
         for line in reader.lines() {
-            let line = line.map_err(|e| format!("llm stream read: {e}"))?;
+            let line = line.map_err(|e| {
+                match first_delta_at {
+                    None => format!(
+                        "llm produced NO first token within {:?} (endpoint up but not generating): {e}",
+                        started.elapsed()
+                    ),
+                    Some(_) => format!(
+                        "llm stream STALLED after {deltas} delta(s), {:?} since the last one: {e}",
+                        last_delta_at.elapsed()
+                    ),
+                }
+            })?;
             let data = match line.strip_prefix("data:") {
                 Some(d) => d.trim(),
                 None => continue,
@@ -91,7 +111,15 @@ impl LlmClient {
             }
             let v: serde_json::Value = match serde_json::from_str(data) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    malformed += 1;
+                    if malformed > 20 {
+                        return Err(format!(
+                            "llm stream is emitting garbage ({malformed} malformed SSE chunks) — aborting"
+                        ));
+                    }
+                    continue;
+                }
             };
             let delta = v
                 .get("choices")
@@ -103,6 +131,15 @@ impl LlmClient {
             if delta.is_empty() {
                 continue;
             }
+            if first_delta_at.is_none() {
+                first_delta_at = Some(std::time::Instant::now());
+                eprintln!(
+                    "[aokie-plugin] llm first token after {:?}",
+                    started.elapsed()
+                );
+            }
+            deltas += 1;
+            last_delta_at = std::time::Instant::now();
             full.push_str(delta);
             buf.push_str(delta);
             // Flush every complete sentence so TTS starts on the first one.
@@ -249,11 +286,25 @@ fn discover_model(client: &reqwest::blocking::Client, chat_endpoint: &str) -> Op
         return None;
     }
     let v: serde_json::Value = resp.json().ok()?;
-    v.get("data")?
+    // Deterministic + explainable (audit AOK-LLM-001): the served list's
+    // order is not guaranteed stable, so sort ids and take the first —
+    // the same endpoint always yields the same choice, and the log says
+    // what was available.
+    let mut ids: Vec<String> = v
+        .get("data")?
         .as_array()?
         .iter()
-        .find_map(|m| m.get("id").and_then(|i| i.as_str()))
-        .map(|s| s.to_string())
+        .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+        .collect();
+    ids.sort();
+    let chosen = ids.first().cloned();
+    if let Some(c) = &chosen {
+        eprintln!(
+            "[aokie-plugin] llm model auto-selected '{c}' (no aiModel setting; served: [{}])",
+            ids.join(", ")
+        );
+    }
+    chosen
 }
 
 /// Find a reachable local LLM: return the first candidate whose `/v1/models`

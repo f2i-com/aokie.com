@@ -1773,7 +1773,22 @@ fn run_loop(
                                         );
                                     }
                                 }
-                                Err(e) => eprintln!("[aokie-plugin] agent reply failed: {e}"),
+                                Err(e) => {
+                                    eprintln!("[aokie-plugin] agent reply failed: {e}");
+                                    // Sentences that already PLAYED before the
+                                    // failure are part of the call — record
+                                    // them (audit AOK-VOICE-002/AOK-LLM-001).
+                                    let heard = spoken.join(" ").trim().to_string();
+                                    if !heard.is_empty() {
+                                        let heard = format!("{heard} [reply cut short by an error]");
+                                        history.push(
+                                            serde_json::json!({ "role": "assistant", "content": heard }),
+                                        );
+                                        emit_turn(outbox, sink, &corr, turn_index, "bot", &heard);
+                                        turn_index += 1;
+                                        last_bot_reply = heard;
+                                    }
+                                }
                             }
                         }
                     }
