@@ -32,7 +32,8 @@
     "connector.aokie.sms.thread",
     "connector.aokie.sms.send",
     "connector.aokie.settings.get",
-    "connector.aokie.settings.set"
+    "connector.aokie.settings.set",
+    "connector.aokie.outbox.redrive"
   ],
   "connectors": [
     {
@@ -57,7 +58,8 @@
         "sms.thread",
         "sms.send",
         "settings.get",
-        "settings.set"
+        "settings.set",
+        "outbox.redrive"
       ]
     }
   ],

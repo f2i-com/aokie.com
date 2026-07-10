@@ -341,6 +341,19 @@ impl Outbox {
         Ok(status.as_deref().and_then(OutboxStatus::from_str))
     }
 
+    /// Operator redrive (audit OBS-001): dead-lettered rows go back to
+    /// `pending` with a fresh attempt budget, so the replay thread delivers
+    /// them again. Explicitly operator-triggered — never automatic, or the
+    /// dead-letter state would mean nothing. Returns how many rows revived.
+    pub fn redrive_dead(&self) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE aokie_outbox
+                SET status = 'pending', attempts = 0, next_attempt_at = NULL, last_error = NULL
+              WHERE status = 'dead'",
+            [],
+        )
+    }
+
     /// Per-status counts — surfaced through `dongle.diagnostics` so
     /// `dead` rows are visible without opening the DB by hand.
     pub fn counts(&self) -> rusqlite::Result<OutboxCounts> {
@@ -401,6 +414,33 @@ mod tests {
             Some(OutboxStatus::Sent)
         );
         assert_eq!(ob.counts().unwrap().sent, 1);
+    }
+
+    /// Audit OBS-001: operator redrive revives dead rows into the normal
+    /// retry pipeline; sent/pending rows are untouched.
+    #[test]
+    fn redrive_revives_only_dead_rows() {
+        let ob = Outbox::open_in_memory().unwrap();
+        let dead = event("corr-dead", "aokie.call.ended");
+        let sent = event("corr-sent", "aokie.call.ended");
+        ob.insert_pending(&dead, "desktop").unwrap();
+        ob.insert_pending(&sent, "desktop").unwrap();
+        for _ in 0..MAX_ATTEMPTS {
+            ob.mark_failed(&dead.idempotency_key, "boom").unwrap();
+        }
+        ob.mark_emitted(&sent.idempotency_key).unwrap();
+        ob.mark_sent(&sent.idempotency_key).unwrap();
+        assert_eq!(ob.counts().unwrap().dead, 1);
+
+        assert_eq!(ob.redrive_dead().unwrap(), 1);
+
+        let counts = ob.counts().unwrap();
+        assert_eq!((counts.dead, counts.pending, counts.sent), (0, 1, 1));
+        assert_eq!(
+            ob.due_for_retry(10).unwrap().len(),
+            1,
+            "a redriven row re-enters the retry pipeline immediately"
+        );
     }
 
     #[test]

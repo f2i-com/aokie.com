@@ -108,6 +108,7 @@ pub mod commands {
         "sms.send",
         "settings.get",
         "settings.set",
+        "outbox.redrive",
     ];
 }
 
