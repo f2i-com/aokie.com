@@ -1,0 +1,49 @@
+name: CI
+
+# Audit REL-001/C-09: this repo previously had NO CI — the plugin's contract,
+# lifecycle, isolation and delivery guarantees were only tested on the dev
+# machine. Runs on Windows because that is the only platform the plugin
+# ships on (WinUSB radio).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  plugin:
+    name: aokie-plugin (tests, default features)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      # Lib + contract-schema + integration tests: the manifest/event/command
+      # drift gates (contract.rs), call-session lifecycle, ack-mode outbox,
+      # callId guards, endpoint classification, truthful health.
+      - name: Tests
+        run: cargo test -p aokie-plugin
+
+  plugin-voice:
+    name: aokie-plugin (check, voice features)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      # The voice build compiles a distinct cfg surface (agent, AEC, TTS/STT
+      # runtimes) that the default build never touches — check BOTH, always
+      # (the repo rule since the barge-in work). No release signing gate here:
+      # this is a debug check, not a shippable artifact.
+      - name: Check (voice)
+        run: cargo check -p aokie-plugin --features voice
