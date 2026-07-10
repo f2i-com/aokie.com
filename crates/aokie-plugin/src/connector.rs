@@ -354,6 +354,20 @@ impl Plugin {
             std::env::set_var("AOKIE_BARGE_IN", "1");
             eprintln!("[aokie-plugin] bargeIn ON → full-duplex (caller can talk over Aokie)");
         }
+        // Agent-initiated hangup: when `agentHangup` is truthy AND the agent is on,
+        // the receptionist ends the call itself after a completed conversation
+        // (says goodbye, then AT+CHUP) so the caller doesn't have to hang up first.
+        let agent_hangup = self
+            .store
+            .config
+            .settings
+            .get("agentHangup")
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false);
+        if agent_hangup {
+            std::env::set_var("AOKIE_AGENT_HANGUP", "1");
+            eprintln!("[aokie-plugin] agentHangup ON → the agent hangs up when the call is done");
+        }
         if let Some(rms) = self
             .store
             .config
@@ -1493,6 +1507,7 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     SettingSpec { key: "autoAnswer", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "aiReceptionist", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "bargeIn", kind: SettingKind::Bool, applies_live: false },
+    SettingSpec { key: "agentHangup", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "reenumerateHwid", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "mockCalls", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "bargeSensitivity", kind: SettingKind::Int { min: 50, max: 5000 }, applies_live: false },
