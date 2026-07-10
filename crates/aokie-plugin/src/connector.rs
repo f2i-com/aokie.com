@@ -1200,7 +1200,7 @@ impl Plugin {
         }
         if self.store.quarantined {
             reasons.push(
-                "settings file was corrupt — quarantined, running on safe defaults (auto-answer OFF)"
+                "settings file was corrupt — quarantined; recovered last-known-good backup or safe defaults (auto-answer OFF)"
                     .to_string(),
             );
         }
