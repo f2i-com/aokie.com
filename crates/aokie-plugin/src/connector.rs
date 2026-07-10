@@ -161,6 +161,9 @@ pub struct Plugin {
     /// The host advertised `eventAck` at init: outboxed events await an
     /// `event.ack` before counting as delivered (audit INT-003).
     pub ack_mode: bool,
+    /// Replay-thread heartbeat (audit AOK-OUTBOX-002) — None until ack mode
+    /// starts the thread; 0 = failed to start; stale = stalled/dead thread.
+    pub replay_heartbeat: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Plugin {
@@ -183,6 +186,7 @@ impl Plugin {
             initialized: false,
             shutdown_requested: false,
             ack_mode: false,
+            replay_heartbeat: None,
         })
     }
 
@@ -205,6 +209,7 @@ impl Plugin {
             initialized: false,
             shutdown_requested: false,
             ack_mode: false,
+            replay_heartbeat: None,
         }
     }
 
@@ -511,7 +516,9 @@ impl Plugin {
                 // The replay thread writes real protocol lines to stdout —
                 // unit tests exercise `replay_once` directly instead.
                 if !cfg!(test) {
-                    crate::event_bridge::spawn_replay_thread(self.data_dir.join(OUTBOX_FILE));
+                    self.replay_heartbeat = Some(crate::event_bridge::spawn_replay_thread(
+                        self.data_dir.join(OUTBOX_FILE),
+                    ));
                 }
                 eprintln!("[aokie-plugin] host supports eventAck — durable delivery on");
             }
@@ -1207,6 +1214,21 @@ impl Plugin {
         };
         if counts.dead > 0 {
             reasons.push(format!("{} dead outbox event(s) need redrive", counts.dead));
+        }
+        // Replay-thread liveness (audit AOK-OUTBOX-002): durable delivery
+        // silently freezing is exactly the failure health must not hide.
+        let replay_age = self.replay_heartbeat.as_ref().map(|hb| {
+            let v = hb.load(std::sync::atomic::Ordering::Relaxed);
+            if v == 0 { u64::MAX } else { crate::event_bridge::unix_now().saturating_sub(v) }
+        });
+        match replay_age {
+            Some(u64::MAX) => reasons.push(
+                "outbox replay thread failed to start — durable delivery halted".to_string(),
+            ),
+            Some(age) if age > 30 => reasons.push(format!(
+                "outbox replay thread stalled ({age}s since last tick) — durable delivery frozen"
+            )),
+            _ => {}
         }
         if self.store.quarantined {
             reasons.push(

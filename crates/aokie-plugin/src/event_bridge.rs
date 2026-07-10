@@ -211,7 +211,24 @@ pub fn replay_once(sink: &mut dyn Sink, outbox: &Outbox, limit: u32) -> usize {
 /// then every second re-emits whatever has come due, and periodically
 /// prunes acknowledged rows past retention. Runs for the process's
 /// life — the main loop exits on stdin EOF, taking this with it.
-pub fn spawn_replay_thread(outbox_path: std::path::PathBuf) {
+/// Seconds since the Unix epoch — the replay heartbeat's clock.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Spawns the replay thread and returns its HEARTBEAT (audit AOK-OUTBOX-002):
+/// the thread stamps it every loop; `plugin.health` reads it so a dead or
+/// stalled replay thread degrades readiness instead of silently freezing
+/// durable delivery. Value 0 = the thread failed to start at all.
+pub fn spawn_replay_thread(
+    outbox_path: std::path::PathBuf,
+) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    use std::sync::atomic::Ordering;
+    let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(unix_now()));
+    let beat = heartbeat.clone();
     let _ = std::thread::Builder::new()
         .name("aokie-outbox-replay".into())
         .spawn(move || {
@@ -222,6 +239,7 @@ pub fn spawn_replay_thread(outbox_path: std::path::PathBuf) {
                         "[aokie-plugin] replay thread cannot open outbox {}: {e}",
                         outbox_path.display()
                     );
+                    beat.store(0, Ordering::Relaxed);
                     return;
                 }
             };
@@ -236,6 +254,7 @@ pub fn spawn_replay_thread(outbox_path: std::path::PathBuf) {
             let mut last_prune = std::time::Instant::now();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
+                beat.store(unix_now(), Ordering::Relaxed);
                 replay_once(&mut sink, &outbox, 16);
                 if last_prune.elapsed().as_secs() >= 600 {
                     last_prune = std::time::Instant::now();
@@ -259,6 +278,7 @@ pub fn spawn_replay_thread(outbox_path: std::path::PathBuf) {
                 }
             }
         });
+    heartbeat
 }
 
 /// Emit a `log.emit` notification. The MESSAGE MUST ALREADY BE

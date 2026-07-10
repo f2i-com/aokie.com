@@ -232,7 +232,11 @@ impl Outbox {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // journal_mode returns the resulting mode as a row — query it.
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
-        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        // FULL, not NORMAL (audit AOK-OUTBOX-002): this ledger IS the
+        // "never lose a business event" claim — NORMAL can lose the most
+        // recent commits on power loss. The outbox writes a handful of rows
+        // per call; the extra fsync is noise here.
+        conn.execute_batch("PRAGMA synchronous=FULL;")?;
         Self::with_connection(conn)
     }
 
@@ -262,12 +266,15 @@ impl Outbox {
         )?;
         // v2 migration (ack mode): when the row may next be (re-)emitted,
         // RFC3339 UTC like created_at/updated_at (lexicographic-comparable).
-        // NULL = due immediately. ALTER is idempotent-by-error: a duplicate
-        // column just means the migration already ran.
-        match conn.execute_batch("ALTER TABLE aokie_outbox ADD COLUMN next_attempt_at TEXT;") {
-            Ok(()) => {}
-            Err(e) if e.to_string().contains("duplicate column name") => {}
-            Err(e) => return Err(e),
+        // NULL = due immediately. Deterministic (audit AOK-OUTBOX-002): the
+        // column's existence is CHECKED via table_info rather than matching
+        // a locale/version-dependent error string.
+        let has_next_attempt: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('aokie_outbox') WHERE name = 'next_attempt_at'")?
+            .query_row([], |r| r.get::<_, i64>(0))
+            .map(|n| n > 0)?;
+        if !has_next_attempt {
+            conn.execute_batch("ALTER TABLE aokie_outbox ADD COLUMN next_attempt_at TEXT;")?;
         }
         Ok(Outbox { conn })
     }
