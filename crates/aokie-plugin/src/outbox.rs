@@ -24,6 +24,140 @@ pub const MAX_ATTEMPTS: u32 = 8;
 /// hold transcript/SMS text (audit C-06: bounded PII retention).
 pub const SENT_RETENTION_DAYS: i64 = 7;
 
+/// How long dead-lettered rows keep their (protected) payloads before they
+/// are deleted (audit AOK-OUTBOX-001): long enough for an operator redrive
+/// after a bad week, short enough that failed transcript/SMS payloads do not
+/// accumulate indefinitely.
+pub const DEAD_RETENTION_DAYS: i64 = 14;
+
+// ── Payload protection at rest (audit AOK-OUTBOX-001) ──────────────────────
+// Transcript and SMS bodies must not be readable by opening the SQLite file.
+// Windows DPAPI (per-user scope): no key management, decryptable only in the
+// operator's own user context. Stored as "dpapi1:<base64>"; rows WITHOUT the
+// prefix are legacy plaintext and stay readable (migration-free) — every new
+// write is protected. Durability beats secrecy for the business record, so a
+// DPAPI failure stores plaintext with a LOUD log rather than losing the event.
+
+const DPAPI_PREFIX: &str = "dpapi1:";
+
+#[cfg(windows)]
+fn protect_payload(plain: &str) -> String {
+    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+    unsafe {
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: plain.len() as u32,
+            pbData: plain.as_ptr() as *mut u8,
+        };
+        let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+        if CryptProtectData(
+            &mut input,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut out,
+        ) == 0
+        {
+            eprintln!("[aokie-plugin] DPAPI protect FAILED — storing outbox payload unprotected");
+            return plain.to_string();
+        }
+        let slice = std::slice::from_raw_parts(out.pbData, out.cbData as usize);
+        let encoded = format!("{DPAPI_PREFIX}{}", b64_encode(slice));
+        windows_sys::Win32::Foundation::LocalFree(out.pbData as *mut core::ffi::c_void);
+        encoded
+    }
+}
+
+#[cfg(windows)]
+fn unprotect_payload(stored: &str) -> String {
+    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+    let Some(b64) = stored.strip_prefix(DPAPI_PREFIX) else {
+        return stored.to_string(); // legacy plaintext row
+    };
+    let Some(bytes) = b64_decode(b64) else {
+        eprintln!("[aokie-plugin] outbox payload base64 is corrupt — treating as undecryptable");
+        return String::new();
+    };
+    unsafe {
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: bytes.len() as u32,
+            pbData: bytes.as_ptr() as *mut u8,
+        };
+        let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+        if CryptUnprotectData(
+            &mut input,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut out,
+        ) == 0
+        {
+            eprintln!("[aokie-plugin] DPAPI unprotect FAILED (different user context?) — payload unreadable");
+            return String::new();
+        }
+        let slice = std::slice::from_raw_parts(out.pbData, out.cbData as usize);
+        let plain = String::from_utf8_lossy(slice).into_owned();
+        windows_sys::Win32::Foundation::LocalFree(out.pbData as *mut core::ffi::c_void);
+        plain
+    }
+}
+
+// The plugin ships Windows-only; non-Windows dev builds pass through.
+#[cfg(not(windows))]
+fn protect_payload(plain: &str) -> String {
+    plain.to_string()
+}
+#[cfg(not(windows))]
+fn unprotect_payload(stored: &str) -> String {
+    stored.to_string()
+}
+
+// Minimal std-only base64 (standard alphabet, padded) — not worth a crate.
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn b64_decode(text: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        B64.iter().position(|&b| b == c).map(|i| i as u32)
+    }
+    let bytes: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if bytes.len() % 4 != 0 || bytes.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().filter(|&&c| c == b'=').count();
+        let mut n: u32 = 0;
+        for (i, &c) in chunk.iter().enumerate() {
+            let v = if c == b'=' { 0 } else { val(c)? };
+            n |= v << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Default emission target. Post-MVP the outbox gains a second
 /// target ("formlogic") for direct API submission.
 pub const TARGET_DESKTOP: &str = "desktop";
@@ -144,7 +278,7 @@ impl Outbox {
     /// existing row, whatever its status, is authoritative).
     pub fn insert_pending(&self, event: &DesktopEvent, target: &str) -> rusqlite::Result<bool> {
         let now = now_iso8601();
-        let payload = serde_json::to_string(event).expect("DesktopEvent serialises");
+        let payload = protect_payload(&serde_json::to_string(event).expect("DesktopEvent serialises"));
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO aokie_outbox
                 (event_name, correlation_id, idempotency_key, target,
@@ -262,7 +396,7 @@ impl Outbox {
                     correlation_id: row.get(2)?,
                     idempotency_key: row.get(3)?,
                     target: row.get(4)?,
-                    payload_json: row.get(5)?,
+                    payload_json: unprotect_payload(&row.get::<_, String>(5)?),
                     status: OutboxStatus::from_str(&status).unwrap_or(OutboxStatus::Failed),
                     attempts: row.get(7)?,
                     last_error: row.get(8)?,
@@ -296,7 +430,7 @@ impl Outbox {
                     correlation_id: row.get(2)?,
                     idempotency_key: row.get(3)?,
                     target: row.get(4)?,
-                    payload_json: row.get(5)?,
+                    payload_json: unprotect_payload(&row.get::<_, String>(5)?),
                     status: OutboxStatus::from_str(&status).unwrap_or(OutboxStatus::Failed),
                     attempts: row.get(7)?,
                     last_error: row.get(8)?,
@@ -345,12 +479,33 @@ impl Outbox {
     /// `pending` with a fresh attempt budget, so the replay thread delivers
     /// them again. Explicitly operator-triggered — never automatic, or the
     /// dead-letter state would mean nothing. Returns how many rows revived.
-    pub fn redrive_dead(&self) -> rusqlite::Result<usize> {
+    /// TARGETED by default (audit AOK-OUTBOX-001): pass an idempotency key
+    /// to revive one row; `None` (an explicit "all") revives the whole dead
+    /// set, which [`prune_dead`](Self::prune_dead) keeps bounded.
+    pub fn redrive_dead(&self, idempotency_key: Option<&str>) -> rusqlite::Result<usize> {
+        match idempotency_key {
+            Some(key) => self.conn.execute(
+                "UPDATE aokie_outbox
+                    SET status = 'pending', attempts = 0, next_attempt_at = NULL, last_error = NULL
+                  WHERE status = 'dead' AND idempotency_key = ?1",
+                params![key],
+            ),
+            None => self.conn.execute(
+                "UPDATE aokie_outbox
+                    SET status = 'pending', attempts = 0, next_attempt_at = NULL, last_error = NULL
+                  WHERE status = 'dead'",
+                [],
+            ),
+        }
+    }
+
+    /// Dead-letter retention (audit AOK-OUTBOX-001): failed transcript/SMS
+    /// payloads must not sit in the file forever. Runs beside prune_sent.
+    pub fn prune_dead(&self, retention_days: i64) -> rusqlite::Result<usize> {
+        let cutoff = iso8601_after_secs(-(retention_days * 86_400));
         self.conn.execute(
-            "UPDATE aokie_outbox
-                SET status = 'pending', attempts = 0, next_attempt_at = NULL, last_error = NULL
-              WHERE status = 'dead'",
-            [],
+            "DELETE FROM aokie_outbox WHERE status = 'dead' AND updated_at < ?1",
+            params![cutoff],
         )
     }
 
@@ -432,7 +587,11 @@ mod tests {
         ob.mark_sent(&sent.idempotency_key).unwrap();
         assert_eq!(ob.counts().unwrap().dead, 1);
 
-        assert_eq!(ob.redrive_dead().unwrap(), 1);
+        // Targeted redrive misses a wrong key, hits the right one, and the
+        // explicit all-form works (audit AOK-OUTBOX-001).
+        assert_eq!(ob.redrive_dead(Some("no-such-key")).unwrap(), 0);
+        assert_eq!(ob.redrive_dead(Some(&dead.idempotency_key)).unwrap(), 1);
+        assert_eq!(ob.redrive_dead(None).unwrap(), 0, "nothing left dead");
 
         let counts = ob.counts().unwrap();
         assert_eq!((counts.dead, counts.pending, counts.sent), (0, 1, 1));
@@ -541,6 +700,68 @@ mod tests {
 
     /// Acked rows past retention are pruned (bounded PII — audit C-06);
     /// recent and undelivered rows are untouched.
+    /// Audit AOK-OUTBOX-001: payloads are protected at rest — the raw column
+    /// must not contain the transcript text, while reads round-trip it.
+    #[test]
+    fn payloads_are_protected_at_rest_and_round_trip() {
+        let ob = Outbox::open_in_memory().unwrap();
+        let mut ev = event("corr-secret", "aokie.call.turn.final");
+        ev.data = serde_json::json!({"text": "my card number is 4111"});
+        ob.insert_pending(&ev, "desktop").unwrap();
+
+        let raw: String = ob
+            .conn
+            .query_row("SELECT payload_json FROM aokie_outbox LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        if cfg!(windows) {
+            assert!(raw.starts_with(DPAPI_PREFIX), "stored protected: {raw:.20}");
+            assert!(!raw.contains("4111"), "PII must not be readable in the file");
+        }
+        let rows = ob.due_for_retry(10).unwrap();
+        let back: DesktopEvent = serde_json::from_str(&rows[0].payload_json).unwrap();
+        assert_eq!(back.data["text"], "my card number is 4111", "reads round-trip");
+    }
+
+    /// Legacy plaintext rows (pre-protection installs) stay readable.
+    #[test]
+    fn legacy_plaintext_rows_still_read() {
+        let ob = Outbox::open_in_memory().unwrap();
+        let ev = event("corr-legacy", "aokie.call.ended");
+        let plain = serde_json::to_string(&ev).unwrap();
+        ob.conn
+            .execute(
+                "INSERT INTO aokie_outbox (event_name, correlation_id, idempotency_key, target,
+                    payload_json, status, attempts, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'desktop', ?4, 'pending', 0, ?5, ?5)",
+                params![ev.name, ev.correlation_id, ev.idempotency_key, plain, now_iso8601()],
+            )
+            .unwrap();
+        let rows = ob.due_for_retry(10).unwrap();
+        let back: DesktopEvent = serde_json::from_str(&rows[0].payload_json).unwrap();
+        assert_eq!(back.idempotency_key, ev.idempotency_key);
+    }
+
+    /// Audit AOK-OUTBOX-001: dead rows expire after retention; fresh ones stay.
+    #[test]
+    fn prune_dead_expires_only_old_rows() {
+        let ob = Outbox::open_in_memory().unwrap();
+        let ev = event("corr-dead-old", "aokie.call.ended");
+        ob.insert_pending(&ev, "desktop").unwrap();
+        for _ in 0..MAX_ATTEMPTS {
+            ob.mark_failed(&ev.idempotency_key, "boom").unwrap();
+        }
+        assert_eq!(ob.counts().unwrap().dead, 1);
+        // Fresh dead row survives…
+        assert_eq!(ob.prune_dead(DEAD_RETENTION_DAYS).unwrap(), 0);
+        // …an aged one goes.
+        let old = iso8601_after_secs(-((DEAD_RETENTION_DAYS + 1) * 86_400));
+        ob.conn
+            .execute("UPDATE aokie_outbox SET updated_at = ?1", params![old])
+            .unwrap();
+        assert_eq!(ob.prune_dead(DEAD_RETENTION_DAYS).unwrap(), 1);
+        assert_eq!(ob.counts().unwrap().dead, 0);
+    }
+
     #[test]
     fn prune_sent_removes_only_old_acknowledged_rows() {
         let ob = Outbox::open_in_memory().unwrap();
