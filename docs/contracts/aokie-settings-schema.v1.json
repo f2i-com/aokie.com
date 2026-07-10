@@ -18,6 +18,11 @@
       "appliesLive": false
     },
     {
+      "key": "agentHangup",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
       "key": "reenumerateHwid",
       "type": "bool",
       "appliesLive": false
