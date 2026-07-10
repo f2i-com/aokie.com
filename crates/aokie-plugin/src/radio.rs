@@ -220,6 +220,19 @@ fn emit_turn(
     );
 }
 
+/// PII gate for conversation content in logs (audit PRIV-001/C-06): stderr is
+/// captured by Desktop's log ring, so caller speech and agent replies appear
+/// verbatim only when the operator explicitly opts in (`AOKIE_LOG_CONTENT=1`);
+/// default logs carry only lengths.
+#[cfg(feature = "voice")]
+fn content_for_log(text: &str) -> String {
+    if std::env::var("AOKIE_LOG_CONTENT").map(|v| v == "1").unwrap_or(false) {
+        format!("{text:?}")
+    } else {
+        format!("[{} chars]", text.chars().count())
+    }
+}
+
 /// Heuristic self-echo guard for the in-plugin agent: true when `caller` (a fresh
 /// transcript) is mostly the same words as Aokie's last spoken reply `bot` â€” i.e.
 /// Aokie's own TTS leaked back into the mic and STT transcribed it. Keeps Aokie
@@ -1286,8 +1299,9 @@ fn run_loop(
                 if tracker.current().map(|s| s.generation) != Some(generation) {
                     let n = status.stale_stt_results.fetch_add(1, Ordering::Relaxed) + 1;
                     eprintln!(
-                        "[aokie-plugin] DROPPED stale STT result (call gen {generation}, utterance {utterance}, current gen {}, {n} total): {text:?}",
-                        tracker.generation()
+                        "[aokie-plugin] DROPPED stale STT result (call gen {generation}, utterance {utterance}, current gen {}, {n} total): {}",
+                        tracker.generation(),
+                        content_for_log(&text)
                     );
                     continue;
                 }
@@ -1297,10 +1311,10 @@ fn run_loop(
                     // (belt-and-suspenders over the half-duplex mute) so it never
                     // records it as a caller turn or answers itself.
                     if agent_enabled && looks_like_echo(&text, &last_bot_reply) {
-                        eprintln!("[aokie-plugin] ignored self-echo: {text:?}");
+                        eprintln!("[aokie-plugin] ignored self-echo: {}", content_for_log(&text));
                         continue;
                     }
-                    eprintln!("[aokie-plugin] heard [turn {turn_index}]: {text:?}");
+                    eprintln!("[aokie-plugin] heard [turn {turn_index}]: {}", content_for_log(&text));
                     emit_turn(outbox, sink, &corr, turn_index, "caller", &text);
                     turn_index += 1;
 
@@ -1348,8 +1362,9 @@ fn run_loop(
                             let outcome =
                                 client.stream_reply(serde_json::json!(messages), |sentence| {
                                     eprintln!(
-                                        "[aokie-plugin] agent sentence (+{:?}): {sentence:?}",
-                                        t0.elapsed()
+                                        "[aokie-plugin] agent sentence (+{:?}): {}",
+                                        t0.elapsed(),
+                                        content_for_log(sentence)
                                     );
                                     if barge_in {
                                         let out = tts_speak(
@@ -1463,7 +1478,8 @@ fn run_loop(
                         // stale enabled-copy in the desktop's runtime cache) â€”
                         // otherwise the caller is answered twice.
                         eprintln!(
-                            "[aokie-plugin] ignoring operatorSpeak (agent owns replies): {text:?}"
+                            "[aokie-plugin] ignoring operatorSpeak (agent owns replies): {}",
+                            content_for_log(&text)
                         );
                     } else {
                         let sr = bt.get_sample_rate();
