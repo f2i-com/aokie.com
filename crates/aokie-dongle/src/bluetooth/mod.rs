@@ -26,6 +26,8 @@ pub enum BluetoothEvent {
     AudioConnected {
         codec: String,
         sample_rate: u16,
+        /// false = SCO up but iso pipes did not arm — silent call (AOK-HW-001).
+        armed: bool,
     },
     AudioDisconnected,
     CallerId(String),
@@ -261,8 +263,8 @@ fn bluetooth_event_from_runtime(
         RuntimeEvent::CallRinging => BluetoothEvent::CallRinging,
         RuntimeEvent::CallAnswered => BluetoothEvent::CallAnswered,
         RuntimeEvent::CallTerminated => BluetoothEvent::CallTerminated,
-        RuntimeEvent::AudioConnected { codec, sample_rate } => {
-            BluetoothEvent::AudioConnected { codec, sample_rate }
+        RuntimeEvent::AudioConnected { codec, sample_rate, armed } => {
+            BluetoothEvent::AudioConnected { codec, sample_rate, armed }
         }
         RuntimeEvent::AudioDisconnected => BluetoothEvent::AudioDisconnected,
         RuntimeEvent::CallerId(num) => BluetoothEvent::CallerId(num),
@@ -311,7 +313,9 @@ pub fn bluetooth_event_from_aokie_hfp(
             Some(BluetoothEvent::CallerId(number))
         }
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CodecSelected { codec, sample_rate } => {
-            Some(BluetoothEvent::AudioConnected { codec, sample_rate })
+            // Codec selection precedes iso arming; this legacy path never
+            // observed an arming failure, so it reports armed.
+            Some(BluetoothEvent::AudioConnected { codec, sample_rate, armed: true })
         }
     }
 }
@@ -340,6 +344,7 @@ mod tests {
             Some(BluetoothEvent::AudioConnected {
                 codec: "mSBC".to_string(),
                 sample_rate: 16000,
+                armed: true,
             })
         );
         assert_eq!(

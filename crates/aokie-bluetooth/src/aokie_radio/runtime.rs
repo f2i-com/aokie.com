@@ -70,6 +70,12 @@ pub enum RuntimeEvent {
     AudioConnected {
         codec: String,
         sample_rate: u16,
+        /// Whether the USB iso pipes actually ARMED (audit AOK-HW-001):
+        /// false = the SCO link is up at HCI but the alternate-setting
+        /// configure failed — audio WILL be silent this call. The link is
+        /// kept (tearing down would drop HFP/MAP/PBAP too) but readiness
+        /// surfaces must never show a silent path as fully ready.
+        armed: bool,
     },
     AudioDisconnected,
     CallerId(String),
@@ -1898,7 +1904,7 @@ fn run_runtime(
                                 e
                             );
                         }
-                        let _ = event_tx.send(RuntimeEvent::AudioConnected { codec, sample_rate });
+                        let _ = event_tx.send(RuntimeEvent::AudioConnected { codec, sample_rate, armed: alt_result.is_ok() });
                     } else {
                         eprintln!(
                             "[AokieRadio] SCO link FAILED status 0x{:02x} handle {:#06x}",
