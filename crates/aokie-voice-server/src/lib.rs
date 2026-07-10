@@ -280,12 +280,22 @@ pub fn handle_request(
 }
 
 fn health_response(server: &VoiceServer) -> HttpResponse {
+    // Truthful readiness (audit AOK-VOICE-SRV-001): "ok" only when BOTH
+    // capabilities have their model assets on disk — a voice server that can
+    // neither hear nor speak must never read green. Build provenance
+    // (CROSS-OBS-001) says exactly which build answered.
+    let stt = server.paths.stt_files_present();
+    let tts = server.paths.tts_files_present();
     HttpResponse::json(
         200,
         json!({
-            "status": "ok",
-            "stt": server.paths.stt_files_present(),
-            "tts": server.paths.tts_files_present(),
+            "status": if stt && tts { "ok" } else { "degraded" },
+            "stt": stt,
+            "tts": tts,
+            "build": {
+                "version": env!("CARGO_PKG_VERSION"),
+                "ref": env!("AOKIE_BUILD_REF"),
+            },
         }),
     )
 }
