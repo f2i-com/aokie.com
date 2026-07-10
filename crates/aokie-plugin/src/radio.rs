@@ -20,7 +20,7 @@
 //! The whole radio surface is Windows-only (WinUSB); on other targets
 //! [`spawn`] returns an error and the plugin simply never has a radio.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -109,6 +109,10 @@ pub struct RadioStatus {
     pub paired: Mutex<Vec<PairedDevice>>,
     /// Last fatal reason the radio reported (no dongle, driver not bound, â€¦).
     pub last_error: Mutex<Option<String>>,
+    /// Speech results that arrived for a call that was no longer current and
+    /// were DROPPED instead of being attributed to the wrong caller (audit
+    /// C-05). Observable via dongle.diagnostics.
+    pub stale_stt_results: AtomicU64,
 }
 
 /// Handle held by the [`Plugin`](crate::connector::Plugin): send control
@@ -155,6 +159,9 @@ impl RadioHandle {
     }
     pub fn last_error(&self) -> Option<String> {
         self.status.last_error.lock().unwrap().clone()
+    }
+    pub fn stale_stt_results(&self) -> u64 {
+        self.status.stale_stt_results.load(Ordering::Relaxed)
     }
 }
 
@@ -395,9 +402,28 @@ fn normalize_endpoint(endpoint: Option<String>) -> Option<String> {
 
 #[cfg(feature = "voice")]
 enum SttWork {
-    Utterance(Vec<f32>),
-    Configure { endpoint: Option<String> },
+    /// One finished caller utterance, stamped with the call it belongs to
+    /// (audit C-05): the worker skips jobs whose generation is no longer
+    /// current, and the consumer drops results the same way — a slow
+    /// transcription from call A can never be attributed to call B.
+    Utterance {
+        generation: u64,
+        utterance: u32,
+        samples: Vec<f32>,
+    },
+    Configure {
+        endpoint: Option<String>,
+    },
     ResetCall,
+}
+
+/// A finished transcription, still carrying the identity of the call whose
+/// audio produced it.
+#[cfg(feature = "voice")]
+struct SttResult {
+    generation: u64,
+    utterance: u32,
+    text: String,
 }
 
 #[cfg(feature = "voice")]
@@ -796,7 +822,9 @@ fn run_loop(
     mut greeting: Option<String>,
 ) {
     use std::sync::mpsc::TryRecvError;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    #[cfg(feature = "voice")]
+    use std::time::Instant;
 
     // Lazily-loaded in-process TTS (voice build only). Loaded on the first thing
     // Aokie needs to say (greeting or operatorSpeak) so a call with no speech
@@ -805,8 +833,6 @@ fn run_loop(
     let mut tts: Option<crate::voice::TtsEngine> = None;
     #[cfg(feature = "voice")]
     let mut http_tts = HttpTtsRuntime::from_env("AOKIE_TTS_ENDPOINT");
-    // Which call we've already greeted, so the greeting plays exactly once.
-    let mut greeted_corr: Option<String> = None;
     let _ = &greeting; // used only in the voice build / greeting block below
 
     // â”€â”€ Speech-to-text (voice build) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -816,11 +842,17 @@ fn run_loop(
     // utterances with a simple energy VAD and ships each finished one to the
     // worker; finished transcripts come back and become `aokie.call.turn.final`
     // events â€” the hook a flow binds to drive the conversation.
+    // The CURRENT call generation, shared with the worker: jobs stamped with
+    // any other generation are for a finished call — the worker skips them
+    // WITHOUT transcribing (cheap cancellation on hangup; audit AK-002).
+    #[cfg(feature = "voice")]
+    let stt_current_gen = Arc::new(AtomicU64::new(0));
     #[cfg(feature = "voice")]
     let (stt_tx, stt_result_rx) = {
         let (utter_tx, utter_rx) = std::sync::mpsc::channel::<SttWork>();
-        let (res_tx, res_rx) = std::sync::mpsc::channel::<String>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<SttResult>();
         let initial_stt_endpoint = std::env::var("AOKIE_STT_ENDPOINT").ok();
+        let worker_gen = stt_current_gen.clone();
         std::thread::Builder::new()
             .name("aokie-stt".into())
             .spawn(move || {
@@ -828,8 +860,12 @@ fn run_loop(
                 let client = http_speech_client();
                 let mut http_stt = HttpSpeechFallback::new(initial_stt_endpoint);
                 while let Ok(work) = utter_rx.recv() {
-                    let buf = match work {
-                        SttWork::Utterance(buf) => buf,
+                    let (generation, utterance, buf) = match work {
+                        SttWork::Utterance {
+                            generation,
+                            utterance,
+                            samples,
+                        } => (generation, utterance, samples),
                         SttWork::Configure { endpoint } => {
                             http_stt.configure(endpoint);
                             continue;
@@ -839,10 +875,26 @@ fn run_loop(
                             continue;
                         }
                     };
+                    // Stale-job gate: the call this audio belongs to is over
+                    // (or a new one replaced it) — do not spend a transcription
+                    // on it, and never emit its text.
+                    if generation != worker_gen.load(Ordering::Relaxed) {
+                        eprintln!(
+                            "[aokie-plugin] skipped stale STT job (call gen {generation}, utterance {utterance})"
+                        );
+                        continue;
+                    }
+                    let send = |text: String| {
+                        let _ = res_tx.send(SttResult {
+                            generation,
+                            utterance,
+                            text,
+                        });
+                    };
                     if let Some(endpoint) = http_stt.endpoint_for_call().map(str::to_string) {
                         match http_stt_transcribe(&client, &endpoint, &buf) {
                             Ok(text) if !text.is_empty() => {
-                                let _ = res_tx.send(text);
+                                send(text);
                                 continue;
                             }
                             Ok(_) => continue,
@@ -869,9 +921,7 @@ fn run_loop(
                     }
                     if let Some(eng) = engine.as_mut() {
                         match eng.transcribe(&buf) {
-                            Ok(text) if !text.is_empty() => {
-                                let _ = res_tx.send(text);
-                            }
+                            Ok(text) if !text.is_empty() => send(text),
                             Ok(_) => {}
                             Err(e) => eprintln!("[aokie-plugin] STT transcribe failed: {e}"),
                         }
@@ -965,11 +1015,10 @@ fn run_loop(
     #[cfg(feature = "voice")]
     let mut turn_index: u32 = 1;
 
-    // Per-call bookkeeping. `pending_incoming` holds a just-rung call whose
-    // `aokie.call.incoming` we delay briefly so the CLIP (caller id) can be
-    // folded into its `from` field â€” matching the mock's `{from, at}` shape.
-    // `answered_corr` records the call we've already auto-answered so we
-    // answer exactly once.
+    // Per-call state: ONE explicit session state machine (audit AK-001) owns
+    // the call id, generation, phase, timing, caller id, termination intent
+    // and the once-per-call flags (incoming emitted / auto-answered / toned /
+    // greeted) that used to be six scattered Option<String>s here.
     //
     // Auto-answer fires IMMEDIATELY when a call appears â€” NOT after a ring
     // delay â€” because on some dongles the SCO/audio channel that comes up
@@ -977,81 +1026,86 @@ fn run_loop(
     // never gets serviced. Answering in the brief pre-SCO window is what
     // gets the AT+ATA out. (Emitting `aokie.call.incoming` still waits for
     // the caller id; only the answer is hurried.)
-    let mut caller_id: Option<String> = None;
-    let mut current_corr: Option<String> = None;
+    let mut tracker = crate::call_session::SessionTracker::new();
+    // Which generation the voice pipeline is configured for; a change (new
+    // call OR idle) resets per-call voice state and re-stamps the STT gate.
     #[cfg(feature = "voice")]
-    let mut voice_call_corr: Option<String> = None;
-    let mut pending_incoming: Option<(String, Instant)> = None;
-    let mut answered_corr: Option<String> = None;
-    // When the current call was ANSWERED — powers call.ended's durationSeconds
-    // (0 = never answered = missed), which the after-call flows gate on.
-    let mut answered_at: Option<Instant> = None;
-    // Stage-2 diagnostic: which call we've played the outbound-audio test chime
-    // to (verifies the SCO-OUT path reaches the caller on this dongle).
-    let mut toned_corr: Option<String> = None;
+    let mut voice_call_gen: u64 = 0;
 
     loop {
         let mut idle = true;
 
         while let Some(ev) = bt.try_recv_event() {
             idle = false;
-            handle_event(
-                ev,
-                &mut caller_id,
-                &mut current_corr,
-                &mut pending_incoming,
-                &mut answered_at,
-                outbox,
-                sink,
-                &status,
-            );
+            handle_event(ev, &mut tracker, outbox, sink, &status);
         }
 
+        // Per-call voice isolation (audit AK-002/C-05): the moment the session
+        // generation changes — a call ended, or a new one replaced it — stamp
+        // the STT gate (queued jobs for the old generation are skipped, their
+        // results dropped) and reset EVERY piece of per-call voice state:
+        // conversation history, transcript turn index, utterance buffers, echo
+        // canceller and mute gate. Doing it on generation change (not on an
+        // observed idle tick) means back-to-back calls in one event batch can
+        // never leak history or half-built utterances into the next call.
         #[cfg(feature = "voice")]
-        if voice_call_corr != current_corr {
-            voice_call_corr = current_corr.clone();
+        if voice_call_gen != tracker.generation() {
+            voice_call_gen = tracker.generation();
+            stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
             http_tts.reset_call();
             let _ = stt_tx.send(SttWork::ResetCall);
+            turn_index = 1;
+            history.clear();
+            last_bot_reply.clear();
+            stt_buf.clear();
+            stt_had_speech = false;
+            stt_silence = Duration::ZERO;
+            mute_stt_until = None;
+            if let Some(a) = aec.as_mut() {
+                a.reset();
+            }
         }
 
         // Flush a buffered incoming call once the caller id is known or the
         // grace window elapses.
-        if let Some((corr, since)) = pending_incoming.clone() {
-            if caller_id.is_some() || since.elapsed() > Duration::from_millis(800) {
-                let from = caller_id.clone().unwrap_or_else(|| "unknown".to_string());
-                emit(
-                    outbox,
-                    sink,
-                    aokie_core::events::aokie_event(
-                        crate::contract::events::CALL_INCOMING,
-                        &corr,
-                        json!({"from": from, "at": aokie_core::events::now_iso8601()}),
-                    ),
-                );
-                pending_incoming = None;
-            }
+        let flush_incoming = tracker.current().is_some_and(|s| {
+            s.incoming_pending() && (s.caller_id.is_some() || s.incoming_pending_ms() > 800)
+        });
+        if flush_incoming {
+            let (corr, from) = {
+                let s = tracker.current_mut().unwrap();
+                s.mark_incoming_emitted();
+                (
+                    s.id.clone(),
+                    s.caller_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                )
+            };
+            emit(
+                outbox,
+                sink,
+                aokie_core::events::aokie_event(
+                    crate::contract::events::CALL_INCOMING,
+                    &corr,
+                    json!({"callId": corr, "from": from, "at": aokie_core::events::now_iso8601()}),
+                ),
+            );
         }
 
         // Auto-answer ASAP: the instant a call is present and not yet answered,
         // send the answer â€” before the audio channel comes up and freezes the
-        // loop. Answer exactly once per call (tracked by `answered_corr`).
+        // loop. Answer exactly once per call (the session's auto_answered flag).
         if auto_answer {
-            match current_corr.as_deref() {
-                Some(corr)
-                    if answered_corr.as_deref() != Some(corr)
-                        && !status.call_active.load(Ordering::Relaxed) =>
-                {
+            if let Some(s) = tracker.current_mut() {
+                if !s.auto_answered && !s.is_active() {
                     match bt.answer_call() {
                         Ok(()) => {
                             eprintln!("[aokie-plugin] auto-answered incoming call (immediate)")
                         }
                         Err(e) => eprintln!("[aokie-plugin] auto-answer failed: {e}"),
                     }
-                    answered_corr = Some(corr.to_string());
+                    s.auto_answered = true;
                     idle = false;
                 }
-                None => answered_corr = None, // call cleared â€” ready for the next
-                _ => {}
             }
         }
 
@@ -1061,89 +1115,76 @@ fn run_loop(
         // TTS speech replaces this once outbound audio is confirmed. Gated by
         // settings.answerTone.
         if answer_tone {
-            match current_corr.as_deref() {
-                Some(corr) if toned_corr.as_deref() != Some(corr) => {
-                    let sr = bt.get_sample_rate();
-                    if sr > 0 {
-                        let tone = greeting_tone(sr);
-                        eprintln!(
-                            "[aokie-plugin] answerTone: sending {} samples @ {}Hz to the caller",
-                            tone.len(),
-                            sr
-                        );
-                        bt.send_audio(&tone);
-                        toned_corr = Some(corr.to_string());
-                        idle = false;
-                    }
+            let sr = bt.get_sample_rate();
+            if let Some(s) = tracker.current_mut() {
+                if !s.toned && sr > 0 {
+                    let tone = greeting_tone(sr);
+                    eprintln!(
+                        "[aokie-plugin] answerTone: sending {} samples @ {}Hz to the caller",
+                        tone.len(),
+                        sr
+                    );
+                    bt.send_audio(&tone);
+                    s.toned = true;
+                    idle = false;
                 }
-                None => toned_corr = None,
-                _ => {}
             }
         }
 
         // Greet the caller with real TTS speech once the SCO audio channel is up
-        // (voice build). Plays exactly once per call. Without the voice feature
-        // this is a no-op (greeted_corr just tracks the call).
-        match current_corr.as_deref() {
-            Some(corr) if greeted_corr.as_deref() != Some(corr) => {
-                let sr = bt.get_sample_rate();
-                if sr > 0 {
-                    #[cfg(feature = "voice")]
-                    {
-                        // Build the echo canceller once we know the negotiated SCO
-                        // rate (full-duplex only). Reused for every phrase this call.
-                        if barge_in && aec.is_none() {
-                            aec = Some(crate::aec::EchoCanceller::new(sr as u32));
-                            eprintln!(
-                                "[aokie-plugin] full-duplex barge-in ON (AEC @ {sr}Hz, rms>{barge_rms})"
-                            );
+        // (voice build). Plays exactly once per call (the session's `greeted`
+        // flag); per-call voice state RESETS live in the generation block above.
+        let greet_now = {
+            let sr = bt.get_sample_rate();
+            match tracker.current_mut() {
+                Some(s) if !s.greeted && sr > 0 => {
+                    s.greeted = true;
+                    Some((s.id.clone(), sr))
+                }
+                _ => None,
+            }
+        };
+        if let Some((corr, sr)) = greet_now {
+            #[cfg(not(feature = "voice"))]
+            let _ = (&corr, sr);
+            #[cfg(feature = "voice")]
+            {
+                // Build the echo canceller once we know the negotiated SCO
+                // rate (full-duplex only). Reused for every phrase this call.
+                if barge_in && aec.is_none() {
+                    aec = Some(crate::aec::EchoCanceller::new(sr as u32));
+                    eprintln!(
+                        "[aokie-plugin] full-duplex barge-in ON (AEC @ {sr}Hz, rms>{barge_rms})"
+                    );
+                }
+                if let Some(text) = greeting.as_deref() {
+                    // In barge-in mode the caller can talk over the greeting;
+                    // in half-duplex we mute STT for its playout instead.
+                    let (aec_ref, brms) = if barge_in {
+                        (aec.as_mut(), Some(barge_rms))
+                    } else {
+                        (None, None)
+                    };
+                    let out = tts_speak(bt, &mut tts, &mut http_tts, text, sr, aec_ref, brms);
+                    if barge_in {
+                        if out.barged {
+                            bt.flush_tx_audio();
                         }
-                        if let Some(text) = greeting.as_deref() {
-                            // In barge-in mode the caller can talk over the greeting;
-                            // in half-duplex we mute STT for its playout instead.
-                            let (aec_ref, brms) = if barge_in {
-                                (aec.as_mut(), Some(barge_rms))
-                            } else {
-                                (None, None)
-                            };
-                            let out =
-                                tts_speak(bt, &mut tts, &mut http_tts, text, sr, aec_ref, brms);
-                            if barge_in {
-                                if out.barged {
-                                    bt.flush_tx_audio();
-                                }
-                                mute_stt_until = None;
-                            } else {
-                                mute_stt_until =
-                                    Some(Instant::now() + out.dur + Duration::from_millis(400));
-                            }
-                            stt_buf.clear();
-                            stt_had_speech = false;
-                            stt_silence = Duration::ZERO;
-                            emit_turn(outbox, sink, corr, turn_index, "bot", text);
-                            turn_index += 1;
-                            history
-                                .push(serde_json::json!({ "role": "assistant", "content": text }));
-                            last_bot_reply = text.to_string();
-                        }
+                        mute_stt_until = None;
+                    } else {
+                        mute_stt_until =
+                            Some(Instant::now() + out.dur + Duration::from_millis(400));
                     }
-                    greeted_corr = Some(corr.to_string());
-                    idle = false;
+                    stt_buf.clear();
+                    stt_had_speech = false;
+                    stt_silence = Duration::ZERO;
+                    emit_turn(outbox, sink, &corr, turn_index, "bot", text);
+                    turn_index += 1;
+                    history.push(serde_json::json!({ "role": "assistant", "content": text }));
+                    last_bot_reply = text.to_string();
                 }
             }
-            None => {
-                greeted_corr = None;
-                #[cfg(feature = "voice")]
-                {
-                    turn_index = 1;
-                    history.clear();
-                    last_bot_reply.clear();
-                    if let Some(a) = aec.as_mut() {
-                        a.reset();
-                    }
-                }
-            }
-            _ => {}
+            idle = false;
         }
 
         // Inbound caller audio.
@@ -1161,7 +1202,7 @@ fn run_loop(
             let muted = mute_stt_until.is_some_and(|t| Instant::now() < t);
             while let Some(frame) = bt.try_recv_audio() {
                 idle = false;
-                if current_corr.is_none() {
+                if tracker.current().is_none() {
                     continue;
                 }
                 // Full-duplex: echo-cancel the mic (so Aokie's own voice, even
@@ -1203,7 +1244,17 @@ fn run_loop(
             }
             if stt_had_speech && stt_silence >= endpoint {
                 if stt_buf.len() >= 16_000 / 3 {
-                    let _ = stt_tx.send(SttWork::Utterance(std::mem::take(&mut stt_buf)));
+                    // Stamp the job with the call it belongs to (audit C-05).
+                    if let Some(s) = tracker.current_mut() {
+                        let utterance = s.next_utterance_id();
+                        let _ = stt_tx.send(SttWork::Utterance {
+                            generation: s.generation,
+                            utterance,
+                            samples: std::mem::take(&mut stt_buf),
+                        });
+                    } else {
+                        stt_buf.clear();
+                    }
                 } else {
                     stt_buf.clear();
                 }
@@ -1213,9 +1264,27 @@ fn run_loop(
             // Finished transcripts â†’ aokie.call.turn.final (the flow's conversation hook,
             // and the recording source). If the in-plugin agent is on, also answer
             // the caller directly here â€” streaming the LLM + speaking each sentence.
-            while let Ok(text) = stt_result_rx.try_recv() {
+            while let Ok(SttResult {
+                generation,
+                utterance,
+                text,
+            }) = stt_result_rx.try_recv()
+            {
                 idle = false;
-                if let Some(corr) = current_corr.clone() {
+                // Stale-result gate (audit C-05): only text whose generation IS
+                // the current call may be recorded or answered. A slow result
+                // from a previous call is dropped and counted — never spoken
+                // to, or attributed to, the next caller.
+                if tracker.current().map(|s| s.generation) != Some(generation) {
+                    let n = status.stale_stt_results.fetch_add(1, Ordering::Relaxed) + 1;
+                    eprintln!(
+                        "[aokie-plugin] DROPPED stale STT result (call gen {generation}, utterance {utterance}, current gen {}, {n} total): {text:?}",
+                        tracker.generation()
+                    );
+                    continue;
+                }
+                {
+                    let corr = tracker.call_id().unwrap_or_default().to_string();
                     // Drop a transcript that's really Aokie's own reply echoing back
                     // (belt-and-suspenders over the half-duplex mute) so it never
                     // records it as a caller turn or answers itself.
@@ -1351,11 +1420,16 @@ fn run_loop(
                     }
                 }
                 Ok(RadioControl::Reject) => {
+                    // Record WHY before the phone acts, so the eventual
+                    // CallTerminated reads outcome "rejected", never "missed"
+                    // (audit AK-001/AK-01).
+                    tracker.note_intent(crate::call_session::TerminationIntent::OperatorReject);
                     if let Err(e) = bt.reject_call() {
                         eprintln!("[aokie-plugin] radio reject failed: {e}");
                     }
                 }
                 Ok(RadioControl::Hangup) => {
+                    tracker.note_intent(crate::call_session::TerminationIntent::OperatorHangup);
                     if let Err(e) = bt.hangup() {
                         eprintln!("[aokie-plugin] radio hangup failed: {e}");
                     }
@@ -1392,7 +1466,7 @@ fn run_loop(
                         stt_had_speech = false;
                         stt_silence = Duration::ZERO;
                         // Record Aokie's spoken reply as a bot transcript turn.
-                        if let Some(corr) = current_corr.clone() {
+                        if let Some(corr) = tracker.call_id().map(str::to_string) {
                             emit_turn(outbox, sink, &corr, turn_index, "bot", &text);
                             turn_index += 1;
                         }
@@ -1488,15 +1562,13 @@ fn run_loop(
     }
 }
 
-/// Map one `BluetoothEvent` to the `aokie.*` contract + update shared status.
-/// Available on all targets (it only touches `BluetoothEvent`, which is not
-/// Windows-gated) so it stays unit-testable.
+/// Map one `BluetoothEvent` to the `aokie.*` contract: drive the call-session
+/// state machine (audit AK-001) + mirror shared status. Available on all
+/// targets (it only touches `BluetoothEvent`, which is not Windows-gated) so
+/// the whole lifecycle stays unit-testable.
 fn handle_event(
     ev: aokie_dongle::bluetooth::BluetoothEvent,
-    caller_id: &mut Option<String>,
-    current_corr: &mut Option<String>,
-    pending_incoming: &mut Option<(String, std::time::Instant)>,
-    answered_at: &mut Option<std::time::Instant>,
+    tracker: &mut crate::call_session::SessionTracker,
     outbox: Option<&Outbox>,
     sink: &mut dyn Sink,
     status: &Arc<RadioStatus>,
@@ -1551,89 +1623,88 @@ fn handle_event(
             );
         }
         E::CallIncoming => {
-            // Some phones emit the ring / callsetup indicator more than once for
-            // a single call. Only start a NEW call (fresh corr) when we aren't
-            // already handling one, so the incoming event + greeting fire exactly
-            // once per call (fixes the double greeting).
-            if current_corr.is_none() {
-                let corr = format!("call_{}", uuid::Uuid::new_v4().simple());
-                *current_corr = Some(corr.clone());
-                *caller_id = None;
-                *status.current_caller.lock().unwrap() = None;
+            // Some phones emit the ring / callsetup indicator more than once
+            // for a single call — the tracker starts a NEW session only when
+            // idle, so incoming + greeting fire exactly once per call.
+            let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+            if let Some(s) = tracker.ring(id, now_iso8601()) {
                 // Shared call identity: `call.current` recovers a live call
                 // from these after a browser refresh (audit C-02), and call
                 // controls verify their `callId` against it (audit C-01).
-                *status.current_call_id.lock().unwrap() = Some(corr.clone());
-                *status.call_started_at.lock().unwrap() = Some(now_iso8601());
-                *pending_incoming = Some((corr, std::time::Instant::now()));
+                *status.current_caller.lock().unwrap() = None;
+                *status.current_call_id.lock().unwrap() = Some(s.id.clone());
+                *status.call_started_at.lock().unwrap() = Some(s.started_at_iso.clone());
             }
         }
         E::CallerId(num) => {
-            *caller_id = Some(num.clone());
+            tracker.caller_id(num.clone());
             *status.current_caller.lock().unwrap() = Some(num);
         }
         E::CallRinging => {
-            if let Some(corr) = current_corr.as_ref() {
+            if let Some(corr) = tracker.call_id() {
                 emit(
                     outbox,
                     sink,
-                    aokie_event(crate::contract::events::CALL_RINGING, corr, json!({"at": now_iso8601()})),
+                    aokie_event(
+                        crate::contract::events::CALL_RINGING,
+                        corr,
+                        json!({"at": now_iso8601()}),
+                    ),
                 );
             }
         }
         E::CallAnswered => {
             status.call_active.store(true, Ordering::Relaxed);
-            *answered_at = Some(std::time::Instant::now());
-            if let Some(corr) = current_corr.as_ref() {
+            tracker.answered();
+            if let Some(corr) = tracker.call_id() {
                 emit(
                     outbox,
                     sink,
-                    aokie_event(crate::contract::events::CALL_ANSWERED, corr, json!({"at": now_iso8601()})),
+                    aokie_event(
+                        crate::contract::events::CALL_ANSWERED,
+                        corr,
+                        json!({"at": now_iso8601()}),
+                    ),
                 );
             }
         }
         E::CallTerminated => {
             status.call_active.store(false, Ordering::Relaxed);
-            if let Some(corr) = current_corr.take() {
+            if let Some(ended) = tracker.terminate() {
                 // The after-call flows key off this payload (contract §events):
-                // callId mirrors the envelope correlation (same convention as
-                // turn.final), from/callerPhone carry the caller id, and
-                // durationSeconds counts from ANSWER — so a never-answered call
-                // reads durationSeconds 0 + outcome "missed" and the pack's
-                // missed-call binding (outcome === 'missed') matches, while the
-                // after-call/summary bindings (durationSeconds > 5) skip it.
-                let duration_seconds = answered_at
-                    .take()
-                    .map(|t| t.elapsed().as_secs())
-                    .unwrap_or(0);
-                let from = caller_id.clone().unwrap_or_default();
+                // callId mirrors the envelope correlation, from/callerPhone
+                // carry the caller id, durationSeconds/durationMs count from
+                // ANSWER. The outcome comes from the session state machine
+                // (audit AK-001): answered → "completed" (even a sub-second
+                // call), operator-rejected → "rejected", never answered →
+                // "missed" — so the pack's missed-call binding
+                // (outcome === 'missed') no longer fires for rejections.
+                let from = ended.caller_id.clone().unwrap_or_default();
                 emit(
                     outbox,
                     sink,
                     aokie_event(
                         crate::contract::events::CALL_ENDED,
-                        &corr,
+                        &ended.id,
                         json!({
                             "at": now_iso8601(),
-                            "reason": "remote_or_operator",
-                            "callId": corr,
+                            "reason": ended.reason,
+                            "callId": ended.id,
                             "from": from,
                             "callerPhone": from,
-                            "durationSeconds": duration_seconds,
-                            "outcome": if duration_seconds > 0 { "completed" } else { "missed" },
+                            "durationSeconds": ended.duration_seconds,
+                            "durationMs": ended.duration_ms as u64,
+                            "outcome": ended.outcome,
                         }),
                     ),
                 );
             }
-            *answered_at = None;
-            *caller_id = None;
-            *pending_incoming = None;
             *status.current_caller.lock().unwrap() = None;
             *status.current_call_id.lock().unwrap() = None;
             *status.call_started_at.lock().unwrap() = None;
         }
         E::AudioConnected { codec, sample_rate } => {
-            let corr = current_corr.clone().unwrap_or_else(|| "radio".to_string());
+            let corr = tracker.call_id().unwrap_or("radio").to_string();
             emit(
                 outbox,
                 sink,
@@ -1645,11 +1716,15 @@ fn handle_event(
             );
         }
         E::AudioDisconnected => {
-            let corr = current_corr.clone().unwrap_or_else(|| "radio".to_string());
+            let corr = tracker.call_id().unwrap_or("radio").to_string();
             emit(
                 outbox,
                 sink,
-                aokie_event(crate::contract::events::CALL_AUDIO_DISCONNECTED, &corr, json!({})),
+                aokie_event(
+                    crate::contract::events::CALL_AUDIO_DISCONNECTED,
+                    &corr,
+                    json!({}),
+                ),
             );
         }
         E::SmsReceived(p) => {
@@ -1714,10 +1789,11 @@ pub fn spawn(
 mod tests {
     use super::*;
 
-    /// Audit C-01/C-02: the radio publishes the current call's identity
+    /// Audit C-01/C-02/AK-001: the radio publishes the current call's identity
     /// (`callId` + `startedAt`) into the shared status the moment it rings
     /// and clears it on termination — `call.current` and the call-control
-    /// `callId` guard read exactly these fields.
+    /// `callId` guard read exactly these fields — and the session state
+    /// machine decides the ended outcome.
     #[test]
     fn handle_event_tracks_shared_call_identity() {
         use crate::event_bridge::VecSink;
@@ -1725,23 +1801,11 @@ mod tests {
 
         let status = Arc::new(RadioStatus::default());
         let mut sink = VecSink::default();
-        let mut caller_id: Option<String> = None;
-        let mut current_corr: Option<String> = None;
-        let mut pending_incoming: Option<(String, std::time::Instant)> = None;
-        let mut answered_at: Option<std::time::Instant> = None;
+        let mut tracker = crate::call_session::SessionTracker::new();
 
         macro_rules! apply {
             ($ev:expr) => {
-                handle_event(
-                    $ev,
-                    &mut caller_id,
-                    &mut current_corr,
-                    &mut pending_incoming,
-                    &mut answered_at,
-                    None,
-                    &mut sink,
-                    &status,
-                )
+                handle_event($ev, &mut tracker, None, &mut sink, &status)
             };
         }
 
@@ -1749,14 +1813,24 @@ mod tests {
 
         apply!(E::CallIncoming);
         let call_id = status.current_call_id.lock().unwrap().clone();
-        assert_eq!(call_id, current_corr, "shared id mirrors the corr");
+        assert_eq!(
+            call_id.as_deref(),
+            tracker.call_id(),
+            "shared id mirrors the session"
+        );
         assert!(call_id.as_deref().unwrap().starts_with("call_"));
         assert!(status.call_started_at.lock().unwrap().is_some());
-        assert!(!status.call_active.load(Ordering::Relaxed), "ringing, not active");
+        assert!(
+            !status.call_active.load(Ordering::Relaxed),
+            "ringing, not active"
+        );
+        let first_gen = tracker.generation();
+        assert_eq!(first_gen, 1);
 
         // Phones re-emit the ring indicator — the id must not change mid-call.
         apply!(E::CallIncoming);
         assert_eq!(*status.current_call_id.lock().unwrap(), call_id);
+        assert_eq!(tracker.generation(), first_gen);
 
         apply!(E::CallerId("+61400000001".to_string()));
         assert_eq!(
@@ -1774,19 +1848,56 @@ mod tests {
         assert!(status.call_started_at.lock().unwrap().is_none());
         assert!(status.current_caller.lock().unwrap().is_none());
         assert!(!status.call_active.load(Ordering::Relaxed));
-        // The ended event carried the SAME call id the whole call used.
+        assert_eq!(tracker.generation(), 0, "idle after termination");
+        // The ended event carried the SAME call id the whole call used, and
+        // an ANSWERED call is completed even when it lasted under a second.
         let v: serde_json::Value = serde_json::from_str(&sink.lines[0]).unwrap();
         assert_eq!(
             v["params"]["event"]["name"],
             json!(crate::contract::events::CALL_ENDED)
         );
         assert_eq!(v["params"]["event"]["data"]["callId"], json!(call_id));
+        assert_eq!(v["params"]["event"]["data"]["outcome"], json!("completed"));
+        assert_eq!(v["params"]["event"]["data"]["from"], json!("+61400000001"));
 
-        // The next call gets a FRESH id.
+        // The next call gets a FRESH id and a FRESH generation.
         apply!(E::CallIncoming);
         let second = status.current_call_id.lock().unwrap().clone();
         assert!(second.is_some());
         assert_ne!(second, call_id);
+        assert_eq!(tracker.generation(), 2);
+    }
+
+    /// Audit AK-001/AK-01: an operator-rejected ring ends "rejected", a
+    /// remote-abandoned ring ends "missed" — the two are no longer conflated.
+    #[test]
+    fn handle_event_rejected_is_not_missed() {
+        use crate::event_bridge::VecSink;
+        use aokie_dongle::bluetooth::BluetoothEvent as E;
+
+        let status = Arc::new(RadioStatus::default());
+        let mut sink = VecSink::default();
+        let mut tracker = crate::call_session::SessionTracker::new();
+
+        // Operator rejects the ringing call (RadioControl::Reject notes the
+        // intent, then the phone reports termination).
+        handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+        tracker.note_intent(crate::call_session::TerminationIntent::OperatorReject);
+        sink.lines.clear();
+        handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
+        let v: serde_json::Value = serde_json::from_str(&sink.lines[0]).unwrap();
+        assert_eq!(v["params"]["event"]["data"]["outcome"], json!("rejected"));
+        assert_eq!(
+            v["params"]["event"]["data"]["reason"],
+            json!("operator_reject")
+        );
+
+        // Remote abandons the next ring: genuinely missed.
+        handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+        sink.lines.clear();
+        handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
+        let v: serde_json::Value = serde_json::from_str(&sink.lines[0]).unwrap();
+        assert_eq!(v["params"]["event"]["data"]["outcome"], json!("missed"));
     }
 
     #[test]

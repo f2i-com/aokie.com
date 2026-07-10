@@ -31,6 +31,7 @@
 pub mod aec;
 #[cfg(feature = "voice")]
 pub mod agent;
+pub mod call_session;
 pub mod config;
 pub mod connector;
 pub mod contract;
