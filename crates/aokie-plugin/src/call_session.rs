@@ -21,6 +21,10 @@ use std::time::Instant;
 pub enum TerminationIntent {
     OperatorReject,
     OperatorHangup,
+    /// The dongle/phone link vanished under a live call (audit AOK-LIF-003):
+    /// the radio synthesizes termination rather than leaving the session —
+    /// and the operator UI — stuck "live" on hardware that is gone.
+    DeviceLost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +211,10 @@ impl SessionTracker {
         let s = self.session.take()?;
         let duration_ms = s.answered.map(|t| t.elapsed().as_millis()).unwrap_or(0);
         let (outcome, reason) = match (s.answered.is_some(), s.intent) {
+            // Device loss is its own truth (audit AOK-LIF-003): the call did
+            // not complete or get rejected — the hardware went away.
+            (true, Some(TerminationIntent::DeviceLost)) => ("completed", "device_lost"),
+            (false, Some(TerminationIntent::DeviceLost)) => ("missed", "device_lost"),
             (true, Some(TerminationIntent::OperatorHangup)) => ("completed", "operator_hangup"),
             (true, _) => ("completed", "remote_or_operator"),
             (false, Some(TerminationIntent::OperatorReject)) => ("rejected", "operator_reject"),

@@ -226,6 +226,42 @@ fn emit_turn(
     );
 }
 
+/// The canonical `call.ended` emission — shared by the phone's real
+/// CallTerminated and the synthesized device-loss termination (audit
+/// AOK-LIF-003), so both produce ONE identical terminal event shape.
+/// The after-call flows key off this payload (contract §events): callId
+/// mirrors the envelope correlation, from/callerPhone carry the caller id,
+/// durationSeconds/durationMs count from ANSWER. The outcome comes from the
+/// session state machine (audit AK-001): answered → "completed" (even a
+/// sub-second call), operator-rejected → "rejected", never answered →
+/// "missed", radio link gone → reason "device_lost".
+fn emit_call_ended(
+    ended: &crate::call_session::EndedCall,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+) {
+    use aokie_core::events::{aokie_event, now_iso8601};
+    let from = ended.caller_id.clone().unwrap_or_default();
+    emit(
+        outbox,
+        sink,
+        aokie_event(
+            crate::contract::events::CALL_ENDED,
+            &ended.id,
+            json!({
+                "at": now_iso8601(),
+                "reason": ended.reason,
+                "callId": ended.id,
+                "from": from,
+                "callerPhone": from,
+                "durationSeconds": ended.duration_seconds,
+                "durationMs": ended.duration_ms as u64,
+                "outcome": ended.outcome,
+            }),
+        ),
+    );
+}
+
 /// PII gate for conversation content in logs (audit PRIV-001/C-06): stderr is
 /// captured by Desktop's log ring, so caller speech and agent replies appear
 /// verbatim only when the operator explicitly opts in (`AOKIE_LOG_CONTENT=1`);
@@ -1804,6 +1840,25 @@ fn handle_event(
             );
         }
         E::DeviceDisconnected(addr) => {
+            // A live session cannot outlive its radio link (audit
+            // AOK-LIF-003): synthesize the terminal outcome NOW — otherwise
+            // call.current and the operator UI stay "live" on hardware that
+            // is gone. A late real CallTerminated lands on an idle tracker
+            // and is a no-op (no duplicate terminal event).
+            if tracker.current().is_some() {
+                status.call_active.store(false, Ordering::Relaxed);
+                tracker.note_intent(crate::call_session::TerminationIntent::DeviceLost);
+                if let Some(ended) = tracker.terminate() {
+                    eprintln!(
+                        "[aokie-plugin] phone link lost during call {} — synthesized termination (outcome {})",
+                        ended.id, ended.outcome
+                    );
+                    emit_call_ended(&ended, outbox, sink);
+                }
+                *status.current_caller.lock().unwrap() = None;
+                *status.current_call_id.lock().unwrap() = None;
+                *status.call_started_at.lock().unwrap() = None;
+            }
             status.connected.store(false, Ordering::Relaxed);
             *status.connected_address.lock().unwrap() = None;
             emit(
@@ -1865,33 +1920,7 @@ fn handle_event(
         E::CallTerminated => {
             status.call_active.store(false, Ordering::Relaxed);
             if let Some(ended) = tracker.terminate() {
-                // The after-call flows key off this payload (contract §events):
-                // callId mirrors the envelope correlation, from/callerPhone
-                // carry the caller id, durationSeconds/durationMs count from
-                // ANSWER. The outcome comes from the session state machine
-                // (audit AK-001): answered → "completed" (even a sub-second
-                // call), operator-rejected → "rejected", never answered →
-                // "missed" — so the pack's missed-call binding
-                // (outcome === 'missed') no longer fires for rejections.
-                let from = ended.caller_id.clone().unwrap_or_default();
-                emit(
-                    outbox,
-                    sink,
-                    aokie_event(
-                        crate::contract::events::CALL_ENDED,
-                        &ended.id,
-                        json!({
-                            "at": now_iso8601(),
-                            "reason": ended.reason,
-                            "callId": ended.id,
-                            "from": from,
-                            "callerPhone": from,
-                            "durationSeconds": ended.duration_seconds,
-                            "durationMs": ended.duration_ms as u64,
-                            "outcome": ended.outcome,
-                        }),
-                    ),
-                );
+                emit_call_ended(&ended, outbox, sink);
             }
             *status.current_caller.lock().unwrap() = None;
             *status.current_call_id.lock().unwrap() = None;
@@ -2118,6 +2147,57 @@ mod tests {
         handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
         let v: serde_json::Value = serde_json::from_str(&sink.lines[0]).unwrap();
         assert_eq!(v["params"]["event"]["data"]["outcome"], json!("missed"));
+    }
+
+    /// Audit AOK-LIF-003: losing the phone/radio link under a live call
+    /// synthesizes exactly ONE terminal `call.ended` (reason device_lost),
+    /// clears the shared call identity, and a late real CallTerminated is a
+    /// no-op — the UI can never stay "live" on hardware that is gone.
+    #[test]
+    fn handle_event_device_loss_terminates_the_active_call_once() {
+        use crate::event_bridge::VecSink;
+        use aokie_dongle::bluetooth::BluetoothEvent as E;
+
+        let status = Arc::new(RadioStatus::default());
+        let mut sink = VecSink::default();
+        let mut tracker = crate::call_session::SessionTracker::new();
+
+        handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+        handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
+        assert!(status.call_active.load(Ordering::Relaxed));
+        sink.lines.clear();
+
+        handle_event(
+            E::DeviceDisconnected("AA:BB:CC:DD:EE:FF".into()),
+            &mut tracker,
+            None,
+            &mut sink,
+            &status,
+        );
+
+        let events: Vec<serde_json::Value> = sink
+            .lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let ended: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|v| v["params"]["event"]["name"] == json!(crate::contract::events::CALL_ENDED))
+            .collect();
+        assert_eq!(ended.len(), 1, "exactly one terminal event");
+        assert_eq!(ended[0]["params"]["event"]["data"]["reason"], json!("device_lost"));
+        assert_eq!(ended[0]["params"]["event"]["data"]["outcome"], json!("completed"));
+        assert!(!status.call_active.load(Ordering::Relaxed));
+        assert!(status.current_call_id.lock().unwrap().is_none(), "call identity cleared");
+        assert!(tracker.current().is_none(), "session consumed");
+
+        // The phone reports the (now stale) termination later: no duplicate.
+        sink.lines.clear();
+        handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
+        assert!(
+            sink.lines.iter().all(|l| !l.contains(crate::contract::events::CALL_ENDED)),
+            "late real termination after synthesized one is a no-op"
+        );
     }
 
     #[test]
