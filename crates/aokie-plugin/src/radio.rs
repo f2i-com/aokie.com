@@ -1077,6 +1077,10 @@ fn run_loop(
     // VAD / utterance accumulator (all in 16 kHz mono f32, the STT engine's rate).
     #[cfg(feature = "voice")]
     let mut stt_buf: Vec<f32> = Vec::new();
+    // Utterances sent to the STT worker whose results haven't come back yet
+    // (audit AOK-LIF-002): the termination drain waits for these — bounded —
+    // so the caller's last words land BEFORE call.ended.
+    let mut stt_outstanding: usize = 0;
     #[cfg(feature = "voice")]
     let mut stt_had_speech = false;
     #[cfg(feature = "voice")]
@@ -1188,6 +1192,81 @@ fn run_loop(
 
         while let Some(ev) = bt.try_recv_event() {
             idle = false;
+            // Final-transcript drain (audit AOK-LIF-002): the caller's last
+            // words must land BEFORE call.ended — summaries and after-call
+            // flows key off ended, and the last sentence is often the most
+            // important one. On termination of a live call: finalize any
+            // buffered audio as the closing utterance, wait (bounded) for
+            // in-flight STT, and flush the held turn — THEN let handle_event
+            // publish the terminal event. The call is already over, so the
+            // short stall cannot delay answering it.
+            #[cfg(feature = "voice")]
+            if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallTerminated)
+                && tracker.current().is_some()
+            {
+                if stt_had_speech && stt_buf.len() >= 16_000 / 3 {
+                    if let Some(s) = tracker.current_mut() {
+                        let utterance = s.next_utterance_id();
+                        if stt_tx
+                            .send(SttWork::Utterance {
+                                generation: s.generation,
+                                utterance,
+                                samples: std::mem::take(&mut stt_buf),
+                            })
+                            .is_ok()
+                        {
+                            stt_outstanding += 1;
+                        }
+                    }
+                }
+                stt_buf.clear();
+                stt_had_speech = false;
+                stt_silence = Duration::ZERO;
+
+                let gen_now = tracker.generation();
+                let deadline = Instant::now() + Duration::from_millis(1500);
+                while stt_outstanding > 0 {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        eprintln!(
+                            "[aokie-plugin] final-transcript drain timed out with {stt_outstanding} STT job(s) in flight"
+                        );
+                        break;
+                    }
+                    match stt_result_rx.recv_timeout(left) {
+                        Ok(SttResult { generation, text, .. }) => {
+                            stt_outstanding = stt_outstanding.saturating_sub(1);
+                            if generation != gen_now {
+                                status.stale_stt_results.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            if agent_enabled && looks_like_echo(&text, &last_bot_reply) {
+                                continue;
+                            }
+                            match pending_turn.as_mut() {
+                                Some(p) => {
+                                    p.text.push(' ');
+                                    p.text.push_str(text.trim());
+                                }
+                                None => {
+                                    pending_turn = Some(PendingTurn {
+                                        corr: tracker.call_id().unwrap_or_default().to_string(),
+                                        text: text.trim().to_string(),
+                                        flush_at: Instant::now(),
+                                    })
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if let Some(p) = pending_turn.take() {
+                    if !p.corr.is_empty() && !p.text.is_empty() {
+                        emit_turn(outbox, sink, &p.corr, turn_index, "caller", &p.text);
+                        turn_index += 1;
+                    }
+                }
+            }
             handle_event(ev, &mut tracker, outbox, sink, &status);
         }
 
@@ -1218,6 +1297,10 @@ fn run_loop(
             stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
             http_tts.reset_call();
             let _ = stt_tx.send(SttWork::ResetCall);
+            // Self-healing (AOK-LIF-002): skipped/empty STT jobs never send a
+            // result, so the in-flight counter resets at every call boundary
+            // rather than accumulating drift across calls.
+            stt_outstanding = 0;
             turn_index = 1;
             history.clear();
             last_bot_reply.clear();
@@ -1395,11 +1478,16 @@ fn run_loop(
                     // Stamp the job with the call it belongs to (audit C-05).
                     if let Some(s) = tracker.current_mut() {
                         let utterance = s.next_utterance_id();
-                        let _ = stt_tx.send(SttWork::Utterance {
-                            generation: s.generation,
-                            utterance,
-                            samples: std::mem::take(&mut stt_buf),
-                        });
+                        if stt_tx
+                            .send(SttWork::Utterance {
+                                generation: s.generation,
+                                utterance,
+                                samples: std::mem::take(&mut stt_buf),
+                            })
+                            .is_ok()
+                        {
+                            stt_outstanding += 1;
+                        }
                     } else {
                         stt_buf.clear();
                     }
@@ -1422,6 +1510,7 @@ fn run_loop(
             }) = stt_result_rx.try_recv()
             {
                 idle = false;
+                stt_outstanding = stt_outstanding.saturating_sub(1);
                 // Stale-result gate (audit C-05): only text whose generation IS
                 // the current call may be recorded or answered. A slow result
                 // from a previous call is dropped and counted — never spoken
