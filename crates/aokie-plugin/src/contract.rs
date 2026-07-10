@@ -131,11 +131,51 @@ pub mod call_state {
     pub const ENDED: &str = "ended";
 }
 
+/// The default in-plugin voice-agent persona (audit CROSS-SCHEMA-001). Lives
+/// in the always-compiled contract module — NOT behind the voice cfg — so
+/// both the radio's agent and the shared cross-repo fixture
+/// (`docs/contracts/aokie-persona.v1.json`, byte-identical in the FormLogic
+/// repo where the pack's DEFAULT_PERSONA is locked to it) resolve to ONE
+/// source. The in-plugin agent and the flow-based reply path can never drift.
+pub const DEFAULT_AGENT_PERSONA: &str = "You are Aokie, a warm, efficient phone receptionist for a small \
+business, speaking out loud on a live phone call. If the caller asks who you are or your name, say \
+you are Aokie, the automated receptionist - never invent a different name for yourself. Reply with ONE short, natural spoken sentence — no \
+lists, markdown, or emoji. Your job: greet the caller, find out their name and how you can help, \
+capture the key details (what they need, and a callback number or time if relevant), and either book \
+them in or take a message. Ask only ONE clear question at a time and keep the conversation moving. \
+IMPORTANT - only promise what actually happens: you take booking REQUESTS and messages for the team \
+to confirm, so say things like I have noted that down and someone will confirm with you - NEVER say \
+you will send a text, SMS, email, or confirmation yourself, and never claim something is booked, \
+sent, or done, because you cannot send messages and bookings are confirmed by a person afterwards.";
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use serde_json::Value;
+
+    /// Audit CROSS-SCHEMA-001: the default persona matches the shared
+    /// cross-repo fixture (byte-identical copy in the FormLogic repo, where
+    /// the pack's DEFAULT_PERSONA is locked to it). Drift in either repo
+    /// fails its own CI — the voice agent and the flow reply path stay one
+    /// voice. Also guards against the mojibake em-dash this fixture fixed.
+    #[test]
+    fn persona_matches_the_shared_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../docs/contracts/aokie-persona.v1.json"
+        ))
+        .expect("persona fixture parses");
+        assert_eq!(fixture["personaVersion"], 1);
+        assert_eq!(
+            fixture["persona"].as_str().expect("persona string"),
+            super::DEFAULT_AGENT_PERSONA,
+            "DEFAULT_AGENT_PERSONA drifted from the shared persona fixture"
+        );
+        assert!(
+            !super::DEFAULT_AGENT_PERSONA.contains('\u{00e2}'),
+            "persona contains a mojibake byte"
+        );
+    }
 
     /// Audit CROSS-COMPAT-001: the shared cross-repo contract fixture. A
     /// byte-identical copy lives in the FormLogic repo, test-locked there

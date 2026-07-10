@@ -67,22 +67,14 @@ pub enum RadioControl {
     Shutdown,
 }
 
-/// Default receptionist system prompt when none is configured (voice build). A
-/// goal-directed SCRIPT, not just a style: greet, get the caller's name and
-/// reason, capture the key details, and book them in or take a message â€” one
-/// short spoken question at a time. Editable live via the `persona` setting /
-/// a flow push, so most deployments override this.
+/// Default receptionist system prompt when none is configured (voice build) —
+/// a goal-directed SCRIPT, not just a style: greet, get the caller's name and
+/// reason, capture the key details, and book them in or take a message, one
+/// short spoken question at a time. THE persona lives in the always-compiled
+/// contract module (audit CROSS-SCHEMA-001) and is test-locked to the shared
+/// cross-repo fixture; editable live via the `persona` setting / a flow push.
 #[cfg(all(target_os = "windows", feature = "voice"))]
-const DEFAULT_AGENT_PERSONA: &str = "You are Aokie, a warm, efficient phone receptionist for a small \
-business, speaking out loud on a live phone call. If the caller asks who you are or your name, say \
-you are Aokie, the automated receptionist - never invent a different name for yourself. Reply with ONE short, natural spoken sentence â€” no \
-lists, markdown, or emoji. Your job: greet the caller, find out their name and how you can help, \
-capture the key details (what they need, and a callback number or time if relevant), and either book \
-them in or take a message. Ask only ONE clear question at a time and keep the conversation moving. \
-IMPORTANT - only promise what actually happens: you take booking REQUESTS and messages for the team \
-to confirm, so say things like I have noted that down and someone will confirm with you - NEVER say \
-you will send a text, SMS, email, or confirmation yourself, and never claim something is booked, \
-sent, or done, because you cannot send messages and bookings are confirmed by a person afterwards.";
+use crate::contract::DEFAULT_AGENT_PERSONA;
 
 /// Spoken on answer when no greeting is configured. A BLANK greeting setting means
 /// "use the default", never "answer silently" — a desktop settings-form save (which
