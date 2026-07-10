@@ -107,6 +107,10 @@ pub struct RadioStatus {
     /// termination — this is what lets `call.current` recover a live call
     /// after a page refresh and lets call controls verify a `callId`.
     pub current_call_id: Mutex<Option<String>>,
+    /// The settings revision in effect (audit AOK-CONFIG-002): stamped by the
+    /// connector at spawn and on every settings.set, embedded in call.ended
+    /// so a call record identifies exactly which configuration it ran under.
+    pub config_version: AtomicU64,
     /// ISO-8601 instant the current call started RINGING (not answered) —
     /// the Live Call screen's timer runs from here.
     pub call_started_at: Mutex<Option<String>>,
@@ -267,6 +271,7 @@ fn flush_incoming_if_pending(
 /// "missed", radio link gone → reason "device_lost".
 fn emit_call_ended(
     ended: &crate::call_session::EndedCall,
+    config_version: u64,
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
 ) {
@@ -287,6 +292,7 @@ fn emit_call_ended(
                 "durationSeconds": ended.duration_seconds,
                 "durationMs": ended.duration_ms as u64,
                 "outcome": ended.outcome,
+                "configVersion": config_version,
             }),
         ),
     );
@@ -2005,7 +2011,7 @@ fn handle_event(
                         "[aokie-plugin] phone link lost during call {} — synthesized termination (outcome {})",
                         ended.id, ended.outcome
                     );
-                    emit_call_ended(&ended, outbox, sink);
+                    emit_call_ended(&ended, status.config_version.load(Ordering::Relaxed), outbox, sink);
                 }
                 *status.current_caller.lock().unwrap() = None;
                 *status.current_call_id.lock().unwrap() = None;
@@ -2079,7 +2085,7 @@ fn handle_event(
             flush_incoming_if_pending(tracker, outbox, sink);
             status.call_active.store(false, Ordering::Relaxed);
             if let Some(ended) = tracker.terminate() {
-                emit_call_ended(&ended, outbox, sink);
+                emit_call_ended(&ended, status.config_version.load(Ordering::Relaxed), outbox, sink);
             }
             *status.current_caller.lock().unwrap() = None;
             *status.current_call_id.lock().unwrap() = None;

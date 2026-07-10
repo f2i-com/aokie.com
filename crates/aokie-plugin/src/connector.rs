@@ -421,6 +421,11 @@ impl Plugin {
                 eprintln!(
                     "[aokie-plugin] live radio starting (real mode, auto_answer={auto_answer})"
                 );
+                // Initial config revision for call records (AOK-CONFIG-002).
+                handle
+                    .status
+                    .config_version
+                    .store(self.store.config.config_version, std::sync::atomic::Ordering::Relaxed);
                 self.radio = Some(handle);
             }
             Err(e) => eprintln!("[aokie-plugin] live radio unavailable: {e}"),
@@ -998,6 +1003,15 @@ impl Plugin {
                 }
                 self.store.config.config_version += 1;
                 self.save_config()?;
+                // Stamp the live revision into the radio status so the NEXT
+                // call.ended records which configuration it ran under
+                // (audit AOK-CONFIG-002).
+                if let Some(radio) = self.radio.as_ref() {
+                    radio
+                        .status
+                        .config_version
+                        .store(self.store.config.config_version, std::sync::atomic::Ordering::Relaxed);
+                }
                 // Live-reconfigure a running receptionist so a flow (or the desktop)
                 // can push the Receptionist Settings — persona/greeting/voice/model —
                 // and have them take effect on the current call, no reconnect. Only
@@ -1023,14 +1037,10 @@ impl Plugin {
                 let mut applied_live: Vec<&String> = Vec::new();
                 let mut applies_at_reconnect: Vec<&String> = Vec::new();
                 for key in obj.keys() {
-                    if LIVE_SETTING_KEYS.contains(&key.as_str()) {
-                        if radio_running {
-                            applied_live.push(key);
-                        } else {
-                            applies_at_reconnect.push(key);
-                        }
-                    } else if RECONNECT_SETTING_KEYS.contains(&key.as_str()) {
-                        applies_at_reconnect.push(key);
+                    match setting_spec(key) {
+                        Some(spec) if spec.applies_live && radio_running => applied_live.push(key),
+                        Some(_) => applies_at_reconnect.push(key),
+                        None => {}
                     }
                 }
                 Ok(json!({
@@ -1456,87 +1466,63 @@ fn expect_fields(payload: &Value, allowed: &[&str]) -> Result<Map<String, Value>
 /// Settings the running radio applies immediately via `RadioControl::Configure`
 /// (audit AK-006 `appliedLive`); everything else known takes effect at the
 /// next connect (`appliesAtReconnect` — read once at radio spawn).
-const LIVE_SETTING_KEYS: &[&str] = &[
-    "persona",
-    "greeting",
-    "ttsVoice",
-    "aiModel",
-    "aiEndpoint",
-    "sttEndpoint",
-    "ttsEndpoint",
-];
-const RECONNECT_SETTING_KEYS: &[&str] = &[
-    "autoAnswer",
-    "aiReceptionist",
-    "bargeIn",
-    "bargeSensitivity",
-    "sttEndpointMs",
-    "hfpCodec",
-    "reenumerateHwid",
-    "mockCalls",
+/// One known setting's contract (audit AOK-CONFIG-002): THE single source
+/// for type, bounds and apply-time. `docs/contracts/aokie-settings-schema.v1
+/// .json` is generated from this table and test-locked in BOTH repos, so the
+/// plugin, the Desktop panel and the FormLogic pack cannot disagree about
+/// defaults, options or what applies live versus at reconnect.
+pub struct SettingSpec {
+    pub key: &'static str,
+    pub kind: SettingKind,
+    /// true = a running radio applies it immediately (RadioControl::Configure);
+    /// false = read once at radio spawn — takes effect at the next connect.
+    pub applies_live: bool,
+}
+
+pub enum SettingKind {
+    Bool,
+    Int { min: i64, max: i64 },
+    Enum(&'static [&'static str]),
+    Str { max_chars: usize },
+    EndpointUrl,
+}
+
+/// Every known operational setting. Unknown keys stay allowed (the bag is
+/// deliberately extensible) but must be scalar and bounded.
+pub const SETTING_SPECS: &[SettingSpec] = &[
+    SettingSpec { key: "autoAnswer", kind: SettingKind::Bool, applies_live: false },
+    SettingSpec { key: "aiReceptionist", kind: SettingKind::Bool, applies_live: false },
+    SettingSpec { key: "bargeIn", kind: SettingKind::Bool, applies_live: false },
+    SettingSpec { key: "reenumerateHwid", kind: SettingKind::Bool, applies_live: false },
+    SettingSpec { key: "mockCalls", kind: SettingKind::Bool, applies_live: false },
+    SettingSpec { key: "bargeSensitivity", kind: SettingKind::Int { min: 50, max: 5000 }, applies_live: false },
+    SettingSpec { key: "sttEndpointMs", kind: SettingKind::Int { min: 100, max: 5000 }, applies_live: false },
+    SettingSpec { key: "hfpCodec", kind: SettingKind::Enum(&["auto", "cvsd", "wbs"]), applies_live: false },
+    SettingSpec { key: "persona", kind: SettingKind::Str { max_chars: 4000 }, applies_live: true },
+    SettingSpec { key: "greeting", kind: SettingKind::Str { max_chars: 1000 }, applies_live: true },
+    SettingSpec { key: "ttsVoice", kind: SettingKind::Str { max_chars: 200 }, applies_live: true },
+    SettingSpec { key: "aiModel", kind: SettingKind::Str { max_chars: 200 }, applies_live: true },
+    SettingSpec { key: "replyMode", kind: SettingKind::Str { max_chars: 200 }, applies_live: false },
+    SettingSpec { key: "aiEndpoint", kind: SettingKind::EndpointUrl, applies_live: true },
+    SettingSpec { key: "sttEndpoint", kind: SettingKind::EndpointUrl, applies_live: true },
+    SettingSpec { key: "ttsEndpoint", kind: SettingKind::EndpointUrl, applies_live: true },
 ];
 
-/// Typed validation for settings (audit AK-006): wrong types, out-of-range
-/// numbers, bogus enums and unbounded blobs are rejected BEFORE persisting.
-/// Unknown keys stay allowed (the bag is deliberately extensible) but must be
-/// scalar and bounded — a typo'd key can't smuggle a megabyte of JSON. `null`
-/// always passes: it means "clear this setting".
+fn setting_spec(key: &str) -> Option<&'static SettingSpec> {
+    SETTING_SPECS.iter().find(|s| s.key == key)
+}
+
+/// Typed validation for settings (audit AK-006/AOK-CONFIG-002): wrong types,
+/// out-of-range numbers, bogus enums and unbounded blobs are rejected BEFORE
+/// persisting — driven entirely by [`SETTING_SPECS`]. Unknown keys stay
+/// allowed but must be scalar and bounded — a typo'd key can't smuggle a
+/// megabyte of JSON. `null` always passes: it means "clear this setting".
 fn validate_setting(key: &str, value: &Value) -> Result<(), CmdError> {
-    fn want_bool(key: &str, v: &Value) -> Result<(), CmdError> {
-        match v {
-            Value::Null | Value::Bool(_) => Ok(()),
-            // Legacy string bools exist in shipped settings.json files.
-            Value::String(s) if s == "true" || s == "false" => Ok(()),
-            other => Err(CmdError::failed(format!(
-                "{key} must be a boolean, got {}",
-                json_type_name(other)
-            ))),
-        }
+    if matches!(value, Value::Null) {
+        return Ok(());
     }
-    fn want_int(key: &str, v: &Value, lo: i64, hi: i64) -> Result<(), CmdError> {
-        match v {
-            Value::Null => Ok(()),
-            Value::Number(n) => match n.as_i64() {
-                Some(n) if (lo..=hi).contains(&n) => Ok(()),
-                _ => Err(CmdError::failed(format!(
-                    "{key} must be a whole number between {lo} and {hi}"
-                ))),
-            },
-            other => Err(CmdError::failed(format!(
-                "{key} must be a number, got {}",
-                json_type_name(other)
-            ))),
-        }
-    }
-    fn want_str(key: &str, v: &Value, max: usize) -> Result<(), CmdError> {
-        match v {
-            Value::Null => Ok(()),
-            Value::String(s) if s.chars().count() <= max => Ok(()),
-            Value::String(_) => Err(CmdError::failed(format!(
-                "{key} must be at most {max} characters"
-            ))),
-            other => Err(CmdError::failed(format!(
-                "{key} must be a string, got {}",
-                json_type_name(other)
-            ))),
-        }
-    }
-    match key {
-        "autoAnswer" | "aiReceptionist" | "bargeIn" | "reenumerateHwid" | "mockCalls" => {
-            want_bool(key, value)
-        }
-        "bargeSensitivity" => want_int(key, value, 50, 5000),
-        "sttEndpointMs" => want_int(key, value, 100, 5000),
-        "hfpCodec" => match value {
-            Value::Null => Ok(()),
-            Value::String(s) if s == "cvsd" || s == "wbs" => Ok(()),
-            _ => Err(CmdError::failed("hfpCodec must be 'cvsd' or 'wbs'")),
-        },
-        "persona" => want_str(key, value, 4000),
-        "greeting" => want_str(key, value, 1000),
-        "ttsVoice" | "aiModel" | "replyMode" => want_str(key, value, 200),
-        _ if ENDPOINT_SETTING_KEYS.contains(&key) => validate_endpoint_setting(key, value),
-        _ => match value {
+    let Some(spec) = setting_spec(key) else {
+        return match value {
             Value::Object(_) | Value::Array(_) => Err(CmdError::failed(format!(
                 "{key}: objects/arrays are not valid settings values"
             ))),
@@ -1544,7 +1530,48 @@ fn validate_setting(key: &str, value: &Value) -> Result<(), CmdError> {
                 "{key} must be at most 4000 characters"
             ))),
             _ => Ok(()),
+        };
+    };
+    match &spec.kind {
+        SettingKind::Bool => match value {
+            Value::Bool(_) => Ok(()),
+            // Legacy string bools exist in shipped settings.json files.
+            Value::String(s) if s == "true" || s == "false" => Ok(()),
+            other => Err(CmdError::failed(format!(
+                "{key} must be a boolean, got {}",
+                json_type_name(other)
+            ))),
         },
+        SettingKind::Int { min, max } => match value {
+            Value::Number(n) => match n.as_i64() {
+                Some(n) if (*min..=*max).contains(&n) => Ok(()),
+                _ => Err(CmdError::failed(format!(
+                    "{key} must be a whole number between {min} and {max}"
+                ))),
+            },
+            other => Err(CmdError::failed(format!(
+                "{key} must be a number, got {}",
+                json_type_name(other)
+            ))),
+        },
+        SettingKind::Enum(options) => match value {
+            Value::String(s) if options.contains(&s.as_str()) => Ok(()),
+            _ => Err(CmdError::failed(format!(
+                "{key} must be one of: {}",
+                options.join(", ")
+            ))),
+        },
+        SettingKind::Str { max_chars } => match value {
+            Value::String(s) if s.chars().count() <= *max_chars => Ok(()),
+            Value::String(_) => Err(CmdError::failed(format!(
+                "{key} must be at most {max_chars} characters"
+            ))),
+            other => Err(CmdError::failed(format!(
+                "{key} must be a string, got {}",
+                json_type_name(other)
+            ))),
+        },
+        SettingKind::EndpointUrl => validate_endpoint_setting(key, value),
     }
 }
 
@@ -2168,6 +2195,54 @@ mod tests {
         let mut off = Map::new();
         off.insert("autoAnswer".to_string(), json!(false));
         assert!(!auto_answer_from_settings(&off));
+    }
+
+    /// Audit AOK-CONFIG-002: SETTING_SPECS is the single source for setting
+    /// types/bounds/apply-times, and the shared cross-repo schema fixture
+    /// must mirror it exactly — a drift fails this repo's CI until the
+    /// fixture is updated in a coordinated two-repo PR set.
+    #[test]
+    fn settings_schema_fixture_matches_setting_specs() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../docs/contracts/aokie-settings-schema.v1.json"
+        ))
+        .expect("settings schema fixture parses");
+        assert_eq!(fixture["settingsSchemaVersion"], 1);
+        let rendered: Vec<Value> = SETTING_SPECS
+            .iter()
+            .map(|spec| {
+                let mut v = serde_json::Map::new();
+                v.insert("key".into(), json!(spec.key));
+                match &spec.kind {
+                    SettingKind::Bool => {
+                        v.insert("type".into(), json!("bool"));
+                    }
+                    SettingKind::Int { min, max } => {
+                        v.insert("type".into(), json!("int"));
+                        v.insert("min".into(), json!(min));
+                        v.insert("max".into(), json!(max));
+                    }
+                    SettingKind::Enum(options) => {
+                        v.insert("type".into(), json!("enum"));
+                        v.insert("options".into(), json!(options));
+                    }
+                    SettingKind::Str { max_chars } => {
+                        v.insert("type".into(), json!("string"));
+                        v.insert("maxChars".into(), json!(max_chars));
+                    }
+                    SettingKind::EndpointUrl => {
+                        v.insert("type".into(), json!("endpointUrl"));
+                    }
+                }
+                v.insert("appliesLive".into(), json!(spec.applies_live));
+                Value::Object(v)
+            })
+            .collect();
+        assert_eq!(
+            json!(rendered),
+            fixture["settings"],
+            "SETTING_SPECS drifted from the shared settings schema fixture"
+        );
     }
 
     /// Audit AK-006: settings are TYPED — wrong types, out-of-range numbers,
