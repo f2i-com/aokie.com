@@ -695,11 +695,23 @@ pub fn run_from_env() -> Result<(), String> {
     run_http(server, port)
 }
 
+/// How many requests may run at once (audit AK-007). Inference already
+/// serialises per engine behind its Mutex; this bounds the QUEUE of callers
+/// waiting on those locks so a burst gets a fast, retryable 503 instead of a
+/// pile of stuck sockets. `/health` bypasses the cap — readiness must answer
+/// while inference is busy.
+const MAX_INFLIGHT: usize = 4;
+
 pub fn run_http(server: VoiceServer, port: u16) -> Result<(), String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| format!("bind 127.0.0.1:{port}: {e}"))?;
     eprintln!("[aokie-voice-server] listening on http://127.0.0.1:{port}");
 
+    let server = Arc::new(server);
+    let inflight = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(stream) => stream,
@@ -709,20 +721,51 @@ pub fn run_http(server: VoiceServer, port: u16) -> Result<(), String> {
             }
         };
 
-        let response = match read_http_request(&mut stream, server.max_body_bytes()) {
-            Ok(request) => handle_request(
-                &server,
-                &request.method,
-                &request.url,
-                &request.headers,
-                &request.body,
-            ),
-            Err(err) => err.response(),
-        };
+        // Thread-per-connection (audit AK-007): a multi-second STT/TTS job
+        // must not freeze the accept loop — /health stays responsive during
+        // inference, and each connection keeps its own read timeout.
+        let server = Arc::clone(&server);
+        let inflight = Arc::clone(&inflight);
+        std::thread::spawn(move || {
+            let response = match read_http_request(&mut stream, server.max_body_bytes()) {
+                Ok(request) => {
+                    // This is a machine-local service for native callers; a
+                    // browser always sends Origin on POST, so its presence
+                    // means a web page is probing localhost (DNS-rebinding /
+                    // drive-by) — refuse outright (audit AK-007).
+                    if header_value(&request.headers, "origin").is_some() {
+                        AppError::new(403, "browser origins are not served").response()
+                    } else if request.url == "/health" {
+                        handle_request(
+                            &server,
+                            &request.method,
+                            &request.url,
+                            &request.headers,
+                            &request.body,
+                        )
+                    } else if inflight.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT {
+                        inflight.fetch_sub(1, Ordering::SeqCst);
+                        AppError::new(503, "voice server is at capacity — retry shortly")
+                            .response()
+                    } else {
+                        let response = handle_request(
+                            &server,
+                            &request.method,
+                            &request.url,
+                            &request.headers,
+                            &request.body,
+                        );
+                        inflight.fetch_sub(1, Ordering::SeqCst);
+                        response
+                    }
+                }
+                Err(err) => err.response(),
+            };
 
-        if let Err(e) = write_http_response(&mut stream, response) {
-            eprintln!("[aokie-voice-server] respond failed: {e}");
-        }
+            if let Err(e) = write_http_response(&mut stream, response) {
+                eprintln!("[aokie-voice-server] respond failed: {e}");
+            }
+        });
     }
     Ok(())
 }
