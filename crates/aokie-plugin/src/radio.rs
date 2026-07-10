@@ -1064,6 +1064,10 @@ fn run_loop(
     // PendingTurn): replies wait until the turn stops looking unfinished.
     #[cfg(feature = "voice")]
     let mut pending_turn: Option<PendingTurn> = None;
+    // Controls that arrived DURING an agent reply (audit AK-003): the
+    // mid-reply poll acts on Hangup/Reject instantly and parks everything
+    // else here; the main control loop drains this before its channel.
+    let mut pending_controls: std::collections::VecDeque<RadioControl> = Default::default();
     // Aokie's last spoken line (greeting or reply) â€” for the self-echo guard.
     #[cfg(feature = "voice")]
     let mut last_bot_reply = String::new();
@@ -1477,6 +1481,38 @@ fn run_loop(
                             eprintln!("[aokie-plugin] agent replying (streaming)â€¦");
                             let outcome =
                                 client.stream_reply(serde_json::json!(messages), |sentence| {
+                                    // Audit AK-003: the radio loop is inside this
+                                    // stream — without this poll a Hangup waits for
+                                    // the WHOLE reply. Hangup/Reject act right here
+                                    // (worst-case latency: one sentence); everything
+                                    // else is parked for the main control loop.
+                                    while let Ok(ctl) = control_rx.try_recv() {
+                                        match ctl {
+                                            RadioControl::Hangup => {
+                                                tracker.note_intent(
+                                                    crate::call_session::TerminationIntent::OperatorHangup,
+                                                );
+                                                bt.flush_tx_audio();
+                                                if let Err(e) = bt.hangup() {
+                                                    eprintln!("[aokie-plugin] mid-reply hangup failed: {e}");
+                                                }
+                                                barged = true; // record only what played
+                                                return false; // abort the reply now
+                                            }
+                                            RadioControl::Reject => {
+                                                tracker.note_intent(
+                                                    crate::call_session::TerminationIntent::OperatorReject,
+                                                );
+                                                bt.flush_tx_audio();
+                                                if let Err(e) = bt.reject_call() {
+                                                    eprintln!("[aokie-plugin] mid-reply reject failed: {e}");
+                                                }
+                                                barged = true;
+                                                return false;
+                                            }
+                                            other => pending_controls.push_back(other),
+                                        }
+                                    }
                                     eprintln!(
                                         "[aokie-plugin] agent sentence (+{:?}): {}",
                                         t0.elapsed(),
@@ -1564,7 +1600,13 @@ fn run_loop(
         }
 
         loop {
-            match control_rx.try_recv() {
+            // Controls deferred by the mid-reply poll (audit AK-003) run first,
+            // in arrival order, before anything newly queued.
+            let next = match pending_controls.pop_front() {
+                Some(c) => Ok(c),
+                None => control_rx.try_recv(),
+            };
+            match next {
                 Ok(RadioControl::Answer) => {
                     if let Err(e) = bt.answer_call() {
                         eprintln!("[aokie-plugin] radio answer failed: {e}");
