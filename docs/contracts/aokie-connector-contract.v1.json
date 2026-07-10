@@ -1,0 +1,61 @@
+{
+  "$comment": "Shared FormLogic<->Aokie connector contract fixture (audit CROSS-COMPAT-001). Byte-identical copies live in BOTH repos (aokie.com and formlogic.com docs/contracts/); each repo's CI locks its own artifacts (contract.rs + manifest.json on the plugin side; bundled manifest + flowEventCatalog + VALID_ERROR_CODES on the FormLogic side) against this file. Changing the contract means updating this fixture in a coordinated PR set across both repos - a unilateral change fails that repo's tests.",
+  "contractVersion": 1,
+  "pluginApiVersion": 1,
+  "connectorId": "aokie",
+  "events": [
+    "aokie.dongle.detected",
+    "aokie.dongle.driver_required",
+    "aokie.dongle.ready",
+    "aokie.dongle.error",
+    "aokie.phone.pairing_started",
+    "aokie.phone.paired",
+    "aokie.phone.connected",
+    "aokie.phone.disconnected",
+    "aokie.call.incoming",
+    "aokie.call.ringing",
+    "aokie.call.answered",
+    "aokie.call.rejected",
+    "aokie.call.audio.connected",
+    "aokie.call.audio.disconnected",
+    "aokie.call.turn.partial",
+    "aokie.call.turn.final",
+    "aokie.call.ended",
+    "aokie.sms.received",
+    "aokie.sms.sent",
+    "aokie.sms.failed",
+    "aokie.hardware.error"
+  ],
+  "commands": [
+    "dongle.list",
+    "dongle.getPreferred",
+    "dongle.setPreferred",
+    "dongle.installDriver",
+    "dongle.diagnostics",
+    "phone.status",
+    "phone.startPairing",
+    "phone.stopPairing",
+    "phone.listPaired",
+    "call.current",
+    "call.answer",
+    "call.reject",
+    "call.hangup",
+    "call.operatorSpeak",
+    "sms.threads",
+    "sms.thread",
+    "sms.send",
+    "settings.get",
+    "settings.set",
+    "outbox.redrive"
+  ],
+  "errors": [
+    "command_failed",
+    "connector_missing",
+    "stale_call"
+  ],
+  "callStates": [
+    "ringing",
+    "active",
+    "ended"
+  ]
+}
