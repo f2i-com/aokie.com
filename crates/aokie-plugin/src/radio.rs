@@ -165,13 +165,18 @@ impl RadioHandle {
     }
 }
 
+/// The radio's outbox reference: the store plus HOW delivery is bookkept
+/// (Legacy write-marks-sent vs ack-awaited — audit INT-003). Carried as one
+/// value so every emit site stays a single `outbox` argument.
+type OutboxRef<'a> = Option<(&'a Outbox, crate::event_bridge::EmitMode)>;
+
 /// Emit one event best-effort: essential events route through the outbox
 /// (write-before-emit) when it is open; otherwise fall back to a direct
 /// stdout notification so a failed outbox never swallows a live call event.
-fn emit(outbox: Option<&Outbox>, sink: &mut dyn Sink, event: DesktopEvent) {
+fn emit(outbox: OutboxRef<'_>, sink: &mut dyn Sink, event: DesktopEvent) {
     match outbox {
-        Some(o) => {
-            if let Err(e) = emit_event(sink, o, &event, false) {
+        Some((o, mode)) => {
+            if let Err(e) = emit_event(sink, o, &event, false, mode) {
                 eprintln!("[aokie-plugin] radio emit '{}' failed: {e}", event.name);
             }
         }
@@ -190,7 +195,7 @@ fn emit(outbox: Option<&Outbox>, sink: &mut dyn Sink, event: DesktopEvent) {
 /// `speaker === 'caller'` so Aokie never answers itself.
 #[cfg(feature = "voice")]
 fn emit_turn(
-    outbox: Option<&Outbox>,
+    outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
     corr: &str,
     turn_index: u32,
@@ -255,6 +260,7 @@ pub fn spawn(
     answer_tone: bool,
     reenumerate_hwid: Option<String>,
     greeting: Option<String>,
+    ack_mode: bool,
 ) -> Result<RadioHandle, String> {
     use aokie_dongle::bluetooth::BluetoothManager;
     use std::sync::mpsc;
@@ -306,8 +312,10 @@ pub fn spawn(
             if outbox.is_none() {
                 eprintln!("[aokie-plugin] radio: outbox unavailable, emitting without durability");
             }
+            let mode = crate::event_bridge::EmitMode::from_ack(ack_mode);
+            let outbox_ref: OutboxRef<'_> = outbox.as_ref().map(|o| (o, mode));
             let mut sink = crate::event_bridge::StdoutSink::new();
-            run_loop(&mut bt, outbox.as_ref(), &mut sink, control_rx, status_thread, auto_answer, answer_tone, greeting);
+            run_loop(&mut bt, outbox_ref, &mut sink, control_rx, status_thread, auto_answer, answer_tone, greeting);
             unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
         })
         .map_err(|e| format!("spawn radio thread: {e}"))?;
@@ -813,7 +821,7 @@ fn tts_speak(
 #[cfg_attr(not(feature = "voice"), allow(unused_mut))]
 fn run_loop(
     bt: &mut aokie_dongle::bluetooth::BluetoothManager,
-    outbox: Option<&Outbox>,
+    outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
     control_rx: std::sync::mpsc::Receiver<RadioControl>,
     status: Arc<RadioStatus>,
@@ -1569,7 +1577,7 @@ fn run_loop(
 fn handle_event(
     ev: aokie_dongle::bluetooth::BluetoothEvent,
     tracker: &mut crate::call_session::SessionTracker,
-    outbox: Option<&Outbox>,
+    outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
     status: &Arc<RadioStatus>,
 ) {
@@ -1781,6 +1789,7 @@ pub fn spawn(
     _answer_tone: bool,
     _reenumerate_hwid: Option<String>,
     _greeting: Option<String>,
+    _ack_mode: bool,
 ) -> Result<RadioHandle, String> {
     Err("the Aokie radio is only supported on Windows (WinUSB)".to_string())
 }

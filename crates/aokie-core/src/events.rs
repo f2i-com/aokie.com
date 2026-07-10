@@ -71,6 +71,14 @@ pub fn now_iso8601() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// `now + secs` (negative = past) in the SAME fixed-width RFC3339/UTC shape
+/// as [`now_iso8601`]. Fixed width + UTC means these strings compare
+/// lexicographically in chronological order — the outbox's retry/prune
+/// queries rely on that instead of SQLite date parsing.
+pub fn iso8601_after_secs(secs: i64) -> String {
+    (Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 /// Build the Aokie idempotency key: `aokie:<correlationId>:<step>:v1`.
 ///
 /// `step` is the event name minus the `aokie.` prefix, with the
