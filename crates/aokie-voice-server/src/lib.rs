@@ -670,7 +670,9 @@ where
     I::Item: Into<String>,
 {
     let mut iter = args.into_iter().map(Into::into).skip(1);
-    while let Some(arg) = iter.next() {
+    // Only ONE argument form exists (--port); every branch returns, so this
+    // is an if-let by design (clippy: the old while-let never looped).
+    if let Some(arg) = iter.next() {
         if arg == "--port" {
             let value = iter
                 .next()
