@@ -156,6 +156,10 @@ pub struct Plugin {
     /// non-Windows build). When `Some`, the `call.* / phone.* / sms.*`
     /// handlers drive the real radio instead of the scripted mock.
     pub radio: Option<crate::radio::RadioHandle>,
+    /// Why the last real-mode radio start failed (FL-CONN-001) — surfaced in
+    /// command errors, phone.status and plugin.health so an outage is
+    /// diagnosable instead of silently degrading to mock behaviour.
+    pub radio_start_error: Option<String>,
     pub initialized: bool,
     pub shutdown_requested: bool,
     /// The host advertised `eventAck` at init: outboxed events await an
@@ -183,6 +187,7 @@ impl Plugin {
             outbox,
             mock: MockState::default(),
             radio: None,
+            radio_start_error: None,
             initialized: false,
             shutdown_requested: false,
             ack_mode: false,
@@ -206,6 +211,7 @@ impl Plugin {
             outbox: Outbox::open_in_memory().expect("in-memory outbox"),
             mock: MockState::default(),
             radio: None,
+            radio_start_error: None,
             initialized: false,
             shutdown_requested: false,
             ack_mode: false,
@@ -441,9 +447,31 @@ impl Plugin {
                     .config_version
                     .store(self.store.config.config_version, std::sync::atomic::Ordering::Relaxed);
                 self.radio = Some(handle);
+                self.radio_start_error = None;
             }
-            Err(e) => eprintln!("[aokie-plugin] live radio unavailable: {e}"),
+            Err(e) => {
+                eprintln!("[aokie-plugin] live radio unavailable: {e}");
+                self.radio_start_error = Some(e.to_string());
+            }
         }
+    }
+
+    /// FL-CONN-001: in real (non-dev) mode a missing radio is an OUTAGE — the
+    /// dev-mode mock twin must never answer for it. Every `call.* / phone.* /
+    /// sms.*` handler calls this before its mock fallthrough, so an
+    /// unavailable radio is a typed failure ("command not performed"), not a
+    /// fabricated success the browser/flows would record as real.
+    fn require_radio_or_dev(&self, command: &str) -> Result<(), CmdError> {
+        if self.dev_mode || self.radio.is_some() {
+            return Ok(());
+        }
+        let cause = self
+            .radio_start_error
+            .as_deref()
+            .unwrap_or("no dongle / driver not bound / startup failed");
+        Err(CmdError::failed(format!(
+            "{command}: the radio is not running ({cause}) — command not performed"
+        )))
     }
 
     /// Handle one parsed protocol message. Returns the response line
@@ -740,18 +768,30 @@ impl Plugin {
                         "note": "Open your phone's Bluetooth and pair with \"Aokie AI Assistant\".",
                     }));
                 }
+                // Real mode with no radio: startup FAILED — a fabricated
+                // "pairing" session would leave the operator waiting on a
+                // phone that can never see us (FL-CONN-001).
+                self.require_radio_or_dev("phone.startPairing")?;
                 let session_id = format!("pair_{}", uuid::Uuid::new_v4().simple());
                 let ev = aokie_event(
                     crate::contract::events::PHONE_PAIRING_STARTED,
                     &session_id,
-                    json!({"at": now_iso8601()}),
+                    json!({"at": now_iso8601(), "simulated": true}),
                 );
                 emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
-                Ok(json!({"sessionId": session_id, "status": "pairing"}))
+                Ok(json!({"sessionId": session_id, "status": "pairing", "simulated": true}))
             }
             "phone.stopPairing" => {
                 expect_fields(payload, &["sessionId"])?;
-                Ok(json!({"stopped": true}))
+                if self.dev_mode {
+                    return Ok(json!({"stopped": true, "simulated": true}));
+                }
+                // FL-CONN-001: this was a no-op that reported success. The real
+                // radio stays discoverable while it runs — there is no bounded
+                // pairing window to close yet (that window is AOK-BT-001).
+                Err(CmdError::failed(
+                    "phone.stopPairing is not supported by this radio: it stays discoverable while running — nothing was stopped",
+                ))
             }
             "phone.listPaired" => {
                 expect_fields(payload, &[])?;
@@ -780,6 +820,7 @@ impl Plugin {
                     });
                     return Ok(json!({"call": call}));
                 }
+                self.require_radio_or_dev("call.current")?;
                 Ok(json!({"call": self.mock.current_call.as_ref().map(call_json)}))
             }
             "call.answer" => {
@@ -794,6 +835,7 @@ impl Plugin {
                         json!({"answered": true, "via": "radio", "callId": radio.current_call_id()}),
                     );
                 }
+                self.require_radio_or_dev("call.answer")?;
                 check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
                 let call = self.require_call(&[MockCallState::Incoming], "call.answer")?;
                 call.state = MockCallState::Active;
@@ -815,6 +857,7 @@ impl Plugin {
                         .map_err(CmdError::failed)?;
                     return Ok(json!({"rejected": true, "via": "radio"}));
                 }
+                self.require_radio_or_dev("call.reject")?;
                 check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
                 let call = self.require_call(&[MockCallState::Incoming], "call.reject")?;
                 call.state = MockCallState::Ended;
@@ -833,6 +876,7 @@ impl Plugin {
                         .map_err(CmdError::failed)?;
                     return Ok(json!({"ended": true, "via": "radio"}));
                 }
+                self.require_radio_or_dev("call.hangup")?;
                 check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
                 let call = self.require_call(
                     &[MockCallState::Incoming, MockCallState::Active],
@@ -880,6 +924,7 @@ impl Plugin {
                         .map_err(CmdError::failed)?;
                     return Ok(json!({"spoken": true, "via": "radio"}));
                 }
+                self.require_radio_or_dev("call.operatorSpeak")?;
                 check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
                 let call = self.require_call(&[MockCallState::Active], "call.operatorSpeak")?;
                 call.turns += 1;
@@ -889,6 +934,15 @@ impl Plugin {
             }
             "sms.threads" => {
                 expect_fields(payload, &[])?;
+                // FL-CONN-001: this reads the dev simulator's in-memory threads —
+                // it has no real-radio backing yet (AOK-SMS-001), so in real mode
+                // it must fail typed instead of presenting fake history.
+                self.require_radio_or_dev("sms.threads")?;
+                if !self.dev_mode {
+                    return Err(CmdError::failed(
+                        "sms.threads: real thread history is not available from the radio yet — sent/received messages are recorded in FormLogic",
+                    ));
+                }
                 let threads: Vec<Value> = self
                     .mock
                     .sms_threads
@@ -907,6 +961,12 @@ impl Plugin {
             "sms.thread" => {
                 let obj = expect_fields(payload, &["threadId"])?;
                 let thread_id = require_str(&obj, "threadId")?;
+                self.require_radio_or_dev("sms.thread")?;
+                if !self.dev_mode {
+                    return Err(CmdError::failed(
+                        "sms.thread: real thread history is not available from the radio yet — sent/received messages are recorded in FormLogic",
+                    ));
+                }
                 let thread = self
                     .mock
                     .sms_threads
@@ -940,6 +1000,10 @@ impl Plugin {
                         .map_err(CmdError::failed)?;
                     return Ok(json!({"to": to, "status": "queued", "via": "radio"}));
                 }
+                // Real mode with no radio: the message can NOT be sent — a
+                // fabricated "queued" here is the audit's canonical fake
+                // success (a caller was promised an SMS that never existed).
+                self.require_radio_or_dev("sms.send")?;
                 let message_id = format!("sms_{}", uuid::Uuid::new_v4().simple());
                 let at = now_iso8601();
                 // Essential event: outboxed before emission. The
@@ -947,7 +1011,7 @@ impl Plugin {
                 let ev = aokie_event(
                     crate::contract::events::SMS_SENT,
                     &message_id,
-                    json!({"messageId": message_id, "to": to, "at": at}),
+                    json!({"messageId": message_id, "to": to, "at": at, "simulated": true}),
                 );
                 emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
                 let thread = self.mock.thread_for(&to);
@@ -957,7 +1021,7 @@ impl Plugin {
                     body,
                     at,
                 });
-                Ok(json!({"messageId": message_id, "status": "queued"}))
+                Ok(json!({"messageId": message_id, "status": "queued", "simulated": true}))
             }
             "outbox.redrive" => {
                 // Operator redrive (audit OBS-001 / AOK-OUTBOX-001): TARGETED
@@ -1231,9 +1295,13 @@ impl Plugin {
             }
             None => {
                 if !self.dev_mode {
-                    reasons.push("radio not running (no dongle / driver not bound)".to_string());
+                    let cause = self
+                        .radio_start_error
+                        .as_deref()
+                        .unwrap_or("no dongle / driver not bound");
+                    reasons.push(format!("radio not running ({cause})"));
                 }
-                json!({ "present": false })
+                json!({ "present": false, "startError": self.radio_start_error })
             }
         };
         if counts.dead > 0 {
@@ -2547,8 +2615,34 @@ mod tests {
     }
 
     #[test]
-    fn sms_send_validates_and_emits_outboxed_event() {
+    fn sms_send_real_mode_without_radio_is_a_typed_outage_never_queued() {
+        // FL-CONN-001: the canonical fake success — a real-mode plugin whose
+        // radio never started must NOT report an SMS as queued (nor emit
+        // sms.sent); the caller was promised a message that could never exist.
         let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "+61432123456", "body": "See you at 9:30"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "command_failed");
+        assert!(err.message.contains("radio is not running"));
+        assert!(err.message.contains("not performed"));
+        assert!(sink.lines.is_empty(), "no sms.sent event for an unsendable message");
+
+        // The dev-only mock thread reads fail typed in real mode too.
+        let err = plugin
+            .dispatch_command("sms.threads", &Value::Null, &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("radio is not running"));
+    }
+
+    #[test]
+    fn sms_send_validates_and_emits_outboxed_event() {
+        let mut plugin = Plugin::ephemeral(true); // dev mode: the explicit simulator
         let mut sink = VecSink::default();
 
         let err = plugin
@@ -2577,6 +2671,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(data["status"], json!("queued"));
+        assert_eq!(data["simulated"], json!(true), "dev-mode results are stamped simulated");
         let message_id = data["messageId"].as_str().unwrap();
         assert!(message_id.starts_with("sms_"));
 
@@ -2693,8 +2788,8 @@ mod tests {
     }
 
     #[test]
-    fn phone_commands_are_config_backed_mocks() {
-        let mut plugin = Plugin::ephemeral(false);
+    fn phone_pairing_mocks_are_dev_only_and_stamped() {
+        let mut plugin = Plugin::ephemeral(true); // dev mode: the explicit simulator
         let mut sink = VecSink::default();
 
         let data = plugin
@@ -2706,12 +2801,14 @@ mod tests {
             .dispatch_command("phone.startPairing", &Value::Null, &mut sink)
             .unwrap();
         assert_eq!(data["status"], json!("pairing"));
+        assert_eq!(data["simulated"], json!(true));
         assert!(data["sessionId"].as_str().unwrap().starts_with("pair_"));
         let v = parse(&sink.lines[0]);
         assert_eq!(
             v["params"]["event"]["name"],
             json!(crate::contract::events::PHONE_PAIRING_STARTED)
         );
+        assert_eq!(v["params"]["event"]["data"]["simulated"], json!(true));
 
         let data = plugin
             .dispatch_command("phone.stopPairing", &Value::Null, &mut sink)
@@ -2722,5 +2819,31 @@ mod tests {
             .dispatch_command("phone.listPaired", &Value::Null, &mut sink)
             .unwrap();
         assert_eq!(data["devices"], json!([]));
+    }
+
+    #[test]
+    fn phone_pairing_real_mode_without_radio_fails_typed() {
+        // FL-CONN-001: a real-mode plugin whose radio never started must not
+        // report a pairing session the phone can never see, and stopPairing —
+        // previously an unconditional {"stopped": true} no-op — must be honest.
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+
+        let err = plugin
+            .dispatch_command("phone.startPairing", &Value::Null, &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("radio is not running"));
+        assert!(sink.lines.is_empty(), "no phone.pairing.started event for a dead radio");
+
+        let err = plugin
+            .dispatch_command("phone.stopPairing", &Value::Null, &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("nothing was stopped"));
+
+        // Reads stay honest: config-backed status still answers (source: config).
+        let data = plugin
+            .dispatch_command("phone.status", &Value::Null, &mut sink)
+            .unwrap();
+        assert_eq!(data["source"], json!("config"));
     }
 }
