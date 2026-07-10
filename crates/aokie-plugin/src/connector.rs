@@ -36,6 +36,11 @@ const RECEPTIONIST_CONFIG_KEYS: [&str; 7] = [
     "ttsEndpoint",
 ];
 
+/// Settings whose values are URLs that will receive caller audio/transcripts —
+/// classified via `aokie_core::url_classification` before persisting
+/// (audit PRIV-001/C-16).
+const ENDPOINT_SETTING_KEYS: &[&str] = &["aiEndpoint", "sttEndpoint", "ttsEndpoint"];
+
 /// Typed connector-level error, surfaced as a JSON-RPC error with
 /// `error.data = {code, message}` (connector-response.schema.json
 /// codes; the plugin produces `command_failed`, `stale_call` and — for
@@ -359,15 +364,21 @@ impl Plugin {
             eprintln!("[aokie-plugin] bargeSensitivity setting → AOKIE_BARGE_RMS={rms}");
         }
 
-        // Auto-answer incoming calls by default (receptionist behaviour);
-        // a stored `autoAnswer: false` setting turns it off.
-        let auto_answer = self
-            .store
-            .config
-            .settings
-            .get("autoAnswer")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        // Auto-answer defaults OFF (audit INT-006/C-15): a receptionist must
+        // be explicitly enabled (settings.autoAnswer: true — the pack's
+        // Receptionist Settings/configure flow sets it), never assumed. A
+        // build with no voice output can never auto-answer — it would answer
+        // the caller into silence.
+        let mut auto_answer = auto_answer_from_settings(&self.store.config.settings);
+        if auto_answer && !cfg!(feature = "voice") {
+            eprintln!(
+                "[aokie-plugin] autoAnswer disabled: this build has no voice output (voice feature not compiled)"
+            );
+            auto_answer = false;
+        }
+        if !auto_answer {
+            eprintln!("[aokie-plugin] autoAnswer is OFF — calls ring through to the operator");
+        }
         // Stage-2 outbound-audio diagnostic: play a chime to the caller on
         // answer to verify the SCO-OUT path reaches the phone on this dongle
         // (settings.answerTone, default off; superseded by real TTS speech).
@@ -429,7 +440,7 @@ impl Plugin {
         };
         match msg.method.as_str() {
             "plugin.init" => Some(self.handle_init(&id, &msg.params)),
-            "plugin.health" => Some(rpc::success_line(&id, json!({"status": "ok"}))),
+            "plugin.health" => Some(rpc::success_line(&id, self.build_health())),
             "plugin.shutdown" => {
                 self.shutdown_requested = true;
                 if let Some(radio) = self.radio.as_ref() {
@@ -829,6 +840,14 @@ impl Plugin {
                 }
                 let call_id = optional_str(&obj, "callId")?;
                 if let Some(radio) = self.radio.as_ref() {
+                    // Truthfulness gate (audit INT-006/C-15): a build without
+                    // voice output can only LOG the text — never claim it was
+                    // spoken to the caller.
+                    if !cfg!(feature = "voice") {
+                        return Err(CmdError::failed(
+                            "this plugin build has no voice output (voice feature not compiled) — operatorSpeak cannot be spoken",
+                        ));
+                    }
                     check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
                     radio
                         .send(crate::radio::RadioControl::Speak { text: text.clone() })
@@ -930,6 +949,13 @@ impl Plugin {
                 })?;
                 if obj.is_empty() {
                     return Err(CmdError::failed("settings.set payload is empty"));
+                }
+                // Endpoint safety (audit PRIV-001/C-16): these URLs receive
+                // caller AUDIO and TRANSCRIPTS — classify BEFORE persisting.
+                for key in ENDPOINT_SETTING_KEYS {
+                    if let Some(v) = obj.get(*key) {
+                        validate_endpoint_setting(key, v)?;
+                    }
                 }
                 for (key, value) in obj {
                     self.store
@@ -1093,6 +1119,60 @@ impl Plugin {
                 "dead": counts.dead,
             },
         }))
+    }
+
+    /// Truthful health (audit INT-006/C-15): computed from what this build
+    /// and process can actually DO, never a constant "ok". `degraded` means
+    /// answering/speaking is impaired (no voice output compiled, radio not
+    /// up in real mode, dead outbox rows awaiting redrive); components let
+    /// the host show WHICH dependency broke.
+    fn build_health(&self) -> Value {
+        let voice = cfg!(feature = "voice");
+        let counts = self.outbox.counts().unwrap_or_default();
+        let mut reasons: Vec<String> = Vec::new();
+        if !voice {
+            reasons.push("voice feature not compiled — the receptionist cannot speak".to_string());
+        }
+        let radio = match self.radio.as_ref() {
+            Some(r) => {
+                if let Some(e) = r.last_error() {
+                    reasons.push(format!("radio error: {e}"));
+                } else if !r.is_initialized() {
+                    reasons.push("radio starting (dongle not initialised yet)".to_string());
+                }
+                json!({
+                    "present": true,
+                    "initialized": r.is_initialized(),
+                    "phoneConnected": r.is_connected(),
+                    "callActive": r.is_call_active(),
+                    "staleSttResults": r.stale_stt_results(),
+                    "error": r.last_error(),
+                })
+            }
+            None => {
+                if !self.dev_mode {
+                    reasons.push("radio not running (no dongle / driver not bound)".to_string());
+                }
+                json!({ "present": false })
+            }
+        };
+        if counts.dead > 0 {
+            reasons.push(format!("{} dead outbox event(s) need redrive", counts.dead));
+        }
+        json!({
+            "status": if reasons.is_empty() { "ok" } else { "degraded" },
+            "detail": if reasons.is_empty() { Value::Null } else { json!(reasons.join("; ")) },
+            "components": {
+                "voice": voice,
+                "devMode": self.dev_mode,
+                "radio": radio,
+                "outbox": {
+                    "pending": counts.pending,
+                    "failed": counts.failed,
+                    "dead": counts.dead,
+                },
+            },
+        })
     }
 
     /// The mock's current call id (any state) — the `callId` guard target
@@ -1287,6 +1367,65 @@ fn expect_fields(payload: &Value, allowed: &[&str]) -> Result<Map<String, Value>
     }
 }
 
+/// Default-OFF auto-answer (audit INT-006/C-15): only an explicit
+/// `autoAnswer: true` (bool or the string "true") arms the receptionist.
+fn auto_answer_from_settings(settings: &Map<String, Value>) -> bool {
+    settings
+        .get("autoAnswer")
+        .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+        .unwrap_or(false)
+}
+
+/// Gate an AI/speech endpoint URL (audit PRIV-001/C-16). Loopback is the
+/// design target; a private-LAN endpoint is allowed with a disclosure log;
+/// cloud metadata, link-local and unparseable hosts are refused outright;
+/// a PUBLIC endpoint must be HTTPS — caller audio/transcripts never leave
+/// the machine in cleartext.
+fn validate_endpoint_setting(key: &str, value: &Value) -> Result<(), CmdError> {
+    use aokie_core::url_classification::{classify_base_url, BaseUrlClassification as C};
+    let raw = match value {
+        Value::Null => return Ok(()),
+        Value::String(s) => s.trim(),
+        other => {
+            return Err(CmdError::failed(format!(
+                "{key} must be a URL string, got {}",
+                json_type_name(other)
+            )))
+        }
+    };
+    if raw.is_empty() {
+        return Ok(()); // clearing the endpoint is always fine
+    }
+    match classify_base_url(raw) {
+        C::Empty | C::Loopback => Ok(()),
+        C::Private => {
+            eprintln!(
+                "[aokie-plugin] {key} points at a private-network host — caller audio/transcripts will leave this machine over the LAN"
+            );
+            Ok(())
+        }
+        C::Metadata => Err(CmdError::failed(format!(
+            "{key} rejected: cloud-metadata endpoints must never receive caller data"
+        ))),
+        C::LinkLocal => Err(CmdError::failed(format!(
+            "{key} rejected: link-local addresses are almost always a misconfiguration"
+        ))),
+        C::Invalid => Err(CmdError::failed(format!("{key} rejected: not a valid URL"))),
+        C::Public => {
+            if raw.starts_with("https://") {
+                eprintln!(
+                    "[aokie-plugin] {key} points at a public host — caller audio/transcripts will be sent to it"
+                );
+                Ok(())
+            } else {
+                Err(CmdError::failed(format!(
+                    "{key} rejected: a public endpoint must use https:// (caller audio/transcripts must not travel in cleartext)"
+                )))
+            }
+        }
+    }
+}
+
 /// Optional string field: missing/null → None; a non-string is an error.
 fn optional_str(obj: &Map<String, Value>, key: &str) -> Result<Option<String>, CmdError> {
     match obj.get(key) {
@@ -1436,7 +1575,13 @@ mod tests {
         let resp = plugin
             .handle_rpc(request(2, "plugin.health", json!({})), &mut sink)
             .unwrap();
-        assert_eq!(parse(&resp)["result"]["status"], json!("ok"));
+        // Truthful health (audit INT-006): real mode with no radio running is
+        // DEGRADED, never a blanket ok — the receptionist cannot answer.
+        assert_eq!(parse(&resp)["result"]["status"], json!("degraded"));
+        assert!(parse(&resp)["result"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("radio"));
 
         let resp = plugin
             .handle_rpc(request(3, "plugin.shutdown", json!({})), &mut sink)
@@ -1793,6 +1938,99 @@ mod tests {
         assert!(plugin
             .dispatch_command("call.hangup", &Value::Null, &mut sink)
             .is_err());
+    }
+
+    /// Audit INT-006/C-15: health is COMPUTED, never a constant ok — a build
+    /// that cannot speak, or a real-mode process with no radio, says so.
+    #[test]
+    fn health_reports_real_component_state() {
+        let mut plugin = Plugin::ephemeral(true); // dev mode: no radio expected
+        let mut sink = VecSink::default();
+        let resp = plugin
+            .handle_rpc(request(1, "plugin.health", json!({})), &mut sink)
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        let health = &v["result"];
+        assert_eq!(health["components"]["voice"], json!(cfg!(feature = "voice")));
+        assert_eq!(health["components"]["devMode"], json!(true));
+        assert_eq!(health["components"]["radio"]["present"], json!(false));
+        assert!(health["components"]["outbox"]["dead"].is_u64());
+        if cfg!(feature = "voice") {
+            // Dev mode with voice compiled and a clean outbox: genuinely ok.
+            assert_eq!(health["status"], json!("ok"));
+        } else {
+            // No voice output → the receptionist cannot speak → degraded.
+            assert_eq!(health["status"], json!("degraded"));
+            assert!(health["detail"].as_str().unwrap().contains("voice"));
+        }
+
+        // Non-dev with no radio is degraded in EVERY build.
+        let mut real = Plugin::ephemeral(false);
+        let resp = real
+            .handle_rpc(request(2, "plugin.health", json!({})), &mut sink)
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["status"], json!("degraded"));
+    }
+
+    /// Audit INT-006/C-15: auto-answer is opt-in, never assumed.
+    #[test]
+    fn auto_answer_defaults_off_and_requires_explicit_true() {
+        let empty = Map::new();
+        assert!(!auto_answer_from_settings(&empty), "default is OFF");
+        let mut on = Map::new();
+        on.insert("autoAnswer".to_string(), json!(true));
+        assert!(auto_answer_from_settings(&on));
+        let mut on_str = Map::new();
+        on_str.insert("autoAnswer".to_string(), json!("true"));
+        assert!(auto_answer_from_settings(&on_str));
+        let mut off = Map::new();
+        off.insert("autoAnswer".to_string(), json!(false));
+        assert!(!auto_answer_from_settings(&off));
+    }
+
+    /// Audit PRIV-001/C-16: AI/speech endpoints are classified BEFORE being
+    /// persisted — unsafe destinations for caller audio/transcripts never
+    /// reach the config.
+    #[test]
+    fn settings_set_rejects_unsafe_endpoints() {
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink::default();
+
+        // Loopback (the design target) and clearing are fine.
+        plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"sttEndpoint": "http://127.0.0.1:17920/v1/audio/transcriptions"}),
+                &mut sink,
+            )
+            .unwrap();
+        plugin
+            .dispatch_command("settings.set", &json!({"sttEndpoint": ""}), &mut sink)
+            .unwrap();
+        // Public HTTPS is allowed (with disclosure); public HTTP is not.
+        plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"aiEndpoint": "https://api.example.com/v1/chat/completions"}),
+                &mut sink,
+            )
+            .unwrap();
+        for (key, url, why) in [
+            ("aiEndpoint", "http://api.example.com/v1", "cleartext public"),
+            ("aiEndpoint", "http://169.254.169.254/latest/meta-data", "metadata"),
+            ("ttsEndpoint", "http://169.254.7.9:9000/tts", "link-local"),
+        ] {
+            let err = plugin
+                .dispatch_command("settings.set", &json!({ key: url }), &mut sink)
+                .unwrap_err();
+            assert_eq!(err.code, crate::contract::errors::COMMAND_FAILED, "{why}");
+            // Rejected values are NEVER persisted.
+            assert!(
+                plugin.store.config.settings.get(key).map(|v| v != &json!(url)).unwrap_or(true),
+                "{why}: rejected URL must not be stored"
+            );
+        }
     }
 
     /// Audit INT-003: `plugin.init` feature negotiation flips ack mode, and
