@@ -73,11 +73,20 @@ jobs:
   supply-chain:
     name: cargo audit (RustSec advisories)
     runs-on: ubuntu-latest
+    # Run cargo-audit directly rather than rustsec/audit-check: the action posts
+    # a check-run and needs write scope (the default read-only GITHUB_TOKEN gave
+    # "Resource not accessible by integration"). Plain cargo audit needs no token.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      # Accepted transitive advisories are listed with rationale in
+      # .cargo/audit.toml; every NEW advisory still fails the job.
+      - run: cargo audit
 
   # Audit PKG-001 (best-effort until signing infrastructure exists): a
   # reproducible RELEASE plugin bundle — helper built first so its post-build
