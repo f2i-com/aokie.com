@@ -306,46 +306,46 @@ impl MsbcStreamFramer {
     /// `find_h2_sync`). All three bytes match → start of a real H2
     /// frame; we drop everything before it and emit the next 60 bytes.
     pub fn next_frame(&mut self) -> Option<[u8; MSBC_H2_PACKET_SIZE]> {
-        loop {
-            if self.buffer.len() < 3 {
-                return None;
-            }
-            // Walk forward looking for the mSBC sync byte at offset i
-            // with valid H2 header bytes at i-2 and i-1.
-            let mut found_at: Option<usize> = None;
-            for i in 2..self.buffer.len() {
-                if self.buffer[i] != MSBC_SYNC_BYTE {
-                    continue;
-                }
-                let h2_byte_0 = self.buffer[i - 2];
-                let h2_byte_1 = self.buffer[i - 1];
-                if h2_byte_0 == H2_SYNC_BYTE_0 && is_valid_h2_sequence_byte(h2_byte_1) {
-                    found_at = Some(i - 2);
-                    break;
-                }
-            }
-            let start = match found_at {
-                Some(start) => start,
-                None => {
-                    // No valid sync visible. Keep the last 2 bytes —
-                    // they could be the leading H2 header of a sync we
-                    // haven't seen the third byte of yet.
-                    let n = self.buffer.len().saturating_sub(2);
-                    self.buffer.drain(..n);
-                    return None;
-                }
-            };
-            // Drop the prefix that wasn't part of a valid frame.
-            self.buffer.drain(..start);
-            if self.buffer.len() < MSBC_H2_PACKET_SIZE {
-                return None;
-            }
-            let mut frame = [0u8; MSBC_H2_PACKET_SIZE];
-            for slot in frame.iter_mut() {
-                *slot = self.buffer.pop_front().unwrap();
-            }
-            return Some(frame);
+        // (Single-shot per call by design — callers pull frames in their own
+        // loop. clippy: the old `loop {}` wrapper never actually looped.)
+        if self.buffer.len() < 3 {
+            return None;
         }
+        // Walk forward looking for the mSBC sync byte at offset i
+        // with valid H2 header bytes at i-2 and i-1.
+        let mut found_at: Option<usize> = None;
+        for i in 2..self.buffer.len() {
+            if self.buffer[i] != MSBC_SYNC_BYTE {
+                continue;
+            }
+            let h2_byte_0 = self.buffer[i - 2];
+            let h2_byte_1 = self.buffer[i - 1];
+            if h2_byte_0 == H2_SYNC_BYTE_0 && is_valid_h2_sequence_byte(h2_byte_1) {
+                found_at = Some(i - 2);
+                break;
+            }
+        }
+        let start = match found_at {
+            Some(start) => start,
+            None => {
+                // No valid sync visible. Keep the last 2 bytes —
+                // they could be the leading H2 header of a sync we
+                // haven't seen the third byte of yet.
+                let n = self.buffer.len().saturating_sub(2);
+                self.buffer.drain(..n);
+                return None;
+            }
+        };
+        // Drop the prefix that wasn't part of a valid frame.
+        self.buffer.drain(..start);
+        if self.buffer.len() < MSBC_H2_PACKET_SIZE {
+            return None;
+        }
+        let mut frame = [0u8; MSBC_H2_PACKET_SIZE];
+        for slot in frame.iter_mut() {
+            *slot = self.buffer.pop_front().unwrap();
+        }
+        Some(frame)
     }
 
     pub fn reset(&mut self) {
