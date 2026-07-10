@@ -35,13 +35,23 @@ export AOKIE_EXPECTED_HELPER_SHA256=<sha256 of the deployed aokie-driver-helper.
 cargo build -p aokie-plugin --features voice --release
 ```
 
+## Docs
+
+- `docs/ARCHITECTURE.md` — process shape, the call-session + voice state
+  machines, and the durability model.
+- `docs/HARDWARE.md` — supported dongle chipsets (compatibility tiers) and
+  the Windows/phone notes.
+- `docs/FORMLOGIC_PLUGIN_CONTRACT.md` + `docs/contracts/*.json` — the frozen
+  cross-repo surface (events, commands, errors, settings schema, persona).
+
 ## Contract
 
-The FormLogic↔Aokie surface (events, commands, errors, settings schema) is
-frozen in `docs/contracts/*.json` — byte-identical copies live in the
-FormLogic repo, and each repo's tests lock its own artifacts against its
+The FormLogic↔Aokie surface (events, commands, errors, settings schema,
+persona) is frozen in `docs/contracts/*.json` — byte-identical copies live in
+the FormLogic repo, and each repo's tests lock its own artifacts against its
 copy. Changing the contract is a coordinated two-repo change by construction.
-See `docs/FORMLOGIC_PLUGIN_CONTRACT.md`.
+Operator-facing runbook + troubleshooting live in the FormLogic repo
+(`docs/AOKIE_OPERATIONS.md`, `docs/AOKIE_TROUBLESHOOTING.md`).
 
 ## Security
 
