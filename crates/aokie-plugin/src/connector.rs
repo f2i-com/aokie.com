@@ -933,6 +933,18 @@ impl Plugin {
                 });
                 Ok(json!({"messageId": message_id, "status": "queued"}))
             }
+            "outbox.redrive" => {
+                // Operator redrive (audit OBS-001): dead-lettered events go
+                // back to pending and the replay thread re-delivers them.
+                let revived = self
+                    .outbox
+                    .redrive_dead()
+                    .map_err(|e| CmdError::failed(format!("outbox redrive failed: {e}")))?;
+                if revived > 0 {
+                    eprintln!("[aokie-plugin] operator redrive revived {revived} dead outbox event(s)");
+                }
+                Ok(json!({ "revived": revived }))
+            }
             "settings.get" => {
                 let obj = expect_fields(payload, &["key"])?;
                 match obj.get("key").and_then(Value::as_str) {
