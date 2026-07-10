@@ -1083,10 +1083,10 @@ fn run_loop(
             let (corr, from) = {
                 let s = tracker.current_mut().unwrap();
                 s.mark_incoming_emitted();
-                (
-                    s.id.clone(),
-                    s.caller_id.clone().unwrap_or_else(|| "unknown".to_string()),
-                )
+                // Withheld/late caller id → EMPTY, never a sentinel like
+                // "unknown": that string in a phone-validated form field
+                // rejected the whole Calls record on a live call (audit §8).
+                (s.id.clone(), s.caller_id.clone().unwrap_or_default())
             };
             emit(
                 outbox,
