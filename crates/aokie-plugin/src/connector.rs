@@ -153,6 +153,9 @@ pub struct Plugin {
     pub radio: Option<crate::radio::RadioHandle>,
     pub initialized: bool,
     pub shutdown_requested: bool,
+    /// The host advertised `eventAck` at init: outboxed events await an
+    /// `event.ack` before counting as delivered (audit INT-003).
+    pub ack_mode: bool,
 }
 
 impl Plugin {
@@ -174,6 +177,7 @@ impl Plugin {
             radio: None,
             initialized: false,
             shutdown_requested: false,
+            ack_mode: false,
         })
     }
 
@@ -195,6 +199,7 @@ impl Plugin {
             radio: None,
             initialized: false,
             shutdown_requested: false,
+            ack_mode: false,
         }
     }
 
@@ -394,6 +399,7 @@ impl Plugin {
             answer_tone,
             reenumerate_hwid,
             greeting,
+            self.ack_mode,
         ) {
             Ok(handle) => {
                 eprintln!(
@@ -408,7 +414,19 @@ impl Plugin {
     /// Handle one parsed protocol message. Returns the response line
     /// for requests, `None` for notifications (which get no answer).
     pub fn handle_rpc(&mut self, msg: RpcMessage, sink: &mut dyn Sink) -> Option<String> {
-        let id = msg.id.clone()?; // notifications: process nothing, answer nothing
+        let Some(id) = msg.id.clone() else {
+            // Notifications get no answer, but `event.ack` IS processed: the
+            // host durably received an outboxed event — mark it delivered
+            // (audit INT-003; until then the replay thread keeps re-sending).
+            if msg.method == "event.ack" {
+                if let Some(key) = msg.params.get("idempotencyKey").and_then(Value::as_str) {
+                    if let Err(e) = self.outbox.mark_sent(key) {
+                        eprintln!("[aokie-plugin] event.ack for {key} failed to persist: {e}");
+                    }
+                }
+            }
+            return None;
+        };
         match msg.method.as_str() {
             "plugin.init" => Some(self.handle_init(&id, &msg.params)),
             "plugin.health" => Some(rpc::success_line(&id, json!({"status": "ok"}))),
@@ -465,6 +483,26 @@ impl Plugin {
             }
             if let Some(dev) = obj.get("devMode").and_then(Value::as_bool) {
                 self.dev_mode = self.dev_mode || dev;
+            }
+            // Host feature negotiation (audit INT-003): `eventAck` = the host
+            // durably journals every event.emit and confirms with an
+            // `event.ack` notification. Outboxed events then stay pending
+            // until acknowledged, and a replay thread re-delivers anything
+            // unacknowledged — crash-safe, at-least-once, deduped by the
+            // host on idempotencyKey. Hosts without the feature keep the
+            // legacy write-marks-sent behaviour.
+            let ack = obj
+                .get("features")
+                .and_then(Value::as_array)
+                .is_some_and(|f| f.iter().any(|v| v.as_str() == Some("eventAck")));
+            if ack && !self.ack_mode {
+                self.ack_mode = true;
+                // The replay thread writes real protocol lines to stdout —
+                // unit tests exercise `replay_once` directly instead.
+                if !cfg!(test) {
+                    crate::event_bridge::spawn_replay_thread(self.data_dir.join(OUTBOX_FILE));
+                }
+                eprintln!("[aokie-plugin] host supports eventAck — durable delivery on");
             }
         }
         self.initialized = true;
@@ -671,7 +709,7 @@ impl Plugin {
                     &session_id,
                     json!({"at": now_iso8601()}),
                 );
-                emit_event(sink, &self.outbox, &ev, false).map_err(CmdError::failed)?;
+                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
                 Ok(json!({"sessionId": session_id, "status": "pairing"}))
             }
             "phone.stopPairing" => {
@@ -727,7 +765,7 @@ impl Plugin {
                     (c.correlation_id.clone(), call_json(c))
                 };
                 let ev = aokie_event(crate::contract::events::CALL_ANSWERED, &corr, json!({"at": now_iso8601()}));
-                emit_event(sink, &self.outbox, &ev, false).map_err(CmdError::failed)?;
+                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
                 Ok(json!({"answered": true, "call": snapshot}))
             }
             "call.reject" => {
@@ -745,7 +783,7 @@ impl Plugin {
                 call.state = MockCallState::Ended;
                 let corr = call.correlation_id.clone();
                 let ev = aokie_event(crate::contract::events::CALL_REJECTED, &corr, json!({"at": now_iso8601()}));
-                emit_event(sink, &self.outbox, &ev, false).map_err(CmdError::failed)?;
+                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
                 Ok(json!({"rejected": true}))
             }
             "call.hangup" => {
@@ -780,7 +818,7 @@ impl Plugin {
                         "outcome": "completed",
                     }),
                 );
-                emit_event(sink, &self.outbox, &ev, false).map_err(CmdError::failed)?;
+                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
                 Ok(json!({"ended": true}))
             }
             "call.operatorSpeak" => {
@@ -866,7 +904,7 @@ impl Plugin {
                     &message_id,
                     json!({"messageId": message_id, "to": to, "at": at}),
                 );
-                emit_event(sink, &self.outbox, &ev, false).map_err(CmdError::failed)?;
+                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
                 let thread = self.mock.thread_for(&to);
                 thread.messages.push(MockSmsMessage {
                     id: message_id.clone(),
@@ -936,7 +974,7 @@ impl Plugin {
         let mut emit = |plugin: &mut Plugin, ev: aokie_core::events::DesktopEvent| {
             // The scripted run records EVERY step in the outbox so
             // integration tests can assert write-before-emit.
-            emit_event(sink, &plugin.outbox, &ev, true).map_err(CmdError::failed)?;
+            emit_event(sink, &plugin.outbox, &ev, true, crate::event_bridge::EmitMode::from_ack(plugin.ack_mode)).map_err(CmdError::failed)?;
             emitted.push(ev.name.clone());
             Ok::<(), CmdError>(())
         };
@@ -1755,6 +1793,80 @@ mod tests {
         assert!(plugin
             .dispatch_command("call.hangup", &Value::Null, &mut sink)
             .is_err());
+    }
+
+    /// Audit INT-003: `plugin.init` feature negotiation flips ack mode, and
+    /// an `event.ack` NOTIFICATION (no id, no response) marks the outbox row
+    /// delivered — the ack path end to end at the dispatch layer.
+    #[test]
+    fn init_features_enable_ack_mode_and_event_ack_marks_sent() {
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink::default();
+        assert!(!plugin.ack_mode);
+
+        // Handshake WITHOUT the feature: legacy mode.
+        let resp = plugin
+            .handle_rpc(
+                request(1, "plugin.init", json!({"pluginApiVersion": 1})),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(resp.contains("\"ok\":true"));
+        assert!(!plugin.ack_mode);
+
+        // Handshake WITH eventAck: ack mode on.
+        let resp = plugin
+            .handle_rpc(
+                request(
+                    2,
+                    "plugin.init",
+                    json!({"pluginApiVersion": 1, "features": ["eventAck"]}),
+                ),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(resp.contains("\"ok\":true"));
+        assert!(plugin.ack_mode);
+
+        // An outboxed emission now awaits the ack…
+        let ev = aokie_event(
+            crate::contract::events::CALL_INCOMING,
+            "call_ack",
+            json!({"from": "x"}),
+        );
+        crate::event_bridge::emit_event(
+            &mut sink,
+            &plugin.outbox,
+            &ev,
+            false,
+            crate::event_bridge::EmitMode::from_ack(plugin.ack_mode),
+        )
+        .unwrap();
+        assert_eq!(
+            plugin.outbox.status_of(&ev.idempotency_key).unwrap(),
+            Some(OutboxStatus::Pending)
+        );
+
+        // …and the host's event.ack notification (id-less; must produce NO
+        // response line) marks it sent.
+        let ack = RpcMessage {
+            id: None,
+            method: "event.ack".to_string(),
+            params: json!({"idempotencyKey": ev.idempotency_key}),
+        };
+        assert!(plugin.handle_rpc(ack, &mut sink).is_none());
+        assert_eq!(
+            plugin.outbox.status_of(&ev.idempotency_key).unwrap(),
+            Some(OutboxStatus::Sent)
+        );
+
+        // An ack for an unknown key is harmless (idempotent, still silent).
+        let stray = RpcMessage {
+            id: None,
+            method: "event.ack".to_string(),
+            params: json!({"idempotencyKey": "aokie:nope:incoming:v1"}),
+        };
+        assert!(plugin.handle_rpc(stray, &mut sink).is_none());
     }
 
     /// Audit C-01: call controls accept an optional `callId`; a stale one
