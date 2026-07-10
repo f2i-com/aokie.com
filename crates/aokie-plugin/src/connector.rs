@@ -1220,6 +1220,11 @@ impl Plugin {
                     "version": self.store.config.config_version,
                     "quarantined": self.store.quarantined,
                 },
+                // Build provenance (audit CROSS-OBS-001): WHICH build answered.
+                "build": {
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "ref": env!("AOKIE_BUILD_REF"),
+                },
             },
         })
     }
