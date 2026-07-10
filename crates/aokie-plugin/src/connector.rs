@@ -606,6 +606,10 @@ impl Plugin {
                                     "connectedPhone": radio.connected_address(),
                                     "deviceName": "Aokie AI Assistant",
                                     "error": radio.last_error(),
+                                    // Speech results dropped because their call was
+                                    // already over (audit C-05) — non-zero is fine,
+                                    // growth per call is worth investigating.
+                                    "staleSttResults": radio.stale_stt_results(),
                                 },
                                 "outbox": {"pending": c.pending, "failed": c.failed, "dead": c.dead},
                             }));
