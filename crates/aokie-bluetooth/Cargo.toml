@@ -36,3 +36,8 @@ windows-sys = { version = "0.59", features = [
 rusb = "0.9"
 libusb1-sys = "0.7"
 libc = "0.2"
+
+[dev-dependencies]
+# Property-based fuzzing of the byte-stream parsers (audit AOK-TEST-002):
+# adversarial inputs must never panic or read out of bounds.
+proptest = "1"
