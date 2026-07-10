@@ -226,6 +226,36 @@ fn emit_turn(
     );
 }
 
+/// Emit the buffered `call.incoming` NOW if it hasn't gone out yet (audit
+/// AOK-LIF-001). The incoming event is normally held briefly for caller-ID
+/// enrichment; every other call-scoped event (ringing/answered/audio/ended)
+/// forces it out first, so `incoming` ALWAYS precedes the rest of its call's
+/// lifecycle regardless of the hold. `from` is whatever caller id has
+/// arrived — empty when the phone hasn't sent one (never a sentinel, §8).
+fn flush_incoming_if_pending(
+    tracker: &mut crate::call_session::SessionTracker,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+) {
+    if !tracker.current().is_some_and(|s| s.incoming_pending()) {
+        return;
+    }
+    let (corr, from) = {
+        let s = tracker.current_mut().unwrap();
+        s.mark_incoming_emitted();
+        (s.id.clone(), s.caller_id.clone().unwrap_or_default())
+    };
+    emit(
+        outbox,
+        sink,
+        aokie_core::events::aokie_event(
+            crate::contract::events::CALL_INCOMING,
+            &corr,
+            json!({"callId": corr, "from": from, "at": aokie_core::events::now_iso8601()}),
+        ),
+    );
+}
+
 /// The canonical `call.ended` emission — shared by the phone's real
 /// CallTerminated and the synthesized device-loss termination (audit
 /// AOK-LIF-003), so both produce ONE identical terminal event shape.
@@ -1206,23 +1236,7 @@ fn run_loop(
             s.incoming_pending() && (s.caller_id.is_some() || s.incoming_pending_ms() > 800)
         });
         if flush_incoming {
-            let (corr, from) = {
-                let s = tracker.current_mut().unwrap();
-                s.mark_incoming_emitted();
-                // Withheld/late caller id → EMPTY, never a sentinel like
-                // "unknown": that string in a phone-validated form field
-                // rejected the whole Calls record on a live call (audit §8).
-                (s.id.clone(), s.caller_id.clone().unwrap_or_default())
-            };
-            emit(
-                outbox,
-                sink,
-                aokie_core::events::aokie_event(
-                    crate::contract::events::CALL_INCOMING,
-                    &corr,
-                    json!({"callId": corr, "from": from, "at": aokie_core::events::now_iso8601()}),
-                ),
-            );
+            flush_incoming_if_pending(&mut tracker, outbox, sink);
         }
 
         // Auto-answer ASAP: the instant a call is present and not yet answered,
@@ -1846,6 +1860,7 @@ fn handle_event(
             // is gone. A late real CallTerminated lands on an idle tracker
             // and is a no-op (no duplicate terminal event).
             if tracker.current().is_some() {
+                flush_incoming_if_pending(tracker, outbox, sink);
                 status.call_active.store(false, Ordering::Relaxed);
                 tracker.note_intent(crate::call_session::TerminationIntent::DeviceLost);
                 if let Some(ended) = tracker.terminate() {
@@ -1890,6 +1905,7 @@ fn handle_event(
             *status.current_caller.lock().unwrap() = Some(num);
         }
         E::CallRinging => {
+            flush_incoming_if_pending(tracker, outbox, sink);
             if let Some(corr) = tracker.call_id() {
                 emit(
                     outbox,
@@ -1903,6 +1919,9 @@ fn handle_event(
             }
         }
         E::CallAnswered => {
+            // Lifecycle order (audit AOK-LIF-001): incoming ALWAYS precedes
+            // answered — even when the caller-ID hold hasn't elapsed yet.
+            flush_incoming_if_pending(tracker, outbox, sink);
             status.call_active.store(true, Ordering::Relaxed);
             tracker.answered();
             if let Some(corr) = tracker.call_id() {
@@ -1918,6 +1937,9 @@ fn handle_event(
             }
         }
         E::CallTerminated => {
+            // Even an instantly-abandoned ring gets its incoming record
+            // before the terminal event (audit AOK-LIF-001).
+            flush_incoming_if_pending(tracker, outbox, sink);
             status.call_active.store(false, Ordering::Relaxed);
             if let Some(ended) = tracker.terminate() {
                 emit_call_ended(&ended, outbox, sink);
@@ -1927,6 +1949,7 @@ fn handle_event(
             *status.call_started_at.lock().unwrap() = None;
         }
         E::AudioConnected { codec, sample_rate } => {
+            flush_incoming_if_pending(tracker, outbox, sink);
             let corr = tracker.call_id().unwrap_or("radio").to_string();
             emit(
                 outbox,
@@ -1939,6 +1962,7 @@ fn handle_event(
             );
         }
         E::AudioDisconnected => {
+            flush_incoming_if_pending(tracker, outbox, sink);
             let corr = tracker.call_id().unwrap_or("radio").to_string();
             emit(
                 outbox,
@@ -2130,11 +2154,20 @@ mod tests {
 
         // Operator rejects the ringing call (RadioControl::Reject notes the
         // intent, then the phone reports termination).
+        // CallTerminated force-flushes the pending incoming first (AOK-LIF-001),
+        // so locate the terminal event by NAME, not position.
+        let ended_event = |sink: &VecSink| -> serde_json::Value {
+            sink.lines
+                .iter()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .find(|v| v["params"]["event"]["name"] == json!(crate::contract::events::CALL_ENDED))
+                .expect("a call.ended event")
+        };
         handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
         tracker.note_intent(crate::call_session::TerminationIntent::OperatorReject);
         sink.lines.clear();
         handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
-        let v: serde_json::Value = serde_json::from_str(&sink.lines[0]).unwrap();
+        let v = ended_event(&sink);
         assert_eq!(v["params"]["event"]["data"]["outcome"], json!("rejected"));
         assert_eq!(
             v["params"]["event"]["data"]["reason"],
@@ -2145,8 +2178,60 @@ mod tests {
         handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
         sink.lines.clear();
         handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
-        let v: serde_json::Value = serde_json::from_str(&sink.lines[0]).unwrap();
+        let v = ended_event(&sink);
         assert_eq!(v["params"]["event"]["data"]["outcome"], json!("missed"));
+    }
+
+    /// Audit AOK-LIF-001: `incoming` always precedes the rest of its call's
+    /// lifecycle. The caller-ID enrichment hold must not let an instant
+    /// answer (or termination) overtake the canonical start-of-call event.
+    #[test]
+    fn handle_event_incoming_always_precedes_answered() {
+        use crate::event_bridge::VecSink;
+        use aokie_dongle::bluetooth::BluetoothEvent as E;
+
+        let status = Arc::new(RadioStatus::default());
+        let mut sink = VecSink::default();
+        let mut tracker = crate::call_session::SessionTracker::new();
+
+        // The phone answers within the enrichment hold — no run_loop flush
+        // tick has happened between the two events.
+        handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+        handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
+
+        let names: Vec<String> = sink
+            .lines
+            .iter()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["params"]["event"]["name"].as_str().unwrap_or("").to_string()
+            })
+            .collect();
+        let incoming_at = names.iter().position(|n| n == crate::contract::events::CALL_INCOMING);
+        let answered_at = names.iter().position(|n| n == crate::contract::events::CALL_ANSWERED);
+        assert!(incoming_at.is_some(), "incoming must be emitted (forced flush)");
+        assert!(
+            incoming_at < answered_at,
+            "incoming must precede answered, got order {names:?}"
+        );
+
+        // An instantly-abandoned ring still gets incoming before ended.
+        sink.lines.clear();
+        handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
+        handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+        sink.lines.clear();
+        handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
+        let names: Vec<String> = sink
+            .lines
+            .iter()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["params"]["event"]["name"].as_str().unwrap_or("").to_string()
+            })
+            .collect();
+        let incoming_at = names.iter().position(|n| n == crate::contract::events::CALL_INCOMING);
+        let ended_at = names.iter().position(|n| n == crate::contract::events::CALL_ENDED);
+        assert!(incoming_at.is_some() && incoming_at < ended_at, "incoming precedes ended, got {names:?}");
     }
 
     /// Audit AOK-LIF-003: losing the phone/radio link under a live call
