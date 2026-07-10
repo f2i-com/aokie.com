@@ -7,8 +7,10 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   plugin:
@@ -47,3 +49,89 @@ jobs:
       # this is a debug check, not a shippable artifact.
       - name: Check (voice)
         run: cargo check -p aokie-plugin --features voice
+
+  # Audit PKG-001 (best-effort until signing infrastructure exists): a
+  # reproducible RELEASE plugin bundle — helper built first so its post-build
+  # SHA-256 can be pinned into the plugin (the aokie-dongle release gate),
+  # then plugin (voice) + helper + manifest + checksums as one artifact.
+  # Signing mirrors the desktop pipeline: applied when the WINDOWS_CERT_*
+  # secrets exist, loudly UNSIGNED otherwise. Tag/manual builds only — the
+  # test jobs stay the required gate on every push.
+  plugin-release:
+    name: aokie-plugin release bundle
+    runs-on: windows-latest
+    needs: [plugin, plugin-voice]
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build helper, pin its hash, build plugin (voice, release)
+        shell: pwsh
+        run: |
+          cargo build -p aokie-dongle --bin aokie-driver-helper --release
+          if ($LASTEXITCODE -ne 0) { throw "helper build failed" }
+          $sha = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
+          "helper sha256 = $sha"
+          $env:AOKIE_EXPECTED_HELPER_SHA256 = $sha
+          cargo build -p aokie-plugin --features voice --release
+          if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
+
+      - name: Assemble bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bundle | Out-Null
+          Copy-Item target/release/aokie-plugin.exe bundle/
+          Copy-Item target/release/aokie-driver-helper.exe bundle/
+          Copy-Item crates/aokie-plugin/manifest.json bundle/
+          # The ort crate drops the ONNX Runtime DLL beside the exe; the plugin
+          # needs it at runtime. Warn rather than fail if the layout changes.
+          $dll = Get-ChildItem target/release -Filter 'onnxruntime*.dll' -ErrorAction SilentlyContinue
+          if ($dll) { $dll | Copy-Item -Destination bundle/ } else { Write-Warning "no onnxruntime*.dll found beside the exe — bundle ships without it" }
+
+      - name: Sign binaries (when a certificate is configured)
+        shell: pwsh
+        working-directory: bundle
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
+          CERT_PASS: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if (-not $env:CERT_B64) {
+            Write-Warning "PKG-001: no signing certificate configured — shipping UNSIGNED binaries. Add the WINDOWS_CERT_PFX_B64 + WINDOWS_CERT_PASSWORD secrets to close the gap."
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1
+          Get-ChildItem -Include *.exe -Recurse | ForEach-Object {
+            & $signtool.FullName sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signing failed for $($_.Name)" }
+          }
+          Remove-Item $pfx
+          # NOTE: signing the helper changes its bytes — a signed release must
+          # rebuild the plugin with the POST-SIGN helper hash pinned. Until the
+          # cert exists this is documented, not automated (PKG-001 follow-up).
+          Write-Warning "signed helper hash no longer matches the pin baked into this plugin build — rebuild with the post-sign hash before shipping"
+
+      - name: Checksums
+        shell: pwsh
+        working-directory: bundle
+        run: |
+          Get-ChildItem -File | Where-Object Name -ne 'SHA256SUMS.txt' |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aokie-plugin-windows
+          path: bundle/*
+          if-no-files-found: error
+          retention-days: 30
