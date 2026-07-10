@@ -23,6 +23,10 @@ impl LlmClient {
     pub fn new(endpoint: String, model: Option<String>) -> Self {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
+            // Audit AK-003: an unreachable endpoint must fail in seconds, not
+            // hold the radio loop for the full request timeout — call controls
+            // are blocked while a reply request is in flight.
+            .connect_timeout(Duration::from_secs(3))
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
         let model = model
