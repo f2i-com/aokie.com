@@ -23,6 +23,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "voice")]
+use std::time::{Duration, Instant};
 
 use aokie_core::events::DesktopEvent;
 use serde_json::json;
@@ -76,7 +78,11 @@ business, speaking out loud on a live phone call. If the caller asks who you are
 you are Aokie, the automated receptionist - never invent a different name for yourself. Reply with ONE short, natural spoken sentence â€” no \
 lists, markdown, or emoji. Your job: greet the caller, find out their name and how you can help, \
 capture the key details (what they need, and a callback number or time if relevant), and either book \
-them in or take a message. Ask only ONE clear question at a time and keep the conversation moving.";
+them in or take a message. Ask only ONE clear question at a time and keep the conversation moving. \
+IMPORTANT - only promise what actually happens: you take booking REQUESTS and messages for the team \
+to confirm, so say things like I have noted that down and someone will confirm with you - NEVER say \
+you will send a text, SMS, email, or confirmation yourself, and never claim something is booked, \
+sent, or done, because you cannot send messages and bookings are confirmed by a person afterwards.";
 
 /// Spoken on answer when no greeting is configured. A BLANK greeting setting means
 /// "use the default", never "answer silently" — a desktop settings-form save (which
@@ -256,6 +262,56 @@ fn looks_like_echo(caller: &str, bot: &str) -> bool {
     }
     let overlap = c.iter().filter(|w| b.contains(*w)).count();
     (overlap as f32 / c.len() as f32) >= 0.7
+}
+
+/// How long a caller turn stays OPEN after a transcript that looks unfinished
+/// (audit AK-008): callers read phone numbers in groups with pauses well past
+/// the STT endpoint, and replying into that pause both talks over them and
+/// books half a number. Long enough to bridge a between-groups breath, short
+/// enough that a genuinely finished number only delays the reply by a beat.
+#[cfg(feature = "voice")]
+const CONTINUATION_HOLD: Duration = Duration::from_millis(1400);
+
+/// Cap on a merged caller turn — past this, flush regardless (a runaway hold
+/// must never buffer the whole call into one turn).
+#[cfg(feature = "voice")]
+const CONTINUATION_MAX_CHARS: usize = 240;
+
+/// True when a transcript's tail says "the caller isn't done" (audit AK-008):
+/// it ends in a digit group, a spoken number word, or a connective that
+/// announces one ("my number is …"). Drives the continuation hold above.
+#[cfg(feature = "voice")]
+fn ends_with_unfinished_number(text: &str) -> bool {
+    let Some(last) = text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .last()
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    if last.chars().all(|c| c.is_ascii_digit()) {
+        return true; // "…0412", "…345" — a digit group just ended at a pause
+    }
+    matches!(
+        last.as_str(),
+        // Spoken digits and digit multipliers…
+        "zero" | "one" | "two" | "three" | "four" | "five" | "six" | "seven" | "eight"
+            | "nine" | "oh" | "double" | "triple"
+            // …and connectives that promise a number/detail is coming.
+            | "is" | "its" | "on" | "number" | "and" | "um" | "uh"
+    )
+}
+
+/// A caller turn being merged across STT utterances (audit AK-008). `corr` is
+/// pinned at first fragment so a turn that outlives its call (hangup inside
+/// the hold window) still lands against the right call record.
+#[cfg(feature = "voice")]
+struct PendingTurn {
+    corr: String,
+    text: String,
+    flush_at: Instant,
 }
 
 // â”€â”€ Windows: the real radio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1004,6 +1060,10 @@ fn run_loop(
     // Conversation history for the agent (OpenAI chat messages), reset per call.
     #[cfg(feature = "voice")]
     let mut history: Vec<serde_json::Value> = Vec::new();
+    // Caller turn held open across STT utterances (audit AK-008 — see
+    // PendingTurn): replies wait until the turn stops looking unfinished.
+    #[cfg(feature = "voice")]
+    let mut pending_turn: Option<PendingTurn> = None;
     // Aokie's last spoken line (greeting or reply) â€” for the self-echo guard.
     #[cfg(feature = "voice")]
     let mut last_bot_reply = String::new();
@@ -1071,6 +1131,19 @@ fn run_loop(
         // never leak history or half-built utterances into the next call.
         #[cfg(feature = "voice")]
         if voice_call_gen != tracker.generation() {
+            // A turn still held open when its call ends (hangup inside the
+            // continuation window) is RECORDED against that call — losing the
+            // caller's last fragment (often the tail of a phone number) is
+            // worse than a late turn event — but never answered.
+            if let Some(p) = pending_turn.take() {
+                if !p.corr.is_empty() && !p.text.is_empty() {
+                    eprintln!(
+                        "[aokie-plugin] flushing held caller turn from ended call: {}",
+                        content_for_log(&p.text)
+                    );
+                    emit_turn(outbox, sink, &p.corr, turn_index, "caller", &p.text);
+                }
+            }
             voice_call_gen = tracker.generation();
             stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
             http_tts.reset_call();
@@ -1282,9 +1355,12 @@ fn run_loop(
                 stt_had_speech = false;
                 stt_silence = Duration::ZERO;
             }
-            // Finished transcripts â†’ aokie.call.turn.final (the flow's conversation hook,
-            // and the recording source). If the in-plugin agent is on, also answer
-            // the caller directly here â€” streaming the LLM + speaking each sentence.
+            // Finished transcripts: accumulate into the OPEN caller turn
+            // (audit AK-008). A transcript whose tail looks unfinished — a
+            // digit group mid-phone-number, "my number is…" — keeps the turn
+            // open for CONTINUATION_HOLD instead of triggering a reply into
+            // the caller's pause; the next utterance merges into it. Anything
+            // else flushes on the spot (no added latency for normal turns).
             while let Ok(SttResult {
                 generation,
                 utterance,
@@ -1305,15 +1381,50 @@ fn run_loop(
                     );
                     continue;
                 }
-                {
-                    let corr = tracker.call_id().unwrap_or_default().to_string();
-                    // Drop a transcript that's really Aokie's own reply echoing back
-                    // (belt-and-suspenders over the half-duplex mute) so it never
-                    // records it as a caller turn or answers itself.
-                    if agent_enabled && looks_like_echo(&text, &last_bot_reply) {
-                        eprintln!("[aokie-plugin] ignored self-echo: {}", content_for_log(&text));
-                        continue;
+                // Drop a transcript that's really Aokie's own reply echoing back
+                // (belt-and-suspenders over the half-duplex mute) so it never
+                // records it as a caller turn or answers itself.
+                if agent_enabled && looks_like_echo(&text, &last_bot_reply) {
+                    eprintln!("[aokie-plugin] ignored self-echo: {}", content_for_log(&text));
+                    continue;
+                }
+                let corr = tracker.call_id().unwrap_or_default().to_string();
+                match pending_turn.as_mut() {
+                    Some(p) => {
+                        p.text.push(' ');
+                        p.text.push_str(text.trim());
+                        p.corr = corr;
                     }
+                    None => {
+                        pending_turn = Some(PendingTurn {
+                            corr,
+                            text: text.trim().to_string(),
+                            flush_at: Instant::now(),
+                        })
+                    }
+                }
+                let p = pending_turn.as_mut().expect("just set");
+                if p.text.len() < CONTINUATION_MAX_CHARS && ends_with_unfinished_number(&p.text) {
+                    p.flush_at = Instant::now() + CONTINUATION_HOLD;
+                    eprintln!(
+                        "[aokie-plugin] holding turn open (looks unfinished): {}",
+                        content_for_log(&p.text)
+                    );
+                } else {
+                    p.flush_at = Instant::now();
+                }
+            }
+            // Flush the open turn once its hold expired AND the caller isn't
+            // mid-utterance (fresh speech extends the merge window naturally).
+            let flushed_turn = match pending_turn.as_ref() {
+                Some(p) if Instant::now() >= p.flush_at && !stt_had_speech => {
+                    pending_turn.take().map(|p| (p.corr, p.text))
+                }
+                _ => None,
+            };
+            if let Some((corr, text)) = flushed_turn {
+                idle = false;
+                {
                     eprintln!("[aokie-plugin] heard [turn {turn_index}]: {}", content_for_log(&text));
                     emit_turn(outbox, sink, &corr, turn_index, "caller", &text);
                     turn_index += 1;
@@ -1358,6 +1469,11 @@ fn run_loop(
                             let t0 = Instant::now();
                             let mut reply_dur = Duration::ZERO;
                             let mut barged = false;
+                            // What the caller actually HEARD (audit AK-008):
+                            // sentences that reached the speaker, including the
+                            // one cut mid-play by a barge-in. The history/turn
+                            // record uses this, never the full generation.
+                            let mut spoken: Vec<String> = Vec::new();
                             eprintln!("[aokie-plugin] agent replying (streaming)â€¦");
                             let outcome =
                                 client.stream_reply(serde_json::json!(messages), |sentence| {
@@ -1377,6 +1493,7 @@ fn run_loop(
                                             Some(barge_rms),
                                         );
                                         reply_dur += out.dur;
+                                        spoken.push(sentence.trim().to_string());
                                         if out.barged {
                                             bt.flush_tx_audio(); // stop the queued tail now
                                             barged = true;
@@ -1405,14 +1522,26 @@ fn run_loop(
                                 mute_stt_until = Some(plays_until + Duration::from_millis(800));
                             }
                             match outcome {
-                                Ok(full) if !full.trim().is_empty() => {
-                                    let full = full.trim().to_string();
-                                    history.push(
-                                        serde_json::json!({ "role": "assistant", "content": full }),
-                                    );
-                                    emit_turn(outbox, sink, &corr, turn_index, "bot", &full);
-                                    turn_index += 1;
-                                    last_bot_reply = full;
+                                Ok(full) => {
+                                    // Truthful transcript (audit AK-008): a barged
+                                    // reply records what actually PLAYED — the full
+                                    // generation includes sentences the caller never
+                                    // heard, and letting the LLM "remember" saying
+                                    // them corrupts every turn after the interrupt.
+                                    let heard = if barged {
+                                        let h = spoken.join(" ").trim().to_string();
+                                        if h.is_empty() { h } else { format!("{h} [caller interrupted]") }
+                                    } else {
+                                        full.trim().to_string()
+                                    };
+                                    if !heard.is_empty() {
+                                        history.push(
+                                            serde_json::json!({ "role": "assistant", "content": heard }),
+                                        );
+                                        emit_turn(outbox, sink, &corr, turn_index, "bot", &heard);
+                                        turn_index += 1;
+                                        last_bot_reply = heard;
+                                    }
                                     if !barged {
                                         // Discard anything captured while we replied.
                                         // On barge-in, KEEP it: the caller's interrupting
@@ -1426,7 +1555,6 @@ fn run_loop(
                                         );
                                     }
                                 }
-                                Ok(_) => {}
                                 Err(e) => eprintln!("[aokie-plugin] agent reply failed: {e}"),
                             }
                         }
@@ -1813,6 +1941,31 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit AK-008: the continuation heuristic must hold a turn open exactly
+    /// when the caller sounds mid-number — digit groups, spoken digits, and
+    /// the connectives that announce one — and never for a finished sentence.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn unfinished_number_heuristic() {
+        // The live failure: a phone number read in groups with pauses.
+        assert!(ends_with_unfinished_number("my number is 0412"));
+        assert!(ends_with_unfinished_number("it's 0412 345"));
+        assert!(ends_with_unfinished_number("zero four one two"));
+        assert!(ends_with_unfinished_number("you can reach me on 0412, 345"));
+        assert!(ends_with_unfinished_number("double four"));
+        assert!(ends_with_unfinished_number("my number is"));
+        assert!(ends_with_unfinished_number("you can call me on"));
+        // Finished turns must flush immediately — no added latency.
+        assert!(!ends_with_unfinished_number("I'd like to book a haircut"));
+        assert!(!ends_with_unfinished_number("yes that's right"));
+        assert!(!ends_with_unfinished_number("my name is Lance"));
+        assert!(!ends_with_unfinished_number(""));
+        assert!(!ends_with_unfinished_number("   "));
+        // A word after the digits releases the hold.
+        assert!(!ends_with_unfinished_number("nine thirty tomorrow"));
+        assert!(!ends_with_unfinished_number("0412 345 678 thanks"));
+    }
 
     /// Audit C-01/C-02/AK-001: the radio publishes the current call's identity
     /// (`callId` + `startedAt`) into the shared status the moment it rings
