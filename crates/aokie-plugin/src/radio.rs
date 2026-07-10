@@ -1835,10 +1835,21 @@ fn run_loop(
                         stt_buf.clear();
                         stt_had_speech = false;
                         stt_silence = Duration::ZERO;
-                        // Record Aokie's spoken reply as a bot transcript turn.
-                        if let Some(corr) = tracker.call_id().map(str::to_string) {
-                            emit_turn(outbox, sink, &corr, turn_index, "bot", &text);
-                            turn_index += 1;
+                        // Truthful transcript (audit AOK-VOICE-002): record a
+                        // bot turn ONLY when synthesis actually produced audio
+                        // for the caller. A zero-duration outcome means TTS
+                        // failed — the transcript must not claim speech the
+                        // caller never heard.
+                        if out.dur > Duration::ZERO {
+                            if let Some(corr) = tracker.call_id().map(str::to_string) {
+                                emit_turn(outbox, sink, &corr, turn_index, "bot", &text);
+                                turn_index += 1;
+                            }
+                        } else {
+                            eprintln!(
+                                "[aokie-plugin] operatorSpeak produced NO audio (TTS failed) — not recorded as a spoken turn: {}",
+                                content_for_log(&text)
+                            );
                         }
                     }
                     #[cfg(not(feature = "voice"))]
