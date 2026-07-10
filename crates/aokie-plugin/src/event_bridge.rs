@@ -246,6 +246,16 @@ pub fn spawn_replay_thread(outbox_path: std::path::PathBuf) {
                             crate::outbox::SENT_RETENTION_DAYS
                         ),
                     }
+                    // Dead-letter retention rides the same maintenance tick
+                    // (audit AOK-OUTBOX-001): failed transcript/SMS payloads
+                    // must not sit in the file forever.
+                    match outbox.prune_dead(crate::outbox::DEAD_RETENTION_DAYS) {
+                        Ok(0) | Err(_) => {}
+                        Ok(n) => eprintln!(
+                            "[aokie-plugin] pruned {n} dead outbox row(s) past {} day retention",
+                            crate::outbox::DEAD_RETENTION_DAYS
+                        ),
+                    }
                 }
             }
         });
