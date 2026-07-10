@@ -443,14 +443,51 @@ pub fn spawn(
                 }
             };
             // Second connection to the same outbox file (see module docs).
-            let outbox = Outbox::open(&data_dir.join(crate::connector::OUTBOX_FILE)).ok();
-            if outbox.is_none() {
-                eprintln!("[aokie-plugin] radio: outbox unavailable, emitting without durability");
-            }
+            // Fail CLOSED (audit AOK-RUN-001): call/SMS events are the
+            // business record — if they can't be durably queued, the radio
+            // must not run and LOOK available while silently downgrading to
+            // direct stdout. The error lands in last_error, so health reads
+            // degraded and the operator sees why.
+            let outbox = match Outbox::open(&data_dir.join(crate::connector::OUTBOX_FILE)) {
+                Ok(o) => o,
+                Err(e) => {
+                    let msg = format!(
+                        "radio outbox unavailable ({e}) — refusing to start without durable event delivery"
+                    );
+                    eprintln!("[aokie-plugin] {msg}");
+                    *status_thread.last_error.lock().unwrap() = Some(msg);
+                    unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+                    return;
+                }
+            };
             let mode = crate::event_bridge::EmitMode::from_ack(ack_mode);
-            let outbox_ref: OutboxRef<'_> = outbox.as_ref().map(|o| (o, mode));
             let mut sink = crate::event_bridge::StdoutSink::new();
-            run_loop(&mut bt, outbox_ref, &mut sink, control_rx, status_thread, auto_answer, answer_tone, greeting);
+            // Exit supervision (audit AOK-RUN-001): the spawner returned long
+            // ago — if the loop panics or returns, readiness must flip
+            // IMMEDIATELY, never leaving "initialized/connected" green on a
+            // thread that no longer exists.
+            let status_exit = status_thread.clone();
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_loop(
+                    &mut bt,
+                    Some((&outbox, mode)),
+                    &mut sink,
+                    control_rx,
+                    status_thread,
+                    auto_answer,
+                    answer_tone,
+                    greeting,
+                );
+            }));
+            if ran.is_err() {
+                let msg = "radio thread panicked — phone service stopped".to_string();
+                eprintln!("[aokie-plugin] {msg}");
+                *status_exit.last_error.lock().unwrap() = Some(msg);
+            }
+            status_exit.initialized.store(false, Ordering::Relaxed);
+            status_exit.connected.store(false, Ordering::Relaxed);
+            status_exit.call_active.store(false, Ordering::Relaxed);
+            *status_exit.current_call_id.lock().unwrap() = None;
             unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
         })
         .map_err(|e| format!("spawn radio thread: {e}"))?;
