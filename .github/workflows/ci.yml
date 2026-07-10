@@ -71,52 +71,89 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build helper, pin its hash, build plugin (voice, release)
+      # Audit AOK-REL-001: the ONLY correct order is
+      #   build helper → SIGN helper → VERIFY signature → hash the SIGNED
+      #   bytes → build plugin with that hash pinned → sign plugin → verify →
+      #   self-test → package.
+      # The old job hashed the helper BEFORE signing, so a signed release
+      # shipped a plugin whose embedded pin could never match the signed
+      # helper — acknowledged only as a warning. Every verification below is
+      # a hard failure; nothing about integrity is warning-only anymore.
+      - name: Build + sign helper, pin SIGNED hash, build + sign plugin
         shell: pwsh
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
+          CERT_PASS: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
           cargo build -p aokie-dongle --bin aokie-driver-helper --release
           if ($LASTEXITCODE -ne 0) { throw "helper build failed" }
+
+          $signtool = $null
+          $pfx = $null
+          if ($env:CERT_B64) {
+            $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
+            $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
+            & $signtool sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/aokie-driver-helper.exe
+            if ($LASTEXITCODE -ne 0) { throw "helper signing failed" }
+            & $signtool verify /pa target/release/aokie-driver-helper.exe
+            if ($LASTEXITCODE -ne 0) { throw "helper signature verification failed" }
+          } else {
+            Write-Warning "no signing certificate configured — UNSIGNED release flavour (hash pinning still enforced)"
+          }
+
+          # Hash the FINAL helper bytes (post-sign when a cert exists) and
+          # only now build the plugin, so the embedded pin always matches
+          # what actually ships.
           $sha = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
-          "helper sha256 = $sha"
+          "final helper sha256 = $sha"
           $env:AOKIE_EXPECTED_HELPER_SHA256 = $sha
           cargo build -p aokie-plugin --features voice --release
           if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
 
-      - name: Assemble bundle
+          if ($signtool) {
+            & $signtool sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/aokie-plugin.exe
+            if ($LASTEXITCODE -ne 0) { throw "plugin signing failed" }
+            & $signtool verify /pa target/release/aokie-plugin.exe
+            if ($LASTEXITCODE -ne 0) { throw "plugin signature verification failed" }
+            Remove-Item $pfx
+          }
+
+          # Record the pinned hash for the packaging step's cross-check.
+          Set-Content -Encoding ascii pinned-helper-sha.txt $sha
+
+      # Audit AOK-REL-002: a voice release without its runtime is a phone
+      # that can't hear or speak — missing assets FAIL the release, and the
+      # pin/signature invariants are re-checked on the exact bytes packaged.
+      - name: Assemble + verify bundle (fail closed)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force bundle | Out-Null
           Copy-Item target/release/aokie-plugin.exe bundle/
           Copy-Item target/release/aokie-driver-helper.exe bundle/
           Copy-Item crates/aokie-plugin/manifest.json bundle/
-          # The ort crate drops the ONNX Runtime DLL beside the exe; the plugin
-          # needs it at runtime. Warn rather than fail if the layout changes.
           $dll = Get-ChildItem target/release -Filter 'onnxruntime*.dll' -ErrorAction SilentlyContinue
-          if ($dll) { $dll | Copy-Item -Destination bundle/ } else { Write-Warning "no onnxruntime*.dll found beside the exe — bundle ships without it" }
+          if (-not $dll) { throw "AOK-REL-002: voice release requires onnxruntime*.dll beside the plugin exe — none found; the packaged receptionist could not transcribe or speak" }
+          $dll | Copy-Item -Destination bundle/
 
-      - name: Sign binaries (when a certificate is configured)
-        shell: pwsh
-        working-directory: bundle
+          # Cross-check: the helper bytes being PACKAGED must hash to the pin
+          # the plugin was built with — one byte of drift fails the release.
+          $pinned = (Get-Content pinned-helper-sha.txt -Raw).Trim()
+          $packaged = (Get-FileHash bundle/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
+          if ($pinned -ne $packaged) { throw "helper hash drift: pinned $pinned but packaging $packaged" }
+
+          # Release manifest beside the binaries (AOK-REL-001 acceptance).
+          $manifest = [ordered]@{
+            builtAt = (Get-Date).ToUniversalTime().ToString('o')
+            ref = $env:GITHUB_SHA
+            flavour = 'voice'
+            signed = [bool]$env:CERT_B64
+            helperSha256 = $packaged
+            files = @(Get-ChildItem bundle -File | ForEach-Object { [ordered]@{ name = $_.Name; sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() } })
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding ascii bundle/release-manifest.json
         env:
           CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
-          CERT_PASS: ${{ secrets.WINDOWS_CERT_PASSWORD }}
-        run: |
-          if (-not $env:CERT_B64) {
-            Write-Warning "PKG-001: no signing certificate configured — shipping UNSIGNED binaries. Add the WINDOWS_CERT_PFX_B64 + WINDOWS_CERT_PASSWORD secrets to close the gap."
-            exit 0
-          }
-          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
-          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1
-          Get-ChildItem -Include *.exe -Recurse | ForEach-Object {
-            & $signtool.FullName sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
-            if ($LASTEXITCODE -ne 0) { throw "signing failed for $($_.Name)" }
-          }
-          Remove-Item $pfx
-          # NOTE: signing the helper changes its bytes — a signed release must
-          # rebuild the plugin with the POST-SIGN helper hash pinned. Until the
-          # cert exists this is documented, not automated (PKG-001 follow-up).
-          Write-Warning "signed helper hash no longer matches the pin baked into this plugin build — rebuild with the post-sign hash before shipping"
 
       - name: Checksums
         shell: pwsh
