@@ -1,0 +1,94 @@
+# Aokie — Architecture
+
+Aokie is a FormLogic Desktop **plugin**: a JSON-RPC process (stdio, NDJSON)
+that owns the phone bridge and the voice loop and streams events to FormLogic,
+which owns records, roles, dashboards and flows. This document maps the moving
+parts and the two state machines that matter for correctness.
+
+## Process shape
+
+```
+FormLogic Desktop (Tauri host)
+  └─ spawns  aokie-plugin.exe  (stdio JSON-RPC 2.0, NDJSON)
+                ├─ radio thread            (WinUSB HCI/ACL/SCO, HFP, MAP, PBAP)
+                ├─ STT worker               (Parakeet, generation-stamped jobs)
+                ├─ outbox replay thread     (durable delivery, heartbeat)
+                └─ (voice feature) in-plugin agent: STT → LLM → TTS
+  └─ spawns  aokie-voice-server.exe  (:17920 loopback OpenAI-compatible STT/TTS)
+  └─ spawns  llama-server.exe        (:8080 local LLM the agent reuses)
+```
+
+The plugin inherits no secrets — only an allow-listed environment. Everything
+it persists lives under the per-plugin data dir handed to it at `plugin.init`.
+
+## Call-session state machine (`call_session.rs`)
+
+One live call is a `CallSession` with an **immutable** id (`call_<uuid>`, never
+reused) and a monotonic **generation** stamped through the async voice
+pipeline. The generation is how a slow STT result from call A is dropped rather
+than attributed to call B.
+
+```
+        CallIncoming            CallAnswered           CallTerminated
+   idle ───────────▶ Ringing ───────────▶ Active ───────────▶ (consumed)
+                        │                                   ▲
+                        └──────── CallTerminated ───────────┘
+```
+
+Termination is computed from `(answered?, intent)` into an explicit outcome —
+never a guess:
+
+| answered | intent | outcome | reason |
+|---|---|---|---|
+| yes | OperatorHangup | completed | operator_hangup |
+| yes | (remote) | completed | remote_or_operator |
+| yes | DeviceLost | completed | device_lost |
+| no | OperatorReject | rejected | operator_reject |
+| no | DeviceLost | missed | device_lost |
+| no | (none) | missed | remote_or_operator |
+
+Key invariants (each pinned by a test):
+
+- **`incoming` always precedes** `answered`/`ended`/audio events, even during
+  the ~800 ms caller-ID enrichment hold — every call-scoped emission
+  force-flushes a pending `incoming` first.
+- **Device loss terminates the call exactly once**: a dropped dongle
+  synthesizes termination through the same machine (`reason: device_lost`); a
+  late real `CallTerminated` lands on an idle tracker and is a no-op.
+- **The caller's final words land before `call.ended`**: on termination the
+  radio drains buffered audio + in-flight STT (bounded 1.5 s) so summaries and
+  after-call flows see the last sentence.
+
+## Voice pipeline (voice feature)
+
+Per caller turn: energy-VAD segments speech → generation-stamped STT job →
+stream the local LLM (first sentence starts TTS immediately) → per-sentence
+TTS → SCO out. Barge-in: AEC cancels Aokie's own voice from the mic; sustained
+caller speech flushes the queued TTS tail and aborts the LLM.
+
+Truthfulness rules the transcript: a barged or errored reply records only the
+sentences that **actually played** (`[caller interrupted]` / `[reply cut short
+by an error]`), and an `operatorSpeak` that produced no audio records nothing.
+
+`AudioConnected` carries `armed` — false means the SCO alternate-setting failed
+and the call is silent both ways; the plugin emits `hardware.error
+{sco_unarmed}` with a recovery action rather than reporting a healthy call.
+
+## Durability (`outbox.rs`)
+
+Every essential record event (`call.*`, `sms.*`, `hardware.error`) is written
+to a SQLite outbox **before** emission (`synchronous=FULL`). Delivery is
+ACK-gated: the desktop journals the envelope (fsynced) before sending
+`event.ack`; unacked rows stay pending and a replay thread re-delivers on
+backoff, dead-lettering after the attempt budget. Payloads (transcripts, SMS)
+are **DPAPI-protected at rest**. Dead rows expire after 14 days; an operator
+can redrive one (`outbox.redrive {idempotencyKey}`) or all (`{all:true}`). The
+replay thread's heartbeat is surfaced in `plugin.health`, so a frozen delivery
+pipeline degrades readiness rather than silently stalling.
+
+## Contract
+
+Events, commands, error codes, the settings schema and the persona are frozen
+in `docs/contracts/*.json`, byte-identical in the FormLogic repo, and each
+repo's tests lock its own artifacts against its copy — see
+`docs/FORMLOGIC_PLUGIN_CONTRACT.md`.
