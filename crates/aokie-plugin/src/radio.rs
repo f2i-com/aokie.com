@@ -2106,7 +2106,7 @@ fn handle_event(
             *status.current_call_id.lock().unwrap() = None;
             *status.call_started_at.lock().unwrap() = None;
         }
-        E::AudioConnected { codec, sample_rate } => {
+        E::AudioConnected { codec, sample_rate, armed } => {
             flush_incoming_if_pending(tracker, outbox, sink);
             let corr = tracker.call_id().unwrap_or("radio").to_string();
             emit(
@@ -2115,9 +2115,26 @@ fn handle_event(
                 aokie_event(
                     crate::contract::events::CALL_AUDIO_CONNECTED,
                     &corr,
-                    json!({"codec": codec, "sampleRate": sample_rate}),
+                    json!({"codec": codec, "sampleRate": sample_rate, "armed": armed}),
                 ),
             );
+            // Silent SCO must never LOOK healthy (audit AOK-HW-001): the
+            // link is up but the iso pipes didn't arm — record it where the
+            // Device Setup console shows it, with the concrete recovery.
+            if !armed {
+                emit(
+                    outbox,
+                    sink,
+                    aokie_event(
+                        crate::contract::events::HARDWARE_ERROR,
+                        &corr,
+                        json!({
+                            "message": "Call audio failed to arm (SCO alternate setting) — this call will be SILENT both ways. Hang up, unplug and replug the dongle, then take the next call.",
+                            "code": "sco_unarmed",
+                        }),
+                    ),
+                );
+            }
         }
         E::AudioDisconnected => {
             flush_incoming_if_pending(tracker, outbox, sink);
