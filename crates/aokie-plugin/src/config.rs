@@ -41,25 +41,53 @@ pub struct PluginConfig {
     pub preferred_dongle: Option<PreferredDongle>,
     pub paired_devices: Vec<PairedDevice>,
     pub settings: Map<String, Value>,
+    /// Monotonic change counter (audit AK-006): bumped on every successful
+    /// `settings.set` save, so operators and tests can tell exactly which
+    /// configuration a call ran under.
+    pub config_version: u64,
 }
 
 /// Load/save wrapper bound to one data dir.
 pub struct ConfigStore {
     path: PathBuf,
     pub config: PluginConfig,
+    /// True when load() found a CORRUPT settings file (audit AK-006): the
+    /// file was quarantined and safe defaults are in effect — surfaced in
+    /// `plugin.health` and `settings.get` so the reset is never silent.
+    pub quarantined: bool,
 }
 
 impl ConfigStore {
-    /// Load `settings.json` from `data_dir`, falling back to defaults
-    /// when missing or unreadable (a corrupt settings file must never
-    /// keep the plugin from starting — Desktop would mark it crashed).
+    /// Load `settings.json` from `data_dir`. A missing file is a normal
+    /// first run; a CORRUPT file is quarantined (renamed to
+    /// `settings.json.corrupt`, preserving the evidence) and safe defaults
+    /// take over — with auto-answer OFF by default (INT-006), a mangled
+    /// config can never arm the receptionist.
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join(SETTINGS_FILE);
-        let config = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
-        ConfigStore { path, config }
+        let mut quarantined = false;
+        let config = match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(c) => c,
+                Err(e) => {
+                    let quarantine = path.with_extension("json.corrupt");
+                    let _ = std::fs::remove_file(&quarantine);
+                    let moved = std::fs::rename(&path, &quarantine).is_ok();
+                    eprintln!(
+                        "[aokie-plugin] settings.json is corrupt ({e}) — {} and running on safe defaults (auto-answer OFF)",
+                        if moved { "quarantined to settings.json.corrupt" } else { "quarantine rename failed; ignoring the file" }
+                    );
+                    quarantined = true;
+                    PluginConfig::default()
+                }
+            },
+            Err(_) => PluginConfig::default(),
+        };
+        ConfigStore {
+            path,
+            config,
+            quarantined,
+        }
     }
 
     /// Persist atomically (write tmp + rename) so a crash mid-write
@@ -121,11 +149,35 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_file_falls_back_to_defaults() {
+    fn corrupt_file_is_quarantined_with_safe_defaults() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(SETTINGS_FILE), "{not json").unwrap();
         let store = ConfigStore::load(dir.path());
         assert_eq!(store.config, PluginConfig::default());
+        assert!(store.quarantined, "corruption must be visible, not silent");
+        // Evidence preserved, live file gone — the next save starts clean.
+        assert!(dir.path().join("settings.json.corrupt").is_file());
+        assert!(!dir.path().join(SETTINGS_FILE).exists());
+        // A fresh load after quarantine is a normal (non-quarantined) run.
+        let again = ConfigStore::load(dir.path());
+        assert!(!again.quarantined);
+    }
+
+    #[test]
+    fn missing_file_is_not_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::load(dir.path());
+        assert!(!store.quarantined, "first run must not report corruption");
+    }
+
+    #[test]
+    fn config_version_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::load(dir.path());
+        assert_eq!(store.config.config_version, 0);
+        store.config.config_version = 7;
+        store.save().unwrap();
+        assert_eq!(ConfigStore::load(dir.path()).config.config_version, 7);
     }
 
     #[test]
