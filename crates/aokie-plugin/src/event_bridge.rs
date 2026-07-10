@@ -85,17 +85,41 @@ impl Sink for VecSink {
     }
 }
 
+/// How emission success is bookkept in the outbox (audit INT-003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmitMode {
+    /// Legacy hosts (no `eventAck` feature): a successful WRITE marks the
+    /// row `sent` — the pre-ack behaviour, kept for compatibility.
+    Legacy,
+    /// Ack-capable hosts: a successful write only schedules the next
+    /// re-emission (`mark_emitted`); the row becomes `sent` when the host's
+    /// `event.ack` notification confirms it DURABLY received the envelope.
+    AckExpected,
+}
+
+impl EmitMode {
+    pub fn from_ack(ack: bool) -> Self {
+        if ack {
+            EmitMode::AckExpected
+        } else {
+            EmitMode::Legacy
+        }
+    }
+}
+
 /// Emit one event as an `event.emit` notification.
 ///
 /// * `force_outbox` routes even non-essential events through the
 ///   outbox (the dev-mode scripted lifecycle records every step).
-/// * Essential events are ALWAYS outboxed: insert `pending` →
-///   emit → `sent`, or → `failed` with the error recorded.
+/// * Essential events are ALWAYS outboxed: insert `pending` → emit →
+///   then either `sent` (Legacy) or "await ack" (AckExpected); a failed
+///   write records `failed` with the error either way.
 pub fn emit_event(
     sink: &mut dyn Sink,
     outbox: &Outbox,
     event: &DesktopEvent,
     force_outbox: bool,
+    mode: EmitMode,
 ) -> Result<(), String> {
     let outboxed = force_outbox || is_essential(&event.name);
     if outboxed {
@@ -107,9 +131,16 @@ pub fn emit_event(
     match sink.send_line(&line) {
         Ok(()) => {
             if outboxed {
-                outbox
-                    .mark_sent(&event.idempotency_key)
-                    .map_err(|e| format!("outbox mark_sent failed: {e}"))?;
+                match mode {
+                    EmitMode::Legacy => outbox
+                        .mark_sent(&event.idempotency_key)
+                        .map_err(|e| format!("outbox mark_sent failed: {e}"))?,
+                    EmitMode::AckExpected => {
+                        outbox
+                            .mark_emitted(&event.idempotency_key)
+                            .map_err(|e| format!("outbox mark_emitted failed: {e}"))?;
+                    }
+                }
             }
             Ok(())
         }
@@ -122,6 +153,102 @@ pub fn emit_event(
             Err(format!("event.emit failed for {}: {e}", event.name))
         }
     }
+}
+
+/// One replay pass (ack mode): re-emit every DUE unacknowledged row —
+/// crash recovery ("written to the outbox but never delivered"), lost
+/// host writes, and un-acked emissions all funnel through here with the
+/// SAME idempotency key, so the host's receipt dedupe makes redelivery
+/// harmless. Returns how many rows were re-emitted. The caller owns the
+/// timer (the plugin's replay thread; tests call it directly).
+pub fn replay_once(sink: &mut dyn Sink, outbox: &Outbox, limit: u32) -> usize {
+    let rows = match outbox.due_for_retry(limit) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("[aokie-plugin] outbox replay query failed: {e}");
+            return 0;
+        }
+    };
+    let mut emitted = 0usize;
+    for row in rows {
+        let event: DesktopEvent = match serde_json::from_str(&row.payload_json) {
+            Ok(ev) => ev,
+            Err(e) => {
+                // Unparseable payload can never deliver — dead-letter it.
+                eprintln!(
+                    "[aokie-plugin] outbox row {} has an unreadable payload ({e}) — dead-lettering",
+                    row.idempotency_key
+                );
+                for _ in 0..crate::outbox::MAX_ATTEMPTS {
+                    let _ = outbox.mark_failed(&row.idempotency_key, "unreadable payload");
+                }
+                continue;
+            }
+        };
+        let line = rpc::notification_line("event.emit", json!({ "event": event }));
+        match sink.send_line(&line) {
+            Ok(()) => {
+                let _ = outbox.mark_emitted(&row.idempotency_key);
+                emitted += 1;
+                if row.attempts > 0 {
+                    eprintln!(
+                        "[aokie-plugin] replayed unacknowledged event {} (attempt {})",
+                        row.idempotency_key,
+                        row.attempts + 1
+                    );
+                }
+            }
+            Err(e) => {
+                let _ = outbox.mark_failed(&row.idempotency_key, &e.to_string());
+            }
+        }
+    }
+    emitted
+}
+
+/// Spawn the ack-mode replay thread: an initial pass picks up rows a
+/// previous process crashed with (pending/failed, never acknowledged),
+/// then every second re-emits whatever has come due, and periodically
+/// prunes acknowledged rows past retention. Runs for the process's
+/// life — the main loop exits on stdin EOF, taking this with it.
+pub fn spawn_replay_thread(outbox_path: std::path::PathBuf) {
+    let _ = std::thread::Builder::new()
+        .name("aokie-outbox-replay".into())
+        .spawn(move || {
+            let outbox = match Outbox::open(&outbox_path) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!(
+                        "[aokie-plugin] replay thread cannot open outbox {}: {e}",
+                        outbox_path.display()
+                    );
+                    return;
+                }
+            };
+            let mut sink = StdoutSink::new();
+            // Let the host finish its side of the handshake before the
+            // crash-recovery pass floods it.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let recovered = replay_once(&mut sink, &outbox, 64);
+            if recovered > 0 {
+                eprintln!("[aokie-plugin] replayed {recovered} undelivered event(s) from a previous run");
+            }
+            let mut last_prune = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                replay_once(&mut sink, &outbox, 16);
+                if last_prune.elapsed().as_secs() >= 600 {
+                    last_prune = std::time::Instant::now();
+                    match outbox.prune_sent(crate::outbox::SENT_RETENTION_DAYS) {
+                        Ok(0) | Err(_) => {}
+                        Ok(n) => eprintln!(
+                            "[aokie-plugin] pruned {n} acknowledged outbox row(s) past {} day retention",
+                            crate::outbox::SENT_RETENTION_DAYS
+                        ),
+                    }
+                }
+            }
+        });
 }
 
 /// Emit a `log.emit` notification. The MESSAGE MUST ALREADY BE
@@ -161,7 +288,7 @@ mod tests {
         let outbox = Outbox::open_in_memory().unwrap();
         let mut sink = VecSink::default();
         let ev = aokie_event(crate::contract::events::CALL_INCOMING, "call_a", json!({"from": "x"}));
-        emit_event(&mut sink, &outbox, &ev, false).unwrap();
+        emit_event(&mut sink, &outbox, &ev, false, EmitMode::Legacy).unwrap();
 
         assert_eq!(sink.lines.len(), 1);
         let v: Value = serde_json::from_str(&sink.lines[0]).unwrap();
@@ -178,10 +305,10 @@ mod tests {
         let outbox = Outbox::open_in_memory().unwrap();
         let mut sink = VecSink::default();
         let ev = aokie_event(crate::contract::events::DONGLE_DETECTED, "call_b", json!({}));
-        emit_event(&mut sink, &outbox, &ev, false).unwrap();
+        emit_event(&mut sink, &outbox, &ev, false, EmitMode::Legacy).unwrap();
         assert_eq!(outbox.status_of(&ev.idempotency_key).unwrap(), None);
 
-        emit_event(&mut sink, &outbox, &ev, true).unwrap();
+        emit_event(&mut sink, &outbox, &ev, true, EmitMode::Legacy).unwrap();
         assert_eq!(
             outbox.status_of(&ev.idempotency_key).unwrap(),
             Some(OutboxStatus::Sent)
@@ -196,7 +323,7 @@ mod tests {
             ..Default::default()
         };
         let ev = aokie_event(crate::contract::events::SMS_SENT, "sms_1", json!({}));
-        let err = emit_event(&mut sink, &outbox, &ev, false).unwrap_err();
+        let err = emit_event(&mut sink, &outbox, &ev, false, EmitMode::Legacy).unwrap_err();
         assert!(err.contains("event.emit failed"), "got: {err}");
         assert_eq!(
             outbox.status_of(&ev.idempotency_key).unwrap(),
@@ -205,6 +332,93 @@ mod tests {
         let rows = outbox.retryable(10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].attempts, 1);
+    }
+
+    /// Audit INT-003, the crash-boundary table:
+    /// - crash BEFORE send: row pending, no next_attempt_at → replayed;
+    /// - crash AFTER send, before ack: row pending with a due backoff →
+    ///   replayed with the SAME idempotency key (host dedupes);
+    /// - after ack: row sent → never replayed.
+    #[test]
+    fn ack_mode_replays_until_acknowledged() {
+        let outbox = Outbox::open_in_memory().unwrap();
+        let mut sink = VecSink::default();
+        let ev = aokie_event(
+            crate::contract::events::CALL_INCOMING,
+            "call_a",
+            json!({"from": "x"}),
+        );
+
+        // Live emission in ack mode: written, but NOT sent — awaiting ack.
+        emit_event(&mut sink, &outbox, &ev, false, EmitMode::AckExpected).unwrap();
+        assert_eq!(sink.lines.len(), 1);
+        assert_eq!(
+            outbox.status_of(&ev.idempotency_key).unwrap(),
+            Some(OutboxStatus::Pending)
+        );
+
+        // Freshly emitted → backoff gates the replay loop (nothing due).
+        assert_eq!(replay_once(&mut sink, &outbox, 10), 0);
+
+        // Simulate the backoff elapsing (crash-recovery equivalence: a row
+        // whose next attempt is due). Then the replay pass re-emits the SAME
+        // envelope with the SAME idempotency key.
+        force_due(&outbox, &ev.idempotency_key);
+        assert_eq!(replay_once(&mut sink, &outbox, 10), 1);
+        assert_eq!(sink.lines.len(), 2);
+        let a: Value = serde_json::from_str(&sink.lines[0]).unwrap();
+        let b: Value = serde_json::from_str(&sink.lines[1]).unwrap();
+        assert_eq!(
+            a["params"]["event"]["idempotencyKey"],
+            b["params"]["event"]["idempotencyKey"],
+            "replay uses the same occurrence id so the host can dedupe"
+        );
+
+        // The host acks → sent; no more replays even when 'due'.
+        outbox.mark_sent(&ev.idempotency_key).unwrap();
+        force_due(&outbox, &ev.idempotency_key);
+        assert_eq!(replay_once(&mut sink, &outbox, 10), 0);
+        assert_eq!(
+            outbox.status_of(&ev.idempotency_key).unwrap(),
+            Some(OutboxStatus::Sent)
+        );
+    }
+
+    /// Crash BEFORE the first send: the row sits pending with no
+    /// next_attempt_at — the replay thread's startup pass delivers it.
+    #[test]
+    fn ack_mode_startup_pass_delivers_rows_a_crash_stranded() {
+        let outbox = Outbox::open_in_memory().unwrap();
+        let ev = aokie_event(
+            crate::contract::events::SMS_RECEIVED,
+            "sms_9",
+            json!({"from": "+61", "body": "hi"}),
+        );
+        // insert_pending happened, then the process died before send_line.
+        outbox.insert_pending(&ev, TARGET_DESKTOP).unwrap();
+
+        let mut sink = VecSink::default();
+        assert_eq!(replay_once(&mut sink, &outbox, 10), 1);
+        let v: Value = serde_json::from_str(&sink.lines[0]).unwrap();
+        assert_eq!(v["method"], json!("event.emit"));
+        assert_eq!(
+            v["params"]["event"]["idempotencyKey"],
+            json!(ev.idempotency_key)
+        );
+        // Still awaiting ack — not marked sent by mere re-emission.
+        assert_eq!(
+            outbox.status_of(&ev.idempotency_key).unwrap(),
+            Some(OutboxStatus::Pending)
+        );
+    }
+
+    /// Backdate a row's next_attempt_at so it is due NOW (test helper for
+    /// the backoff window without sleeping).
+    fn force_due(outbox: &Outbox, key: &str) {
+        // Reuse the public surface: a fresh insert keeps NULL, but an
+        // emitted row needs its schedule rewound — go through a tiny SQL
+        // shim exposed for tests via mark-then-rewind semantics.
+        outbox.rewind_next_attempt_for_tests(key);
     }
 
     #[test]
