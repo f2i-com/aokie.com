@@ -58,14 +58,28 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
-    /// Load `settings.json` from `data_dir`. A missing file is a normal
-    /// first run; a CORRUPT file is quarantined (renamed to
-    /// `settings.json.corrupt`, preserving the evidence) and safe defaults
-    /// take over — with auto-answer OFF by default (INT-006), a mangled
-    /// config can never arm the receptionist.
+    /// Load `settings.json` from `data_dir`. A missing file falls back to
+    /// the last-known-good `settings.json.bak` (audit AOK-CFG-001 — a crash
+    /// inside an old save's delete window, or a failed replace, must not
+    /// reset the receptionist) and only then to first-run defaults. A
+    /// CORRUPT file is quarantined (renamed to `settings.json.corrupt`,
+    /// preserving the evidence) and the same recovery ladder applies — with
+    /// auto-answer OFF by default (INT-006), a mangled config can never arm
+    /// the receptionist even when no backup survives.
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join(SETTINGS_FILE);
+        let bak = path.with_extension("json.bak");
+        let restore = |why: &str| -> Option<PluginConfig> {
+            let text = std::fs::read_to_string(&bak).ok()?;
+            let cfg: PluginConfig = serde_json::from_str(&text).ok()?;
+            eprintln!(
+                "[aokie-plugin] settings.json {why} — restored last-known-good settings.json.bak (configVersion {})",
+                cfg.config_version
+            );
+            Some(cfg)
+        };
         let mut quarantined = false;
+        let mut restored = None;
         let config = match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str(&text) {
                 Ok(c) => c,
@@ -74,24 +88,42 @@ impl ConfigStore {
                     let _ = std::fs::remove_file(&quarantine);
                     let moved = std::fs::rename(&path, &quarantine).is_ok();
                     eprintln!(
-                        "[aokie-plugin] settings.json is corrupt ({e}) — {} and running on safe defaults (auto-answer OFF)",
+                        "[aokie-plugin] settings.json is corrupt ({e}) — {}",
                         if moved { "quarantined to settings.json.corrupt" } else { "quarantine rename failed; ignoring the file" }
                     );
                     quarantined = true;
-                    PluginConfig::default()
+                    restored = restore("was corrupt");
+                    restored.clone().unwrap_or_default()
                 }
             },
-            Err(_) => PluginConfig::default(),
+            Err(_) => {
+                restored = restore("is missing");
+                restored.clone().unwrap_or_default()
+            }
         };
-        ConfigStore {
+        let store = ConfigStore {
             path,
             config,
             quarantined,
+        };
+        // A recovery is only durable once it is the PRIMARY file again.
+        if restored.is_some() {
+            let _ = store.save();
         }
+        store
     }
 
-    /// Persist atomically (write tmp + rename) so a crash mid-write
-    /// can't truncate the settings file.
+    /// Persist atomically AND recoverably (audit AOK-CFG-001).
+    ///
+    /// Order of operations matters: (1) the new content is written to a tmp
+    /// file and fsynced — a crash mid-write can never touch the live file;
+    /// (2) the current live file is copied to `settings.json.bak` — the
+    /// last-known-good [`load`](Self::load) restores from; (3) the tmp file
+    /// REPLACES the live file in one rename (Rust's Windows rename uses
+    /// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`), so there is no window where
+    /// no settings file exists. The old delete-then-rename left exactly that
+    /// window: a crash or an antivirus lock between the two calls stranded
+    /// the receptionist with NO configuration at all.
     pub fn save(&self) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -99,13 +131,28 @@ impl ConfigStore {
         let tmp = self.path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(&self.config)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&tmp, text)?;
-        // Windows rename fails if the target exists; replace explicitly.
-        if self.path.exists() {
-            std::fs::remove_file(&self.path)?;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?; // the bytes must be ON DISK before they can replace the live file
         }
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        // Keep the outgoing config as last-known-good (best-effort: a failed
+        // backup must not block the save itself).
+        if self.path.is_file() {
+            let _ = std::fs::copy(&self.path, self.path.with_extension("json.bak"));
+        }
+        match std::fs::rename(&tmp, &self.path) {
+            Ok(()) => Ok(()),
+            Err(_) if self.path.exists() => {
+                // Fallback for a platform/filesystem where rename won't
+                // replace: the pre-existing (riskier) delete-then-rename,
+                // now safe to attempt because .bak was captured above.
+                std::fs::remove_file(&self.path)?;
+                std::fs::rename(&tmp, &self.path)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -168,6 +215,63 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ConfigStore::load(dir.path());
         assert!(!store.quarantined, "first run must not report corruption");
+    }
+
+    /// Audit AOK-CFG-001: the crash window of the old delete-then-rename —
+    /// primary GONE, only the backup left — must recover the last good
+    /// config and re-materialize it as the primary file.
+    #[test]
+    fn missing_primary_restores_last_known_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::load(dir.path());
+        store.config.settings.insert("greeting".into(), json!("Hi!"));
+        store.config.config_version = 3;
+        store.save().unwrap();
+        store.save().unwrap(); // second save captures v3 into .bak
+        std::fs::remove_file(dir.path().join(SETTINGS_FILE)).unwrap(); // simulated crash window
+
+        let back = ConfigStore::load(dir.path());
+        assert_eq!(back.config.config_version, 3, "last-known-good restored");
+        assert_eq!(back.config.settings.get("greeting"), Some(&json!("Hi!")));
+        assert!(!back.quarantined, "a clean restore is not corruption");
+        assert!(
+            dir.path().join(SETTINGS_FILE).is_file(),
+            "recovery re-materializes the primary file"
+        );
+    }
+
+    /// Audit AOK-CFG-001 + AK-006: a corrupt primary quarantines AND
+    /// recovers the backup instead of falling all the way to defaults.
+    #[test]
+    fn corrupt_primary_prefers_backup_over_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::load(dir.path());
+        store.config.config_version = 5;
+        store.save().unwrap();
+        store.save().unwrap(); // .bak now holds v5
+        std::fs::write(dir.path().join(SETTINGS_FILE), "{mangled").unwrap();
+
+        let back = ConfigStore::load(dir.path());
+        assert!(back.quarantined, "corruption is still surfaced");
+        assert_eq!(back.config.config_version, 5, "backup beats defaults");
+        assert!(dir.path().join("settings.json.corrupt").is_file());
+    }
+
+    /// Every save keeps the OUTGOING config as .bak — the invariant the
+    /// recovery ladder stands on.
+    #[test]
+    fn save_captures_previous_version_as_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::load(dir.path());
+        store.config.config_version = 1;
+        store.save().unwrap();
+        store.config.config_version = 2;
+        store.save().unwrap();
+        let bak: PluginConfig = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("settings.json.bak")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bak.config_version, 1, ".bak holds the version being replaced");
     }
 
     #[test]
