@@ -1226,8 +1226,11 @@ mod tests {
         let response = handle_request(&server, "GET", "/health", &[], b"");
         assert_eq!(response.status, 200);
         let value = decode_json(&response.body);
-        assert_eq!(value["status"], "ok");
+        // Truthful readiness (AOK-VOICE-SRV-001): TTS assets are absent, so
+        // the server must NOT read green — half a voice stack can't take a call.
+        assert_eq!(value["status"], "degraded");
         assert_eq!(value["stt"], true);
         assert_eq!(value["tts"], false);
+        assert!(value["build"]["version"].is_string(), "build provenance present");
     }
 }
