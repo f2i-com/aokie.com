@@ -940,7 +940,11 @@ impl Plugin {
                         "key": key,
                         "value": self.store.config.settings.get(key).cloned(),
                     })),
-                    None => Ok(json!({"settings": self.store.config.settings})),
+                    None => Ok(json!({
+                        "settings": self.store.config.settings,
+                        "configVersion": self.store.config.config_version,
+                        "configQuarantined": self.store.quarantined,
+                    })),
                 }
             }
             "settings.set" => {
@@ -950,12 +954,12 @@ impl Plugin {
                 if obj.is_empty() {
                     return Err(CmdError::failed("settings.set payload is empty"));
                 }
-                // Endpoint safety (audit PRIV-001/C-16): these URLs receive
-                // caller AUDIO and TRANSCRIPTS — classify BEFORE persisting.
-                for key in ENDPOINT_SETTING_KEYS {
-                    if let Some(v) = obj.get(*key) {
-                        validate_endpoint_setting(key, v)?;
-                    }
+                // Typed validation (audit AK-006) — covers the endpoint-URL
+                // classification (PRIV-001/C-16) for aiEndpoint/sttEndpoint/
+                // ttsEndpoint. ALL keys validate before ANY persist: a batch
+                // with one bad key changes nothing.
+                for (key, value) in obj {
+                    validate_setting(key, value)?;
                 }
                 for (key, value) in obj {
                     self.store
@@ -963,12 +967,14 @@ impl Plugin {
                         .settings
                         .insert(key.clone(), value.clone());
                 }
+                self.store.config.config_version += 1;
                 self.save_config()?;
                 // Live-reconfigure a running receptionist so a flow (or the desktop)
                 // can push the Receptionist Settings — persona/greeting/voice/model —
                 // and have them take effect on the current call, no reconnect. Only
                 // the agent-shaping keys trip this; other settings just persist.
                 let agent_key = has_receptionist_config_key(obj);
+                let radio_running = self.radio.is_some();
                 if agent_key {
                     if let Some(radio) = self.radio.as_ref() {
                         let _ = radio.send(crate::radio::RadioControl::Configure {
@@ -982,7 +988,28 @@ impl Plugin {
                         });
                     }
                 }
-                Ok(json!({"settings": self.store.config.settings}))
+                // Truthful apply-state per key (audit AK-006): live keys only
+                // count as applied when a radio is actually running to receive
+                // the Configure; everything else waits for the next connect.
+                let mut applied_live: Vec<&String> = Vec::new();
+                let mut applies_at_reconnect: Vec<&String> = Vec::new();
+                for key in obj.keys() {
+                    if LIVE_SETTING_KEYS.contains(&key.as_str()) {
+                        if radio_running {
+                            applied_live.push(key);
+                        } else {
+                            applies_at_reconnect.push(key);
+                        }
+                    } else if RECONNECT_SETTING_KEYS.contains(&key.as_str()) {
+                        applies_at_reconnect.push(key);
+                    }
+                }
+                Ok(json!({
+                    "settings": self.store.config.settings,
+                    "configVersion": self.store.config.config_version,
+                    "appliedLive": applied_live,
+                    "appliesAtReconnect": applies_at_reconnect,
+                }))
             }
             other => Err(CmdError::failed(format!("unknown command: {other}"))),
         }
@@ -1159,6 +1186,12 @@ impl Plugin {
         if counts.dead > 0 {
             reasons.push(format!("{} dead outbox event(s) need redrive", counts.dead));
         }
+        if self.store.quarantined {
+            reasons.push(
+                "settings file was corrupt — quarantined, running on safe defaults (auto-answer OFF)"
+                    .to_string(),
+            );
+        }
         json!({
             "status": if reasons.is_empty() { "ok" } else { "degraded" },
             "detail": if reasons.is_empty() { Value::Null } else { json!(reasons.join("; ")) },
@@ -1170,6 +1203,10 @@ impl Plugin {
                     "pending": counts.pending,
                     "failed": counts.failed,
                     "dead": counts.dead,
+                },
+                "config": {
+                    "version": self.store.config.config_version,
+                    "quarantined": self.store.quarantined,
                 },
             },
         })
@@ -1364,6 +1401,101 @@ fn expect_fields(payload: &Value, allowed: &[&str]) -> Result<Map<String, Value>
             "payload must be an object, got {}",
             json_type_name(other)
         ))),
+    }
+}
+
+/// Settings the running radio applies immediately via `RadioControl::Configure`
+/// (audit AK-006 `appliedLive`); everything else known takes effect at the
+/// next connect (`appliesAtReconnect` — read once at radio spawn).
+const LIVE_SETTING_KEYS: &[&str] = &[
+    "persona",
+    "greeting",
+    "ttsVoice",
+    "aiModel",
+    "aiEndpoint",
+    "sttEndpoint",
+    "ttsEndpoint",
+];
+const RECONNECT_SETTING_KEYS: &[&str] = &[
+    "autoAnswer",
+    "aiReceptionist",
+    "bargeIn",
+    "bargeSensitivity",
+    "sttEndpointMs",
+    "hfpCodec",
+    "reenumerateHwid",
+    "mockCalls",
+];
+
+/// Typed validation for settings (audit AK-006): wrong types, out-of-range
+/// numbers, bogus enums and unbounded blobs are rejected BEFORE persisting.
+/// Unknown keys stay allowed (the bag is deliberately extensible) but must be
+/// scalar and bounded — a typo'd key can't smuggle a megabyte of JSON. `null`
+/// always passes: it means "clear this setting".
+fn validate_setting(key: &str, value: &Value) -> Result<(), CmdError> {
+    fn want_bool(key: &str, v: &Value) -> Result<(), CmdError> {
+        match v {
+            Value::Null | Value::Bool(_) => Ok(()),
+            // Legacy string bools exist in shipped settings.json files.
+            Value::String(s) if s == "true" || s == "false" => Ok(()),
+            other => Err(CmdError::failed(format!(
+                "{key} must be a boolean, got {}",
+                json_type_name(other)
+            ))),
+        }
+    }
+    fn want_int(key: &str, v: &Value, lo: i64, hi: i64) -> Result<(), CmdError> {
+        match v {
+            Value::Null => Ok(()),
+            Value::Number(n) => match n.as_i64() {
+                Some(n) if (lo..=hi).contains(&n) => Ok(()),
+                _ => Err(CmdError::failed(format!(
+                    "{key} must be a whole number between {lo} and {hi}"
+                ))),
+            },
+            other => Err(CmdError::failed(format!(
+                "{key} must be a number, got {}",
+                json_type_name(other)
+            ))),
+        }
+    }
+    fn want_str(key: &str, v: &Value, max: usize) -> Result<(), CmdError> {
+        match v {
+            Value::Null => Ok(()),
+            Value::String(s) if s.chars().count() <= max => Ok(()),
+            Value::String(_) => Err(CmdError::failed(format!(
+                "{key} must be at most {max} characters"
+            ))),
+            other => Err(CmdError::failed(format!(
+                "{key} must be a string, got {}",
+                json_type_name(other)
+            ))),
+        }
+    }
+    match key {
+        "autoAnswer" | "aiReceptionist" | "bargeIn" | "reenumerateHwid" | "mockCalls" => {
+            want_bool(key, value)
+        }
+        "bargeSensitivity" => want_int(key, value, 50, 5000),
+        "sttEndpointMs" => want_int(key, value, 100, 5000),
+        "hfpCodec" => match value {
+            Value::Null => Ok(()),
+            Value::String(s) if s == "cvsd" || s == "wbs" => Ok(()),
+            _ => Err(CmdError::failed("hfpCodec must be 'cvsd' or 'wbs'")),
+        },
+        "persona" => want_str(key, value, 4000),
+        "greeting" => want_str(key, value, 1000),
+        "ttsVoice" | "aiModel" | "replyMode" => want_str(key, value, 200),
+        _ if ENDPOINT_SETTING_KEYS.contains(&key) => validate_endpoint_setting(key, value),
+        _ => match value {
+            Value::Object(_) | Value::Array(_) => Err(CmdError::failed(format!(
+                "{key}: objects/arrays are not valid settings values"
+            ))),
+            Value::String(s) if s.chars().count() > 4000 => Err(CmdError::failed(format!(
+                "{key} must be at most 4000 characters"
+            ))),
+            _ => Ok(()),
+        },
     }
 }
 
@@ -1987,6 +2119,62 @@ mod tests {
         let mut off = Map::new();
         off.insert("autoAnswer".to_string(), json!(false));
         assert!(!auto_answer_from_settings(&off));
+    }
+
+    /// Audit AK-006: settings are TYPED — wrong types, out-of-range numbers,
+    /// bogus enums and unbounded blobs are rejected atomically (one bad key
+    /// fails the whole batch, nothing persists), while valid writes report
+    /// their apply-state and bump the visible config version.
+    #[test]
+    fn settings_set_is_typed_versioned_and_atomic() {
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink::default();
+
+        for (payload, why) in [
+            (json!({"autoAnswer": "yes"}), "non-bool bool"),
+            (json!({"bargeSensitivity": 9000}), "out of range"),
+            (json!({"bargeSensitivity": "500"}), "stringly number"),
+            (json!({"sttEndpointMs": 5}), "below range"),
+            (json!({"hfpCodec": "mp3"}), "bogus enum"),
+            (json!({"persona": "x".repeat(4001)}), "unbounded blob"),
+            (json!({"customKey": {"nested": true}}), "non-scalar unknown key"),
+            // Atomicity: the valid key must not survive its bad sibling.
+            (json!({"greeting": "Hi!", "hfpCodec": "mp3"}), "bad sibling"),
+        ] {
+            assert!(
+                plugin.dispatch_command("settings.set", &payload, &mut sink).is_err(),
+                "{why} must be rejected"
+            );
+        }
+        let all = plugin.dispatch_command("settings.get", &json!({}), &mut sink).unwrap();
+        assert_eq!(all["configVersion"], 0, "rejected writes must not bump the version");
+        assert!(all["settings"].get("greeting").is_none(), "bad batch persisted its valid key");
+        assert_eq!(all["configQuarantined"], false);
+
+        // Valid writes: version bumps, apply-state is truthful (no radio in
+        // ephemeral mode, so even live keys wait for the next connect).
+        let res = plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"greeting": "Hi!", "bargeSensitivity": 500, "autoAnswer": true, "customFlag": true}),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(res["configVersion"], 1);
+        assert_eq!(res["appliedLive"], json!([]));
+        let mut reconnect: Vec<String> = res["appliesAtReconnect"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        reconnect.sort();
+        assert_eq!(reconnect, ["autoAnswer", "bargeSensitivity", "greeting"]);
+        assert!(plugin
+            .dispatch_command("settings.set", &json!({"hfpCodec": "wbs"}), &mut sink)
+            .is_ok());
+        let all = plugin.dispatch_command("settings.get", &json!({}), &mut sink).unwrap();
+        assert_eq!(all["configVersion"], 2);
     }
 
     /// Audit PRIV-001/C-16: AI/speech endpoints are classified BEFORE being
