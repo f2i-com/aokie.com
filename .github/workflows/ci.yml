@@ -25,11 +25,13 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 
-      # Lib + contract-schema + integration tests: the manifest/event/command
-      # drift gates (contract.rs), call-session lifecycle, ack-mode outbox,
-      # callId guards, endpoint classification, truthful health.
-      - name: Tests
-        run: cargo test -p aokie-plugin
+      # The WHOLE shipping workspace (audit AOK-CI-001): core, bluetooth, db,
+      # audio, ai, dongle, voice-server, receptionist AND the plugin — the
+      # radio/recovery logic lives in crates the old plugin-only run never
+      # touched. Contract drift gates, call lifecycle, outbox, endpoint
+      # classification and truthful health all ride along.
+      - name: Tests (workspace)
+        run: cargo test --workspace
 
   plugin-voice:
     name: aokie-plugin (check, voice features)
@@ -49,6 +51,17 @@ jobs:
       # this is a debug check, not a shippable artifact.
       - name: Check (voice)
         run: cargo check -p aokie-plugin --features voice
+
+  # Supply-chain gate (audit AOK-CI-001): RustSec advisories fail CI — accept
+  # an unavoidable one explicitly via audit.toml with a documented reason.
+  supply-chain:
+    name: cargo audit (RustSec advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # Audit PKG-001 (best-effort until signing infrastructure exists): a
   # reproducible RELEASE plugin bundle — helper built first so its post-build
