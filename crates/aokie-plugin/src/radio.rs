@@ -1115,6 +1115,7 @@ fn run_loop(
     // Utterances sent to the STT worker whose results haven't come back yet
     // (audit AOK-LIF-002): the termination drain waits for these — bounded —
     // so the caller's last words land BEFORE call.ended.
+    #[cfg(feature = "voice")]
     let mut stt_outstanding: usize = 0;
     #[cfg(feature = "voice")]
     let mut stt_had_speech = false;
@@ -1343,9 +1344,14 @@ fn run_loop(
             stt_had_speech = false;
             stt_silence = Duration::ZERO;
             mute_stt_until = None;
-            if let Some(a) = aec.as_mut() {
-                a.reset();
-            }
+            // Drop the echo canceller entirely rather than just resetting its
+            // FIFOs (review sweep): it was built at the FIRST call's SCO rate
+            // and reset() keeps that rate + filter length. Back-to-back calls
+            // can negotiate different codecs (mSBC 16 kHz vs CVSD 8 kHz), so a
+            // reused AEC would run at the wrong rate and cancel nothing. None
+            // makes it rebuild at THIS call's actual sample rate on the first
+            // captured frame below.
+            aec = None;
         }
 
         // Flush a buffered incoming call once the caller id is known or the
@@ -1647,10 +1653,16 @@ fn run_loop(
                             let t0 = Instant::now();
                             let mut reply_dur = Duration::ZERO;
                             let mut barged = false;
-                            // What the caller actually HEARD (audit AK-008):
-                            // sentences that reached the speaker, including the
-                            // one cut mid-play by a barge-in. The history/turn
-                            // record uses this, never the full generation.
+                            // Distinguish a CALLER barge-in from an OPERATOR
+                            // hangup/reject mid-reply (review sweep): both stop
+                            // the reply, but the transcript must not label an
+                            // operator action as "caller interrupted".
+                            let mut operator_ended = false;
+                            // What the caller actually HEARD: sentences that
+                            // reached the speaker (audit AK-008 + sweep). The
+                            // history/turn record uses this, never the full
+                            // generation — populated in BOTH duplex modes so a
+                            // mid-reply failure/hangup records what played.
                             let mut spoken: Vec<String> = Vec::new();
                             eprintln!("[aokie-plugin] agent replying (streaming)â€¦");
                             let outcome =
@@ -1670,7 +1682,7 @@ fn run_loop(
                                                 if let Err(e) = bt.hangup() {
                                                     eprintln!("[aokie-plugin] mid-reply hangup failed: {e}");
                                                 }
-                                                barged = true; // record only what played
+                                                operator_ended = true; // record only what played, not "caller interrupted"
                                                 return false; // abort the reply now
                                             }
                                             RadioControl::Reject => {
@@ -1681,7 +1693,7 @@ fn run_loop(
                                                 if let Err(e) = bt.reject_call() {
                                                     eprintln!("[aokie-plugin] mid-reply reject failed: {e}");
                                                 }
-                                                barged = true;
+                                                operator_ended = true;
                                                 return false;
                                             }
                                             other => pending_controls.push_back(other),
@@ -1720,6 +1732,7 @@ fn run_loop(
                                             None,
                                         );
                                         reply_dur += out.dur;
+                                        spoken.push(sentence.trim().to_string());
                                         let plays_until = (t0 + reply_dur).max(Instant::now());
                                         mute_stt_until =
                                             Some(plays_until + Duration::from_millis(600));
@@ -1733,16 +1746,24 @@ fn run_loop(
                             }
                             match outcome {
                                 Ok(full) => {
-                                    // Truthful transcript (audit AK-008): a barged
-                                    // reply records what actually PLAYED — the full
-                                    // generation includes sentences the caller never
-                                    // heard, and letting the LLM "remember" saying
-                                    // them corrupts every turn after the interrupt.
-                                    let heard = if barged {
-                                        let h = spoken.join(" ").trim().to_string();
-                                        if h.is_empty() { h } else { format!("{h} [caller interrupted]") }
+                                    // Truthful transcript (audit AK-008 + sweep): a
+                                    // reply cut short records what actually PLAYED,
+                                    // annotated with WHY — the full generation
+                                    // includes sentences the caller never heard, and
+                                    // an operator hangup is not a caller interruption.
+                                    let cut = if barged {
+                                        Some(" [caller interrupted]")
+                                    } else if operator_ended {
+                                        Some(" [ended by the operator]")
                                     } else {
-                                        full.trim().to_string()
+                                        None
+                                    };
+                                    let heard = match cut {
+                                        Some(tag) => {
+                                            let h = spoken.join(" ").trim().to_string();
+                                            if h.is_empty() { h } else { format!("{h}{tag}") }
+                                        }
+                                        None => full.trim().to_string(),
                                     };
                                     if !heard.is_empty() {
                                         history.push(
