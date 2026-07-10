@@ -146,6 +146,8 @@ jobs:
           $manifest = [ordered]@{
             builtAt = (Get-Date).ToUniversalTime().ToString('o')
             ref = $env:GITHUB_SHA
+            # The tested compatibility tuple (audit CROSS-COMPAT-001).
+            contractVersion = (Get-Content docs/contracts/aokie-connector-contract.v1.json -Raw | ConvertFrom-Json).contractVersion
             flavour = 'voice'
             signed = [bool]$env:CERT_B64
             helperSha256 = $packaged
