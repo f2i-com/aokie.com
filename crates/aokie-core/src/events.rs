@@ -104,8 +104,42 @@ pub fn step_for_event_name(name: &str) -> &str {
 /// `source`/`pluginId` = "aokie", `schemaVersion` = 1, `occurredAt` =
 /// now, `idempotencyKey` = `aokie:<correlationId>:<step>:v1` where
 /// the step is derived from the name via [`step_for_event_name`].
+///
+/// ONLY for steps that occur at most once per correlation (e.g.
+/// `incoming`/`ended` per call id). A step that can legitimately REPEAT
+/// under one correlation — radio lifecycle under the shared `radio`
+/// correlation, hardware errors, per-call audio up/down cycles — must
+/// use [`aokie_event_occurrence`] instead, or every repeat collides on
+/// the first occurrence's key and is silently dropped by the outbox and
+/// the Desktop receipt dedupe (audit AOK-EVENT-001).
 pub fn aokie_event(name: &str, correlation_id: &str, data: serde_json::Value) -> DesktopEvent {
     aokie_event_with_step(name, correlation_id, step_for_event_name(name), data)
+}
+
+/// Mint a compact immutable occurrence id (12 hex chars) for an incident
+/// that can repeat under one correlation. Mint ONCE when the incident is
+/// DETECTED and carry it in the event object for its whole life — never
+/// re-mint per emission attempt — so re-delivery of one occurrence keeps
+/// one key, while every new incident gets a fresh key (AOK-EVENT-001).
+pub fn occurrence_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
+}
+
+/// Build an `aokie.*` envelope whose idempotency-key step carries a
+/// per-incident occurrence id: `aokie:<corr>:<step>.<occ>:v1`. Use for
+/// steps that can repeat under one correlation; see [`aokie_event`].
+pub fn aokie_event_occurrence(
+    name: &str,
+    correlation_id: &str,
+    occurrence: &str,
+    data: serde_json::Value,
+) -> DesktopEvent {
+    aokie_event_with_step(
+        name,
+        correlation_id,
+        &format!("{}.{occurrence}", step_for_event_name(name)),
+        data,
+    )
 }
 
 /// Like [`aokie_event`] but with an explicit idempotency-key step —
@@ -183,6 +217,30 @@ mod tests {
         // occurredAt is ISO-8601 UTC with Z suffix.
         assert!(ev.occurred_at.ends_with('Z'), "got: {}", ev.occurred_at);
         assert!(ev.occurred_at.contains('T'));
+    }
+
+    /// Audit AOK-EVENT-001: repeatable incidents get distinct stable keys —
+    /// two occurrences differ, one occurrence's key never changes.
+    #[test]
+    fn occurrence_events_are_distinct_per_incident_and_stable_per_occurrence() {
+        let occ_a = occurrence_id();
+        let occ_b = occurrence_id();
+        assert_ne!(occ_a, occ_b, "each incident mints a fresh id");
+        assert_eq!(occ_a.len(), 12);
+        assert!(occ_a.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let first = aokie_event_occurrence("aokie.hardware.error", "radio", &occ_a, json!({"m": 1}));
+        let second = aokie_event_occurrence("aokie.hardware.error", "radio", &occ_b, json!({"m": 2}));
+        assert_eq!(first.idempotency_key, format!("aokie:radio:hardware.error.{occ_a}:v1"));
+        assert_ne!(first.idempotency_key, second.idempotency_key);
+
+        // Re-building the SAME occurrence (same id) reproduces the same key.
+        let replay = aokie_event_occurrence("aokie.hardware.error", "radio", &occ_a, json!({"m": 1}));
+        assert_eq!(replay.idempotency_key, first.idempotency_key);
+
+        // call.* events still drop the call. prefix in the step.
+        let audio = aokie_event_occurrence("aokie.call.audio.connected", "call_x", "abc123abc123", json!({}));
+        assert_eq!(audio.idempotency_key, "aokie:call_x:audio.connected.abc123abc123:v1");
     }
 
     #[test]
