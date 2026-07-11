@@ -27,6 +27,17 @@ pub struct UsbDevice {
     pub driver: String,
     pub hardware_id: String,
     pub is_composite: bool,
+    /// The unique device-instance id, e.g.
+    /// `USB\VID_0A5C&PID_21EC\00198600226C`. Distinct per physical
+    /// plug-in (unlike `hardware_id`, which is just the VID/PID prefix
+    /// shared by every unit of a model). AOK-DRIVER-001 signs this into
+    /// the elevated install job so the helper can confirm it is binding
+    /// the EXACT device the operator selected, not a same-model unit
+    /// swapped in after approval.
+    pub instance_id: String,
+    /// `SPDRP_CLASS` (e.g. "USBDevice", "Bluetooth", "HIDClass"). Fed to
+    /// the install-policy deny-list.
+    pub class: String,
 }
 
 pub fn list_devices(list_all: bool) -> Result<Vec<UsbDevice>, String> {
@@ -107,6 +118,8 @@ unsafe fn list_devices_impl(list_all: bool) -> Result<Vec<UsbDevice>, String> {
             driver,
             hardware_id,
             is_composite,
+            instance_id,
+            class,
         });
     }
 
@@ -332,6 +345,110 @@ pub fn find_device(vid: u16, pid: u16) -> Result<Option<UsbDevice>, String> {
     Ok(list_devices(true)?
         .into_iter()
         .find(|device| device.vid == vid && device.pid == pid))
+}
+
+/// AOK-DRIVER-001: whether the operator has opted in to rebinding a
+/// dongle that isn't in the catalog. Release builds demand the verbose
+/// [`UNKNOWN_DONGLE_OPT_IN`] sentinel so it can't be flipped by a stray
+/// `=1`; debug builds also accept `1` for local bring-up of a new
+/// chipset. Read fresh on every call (env can change between installs).
+pub fn allow_unknown_dongle() -> bool {
+    use aokie_core::dongle_catalog::UNKNOWN_DONGLE_OPT_IN;
+    match std::env::var("AOKIE_INSTALL_UNKNOWN_DONGLE") {
+        Ok(v) if v == UNKNOWN_DONGLE_OPT_IN => true,
+        #[cfg(debug_assertions)]
+        Ok(v) if v == "1" => true,
+        _ => false,
+    }
+}
+
+/// AOK-DRIVER-001 install gate, shared by the unelevated dispatcher and
+/// the elevated helper. Enumerates the LIVE device set, finds the
+/// (vid, pid) target, and runs it through the pure
+/// [`evaluate_install_target`](aokie_core::dongle_catalog::evaluate_install_target)
+/// policy. On success returns the matched [`UsbDevice`] (whose
+/// `instance_id` the caller signs into / checks against the job); on
+/// failure returns the policy's actionable message. A device that isn't
+/// enumerated at all is `NotPresent` — Aokie never stages a driver
+/// against an absent device.
+pub fn evaluate_present_target(vid: u16, pid: u16, allow_unknown: bool) -> Result<UsbDevice, String> {
+    use aokie_core::dongle_catalog::{evaluate_install_target, DeviceFacts, InstallRejection};
+
+    let device = find_device(vid, pid)?;
+    // `list_devices` already filters out hubs / host controllers, so a
+    // found device is never one; an absent target surfaces as NotPresent.
+    let facts = match &device {
+        Some(d) => DeviceFacts {
+            vid: d.vid,
+            pid: d.pid,
+            present: true,
+            is_composite: d.is_composite,
+            is_hub_or_controller: false,
+            class: &d.class,
+        },
+        None => DeviceFacts {
+            vid,
+            pid,
+            present: false,
+            is_composite: false,
+            is_hub_or_controller: false,
+            class: "",
+        },
+    };
+
+    match evaluate_install_target(&facts, allow_unknown) {
+        Ok(approval) => {
+            let d = device.expect("present target implies Some(device)");
+            if approval.unknown_opt_in {
+                aokie_core::redact::audit(
+                    "winusb_install_unknown_dongle",
+                    format!(
+                        "vid={:04x} pid={:04x} instance={} — admitted via opt-in",
+                        d.vid, d.pid, d.instance_id
+                    ),
+                );
+            }
+            Ok(d)
+        }
+        Err(rejection @ InstallRejection::NotPresent { .. }) => Err(rejection.message()),
+        Err(rejection) => {
+            // A refusal on a device that IS plugged in is worth an audit
+            // line — it's the tamper / mistaken-target signal.
+            aokie_core::redact::audit(
+                "winusb_install_refused",
+                format!("vid={:04x} pid={:04x}: {:?}", vid, pid, rejection),
+            );
+            Err(rejection.message())
+        }
+    }
+}
+
+/// SHA-256 the file at `path`, lowercase hex. Streams in 64 KiB chunks.
+/// Shared by the unelevated dispatcher (to sign the rendered INF into
+/// the job) and the elevated helper (to verify the INF bytes on disk
+/// match what was approved before staging the driver).
+pub fn sha256_file(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("open {:?}: {}", path, e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("read {:?}: {}", path, e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{:02x}", byte);
+    }
+    Ok(hex)
 }
 
 pub fn write_winusb_package(vid: u16, pid: u16, work_dir: &Path) -> Result<PathBuf, String> {
