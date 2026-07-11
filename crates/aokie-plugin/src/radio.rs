@@ -2006,9 +2006,10 @@ fn run_loop(
                         emit(
                             outbox,
                             sink,
-                            aokie_core::events::aokie_event(
+                            aokie_core::events::aokie_event_occurrence(
                                 crate::contract::events::HARDWARE_ERROR,
                                 "radio",
+                                &aokie_core::events::occurrence_id(),
                                 json!({"message": format!("send_sms failed: {e}")}),
                             ),
                         );
@@ -2167,9 +2168,15 @@ fn handle_event(
     sink: &mut dyn Sink,
     status: &Arc<RadioStatus>,
 ) {
-    use aokie_core::events::{aokie_event, now_iso8601};
+    use aokie_core::events::{aokie_event, aokie_event_occurrence, now_iso8601, occurrence_id};
     use aokie_dongle::bluetooth::BluetoothEvent as E;
 
+    // Radio-lifecycle incidents share the `radio` correlation but are DISTINCT
+    // occurrences (replug → a second dongle.ready, reconnect → a second
+    // phone.connected, every hardware error is its own incident): each mints a
+    // fresh occurrence id HERE — once, at detection — so repeats aren't
+    // silently dropped by key collision while replays of one occurrence keep
+    // one key (audit AOK-EVENT-001).
     match ev {
         E::Initialized(addr) => {
             status.initialized.store(true, Ordering::Relaxed);
@@ -2178,9 +2185,10 @@ fn handle_event(
             emit(
                 outbox,
                 sink,
-                aokie_event(
+                aokie_event_occurrence(
                     crate::contract::events::DONGLE_READY,
                     "radio",
+                    &occurrence_id(),
                     json!({"address": addr, "source": "radio"}),
                 ),
             );
@@ -2200,7 +2208,12 @@ fn handle_event(
             emit(
                 outbox,
                 sink,
-                aokie_event(crate::contract::events::PHONE_CONNECTED, "radio", json!({"address": addr})),
+                aokie_event_occurrence(
+                    crate::contract::events::PHONE_CONNECTED,
+                    "radio",
+                    &occurrence_id(),
+                    json!({"address": addr}),
+                ),
             );
         }
         E::DeviceDisconnected(addr) => {
@@ -2229,9 +2242,10 @@ fn handle_event(
             emit(
                 outbox,
                 sink,
-                aokie_event(
+                aokie_event_occurrence(
                     crate::contract::events::PHONE_DISCONNECTED,
                     "radio",
+                    &occurrence_id(),
                     json!({"address": addr}),
                 ),
             );
@@ -2300,13 +2314,16 @@ fn handle_event(
         }
         E::AudioConnected { codec, sample_rate, armed } => {
             flush_incoming_if_pending(tracker, outbox, sink);
+            // SCO can drop and re-arm repeatedly within ONE call, so even with
+            // a call correlation these are per-incident occurrences.
             let corr = tracker.call_id().unwrap_or("radio").to_string();
             emit(
                 outbox,
                 sink,
-                aokie_event(
+                aokie_event_occurrence(
                     crate::contract::events::CALL_AUDIO_CONNECTED,
                     &corr,
+                    &occurrence_id(),
                     json!({"codec": codec, "sampleRate": sample_rate, "armed": armed}),
                 ),
             );
@@ -2317,9 +2334,10 @@ fn handle_event(
                 emit(
                     outbox,
                     sink,
-                    aokie_event(
+                    aokie_event_occurrence(
                         crate::contract::events::HARDWARE_ERROR,
                         &corr,
+                        &occurrence_id(),
                         json!({
                             "message": "Call audio failed to arm (SCO alternate setting) — this call will be SILENT both ways. Hang up, unplug and replug the dongle, then take the next call.",
                             "code": "sco_unarmed",
@@ -2334,15 +2352,34 @@ fn handle_event(
             emit(
                 outbox,
                 sink,
-                aokie_event(
+                aokie_event_occurrence(
                     crate::contract::events::CALL_AUDIO_DISCONNECTED,
                     &corr,
+                    &occurrence_id(),
                     json!({}),
                 ),
             );
         }
         E::SmsReceived(p) => {
-            let corr = format!("sms_{}", uuid::Uuid::new_v4().simple());
+            // Stable inbound identity (audit AOK-EVENT-001): the MAP handle is
+            // the AG's own stable id for this message on this phone, so a
+            // re-fetch of the SAME message (MNS re-notification, reconnect
+            // replay) dedupes instead of duplicating the record. Scope it by
+            // device address — handles are only unique per phone. A phone
+            // that sends no handle falls back to a fresh occurrence id (no
+            // dedupe possible, matching the old behaviour).
+            let corr = if p.handle.is_empty() {
+                format!("sms_{}", occurrence_id())
+            } else {
+                let device = status
+                    .connected_address
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_default()
+                    .replace(':', "");
+                format!("sms_{device}_{}", p.handle)
+            };
             emit(
                 outbox,
                 sink,
@@ -2376,10 +2413,18 @@ fn handle_event(
         }
         E::Error(e) => {
             *status.last_error.lock().unwrap() = Some(e.clone());
+            // Every hardware error is its own incident — without an occurrence
+            // id the SECOND distinct error would collide with the first's key
+            // and be silently dropped (essential/outboxed event!).
             emit(
                 outbox,
                 sink,
-                aokie_event(crate::contract::events::HARDWARE_ERROR, "radio", json!({"message": e})),
+                aokie_event_occurrence(
+                    crate::contract::events::HARDWARE_ERROR,
+                    "radio",
+                    &occurrence_id(),
+                    json!({"message": e}),
+                ),
             );
         }
     }

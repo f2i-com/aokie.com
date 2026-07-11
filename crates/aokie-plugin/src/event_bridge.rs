@@ -123,9 +123,19 @@ pub fn emit_event(
 ) -> Result<(), String> {
     let outboxed = force_outbox || is_essential(&event.name);
     if outboxed {
-        outbox
+        let outcome = outbox
             .insert_pending(event, TARGET_DESKTOP)
             .map_err(|e| format!("outbox write failed for {}: {e}", event.idempotency_key))?;
+        if outcome == crate::outbox::InsertOutcome::PayloadCollision {
+            // A DIFFERENT occurrence collided on this key (key-derivation
+            // bug — audit AOK-EVENT-001). The stored row is authoritative;
+            // emitting the rejected content under its key would make the
+            // host record the wrong occurrence. Refuse, loudly.
+            return Err(format!(
+                "event.emit refused for {}: idempotency key {} already holds different content",
+                event.name, event.idempotency_key
+            ));
+        }
     }
     let line = rpc::notification_line("event.emit", json!({ "event": event }));
     match sink.send_line(&line) {
@@ -137,7 +147,7 @@ pub fn emit_event(
                         .map_err(|e| format!("outbox mark_sent failed: {e}"))?,
                     EmitMode::AckExpected => {
                         outbox
-                            .mark_emitted(&event.idempotency_key)
+                            .mark_emitted(&event.idempotency_key, None)
                             .map_err(|e| format!("outbox mark_emitted failed: {e}"))?;
                     }
                 }
@@ -148,7 +158,7 @@ pub fn emit_event(
             if outboxed {
                 // Best-effort: the row stays pending/failed for the
                 // retry loop even if this bookkeeping write fails too.
-                let _ = outbox.mark_failed(&event.idempotency_key, &e.to_string());
+                let _ = outbox.mark_failed(&event.idempotency_key, &e.to_string(), None);
             }
             Err(format!("event.emit failed for {}: {e}", event.name))
         }
@@ -180,15 +190,19 @@ pub fn replay_once(sink: &mut dyn Sink, outbox: &Outbox, limit: u32) -> usize {
                     row.idempotency_key
                 );
                 for _ in 0..crate::outbox::MAX_ATTEMPTS {
-                    let _ = outbox.mark_failed(&row.idempotency_key, "unreadable payload");
+                    let _ = outbox.mark_failed(&row.idempotency_key, "unreadable payload", None);
                 }
                 continue;
             }
         };
         let line = rpc::notification_line("event.emit", json!({ "event": event }));
+        // Bookkeeping is conditional on the attempt GENERATION this pass read
+        // (audit AOK-EVENT-001): if the ack thread marked the row `sent` — or
+        // another pass already booked this generation — the update is a no-op
+        // instead of dragging the row backward or double-counting.
         match sink.send_line(&line) {
             Ok(()) => {
-                let _ = outbox.mark_emitted(&row.idempotency_key);
+                let _ = outbox.mark_emitted(&row.idempotency_key, Some(row.attempts));
                 emitted += 1;
                 if row.attempts > 0 {
                     eprintln!(
@@ -199,7 +213,7 @@ pub fn replay_once(sink: &mut dyn Sink, outbox: &Outbox, limit: u32) -> usize {
                 }
             }
             Err(e) => {
-                let _ = outbox.mark_failed(&row.idempotency_key, &e.to_string());
+                let _ = outbox.mark_failed(&row.idempotency_key, &e.to_string(), Some(row.attempts));
             }
         }
     }

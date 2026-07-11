@@ -164,12 +164,35 @@ pub const TARGET_DESKTOP: &str = "desktop";
 
 /// Row status lifecycle: `pending → sent` on success, `pending →
 /// failed → … → dead` on repeated failure.
+///
+/// `sent` is TERMINAL (audit AOK-EVENT-001): once the host has
+/// acknowledged durable receipt, no replay/failure bookkeeping may move
+/// the row backward — [`mark_failed`](Outbox::mark_failed) and
+/// [`mark_emitted`](Outbox::mark_emitted) only touch `pending`/`failed`
+/// rows. `dead` only leaves via an explicit operator
+/// [`redrive_dead`](Outbox::redrive_dead).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboxStatus {
     Pending,
     Sent,
     Failed,
     Dead,
+}
+
+/// Outcome of [`Outbox::insert_pending`] (audit AOK-EVENT-001).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    /// New row created — first sighting of this occurrence.
+    Inserted,
+    /// The idempotency key already exists with the SAME payload content:
+    /// a crash/retry duplicate of one occurrence. The existing row,
+    /// whatever its status, is authoritative.
+    Duplicate,
+    /// The idempotency key already exists with DIFFERENT payload content —
+    /// a key-derivation bug upstream (two distinct occurrences colliding).
+    /// The existing row is kept, the new event is REJECTED, and the
+    /// collision is counted for diagnostics. Never silent.
+    PayloadCollision,
 }
 
 impl OutboxStatus {
@@ -276,34 +299,132 @@ impl Outbox {
         if !has_next_attempt {
             conn.execute_batch("ALTER TABLE aokie_outbox ADD COLUMN next_attempt_at TEXT;")?;
         }
+        // v3 migration (audit AOK-EVENT-001): content fingerprint for the
+        // collision tripwire — same key + different content is a key-derivation
+        // bug, not a harmless duplicate. NULL on legacy rows (no comparison
+        // possible). The meta table holds durable diagnostic counters.
+        let has_payload_hash: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('aokie_outbox') WHERE name = 'payload_hash'")?
+            .query_row([], |r| r.get::<_, i64>(0))
+            .map(|n| n > 0)?;
+        if !has_payload_hash {
+            conn.execute_batch("ALTER TABLE aokie_outbox ADD COLUMN payload_hash TEXT;")?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS aokie_outbox_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )?;
         Ok(Outbox { conn })
     }
 
-    /// Write-before-emit: insert the event as `pending`. Returns
-    /// `true` if a new row was created, `false` when the
-    /// idempotency key already exists (crash/retry duplicate — the
-    /// existing row, whatever its status, is authoritative).
-    pub fn insert_pending(&self, event: &DesktopEvent, target: &str) -> rusqlite::Result<bool> {
+    /// Content fingerprint for the collision tripwire: name + correlation +
+    /// payload data, EXCLUDING the envelope's `occurredAt` and any top-level
+    /// `at` inside `data` — both are observation timestamps that legitimately
+    /// differ when one occurrence is rebuilt (e.g. a re-fetched MAP message),
+    /// while every other difference means two distinct occurrences collided
+    /// on one key. FNV-1a 64 (tripwire, not crypto).
+    fn payload_fingerprint(event: &DesktopEvent) -> String {
+        let mut data = event.data.clone();
+        if let Some(obj) = data.as_object_mut() {
+            obj.remove("at");
+        }
+        let canonical = format!(
+            "{}\n{}\n{}",
+            event.name,
+            event.correlation_id,
+            serde_json::to_string(&data).unwrap_or_default()
+        );
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in canonical.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("fnv1a64:{hash:016x}")
+    }
+
+    fn bump_meta_counter(&self, key: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO aokie_outbox_meta (key, value) VALUES (?1, '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+            params![key],
+        )?;
+        Ok(())
+    }
+
+    /// How many same-key/different-payload collisions this outbox has
+    /// rejected — non-zero means a key-derivation bug upstream. Surfaced
+    /// through `dongle.diagnostics`.
+    pub fn collision_count(&self) -> rusqlite::Result<u64> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM aokie_outbox_meta WHERE key = 'payload_collisions'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+
+    /// Write-before-emit: insert the event as `pending`.
+    ///
+    /// An existing row with the same idempotency key is authoritative:
+    /// same content → [`InsertOutcome::Duplicate`] (crash/retry replay of
+    /// one occurrence), different content →
+    /// [`InsertOutcome::PayloadCollision`] (key-derivation bug — rejected,
+    /// logged, counted; audit AOK-EVENT-001).
+    pub fn insert_pending(&self, event: &DesktopEvent, target: &str) -> rusqlite::Result<InsertOutcome> {
         let now = now_iso8601();
         let payload = protect_payload(&serde_json::to_string(event).expect("DesktopEvent serialises"));
+        let hash = Self::payload_fingerprint(event);
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO aokie_outbox
                 (event_name, correlation_id, idempotency_key, target,
-                 payload_json, status, attempts, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?6)",
+                 payload_json, payload_hash, status, attempts, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, ?7)",
             params![
                 event.name,
                 event.correlation_id,
                 event.idempotency_key,
                 target,
                 payload,
+                hash,
                 now
             ],
         )?;
-        Ok(inserted == 1)
+        if inserted == 1 {
+            return Ok(InsertOutcome::Inserted);
+        }
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload_hash FROM aokie_outbox WHERE idempotency_key = ?1",
+                params![event.idempotency_key],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        match existing {
+            // Legacy row (pre-v3, no fingerprint): no comparison possible —
+            // treat as the harmless duplicate it almost certainly is.
+            None => Ok(InsertOutcome::Duplicate),
+            Some(h) if h == hash => Ok(InsertOutcome::Duplicate),
+            Some(_) => {
+                self.bump_meta_counter("payload_collisions")?;
+                eprintln!(
+                    "[aokie-plugin] OUTBOX KEY COLLISION: {} ({}) re-used with DIFFERENT content — \
+                     new event rejected, existing row kept. This is a key-derivation bug.",
+                    event.idempotency_key, event.name
+                );
+                Ok(InsertOutcome::PayloadCollision)
+            }
+        }
     }
 
-    /// Mark an emission success.
+    /// The host durably acknowledged this event. `sent` is terminal — this is
+    /// the only transition into it, and nothing transitions out of it.
     pub fn mark_sent(&self, idempotency_key: &str) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE aokie_outbox SET status = 'sent', last_error = NULL, updated_at = ?2
@@ -316,10 +437,18 @@ impl Outbox {
     /// Record an emission failure: increments `attempts`, stores the
     /// error, and flips to `dead` once [`MAX_ATTEMPTS`] is reached.
     /// Returns the resulting status.
+    ///
+    /// Guarded (audit AOK-EVENT-001): only `pending`/`failed` rows move —
+    /// a raced late failure can never drag an acknowledged (`sent`) row
+    /// backward. `expected_attempts` is the attempt GENERATION the caller
+    /// read before emitting: when supplied, the update applies only if the
+    /// row's attempts still match, so two concurrent bookkeepers for the
+    /// same read cannot double-count an attempt.
     pub fn mark_failed(
         &self,
         idempotency_key: &str,
         error: &str,
+        expected_attempts: Option<u32>,
     ) -> rusqlite::Result<OutboxStatus> {
         let next = iso8601_after_secs(Self::next_backoff_secs(self.attempts_of(idempotency_key)?));
         self.conn.execute(
@@ -329,8 +458,10 @@ impl Outbox {
                 status = CASE WHEN attempts + 1 >= ?3 THEN 'dead' ELSE 'failed' END,
                 updated_at = ?4,
                 next_attempt_at = ?5
-             WHERE idempotency_key = ?1",
-            params![idempotency_key, error, MAX_ATTEMPTS, now_iso8601(), next],
+             WHERE idempotency_key = ?1
+               AND status IN ('pending', 'failed')
+               AND (?6 IS NULL OR attempts = ?6)",
+            params![idempotency_key, error, MAX_ATTEMPTS, now_iso8601(), next, expected_attempts],
         )?;
         Ok(self
             .status_of(idempotency_key)?
@@ -342,16 +473,28 @@ impl Outbox {
     /// next re-emission with exponential backoff; the row stays `pending`
     /// until the host's `event.ack` marks it `sent` — or goes `dead` after
     /// [`MAX_ATTEMPTS`] unacknowledged emissions. Returns the new status.
-    pub fn mark_emitted(&self, idempotency_key: &str) -> rusqlite::Result<OutboxStatus> {
+    ///
+    /// Same guards as [`mark_failed`](Self::mark_failed): `sent`/`dead` rows
+    /// are never touched (previously a late `mark_emitted` on a row the ack
+    /// thread had just marked `sent` could push attempts over the limit and
+    /// flip it to `dead` — audit AOK-EVENT-001), and `expected_attempts`
+    /// makes the bookkeeping conditional on the generation the caller read.
+    pub fn mark_emitted(
+        &self,
+        idempotency_key: &str,
+        expected_attempts: Option<u32>,
+    ) -> rusqlite::Result<OutboxStatus> {
         let next = iso8601_after_secs(Self::next_backoff_secs(self.attempts_of(idempotency_key)?));
         self.conn.execute(
             "UPDATE aokie_outbox SET
                 attempts = attempts + 1,
-                status = CASE WHEN attempts + 1 >= ?2 THEN 'dead' ELSE status END,
+                status = CASE WHEN attempts + 1 >= ?2 THEN 'dead' ELSE 'pending' END,
                 updated_at = ?3,
                 next_attempt_at = ?4
-             WHERE idempotency_key = ?1",
-            params![idempotency_key, MAX_ATTEMPTS, now_iso8601(), next],
+             WHERE idempotency_key = ?1
+               AND status IN ('pending', 'failed')
+               AND (?5 IS NULL OR attempts = ?5)",
+            params![idempotency_key, MAX_ATTEMPTS, now_iso8601(), next, expected_attempts],
         )?;
         Ok(self
             .status_of(idempotency_key)?
@@ -554,15 +697,109 @@ mod tests {
     fn insert_starts_pending_and_dedupes_on_idempotency_key() {
         let ob = Outbox::open_in_memory().unwrap();
         let ev = event("call_a", "aokie.call.incoming");
-        assert!(ob.insert_pending(&ev, TARGET_DESKTOP).unwrap());
+        assert_eq!(
+            ob.insert_pending(&ev, TARGET_DESKTOP).unwrap(),
+            InsertOutcome::Inserted
+        );
         assert_eq!(
             ob.status_of(&ev.idempotency_key).unwrap(),
             Some(OutboxStatus::Pending)
         );
         // Same occurrence again (crash/retry): ignored, still one row.
-        assert!(!ob.insert_pending(&ev, TARGET_DESKTOP).unwrap());
+        assert_eq!(
+            ob.insert_pending(&ev, TARGET_DESKTOP).unwrap(),
+            InsertOutcome::Duplicate
+        );
         let counts = ob.counts().unwrap();
         assert_eq!(counts.pending, 1);
+    }
+
+    /// Audit AOK-EVENT-001: a rebuilt sighting of the SAME occurrence (only
+    /// its observation timestamps differ) dedupes; DIFFERENT content under
+    /// one key is a key-derivation bug — rejected, counted, existing row kept.
+    #[test]
+    fn same_key_same_content_dedupes_but_different_content_is_a_collision() {
+        let ob = Outbox::open_in_memory().unwrap();
+        let mut first = event("sms_dev1_h42", "aokie.sms.received");
+        first.data = json!({"from": "+61", "body": "hello", "at": "2026-07-11T00:00:00.000Z"});
+        assert_eq!(ob.insert_pending(&first, TARGET_DESKTOP).unwrap(), InsertOutcome::Inserted);
+
+        // The same MAP message re-fetched: fresh envelope timestamps, same content.
+        let mut refetch = first.clone();
+        refetch.occurred_at = now_iso8601();
+        refetch.data = json!({"from": "+61", "body": "hello", "at": "2026-07-11T00:05:00.000Z"});
+        assert_eq!(ob.insert_pending(&refetch, TARGET_DESKTOP).unwrap(), InsertOutcome::Duplicate);
+        assert_eq!(ob.collision_count().unwrap(), 0);
+
+        // A different message colliding on the key: rejected + counted.
+        let mut clash = first.clone();
+        clash.data = json!({"from": "+61", "body": "TRANSFER $9000 NOW", "at": "2026-07-11T00:06:00.000Z"});
+        assert_eq!(
+            ob.insert_pending(&clash, TARGET_DESKTOP).unwrap(),
+            InsertOutcome::PayloadCollision
+        );
+        assert_eq!(ob.collision_count().unwrap(), 1);
+
+        // The stored row still carries the FIRST occurrence's content.
+        let rows = ob.due_for_retry(10).unwrap();
+        let back: DesktopEvent = serde_json::from_str(&rows[0].payload_json).unwrap();
+        assert_eq!(back.data["body"], "hello");
+        assert_eq!(ob.counts().unwrap().pending, 1, "no second row");
+    }
+
+    /// Audit AOK-EVENT-001 acceptance: `sent` is terminal — raced replay
+    /// bookkeeping from a SECOND connection to the same file can never drag
+    /// an acknowledged row back to failed/dead or over the attempt limit.
+    #[test]
+    fn two_connection_ack_replay_race_cannot_move_sent_backward() {
+        let path = std::env::temp_dir().join(format!(
+            "aokie-outbox-race-{}-{}.sqlite",
+            std::process::id(),
+            now_iso8601().replace(':', "-")
+        ));
+        let ack_conn = Outbox::open(&path).unwrap();
+        let replay_conn = Outbox::open(&path).unwrap();
+
+        let ev = event("call_race", "aokie.call.ended");
+        ack_conn.insert_pending(&ev, TARGET_DESKTOP).unwrap();
+
+        // The replay connection reads the row (generation 0), emits it, and —
+        // before its bookkeeping lands — the ack connection marks it sent.
+        let due = replay_conn.due_for_retry(1).unwrap();
+        let row = &due[0];
+        assert_eq!(row.attempts, 0);
+        ack_conn.mark_sent(&ev.idempotency_key).unwrap();
+
+        // Late bookkeeping from the replay side: all no-ops against `sent`.
+        replay_conn.mark_emitted(&ev.idempotency_key, Some(row.attempts)).unwrap();
+        replay_conn
+            .mark_failed(&ev.idempotency_key, "late failure", Some(row.attempts))
+            .unwrap();
+        for _ in 0..MAX_ATTEMPTS {
+            replay_conn.mark_emitted(&ev.idempotency_key, None).unwrap();
+            replay_conn.mark_failed(&ev.idempotency_key, "storm", None).unwrap();
+        }
+        assert_eq!(
+            ack_conn.status_of(&ev.idempotency_key).unwrap(),
+            Some(OutboxStatus::Sent),
+            "sent is terminal under ack/replay races"
+        );
+
+        // And the generation guard: two bookkeepers for the SAME read apply once.
+        let ev2 = event("call_race2", "aokie.call.ended");
+        ack_conn.insert_pending(&ev2, TARGET_DESKTOP).unwrap();
+        let gen0 = ack_conn.due_for_retry(10).unwrap().last().unwrap().attempts;
+        ack_conn.mark_emitted(&ev2.idempotency_key, Some(gen0)).unwrap();
+        replay_conn.mark_emitted(&ev2.idempotency_key, Some(gen0)).unwrap(); // stale generation
+        let rows = replay_conn.retryable(10).unwrap();
+        let row2 = rows.iter().find(|r| r.idempotency_key == ev2.idempotency_key).unwrap();
+        assert_eq!(row2.attempts, 1, "stale-generation bookkeeping is a no-op");
+
+        drop(ack_conn);
+        drop(replay_conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     #[test]
@@ -588,9 +825,9 @@ mod tests {
         ob.insert_pending(&dead, "desktop").unwrap();
         ob.insert_pending(&sent, "desktop").unwrap();
         for _ in 0..MAX_ATTEMPTS {
-            ob.mark_failed(&dead.idempotency_key, "boom").unwrap();
+            ob.mark_failed(&dead.idempotency_key, "boom", None).unwrap();
         }
-        ob.mark_emitted(&sent.idempotency_key).unwrap();
+        ob.mark_emitted(&sent.idempotency_key, None).unwrap();
         ob.mark_sent(&sent.idempotency_key).unwrap();
         assert_eq!(ob.counts().unwrap().dead, 1);
 
@@ -615,10 +852,10 @@ mod tests {
         let ev = event("call_c", "aokie.sms.sent");
         ob.insert_pending(&ev, TARGET_DESKTOP).unwrap();
         for attempt in 1..MAX_ATTEMPTS {
-            let status = ob.mark_failed(&ev.idempotency_key, "desktop down").unwrap();
+            let status = ob.mark_failed(&ev.idempotency_key, "desktop down", None).unwrap();
             assert_eq!(status, OutboxStatus::Failed, "attempt {attempt}");
         }
-        let status = ob.mark_failed(&ev.idempotency_key, "desktop down").unwrap();
+        let status = ob.mark_failed(&ev.idempotency_key, "desktop down", None).unwrap();
         assert_eq!(status, OutboxStatus::Dead);
         let counts = ob.counts().unwrap();
         assert_eq!(counts.dead, 1);
@@ -632,9 +869,9 @@ mod tests {
         let dying = event("call_e", "aokie.call.incoming");
         ob.insert_pending(&alive, TARGET_DESKTOP).unwrap();
         ob.insert_pending(&dying, TARGET_DESKTOP).unwrap();
-        ob.mark_failed(&alive.idempotency_key, "once").unwrap();
+        ob.mark_failed(&alive.idempotency_key, "once", None).unwrap();
         for _ in 0..MAX_ATTEMPTS {
-            ob.mark_failed(&dying.idempotency_key, "always").unwrap();
+            ob.mark_failed(&dying.idempotency_key, "always", None).unwrap();
         }
         let retryable = ob.retryable(10).unwrap();
         let keys: Vec<_> = retryable
@@ -671,7 +908,7 @@ mod tests {
         // Emitted once: still pending (awaiting ack), but no longer due —
         // backoff(0) = 1s is in the future.
         assert_eq!(
-            ob.mark_emitted(&ev.idempotency_key).unwrap(),
+            ob.mark_emitted(&ev.idempotency_key, None).unwrap(),
             OutboxStatus::Pending
         );
         assert!(ob.due_for_retry(10).unwrap().is_empty(), "backoff gates re-emission");
@@ -694,12 +931,12 @@ mod tests {
         ob.insert_pending(&ev, TARGET_DESKTOP).unwrap();
         for _ in 0..(MAX_ATTEMPTS - 1) {
             assert_eq!(
-                ob.mark_emitted(&ev.idempotency_key).unwrap(),
+                ob.mark_emitted(&ev.idempotency_key, None).unwrap(),
                 OutboxStatus::Pending
             );
         }
         assert_eq!(
-            ob.mark_emitted(&ev.idempotency_key).unwrap(),
+            ob.mark_emitted(&ev.idempotency_key, None).unwrap(),
             OutboxStatus::Dead
         );
         assert!(ob.due_for_retry(10).unwrap().is_empty(), "dead rows never re-emit");
@@ -755,7 +992,7 @@ mod tests {
         let ev = event("corr-dead-old", "aokie.call.ended");
         ob.insert_pending(&ev, "desktop").unwrap();
         for _ in 0..MAX_ATTEMPTS {
-            ob.mark_failed(&ev.idempotency_key, "boom").unwrap();
+            ob.mark_failed(&ev.idempotency_key, "boom", None).unwrap();
         }
         assert_eq!(ob.counts().unwrap().dead, 1);
         // Fresh dead row survives…
