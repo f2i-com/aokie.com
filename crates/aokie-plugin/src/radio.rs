@@ -170,6 +170,18 @@ pub struct RadioStatus {
     /// radio starts. Lets `phone.status` report pairing state (remaining seconds)
     /// without round-tripping the radio thread. `None` until the radio is up.
     pub pairing_window: Mutex<Option<aokie_dongle::bluetooth::PairingWindow>>,
+    /// AOK-VOICE-001: the last KNOWN speech-to-text failure (missing/corrupt
+    /// model, ORT DLL gone, engine load error). `None` = no known failure.
+    /// Seeded by the startup asset preflight, updated by live engine loads.
+    /// A set value degrades plugin.health and blocks auto-answer (a
+    /// receptionist that can't hear must not answer).
+    pub stt_error: Mutex<Option<String>>,
+    /// AOK-VOICE-001: the last KNOWN text-to-speech failure — same lifecycle
+    /// as `stt_error`, additionally updated by every live speech attempt
+    /// (zero-audio outcome sets it, audible speech clears it). A set value
+    /// degrades plugin.health and blocks auto-answer (never answer into
+    /// silence).
+    pub tts_error: Mutex<Option<String>>,
 }
 
 /// Handle held by the [`Plugin`](crate::connector::Plugin): send control
@@ -219,6 +231,14 @@ impl RadioHandle {
     }
     pub fn stale_stt_results(&self) -> u64 {
         self.status.stale_stt_results.load(Ordering::Relaxed)
+    }
+    /// AOK-VOICE-001: the last known STT failure (None = no known failure).
+    pub fn stt_error(&self) -> Option<String> {
+        self.status.stt_error.lock().unwrap().clone()
+    }
+    /// AOK-VOICE-001: the last known TTS failure (None = no known failure).
+    pub fn tts_error(&self) -> Option<String> {
+        self.status.tts_error.lock().unwrap().clone()
     }
 
     /// AOK-BT-001: seconds left in the pairing window, 0 when closed or the radio
@@ -609,12 +629,21 @@ fn greeting_tone(sample_rate: u16) -> Vec<i16> {
     out
 }
 
-/// Result of speaking a phrase: how long the audio will play out, and whether
-/// the caller barged in (started speaking) mid-phrase so we cut it short.
+/// Result of speaking a phrase: how long the audio will play out, whether the
+/// caller barged in (started speaking) mid-phrase so we cut it short, and —
+/// when they did — the echo-cancelled audio of what they said WHILE Aokie was
+/// still talking (audit AK-008). Barge detection needs sustained speech before
+/// it trips, so without this capture the first words of an interruption (the
+/// leading digits of a phone number, classically) were used for detection and
+/// then thrown away — the STT only ever saw the part spoken after the trip.
 #[cfg(all(target_os = "windows", feature = "voice"))]
 struct SpeakOutcome {
     dur: std::time::Duration,
     barged: bool,
+    /// AEC-cleaned caller speech captured during playback, at the SCO rate,
+    /// starting a short pre-roll before their first above-threshold frame.
+    /// Empty when nothing crossed the speech threshold (or half-duplex mode).
+    captured_speech: Vec<i16>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -820,7 +849,13 @@ fn decode_tts_json_audio(bytes: &[u8]) -> Result<Vec<u8>, String> {
 /// filter has time to converge at a reply's onset (we still call
 /// `process_capture` while un-armed â€” to keep the reference FIFO aligned with
 /// capture â€” but never trip). Shared by the synth callback and the playout monitor.
+///
+/// AK-008: the cleaned audio is APPENDED to `captured` (not discarded) and the
+/// first above-threshold frame's offset is recorded in `speech_start`, so the
+/// caller's words spoken BEFORE the barge trips can be prepended to their
+/// utterance instead of being lost to detection.
 #[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
 fn detect_barge(
     aec: &mut crate::aec::EchoCanceller,
     mic: &[i16],
@@ -829,22 +864,58 @@ fn detect_barge(
     armed: bool,
     speech_frames: &mut u32,
     need: u32,
+    captured: &mut Vec<i16>,
+    speech_start: &mut Option<usize>,
 ) -> bool {
     let cleaned = aec.process_capture(mic);
+    scan_barge_frames(
+        &cleaned,
+        frame,
+        thr,
+        armed,
+        speech_frames,
+        need,
+        captured,
+        speech_start,
+    )
+}
+
+/// Pure scan half of [`detect_barge`] (unit-testable without an AEC): append
+/// `cleaned` to the capture buffer, note the first above-threshold frame, and
+/// report whether sustained speech tripped the barge.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
+fn scan_barge_frames(
+    cleaned: &[i16],
+    frame: usize,
+    thr: f32,
+    armed: bool,
+    speech_frames: &mut u32,
+    need: u32,
+    captured: &mut Vec<i16>,
+    speech_start: &mut Option<usize>,
+) -> bool {
+    let base = captured.len();
+    captured.extend_from_slice(cleaned);
     if !armed {
         return false;
     }
-    for f in cleaned.chunks(frame) {
+    let mut tripped = false;
+    for (i, f) in cleaned.chunks(frame).enumerate() {
         if crate::voice::frame_rms(f) > thr {
+            if speech_start.is_none() {
+                *speech_start = Some(base + i * frame);
+            }
             *speech_frames += 1;
             if *speech_frames >= need {
-                return true;
+                tripped = true;
+                break;
             }
         } else {
             *speech_frames = speech_frames.saturating_sub(1);
         }
     }
-    false
+    tripped
 }
 
 #[cfg(all(target_os = "windows", feature = "voice"))]
@@ -858,6 +929,11 @@ struct TtsChunkPlayback {
     speech_frames: u32,
     need: u32,
     grace: std::time::Duration,
+    /// AK-008: AEC-cleaned mic audio accumulated during playback (SCO rate).
+    captured: Vec<i16>,
+    /// Offset in `captured` of the caller's first above-threshold frame.
+    speech_start: Option<usize>,
+    sample_rate: u16,
 }
 
 #[cfg(all(target_os = "windows", feature = "voice"))]
@@ -874,6 +950,23 @@ impl TtsChunkPlayback {
             speech_frames: 0,
             need: 22,
             grace: std::time::Duration::from_millis(350),
+            captured: Vec::new(),
+            speech_start: None,
+            sample_rate,
+        }
+    }
+
+    /// Keep the capture bounded while the caller ISN'T speaking: with no
+    /// speech detected yet, only a short pre-roll tail can ever matter, so
+    /// trim to the last ~2 s. Once speech started, everything from its
+    /// pre-roll onward is retained (bounded by the phrase length).
+    fn trim_idle_capture(&mut self) {
+        if self.speech_start.is_some() {
+            return;
+        }
+        let keep = (self.sample_rate as usize).saturating_mul(2).max(1);
+        if self.captured.len() > keep * 2 {
+            self.captured.drain(..self.captured.len() - keep);
         }
     }
 
@@ -915,11 +1008,14 @@ impl TtsChunkPlayback {
                     armed,
                     &mut self.speech_frames,
                     self.need,
+                    &mut self.captured,
+                    &mut self.speech_start,
                 ) {
                     self.barged = true;
                     break;
                 }
             }
+            self.trim_idle_capture();
         }
         !self.barged
     }
@@ -956,6 +1052,8 @@ impl TtsChunkPlayback {
                             armed,
                             &mut self.speech_frames,
                             self.need,
+                            &mut self.captured,
+                            &mut self.speech_start,
                         ) {
                             self.barged = true;
                             break;
@@ -964,6 +1062,7 @@ impl TtsChunkPlayback {
                     if self.barged {
                         break;
                     }
+                    self.trim_idle_capture();
                     if !got {
                         std::thread::sleep(Duration::from_millis(5));
                     }
@@ -971,17 +1070,38 @@ impl TtsChunkPlayback {
             }
         }
 
+        // AK-008: hand back what the caller said while we were talking, from a
+        // short pre-roll before their first above-threshold frame. The caller
+        // (run_loop) prepends it to the STT buffer on a barge so the utterance
+        // is complete — detection no longer eats the leading words.
+        let captured_speech = match self.speech_start {
+            Some(start) => {
+                let pre_roll = self.frame * 30; // ~300 ms
+                self.captured.split_off(start.saturating_sub(pre_roll))
+            }
+            None => Vec::new(),
+        };
+
         eprintln!(
-            "[aokie-plugin] spoke ({} chars -> {} samples @ {}Hz, synth {:?}{})",
+            "[aokie-plugin] spoke ({} chars -> {} samples @ {}Hz, synth {:?}{}{})",
             text.chars().count(),
             self.samples,
             sample_rate,
             self.t0.elapsed(),
-            if self.barged { ", BARGED-IN" } else { "" }
+            if self.barged { ", BARGED-IN" } else { "" },
+            if captured_speech.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", captured {}ms of overlapped caller speech",
+                    captured_speech.len() * 1000 / (sample_rate.max(1) as usize)
+                )
+            }
         );
         SpeakOutcome {
             dur: Duration::from_secs_f32(self.samples as f32 / sample_rate.max(1) as f32),
             barged: self.barged,
+            captured_speech,
         }
     }
 }
@@ -989,6 +1109,25 @@ impl TtsChunkPlayback {
 #[cfg(all(target_os = "windows", feature = "voice"))]
 fn http_tts_chunk_samples(sample_rate: u16) -> usize {
     (sample_rate as usize / 50).max(160)
+}
+
+/// AOK-VOICE-001: record the outcome of a live speech attempt in the shared
+/// status — audible speech clears the TTS failure slot; a zero-audio outcome
+/// (engine load / synthesis / endpoint failure) sets it, so health degrades
+/// and auto-answer stops the moment the receptionist demonstrably can't speak.
+/// A barged outcome with no audio is inconclusive (the caller cut it off) and
+/// leaves the slot unchanged.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn note_tts_outcome(status: &RadioStatus, out: &SpeakOutcome) {
+    let mut slot = status.tts_error.lock().unwrap();
+    if out.dur > std::time::Duration::ZERO {
+        *slot = None;
+    } else if !out.barged {
+        *slot = Some(
+            "the last speech attempt produced no audio (TTS engine/endpoint failure) — check the voice models and the plugin log"
+                .to_string(),
+        );
+    }
 }
 
 /// Voice build only: synthesize + stream `text` to SCO with the in-process TTS
@@ -1013,6 +1152,7 @@ fn tts_speak(
     let none = SpeakOutcome {
         dur: Duration::ZERO,
         barged: false,
+        captured_speech: Vec::new(),
     };
     if sample_rate == 0 || text.trim().is_empty() {
         return none;
@@ -1117,6 +1257,31 @@ fn run_loop(
     let mut http_tts = HttpTtsRuntime::from_env("AOKIE_TTS_ENDPOINT");
     let _ = &greeting; // used only in the voice build / greeting block below
 
+    // AOK-VOICE-001: fast asset preflight (presence-only — radio start stays
+    // instant) seeds the shared voice-status slots BEFORE any call can arrive:
+    // a deleted model / missing ONNX Runtime DLL (with no HTTP endpoint
+    // substituting) is a KNOWN failure that degrades plugin.health and blocks
+    // auto-answer below, instead of being discovered mid-call by answering a
+    // caller into silence. Corruption is caught by the live engine loads,
+    // which update the same slots.
+    #[cfg(feature = "voice")]
+    {
+        let pf = crate::voice::preflight_assets();
+        if let Some(e) = &pf.stt_error {
+            eprintln!("[aokie-plugin] voice preflight: {e}");
+        }
+        if let Some(e) = &pf.tts_error {
+            eprintln!("[aokie-plugin] voice preflight: {e}");
+        }
+        if pf.stt_error.is_none() && pf.tts_error.is_none() {
+            eprintln!("[aokie-plugin] voice preflight OK (ORT + STT/TTS assets or endpoints present)");
+        }
+        *status.stt_error.lock().unwrap() = pf.stt_error;
+        *status.tts_error.lock().unwrap() = pf.tts_error;
+    }
+    // Warn-once bookkeeping for the auto-answer voice block (per call id).
+    let mut voice_block_logged_call: Option<String> = None;
+
     // â”€â”€ Speech-to-text (voice build) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // The caller's audio is transcribed OFF the radio loop: a worker thread owns
     // the heavy Parakeet engine (lazy-loaded on the first utterance) so a ~300 ms
@@ -1135,6 +1300,7 @@ fn run_loop(
         let (res_tx, res_rx) = std::sync::mpsc::channel::<SttResult>();
         let initial_stt_endpoint = std::env::var("AOKIE_STT_ENDPOINT").ok();
         let worker_gen = stt_current_gen.clone();
+        let worker_status = status.clone();
         std::thread::Builder::new()
             .name("aokie-stt".into())
             .spawn(move || {
@@ -1196,10 +1362,18 @@ fn run_loop(
                         match crate::voice::SttEngine::load() {
                             Ok(e) => {
                                 eprintln!("[aokie-plugin] STT engine loaded");
+                                // AOK-VOICE-001: a working load clears any
+                                // preflight/previous failure for this half.
+                                *worker_status.stt_error.lock().unwrap() = None;
                                 engine = Some(e);
                             }
                             Err(e) => {
                                 eprintln!("[aokie-plugin] STT load failed: {e}");
+                                // AOK-VOICE-001: a KNOWN hearing failure —
+                                // degrade health + block auto-answer.
+                                *worker_status.stt_error.lock().unwrap() = Some(format!(
+                                    "the STT engine failed to load: {e}"
+                                ));
                                 continue;
                             }
                         }
@@ -1483,14 +1657,38 @@ fn run_loop(
         if auto_answer {
             if let Some(s) = tracker.current_mut() {
                 if !s.auto_answered && !s.is_active() {
-                    match bt.answer_call() {
-                        Ok(()) => {
-                            eprintln!("[aokie-plugin] auto-answered incoming call (immediate)")
+                    // AOK-VOICE-001: never answer into silence. A KNOWN voice
+                    // failure (asset preflight or a live engine/synthesis
+                    // failure) means the receptionist can't hear or speak —
+                    // leave the call ringing for the operator's phone instead
+                    // of answering it into a dead line. Fail-safe direction:
+                    // only a DEFINITIVE recorded failure blocks; healthy or
+                    // not-yet-exercised pipelines answer as before.
+                    #[cfg(feature = "voice")]
+                    let voice_block: Option<String> = {
+                        let tts = status.tts_error.lock().unwrap().clone();
+                        let stt = status.stt_error.lock().unwrap().clone();
+                        tts.or(stt)
+                    };
+                    #[cfg(not(feature = "voice"))]
+                    let voice_block: Option<String> = None;
+                    if let Some(reason) = voice_block {
+                        if voice_block_logged_call.as_deref() != Some(s.id.as_str()) {
+                            eprintln!(
+                                "[aokie-plugin] auto-answer BLOCKED — voice pipeline down ({reason}); the call rings through to the operator"
+                            );
+                            voice_block_logged_call = Some(s.id.clone());
                         }
-                        Err(e) => eprintln!("[aokie-plugin] auto-answer failed: {e}"),
+                    } else {
+                        match bt.answer_call() {
+                            Ok(()) => {
+                                eprintln!("[aokie-plugin] auto-answered incoming call (immediate)")
+                            }
+                            Err(e) => eprintln!("[aokie-plugin] auto-answer failed: {e}"),
+                        }
+                        s.auto_answered = true;
+                        idle = false;
                     }
-                    s.auto_answered = true;
-                    idle = false;
                 }
             }
         }
@@ -1552,6 +1750,9 @@ fn run_loop(
                         (None, None)
                     };
                     let out = tts_speak(bt, &mut tts, &mut http_tts, text, sr, aec_ref, brms);
+                    if !text.trim().is_empty() {
+                        note_tts_outcome(&status, &out);
+                    }
                     if barge_in {
                         if out.barged {
                             bt.flush_tx_audio();
@@ -1564,10 +1765,25 @@ fn run_loop(
                     stt_buf.clear();
                     stt_had_speech = false;
                     stt_silence = Duration::ZERO;
-                    emit_turn(outbox, sink, &corr, turn_index, "bot", text);
-                    turn_index += 1;
-                    history.push(serde_json::json!({ "role": "assistant", "content": text }));
-                    last_bot_reply = text.to_string();
+                    // AK-008: the caller talked over the greeting — seed their
+                    // turn with the echo-cancelled audio captured while we were
+                    // speaking, so its leading words aren't lost to detection.
+                    if out.barged && !out.captured_speech.is_empty() {
+                        stt_buf = crate::voice::to_f32_16k(&out.captured_speech, sr as u32);
+                        stt_had_speech = true;
+                    }
+                    // Truthful transcript (audit AOK-VOICE-001/002): record the
+                    // greeting only when synthesis actually produced audio.
+                    if out.dur > Duration::ZERO {
+                        emit_turn(outbox, sink, &corr, turn_index, "bot", text);
+                        turn_index += 1;
+                        history.push(serde_json::json!({ "role": "assistant", "content": text }));
+                        last_bot_reply = text.to_string();
+                    } else {
+                        eprintln!(
+                            "[aokie-plugin] greeting produced NO audio (TTS failed) — not recorded as a spoken turn"
+                        );
+                    }
                 }
             }
             idle = false;
@@ -1775,6 +1991,10 @@ fn run_loop(
                             let t0 = Instant::now();
                             let mut reply_dur = Duration::ZERO;
                             let mut barged = false;
+                            // AK-008: what the caller said WHILE Aokie spoke,
+                            // captured by the barge path — prepended to their
+                            // turn after the reply so no leading words are lost.
+                            let mut barge_capture: Vec<i16> = Vec::new();
                             // Distinguish a CALLER barge-in from an OPERATOR
                             // hangup/reject mid-reply (review sweep): both stop
                             // the reply, but the transcript must not label an
@@ -1847,11 +2067,18 @@ fn run_loop(
                                             aec.as_mut(),
                                             Some(barge_rms),
                                         );
+                                        if !spoken_text.trim().is_empty() {
+                                            note_tts_outcome(&status, &out);
+                                        }
                                         reply_dur += out.dur;
-                                        if !spoken_text.is_empty() {
+                                        // Truthful transcript (AOK-VOICE-001):
+                                        // a sentence whose synthesis produced no
+                                        // audio was never heard — don't record it.
+                                        if !spoken_text.is_empty() && out.dur > Duration::ZERO {
                                             spoken.push(spoken_text.clone());
                                         }
                                         if out.barged {
+                                            barge_capture = out.captured_speech;
                                             bt.flush_tx_audio(); // stop the queued tail now
                                             barged = true;
                                             return false; // stop pulling from the LLM
@@ -1866,8 +2093,11 @@ fn run_loop(
                                             None,
                                             None,
                                         );
+                                        if !spoken_text.trim().is_empty() {
+                                            note_tts_outcome(&status, &out);
+                                        }
                                         reply_dur += out.dur;
-                                        if !spoken_text.is_empty() {
+                                        if !spoken_text.is_empty() && out.dur > Duration::ZERO {
                                             spoken.push(spoken_text.clone());
                                         }
                                         let plays_until = (t0 + reply_dur).max(Instant::now());
@@ -1911,13 +2141,21 @@ fn run_loop(
                                             clean
                                         }
                                     };
-                                    if !heard.is_empty() {
+                                    // Truthful transcript (AOK-VOICE-001): an
+                                    // un-cut reply whose synthesis produced no
+                                    // audio AT ALL was never heard — record
+                                    // nothing instead of the full generation.
+                                    if !heard.is_empty() && reply_dur > Duration::ZERO {
                                         history.push(
                                             serde_json::json!({ "role": "assistant", "content": heard }),
                                         );
                                         emit_turn(outbox, sink, &corr, turn_index, "bot", &heard);
                                         turn_index += 1;
                                         last_bot_reply = heard;
+                                    } else if !heard.is_empty() {
+                                        eprintln!(
+                                            "[aokie-plugin] agent reply produced NO audio (TTS failed) — not recorded as a spoken turn"
+                                        );
                                     }
                                     if !barged {
                                         // Discard anything captured while we replied.
@@ -1948,6 +2186,20 @@ fn run_loop(
                                         last_bot_reply = heard;
                                     }
                                 }
+                            }
+                            // AK-008: the caller interrupted — their words spoken
+                            // OVER the reply were captured (echo-cancelled) by the
+                            // barge path. Prepend them to the utterance buffer so
+                            // the STT hears the WHOLE turn ("zero four two one…"),
+                            // not just what followed the barge trip. The post-trip
+                            // audio keeps accumulating via the main loop as before.
+                            if barged && !barge_capture.is_empty() {
+                                let mut seeded =
+                                    crate::voice::to_f32_16k(&barge_capture, sr as u32);
+                                seeded.extend_from_slice(&stt_buf);
+                                stt_buf = seeded;
+                                stt_had_speech = true;
+                                stt_silence = Duration::ZERO;
                             }
                             // Agent-initiated hangup: the reply carried the end-call
                             // marker, so the call is fully handled. Respect a barge-in
@@ -2029,6 +2281,9 @@ fn run_loop(
                     } else {
                         let sr = bt.get_sample_rate();
                         let out = tts_speak(bt, &mut tts, &mut http_tts, &text, sr, None, None);
+                        if sr > 0 && !text.trim().is_empty() {
+                            note_tts_outcome(&status, &out);
+                        }
                         mute_stt_until =
                             Some(Instant::now() + out.dur + Duration::from_millis(400));
                         stt_buf.clear();
@@ -2474,6 +2729,59 @@ mod tests {
         let (t, f) = strip_end_call_marker("How else can I help?");
         assert_eq!(t, "How else can I help?");
         assert!(!f);
+    }
+
+    /// AK-008: the barge scan must CAPTURE the audio it inspects and remember
+    /// where speech started, so the caller's words spoken over Aokie are
+    /// prepended to their turn instead of being consumed by detection.
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[test]
+    fn barge_scan_captures_audio_and_marks_speech_start() {
+        let frame = 80usize; // 10 ms @ 8 kHz
+        let mut speech_frames = 0u32;
+        let mut captured: Vec<i16> = Vec::new();
+        let mut speech_start: Option<usize> = None;
+
+        // 1) Silence first: captured grows, no speech start, no trip.
+        let silence = vec![0i16; frame * 5];
+        let tripped = scan_barge_frames(
+            &silence, frame, 500.0, true, &mut speech_frames, 3, &mut captured, &mut speech_start,
+        );
+        assert!(!tripped);
+        assert_eq!(captured.len(), frame * 5);
+        assert_eq!(speech_start, None);
+        assert_eq!(speech_frames, 0);
+
+        // 2) Loud speech: start is marked at ITS offset (after the silence),
+        //    and 3 sustained frames trip the barge.
+        let loud = vec![8000i16; frame * 3];
+        let tripped = scan_barge_frames(
+            &loud, frame, 500.0, true, &mut speech_frames, 3, &mut captured, &mut speech_start,
+        );
+        assert!(tripped);
+        assert_eq!(speech_start, Some(frame * 5), "speech starts where the loud audio began");
+        // The loud chunk was captured too — nothing was consumed by detection.
+        assert_eq!(captured.len(), frame * 8);
+    }
+
+    /// AK-008: un-armed frames (AEC convergence grace) are still captured —
+    /// they may hold the caller's first word — but never trip the barge or
+    /// mark a speech start.
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[test]
+    fn barge_scan_unarmed_captures_but_never_trips() {
+        let frame = 80usize;
+        let mut speech_frames = 0u32;
+        let mut captured: Vec<i16> = Vec::new();
+        let mut speech_start: Option<usize> = None;
+        let loud = vec![8000i16; frame * 10];
+        let tripped = scan_barge_frames(
+            &loud, frame, 500.0, false, &mut speech_frames, 3, &mut captured, &mut speech_start,
+        );
+        assert!(!tripped);
+        assert_eq!(captured.len(), frame * 10);
+        assert_eq!(speech_start, None);
+        assert_eq!(speech_frames, 0);
     }
 
     /// Audit AK-008: the continuation heuristic must hold a turn open exactly
