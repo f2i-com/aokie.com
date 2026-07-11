@@ -69,6 +69,11 @@ pub const HFP_T2_MAX_LATENCY_MS: u16 = 13;
 /// HFP T2 retransmission effort: optimize for link quality (= 0x02).
 pub const HFP_T2_RETRANSMISSION_EFFORT: u8 = 0x02;
 pub const AOKIE_SCAN_ENABLE_CONNECTABLE_DISCOVERABLE: u8 = 0x03;
+/// At-rest scan-enable (audit AOK-BT-001): page scan ON so a BONDED phone can
+/// reconnect, inquiry scan OFF so we are NOT discoverable to strangers. The
+/// radio only advertises as discoverable while an explicit pairing window is
+/// open — see `PairingWindow` and the reconciliation in the runtime loop.
+pub const AOKIE_SCAN_ENABLE_CONNECTABLE: u8 = 0x02;
 pub const AOKIE_EVENT_MASK: u64 = 0x3fffffff_ffffffff;
 pub const AOKIE_LEGACY_PIN: &str = "0000";
 // Roughly 60 s of 8 kHz mono audio. The TTS pipeline can dump a whole
@@ -725,9 +730,12 @@ pub(crate) fn initialize_transport(
     // acks we've already consumed.
     transport.flush_acl_in_pipe()?;
 
+    // AOK-BT-001: come up CONNECTABLE-ONLY (bonded phones reconnect, strangers
+    // can't discover/pair us). The runtime opens a discoverable pairing window
+    // on demand (phone.startPairing) and closes it on success/cancel/timeout.
     command_status(
         transport,
-        &hci::write_scan_enable_command(AOKIE_SCAN_ENABLE_CONNECTABLE_DISCOVERABLE),
+        &hci::write_scan_enable_command(AOKIE_SCAN_ENABLE_CONNECTABLE),
         hci::OPCODE_WRITE_SCAN_ENABLE,
         "Write Scan Enable",
     )?;
@@ -743,7 +751,7 @@ pub(crate) fn initialize_transport(
         page_timeout: AOKIE_PAGE_TIMEOUT,
         link_policy: AOKIE_LINK_POLICY,
         voice_setting: AOKIE_VOICE_SETTING,
-        scan_enable: AOKIE_SCAN_ENABLE_CONNECTABLE_DISCOVERABLE,
+        scan_enable: AOKIE_SCAN_ENABLE_CONNECTABLE,
         simple_pairing_enabled: true,
     })
 }
@@ -758,10 +766,41 @@ fn command_status(
     hci::expect_status_ok(&params, operation)
 }
 
+/// AOK-BT-001 admission gate — pure so the policy is unit-testable without a
+/// live radio. `is_bonded` = we already hold a stored link key for the device;
+/// `pairing_open` = an explicit pairing window is currently open.
+///
+/// An incoming ACL connection is accepted when the device is already bonded
+/// (normal reconnect, always allowed) OR the pairing window is open (a new
+/// device is deliberately being added). An unknown device at rest is refused.
+pub fn may_accept_acl_connection(is_bonded: bool, pairing_open: bool) -> bool {
+    is_bonded || pairing_open
+}
+
+/// AOK-BT-001 admission gate for a FRESH bond — the SSP/PIN reply steps and the
+/// LinkKeyNotification store that together create a new bond. Allowed only while
+/// the pairing window is open; a stranger can never complete a bond at rest.
+pub fn may_complete_new_bond(pairing_open: bool) -> bool {
+    pairing_open
+}
+
+/// Write the controller's scan-enable (audit AOK-BT-001): the runtime loop uses
+/// this to flip between discoverable-connectable (pairing window open) and
+/// connectable-only (at rest).
+pub fn write_scan_enable(transport: &AokieHciTransport, scan_enable: u8) -> Result<(), String> {
+    command_status(
+        transport,
+        &hci::write_scan_enable_command(scan_enable),
+        hci::OPCODE_WRITE_SCAN_ENABLE,
+        "Write Scan Enable",
+    )
+}
+
 fn handle_diagnostic_pairing_event(
     transport: &AokieHciTransport,
     pairing_store: &mut AokiePairingStore,
     event: &hci::HciEvent,
+    pairing_open: bool,
 ) -> Result<Option<String>, String> {
     match event {
         hci::HciEvent::LinkKeyRequest { address } => {
@@ -795,10 +834,31 @@ fn handle_diagnostic_pairing_event(
             link_key,
             key_type,
         } => {
+            // Only persist a NEW bond while the pairing window is open (AOK-BT-001).
+            // A reconnecting bonded device uses LinkKeyRequest→reply and never emits
+            // a notification, so refusing here only rejects an unsanctioned fresh bond.
+            if !may_complete_new_bond(pairing_open) {
+                return Ok(Some(
+                    "refused link-key store — no pairing window open".to_string(),
+                ));
+            }
             pairing_store.put(address, *link_key, *key_type)?;
             Ok(Some(format!("stored link key type 0x{:02x}", key_type)))
         }
         hci::HciEvent::PinCodeRequest { address } => {
+            // Legacy PIN pairing — a fresh bond; gated on the window (AOK-BT-001).
+            if !may_complete_new_bond(pairing_open) {
+                let command = hci::pin_code_request_negative_reply_command(address)?;
+                command_status(
+                    transport,
+                    &command,
+                    hci::OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY,
+                    "PIN Code Request Negative Reply",
+                )?;
+                return Ok(Some(
+                    "refused PIN pairing — no pairing window open".to_string(),
+                ));
+            }
             let command = hci::pin_code_request_reply_command(address, AOKIE_LEGACY_PIN)?;
             command_status(
                 transport,
@@ -809,6 +869,20 @@ fn handle_diagnostic_pairing_event(
             Ok(Some(format!("sent legacy PIN reply {}", AOKIE_LEGACY_PIN)))
         }
         hci::HciEvent::IoCapabilityRequest { address } => {
+            // Simple Pairing IO-capability exchange — a fresh bond; gated (AOK-BT-001).
+            // Reason 0x18 = "Pairing Not Allowed".
+            if !may_complete_new_bond(pairing_open) {
+                let command = hci::io_capability_request_negative_reply_command(address, 0x18)?;
+                command_status(
+                    transport,
+                    &command,
+                    hci::OPCODE_IO_CAPABILITY_REQUEST_NEGATIVE_REPLY,
+                    "IO Capability Request Negative Reply",
+                )?;
+                return Ok(Some(
+                    "refused Simple Pairing — no pairing window open".to_string(),
+                ));
+            }
             let command = hci::io_capability_request_reply_command(
                 address,
                 hci::SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT,
@@ -826,6 +900,19 @@ fn handle_diagnostic_pairing_event(
             ))
         }
         hci::HciEvent::UserConfirmationRequest { address, .. } => {
+            // The just-works confirmation that seals an SSP bond; gated (AOK-BT-001).
+            if !may_complete_new_bond(pairing_open) {
+                let command = hci::user_confirmation_request_negative_reply_command(address)?;
+                command_status(
+                    transport,
+                    &command,
+                    hci::OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY,
+                    "User Confirmation Request Negative Reply",
+                )?;
+                return Ok(Some(
+                    "refused Simple Pairing confirmation — no pairing window open".to_string(),
+                ));
+            }
             let command = hci::user_confirmation_request_reply_command(address)?;
             command_status(
                 transport,
@@ -844,7 +931,9 @@ pub(crate) fn handle_diagnostic_hci_event(
     pairing_store: &mut AokiePairingStore,
     event: &hci::HciEvent,
 ) -> Result<Option<String>, String> {
-    handle_hci_event_with_codec(transport, pairing_store, event, None)
+    // Diagnostic sessions (the `aokie-dongle` listen/call tools) are an EXPLICIT
+    // operator action to exercise pairing, so the window is treated as open.
+    handle_hci_event_with_codec(transport, pairing_store, event, None, true)
 }
 
 pub(crate) fn handle_hci_event_with_codec(
@@ -852,8 +941,9 @@ pub(crate) fn handle_hci_event_with_codec(
     pairing_store: &mut AokiePairingStore,
     event: &hci::HciEvent,
     selected_codec: Option<&(String, u16)>,
+    pairing_open: bool,
 ) -> Result<Option<String>, String> {
-    if let Some(action) = handle_diagnostic_pairing_event(transport, pairing_store, event)? {
+    if let Some(action) = handle_diagnostic_pairing_event(transport, pairing_store, event, pairing_open)? {
         return Ok(Some(action));
     }
 
@@ -863,6 +953,16 @@ pub(crate) fn handle_hci_event_with_codec(
             link_type: hci::LINK_TYPE_ACL,
             ..
         } => {
+            // AOK-BT-001: at rest, only a BONDED device may reconnect; an unknown
+            // device is accepted only inside an explicit pairing window, else rejected.
+            let is_bonded = pairing_store.contains(address);
+            if !may_accept_acl_connection(is_bonded, pairing_open) {
+                let command = hci::reject_connection_request_command(address)?;
+                transport.write_command(&command)?;
+                return Ok(Some(
+                    "rejected incoming ACL from unknown device (no pairing window open)".to_string(),
+                ));
+            }
             let command =
                 hci::accept_connection_request_command(address, hci::ACCEPT_ROLE_REMAIN_SLAVE)?;
             transport.write_command(&command)?;
@@ -1186,6 +1286,8 @@ mod tests {
         assert_eq!(AOKIE_LINK_POLICY, 0x0005);
         assert_eq!(AOKIE_VOICE_SETTING, 0x0060);
         assert_eq!(AOKIE_SCAN_ENABLE_CONNECTABLE_DISCOVERABLE, 0x03);
+        // AOK-BT-001: at-rest = page scan on (0x02, connectable), inquiry scan off.
+        assert_eq!(AOKIE_SCAN_ENABLE_CONNECTABLE, 0x02);
         assert_eq!(AOKIE_LEGACY_PIN, "0000");
         assert_eq!(AOKIE_SCO_TX_QUEUE_SAMPLES, 480_000);
         assert_eq!(AOKIE_SCO_USB_PAYLOAD_BYTES, 24);
@@ -1195,6 +1297,49 @@ mod tests {
         assert_eq!(AOKIE_SCO_TX_TONE_HZ, 440);
         assert_eq!(AOKIE_SCO_TX_TONE_AMPLITUDE, 4_000);
         assert_eq!(AOKIE_HFP_AUTO_ANSWER_ENV, "AOKIE_RADIO_AUTO_ANSWER");
+    }
+
+    #[test]
+    fn pairing_admission_gate_bonds_only_in_window_but_reconnects_always() {
+        // AOK-BT-001 acceptance: an UNKNOWN device can only connect / bond while a
+        // pairing window is open; a BONDED device always reconnects; a fresh bond
+        // is never completed at rest.
+
+        // ACL connection admission.
+        assert!(
+            may_accept_acl_connection(true, false),
+            "bonded device reconnects at rest"
+        );
+        assert!(
+            may_accept_acl_connection(true, true),
+            "bonded device connects during a window too"
+        );
+        assert!(
+            may_accept_acl_connection(false, true),
+            "unknown device connects inside the pairing window"
+        );
+        assert!(
+            !may_accept_acl_connection(false, false),
+            "unknown device is REFUSED at rest"
+        );
+
+        // Fresh-bond completion (PIN / SSP replies + link-key store).
+        assert!(may_complete_new_bond(true), "new bond allowed in the window");
+        assert!(
+            !may_complete_new_bond(false),
+            "no new bond can complete at rest, even for a device mid-handshake"
+        );
+    }
+
+    #[test]
+    fn reject_connection_command_is_well_formed() {
+        let cmd = hci::reject_connection_request_command("00:19:86:00:22:6C").unwrap();
+        assert_eq!(
+            &cmd[0..2],
+            &hci::OPCODE_REJECT_CONNECTION_REQUEST.to_le_bytes()
+        );
+        assert_eq!(cmd[2], 7, "param length = 6 addr + 1 reason");
+        assert_eq!(cmd[9], 0x0F, "reason = Unacceptable BD_ADDR");
     }
 
     #[test]

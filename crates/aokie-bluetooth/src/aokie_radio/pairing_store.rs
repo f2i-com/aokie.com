@@ -65,6 +65,24 @@ impl AokiePairingStore {
         self.records.keys().cloned().collect()
     }
 
+    /// True when a link key is stored for `address` — i.e. this is a bonded
+    /// ("known") device. AOK-BT-001 lets bonded devices reconnect even when
+    /// the pairing window is closed; strangers can't.
+    pub fn contains(&self, address: &str) -> bool {
+        self.records.contains_key(&normalize_address(address))
+    }
+
+    /// Forget a bonded device (AOK-BT-001 `phone.removePaired`): drop its link
+    /// key so it can no longer reconnect without pairing again. Persists
+    /// immediately. Returns true when a record was actually removed.
+    pub fn remove(&mut self, address: &str) -> Result<bool, String> {
+        let removed = self.records.remove(&normalize_address(address)).is_some();
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
     pub fn get(&self, address: &str) -> Result<Option<LinkKeyRecord>, String> {
         self.records
             .get(&normalize_address(address))
@@ -164,6 +182,33 @@ mod tests {
         assert_eq!(record.address, "00:19:86:00:22:6C");
         assert_eq!(record.link_key, key);
         assert_eq!(record.key_type, 0x04);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn contains_and_remove_are_case_insensitive_and_persist() {
+        let path = std::env::temp_dir().join(format!(
+            "aokie_pairing_store_remove_{}_{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut store = AokiePairingStore::load(&path).unwrap();
+        store.put("00:19:86:00:22:6c", [0x22; 16], 0x05).unwrap();
+        // contains() normalizes the address like get()/put() do.
+        assert!(store.contains("00:19:86:00:22:6C"));
+        assert!(!store.contains("aa:bb:cc:dd:ee:ff"));
+
+        // Removing an unknown address is a no-op returning false.
+        assert!(!store.remove("aa:bb:cc:dd:ee:ff").unwrap());
+        // Removing the bonded device returns true and persists.
+        assert!(store.remove("00:19:86:00:22:6c").unwrap());
+        assert!(!store.contains("00:19:86:00:22:6C"));
+
+        let reloaded = AokiePairingStore::load(&path).unwrap();
+        assert_eq!(reloaded.len(), 0, "removal survived a reload");
 
         let _ = std::fs::remove_file(&path);
     }

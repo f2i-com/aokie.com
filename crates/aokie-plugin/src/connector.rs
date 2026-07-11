@@ -728,6 +728,9 @@ impl Plugin {
                 expect_fields(payload, &[])?;
                 if let Some(radio) = self.radio.as_ref() {
                     let addr = radio.connected_address();
+                    // AOK-BT-001: surface the bounded pairing window so the UI shows
+                    // "discoverable, 95s left" vs the at-rest connectable-only state.
+                    let pairing_secs = radio.pairing_window_remaining_secs();
                     return Ok(json!({
                         "paired": addr.is_some(),
                         "device": addr.as_ref().map(|a| json!({"address": a, "name": "Paired phone"})),
@@ -737,6 +740,10 @@ impl Plugin {
                         "localAddress": radio.local_address(),
                         "caller": radio.current_caller(),
                         "error": radio.last_error(),
+                        // AOK-BT-001: discoverable ONLY inside an open pairing window.
+                        "pairingOpen": pairing_secs > 0,
+                        "pairingSecondsRemaining": pairing_secs,
+                        "discoverable": pairing_secs > 0,
                         "source": "radio",
                     }));
                 }
@@ -744,61 +751,98 @@ impl Plugin {
                 Ok(json!({
                     "paired": device.is_some(),
                     "device": device,
+                    "pairingOpen": false,
                     "source": "config",
                 }))
             }
             "phone.startPairing" => {
-                expect_fields(payload, &[])?;
-                // Real mode: the radio is discoverable as "Aokie AI Assistant"
-                // the moment it initialises — there is no separate pairing
-                // step. Ensure it's up and report readiness.
+                // Optional {seconds} — how long to stay discoverable (default 120,
+                // clamped 30..=300 so a stray value can't leave us open forever).
+                let obj = expect_fields(payload, &["seconds"])?;
+                let seconds = obj
+                    .get("seconds")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(120)
+                    .clamp(30, 300);
+                // Ensure the radio is up, then open the bounded pairing window
+                // (AOK-BT-001): the radio is connectable-only at rest, so this is
+                // the ONLY way an unknown phone can discover + pair with us.
                 self.ensure_radio_started();
-                if let Some(radio) = self.radio.as_ref() {
-                    let status = if radio.is_initialized() {
-                        "discoverable"
-                    } else {
-                        "starting"
-                    };
-                    return Ok(json!({
-                        "status": status,
-                        "deviceName": "Aokie AI Assistant",
-                        "initialized": radio.is_initialized(),
-                        "localAddress": radio.local_address(),
-                        "error": radio.last_error(),
-                        "note": "Open your phone's Bluetooth and pair with \"Aokie AI Assistant\".",
-                    }));
-                }
-                // Real mode with no radio: startup FAILED — a fabricated
-                // "pairing" session would leave the operator waiting on a
-                // phone that can never see us (FL-CONN-001).
+                // Real mode with no radio: startup FAILED — a fabricated "pairing"
+                // session would leave the operator waiting on a phone that can never
+                // see us (FL-CONN-001). Dev mode returns the simulated stub.
                 self.require_radio_or_dev("phone.startPairing")?;
+                let Some(radio) = self.radio.as_ref() else {
+                    let session_id = format!("pair_{}", uuid::Uuid::new_v4().simple());
+                    let ev = aokie_event(
+                        crate::contract::events::PHONE_PAIRING_STARTED,
+                        &session_id,
+                        json!({"at": now_iso8601(), "simulated": true}),
+                    );
+                    emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
+                    return Ok(json!({"sessionId": session_id, "status": "pairing", "simulated": true}));
+                };
+                radio.start_pairing(seconds).map_err(CmdError::failed)?;
                 let session_id = format!("pair_{}", uuid::Uuid::new_v4().simple());
                 let ev = aokie_event(
                     crate::contract::events::PHONE_PAIRING_STARTED,
                     &session_id,
-                    json!({"at": now_iso8601(), "simulated": true}),
+                    json!({"at": now_iso8601(), "windowSeconds": seconds}),
                 );
                 emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
-                Ok(json!({"sessionId": session_id, "status": "pairing", "simulated": true}))
+                Ok(json!({
+                    "sessionId": session_id,
+                    "status": if radio.is_initialized() { "discoverable" } else { "starting" },
+                    "deviceName": "Aokie AI Assistant",
+                    "windowSeconds": seconds,
+                    "initialized": radio.is_initialized(),
+                    "localAddress": radio.local_address(),
+                    "error": radio.last_error(),
+                    "note": "Open your phone's Bluetooth and pair with \"Aokie AI Assistant\" within the window.",
+                }))
             }
             "phone.stopPairing" => {
                 expect_fields(payload, &["sessionId"])?;
                 if self.dev_mode {
                     return Ok(json!({"stopped": true, "simulated": true}));
                 }
-                // FL-CONN-001: this was a no-op that reported success. The real
-                // radio stays discoverable while it runs — there is no bounded
-                // pairing window to close yet (that window is AOK-BT-001).
-                Err(CmdError::failed(
-                    "phone.stopPairing is not supported by this radio: it stays discoverable while running — nothing was stopped",
-                ))
+                // AOK-BT-001: close the discoverable window now (back to
+                // connectable-only). Idempotent — closing an already-closed window
+                // is fine and still reports stopped.
+                self.require_radio_or_dev("phone.stopPairing")?;
+                if let Some(radio) = self.radio.as_ref() {
+                    radio.stop_pairing().map_err(CmdError::failed)?;
+                }
+                Ok(json!({"stopped": true}))
             }
             "phone.listPaired" => {
                 expect_fields(payload, &[])?;
                 if let Some(radio) = self.radio.as_ref() {
-                    return Ok(json!({"devices": radio.paired()}));
+                    // AOK-BT-001: the BONDED devices in the pairing store are the
+                    // revocable identities (removePaired targets these) — not the
+                    // live-session connection view.
+                    let devices: Vec<Value> = radio
+                        .list_bonded()
+                        .map_err(CmdError::failed)?
+                        .into_iter()
+                        .map(|address| json!({"address": address}))
+                        .collect();
+                    return Ok(json!({"devices": devices}));
                 }
                 Ok(json!({"devices": self.store.config.paired_devices}))
+            }
+            "phone.removePaired" => {
+                // AOK-BT-001: forget a bonded device so it can no longer reconnect
+                // without pairing again.
+                let obj = expect_fields(payload, &["address"])?;
+                let address = require_str(&obj, "address")?;
+                self.require_radio_or_dev("phone.removePaired")?;
+                if let Some(radio) = self.radio.as_ref() {
+                    let removed = radio.remove_paired(address.clone()).map_err(CmdError::failed)?;
+                    return Ok(json!({"removed": removed, "address": address}));
+                }
+                // Dev mode: nothing bonded to remove.
+                Ok(json!({"removed": false, "address": address, "simulated": true}))
             }
             "call.current" => {
                 expect_fields(payload, &[])?;
@@ -2823,9 +2867,9 @@ mod tests {
 
     #[test]
     fn phone_pairing_real_mode_without_radio_fails_typed() {
-        // FL-CONN-001: a real-mode plugin whose radio never started must not
-        // report a pairing session the phone can never see, and stopPairing —
-        // previously an unconditional {"stopped": true} no-op — must be honest.
+        // FL-CONN-001 + AOK-BT-001: a real-mode plugin whose radio never started
+        // must not report a pairing session the phone can never see, and neither
+        // start nor stop pairing can silently succeed.
         let mut plugin = Plugin::ephemeral(false);
         let mut sink = VecSink::default();
 
@@ -2835,15 +2879,45 @@ mod tests {
         assert!(err.message.contains("radio is not running"));
         assert!(sink.lines.is_empty(), "no phone.pairing.started event for a dead radio");
 
+        // AOK-BT-001: stopPairing without a radio is a typed outage (was previously
+        // a "nothing was stopped" FL-CONN-001 stub — now unified with the gate).
         let err = plugin
             .dispatch_command("phone.stopPairing", &Value::Null, &mut sink)
             .unwrap_err();
-        assert!(err.message.contains("nothing was stopped"));
+        assert!(err.message.contains("radio is not running"));
 
-        // Reads stay honest: config-backed status still answers (source: config).
+        // removePaired is likewise gated on a running radio.
+        let err = plugin
+            .dispatch_command("phone.removePaired", &json!({"address": "00:11:22:33:44:55"}), &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("radio is not running"));
+
+        // Reads stay honest: config-backed status still answers (source: config),
+        // and reports the radio is not in a pairing window.
         let data = plugin
             .dispatch_command("phone.status", &Value::Null, &mut sink)
             .unwrap();
         assert_eq!(data["source"], json!("config"));
+        assert_eq!(data["pairingOpen"], json!(false));
+    }
+
+    #[test]
+    fn phone_start_pairing_rejects_unknown_fields_but_allows_seconds() {
+        // AOK-BT-001: {seconds} is the only accepted field (clamped by the handler).
+        let mut plugin = Plugin::ephemeral(true); // dev mode so no radio is required
+        let mut sink = VecSink::default();
+
+        // A stray field is refused by the allowlist.
+        let err = plugin
+            .dispatch_command("phone.startPairing", &json!({"forever": true}), &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("unknown payload field"));
+
+        // {seconds} is accepted (dev mode returns the simulated stub).
+        let data = plugin
+            .dispatch_command("phone.startPairing", &json!({"seconds": 60}), &mut sink)
+            .unwrap();
+        assert_eq!(data["status"], json!("pairing"));
+        assert_eq!(data["simulated"], json!(true));
     }
 }
