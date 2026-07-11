@@ -641,7 +641,6 @@ struct SttResult {
 #[cfg(feature = "voice")]
 struct HttpTtsRuntime {
     fallback: HttpSpeechFallback,
-    client: reqwest::blocking::Client,
 }
 
 #[cfg(feature = "voice")]
@@ -649,7 +648,6 @@ impl HttpTtsRuntime {
     fn from_env(var: &str) -> Self {
         Self {
             fallback: HttpSpeechFallback::from_env(var),
-            client: http_speech_client(),
         }
     }
 
@@ -662,12 +660,13 @@ impl HttpTtsRuntime {
     }
 }
 
+/// Hardened per-endpoint speech client (audit AOK-ENDPOINT-001): redirects disabled,
+/// hostname endpoints DNS-validated + pinned, cached per endpoint. Err = the endpoint
+/// must not receive caller audio; callers surface it via their existing failure paths
+/// (mark_failed_for_call → sticky in-process fallback).
 #[cfg(feature = "voice")]
-fn http_speech_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+fn http_speech_client(endpoint: &str) -> Result<reqwest::blocking::Client, String> {
+    crate::endpoint_http::client_for(endpoint, std::time::Duration::from_secs(30), None)
 }
 
 #[cfg(feature = "voice")]
@@ -963,7 +962,16 @@ fn tts_speak(
     // Voice from AOKIE_TTS_VOICE, shared by HTTP and in-process synthesis.
     let voice = std::env::var("AOKIE_TTS_VOICE").unwrap_or_default();
     if let Some(endpoint) = http_tts.fallback.endpoint_for_call().map(str::to_string) {
-        match http_tts_synthesize(&http_tts.client, &endpoint, text, &voice) {
+        let tts_client = match http_speech_client(&endpoint) {
+            Ok(c) => c,
+            Err(e) => {
+                if http_tts.fallback.mark_failed_for_call() {
+                    eprintln!("[aokie-radio] TTS endpoint rejected ({e}) — falling back in-process for this call");
+                }
+                return none;
+            }
+        };
+        match http_tts_synthesize(&tts_client, &endpoint, text, &voice) {
             Ok(wav) => {
                 let pcm = crate::speech_wire::resample_i16_mono(
                     &wav.samples,
@@ -1069,7 +1077,6 @@ fn run_loop(
             .name("aokie-stt".into())
             .spawn(move || {
                 let mut engine: Option<crate::voice::SttEngine> = None;
-                let client = http_speech_client();
                 let mut http_stt = HttpSpeechFallback::new(initial_stt_endpoint);
                 while let Ok(work) = utter_rx.recv() {
                     let (generation, utterance, buf) = match work {
@@ -1104,7 +1111,11 @@ fn run_loop(
                         });
                     };
                     if let Some(endpoint) = http_stt.endpoint_for_call().map(str::to_string) {
-                        match http_stt_transcribe(&client, &endpoint, &buf) {
+                        // Hardened per-endpoint client (AOK-ENDPOINT-001); a rejected
+                        // endpoint takes the same sticky fallback path as a failed request.
+                        match http_speech_client(&endpoint)
+                            .and_then(|client| http_stt_transcribe(&client, &endpoint, &buf))
+                        {
                             Ok(text) if !text.is_empty() => {
                                 send(text);
                                 continue;
