@@ -125,6 +125,72 @@ impl TtsEngine {
     }
 }
 
+/// AOK-VOICE-001: the startup voice-asset preflight verdict. `None` = no known
+/// problem; `Some(reason)` = that half of the voice pipeline is KNOWN unable to
+/// work (missing ONNX Runtime DLL / model files, with no HTTP endpoint
+/// substituting for the in-process engine).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VoicePreflight {
+    pub stt_error: Option<String>,
+    pub tts_error: Option<String>,
+}
+
+/// Fast filesystem preflight (no model load — presence only, so radio startup
+/// stays instant): can the receptionist plausibly hear (STT) and speak (TTS)?
+/// An HTTP speech endpoint substitutes for the corresponding in-process engine
+/// (the missing local models then don't matter). Corruption is caught later by
+/// the live engine loads, which update the same status slots.
+pub fn preflight_assets() -> VoicePreflight {
+    ensure_ort_dylib();
+    let ort_ok = std::env::var_os("ORT_DYLIB_PATH")
+        .map(|p| std::path::Path::new(&p).is_file())
+        .unwrap_or(false);
+    let (stt_assets_ok, tts_assets_ok) = match aokie_core::paths::app_data_dir() {
+        Some(app_data) => {
+            let stt_dir = app_data.join("models").join("parakeet");
+            let stt_ok = ["encoder.int8.onnx", "decoder_joint.int8.onnx", "tokenizer.model"]
+                .iter()
+                .all(|f| stt_dir.join(f).is_file());
+            let tts_ok = onnx_tts_models_dir(&app_data, None).is_ok();
+            (stt_ok, tts_ok)
+        }
+        None => (false, false),
+    };
+    let stt_endpoint = std::env::var("AOKIE_STT_ENDPOINT").is_ok_and(|v| !v.trim().is_empty());
+    let tts_endpoint = std::env::var("AOKIE_TTS_ENDPOINT").is_ok_and(|v| !v.trim().is_empty());
+    preflight_decision(ort_ok, stt_assets_ok, tts_assets_ok, stt_endpoint, tts_endpoint)
+}
+
+/// Pure decision half of [`preflight_assets`], unit-testable: which halves of
+/// the voice pipeline are KNOWN broken given what's on disk / configured.
+pub fn preflight_decision(
+    ort_ok: bool,
+    stt_assets_ok: bool,
+    tts_assets_ok: bool,
+    stt_endpoint: bool,
+    tts_endpoint: bool,
+) -> VoicePreflight {
+    // An HTTP endpoint carries its half even with no local assets; local
+    // assets additionally need the ONNX Runtime DLL to be loadable.
+    let local_stt = ort_ok && stt_assets_ok;
+    let local_tts = ort_ok && tts_assets_ok;
+    let describe = |what: &str, assets_ok: bool| {
+        if !ort_ok && assets_ok {
+            format!(
+                "{what} unavailable: the ONNX Runtime DLL was not found next to the plugin (and no HTTP {what} endpoint is configured)"
+            )
+        } else {
+            format!(
+                "{what} unavailable: the local model files are missing (and no HTTP {what} endpoint is configured)"
+            )
+        }
+    };
+    VoicePreflight {
+        stt_error: (!local_stt && !stt_endpoint).then(|| describe("speech-to-text", stt_assets_ok)),
+        tts_error: (!local_tts && !tts_endpoint).then(|| describe("text-to-speech", tts_assets_ok)),
+    }
+}
+
 /// Point `ort` at the ONNX Runtime DLL shipped next to the plugin binary, unless
 /// the operator already set `ORT_DYLIB_PATH`. `ort` is built with `load-dynamic`,
 /// so it resolves onnxruntime.dll at runtime from this env var.
@@ -143,5 +209,46 @@ fn ensure_ort_dylib() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AOK-VOICE-001 preflight decision table.
+    #[test]
+    fn preflight_all_local_assets_present_is_clean() {
+        let p = preflight_decision(true, true, true, false, false);
+        assert_eq!(p, VoicePreflight::default());
+    }
+
+    #[test]
+    fn preflight_missing_models_is_a_known_failure() {
+        let p = preflight_decision(true, false, true, false, false);
+        assert!(p.stt_error.as_deref().unwrap_or("").contains("model files are missing"));
+        assert_eq!(p.tts_error, None);
+
+        let p = preflight_decision(true, true, false, false, false);
+        assert_eq!(p.stt_error, None);
+        assert!(p.tts_error.as_deref().unwrap_or("").contains("model files are missing"));
+    }
+
+    #[test]
+    fn preflight_missing_ort_dll_fails_both_and_names_the_dll() {
+        let p = preflight_decision(false, true, true, false, false);
+        assert!(p.stt_error.as_deref().unwrap_or("").contains("ONNX Runtime DLL"));
+        assert!(p.tts_error.as_deref().unwrap_or("").contains("ONNX Runtime DLL"));
+    }
+
+    #[test]
+    fn preflight_http_endpoints_substitute_for_local_engines() {
+        // No local assets at all, but both endpoints configured → clean.
+        let p = preflight_decision(false, false, false, true, true);
+        assert_eq!(p, VoicePreflight::default());
+        // Endpoint only covers ITS half.
+        let p = preflight_decision(false, false, false, true, false);
+        assert_eq!(p.stt_error, None);
+        assert!(p.tts_error.is_some());
     }
 }
