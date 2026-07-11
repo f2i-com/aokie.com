@@ -1575,14 +1575,13 @@ impl Plugin {
             consent_mode,
             crate::consent::Scope::Bluetooth,
         );
-        match &consent_decision {
-            crate::consent::ConsentDecision::Deny(r) => {
-                reasons.push(format!("consent required: {r}"))
-            }
-            crate::consent::ConsentDecision::Warn(r) => {
-                reasons.push(format!("consent not recorded: {r} (consentMode=warn)"))
-            }
-            crate::consent::ConsentDecision::Allow => {}
+        // Only a DENY (enforce mode, actually blocking the radio) degrades
+        // readiness. In `warn` mode the operator can't act on it yet (no
+        // wizard) and sensitive work still runs, so it's surfaced in the
+        // consent component below — not flagged as degraded, which would be
+        // permanent amber noise on every install.
+        if let crate::consent::ConsentDecision::Deny(r) = &consent_decision {
+            reasons.push(format!("consent required: {r}"));
         }
         let consent = json!({
             "mode": consent_mode.as_str(),
