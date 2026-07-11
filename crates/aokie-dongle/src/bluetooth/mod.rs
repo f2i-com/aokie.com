@@ -11,6 +11,10 @@
 
 pub mod preferred_dongle;
 
+/// Re-exported so the plugin can hold a lock-free handle to the radio's pairing
+/// window (AOK-BT-001) without a direct aokie-bluetooth dependency.
+pub use aokie_bluetooth::aokie_radio::runtime::PairingWindow;
+
 use serde::{Deserialize, Serialize};
 
 /// Event types emitted by the Bluetooth manager.
@@ -184,6 +188,39 @@ impl BluetoothManager {
 
     pub fn hangup(&self) -> Result<(), String> {
         self.runtime.reject_or_hangup()
+    }
+
+    /// AOK-BT-001: open a bounded, discoverable pairing window for `seconds`.
+    /// At rest the radio is connectable-only, so an unknown phone can only
+    /// pair while this window is open.
+    pub fn open_pairing_window(&self, seconds: u64) {
+        self.runtime.open_pairing_window(seconds);
+    }
+
+    /// AOK-BT-001: close the pairing window now (cancel / done).
+    pub fn close_pairing_window(&self) {
+        self.runtime.close_pairing_window();
+    }
+
+    /// AOK-BT-001: seconds left in the pairing window (0 = closed).
+    pub fn pairing_window_remaining_secs(&self) -> u64 {
+        self.runtime.pairing_window_remaining_secs()
+    }
+
+    /// AOK-BT-001: a clone of the shared pairing window for lock-free status reads.
+    pub fn pairing_window(&self) -> aokie_bluetooth::aokie_radio::runtime::PairingWindow {
+        self.runtime.pairing_window()
+    }
+
+    /// AOK-BT-001: bonded devices' addresses (revocable identities).
+    pub fn bonded_addresses(&self) -> Vec<String> {
+        self.runtime.bonded_addresses()
+    }
+
+    /// AOK-BT-001: forget a bonded device so it can no longer reconnect
+    /// without pairing again. Returns whether a link key was removed.
+    pub fn remove_paired(&self, address: &str) -> Result<bool, String> {
+        self.runtime.remove_paired(address.to_string())
     }
 
     pub fn is_initialized(&self) -> bool {

@@ -152,7 +152,57 @@ enum ControlCommand {
         body: String,
         msg_type: Option<String>,
     },
+    /// AOK-BT-001: forget a bonded device. The pairing store lives on the runtime
+    /// thread, so removal is an RPC — the loop drops the link key, refreshes the
+    /// bonded snapshot, and replies over `reply` with whether a record was removed.
+    RemovePaired {
+        address: String,
+        reply: stdmpsc::Sender<Result<bool, String>>,
+    },
     Shutdown,
+}
+
+/// A bounded Bluetooth pairing window (audit AOK-BT-001). While open, the radio
+/// is discoverable and will bond a NEW device; at rest it is connectable-only, so
+/// only already-bonded phones can reconnect and strangers can neither discover nor
+/// pair. Backed by a shared `Arc<AtomicU64>` holding the window deadline as a
+/// Unix-epoch second (0 = closed), so the control thread (which opens/closes it)
+/// and the runtime loop (which reconciles the controller's scan-enable and reads
+/// the gate) share one lock-free source of truth.
+#[derive(Clone, Default)]
+pub struct PairingWindow {
+    deadline_epoch_secs: Arc<AtomicU64>,
+}
+
+impl PairingWindow {
+    /// Open (or extend) the window for `seconds` from now. Clamped to a minimum
+    /// of 1 second so `open_for(0)` can't create an already-expired window.
+    pub fn open_for(&self, seconds: u64) {
+        let until = now_epoch_secs().saturating_add(seconds.max(1));
+        self.deadline_epoch_secs.store(until, Ordering::SeqCst);
+    }
+
+    pub fn close(&self) {
+        self.deadline_epoch_secs.store(0, Ordering::SeqCst);
+    }
+
+    /// Seconds remaining before the window closes; 0 when closed or expired.
+    pub fn remaining_secs(&self) -> u64 {
+        self.deadline_epoch_secs
+            .load(Ordering::SeqCst)
+            .saturating_sub(now_epoch_secs())
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.remaining_secs() > 0
+    }
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Phase 4e: queued MAS operations that share a single MapRuntime
@@ -240,6 +290,15 @@ pub struct RuntimeStatus {
     /// `true` for the rest of process lifetime since by definition we
     /// detached the thread and can't observe whether it ever finished.
     shutdown_timed_out: AtomicBool,
+    /// AOK-BT-001: the bounded pairing window. Opened by `open_pairing_window`
+    /// (phone.startPairing), closed on `close_pairing_window`/timeout. The
+    /// runtime loop reconciles the controller's scan-enable to `is_open()` and
+    /// passes it to the HCI pairing gate.
+    pairing_window: PairingWindow,
+    /// AOK-BT-001: a snapshot of the pairing store's bonded BD_ADDRs (never link
+    /// keys), refreshed at startup and after every bond/removal, so `phone.listPaired`
+    /// can show revocable identities without touching the runtime thread's store.
+    bonded_addresses: RwLock<Vec<String>>,
 }
 
 /// Bounded audio channel depth. Each `AudioFrame` carries one SCO
@@ -438,6 +497,55 @@ impl AokieRuntime {
 
     pub fn shutdown(&self) {
         let _ = self.control_tx.send(ControlCommand::Shutdown);
+    }
+
+    /// AOK-BT-001: open a bounded pairing window for `seconds`. The window is
+    /// shared state, so this takes effect immediately; the runtime loop makes
+    /// the radio discoverable on its next tick and closes it on expiry.
+    pub fn open_pairing_window(&self, seconds: u64) {
+        self.status.pairing_window.open_for(seconds);
+    }
+
+    /// AOK-BT-001: close the pairing window now (operator cancel / pairing done).
+    pub fn close_pairing_window(&self) {
+        self.status.pairing_window.close();
+    }
+
+    /// AOK-BT-001: seconds left in the pairing window, 0 when closed.
+    pub fn pairing_window_remaining_secs(&self) -> u64 {
+        self.status.pairing_window.remaining_secs()
+    }
+
+    /// AOK-BT-001: a clone of the shared pairing window (Arc-backed) so a caller
+    /// can read `remaining_secs()`/`is_open()` lock-free, reflecting expiry and
+    /// auto-close-on-bond without polling the runtime thread.
+    pub fn pairing_window(&self) -> PairingWindow {
+        self.status.pairing_window.clone()
+    }
+
+    /// AOK-BT-001: the bonded devices' BD_ADDRs (never link keys) — the revocable
+    /// identities `phone.listPaired` surfaces.
+    pub fn bonded_addresses(&self) -> Vec<String> {
+        self.status
+            .bonded_addresses
+            .read()
+            .map(|a| a.clone())
+            .unwrap_or_default()
+    }
+
+    /// AOK-BT-001: forget a bonded device. Blocks briefly on the runtime thread
+    /// (the store's owner) and returns whether a link key was removed.
+    pub fn remove_paired(&self, address: String) -> Result<bool, String> {
+        let (reply_tx, reply_rx) = stdmpsc::channel();
+        self.control_tx
+            .send(ControlCommand::RemovePaired {
+                address,
+                reply: reply_tx,
+            })
+            .map_err(|_| "aokie-radio runtime is no longer running".to_string())?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "aokie-radio runtime did not answer the removePaired request".to_string())?
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -914,6 +1022,15 @@ fn run_runtime(
     // 3) Pairing store — lives across runtime restarts so a previously
     //    paired phone reconnects without prompting again.
     let mut pairing_store = AokiePairingStore::load(pairing_store_path)?;
+    // AOK-BT-001: publish the initial bonded-device snapshot so phone.listPaired
+    // reflects the store from the first RPC.
+    if let Ok(mut snap) = status.bonded_addresses.write() {
+        *snap = pairing_store.list_addresses();
+    }
+    // Track the advertised scan-enable so the loop only writes the controller when
+    // the pairing window actually changes state (opened / expired / closed). The
+    // controller came up connectable-only (AOK-BT-001) — not discoverable yet.
+    let mut scan_discoverable = false;
 
     // 4) Loop state, mirrored from `listen_runtime_controller_with_options`.
     let max_acl_len = manager::max_acl_packet_len(&init_report.buffer_size);
@@ -1773,8 +1890,43 @@ fn run_runtime(
                         if is_mms { "MMS" } else { "SMS_GSM" }
                     );
                 }
+                Ok(ControlCommand::RemovePaired { address, reply }) => {
+                    // AOK-BT-001: forget a bonded device on its owner thread, then
+                    // refresh the snapshot so listPaired reflects it immediately.
+                    let result = pairing_store.remove(&address);
+                    if matches!(result, Ok(true)) {
+                        if let Ok(mut snap) = status.bonded_addresses.write() {
+                            *snap = pairing_store.list_addresses();
+                        }
+                        eprintln!("[AokieRadio] removed bonded device {address}");
+                    }
+                    let _ = reply.send(result);
+                }
                 Err(stdmpsc::TryRecvError::Empty) => break,
                 Err(stdmpsc::TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+
+        // AOK-BT-001: reconcile the controller's scan-enable with the pairing
+        // window — this one place handles explicit open/close AND timeout expiry.
+        // Discoverable+connectable while the window is open, connectable-only at rest.
+        let want_discoverable = status.pairing_window.is_open();
+        if want_discoverable != scan_discoverable {
+            let scan_enable = if want_discoverable {
+                manager::AOKIE_SCAN_ENABLE_CONNECTABLE_DISCOVERABLE
+            } else {
+                manager::AOKIE_SCAN_ENABLE_CONNECTABLE
+            };
+            match manager::write_scan_enable(&transport, scan_enable) {
+                Ok(()) => {
+                    scan_discoverable = want_discoverable;
+                    eprintln!(
+                        "[AokieRadio] pairing window {} — scan_enable=0x{:02x}",
+                        if want_discoverable { "OPEN (discoverable)" } else { "closed (connectable-only)" },
+                        scan_enable
+                    );
+                }
+                Err(e) => eprintln!("[AokieRadio] scan-enable reconcile failed: {e} — retrying next tick"),
             }
         }
 
@@ -1797,11 +1949,15 @@ fn run_runtime(
                         continue;
                     }
                 };
+                let bonds_before = pairing_store.len();
                 match manager::handle_hci_event_with_codec(
                     &transport,
                     &mut pairing_store,
                     &event,
                     selected_codec.as_ref(),
+                    // AOK-BT-001: the pairing gate — a fresh bond / unknown-device
+                    // ACL is admitted only while the window is open.
+                    status.pairing_window.is_open(),
                 ) {
                     Ok(Some(action)) => {
                         // Surface ACL/SCO ConnectionRequest acceptance — without
@@ -1815,6 +1971,17 @@ fn run_runtime(
                         eprintln!("[AokieRadio] HCI event handler error: {} — continuing", e);
                         let _ = event_tx.send(RuntimeEvent::Error(format!("hci event: {}", e)));
                         continue;
+                    }
+                }
+                // A new bond just landed (AOK-BT-001): refresh the snapshot and
+                // auto-close the pairing window — one device per window, so a
+                // successful pair doesn't leave us discoverable for the full timeout.
+                if pairing_store.len() != bonds_before {
+                    if let Ok(mut snap) = status.bonded_addresses.write() {
+                        *snap = pairing_store.list_addresses();
+                    }
+                    if pairing_store.len() > bonds_before {
+                        status.pairing_window.close();
                     }
                 }
                 forward_hci_event(&event, active_sco_handle, &event_tx, &status);

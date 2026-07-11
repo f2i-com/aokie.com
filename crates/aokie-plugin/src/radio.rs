@@ -64,6 +64,23 @@ pub enum RadioControl {
         stt_endpoint: Option<String>,
         tts_endpoint: Option<String>,
     },
+    /// AOK-BT-001: open a bounded, discoverable pairing window for `seconds`. At
+    /// rest the radio is connectable-only, so an unknown phone can only pair while
+    /// the window is open. A successful bond (or `StopPairing`, or timeout) closes it.
+    StartPairing {
+        seconds: u64,
+    },
+    /// AOK-BT-001: close the pairing window now (operator cancel / done).
+    StopPairing,
+    /// AOK-BT-001: forget a bonded device; replies whether a link key was removed.
+    RemovePaired {
+        address: String,
+        reply: std::sync::mpsc::Sender<Result<bool, String>>,
+    },
+    /// AOK-BT-001: list bonded (revocable) device addresses; answered over `reply`.
+    ListBonded {
+        reply: std::sync::mpsc::Sender<Vec<String>>,
+    },
     Shutdown,
 }
 
@@ -149,6 +166,10 @@ pub struct RadioStatus {
     /// were DROPPED instead of being attributed to the wrong caller (audit
     /// C-05). Observable via dongle.diagnostics.
     pub stale_stt_results: AtomicU64,
+    /// AOK-BT-001: a lock-free handle to the radio's pairing window, set once the
+    /// radio starts. Lets `phone.status` report pairing state (remaining seconds)
+    /// without round-tripping the radio thread. `None` until the radio is up.
+    pub pairing_window: Mutex<Option<aokie_dongle::bluetooth::PairingWindow>>,
 }
 
 /// Handle held by the [`Plugin`](crate::connector::Plugin): send control
@@ -198,6 +219,44 @@ impl RadioHandle {
     }
     pub fn stale_stt_results(&self) -> u64 {
         self.status.stale_stt_results.load(Ordering::Relaxed)
+    }
+
+    /// AOK-BT-001: seconds left in the pairing window, 0 when closed or the radio
+    /// isn't up yet. Lock-free read of the shared window (reflects timeout + a
+    /// successful-bond auto-close without polling the radio thread).
+    pub fn pairing_window_remaining_secs(&self) -> u64 {
+        self.status
+            .pairing_window
+            .lock()
+            .ok()
+            .and_then(|w| w.as_ref().map(|w| w.remaining_secs()))
+            .unwrap_or(0)
+    }
+
+    /// AOK-BT-001: open a bounded, discoverable pairing window for `seconds`.
+    pub fn start_pairing(&self, seconds: u64) -> Result<(), String> {
+        self.send(RadioControl::StartPairing { seconds })
+    }
+
+    /// AOK-BT-001: close the pairing window now.
+    pub fn stop_pairing(&self) -> Result<(), String> {
+        self.send(RadioControl::StopPairing)
+    }
+
+    /// AOK-BT-001: forget a bonded device (blocks briefly on the radio thread).
+    pub fn remove_paired(&self, address: String) -> Result<bool, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send(RadioControl::RemovePaired { address, reply: tx })?;
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "the radio did not answer the removePaired request".to_string())?
+    }
+
+    /// AOK-BT-001: list bonded (revocable) device addresses.
+    pub fn list_bonded(&self) -> Result<Vec<String>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send(RadioControl::ListBonded { reply: tx })?;
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "the radio did not answer the listPaired request".to_string())
     }
 }
 
@@ -474,6 +533,9 @@ pub fn spawn(
                     return;
                 }
             };
+            // AOK-BT-001: publish the shared pairing window so phone.status can
+            // report pairing state lock-free.
+            *status_thread.pairing_window.lock().unwrap() = Some(bt.pairing_window());
             // Second connection to the same outbox file (see module docs).
             // Fail CLOSED (audit AOK-RUN-001): call/SMS events are the
             // business record — if they can't be durably queued, the radio
@@ -2065,6 +2127,21 @@ fn run_loop(
                             tts_endpoint,
                         );
                     }
+                }
+                Ok(RadioControl::StartPairing { seconds }) => {
+                    // AOK-BT-001: make the radio discoverable for a bounded window.
+                    bt.open_pairing_window(seconds);
+                    eprintln!("[aokie-plugin] pairing window opened for {seconds}s");
+                }
+                Ok(RadioControl::StopPairing) => {
+                    bt.close_pairing_window();
+                    eprintln!("[aokie-plugin] pairing window closed");
+                }
+                Ok(RadioControl::RemovePaired { address, reply }) => {
+                    let _ = reply.send(bt.remove_paired(&address));
+                }
+                Ok(RadioControl::ListBonded { reply }) => {
+                    let _ = reply.send(bt.bonded_addresses());
                 }
                 Ok(RadioControl::Shutdown) => return,
                 Err(TryRecvError::Empty) => break,
