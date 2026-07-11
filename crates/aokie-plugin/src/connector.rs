@@ -892,6 +892,11 @@ impl Plugin {
                                     // already over (audit C-05) — non-zero is fine,
                                     // growth per call is worth investigating.
                                     "staleSttResults": radio.stale_stt_results(),
+                                    // AOK-VOICE-001: known voice-pipeline failures
+                                    // (None = no known failure; set = auto-answer
+                                    // is blocked + health degraded).
+                                    "voiceSttError": radio.stt_error(),
+                                    "voiceTtsError": radio.tts_error(),
                                 },
                                 // keyCollisions non-zero = a key-derivation bug
                                 // rejected an event (audit AOK-EVENT-001).
@@ -1520,6 +1525,18 @@ impl Plugin {
                 } else if !r.is_initialized() {
                     reasons.push("radio starting (dongle not initialised yet)".to_string());
                 }
+                // AOK-VOICE-001: a KNOWN voice failure (asset preflight / live
+                // engine or synthesis failure) is a concrete degraded state —
+                // auto-answer is blocked while either slot is set, so health
+                // must say WHY the receptionist isn't picking up.
+                let stt_err = r.stt_error();
+                let tts_err = r.tts_error();
+                if let Some(e) = &stt_err {
+                    reasons.push(format!("voice: {e}"));
+                }
+                if let Some(e) = &tts_err {
+                    reasons.push(format!("voice: {e}"));
+                }
                 json!({
                     "present": true,
                     "initialized": r.is_initialized(),
@@ -1527,6 +1544,11 @@ impl Plugin {
                     "callActive": r.is_call_active(),
                     "staleSttResults": r.stale_stt_results(),
                     "error": r.last_error(),
+                    "voiceRuntime": {
+                        "ready": stt_err.is_none() && tts_err.is_none(),
+                        "sttError": stt_err,
+                        "ttsError": tts_err,
+                    },
                 })
             }
             None => {
