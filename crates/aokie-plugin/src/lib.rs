@@ -35,6 +35,8 @@ pub mod call_session;
 pub mod config;
 pub mod connector;
 pub mod contract;
+#[cfg(feature = "voice")]
+pub mod endpoint_http;
 pub mod event_bridge;
 pub mod outbox;
 pub mod radio;

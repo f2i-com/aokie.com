@@ -11,7 +11,9 @@ use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 pub struct LlmClient {
-    client: reqwest::blocking::Client,
+    /// Err(reason) when the endpoint failed hardening (AOK-ENDPOINT-001) — every request
+    /// then fails with that reason instead of silently using an unvalidated client.
+    client: Result<reqwest::blocking::Client, String>,
     endpoint: String,
     model: Option<String>,
 }
@@ -21,17 +23,25 @@ impl LlmClient {
     /// the served model from `/v1/models` when `model` is None (so it reuses
     /// whatever the desktop has loaded, e.g. Qwen on llama.cpp).
     pub fn new(endpoint: String, model: Option<String>) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(30))
-            // Audit AK-003: an unreachable endpoint must fail in seconds, not
-            // hold the radio loop for the full request timeout — call controls
-            // are blocked while a reply request is in flight.
-            .connect_timeout(Duration::from_secs(3))
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
-        let model = model
-            .filter(|m| !m.trim().is_empty())
-            .or_else(|| discover_model(&client, &endpoint));
+        // Hardened client (audit AOK-ENDPOINT-001): redirects disabled, hostname endpoints
+        // DNS-validated + pinned. A rejected endpoint yields a client that fails every
+        // request with the rejection reason — caller transcripts never reach it.
+        // Timeouts unchanged (audit AK-003: an unreachable endpoint must fail in seconds,
+        // not hold the radio loop — call controls are blocked while a reply is in flight).
+        let client = crate::endpoint_http::client_for(
+            &endpoint,
+            Duration::from_secs(30),
+            Some(Duration::from_secs(3)),
+        );
+        if let Err(reason) = &client {
+            eprintln!("[aokie-plugin] LLM endpoint rejected: {reason}");
+        }
+        let model = model.filter(|m| !m.trim().is_empty()).or_else(|| {
+            client
+                .as_ref()
+                .ok()
+                .and_then(|c| discover_model(c, &endpoint))
+        });
         Self {
             client,
             endpoint,
@@ -66,8 +76,11 @@ impl LlmClient {
         if let Some(m) = &self.model {
             body["model"] = serde_json::json!(m);
         }
-        let resp = self
+        let client = self
             .client
+            .as_ref()
+            .map_err(|reason| format!("llm endpoint rejected: {reason}"))?;
+        let resp = client
             .post(&self.endpoint)
             .json(&body)
             .send()
@@ -311,10 +324,6 @@ fn discover_model(client: &reqwest::blocking::Client, chat_endpoint: &str) -> Op
 /// answers. `configured` (the `aiEndpoint` setting) wins; else probe llama.cpp
 /// (:8080) then ollama (:11434) — reusing whatever the desktop has running.
 pub fn discover_endpoint(configured: Option<&str>) -> Option<String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok()?;
     let candidates: Vec<String> = match configured {
         Some(e) if !e.trim().is_empty() => vec![e.trim().to_string()],
         _ => vec![
@@ -323,6 +332,11 @@ pub fn discover_endpoint(configured: Option<&str>) -> Option<String> {
         ],
     };
     for ep in candidates {
+        // Hardened per-endpoint client (AOK-ENDPOINT-001): a candidate that fails
+        // validation (bad URL / non-public DNS) is skipped, never probed.
+        let Ok(client) = crate::endpoint_http::client_for(&ep, Duration::from_secs(3), None) else {
+            continue;
+        };
         let models = ep.replace("/chat/completions", "/models");
         if client
             .get(&models)
