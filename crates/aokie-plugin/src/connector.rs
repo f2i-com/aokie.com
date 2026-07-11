@@ -714,7 +714,14 @@ impl Plugin {
                                     // growth per call is worth investigating.
                                     "staleSttResults": radio.stale_stt_results(),
                                 },
-                                "outbox": {"pending": c.pending, "failed": c.failed, "dead": c.dead},
+                                // keyCollisions non-zero = a key-derivation bug
+                                // rejected an event (audit AOK-EVENT-001).
+                                "outbox": {
+                                    "pending": c.pending,
+                                    "failed": c.failed,
+                                    "dead": c.dead,
+                                    "keyCollisions": self.outbox.collision_count().unwrap_or(0),
+                                },
                             }));
                         }
                         Err(CmdError::failed(format!(
@@ -2236,8 +2243,15 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("ended"));
 
-        // Rewind to incoming and drive it manually.
-        plugin.mock.current_call.as_mut().unwrap().state = MockCallState::Incoming;
+        // Fabricate a FRESH incoming call to drive manually. It must be a new
+        // call identity — re-ending the scripted call's correlation would (and
+        // now does) trip the outbox key-collision tripwire (AOK-EVENT-001):
+        // one call ends once.
+        {
+            let call = plugin.mock.current_call.as_mut().unwrap();
+            call.state = MockCallState::Incoming;
+            call.correlation_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+        }
         sink.lines.clear();
         let data = plugin
             .dispatch_command("call.answer", &Value::Null, &mut sink)
@@ -2567,7 +2581,14 @@ mod tests {
                 &mut sink,
             )
             .unwrap();
-        plugin.mock.current_call.as_mut().unwrap().state = MockCallState::Incoming;
+        // Fresh call identity for the manual drive — re-ending the scripted
+        // call's correlation would trip the key-collision tripwire (one call
+        // ends once, AOK-EVENT-001).
+        {
+            let call = plugin.mock.current_call.as_mut().unwrap();
+            call.state = MockCallState::Incoming;
+            call.correlation_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+        }
         let current = plugin.mock_call_id().unwrap();
 
         // Wrong callId → stale_call, state untouched.
