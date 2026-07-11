@@ -36,7 +36,10 @@
     "connector.aokie.sms.send",
     "connector.aokie.settings.get",
     "connector.aokie.settings.set",
-    "connector.aokie.outbox.redrive"
+    "connector.aokie.outbox.redrive",
+    "connector.aokie.consent.get",
+    "connector.aokie.consent.set",
+    "connector.aokie.consent.revoke"
   ],
   "connectors": [
     {
@@ -65,7 +68,10 @@
         "sms.send",
         "settings.get",
         "settings.set",
-        "outbox.redrive"
+        "outbox.redrive",
+        "consent.get",
+        "consent.set",
+        "consent.revoke"
       ]
     }
   ],
