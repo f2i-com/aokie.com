@@ -13,16 +13,28 @@ struct DriverJob {
     /// job it can't parse cleanly.
     #[serde(default = "default_job_version")]
     version: u32,
-    /// v2-only. `install` (default) runs the WinUSB INF install;
-    /// `remove-certs` walks LocalMachine\Root and
-    /// LocalMachine\TrustedPublisher and deletes every Aokie-signed
-    /// cert. Default lets a v1 dispatcher's job (no `mode` field) keep
-    /// working through this helper without rebuilding both sides.
+    /// `install` (default) runs the WinUSB INF install; `remove-certs`
+    /// walks LocalMachine\Root and LocalMachine\TrustedPublisher and
+    /// deletes every Aokie-signed cert; `restore-driver` reverts the
+    /// device to its in-box driver (AOK-DRIVER-001). Default lets a v1
+    /// dispatcher's job (no `mode` field) keep working through this
+    /// helper without rebuilding both sides.
     #[serde(default = "default_job_mode")]
     mode: String,
     vid: u16,
     pid: u16,
     inf_path: PathBuf,
+    /// AOK-DRIVER-001: the device-instance id the unelevated dispatcher
+    /// approved. The helper re-enumerates and refuses if the live
+    /// target's instance id differs. Defaulted so a v1/v2 job (no field)
+    /// still parses — a missing instance id just skips the exact-match
+    /// check, leaving the catalog/class/composite re-validation in force.
+    #[serde(default)]
+    instance_id: String,
+    /// AOK-DRIVER-001: SHA-256 of the INF the dispatcher approved. The
+    /// helper recomputes the INF on disk and refuses on mismatch.
+    #[serde(default)]
+    inf_sha256: String,
 }
 
 fn default_job_version() -> u32 {
@@ -33,7 +45,7 @@ fn default_job_mode() -> String {
     "install".to_string()
 }
 
-const SUPPORTED_JOB_VERSION: u32 = 2;
+const SUPPORTED_JOB_VERSION: u32 = 3;
 
 /// %TEMP%\aokie-driver-helper.log. Lazily initialised the first time
 /// `log_line!` fires so a helper that bails early during arg parsing
@@ -118,8 +130,9 @@ fn run() -> Result<(), String> {
     match job.mode.as_str() {
         "install" => run_install(&job, &job_path),
         "remove-certs" => run_remove_certs(),
+        "restore-driver" => run_restore(&job),
         other => Err(format!(
-            "unknown job mode {:?}; supported modes are 'install' and 'remove-certs'",
+            "unknown job mode {:?}; supported modes are 'install', 'remove-certs' and 'restore-driver'",
             other
         )),
     }
@@ -128,39 +141,66 @@ fn run() -> Result<(), String> {
 fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
     validate_inf_path(&job.inf_path, job_path)?;
 
-    let expected = aokie_dongle::winusb::hardware_id(job.vid, job.pid);
+    // AOK-DRIVER-001 — verify the job + INF were written by a trusted
+    // principal (the elevated user, Administrators, or SYSTEM). This
+    // closes the "a lower-privilege local process planted files in the
+    // work dir and we're about to act on them elevated" race. Soft on a
+    // security-API failure (logged) since the independent re-validation
+    // below is the primary defence; hard on a definitively untrusted
+    // owner.
+    guard_trusted_owner(job_path);
+    guard_trusted_owner(&job.inf_path);
+
     log_line!(
         "[aokie-driver-helper] install job: vid=0x{:04x} pid=0x{:04x} inf={:?}",
         job.vid,
         job.pid,
         job.inf_path
     );
-    // Device-presence check is informational only. install_package
-    // succeeds even when the device is unplugged — it stages the INF +
-    // signed cat into the driver store so the next plug-in binds
-    // automatically. Mirroring libwdi's "no device, INF copied for
-    // next time" behaviour avoids forcing the user to keep the dongle
-    // plugged during the elevation prompt.
-    match aokie_dongle::find_device(job.vid, job.pid)? {
-        Some(device) if device.hardware_id.to_ascii_uppercase().contains(&expected) => {
-            log_line!(
-                "[aokie-driver-helper] target {} is currently plugged in",
-                expected
-            );
+
+    // AOK-DRIVER-001 — re-run the SAME install policy the unelevated
+    // dispatcher ran, against the LIVE device set, INSIDE the elevation.
+    // A tampered job that swapped in a keyboard / internal combo /
+    // absent-or-unknown VID-PID is re-judged and refused here even if it
+    // slipped past the unelevated gate. Unlike the old code this is NOT
+    // "informational only": a device that fails policy stops the install.
+    let device = aokie_dongle::evaluate_present_target(
+        job.vid,
+        job.pid,
+        aokie_dongle::allow_unknown_dongle(),
+    )
+    .map_err(|e| format!("device policy refused this target inside the helper: {}", e))?;
+    log_line!(
+        "[aokie-driver-helper] target present + policy-approved: {} ({})",
+        device.instance_id,
+        device.description
+    );
+
+    // Exact device-instance match: the helper must bind the SAME
+    // physical unit the operator approved, not a same-model dongle
+    // swapped in between approval and elevation. Skipped only when the
+    // job carried no instance id (a legacy v1/v2 job).
+    if !instance_matches(&job.instance_id, &device.instance_id) {
+        return Err(format!(
+            "device instance changed since approval: job approved {:?} but the present \
+             {:04x}:{:04x} is {:?} — refusing (unplug/replug or re-run install)",
+            job.instance_id, job.vid, job.pid, device.instance_id
+        ));
+    }
+
+    // Exact INF-bytes match: the helper installs the SAME INF the
+    // dispatcher rendered + fingerprinted, so a swapped INF pointing at a
+    // different driver payload can't ride in on a tampered job.
+    if !job.inf_sha256.is_empty() {
+        let actual = aokie_dongle::sha256_file(&job.inf_path)
+            .map_err(|e| format!("could not hash INF for verification: {}", e))?;
+        if !inf_hash_matches(&job.inf_sha256, &actual) {
+            return Err(format!(
+                "INF SHA-256 mismatch: job approved {} but {:?} hashes to {} — refusing",
+                job.inf_sha256, job.inf_path, actual
+            ));
         }
-        Some(device) => {
-            log_line!(
-                "[aokie-driver-helper] device hardware ID mismatch: expected {}, got {} — staging INF anyway",
-                expected,
-                device.hardware_id
-            );
-        }
-        None => {
-            log_line!(
-                "[aokie-driver-helper] {} not currently plugged in — staging INF for next plug-in",
-                expected
-            );
-        }
+        log_line!("[aokie-driver-helper] INF hash verified ({}…)", &actual[..actual.len().min(16)]);
     }
 
     let result = aokie_dongle::winusb::install_package(&job.inf_path, job.vid, job.pid)?;
@@ -209,6 +249,74 @@ fn run_remove_certs() -> Result<(), String> {
         total
     );
     Ok(())
+}
+
+/// AOK-DRIVER-001 restore path: revert the device to its in-box driver.
+/// Re-validates the target against the live catalog policy first (so a
+/// tampered restore job can't be aimed at an arbitrary device), then
+/// hands off to the winusb restore routine.
+fn run_restore(job: &DriverJob) -> Result<(), String> {
+    log_line!(
+        "[aokie-driver-helper] restore-driver job: vid=0x{:04x} pid=0x{:04x}",
+        job.vid,
+        job.pid
+    );
+    // Only ever restore a device that is itself a legitimate Aokie
+    // target — never touch an arbitrary device's driver binding.
+    let device = aokie_dongle::evaluate_present_target(
+        job.vid,
+        job.pid,
+        aokie_dongle::allow_unknown_dongle(),
+    )
+    .map_err(|e| format!("device policy refused this restore target: {}", e))?;
+    aokie_dongle::winusb::restore_inbox_driver(job.vid, job.pid)?;
+    log_line!(
+        "[aokie-driver-helper] restored in-box driver for {}",
+        device.instance_id
+    );
+    Ok(())
+}
+
+/// Refuse the install if `path`'s owner is a principal we don't trust
+/// (i.e. not the elevated user, Administrators, or SYSTEM). A
+/// security-API failure is logged and treated as a soft pass — the
+/// catalog/instance/INF re-validation is the primary defence, and we
+/// don't want to brick installs on an exotic filesystem — but a
+/// definitively untrusted owner aborts.
+fn guard_trusted_owner(path: &Path) {
+    match aokie_dongle::winusb::file_owner_is_trusted(path) {
+        Ok(true) => {}
+        Ok(false) => {
+            log_err!(
+                "[aokie-driver-helper] refusing: {:?} is owned by an untrusted principal \
+                 (possible planted file)",
+                path
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            log_line!(
+                "[aokie-driver-helper] owner check for {:?} inconclusive ({}) — continuing on \
+                 catalog/instance/INF re-validation",
+                path,
+                e
+            );
+        }
+    }
+}
+
+/// AOK-DRIVER-001: the live device instance must match the one the
+/// dispatcher approved. An empty approved id means a legacy v1/v2 job
+/// that predates instance pinning — the catalog/class/composite
+/// re-validation still stands, so we don't fail those closed.
+fn instance_matches(approved_instance: &str, live_instance: &str) -> bool {
+    approved_instance.is_empty() || approved_instance.eq_ignore_ascii_case(live_instance)
+}
+
+/// AOK-DRIVER-001: the INF on disk must hash to the value the dispatcher
+/// approved. An empty approved hash means a legacy job (skip the check).
+fn inf_hash_matches(approved_hash: &str, actual_hash: &str) -> bool {
+    approved_hash.is_empty() || approved_hash.eq_ignore_ascii_case(actual_hash)
 }
 
 fn parse_job_path() -> Result<PathBuf, String> {
@@ -423,5 +531,59 @@ mod tests {
         touch(&inf);
         validate_inf_path(&inf, &job).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- AOK-DRIVER-001 ----
+
+    #[test]
+    fn instance_match_is_case_insensitive_and_exact() {
+        assert!(instance_matches(
+            "USB\\VID_0A5C&PID_21EC\\00198600226C",
+            "usb\\vid_0a5c&pid_21ec\\00198600226c"
+        ));
+        assert!(!instance_matches(
+            "USB\\VID_0A5C&PID_21EC\\00198600226C",
+            "USB\\VID_0A5C&PID_21EC\\DEADBEEF0000"
+        ));
+    }
+
+    #[test]
+    fn empty_approved_instance_skips_the_check() {
+        // A legacy v1/v2 job carried no instance id — don't fail it
+        // closed; the catalog/class/composite re-validation still runs.
+        assert!(instance_matches("", "USB\\VID_0A5C&PID_21EC\\ANY"));
+    }
+
+    #[test]
+    fn inf_hash_match_is_case_insensitive() {
+        let h = "ABCD1234";
+        assert!(inf_hash_matches(h, "abcd1234"));
+        assert!(!inf_hash_matches(h, "0000ffff"));
+        assert!(inf_hash_matches("", "anything")); // legacy job → skip
+    }
+
+    #[test]
+    fn v2_job_without_new_fields_still_parses() {
+        // Back-compat: a job missing instance_id / inf_sha256 deserializes
+        // with empty defaults (which the match helpers treat as skip).
+        let json = r#"{"version":2,"mode":"install","vid":2652,"pid":8684,
+                       "inf_path":"C:\\x\\aokie_winusb_bluetooth.inf"}"#;
+        let job: DriverJob = serde_json::from_str(json).unwrap();
+        assert_eq!(job.version, 2);
+        assert_eq!(job.mode, "install");
+        assert!(job.instance_id.is_empty());
+        assert!(job.inf_sha256.is_empty());
+    }
+
+    #[test]
+    fn v3_job_round_trips_the_new_fields() {
+        let json = r#"{"version":3,"mode":"install","vid":2652,"pid":8684,
+                       "inf_path":"C:\\x\\aokie_winusb_bluetooth.inf",
+                       "instance_id":"USB\\VID_0A5C&PID_21EC\\00198600226C",
+                       "inf_sha256":"deadbeef"}"#;
+        let job: DriverJob = serde_json::from_str(json).unwrap();
+        assert_eq!(job.version, 3);
+        assert_eq!(job.instance_id, "USB\\VID_0A5C&PID_21EC\\00198600226C");
+        assert_eq!(job.inf_sha256, "deadbeef");
     }
 }
