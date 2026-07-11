@@ -34,6 +34,7 @@ pub mod agent;
 pub mod call_session;
 pub mod config;
 pub mod connector;
+pub mod consent;
 pub mod contract;
 #[cfg(feature = "voice")]
 pub mod endpoint_http;
