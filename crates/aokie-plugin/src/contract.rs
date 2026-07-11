@@ -112,6 +112,9 @@ pub mod commands {
         "settings.get",
         "settings.set",
         "outbox.redrive",
+        "consent.get",
+        "consent.set",
+        "consent.revoke",
     ];
 }
 

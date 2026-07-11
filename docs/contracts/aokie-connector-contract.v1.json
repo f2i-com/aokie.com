@@ -49,7 +49,10 @@
     "sms.send",
     "settings.get",
     "settings.set",
-    "outbox.redrive"
+    "outbox.redrive",
+    "consent.get",
+    "consent.set",
+    "consent.revoke"
   ],
   "errors": [
     "command_failed",

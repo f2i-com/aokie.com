@@ -168,6 +168,11 @@ pub struct Plugin {
     /// Replay-thread heartbeat (audit AOK-OUTBOX-002) — None until ack mode
     /// starts the thread; 0 = failed to start; stale = stalled/dead thread.
     pub replay_heartbeat: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// AOK-CONSENT-001: set when the radio was NOT started because consent
+    /// enforcement denied the `bluetooth` scope. Surfaced in phone.status,
+    /// plugin.health and command errors so an operator sees WHY the phone is
+    /// offline (vs a hardware fault). Cleared once consent is satisfied.
+    pub consent_blocked: Option<String>,
 }
 
 impl Plugin {
@@ -192,6 +197,7 @@ impl Plugin {
             shutdown_requested: false,
             ack_mode: false,
             replay_heartbeat: None,
+            consent_blocked: None,
         })
     }
 
@@ -216,6 +222,7 @@ impl Plugin {
             shutdown_requested: false,
             ack_mode: false,
             replay_heartbeat: None,
+            consent_blocked: None,
         }
     }
 
@@ -230,6 +237,31 @@ impl Plugin {
         // behaviour is verified by the E2E harness, not the unit suite.
         if cfg!(test) || self.dev_mode || self.radio.is_some() {
             return;
+        }
+
+        // AOK-CONSENT-001: the radio is the entry point to ALL sensitive
+        // processing (pairing, call audio, STT, MAP/PBAP). Gate its start on
+        // the `bluetooth` consent scope. In `enforce` a missing / stale /
+        // unscoped grant blocks bring-up (recorded in `consent_blocked`, so
+        // the phone reads "offline: consent required", not a hardware fault);
+        // in the default `warn` posture it only logs + degrades health so an
+        // already-deployed receptionist keeps working through the upgrade.
+        match self.consent_gate(crate::consent::Scope::Bluetooth) {
+            crate::consent::ConsentDecision::Deny(reason) => {
+                eprintln!("[aokie-plugin] radio NOT started — consent required: {reason}");
+                self.consent_blocked = Some(reason);
+                return;
+            }
+            crate::consent::ConsentDecision::Warn(reason) => {
+                eprintln!(
+                    "[aokie-plugin] ⚠ consent not recorded: {reason} (consentMode=warn; set \
+                     consentMode=enforce to block sensitive processing until consent is given)"
+                );
+                self.consent_blocked = None;
+            }
+            crate::consent::ConsentDecision::Allow => {
+                self.consent_blocked = None;
+            }
         }
         // HFP-codec override (settings.hfpCodec: "auto" | "cvsd" | "wbs").
         // Some dongles (e.g. Broadcom BCM20702) need CVSD-only — mSBC's SCO
@@ -474,6 +506,148 @@ impl Plugin {
         )))
     }
 
+    /// AOK-CONSENT-001: the enforcement posture from the `consentMode`
+    /// setting (safe default `warn`). Dev mode never enforces — it never
+    /// touches real hardware or a real caller.
+    fn consent_mode(&self) -> crate::consent::ConsentMode {
+        if self.dev_mode {
+            return crate::consent::ConsentMode::Off;
+        }
+        crate::consent::ConsentMode::from_setting(
+            self.store
+                .config
+                .settings
+                .get("consentMode")
+                .and_then(Value::as_str),
+        )
+    }
+
+    /// AOK-CONSENT-001: run the pure consent gate for `scope` against the
+    /// recorded grant + current mode.
+    fn consent_gate(&self, scope: crate::consent::Scope) -> crate::consent::ConsentDecision {
+        let grant = crate::consent::load(&self.data_dir);
+        crate::consent::evaluate(
+            grant.as_ref(),
+            crate::consent::CURRENT_CONSENT_VERSION,
+            self.consent_mode(),
+            scope,
+        )
+    }
+
+    /// AOK-CONSENT-001: refuse a sensitive command when consent enforcement
+    /// denies its scope. A `Deny` (enforce mode) is a typed command failure;
+    /// a `Warn` is logged but allowed. Used by the `sms.*` and pairing
+    /// handlers (calls/STT are already gated by the radio not starting).
+    fn check_consent(&self, command: &str, scope: crate::consent::Scope) -> Result<(), CmdError> {
+        match self.consent_gate(scope) {
+            crate::consent::ConsentDecision::Deny(reason) => Err(CmdError::failed(format!(
+                "{command}: {reason} — enable it in FormLogic (consent required)"
+            ))),
+            crate::consent::ConsentDecision::Warn(reason) => {
+                eprintln!("[aokie-plugin] ⚠ {command}: {reason} (consentMode=warn)");
+                Ok(())
+            }
+            crate::consent::ConsentDecision::Allow => Ok(()),
+        }
+    }
+
+    /// AOK-CONSENT-001 `consent.get`: the recorded grant (or null), the
+    /// required version, the current enforcement mode, and the live gate
+    /// decision for the bluetooth scope — so FormLogic can show consent
+    /// status and whether sensitive processing is currently permitted.
+    fn consent_get(&self) -> Result<Value, CmdError> {
+        let grant = crate::consent::load(&self.data_dir);
+        let mode = self.consent_mode();
+        let decision = crate::consent::evaluate(
+            grant.as_ref(),
+            crate::consent::CURRENT_CONSENT_VERSION,
+            mode,
+            crate::consent::Scope::Bluetooth,
+        );
+        Ok(json!({
+            "grant": grant,
+            "requiredVersion": crate::consent::CURRENT_CONSENT_VERSION,
+            "mode": mode.as_str(),
+            "bluetooth": { "allowed": !decision.is_denied(), "reason": decision.reason() },
+            "blocked": self.consent_blocked,
+        }))
+    }
+
+    /// AOK-CONSENT-001 `consent.set`: record a consent grant issued by
+    /// FormLogic (the operator accepted the wizard). `accepted_at` is stamped
+    /// by the plugin, not trusted from the wire. Once recorded, the radio is
+    /// (re)started if consent had blocked it.
+    fn consent_set(&mut self, payload: &Value) -> Result<Value, CmdError> {
+        let obj = payload
+            .as_object()
+            .ok_or_else(|| CmdError::failed("consent.set requires an object body"))?;
+        let scopes: crate::consent::ConsentScopes =
+            serde_json::from_value(obj.get("scopes").cloned().unwrap_or_else(|| json!({})))
+                .map_err(|e| CmdError::failed(format!("consent.set invalid scopes: {e}")))?;
+        let version = obj
+            .get("version")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32)
+            .unwrap_or(crate::consent::CURRENT_CONSENT_VERSION);
+        let accepted_by = obj
+            .get("acceptedBy")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let signature = obj
+            .get("signature")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let grant = crate::consent::ConsentGrant {
+            version,
+            scopes,
+            accepted_at: String::new(), // stamped by save()
+            accepted_by,
+            signature,
+        };
+        let saved = crate::consent::save(&self.data_dir, grant).map_err(CmdError::failed)?;
+        // Consent may now be satisfied — clear the block and try to bring the
+        // radio up (idempotent; a no-op if it's already running or unavailable).
+        self.consent_blocked = None;
+        self.ensure_radio_started();
+        Ok(json!({
+            "recorded": true,
+            "version": saved.version,
+            "acceptedAt": saved.accepted_at,
+            "mode": self.consent_mode().as_str(),
+            "radioStarted": self.radio.is_some(),
+            "blocked": self.consent_blocked,
+        }))
+    }
+
+    /// AOK-CONSENT-001 `consent.revoke`: delete the grant and IMMEDIATELY
+    /// stop sensitive work — disable auto-answer and stop the radio — without
+    /// a plugin restart. Applies regardless of mode (revoking is an explicit
+    /// operator action, not a policy toggle).
+    fn consent_revoke(&mut self) -> Result<Value, CmdError> {
+        crate::consent::revoke(&self.data_dir).map_err(CmdError::failed)?;
+        // Auto-answer off so a still-connected phone can't be answered before
+        // the radio is torn down; persisted so it survives a restart too.
+        self.store
+            .config
+            .settings
+            .insert("autoAnswer".to_string(), json!(false));
+        self.store.config.config_version += 1;
+        self.save_config()?;
+        let radio_stopped = if let Some(radio) = self.radio.take() {
+            let _ = radio.send(crate::radio::RadioControl::Shutdown);
+            true
+        } else {
+            false
+        };
+        self.consent_blocked = Some("consent was revoked".to_string());
+        eprintln!("[aokie-plugin] consent revoked — auto-answer disabled, radio stopped");
+        Ok(json!({
+            "revoked": true,
+            "radioStopped": radio_stopped,
+            "autoAnswerDisabled": true,
+        }))
+    }
+
     /// Handle one parsed protocol message. Returns the response line
     /// for requests, `None` for notifications (which get no answer).
     pub fn handle_rpc(&mut self, msg: RpcMessage, sink: &mut dyn Sink) -> Option<String> {
@@ -689,6 +863,9 @@ impl Plugin {
             "dongle.installDriver" => self.install_driver(payload),
             "dongle.restoreDriver" => self.restore_driver(payload),
             "dongle.removeCerts" => self.remove_certs(payload),
+            "consent.get" => self.consent_get(),
+            "consent.set" => self.consent_set(payload),
+            "consent.revoke" => self.consent_revoke(),
             "dongle.diagnostics" => {
                 let obj = expect_fields(payload, &["simulate"])?;
                 match obj.get("simulate").and_then(Value::as_str) {
@@ -773,6 +950,10 @@ impl Plugin {
                     .and_then(Value::as_u64)
                     .unwrap_or(120)
                     .clamp(30, 300);
+                // AOK-CONSENT-001: pairing needs the bluetooth scope. Gives a
+                // clear "consent required" error under enforce instead of the
+                // generic radio-not-running one (the radio also won't start).
+                self.check_consent("phone.startPairing", crate::consent::Scope::Bluetooth)?;
                 // Ensure the radio is up, then open the bounded pairing window
                 // (AOK-BT-001): the radio is connectable-only at rest, so this is
                 // the ONLY way an unknown phone can discover + pair with us.
@@ -1041,6 +1222,8 @@ impl Plugin {
                 let body = require_str(&obj, "body")?;
                 let to = validate_sms_recipient(&to).map_err(CmdError::failed)?;
                 let body = validate_sms_body(&body).map_err(CmdError::failed)?;
+                // AOK-CONSENT-001: sending SMS (MAP) needs the `sms` scope.
+                self.check_consent("sms.send", crate::consent::Scope::Sms)?;
                 if let Some(radio) = self.radio.as_ref() {
                     // The runtime builds the bMessage + PushMessage; the
                     // aokie.sms.sent event (with its handle) is emitted by the
@@ -1381,6 +1564,34 @@ impl Plugin {
                     .to_string(),
             );
         }
+        // AOK-CONSENT-001: consent posture. A hard block (enforce + no valid
+        // grant) or an unrecorded-consent warning both degrade readiness so
+        // the operator sees WHY the phone is offline / at risk.
+        let consent_mode = self.consent_mode();
+        let consent_grant = crate::consent::load(&self.data_dir);
+        let consent_decision = crate::consent::evaluate(
+            consent_grant.as_ref(),
+            crate::consent::CURRENT_CONSENT_VERSION,
+            consent_mode,
+            crate::consent::Scope::Bluetooth,
+        );
+        match &consent_decision {
+            crate::consent::ConsentDecision::Deny(r) => {
+                reasons.push(format!("consent required: {r}"))
+            }
+            crate::consent::ConsentDecision::Warn(r) => {
+                reasons.push(format!("consent not recorded: {r} (consentMode=warn)"))
+            }
+            crate::consent::ConsentDecision::Allow => {}
+        }
+        let consent = json!({
+            "mode": consent_mode.as_str(),
+            "recorded": consent_grant.is_some(),
+            "recordedVersion": consent_grant.as_ref().map(|g| g.version),
+            "requiredVersion": crate::consent::CURRENT_CONSENT_VERSION,
+            "bluetoothAllowed": !consent_decision.is_denied(),
+            "blocked": self.consent_blocked,
+        });
         json!({
             "status": if reasons.is_empty() { "ok" } else { "degraded" },
             "detail": if reasons.is_empty() { Value::Null } else { json!(reasons.join("; ")) },
@@ -1388,6 +1599,7 @@ impl Plugin {
                 "voice": voice,
                 "devMode": self.dev_mode,
                 "radio": radio,
+                "consent": consent,
                 "outbox": {
                     "pending": counts.pending,
                     "failed": counts.failed,
@@ -2370,6 +2582,74 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["status"], json!("degraded"));
+    }
+
+    /// AOK-CONSENT-001: in enforce mode, sensitive commands are refused until
+    /// a scoped grant is recorded; consent.set unblocks them; consent.revoke
+    /// clears the grant + disables auto-answer.
+    #[test]
+    fn consent_enforce_blocks_then_records_then_revokes() {
+        let mut plugin = Plugin::ephemeral(false); // non-dev → consent is live
+        let mut sink = VecSink::default();
+
+        // Flip to enforce.
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "enforce"}), &mut sink)
+            .unwrap();
+
+        // No grant yet → pairing + sms.send are refused with a consent message.
+        let err = plugin
+            .dispatch_command("phone.startPairing", &json!({}), &mut sink)
+            .unwrap_err();
+        assert!(err.message.to_lowercase().contains("consent"), "got: {}", err.message);
+        let err = plugin
+            .dispatch_command("sms.send", &json!({"to": "+61400000000", "body": "hi"}), &mut sink)
+            .unwrap_err();
+        assert!(err.message.to_lowercase().contains("consent"), "got: {}", err.message);
+
+        // consent.get reflects the block.
+        let g = plugin
+            .dispatch_command("consent.get", &json!({}), &mut sink)
+            .unwrap();
+        assert_eq!(g["mode"], json!("enforce"));
+        assert_eq!(g["bluetooth"]["allowed"], json!(false));
+
+        // Record consent for bluetooth + sms.
+        let set = plugin
+            .dispatch_command(
+                "consent.set",
+                &json!({"scopes": {"bluetooth": true, "sms": true}, "acceptedBy": "op@example.com"}),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(set["recorded"], json!(true));
+
+        // Now allowed: consent.get says so, and pairing no longer fails on
+        // consent (it fails later, for lack of a radio in the test process).
+        let g = plugin
+            .dispatch_command("consent.get", &json!({}), &mut sink)
+            .unwrap();
+        assert_eq!(g["bluetooth"]["allowed"], json!(true));
+        let err = plugin
+            .dispatch_command("phone.startPairing", &json!({}), &mut sink)
+            .unwrap_err();
+        assert!(!err.message.to_lowercase().contains("consent"), "got: {}", err.message);
+
+        // Revoke: grant gone, auto-answer disabled, gate blocks again.
+        let rev = plugin
+            .dispatch_command("consent.revoke", &json!({}), &mut sink)
+            .unwrap();
+        assert_eq!(rev["revoked"], json!(true));
+        assert_eq!(rev["autoAnswerDisabled"], json!(true));
+        let g = plugin
+            .dispatch_command("consent.get", &json!({}), &mut sink)
+            .unwrap();
+        assert_eq!(g["grant"], Value::Null);
+        assert_eq!(g["bluetooth"]["allowed"], json!(false));
+        assert_eq!(
+            plugin.store.config.settings.get("autoAnswer"),
+            Some(&json!(false))
+        );
     }
 
     /// Audit INT-006/C-15: auto-answer is opt-in, never assumed.
