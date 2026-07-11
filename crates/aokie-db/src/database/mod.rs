@@ -503,12 +503,27 @@ pub fn open_migrated_connection(host: &dyn DbHost) -> Result<Connection, String>
 }
 
 /// Run all migrations needed to bring the connection up to
-/// `CURRENT_VERSION`. Each migration runs inside its own transaction
-/// and bumps `PRAGMA user_version` on commit, so a partial failure
-/// in step N+1 leaves the schema at version N — the next launch
-/// resumes from the right point instead of re-running an already
-/// applied migration and crashing on a duplicate column / table.
+/// `CURRENT_VERSION`. The whole upgrade runs under a SINGLE IMMEDIATE
+/// transaction and bumps `PRAGMA user_version` per step, committing
+/// once at the end, so the upgrade is atomic: a partial failure rolls
+/// back to the starting version and the next launch re-applies from
+/// there cleanly (never re-running an already-committed migration and
+/// crashing on a duplicate column / table).
+///
+/// One transaction — not one per step — is deliberate for concurrency.
+/// Several "cold-start" connections can open the fresh DB at once (a
+/// Tauri command racing `init_database`). With a lock PER STEP, each of
+/// N openers took up to `steps` write locks (~N×9 acquisitions); the
+/// winner released and re-acquired the lock between every step, and a
+/// loser could starve its `busy_timeout` racing for the lock between
+/// those releases — surfacing as `SQLITE_BUSY` ("database is locked").
+/// Holding ONE lock for the whole ladder means every loser blocks on a
+/// SINGLE `BEGIN IMMEDIATE` (where `busy_timeout` applies cleanly), then
+/// observes the winner's committed `user_version` and no-ops. The
+/// steady state (already migrated) takes no write lock at all.
 fn run_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Fast path: no write lock once the schema is current, so the hot
+    // open path never contends.
     let user_version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
     if user_version >= CURRENT_VERSION {
@@ -560,36 +575,34 @@ fn run_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error + S
         (9, migrate_v9),
     ];
 
+    // Take the write lock ONCE for the whole ladder (IMMEDIATE, so
+    // `busy_timeout` covers the wait) — see the fn doc for why per-step
+    // locking starved concurrent openers into SQLITE_BUSY. The whole
+    // upgrade either fully applies + commits, or rolls back atomically:
+    // an ALTER TABLE that fails partway (FK constraint, disk full) leaves
+    // `user_version` unchanged, so the next launch re-applies cleanly
+    // instead of hitting a half-modified schema.
+    let tx =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // R3-#17: re-read `user_version` INSIDE the lock. The loser of the
+    // IMMEDIATE-lock race observes the winner's committed version and
+    // skips the whole (already-applied) ladder rather than re-running
+    // migrate_v1 and crashing on `duplicate table`.
+    let current_version: u32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current_version >= CURRENT_VERSION {
+        tx.commit()?;
+        return Ok(());
+    }
+
     for (target, run) in steps {
-        if user_version >= *target {
-            continue;
-        }
-        // Each migration is run inside an IMMEDIATE transaction so
-        // it either fully applies + bumps user_version, or fully
-        // rolls back. Without this, an ALTER TABLE that fails
-        // partway (FK constraint, disk full) would leave the table
-        // half-modified but `user_version` unchanged — the next
-        // launch would re-run the same migration and fail on
-        // "duplicate column" with no clear path forward.
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-        // R3-#17: re-read `user_version` *inside* the transaction.
-        // Without this, two cold-start connections that both saw
-        // user_version=0 at the top of the function would both try
-        // to apply migrate_v1; the loser of the IMMEDIATE-lock race
-        // would crash on `duplicate table`. Now the loser observes
-        // the winner's freshly bumped user_version under the lock
-        // and skips the no-longer-needed step.
-        let current_version: u32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if current_version >= *target {
-            tx.commit()?;
             continue;
         }
         run(&tx)?;
         tx.pragma_update(None, "user_version", *target)?;
-        tx.commit()?;
         println!("[Database] migrated to v{}", target);
     }
+    tx.commit()?;
 
     Ok(())
 }
