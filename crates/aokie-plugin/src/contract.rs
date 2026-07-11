@@ -93,6 +93,8 @@ pub mod commands {
         "dongle.getPreferred",
         "dongle.setPreferred",
         "dongle.installDriver",
+        "dongle.restoreDriver",
+        "dongle.removeCerts",
         "dongle.diagnostics",
         "phone.status",
         "phone.startPairing",

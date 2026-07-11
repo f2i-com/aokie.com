@@ -687,6 +687,8 @@ impl Plugin {
                 Ok(json!({"preferred": {"vid": vid, "pid": pid}}))
             }
             "dongle.installDriver" => self.install_driver(payload),
+            "dongle.restoreDriver" => self.restore_driver(payload),
+            "dongle.removeCerts" => self.remove_certs(payload),
             "dongle.diagnostics" => {
                 let obj = expect_fields(payload, &["simulate"])?;
                 match obj.get("simulate").and_then(Value::as_str) {
@@ -1475,6 +1477,54 @@ impl Plugin {
     fn install_driver(&self, _payload: &Value) -> Result<Value, CmdError> {
         Err(CmdError::failed(
             "dongle.installDriver is only supported on Windows (WinUSB)",
+        ))
+    }
+
+    /// AOK-DRIVER-001: revert a dongle Aokie bound to WinUSB back to its
+    /// in-box driver. Elevated (UAC on the host). vid/pid from the payload
+    /// or the configured preferred dongle.
+    #[cfg(target_os = "windows")]
+    fn restore_driver(&self, payload: &Value) -> Result<Value, CmdError> {
+        let obj = payload.as_object().cloned().unwrap_or_default();
+        let (vid, pid) = if obj.contains_key("vid") || obj.contains_key("pid") {
+            (require_u16(&obj, "vid")?, require_u16(&obj, "pid")?)
+        } else if let Some(pref) = &self.store.config.preferred_dongle {
+            (pref.vid, pref.pid)
+        } else {
+            return Err(CmdError::failed(
+                "dongle.restoreDriver needs vid + pid (or set a preferred dongle via dongle.setPreferred first)",
+            ));
+        };
+        let work_dir = self.data_dir.join("winusb-install");
+        match aokie_dongle::installer::restore_original_driver(vid, pid, &work_dir) {
+            Ok(()) => Ok(json!({"restored": true, "vid": vid, "pid": pid})),
+            Err(e) => Err(CmdError::failed(format!("restore original driver failed: {e}"))),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn restore_driver(&self, _payload: &Value) -> Result<Value, CmdError> {
+        Err(CmdError::failed(
+            "dongle.restoreDriver is only supported on Windows (WinUSB)",
+        ))
+    }
+
+    /// AOK-DRIVER-001: remove every Aokie-signed certificate from the
+    /// machine trust stores (clean-uninstall path). Elevated (UAC).
+    #[cfg(target_os = "windows")]
+    fn remove_certs(&self, payload: &Value) -> Result<Value, CmdError> {
+        expect_fields(payload, &[])?;
+        let work_dir = self.data_dir.join("winusb-install");
+        match aokie_dongle::installer::remove_aokie_certs(&work_dir) {
+            Ok(()) => Ok(json!({"removed": true})),
+            Err(e) => Err(CmdError::failed(format!("remove Aokie certs failed: {e}"))),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn remove_certs(&self, _payload: &Value) -> Result<Value, CmdError> {
+        Err(CmdError::failed(
+            "dongle.removeCerts is only supported on Windows",
         ))
     }
 

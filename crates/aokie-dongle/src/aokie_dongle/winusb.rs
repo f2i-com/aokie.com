@@ -741,6 +741,188 @@ pub fn flag_phantom_devices_for_reinstall(target_hardware_id: &str) -> Result<us
     Ok(flagged)
 }
 
+/// AOK-DRIVER-001 restore: revert a device Aokie bound to WinUSB back to
+/// its in-box driver (e.g. BTHUSB). Mechanism: set `CONFIGFLAG_REINSTALL`
+/// on every present device matching `hwid`, then re-enumerate. Without an
+/// `INSTALLFLAG_FORCE` in that PnP re-search, Windows re-ranks the
+/// candidate INFs by signature trust and picks Microsoft-signed BTHUSB
+/// over our self-signed WinUSB INF — which is exactly the revert we want.
+/// (This is the mirror image of the "install doesn't persist" bug the
+/// `clear_reinstall_flag_on_present_devices` path guards against.)
+pub fn restore_inbox_driver(vid: u16, pid: u16) -> Result<(), String> {
+    let hwid = hardware_id(vid, pid);
+    let flagged = set_reinstall_flag_on_present_devices(&hwid)?;
+    if flagged == 0 {
+        return Err(format!(
+            "no present {} device to restore — plug the dongle in and retry",
+            hwid
+        ));
+    }
+    // Best-effort re-search; a not-present device is a no-op.
+    let _ = reenumerate_device(&hwid);
+    Ok(())
+}
+
+/// OR `CONFIGFLAG_REINSTALL` into every PRESENT device matching
+/// `target_hardware_id` (the inverse of
+/// `clear_reinstall_flag_on_present_devices`). Used only by
+/// [`restore_inbox_driver`].
+fn set_reinstall_flag_on_present_devices(target_hardware_id: &str) -> Result<usize, String> {
+    let enumerator = wide_null("USB");
+    let info_set = unsafe {
+        SetupDiGetClassDevsW(
+            null(),
+            enumerator.as_ptr(),
+            null_mut(),
+            DIGCF_ALLCLASSES | DIGCF_PRESENT,
+        )
+    };
+    if info_set == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE as HDEVINFO {
+        return Err(format!(
+            "SetupDiGetClassDevsW(USB, ALLCLASSES|PRESENT) failed: Win32 error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    let _info_set_guard = DeviceInfoSetGuard(info_set);
+
+    let target_upper = target_hardware_id.to_ascii_uppercase();
+    let mut flagged = 0usize;
+    let mut index: u32 = 0;
+    loop {
+        let mut info: SP_DEVINFO_DATA = unsafe { zeroed() };
+        info.cbSize = size_of::<SP_DEVINFO_DATA>() as u32;
+        if unsafe { SetupDiEnumDeviceInfo(info_set, index, &mut info) } == 0 {
+            if unsafe { GetLastError() } == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            index += 1;
+            continue;
+        }
+        index += 1;
+
+        let hw_ids = read_multi_sz(info_set, &info, SPDRP_HARDWAREID);
+        if !hw_ids
+            .iter()
+            .any(|id| id.to_ascii_uppercase().contains(&target_upper))
+        {
+            continue;
+        }
+
+        let mut config_flags: u32 = 0;
+        let mut reg_type: u32 = 0;
+        let mut size: u32 = size_of::<u32>() as u32;
+        if unsafe {
+            SetupDiGetDeviceRegistryPropertyW(
+                info_set,
+                &info,
+                SPDRP_CONFIGFLAGS,
+                &mut reg_type,
+                &mut config_flags as *mut _ as *mut u8,
+                size,
+                &mut size,
+            )
+        } == 0
+        {
+            config_flags = 0;
+        }
+        config_flags |= CONFIGFLAG_REINSTALL;
+        if unsafe {
+            SetupDiSetDeviceRegistryPropertyW(
+                info_set,
+                &mut info,
+                SPDRP_CONFIGFLAGS,
+                &config_flags as *const _ as *const u8,
+                size_of::<u32>() as u32,
+            )
+        } != 0
+        {
+            flagged += 1;
+        }
+    }
+    Ok(flagged)
+}
+
+/// AOK-DRIVER-001: is `path` owned by a principal we trust to have staged
+/// an elevated-install job — the current (elevated) user, the
+/// Administrators group, or SYSTEM? Used by the helper to reject files a
+/// lower-privilege process may have planted in the work dir. Returns
+/// `Err` on a security-API failure so the caller can decide (it treats
+/// that as a logged soft-pass, since the catalog/instance/INF
+/// re-validation is the primary defence).
+pub fn file_owner_is_trusted(path: &std::path::Path) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION,
+        PSID,
+    };
+
+    let path_w = wide_null(&path.to_string_lossy());
+    let mut owner: PSID = null_mut();
+    let mut security_descriptor = null_mut();
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut security_descriptor,
+        )
+    };
+    if rc != 0 {
+        return Err(format!("GetNamedSecurityInfoW failed: Win32 error {}", rc));
+    }
+    if owner.is_null() {
+        unsafe { LocalFree(security_descriptor as _) };
+        return Err("GetNamedSecurityInfoW returned a null owner SID".to_string());
+    }
+
+    let admins = unsafe { IsWellKnownSid(owner, WinBuiltinAdministratorsSid) } != 0;
+    let system = unsafe { IsWellKnownSid(owner, WinLocalSystemSid) } != 0;
+    let is_me = current_process_user_owns(owner);
+
+    unsafe { LocalFree(security_descriptor as _) };
+    Ok(admins || system || is_me)
+}
+
+/// True when `owner` equals the current process token's user SID.
+fn current_process_user_owns(owner: windows_sys::Win32::Security::PSID) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{EqualSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut needed: u32 = 0;
+        // First call sizes the buffer (expected to "fail" with the size in `needed`).
+        GetTokenInformation(token, TokenUser, null_mut(), 0, &mut needed);
+        if needed == 0 {
+            CloseHandle(token);
+            return false;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr() as *mut _,
+            needed,
+            &mut needed,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return false;
+        }
+        let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+        EqualSid(owner, token_user.User.Sid) != 0
+    }
+}
+
 fn read_multi_sz(info_set: HDEVINFO, info: &SP_DEVINFO_DATA, property: u32) -> Vec<String> {
     let mut required: u32 = 0;
     let mut reg_type: u32 = 0;
