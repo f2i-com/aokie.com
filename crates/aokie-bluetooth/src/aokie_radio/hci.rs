@@ -31,6 +31,7 @@ pub const OPCODE_RESET: u16 = 0x0c03;
 pub const OPCODE_CREATE_CONNECTION: u16 = 0x0405;
 pub const OPCODE_DISCONNECT: u16 = 0x0406;
 pub const OPCODE_ACCEPT_CONNECTION_REQUEST: u16 = 0x0409;
+pub const OPCODE_REJECT_CONNECTION_REQUEST: u16 = 0x040a;
 pub const OPCODE_ACCEPT_SYNCHRONOUS_CONNECTION_REQUEST: u16 = 0x0429;
 pub const OPCODE_LINK_KEY_REQUEST_REPLY: u16 = 0x040b;
 pub const OPCODE_LINK_KEY_REQUEST_NEGATIVE_REPLY: u16 = 0x040c;
@@ -436,6 +437,20 @@ pub fn accept_connection_request_command(address: &str, role: u8) -> Result<[u8;
     out[2] = 7;
     out[3..9].copy_from_slice(&parse_bd_addr(address)?);
     out[9] = role;
+    Ok(out)
+}
+
+/// HCI Reject Connection Request (Core Spec v5.4 Vol 4 Part E §7.1.9).
+/// Refuse an incoming ACL connection from a device we will not talk to —
+/// AOK-BT-001 rejects an UNKNOWN device outside the pairing window. Reason
+/// 0x0F = "Connection Rejected due to Unacceptable BD_ADDR", the standard
+/// "we don't want this peer" refusal.
+pub fn reject_connection_request_command(address: &str) -> Result<[u8; 10], String> {
+    let mut out = [0u8; 10];
+    out[0..2].copy_from_slice(&OPCODE_REJECT_CONNECTION_REQUEST.to_le_bytes());
+    out[2] = 7;
+    out[3..9].copy_from_slice(&parse_bd_addr(address)?);
+    out[9] = 0x0F; // Connection Rejected due to Unacceptable BD_ADDR
     Ok(out)
 }
 
