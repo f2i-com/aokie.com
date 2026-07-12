@@ -142,6 +142,13 @@ jobs:
             throw "TRUST-001: tag releases require WINDOWS_CERT_PFX_B64/WINDOWS_CERT_PASSWORD — refusing to produce an unsigned public release"
           }
 
+          # The release-build compile gate (installer.rs env!) applies to the
+          # aokie-dongle LIB, which the helper bin itself links. The pin is
+          # meaningless inside the helper (it never dispatches elevation), so
+          # the helper build uses a placeholder; the REAL signed hash is
+          # exported before the plugin build below and cargo's env! tracking
+          # recompiles the lib with it.
+          $env:AOKIE_EXPECTED_HELPER_SHA256 = 'helper-build-placeholder'
           cargo build -p aokie-dongle --bin aokie-driver-helper --release
           if ($LASTEXITCODE -ne 0) { throw "helper build failed" }
 
