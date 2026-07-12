@@ -1683,6 +1683,19 @@ impl Plugin {
                 if let Some(e) = &tts_err {
                     reasons.push(format!("voice: {e}"));
                 }
+                // VOICE-001: the loopback self-test — running (None) or failed
+                // both degrade readiness (auto-answer is blocked either way).
+                let self_test = r.self_test();
+                match &self_test {
+                    None => reasons.push(
+                        "voice self-test still running — auto-answer arms once it passes"
+                            .to_string(),
+                    ),
+                    Some(st) if !st.ok => {
+                        reasons.push(format!("voice self-test failed: {}", st.detail))
+                    }
+                    Some(_) => {}
+                }
                 json!({
                     "present": true,
                     "initialized": r.is_initialized(),
@@ -1691,9 +1704,16 @@ impl Plugin {
                     "staleSttResults": r.stale_stt_results(),
                     "error": r.last_error(),
                     "voiceRuntime": {
-                        "ready": stt_err.is_none() && tts_err.is_none(),
+                        "ready": stt_err.is_none() && tts_err.is_none()
+                            && self_test.as_ref().is_some_and(|st| st.ok),
                         "sttError": stt_err,
                         "ttsError": tts_err,
+                        "selfTest": self_test.map(|st| json!({
+                            "ok": st.ok,
+                            "at": st.at,
+                            "durationMs": st.duration_ms,
+                            "detail": st.detail,
+                        })),
                     },
                 })
             }

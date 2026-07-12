@@ -191,6 +191,63 @@ pub fn preflight_decision(
     }
 }
 
+/// VOICE-001: the measured TTS→STT loopback self-test. Unlike the presence-only
+/// preflight, this EXERCISES the pipeline: synthesize a known phrase with the
+/// real TTS engine, transcribe the produced PCM with the real STT engine, and
+/// verify the words survive the round trip. A corrupt model, broken ORT
+/// provider, or silently-empty synthesis is caught HERE at radio startup —
+/// before auto-answer arms — instead of by the first caller.
+///
+/// Heavy by design (~800 MB of transient ONNX graphs, seconds of inference):
+/// callers run it on a dedicated thread. Both engines are loaded fresh and
+/// dropped — the live lazy-loaded engines are untouched.
+pub const SELF_TEST_PHRASE: &str = "Aokie self test one two three";
+
+pub fn run_loopback_self_test() -> Result<String, String> {
+    let mut tts = TtsEngine::load().map_err(|e| format!("TTS engine load failed: {e}"))?;
+    let pcm = tts
+        .synthesize(SELF_TEST_PHRASE, "", 16_000)
+        .map_err(|e| format!("TTS synthesis failed: {e}"))?;
+    // Anything under ~0.5 s of audio for a 5-word phrase is silence/garbage.
+    if pcm.len() < 8_000 {
+        return Err(format!(
+            "TTS produced only {} samples (~{} ms) for the test phrase — synthesis is silent",
+            pcm.len(),
+            pcm.len() / 16
+        ));
+    }
+    let mut stt = SttEngine::load().map_err(|e| format!("STT engine load failed: {e}"))?;
+    let heard = stt
+        .transcribe(&to_f32_16k(&pcm, 16_000))
+        .map_err(|e| format!("STT transcription failed: {e}"))?;
+    self_test_verdict(&heard).map(|()| heard)
+}
+
+/// Pure verdict half of the loopback, unit-testable: does the transcript prove
+/// the round trip? STT phrasing wobbles ("1 2 3" vs "one two three"), so we
+/// require a MAJORITY of the expected words, not an exact match.
+pub fn self_test_verdict(heard: &str) -> Result<(), String> {
+    let h = heard.to_ascii_lowercase();
+    let expected: &[&[&str]] = &[
+        &["self"],
+        &["test"],
+        &["one", "1"],
+        &["two", "2", "to", "too"],
+        &["three", "3"],
+    ];
+    let hits = expected
+        .iter()
+        .filter(|alts| alts.iter().any(|w| h.contains(w)))
+        .count();
+    if hits >= 3 {
+        Ok(())
+    } else {
+        Err(format!(
+            "loopback transcript matched only {hits}/5 expected words — heard {heard:?}"
+        ))
+    }
+}
+
 /// Point `ort` at the ONNX Runtime DLL shipped next to the plugin binary, unless
 /// the operator already set `ORT_DYLIB_PATH`. `ort` is built with `load-dynamic`,
 /// so it resolves onnxruntime.dll at runtime from this env var.
@@ -239,6 +296,19 @@ mod tests {
         let p = preflight_decision(false, true, true, false, false);
         assert!(p.stt_error.as_deref().unwrap_or("").contains("ONNX Runtime DLL"));
         assert!(p.tts_error.as_deref().unwrap_or("").contains("ONNX Runtime DLL"));
+    }
+
+    /// VOICE-001: the loopback verdict tolerates STT phrasing wobble but
+    /// refuses a transcript that doesn't prove the round trip.
+    #[test]
+    fn self_test_verdict_accepts_wobble_and_rejects_garbage() {
+        assert!(self_test_verdict("Aokie self test one two three").is_ok());
+        assert!(self_test_verdict("okie self test 1 2 3").is_ok());
+        assert!(self_test_verdict("self test one").is_ok(), "3/5 words is enough");
+        assert!(self_test_verdict("").is_err());
+        assert!(self_test_verdict("hello world").is_err());
+        let err = self_test_verdict("mumble").unwrap_err();
+        assert!(err.contains("0/5"), "got: {err}");
     }
 
     #[test]
