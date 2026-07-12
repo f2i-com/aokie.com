@@ -106,7 +106,62 @@ pub enum RuntimeEvent {
     SmsSent {
         recipient_phone: String,
     },
+    /// PAIR-001: SSP numeric comparison is HELD for the operator — the
+    /// phone shows the same `numeric_value`; the operator answers via
+    /// `confirm_pairing(address, accept)`. Expires with a negative reply
+    /// after `PAIRING_CONFIRM_TIMEOUT_SECS`.
+    PairingConfirmRequired {
+        address: String,
+        numeric_value: u32,
+    },
     Error(String),
+}
+
+/// PAIR-001: how long a held SSP numeric confirmation waits for the
+/// operator before the runtime answers negatively on their behalf. The
+/// LMP response timeout aborts the handshake at ~30 s regardless, so
+/// waiting longer would only surface a stale prompt.
+pub const PAIRING_CONFIRM_TIMEOUT_SECS: u64 = 25;
+
+/// PAIR-001: the held SSP numeric comparison awaiting operator input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPairingConfirm {
+    pub address: String,
+    pub numeric_value: u32,
+    /// Unix-epoch second past which the runtime auto-refuses.
+    pub expires_epoch_secs: u64,
+}
+
+/// PAIR-001: shared, lock-cheap view of the pending confirmation so
+/// `phone.status` can report it without an RPC to the runtime thread —
+/// same shape as `PairingWindow`.
+#[derive(Clone, Default)]
+pub struct PairingConfirmSlot {
+    inner: Arc<RwLock<Option<PendingPairingConfirm>>>,
+}
+
+impl PairingConfirmSlot {
+    pub fn set(&self, pending: PendingPairingConfirm) {
+        if let Ok(mut slot) = self.inner.write() {
+            *slot = Some(pending);
+        }
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut slot) = self.inner.write() {
+            *slot = None;
+        }
+    }
+
+    /// The pending confirmation, if any — expired entries read as None
+    /// (the runtime loop sends the negative reply on its next tick).
+    pub fn get(&self) -> Option<PendingPairingConfirm> {
+        let pending = self.inner.read().ok().and_then(|slot| slot.clone())?;
+        if pending.expires_epoch_secs <= now_epoch_secs() {
+            return None;
+        }
+        Some(pending)
+    }
 }
 
 /// Phase 3e contact tuple shipped from the runtime thread to the
@@ -158,6 +213,14 @@ enum ControlCommand {
     RemovePaired {
         address: String,
         reply: stdmpsc::Sender<Result<bool, String>>,
+    },
+    /// PAIR-001: resolve a held SSP numeric confirmation. `accept` sends the
+    /// positive reply (bond proceeds); `false` sends the negative reply. `Err`
+    /// when nothing is pending for `address` (expired / wrong address).
+    ConfirmPairing {
+        address: String,
+        accept: bool,
+        reply: stdmpsc::Sender<Result<(), String>>,
     },
     Shutdown,
 }
@@ -299,6 +362,9 @@ pub struct RuntimeStatus {
     /// keys), refreshed at startup and after every bond/removal, so `phone.listPaired`
     /// can show revocable identities without touching the runtime thread's store.
     bonded_addresses: RwLock<Vec<String>>,
+    /// PAIR-001: the held SSP numeric comparison awaiting the operator, if any.
+    /// Written by the runtime loop, read by `phone.status` via the slot clone.
+    pairing_confirm: PairingConfirmSlot,
 }
 
 /// Bounded audio channel depth. Each `AudioFrame` carries one SCO
@@ -531,6 +597,30 @@ impl AokieRuntime {
             .read()
             .map(|a| a.clone())
             .unwrap_or_default()
+    }
+
+    /// PAIR-001: a clone of the shared pending-confirmation slot so callers can
+    /// poll `phone.status` without an RPC to the runtime thread.
+    pub fn pairing_confirm_slot(&self) -> PairingConfirmSlot {
+        self.status.pairing_confirm.clone()
+    }
+
+    /// PAIR-001: resolve the held SSP numeric confirmation for `address`.
+    /// Blocks briefly on the runtime thread (which owns the HCI transport).
+    pub fn confirm_pairing(&self, address: String, accept: bool) -> Result<(), String> {
+        let (reply_tx, reply_rx) = stdmpsc::channel();
+        self.control_tx
+            .send(ControlCommand::ConfirmPairing {
+                address,
+                accept,
+                reply: reply_tx,
+            })
+            .map_err(|_| "aokie-radio runtime is no longer running".to_string())?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| {
+                "aokie-radio runtime did not answer the confirmPairing request".to_string()
+            })?
     }
 
     /// AOK-BT-001: forget a bonded device. Blocks briefly on the runtime thread
@@ -1031,6 +1121,20 @@ fn run_runtime(
     // the pairing window actually changes state (opened / expired / closed). The
     // controller came up connectable-only (AOK-BT-001) — not discoverable yet.
     let mut scan_discoverable = false;
+    // PAIR-001: legacy fixed-PIN ("0000") pairing is OFF unless the operator
+    // deliberately enabled the compat setting (plugin maps `legacyPairingPin`
+    // to this env var at radio start; window-gated like every other bond step).
+    let legacy_pin_allowed = std::env::var("AOKIE_LEGACY_PAIRING_PIN").as_deref() == Ok("1");
+    if legacy_pin_allowed {
+        eprintln!(
+            "[AokieRadio] ⚠️ legacyPairingPin compat mode ENABLED — fixed-PIN pairing \
+             provides no authentication; disable it once the device is bonded"
+        );
+    }
+    // PAIR-001: the held SSP numeric comparison (address + operator deadline).
+    // Mirrored into status.pairing_confirm for phone.status; the loop answers
+    // negatively on expiry / window close / peer disconnect.
+    let mut pending_ssp_confirm: Option<(String, Instant)> = None;
 
     // 4) Loop state, mirrored from `listen_runtime_controller_with_options`.
     let max_acl_len = manager::max_acl_packet_len(&init_report.buffer_size);
@@ -1891,6 +1995,33 @@ fn run_runtime(
                     );
                 }
                 Ok(ControlCommand::RemovePaired { address, reply }) => {
+                    // PAIR-001: forget = DISCONNECT FIRST, then drop the credential.
+                    // Without the disconnect, an already-connected phone keeps its
+                    // live (encrypted) session after the operator revoked it, and
+                    // "forget" only takes effect at some future reconnect.
+                    let remote_is_target = status
+                        .addresses
+                        .read()
+                        .map(|a| a.remote.eq_ignore_ascii_case(&address))
+                        .unwrap_or(false);
+                    if remote_is_target {
+                        if let Some(handle) = active_acl_handle {
+                            // 0x13 = Remote User Terminated Connection.
+                            let cmd = hci::disconnect_command(handle, 0x13);
+                            match transport.write_command(&cmd) {
+                                Ok(()) => eprintln!(
+                                    "[AokieRadio] forget {}: disconnecting active ACL \
+                                     (handle {:#06x}) before removing its link key",
+                                    address, handle
+                                ),
+                                Err(e) => eprintln!(
+                                    "[AokieRadio] forget {}: ACL disconnect write failed \
+                                     ({}) — removing the link key anyway",
+                                    address, e
+                                ),
+                            }
+                        }
+                    }
                     // AOK-BT-001: forget a bonded device on its owner thread, then
                     // refresh the snapshot so listPaired reflects it immediately.
                     let result = pairing_store.remove(&address);
@@ -1902,8 +2033,71 @@ fn run_runtime(
                     }
                     let _ = reply.send(result);
                 }
+                Ok(ControlCommand::ConfirmPairing {
+                    address,
+                    accept,
+                    reply,
+                }) => {
+                    // PAIR-001: resolve the held SSP numeric comparison. Only the
+                    // exact pending address can be answered — anything else is a
+                    // typed error so the UI can't confirm a stale/different device.
+                    let result = match &pending_ssp_confirm {
+                        Some((pending_addr, _)) if pending_addr.eq_ignore_ascii_case(&address) => {
+                            let command = if accept {
+                                hci::user_confirmation_request_reply_command(pending_addr)
+                            } else {
+                                hci::user_confirmation_request_negative_reply_command(pending_addr)
+                            };
+                            command.and_then(|cmd| transport.write_command(&cmd)).map(|()| {
+                                eprintln!(
+                                    "[AokieRadio] operator {} SSP numeric comparison for {}",
+                                    if accept { "CONFIRMED" } else { "REJECTED" },
+                                    pending_addr
+                                );
+                            })
+                        }
+                        Some((pending_addr, _)) => Err(format!(
+                            "pending pairing confirmation is for {}, not {}",
+                            pending_addr, address
+                        )),
+                        None => Err("no pairing confirmation is pending".to_string()),
+                    };
+                    if result.is_ok() {
+                        pending_ssp_confirm = None;
+                        status.pairing_confirm.clear();
+                    }
+                    let _ = reply.send(result);
+                }
                 Err(stdmpsc::TryRecvError::Empty) => break,
                 Err(stdmpsc::TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+
+        // PAIR-001: a held SSP confirmation the operator never answered (or whose
+        // pairing window closed underneath it) is refused on its deadline — the
+        // handshake never completes silently.
+        if let Some((pending_addr, deadline)) = &pending_ssp_confirm {
+            if Instant::now() >= *deadline || !status.pairing_window.is_open() {
+                let reason = if status.pairing_window.is_open() {
+                    "operator did not confirm in time"
+                } else {
+                    "pairing window closed"
+                };
+                match hci::user_confirmation_request_negative_reply_command(pending_addr)
+                    .and_then(|cmd| transport.write_command(&cmd))
+                {
+                    Ok(()) => eprintln!(
+                        "[AokieRadio] refused SSP numeric comparison for {} — {}",
+                        pending_addr, reason
+                    ),
+                    Err(e) => eprintln!(
+                        "[AokieRadio] SSP negative reply for {} failed ({}) — \
+                         the LMP timeout will abort the handshake",
+                        pending_addr, e
+                    ),
+                }
+                pending_ssp_confirm = None;
+                status.pairing_confirm.clear();
             }
         }
 
@@ -1950,21 +2144,51 @@ fn run_runtime(
                     }
                 };
                 let bonds_before = pairing_store.len();
-                match manager::handle_hci_event_with_codec(
+                match manager::handle_hci_event_with_policy(
                     &transport,
                     &mut pairing_store,
                     &event,
                     selected_codec.as_ref(),
-                    // AOK-BT-001: the pairing gate — a fresh bond / unknown-device
-                    // ACL is admitted only while the window is open.
-                    status.pairing_window.is_open(),
+                    // AOK-BT-001 + PAIR-001: a fresh bond / unknown-device ACL is
+                    // admitted only while the window is open; SSP runs as numeric
+                    // comparison held for the operator; legacy PIN only via the
+                    // explicit compat setting.
+                    manager::PairingPolicy::runtime(
+                        status.pairing_window.is_open(),
+                        legacy_pin_allowed,
+                    ),
                 ) {
-                    Ok(Some(action)) => {
+                    Ok(Some(manager::PairingOutcome::Logged(action))) => {
                         // Surface ACL/SCO ConnectionRequest acceptance — without
                         // this, an SCO accept that the controller silently fails
                         // to honor looks identical to "phone never asked for
                         // SCO" in the log. Now we can tell them apart.
                         eprintln!("[AokieRadio] HCI {}", action);
+                    }
+                    Ok(Some(manager::PairingOutcome::ConfirmationPending {
+                        address,
+                        numeric_value,
+                    })) => {
+                        // PAIR-001: the reply is HELD — surface the code to the
+                        // operator and start the confirmation deadline.
+                        let deadline =
+                            Instant::now() + Duration::from_secs(PAIRING_CONFIRM_TIMEOUT_SECS);
+                        pending_ssp_confirm = Some((address.clone(), deadline));
+                        status.pairing_confirm.set(PendingPairingConfirm {
+                            address: address.clone(),
+                            numeric_value,
+                            expires_epoch_secs: now_epoch_secs()
+                                .saturating_add(PAIRING_CONFIRM_TIMEOUT_SECS),
+                        });
+                        eprintln!(
+                            "[AokieRadio] SSP numeric comparison for {} — code {:06} awaiting \
+                             operator confirmation ({}s)",
+                            address, numeric_value, PAIRING_CONFIRM_TIMEOUT_SECS
+                        );
+                        let _ = event_tx.send(RuntimeEvent::PairingConfirmRequired {
+                            address,
+                            numeric_value,
+                        });
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -1972,6 +2196,19 @@ fn run_runtime(
                         let _ = event_tx.send(RuntimeEvent::Error(format!("hci event: {}", e)));
                         continue;
                     }
+                }
+                // PAIR-001: a peer that walks away mid-confirmation (SSP completes
+                // negatively or the ACL drops) clears the held prompt — no stale
+                // "confirm code" UI for a phone that is no longer pairing.
+                if pending_ssp_confirm.is_some()
+                    && matches!(
+                        &event,
+                        hci::HciEvent::SimplePairingComplete { .. }
+                            | hci::HciEvent::DisconnectionComplete { .. }
+                    )
+                {
+                    pending_ssp_confirm = None;
+                    status.pairing_confirm.clear();
                 }
                 // A new bond just landed (AOK-BT-001): refresh the snapshot and
                 // auto-close the pairing window — one device per window, so a

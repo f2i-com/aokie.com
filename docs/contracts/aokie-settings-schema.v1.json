@@ -28,6 +28,11 @@
       "appliesLive": false
     },
     {
+      "key": "legacyPairingPin",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
       "key": "mockCalls",
       "type": "bool",
       "appliesLive": false

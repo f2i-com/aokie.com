@@ -24,6 +24,9 @@ pub mod events {
     pub const DONGLE_ERROR: &str = "aokie.dongle.error";
     // ── Phone link ──────────────────────────────────────────────────
     pub const PHONE_PAIRING_STARTED: &str = "aokie.phone.pairing_started";
+    /// PAIR-001: SSP numeric comparison held for the operator — payload
+    /// carries {address, numericValue}; answered via `phone.confirmPairing`.
+    pub const PHONE_PAIRING_CONFIRM_REQUIRED: &str = "aokie.phone.pairing_confirm_required";
     pub const PHONE_PAIRED: &str = "aokie.phone.paired";
     pub const PHONE_CONNECTED: &str = "aokie.phone.connected";
     pub const PHONE_DISCONNECTED: &str = "aokie.phone.disconnected";
@@ -52,6 +55,7 @@ pub mod events {
         DONGLE_READY,
         DONGLE_ERROR,
         PHONE_PAIRING_STARTED,
+        PHONE_PAIRING_CONFIRM_REQUIRED,
         PHONE_PAIRED,
         PHONE_CONNECTED,
         PHONE_DISCONNECTED,
@@ -99,6 +103,7 @@ pub mod commands {
         "phone.status",
         "phone.startPairing",
         "phone.stopPairing",
+        "phone.confirmPairing",
         "phone.listPaired",
         "phone.removePaired",
         "call.current",

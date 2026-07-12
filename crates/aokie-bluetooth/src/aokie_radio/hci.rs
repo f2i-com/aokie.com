@@ -70,9 +70,17 @@ pub const BLUETOOTH_COMPANY_ID_BROADCOM: u16 = 0x000f;
 pub const LOCAL_NAME_PARAM_LEN: usize = 248;
 pub const LINK_KEY_LEN: usize = 16;
 pub const PIN_CODE_PARAM_LEN: usize = 16;
+/// PAIR-001: the production runtime advertises DisplayYesNo — the FormLogic
+/// Desktop UI is the display, so SSP resolves to NUMERIC COMPARISON (both
+/// sides show the same 6-digit code and a human confirms on each).
+pub const SSP_IO_CAPABILITY_DISPLAY_YES_NO: u8 = 0x01;
 pub const SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT: u8 = 0x03;
 pub const SSP_OOB_DATA_NOT_PRESENT: u8 = 0x00;
 pub const SSP_AUTHREQ_MITM_NOT_REQUIRED_GENERAL_BONDING: u8 = 0x04;
+/// PAIR-001: MITM protection required — pairs with DisplayYesNo above so a
+/// silent just-works bond can't be completed by a nearby stranger racing the
+/// intended phone during an open pairing window.
+pub const SSP_AUTHREQ_MITM_REQUIRED_GENERAL_BONDING: u8 = 0x05;
 pub const ACCEPT_ROLE_REMAIN_SLAVE: u8 = 0x01;
 pub const LINK_TYPE_SCO: u8 = 0x00;
 pub const LINK_TYPE_ACL: u8 = 0x01;

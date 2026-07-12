@@ -434,6 +434,26 @@ impl Plugin {
             std::env::set_var("AOKIE_BARGE_RMS", (rms as f32).to_string());
             eprintln!("[aokie-plugin] bargeSensitivity setting → AOKIE_BARGE_RMS={rms}");
         }
+        // PAIR-001: legacy fixed-PIN ("0000") pairing is OFF unless the
+        // operator deliberately enabled the compat setting. The radio warns
+        // loudly whenever it's on — a fixed PIN authenticates nothing.
+        let legacy_pin = self
+            .store
+            .config
+            .settings
+            .get("legacyPairingPin")
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false);
+        std::env::set_var(
+            "AOKIE_LEGACY_PAIRING_PIN",
+            if legacy_pin { "1" } else { "0" },
+        );
+        if legacy_pin {
+            eprintln!(
+                "[aokie-plugin] ⚠️ legacyPairingPin ON — fixed-PIN (0000) pairing enabled for \
+                 pre-SSP devices; turn it back off once the device is bonded"
+            );
+        }
 
         // Auto-answer defaults OFF (audit INT-006/C-15): a receptionist must
         // be explicitly enabled (settings.autoAnswer: true — the pack's
@@ -992,6 +1012,15 @@ impl Plugin {
                     // AOK-BT-001: surface the bounded pairing window so the UI shows
                     // "discoverable, 95s left" vs the at-rest connectable-only state.
                     let pairing_secs = radio.pairing_window_remaining_secs();
+                    // PAIR-001: the held SSP numeric comparison, if the radio is
+                    // waiting on the operator (answered via phone.confirmPairing).
+                    let pairing_confirm = radio.pending_pairing_confirm().map(|p| {
+                        json!({
+                            "address": p.address,
+                            "numericValue": p.numeric_value,
+                            "expiresEpochSecs": p.expires_epoch_secs,
+                        })
+                    });
                     return Ok(json!({
                         "paired": addr.is_some(),
                         "device": addr.as_ref().map(|a| json!({"address": a, "name": "Paired phone"})),
@@ -1005,6 +1034,7 @@ impl Plugin {
                         "pairingOpen": pairing_secs > 0,
                         "pairingSecondsRemaining": pairing_secs,
                         "discoverable": pairing_secs > 0,
+                        "pairingConfirm": pairing_confirm,
                         "source": "radio",
                     }));
                 }
@@ -1098,7 +1128,8 @@ impl Plugin {
             }
             "phone.removePaired" => {
                 // AOK-BT-001: forget a bonded device so it can no longer reconnect
-                // without pairing again.
+                // without pairing again. PAIR-001: an active session for that
+                // device is disconnected first.
                 let obj = expect_fields(payload, &["address"])?;
                 let address = require_str(&obj, "address")?;
                 self.require_radio_or_dev("phone.removePaired")?;
@@ -1108,6 +1139,29 @@ impl Plugin {
                 }
                 // Dev mode: nothing bonded to remove.
                 Ok(json!({"removed": false, "address": address, "simulated": true}))
+            }
+            "phone.confirmPairing" => {
+                // PAIR-001: the operator's answer to the SSP numeric comparison
+                // (phone.status.pairingConfirm / the pairing_confirm_required
+                // event). Same consent scope as starting the pairing window.
+                let obj = expect_fields(payload, &["address", "accept"])?;
+                let address = require_str(&obj, "address")?;
+                let accept = obj
+                    .get("accept")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| CmdError::failed("confirmPairing needs a boolean `accept`"))?;
+                self.check_consent("phone.confirmPairing", crate::consent::Scope::Bluetooth)?;
+                self.require_radio_or_dev("phone.confirmPairing")?;
+                if let Some(radio) = self.radio.as_ref() {
+                    radio
+                        .confirm_pairing(address.clone(), accept)
+                        .map_err(CmdError::failed)?;
+                    return Ok(json!({"address": address, "accepted": accept}));
+                }
+                // Dev mode: nothing is ever pending.
+                Err(CmdError::failed(
+                    "no pairing confirmation is pending (simulated)",
+                ))
             }
             "call.current" => {
                 expect_fields(payload, &[])?;
@@ -2020,6 +2074,7 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     SettingSpec { key: "bargeIn", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "agentHangup", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "reenumerateHwid", kind: SettingKind::Bool, applies_live: false },
+    SettingSpec { key: "legacyPairingPin", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "mockCalls", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "bargeSensitivity", kind: SettingKind::Int { min: 50, max: 5000 }, applies_live: false },
     SettingSpec { key: "sttEndpointMs", kind: SettingKind::Int { min: 100, max: 5000 }, applies_live: false },
@@ -3605,6 +3660,52 @@ mod tests {
             .unwrap();
         assert_eq!(data["source"], json!("config"));
         assert_eq!(data["pairingOpen"], json!(false));
+
+        // PAIR-001: confirmPairing is gated on a running radio too.
+        let err = plugin
+            .dispatch_command(
+                "phone.confirmPairing",
+                &json!({"address": "00:11:22:33:44:55", "accept": true}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("radio is not running"));
+    }
+
+    #[test]
+    fn phone_confirm_pairing_dev_mode_has_nothing_pending_and_validates_payload() {
+        // PAIR-001: dev mode never holds an SSP confirmation, so the command is
+        // a typed failure — the UI can't "confirm" a phantom device. A missing
+        // or non-boolean `accept` is rejected before any radio interaction.
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink::default();
+
+        let err = plugin
+            .dispatch_command(
+                "phone.confirmPairing",
+                &json!({"address": "00:11:22:33:44:55", "accept": true}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("no pairing confirmation is pending"));
+
+        let err = plugin
+            .dispatch_command(
+                "phone.confirmPairing",
+                &json!({"address": "00:11:22:33:44:55"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("boolean `accept`"));
+
+        let err = plugin
+            .dispatch_command(
+                "phone.confirmPairing",
+                &json!({"address": "00:11:22:33:44:55", "accept": "yes"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("boolean `accept`"));
     }
 
     #[test]
