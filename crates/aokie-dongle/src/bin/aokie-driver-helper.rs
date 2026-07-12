@@ -25,16 +25,26 @@ struct DriverJob {
     pid: u16,
     inf_path: PathBuf,
     /// AOK-DRIVER-001: the device-instance id the unelevated dispatcher
-    /// approved. The helper re-enumerates and refuses if the live
-    /// target's instance id differs. Defaulted so a v1/v2 job (no field)
-    /// still parses — a missing instance id just skips the exact-match
-    /// check, leaving the catalog/class/composite re-validation in force.
+    /// approved. DRIVER-001 made it MANDATORY for install/restore — the
+    /// helper refuses a job without it (no more "empty skips the check").
     #[serde(default)]
     instance_id: String,
-    /// AOK-DRIVER-001: SHA-256 of the INF the dispatcher approved. The
-    /// helper recomputes the INF on disk and refuses on mismatch.
+    /// AOK-DRIVER-001: SHA-256 of the INF the dispatcher approved.
+    /// DRIVER-001: mandatory (64 hex chars) on install jobs; the helper
+    /// recomputes the INF on disk and refuses on mismatch.
     #[serde(default)]
     inf_sha256: String,
+    /// DRIVER-001: the expected hardware id (`USB\VID_xxxx&PID_xxxx`).
+    /// Mandatory on install jobs and must equal the id the helper derives
+    /// from vid/pid itself — a job whose fields disagree is refused.
+    #[serde(default)]
+    hardware_id: String,
+    /// DRIVER-001: whether the dispatcher authorised DEVELOPER self-signing
+    /// (generating a local catalog-signing cert and trusting it machine-wide).
+    /// Production dispatchers write false; the install then requires a
+    /// shipped signed catalog and never mints a certificate.
+    #[serde(default)]
+    allow_dev_self_sign: bool,
 }
 
 fn default_job_version() -> u32 {
@@ -45,7 +55,11 @@ fn default_job_mode() -> String {
     "install".to_string()
 }
 
-const SUPPORTED_JOB_VERSION: u32 = 3;
+/// v4 (DRIVER-001): `instance_id`/`inf_sha256` became mandatory for
+/// install, `hardware_id` + `allow_dev_self_sign` were added, restore
+/// jobs pin the instance id, and the owner check fails CLOSED. Exact
+/// version match — a stale helper or stale dispatcher refuses to run.
+const SUPPORTED_JOB_VERSION: u32 = 4;
 
 /// %TEMP%\aokie-driver-helper.log. Lazily initialised the first time
 /// `log_line!` fires so a helper that bails early during arg parsing
@@ -127,7 +141,16 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    match job.mode.as_str() {
+    // DRIVER-001: the job file itself must be owned by a trusted principal
+    // on EVERY mode — restore and remove-certs mutate machine state too.
+    guard_trusted_owner(&job_path)?;
+
+    transaction_log(&job.mode, &format!(
+        "job accepted: vid=0x{:04x} pid=0x{:04x} instance={:?}",
+        job.vid, job.pid, job.instance_id
+    ));
+
+    let result = match job.mode.as_str() {
         "install" => run_install(&job, &job_path),
         "remove-certs" => run_remove_certs(),
         "restore-driver" => run_restore(&job),
@@ -135,21 +158,94 @@ fn run() -> Result<(), String> {
             "unknown job mode {:?}; supported modes are 'install', 'remove-certs' and 'restore-driver'",
             other
         )),
+    };
+    match &result {
+        Ok(()) => transaction_log(&job.mode, "completed"),
+        Err(e) => transaction_log(&job.mode, &format!("refused/failed: {}", e)),
     }
+    result
+}
+
+/// DRIVER-001: append-only transaction journal of every elevated driver
+/// mutation (and refusal), machine-wide so it survives per-user temp
+/// cleanup. One JSON line per entry: what mode ran, when, and what it did —
+/// the durable record restore/uninstall work can be audited against.
+/// Best-effort by design: journaling must never turn into a way to block
+/// (or be blocked from) an otherwise-valid job, so failures degrade to the
+/// per-run log only.
+fn transaction_log(mode: &str, detail: &str) {
+    let dir = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Aokie");
+    let entry = format!(
+        "{{\"at\":{:?},\"pid\":{},\"mode\":{:?},\"detail\":{:?}}}",
+        chrono::Local::now().to_rfc3339(),
+        std::process::id(),
+        mode,
+        detail
+    );
+    let write = std::fs::create_dir_all(&dir).and_then(|()| {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("driver-transactions.jsonl"))?;
+        writeln!(f, "{}", entry)?;
+        f.flush()
+    });
+    if let Err(e) = write {
+        log_err!(
+            "[aokie-driver-helper] transaction journal write failed ({}): {}",
+            e,
+            entry
+        );
+    }
+}
+
+/// DRIVER-001: install jobs carry every exact-target field, non-empty and
+/// well-formed — a job that omits any of them is refused before elevation
+/// does anything. (The old empty-field "skip the check" tolerance is gone.)
+fn validate_install_job_fields(job: &DriverJob) -> Result<(), String> {
+    if job.instance_id.trim().is_empty() {
+        return Err(
+            "install job has no device instance id — the dispatcher must pin the exact \
+             approved device; refusing"
+                .to_string(),
+        );
+    }
+    let hash = job.inf_sha256.trim();
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "install job's inf_sha256 {:?} is not a 64-hex SHA-256 — the dispatcher must \
+             fingerprint the exact approved INF; refusing",
+            job.inf_sha256
+        ));
+    }
+    let expected_hwid = aokie_dongle::winusb::hardware_id(job.vid, job.pid);
+    if !job.hardware_id.eq_ignore_ascii_case(&expected_hwid) {
+        return Err(format!(
+            "install job's hardware_id {:?} does not match the id derived from \
+             vid/pid ({:?}) — inconsistent job; refusing",
+            job.hardware_id, expected_hwid
+        ));
+    }
+    Ok(())
 }
 
 fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
     validate_inf_path(&job.inf_path, job_path)?;
 
-    // AOK-DRIVER-001 — verify the job + INF were written by a trusted
-    // principal (the elevated user, Administrators, or SYSTEM). This
-    // closes the "a lower-privilege local process planted files in the
-    // work dir and we're about to act on them elevated" race. Soft on a
-    // security-API failure (logged) since the independent re-validation
-    // below is the primary defence; hard on a definitively untrusted
-    // owner.
-    guard_trusted_owner(job_path);
-    guard_trusted_owner(&job.inf_path);
+    // DRIVER-001: every exact-target field is mandatory and well-formed —
+    // there is no legacy "empty field skips the check" path anymore.
+    validate_install_job_fields(job)?;
+
+    // AOK-DRIVER-001 — verify the INF was written by a trusted principal
+    // (the elevated user, Administrators, or SYSTEM); the job file was
+    // guarded in run(). Closes the "a lower-privilege local process
+    // planted files in the work dir and we're about to act on them
+    // elevated" race. DRIVER-001: a security-API failure fails CLOSED.
+    guard_trusted_owner(&job.inf_path)?;
 
     log_line!(
         "[aokie-driver-helper] install job: vid=0x{:04x} pid=0x{:04x} inf={:?}",
@@ -178,8 +274,7 @@ fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
 
     // Exact device-instance match: the helper must bind the SAME
     // physical unit the operator approved, not a same-model dongle
-    // swapped in between approval and elevation. Skipped only when the
-    // job carried no instance id (a legacy v1/v2 job).
+    // swapped in between approval and elevation.
     if !instance_matches(&job.instance_id, &device.instance_id) {
         return Err(format!(
             "device instance changed since approval: job approved {:?} but the present \
@@ -190,20 +285,32 @@ fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
 
     // Exact INF-bytes match: the helper installs the SAME INF the
     // dispatcher rendered + fingerprinted, so a swapped INF pointing at a
-    // different driver payload can't ride in on a tampered job.
-    if !job.inf_sha256.is_empty() {
-        let actual = aokie_dongle::sha256_file(&job.inf_path)
-            .map_err(|e| format!("could not hash INF for verification: {}", e))?;
-        if !inf_hash_matches(&job.inf_sha256, &actual) {
-            return Err(format!(
-                "INF SHA-256 mismatch: job approved {} but {:?} hashes to {} — refusing",
-                job.inf_sha256, job.inf_path, actual
-            ));
-        }
-        log_line!("[aokie-driver-helper] INF hash verified ({}…)", &actual[..actual.len().min(16)]);
+    // different driver payload can't ride in on a tampered job. The hash
+    // is re-verified HERE, immediately before mutation — the field itself
+    // was already format-validated above.
+    let actual = aokie_dongle::sha256_file(&job.inf_path)
+        .map_err(|e| format!("could not hash INF for verification: {}", e))?;
+    if !inf_hash_matches(&job.inf_sha256, &actual) {
+        return Err(format!(
+            "INF SHA-256 mismatch: job approved {} but {:?} hashes to {} — refusing",
+            job.inf_sha256, job.inf_path, actual
+        ));
     }
+    log_line!("[aokie-driver-helper] INF hash verified ({}…)", &actual[..actual.len().min(16)]);
 
-    let result = aokie_dongle::winusb::install_package(&job.inf_path, job.vid, job.pid)?;
+    transaction_log(
+        "install",
+        &format!(
+            "staging driver: instance={} inf={:?} inf_sha256={} dev_self_sign={}",
+            device.instance_id, job.inf_path, actual, job.allow_dev_self_sign
+        ),
+    );
+    let result = aokie_dongle::winusb::install_package(
+        &job.inf_path,
+        job.vid,
+        job.pid,
+        job.allow_dev_self_sign,
+    )?;
     if result.reboot_required {
         log_line!("[aokie-driver-helper] WinUSB installed; reboot may be required");
     } else {
@@ -261,6 +368,15 @@ fn run_restore(job: &DriverJob) -> Result<(), String> {
         job.vid,
         job.pid
     );
+    // DRIVER-001: restore pins the exact approved instance too — a swapped
+    // same-model device between approval and elevation is refused.
+    if job.instance_id.trim().is_empty() {
+        return Err(
+            "restore job has no device instance id — the dispatcher must pin the exact \
+             approved device; refusing"
+                .to_string(),
+        );
+    }
     // Only ever restore a device that is itself a legitimate Aokie
     // target — never touch an arbitrary device's driver binding.
     let device = aokie_dongle::evaluate_present_target(
@@ -269,6 +385,17 @@ fn run_restore(job: &DriverJob) -> Result<(), String> {
         aokie_dongle::allow_unknown_dongle(),
     )
     .map_err(|e| format!("device policy refused this restore target: {}", e))?;
+    if !instance_matches(&job.instance_id, &device.instance_id) {
+        return Err(format!(
+            "device instance changed since approval: restore job approved {:?} but the \
+             present {:04x}:{:04x} is {:?} — refusing",
+            job.instance_id, job.vid, job.pid, device.instance_id
+        ));
+    }
+    transaction_log(
+        "restore-driver",
+        &format!("restoring in-box driver: instance={}", device.instance_id),
+    );
     aokie_dongle::winusb::restore_inbox_driver(job.vid, job.pid)?;
     log_line!(
         "[aokie-driver-helper] restored in-box driver for {}",
@@ -277,46 +404,37 @@ fn run_restore(job: &DriverJob) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse the install if `path`'s owner is a principal we don't trust
-/// (i.e. not the elevated user, Administrators, or SYSTEM). A
-/// security-API failure is logged and treated as a soft pass — the
-/// catalog/instance/INF re-validation is the primary defence, and we
-/// don't want to brick installs on an exotic filesystem — but a
-/// definitively untrusted owner aborts.
-fn guard_trusted_owner(path: &Path) {
+/// Refuse the job if `path`'s owner is a principal we don't trust
+/// (i.e. not the elevated user, Administrators, or SYSTEM). DRIVER-001:
+/// a security-API failure now fails CLOSED too — an owner we cannot
+/// verify is an owner we do not trust; the old "inconclusive → soft
+/// pass" carve-out was an elevation-time fail-open.
+fn guard_trusted_owner(path: &Path) -> Result<(), String> {
     match aokie_dongle::winusb::file_owner_is_trusted(path) {
-        Ok(true) => {}
-        Ok(false) => {
-            log_err!(
-                "[aokie-driver-helper] refusing: {:?} is owned by an untrusted principal \
-                 (possible planted file)",
-                path
-            );
-            std::process::exit(1);
-        }
-        Err(e) => {
-            log_line!(
-                "[aokie-driver-helper] owner check for {:?} inconclusive ({}) — continuing on \
-                 catalog/instance/INF re-validation",
-                path,
-                e
-            );
-        }
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "refusing: {:?} is owned by an untrusted principal (possible planted file)",
+            path
+        )),
+        Err(e) => Err(format!(
+            "refusing: could not verify the owner of {:?} ({}) — an unverifiable job \
+             file is not acted on elevated",
+            path, e
+        )),
     }
 }
 
-/// AOK-DRIVER-001: the live device instance must match the one the
-/// dispatcher approved. An empty approved id means a legacy v1/v2 job
-/// that predates instance pinning — the catalog/class/composite
-/// re-validation still stands, so we don't fail those closed.
+/// AOK-DRIVER-001/DRIVER-001: the live device instance must match the one
+/// the dispatcher approved — exact, case-insensitive, never skipped (an
+/// empty approved id is refused earlier by the mandatory-field checks).
 fn instance_matches(approved_instance: &str, live_instance: &str) -> bool {
-    approved_instance.is_empty() || approved_instance.eq_ignore_ascii_case(live_instance)
+    !approved_instance.is_empty() && approved_instance.eq_ignore_ascii_case(live_instance)
 }
 
-/// AOK-DRIVER-001: the INF on disk must hash to the value the dispatcher
-/// approved. An empty approved hash means a legacy job (skip the check).
+/// AOK-DRIVER-001/DRIVER-001: the INF on disk must hash to the value the
+/// dispatcher approved — never skipped.
 fn inf_hash_matches(approved_hash: &str, actual_hash: &str) -> bool {
-    approved_hash.is_empty() || approved_hash.eq_ignore_ascii_case(actual_hash)
+    !approved_hash.is_empty() && approved_hash.eq_ignore_ascii_case(actual_hash)
 }
 
 fn parse_job_path() -> Result<PathBuf, String> {
@@ -548,42 +666,83 @@ mod tests {
     }
 
     #[test]
-    fn empty_approved_instance_skips_the_check() {
-        // A legacy v1/v2 job carried no instance id — don't fail it
-        // closed; the catalog/class/composite re-validation still runs.
-        assert!(instance_matches("", "USB\\VID_0A5C&PID_21EC\\ANY"));
+    fn empty_approved_instance_is_refused() {
+        // DRIVER-001: the legacy "empty field skips the check" tolerance is
+        // gone — an unpinned job can never match a live device.
+        assert!(!instance_matches("", "USB\\VID_0A5C&PID_21EC\\ANY"));
     }
 
     #[test]
-    fn inf_hash_match_is_case_insensitive() {
+    fn inf_hash_match_is_case_insensitive_and_never_skipped() {
         let h = "ABCD1234";
         assert!(inf_hash_matches(h, "abcd1234"));
         assert!(!inf_hash_matches(h, "0000ffff"));
-        assert!(inf_hash_matches("", "anything")); // legacy job → skip
+        // DRIVER-001: an empty approved hash no longer passes anything.
+        assert!(!inf_hash_matches("", "anything"));
+    }
+
+    fn v4_job(instance_id: &str, inf_sha256: &str, hardware_id: &str) -> DriverJob {
+        serde_json::from_str(&format!(
+            r#"{{"version":4,"mode":"install","vid":2652,"pid":8684,
+                "inf_path":"C:\\x\\aokie_winusb_bluetooth.inf",
+                "instance_id":{:?},"inf_sha256":{:?},"hardware_id":{:?}}}"#,
+            instance_id, inf_sha256, hardware_id
+        ))
+        .unwrap()
+    }
+
+    const GOOD_SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn v4_install_job_requires_every_exact_target_field() {
+        // DRIVER-001 acceptance: missing fields abort before mutation.
+        let hwid = aokie_dongle::winusb::hardware_id(2652, 8684);
+        let good = v4_job("USB\\VID_0A5C&PID_21EC\\00198600226C", GOOD_SHA, &hwid);
+        validate_install_job_fields(&good).unwrap();
+        assert!(!good.allow_dev_self_sign, "self-signing defaults OFF");
+
+        let err = validate_install_job_fields(&v4_job("", GOOD_SHA, &hwid)).unwrap_err();
+        assert!(err.contains("no device instance id"), "got: {}", err);
+
+        let err = validate_install_job_fields(&v4_job("USB\\X\\1", "deadbeef", &hwid)).unwrap_err();
+        assert!(err.contains("not a 64-hex SHA-256"), "got: {}", err);
+
+        let err = validate_install_job_fields(&v4_job("USB\\X\\1", GOOD_SHA, "")).unwrap_err();
+        assert!(err.contains("does not match the id derived"), "got: {}", err);
+
+        let err = validate_install_job_fields(&v4_job(
+            "USB\\X\\1",
+            GOOD_SHA,
+            "USB\\VID_1234&PID_5678",
+        ))
+        .unwrap_err();
+        assert!(err.contains("does not match the id derived"), "got: {}", err);
     }
 
     #[test]
-    fn v2_job_without_new_fields_still_parses() {
-        // Back-compat: a job missing instance_id / inf_sha256 deserializes
-        // with empty defaults (which the match helpers treat as skip).
-        let json = r#"{"version":2,"mode":"install","vid":2652,"pid":8684,
-                       "inf_path":"C:\\x\\aokie_winusb_bluetooth.inf"}"#;
-        let job: DriverJob = serde_json::from_str(json).unwrap();
-        assert_eq!(job.version, 2);
-        assert_eq!(job.mode, "install");
-        assert!(job.instance_id.is_empty());
-        assert!(job.inf_sha256.is_empty());
-    }
-
-    #[test]
-    fn v3_job_round_trips_the_new_fields() {
+    fn stale_v3_job_is_rejected_by_the_version_gate() {
+        // Serde still parses older versions (so the error is a clean version
+        // message, not a parse failure) — but run() refuses anything != v4.
         let json = r#"{"version":3,"mode":"install","vid":2652,"pid":8684,
                        "inf_path":"C:\\x\\aokie_winusb_bluetooth.inf",
                        "instance_id":"USB\\VID_0A5C&PID_21EC\\00198600226C",
                        "inf_sha256":"deadbeef"}"#;
         let job: DriverJob = serde_json::from_str(json).unwrap();
         assert_eq!(job.version, 3);
-        assert_eq!(job.instance_id, "USB\\VID_0A5C&PID_21EC\\00198600226C");
-        assert_eq!(job.inf_sha256, "deadbeef");
+        assert_ne!(job.version, SUPPORTED_JOB_VERSION);
+    }
+
+    #[test]
+    fn v4_job_round_trips_the_new_fields() {
+        let json = r#"{"version":4,"mode":"install","vid":2652,"pid":8684,
+                       "inf_path":"C:\\x\\aokie_winusb_bluetooth.inf",
+                       "instance_id":"USB\\VID_0A5C&PID_21EC\\00198600226C",
+                       "inf_sha256":"deadbeef",
+                       "hardware_id":"USB\\VID_0A5C&PID_21EC",
+                       "allow_dev_self_sign":true}"#;
+        let job: DriverJob = serde_json::from_str(json).unwrap();
+        assert_eq!(job.version, 4);
+        assert_eq!(job.hardware_id, "USB\\VID_0A5C&PID_21EC");
+        assert!(job.allow_dev_self_sign);
     }
 }

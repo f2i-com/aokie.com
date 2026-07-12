@@ -181,7 +181,12 @@ pub fn sanitize_inf_string(value: &str) -> String {
     }
 }
 
-pub fn install_package(inf_path: &Path, vid: u16, pid: u16) -> Result<InstallResult, String> {
+pub fn install_package(
+    inf_path: &Path,
+    vid: u16,
+    pid: u16,
+    allow_dev_self_sign: bool,
+) -> Result<InstallResult, String> {
     let full_inf_path = inf_path
         .canonicalize()
         .map_err(|e| format!("could not canonicalize INF path {:?}: {}", inf_path, e))?;
@@ -195,11 +200,39 @@ pub fn install_package(inf_path: &Path, vid: u16, pid: u16) -> Result<InstallRes
     // INF in the driver store.
     parse_inf_or_describe(&full_inf_path)?;
 
-    // Generate + self-sign the catalog before SetupCopyOEMInfW. The
-    // INF references it by name (CatalogFile=...), and Windows 10/11
-    // refuse to install drivers without a valid signed cat.
-    super::pki::create_and_sign_cat(&full_inf_path, &hwid)
-        .map_err(|e| format!("CAT generation/signing failed: {}", e))?;
+    // DRIVER-001: catalog trust decision.
+    //   1. A `.cat` shipped WITH the package (a production attestation/
+    //      WHQL-signed driver) is used as-is — nothing is minted and NO
+    //      certificate is added to any machine store.
+    //   2. Otherwise, generating + self-signing a catalog (which installs
+    //      a locally-minted cert into LocalMachine\Root + TrustedPublisher)
+    //      happens ONLY when the caller explicitly allowed developer
+    //      self-signing. Production default is REFUSE — a machine-trusted
+    //      root CA must never appear as a side effect of a normal install.
+    let shipped_cat = super::pki::derive_cat_path(&full_inf_path)?;
+    if shipped_cat.is_file() {
+        eprintln!(
+            "[winusb] using the shipped signed catalog {:?} — no local signing certificate is generated",
+            shipped_cat
+        );
+    } else if allow_dev_self_sign {
+        eprintln!(
+            "[winusb] ⚠️ DEVELOPER SELF-SIGNING: generating a locally-signed catalog and \
+             trusting it via LocalMachine\\Root + TrustedPublisher. This is a dev-only \
+             posture — production installs use a signed driver package."
+        );
+        super::pki::create_and_sign_cat(&full_inf_path, &hwid)
+            .map_err(|e| format!("CAT generation/signing failed: {}", e))?;
+    } else {
+        return Err(
+            "driver package has no signed catalog (.cat) and developer self-signing is \
+             disabled: production installs require a properly signed driver package. \
+             (Dev builds allow self-signing automatically; on a release build set \
+             AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 only if you explicitly accept installing \
+             a locally-generated signing certificate into this machine's trust stores.)"
+                .to_string(),
+        );
+    }
 
     let inf_w = wide_null(&full_inf_path.to_string_lossy());
     let media_dir = full_inf_path
