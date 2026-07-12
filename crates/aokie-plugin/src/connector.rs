@@ -974,7 +974,7 @@ impl Plugin {
                         &session_id,
                         json!({"at": now_iso8601(), "simulated": true}),
                     );
-                    emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
+                    emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
                     return Ok(json!({"sessionId": session_id, "status": "pairing", "simulated": true}));
                 };
                 radio.start_pairing(seconds).map_err(CmdError::failed)?;
@@ -984,7 +984,7 @@ impl Plugin {
                     &session_id,
                     json!({"at": now_iso8601(), "windowSeconds": seconds}),
                 );
-                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
+                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
                 Ok(json!({
                     "sessionId": session_id,
                     "status": if radio.is_initialized() { "discoverable" } else { "starting" },
@@ -1083,7 +1083,7 @@ impl Plugin {
                     (c.correlation_id.clone(), call_json(c))
                 };
                 let ev = aokie_event(crate::contract::events::CALL_ANSWERED, &corr, json!({"at": now_iso8601()}));
-                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
+                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
                 Ok(json!({"answered": true, "call": snapshot}))
             }
             "call.reject" => {
@@ -1102,7 +1102,7 @@ impl Plugin {
                 call.state = MockCallState::Ended;
                 let corr = call.correlation_id.clone();
                 let ev = aokie_event(crate::contract::events::CALL_REJECTED, &corr, json!({"at": now_iso8601()}));
-                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
+                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
                 Ok(json!({"rejected": true}))
             }
             "call.hangup" => {
@@ -1138,7 +1138,7 @@ impl Plugin {
                         "outcome": "completed",
                     }),
                 );
-                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
+                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
                 Ok(json!({"ended": true}))
             }
             "call.operatorSpeak" => {
@@ -1254,7 +1254,7 @@ impl Plugin {
                     &message_id,
                     json!({"messageId": message_id, "to": to, "at": at, "simulated": true}),
                 );
-                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::from_ack(self.ack_mode)).map_err(CmdError::failed)?;
+                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
                 let thread = self.mock.thread_for(&to);
                 thread.messages.push(MockSmsMessage {
                     id: message_id.clone(),
@@ -1385,7 +1385,7 @@ impl Plugin {
         let mut emit = |plugin: &mut Plugin, ev: aokie_core::events::DesktopEvent| {
             // The scripted run records EVERY step in the outbox so
             // integration tests can assert write-before-emit.
-            emit_event(sink, &plugin.outbox, &ev, true, crate::event_bridge::EmitMode::from_ack(plugin.ack_mode)).map_err(CmdError::failed)?;
+            emit_event(sink, &plugin.outbox, &ev, true, crate::event_bridge::EmitMode::for_host(plugin.ack_mode, plugin.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
             emitted.push(ev.name.clone());
             Ok::<(), CmdError>(())
         };
@@ -1565,6 +1565,19 @@ impl Plugin {
         if counts.dead > 0 {
             reasons.push(format!("{} dead outbox event(s) need redrive", counts.dead));
         }
+        // AOK-DUR-001 item 3: an ack-incapable PRODUCTION host is UNHEALTHY —
+        // essential events are held in the outbox (RequireAck) rather than
+        // degraded to write-means-sent; with the explicit override the
+        // downgrade is still surfaced. Dev mode (mock host) is exempt.
+        if self.initialized && !self.ack_mode && !self.dev_mode {
+            reasons.push(if crate::event_bridge::legacy_host_allowed() {
+                "host does not support eventAck — legacy write-means-sent delivery in use (explicitly allowed)"
+                    .to_string()
+            } else {
+                "host does not support eventAck — essential events are HELD in the outbox until an ack-capable host connects"
+                    .to_string()
+            });
+        }
         // Replay-thread liveness (audit AOK-OUTBOX-002): durable delivery
         // silently freezing is exactly the failure health must not hide.
         let replay_age = self.replay_heartbeat.as_ref().map(|hb| {
@@ -1625,6 +1638,8 @@ impl Plugin {
                     "pending": counts.pending,
                     "failed": counts.failed,
                     "dead": counts.dead,
+                    // AOK-DUR-001: whether the host confirms durable receipt.
+                    "ackMode": self.ack_mode,
                 },
                 "config": {
                     "version": self.store.config.config_version,
@@ -2881,7 +2896,7 @@ mod tests {
             &plugin.outbox,
             &ev,
             false,
-            crate::event_bridge::EmitMode::from_ack(plugin.ack_mode),
+            crate::event_bridge::EmitMode::for_host(plugin.ack_mode, plugin.dev_mode || crate::event_bridge::legacy_host_allowed()),
         )
         .unwrap();
         assert_eq!(
@@ -2909,6 +2924,44 @@ mod tests {
             params: json!({"idempotencyKey": "aokie:nope:incoming:v1"}),
         };
         assert!(plugin.handle_rpc(stray, &mut sink).is_none());
+    }
+
+    /// AOK-DUR-001 item 3: a PRODUCTION (non-dev) host without eventAck is
+    /// unhealthy — health names the incompatibility and the outbox component
+    /// reports ackMode — while an ack-capable host clears the reason.
+    #[test]
+    fn non_ack_production_host_degrades_health() {
+        let mut plugin = Plugin::ephemeral(false); // non-dev = production posture
+        let mut sink = VecSink::default();
+        plugin
+            .handle_rpc(
+                request(1, "plugin.init", json!({"pluginApiVersion": 1})),
+                &mut sink,
+            )
+            .unwrap();
+        let health = plugin.build_health();
+        assert_eq!(health["status"], json!("degraded"));
+        assert!(
+            health["detail"].as_str().unwrap_or("").contains("eventAck"),
+            "names the incompatible host: {}",
+            health["detail"]
+        );
+        assert_eq!(health["components"]["outbox"]["ackMode"], json!(false));
+
+        // The same host WITH eventAck: no ack-related reason.
+        plugin
+            .handle_rpc(
+                request(2, "plugin.init", json!({"pluginApiVersion": 1, "features": ["eventAck"]})),
+                &mut sink,
+            )
+            .unwrap();
+        let health = plugin.build_health();
+        assert!(
+            !health["detail"].as_str().unwrap_or("").contains("eventAck"),
+            "ack-capable host is not flagged: {}",
+            health["detail"]
+        );
+        assert_eq!(health["components"]["outbox"]["ackMode"], json!(true));
     }
 
     /// Audit C-01: call controls accept an optional `callId`; a stale one

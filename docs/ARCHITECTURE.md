@@ -81,10 +81,20 @@ to a SQLite outbox **before** emission (`synchronous=FULL`). Delivery is
 ACK-gated: the desktop journals the envelope (fsynced) before sending
 `event.ack`; unacked rows stay pending and a replay thread re-delivers on
 backoff, dead-lettering after the attempt budget. Payloads (transcripts, SMS)
-are **DPAPI-protected at rest**. Dead rows expire after 14 days; an operator
-can redrive one (`outbox.redrive {idempotencyKey}`) or all (`{all:true}`). The
-replay thread's heartbeat is surfaced in `plugin.health`, so a frozen delivery
-pipeline degrades readiness rather than silently stalling.
+are **DPAPI-protected at rest with no plaintext fallback** (AOK-DUR-001): a
+protect failure QUARANTINES the event as a typed dead row (metadata kept,
+payload absent, never emitted or redriven), a decrypt failure dead-letters as
+`payload_unreadable` instead of emitting an empty replacement, and legacy
+plaintext rows are sealed in place at open (verified per row, then vacuumed so
+no plaintext pages survive). A host without `eventAck` is treated as
+incompatible in production: essential events are HELD in the outbox and
+`plugin.health` degrades, unless `AOKIE_ALLOW_LEGACY_HOST=1` explicitly
+accepts write-means-sent delivery (non-Windows dev builds likewise need
+`AOKIE_ALLOW_UNPROTECTED_OUTBOX=1` to store plaintext). Dead rows expire after
+14 days; an operator can redrive one (`outbox.redrive {idempotencyKey}`) or
+all (`{all:true}`) — undeliverable (quarantined/unreadable) rows are excluded.
+The replay thread's heartbeat is surfaced in `plugin.health`, so a frozen
+delivery pipeline degrades readiness rather than silently stalling.
 
 ## Contract
 

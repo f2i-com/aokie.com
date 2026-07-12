@@ -88,21 +88,40 @@ impl Sink for VecSink {
 /// How emission success is bookkept in the outbox (audit INT-003).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmitMode {
-    /// Legacy hosts (no `eventAck` feature): a successful WRITE marks the
-    /// row `sent` — the pre-ack behaviour, kept for compatibility.
+    /// Non-ack hosts with the EXPLICIT compatibility override
+    /// (`AOKIE_ALLOW_LEGACY_HOST=1`) or dev mode: a successful WRITE marks
+    /// the row `sent` — the pre-ack behaviour.
     Legacy,
     /// Ack-capable hosts: a successful write only schedules the next
     /// re-emission (`mark_emitted`); the row becomes `sent` when the host's
     /// `event.ack` notification confirms it DURABLY received the envelope.
     AckExpected,
+    /// AOK-DUR-001 item 3: the production default for a host WITHOUT
+    /// `eventAck`. Essential events are journaled to the outbox but HELD —
+    /// not emitted — because a non-ack host cannot confirm durable receipt
+    /// (and re-delivery to it would create duplicate business records). The
+    /// rows deliver when an ack-capable host connects; health reports the
+    /// incompatible host meanwhile.
+    RequireAck,
+}
+
+/// Whether the operator explicitly accepted legacy (write-means-sent)
+/// delivery to a host without `eventAck`.
+pub fn legacy_host_allowed() -> bool {
+    std::env::var("AOKIE_ALLOW_LEGACY_HOST").as_deref() == Ok("1")
 }
 
 impl EmitMode {
-    pub fn from_ack(ack: bool) -> Self {
+    /// Mode for the connected host. `allow_legacy` = dev mode or the
+    /// explicit `AOKIE_ALLOW_LEGACY_HOST=1` override — production non-ack
+    /// hosts get [`EmitMode::RequireAck`].
+    pub fn for_host(ack: bool, allow_legacy: bool) -> Self {
         if ack {
             EmitMode::AckExpected
-        } else {
+        } else if allow_legacy {
             EmitMode::Legacy
+        } else {
+            EmitMode::RequireAck
         }
     }
 }
@@ -126,14 +145,38 @@ pub fn emit_event(
         let outcome = outbox
             .insert_pending(event, TARGET_DESKTOP)
             .map_err(|e| format!("outbox write failed for {}: {e}", event.idempotency_key))?;
-        if outcome == crate::outbox::InsertOutcome::PayloadCollision {
-            // A DIFFERENT occurrence collided on this key (key-derivation
-            // bug — audit AOK-EVENT-001). The stored row is authoritative;
-            // emitting the rejected content under its key would make the
-            // host record the wrong occurrence. Refuse, loudly.
+        match outcome {
+            crate::outbox::InsertOutcome::PayloadCollision => {
+                // A DIFFERENT occurrence collided on this key (key-derivation
+                // bug — audit AOK-EVENT-001). The stored row is authoritative;
+                // emitting the rejected content under its key would make the
+                // host record the wrong occurrence. Refuse, loudly.
+                return Err(format!(
+                    "event.emit refused for {}: idempotency key {} already holds different content",
+                    event.name, event.idempotency_key
+                ));
+            }
+            crate::outbox::InsertOutcome::QuarantinedProtectFailed => {
+                // AOK-DUR-001: the sensitive payload could not be protected at
+                // rest, so it was quarantined (typed dead row, no payload).
+                // Emitting anyway would report success for an event whose
+                // durability just failed — refuse instead.
+                return Err(format!(
+                    "event.emit refused for {}: payload protection failed — event quarantined in the outbox",
+                    event.name
+                ));
+            }
+            crate::outbox::InsertOutcome::Inserted
+            | crate::outbox::InsertOutcome::Duplicate => {}
+        }
+        if mode == EmitMode::RequireAck {
+            // AOK-DUR-001 item 3: the host cannot acknowledge durable receipt.
+            // The event is safely journaled; HOLD it for an ack-capable host
+            // instead of degrading to write-means-sent (or duplicating records
+            // via un-deduped re-delivery).
             return Err(format!(
-                "event.emit refused for {}: idempotency key {} already holds different content",
-                event.name, event.idempotency_key
+                "event.emit held for {}: host does not support eventAck — event retained in the outbox (set AOKIE_ALLOW_LEGACY_HOST=1 to accept legacy delivery)",
+                event.name
             ));
         }
     }
@@ -150,6 +193,8 @@ pub fn emit_event(
                             .mark_emitted(&event.idempotency_key, None)
                             .map_err(|e| format!("outbox mark_emitted failed: {e}"))?;
                     }
+                    // Outboxed + RequireAck returned early above (held).
+                    EmitMode::RequireAck => {}
                 }
             }
             Ok(())
@@ -184,14 +229,18 @@ pub fn replay_once(sink: &mut dyn Sink, outbox: &Outbox, limit: u32) -> usize {
         let event: DesktopEvent = match serde_json::from_str(&row.payload_json) {
             Ok(ev) => ev,
             Err(e) => {
-                // Unparseable payload can never deliver — dead-letter it.
+                // Unparseable payload can never deliver — typed dead letter
+                // (AOK-DUR-001; undecryptable payloads are already filtered
+                // and dead-lettered inside due_for_retry, this is the JSON
+                // backstop for a corrupt legacy row).
                 eprintln!(
-                    "[aokie-plugin] outbox row {} has an unreadable payload ({e}) — dead-lettering",
+                    "[aokie-plugin] outbox row {} has an unparseable payload ({e}) — dead-lettering",
                     row.idempotency_key
                 );
-                for _ in 0..crate::outbox::MAX_ATTEMPTS {
-                    let _ = outbox.mark_failed(&row.idempotency_key, "unreadable payload", None);
-                }
+                let _ = outbox.mark_dead_typed(
+                    &row.idempotency_key,
+                    &format!("payload_unreadable: not valid JSON ({e})"),
+                );
                 continue;
             }
         };
@@ -463,6 +512,63 @@ mod tests {
         // emitted row needs its schedule rewound — go through a tiny SQL
         // shim exposed for tests via mark-then-rewind semantics.
         outbox.rewind_next_attempt_for_tests(key);
+    }
+
+    // ── AOK-DUR-001 ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn for_host_matrix_requires_ack_in_production() {
+        assert_eq!(EmitMode::for_host(true, false), EmitMode::AckExpected);
+        assert_eq!(EmitMode::for_host(true, true), EmitMode::AckExpected);
+        assert_eq!(EmitMode::for_host(false, true), EmitMode::Legacy, "explicit override only");
+        assert_eq!(EmitMode::for_host(false, false), EmitMode::RequireAck, "production default");
+    }
+
+    /// Item 3: on a host without eventAck (no override), an essential event
+    /// is journaled but HELD — nothing goes to the sink, the row stays
+    /// pending for an ack-capable host, and the caller gets a typed error
+    /// instead of a fake success. Non-essential events still flow.
+    #[test]
+    fn require_ack_holds_essential_events_in_the_outbox() {
+        let outbox = Outbox::open_in_memory().unwrap();
+        let mut sink = VecSink::default();
+        let ev = aokie_event(
+            crate::contract::events::SMS_RECEIVED,
+            "sms_hold",
+            json!({"from": "+61", "body": "hi"}),
+        );
+        let err = emit_event(&mut sink, &outbox, &ev, false, EmitMode::RequireAck).unwrap_err();
+        assert!(err.contains("held"), "typed hold: {err}");
+        assert!(sink.lines.is_empty(), "nothing emitted to a non-ack host");
+        assert_eq!(
+            outbox.status_of(&ev.idempotency_key).unwrap(),
+            Some(OutboxStatus::Pending),
+            "the business event is durably retained for an ack-capable host"
+        );
+
+        // Non-essential events carry no durability claim and still emit.
+        let info = aokie_event(crate::contract::events::DONGLE_DETECTED, "d1", json!({}));
+        emit_event(&mut sink, &outbox, &info, false, EmitMode::RequireAck).unwrap();
+        assert_eq!(sink.lines.len(), 1);
+    }
+
+    /// Item 1: a quarantined insert (protect failure) refuses emission — the
+    /// host never receives an event whose local durability failed.
+    #[test]
+    fn quarantined_event_is_not_emitted() {
+        let outbox = crate::outbox::Outbox::open_in_memory_with_protection(
+            crate::outbox::PayloadProtection::Unavailable,
+        )
+        .unwrap();
+        let mut sink = VecSink::default();
+        let ev = aokie_event(
+            crate::contract::events::CALL_TURN_FINAL,
+            "call_qq",
+            json!({"text": "secret"}),
+        );
+        let err = emit_event(&mut sink, &outbox, &ev, false, EmitMode::AckExpected).unwrap_err();
+        assert!(err.contains("quarantined"), "typed: {err}");
+        assert!(sink.lines.is_empty(), "no emission after a protect failure");
     }
 
     #[test]
