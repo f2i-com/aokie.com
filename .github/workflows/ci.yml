@@ -4,13 +4,16 @@ name: CI
 # lifecycle, isolation and delivery guarantees were only tested on the dev
 # machine. Runs on Windows because that is the only platform the plugin
 # ships on (WinUSB radio).
+# PAUSED 2026-07-12: automatic triggers (push/PR/tags) disabled while the account is
+# near its GitHub Actions usage limit. Run manually from the Actions tab. Restore the
+# push/pull_request triggers below when usage resets.
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+  # push:
+  #   branches: [main]
+  #   tags: ['v*']
+  # pull_request:
+  #   branches: [main]
 
 jobs:
   plugin:
