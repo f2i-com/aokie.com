@@ -211,7 +211,7 @@ pub fn run_loopback_self_test() -> Result<String, String> {
     // Anything under ~0.5 s of audio for a 5-word phrase is silence/garbage.
     if pcm.len() < 8_000 {
         return Err(format!(
-            "TTS produced only {} samples (~{} ms) for the test phrase — synthesis is silent",
+            "TTS produced only {} samples (~{} ms) for the test phrase - synthesis is silent",
             pcm.len(),
             pcm.len() / 16
         ));
@@ -243,7 +243,7 @@ pub fn self_test_verdict(heard: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "loopback transcript matched only {hits}/5 expected words — heard {heard:?}"
+            "loopback transcript matched only {hits}/5 expected words - heard {heard:?}"
         ))
     }
 }
