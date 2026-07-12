@@ -113,6 +113,24 @@ pub const DEFAULT_GREETING: &str = "Hello, thanks for calling. How can I help yo
 #[cfg(feature = "voice")]
 const END_CALL_INSTRUCTION: &str = "\n\nEnding the call: ONLY when the caller's request is fully handled and there is nothing left to do, give a brief, warm goodbye and then append the exact marker [[END_CALL]] at the very end of that same final message. Never write the marker mid-conversation or while a question is still open — it hangs up the call.";
 
+/// VOICE-001 fail-safe: what the caller hears when the responder breaks
+/// MID-call (LLM died / synthesis went silent) — a plain apology, then a
+/// clean hangup. Local + fixed so it needs nothing but TTS; when TTS itself
+/// is the broken half, the hangup still happens (silence must END, never
+/// stretch on).
+#[cfg(feature = "voice")]
+const FALLBACK_LINE: &str = "I'm sorry — I'm having technical trouble taking your call right now. \
+Please call back shortly. Goodbye.";
+
+/// VOICE-001, pure for tests: after a reply attempt, is the caller sitting in
+/// DEAD AIR? True only when nothing audibly played AND nothing else explains
+/// the silence — a barge-in means the caller is talking (their turn is already
+/// accumulating), and an operator action means a human has the call.
+#[cfg(feature = "voice")]
+fn reply_left_dead_air(audible: bool, barged: bool, operator_ended: bool) -> bool {
+    !audible && !barged && !operator_ended
+}
+
 /// Remove any end-of-call marker the LLM emitted (tolerant to small-model
 /// variants: bracketed or bare, any case) and report whether one was present.
 /// Returns the cleaned, trimmed text so the marker is never spoken or recorded.
@@ -200,6 +218,25 @@ pub struct RadioStatus {
     /// degrades plugin.health, and blocks auto-answer — a receptionist that
     /// can hear and speak but cannot think must not pick up.
     pub llm_error: Mutex<Option<String>>,
+    /// VOICE-001: the measured TTS→STT loopback self-test outcome. `None` =
+    /// still running (auto-answer stays blocked until it lands — never arm on
+    /// unproven engines); populated with ok/failed + duration once done.
+    /// Skip cases (HTTP endpoints, env override, non-voice build) record an
+    /// ok report with the skip reason so arming isn't held hostage.
+    pub self_test: Mutex<Option<VoiceSelfTest>>,
+}
+
+/// VOICE-001: one loopback self-test outcome (always compiled — non-voice
+/// builds just never populate it with a real run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceSelfTest {
+    pub ok: bool,
+    /// ISO-8601 completion instant.
+    pub at: String,
+    /// Wall-clock cost of the whole loopback (engine loads + inference).
+    pub duration_ms: u64,
+    /// What was heard / why it failed / why it was skipped.
+    pub detail: String,
 }
 
 /// Handle held by the [`Plugin`](crate::connector::Plugin): send control
@@ -262,6 +299,10 @@ impl RadioHandle {
     /// not probed — the probe only runs while the in-plugin agent owns replies).
     pub fn llm_error(&self) -> Option<String> {
         self.status.llm_error.lock().unwrap().clone()
+    }
+    /// VOICE-001: the loopback self-test outcome (None = still running).
+    pub fn self_test(&self) -> Option<VoiceSelfTest> {
+        self.status.self_test.lock().unwrap().clone()
     }
 
     /// AOK-BT-001: seconds left in the pairing window, 0 when closed or the radio
@@ -1326,8 +1367,102 @@ fn run_loop(
         if pf.stt_error.is_none() && pf.tts_error.is_none() {
             eprintln!("[aokie-plugin] voice preflight OK (ORT + STT/TTS assets or endpoints present)");
         }
+        let preflight_failed = pf.stt_error.is_some() || pf.tts_error.is_some();
         *status.stt_error.lock().unwrap() = pf.stt_error;
         *status.tts_error.lock().unwrap() = pf.tts_error;
+
+        // VOICE-001: the measured loopback self-test — EXERCISE the engines
+        // (TTS→STT round trip of a known phrase) before auto-answer may arm,
+        // so a corrupt model / broken provider / silent synthesis is caught at
+        // startup, not by the first caller. Runs on its own thread (the ONNX
+        // loads are heavy); auto-answer stays blocked until a report lands.
+        // Skip cases write an OK report with the reason so arming isn't held
+        // hostage: HTTP endpoints replace the local engines this test covers,
+        // and a failed preflight already blocks via its own slots.
+        let skip_reason: Option<String> =
+            if std::env::var("AOKIE_SKIP_SELF_TEST").as_deref() == Ok("1") {
+                Some("skipped (AOKIE_SKIP_SELF_TEST=1)".to_string())
+            } else if std::env::var("AOKIE_STT_ENDPOINT").is_ok_and(|v| !v.trim().is_empty())
+                || std::env::var("AOKIE_TTS_ENDPOINT").is_ok_and(|v| !v.trim().is_empty())
+            {
+                Some(
+                    "skipped: HTTP speech endpoint(s) configured — the local-engine loopback does not cover them"
+                        .to_string(),
+                )
+            } else if preflight_failed {
+                Some("skipped: asset preflight already failed (see stt/tts errors)".to_string())
+            } else {
+                None
+            };
+        match skip_reason {
+            Some(reason) => {
+                eprintln!("[aokie-plugin] voice self-test {reason}");
+                *status.self_test.lock().unwrap() = Some(VoiceSelfTest {
+                    ok: true,
+                    at: aokie_core::events::now_iso8601(),
+                    duration_ms: 0,
+                    detail: reason,
+                });
+            }
+            None => {
+                let status_st = status.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("aokie-voice-selftest".to_string())
+                    .spawn(move || {
+                        let started = std::time::Instant::now();
+                        // A panic inside the ONNX stack must still produce a
+                        // report — an empty slot blocks auto-answer forever.
+                        let outcome = std::panic::catch_unwind(
+                            crate::voice::run_loopback_self_test,
+                        )
+                        .unwrap_or_else(|_| {
+                            Err("self-test panicked inside the speech stack".to_string())
+                        });
+                        let report = match outcome {
+                            Ok(heard) => VoiceSelfTest {
+                                ok: true,
+                                at: aokie_core::events::now_iso8601(),
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                detail: format!("loopback ok — heard {heard:?}"),
+                            },
+                            Err(e) => VoiceSelfTest {
+                                ok: false,
+                                at: aokie_core::events::now_iso8601(),
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                detail: e,
+                            },
+                        };
+                        eprintln!(
+                            "[aokie-plugin] voice self-test {} in {}ms — {}",
+                            if report.ok { "PASSED" } else { "FAILED (auto-answer blocked)" },
+                            report.duration_ms,
+                            report.detail
+                        );
+                        *status_st.self_test.lock().unwrap() = Some(report);
+                    });
+                if let Err(e) = spawned {
+                    // Can't run it — never leave the slot empty (permanent block).
+                    eprintln!("[aokie-plugin] voice self-test thread failed to start: {e}");
+                    *status.self_test.lock().unwrap() = Some(VoiceSelfTest {
+                        ok: false,
+                        at: aokie_core::events::now_iso8601(),
+                        duration_ms: 0,
+                        detail: format!("self-test thread failed to start: {e}"),
+                    });
+                }
+            }
+        }
+    }
+    // Non-voice builds never run the loopback: record the skip so any reader
+    // (health) sees a settled state instead of "still running" forever.
+    #[cfg(not(feature = "voice"))]
+    {
+        *status.self_test.lock().unwrap() = Some(VoiceSelfTest {
+            ok: true,
+            at: aokie_core::events::now_iso8601(),
+            duration_ms: 0,
+            detail: "skipped: no voice output compiled".to_string(),
+        });
     }
     // Warn-once bookkeeping for the auto-answer voice block (per call id).
     let mut voice_block_logged_call: Option<String> = None;
@@ -1799,7 +1934,20 @@ fn run_loop(
                         } else {
                             None
                         };
-                        tts.or(stt).or(llm)
+                        // VOICE-001: never arm on UNPROVEN engines — the loopback
+                        // self-test must have landed (skip cases record ok) and
+                        // passed before the receptionist may pick up.
+                        let self_test = match status.self_test.lock().unwrap().as_ref() {
+                            None => Some(
+                                "voice self-test still running — arming once it passes"
+                                    .to_string(),
+                            ),
+                            Some(r) if !r.ok => {
+                                Some(format!("voice self-test failed: {}", r.detail))
+                            }
+                            Some(_) => None,
+                        };
+                        tts.or(stt).or(llm).or(self_test)
                     };
                     #[cfg(not(feature = "voice"))]
                     let voice_block: Option<String> = None;
@@ -2251,6 +2399,9 @@ fn run_loop(
                                 let plays_until = (t0 + reply_dur).max(Instant::now());
                                 mute_stt_until = Some(plays_until + Duration::from_millis(800));
                             }
+                            // VOICE-001: set below when this reply attempt left the
+                            // caller in DEAD AIR — triggers the fail-safe after the match.
+                            let mut dead_air_cause: Option<String> = None;
                             match outcome {
                                 Ok(full) => {
                                     // Truthful transcript (audit AK-008 + sweep): a
@@ -2281,6 +2432,21 @@ fn run_loop(
                                             clean
                                         }
                                     };
+                                    // VOICE-001: nothing audible + no barge/operator
+                                    // context = the caller is in DEAD AIR — an empty
+                                    // generation or fully-silent synthesis both count.
+                                    if reply_left_dead_air(
+                                        reply_dur > Duration::ZERO,
+                                        barged,
+                                        operator_ended,
+                                    ) {
+                                        dead_air_cause = Some(if heard.is_empty() {
+                                            "the assistant produced an empty reply".to_string()
+                                        } else {
+                                            "speech synthesis produced no audio for the whole reply"
+                                                .to_string()
+                                        });
+                                    }
                                     // Truthful transcript (AOK-VOICE-001): an
                                     // un-cut reply whose synthesis produced no
                                     // audio AT ALL was never heard — record
@@ -2324,6 +2490,19 @@ fn run_loop(
                                         emit_turn(outbox, sink, &corr, turn_index, "bot", &heard);
                                         turn_index += 1;
                                         last_bot_reply = heard;
+                                    } else if reply_left_dead_air(false, barged, operator_ended) {
+                                        // VOICE-001: total failure — the caller heard
+                                        // nothing at all. Record it as a definitive
+                                        // live LLM failure (health degrades; the
+                                        // PROC-001 probe re-clears on recovery) and
+                                        // take the fail-safe below. A PARTIAL reply
+                                        // is transient: the caller heard something,
+                                        // the next turn may still work.
+                                        *status.llm_error.lock().unwrap() = Some(format!(
+                                            "agent reply failed during a live call: {e}"
+                                        ));
+                                        dead_air_cause =
+                                            Some(format!("the assistant failed to reply ({e})"));
                                     }
                                 }
                             }
@@ -2341,13 +2520,58 @@ fn run_loop(
                                 stt_had_speech = true;
                                 stt_silence = Duration::ZERO;
                             }
+                            // VOICE-001 fail-safe: the caller asked something and heard
+                            // NOTHING — the responder is broken mid-call. Never leave
+                            // them in dead air: apologise with the canned line
+                            // (best-effort — TTS may be the broken half) and end the
+                            // call cleanly. The hangup happens EVEN IF the fallback
+                            // itself is silent: ending the call IS the safe outcome.
+                            let mut ended_by_failsafe = false;
+                            if let Some(cause) = dead_air_cause {
+                                eprintln!(
+                                    "[aokie-plugin] responder failed mid-call ({cause}) — speaking the fallback line and ending the call (VOICE-001)"
+                                );
+                                let out = tts_speak(
+                                    bt,
+                                    &mut tts,
+                                    &mut http_tts,
+                                    FALLBACK_LINE,
+                                    sr,
+                                    None,
+                                    None,
+                                );
+                                note_tts_outcome(&status, &out);
+                                if out.dur > Duration::ZERO {
+                                    // Truthful transcript: the apology WAS heard.
+                                    emit_turn(outbox, sink, &corr, turn_index, "bot", FALLBACK_LINE);
+                                    turn_index += 1;
+                                    // Let the SCO buffer drain the tail before CHUP.
+                                    std::thread::sleep(Duration::from_millis(900));
+                                } else {
+                                    eprintln!(
+                                        "[aokie-plugin] fallback line also produced no audio — hanging up without it"
+                                    );
+                                }
+                                tracker.note_intent(
+                                    crate::call_session::TerminationIntent::AgentHangup,
+                                );
+                                match bt.hangup() {
+                                    Ok(()) => eprintln!(
+                                        "[aokie-plugin] fail-safe hangup complete (AT+CHUP)"
+                                    ),
+                                    Err(e) => {
+                                        eprintln!("[aokie-plugin] fail-safe hangup failed: {e}")
+                                    }
+                                }
+                                ended_by_failsafe = true;
+                            }
                             // Agent-initiated hangup: the reply carried the end-call
                             // marker, so the call is fully handled. Respect a barge-in
                             // (the caller may have more to say) and any operator action
                             // that already ended it. The farewell played in real time via
                             // tts_speak; give the SCO buffer a brief moment to drain its
                             // tail before AT+CHUP cuts the channel.
-                            if hangup_requested && !barged && !operator_ended {
+                            if hangup_requested && !barged && !operator_ended && !ended_by_failsafe {
                                 std::thread::sleep(Duration::from_millis(900));
                                 tracker.note_intent(
                                     crate::call_session::TerminationIntent::AgentHangup,
@@ -2874,6 +3098,22 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VOICE-001: the dead-air decision — the fail-safe (apologise + hang up)
+    /// fires ONLY when nothing audibly played and nothing else explains the
+    /// silence. A barge means the caller is talking; an operator action means
+    /// a human owns the call; any audible sentence = transient, keep going.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn dead_air_fires_only_on_unexplained_total_silence() {
+        assert!(reply_left_dead_air(false, false, false), "total silence = dead air");
+        assert!(!reply_left_dead_air(true, false, false), "partial reply is transient");
+        assert!(!reply_left_dead_air(false, true, false), "barge = caller talking");
+        assert!(!reply_left_dead_air(false, false, true), "operator owns the call");
+        assert!(!reply_left_dead_air(true, true, true));
+        // The canned apology must be non-trivial speech, not a stub.
+        assert!(FALLBACK_LINE.len() > 40 && FALLBACK_LINE.contains("sorry"));
+    }
 
     /// The agent-hangup end-call marker must be stripped from spoken/recorded
     /// text (tolerant to small-model bracket/case variants) and its presence
