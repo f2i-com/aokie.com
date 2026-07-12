@@ -161,7 +161,7 @@ pub fn create_and_sign_cat(
     Ok(cat_path)
 }
 
-fn derive_cat_path(inf_path: &Path) -> Result<std::path::PathBuf, String> {
+pub(crate) fn derive_cat_path(inf_path: &Path) -> Result<std::path::PathBuf, String> {
     inf_path
         .extension()
         .and_then(|ext| ext.to_str())
