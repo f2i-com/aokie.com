@@ -796,12 +796,76 @@ pub fn write_scan_enable(transport: &AokieHciTransport, scan_enable: u8) -> Resu
     )
 }
 
-fn handle_diagnostic_pairing_event(
+/// PAIR-001: how the pairing handshake steps are answered. Groups the
+/// AOK-BT-001 window gate with the two authentication policies the audit
+/// added so every call site states its full posture explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingPolicy {
+    /// AOK-BT-001: an explicit pairing window is currently open.
+    pub pairing_open: bool,
+    /// Legacy PIN ("0000") pairing for pre-SSP peers. DEFAULT OFF — a fixed
+    /// well-known PIN authenticates nothing, so it only exists behind the
+    /// explicit `legacyPairingPin` compat setting, and even then only inside
+    /// an open pairing window.
+    pub legacy_pin_allowed: bool,
+    /// true = production runtime: SSP runs as NUMERIC COMPARISON
+    /// (DisplayYesNo + MITM) and the UserConfirmationRequest is HELD for the
+    /// operator instead of auto-accepted; the caller must surface
+    /// `PairingOutcome::ConfirmationPending` to a human and later send the
+    /// (negative) confirmation reply itself.
+    /// false = diagnostic CLIs: just-works auto-accept (the CLI invocation
+    /// IS the explicit operator action).
+    pub operator_confirm: bool,
+}
+
+impl PairingPolicy {
+    /// Diagnostic tools (`aokie-dongle` listen/call CLIs): running them is an
+    /// explicit operator action, so the window is treated as open and SSP is
+    /// auto-confirmed. Legacy PIN stays available for bench dongles.
+    pub fn diagnostic() -> Self {
+        Self {
+            pairing_open: true,
+            legacy_pin_allowed: true,
+            operator_confirm: false,
+        }
+    }
+
+    /// The production radio runtime: window state comes from the live
+    /// `PairingWindow`, legacy PIN from the `legacyPairingPin` setting, and
+    /// numeric confirmation always goes to the operator.
+    pub fn runtime(pairing_open: bool, legacy_pin_allowed: bool) -> Self {
+        Self {
+            pairing_open,
+            legacy_pin_allowed,
+            operator_confirm: true,
+        }
+    }
+}
+
+/// What a pairing-related HCI event resolved to (PAIR-001).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingOutcome {
+    /// Handled synchronously — the string is the log line.
+    Logged(String),
+    /// SSP numeric comparison is waiting on the operator: NO HCI reply has
+    /// been sent. The caller shows `numeric_value` next to the phone's
+    /// display and answers with `user_confirmation_request_reply_command`
+    /// (accept) or `user_confirmation_request_negative_reply_command`
+    /// (reject / timeout) — never silently.
+    ConfirmationPending {
+        address: String,
+        numeric_value: u32,
+    },
+}
+
+fn handle_pairing_event(
     transport: &AokieHciTransport,
     pairing_store: &mut AokiePairingStore,
     event: &hci::HciEvent,
-    pairing_open: bool,
-) -> Result<Option<String>, String> {
+    policy: PairingPolicy,
+) -> Result<Option<PairingOutcome>, String> {
+    let pairing_open = policy.pairing_open;
+    let logged = |s: String| Ok(Some(PairingOutcome::Logged(s)));
     match event {
         hci::HciEvent::LinkKeyRequest { address } => {
             if let Some(record) = pairing_store.get(address)? {
@@ -812,10 +876,10 @@ fn handle_diagnostic_pairing_event(
                     hci::OPCODE_LINK_KEY_REQUEST_REPLY,
                     "Link Key Request Reply",
                 )?;
-                Ok(Some(format!(
+                logged(format!(
                     "sent stored link-key reply type 0x{:02x}",
                     record.key_type
-                )))
+                ))
             } else {
                 let command = hci::link_key_request_negative_reply_command(address)?;
                 command_status(
@@ -824,9 +888,7 @@ fn handle_diagnostic_pairing_event(
                     hci::OPCODE_LINK_KEY_REQUEST_NEGATIVE_REPLY,
                     "Link Key Request Negative Reply",
                 )?;
-                Ok(Some(
-                    "sent negative link-key reply (no stored key)".to_string(),
-                ))
+                logged("sent negative link-key reply (no stored key)".to_string())
             }
         }
         hci::HciEvent::LinkKeyNotification {
@@ -838,16 +900,16 @@ fn handle_diagnostic_pairing_event(
             // A reconnecting bonded device uses LinkKeyRequest→reply and never emits
             // a notification, so refusing here only rejects an unsanctioned fresh bond.
             if !may_complete_new_bond(pairing_open) {
-                return Ok(Some(
-                    "refused link-key store — no pairing window open".to_string(),
-                ));
+                return logged("refused link-key store — no pairing window open".to_string());
             }
             pairing_store.put(address, *link_key, *key_type)?;
-            Ok(Some(format!("stored link key type 0x{:02x}", key_type)))
+            logged(format!("stored link key type 0x{:02x}", key_type))
         }
         hci::HciEvent::PinCodeRequest { address } => {
-            // Legacy PIN pairing — a fresh bond; gated on the window (AOK-BT-001).
-            if !may_complete_new_bond(pairing_open) {
+            // Legacy PIN pairing — a fresh bond; gated on the window (AOK-BT-001)
+            // AND on the explicit compat setting (PAIR-001): a fixed "0000" PIN
+            // authenticates nothing, so it is refused unless deliberately enabled.
+            if !may_complete_new_bond(pairing_open) || !policy.legacy_pin_allowed {
                 let command = hci::pin_code_request_negative_reply_command(address)?;
                 command_status(
                     transport,
@@ -855,10 +917,18 @@ fn handle_diagnostic_pairing_event(
                     hci::OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY,
                     "PIN Code Request Negative Reply",
                 )?;
-                return Ok(Some(
-                    "refused PIN pairing — no pairing window open".to_string(),
-                ));
+                return logged(if may_complete_new_bond(pairing_open) {
+                    "refused legacy PIN pairing — legacyPairingPin compat mode is off (PAIR-001)"
+                        .to_string()
+                } else {
+                    "refused PIN pairing — no pairing window open".to_string()
+                });
             }
+            eprintln!(
+                "[AokieRadio] ⚠️ legacy PIN pairing in use for {} — the fixed \"{}\" PIN \
+                 provides NO authentication; disable legacyPairingPin once the device is bonded",
+                address, AOKIE_LEGACY_PIN
+            );
             let command = hci::pin_code_request_reply_command(address, AOKIE_LEGACY_PIN)?;
             command_status(
                 transport,
@@ -866,7 +936,7 @@ fn handle_diagnostic_pairing_event(
                 hci::OPCODE_PIN_CODE_REQUEST_REPLY,
                 "PIN Code Request Reply",
             )?;
-            Ok(Some(format!("sent legacy PIN reply {}", AOKIE_LEGACY_PIN)))
+            logged(format!("sent legacy PIN reply {}", AOKIE_LEGACY_PIN))
         }
         hci::HciEvent::IoCapabilityRequest { address } => {
             // Simple Pairing IO-capability exchange — a fresh bond; gated (AOK-BT-001).
@@ -879,15 +949,30 @@ fn handle_diagnostic_pairing_event(
                     hci::OPCODE_IO_CAPABILITY_REQUEST_NEGATIVE_REPLY,
                     "IO Capability Request Negative Reply",
                 )?;
-                return Ok(Some(
-                    "refused Simple Pairing — no pairing window open".to_string(),
-                ));
+                return logged("refused Simple Pairing — no pairing window open".to_string());
             }
+            // PAIR-001: in production the Desktop UI is our display, so we
+            // advertise DisplayYesNo + MITM — SSP resolves to numeric
+            // comparison and a stranger can't complete a silent just-works
+            // bond during the window. Diagnostic CLIs keep just-works.
+            let (io_capability, authreq, label) = if policy.operator_confirm {
+                (
+                    hci::SSP_IO_CAPABILITY_DISPLAY_YES_NO,
+                    hci::SSP_AUTHREQ_MITM_REQUIRED_GENERAL_BONDING,
+                    "sent DisplayYesNo + MITM-required IO capability reply (numeric comparison)",
+                )
+            } else {
+                (
+                    hci::SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT,
+                    hci::SSP_AUTHREQ_MITM_NOT_REQUIRED_GENERAL_BONDING,
+                    "sent no-input/no-output IO capability reply",
+                )
+            };
             let command = hci::io_capability_request_reply_command(
                 address,
-                hci::SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT,
+                io_capability,
                 hci::SSP_OOB_DATA_NOT_PRESENT,
-                hci::SSP_AUTHREQ_MITM_NOT_REQUIRED_GENERAL_BONDING,
+                authreq,
             )?;
             command_status(
                 transport,
@@ -895,12 +980,13 @@ fn handle_diagnostic_pairing_event(
                 hci::OPCODE_IO_CAPABILITY_REQUEST_REPLY,
                 "IO Capability Request Reply",
             )?;
-            Ok(Some(
-                "sent no-input/no-output IO capability reply".to_string(),
-            ))
+            logged(label.to_string())
         }
-        hci::HciEvent::UserConfirmationRequest { address, .. } => {
-            // The just-works confirmation that seals an SSP bond; gated (AOK-BT-001).
+        hci::HciEvent::UserConfirmationRequest {
+            address,
+            numeric_value,
+        } => {
+            // The confirmation that seals an SSP bond; gated (AOK-BT-001).
             if !may_complete_new_bond(pairing_open) {
                 let command = hci::user_confirmation_request_negative_reply_command(address)?;
                 command_status(
@@ -909,9 +995,18 @@ fn handle_diagnostic_pairing_event(
                     hci::OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY,
                     "User Confirmation Request Negative Reply",
                 )?;
-                return Ok(Some(
+                return logged(
                     "refused Simple Pairing confirmation — no pairing window open".to_string(),
-                ));
+                );
+            }
+            if policy.operator_confirm {
+                // PAIR-001: HOLD the reply — the operator must compare the
+                // numeric code against the phone's display and answer via the
+                // Desktop UI. The caller owns sending the eventual reply.
+                return Ok(Some(PairingOutcome::ConfirmationPending {
+                    address: address.clone(),
+                    numeric_value: *numeric_value,
+                }));
             }
             let command = hci::user_confirmation_request_reply_command(address)?;
             command_status(
@@ -920,7 +1015,7 @@ fn handle_diagnostic_pairing_event(
                 hci::OPCODE_USER_CONFIRMATION_REQUEST_REPLY,
                 "User Confirmation Request Reply",
             )?;
-            Ok(Some("auto-confirmed Simple Pairing request".to_string()))
+            logged("auto-confirmed Simple Pairing request".to_string())
         }
         _ => Ok(None),
     }
@@ -932,20 +1027,38 @@ pub(crate) fn handle_diagnostic_hci_event(
     event: &hci::HciEvent,
 ) -> Result<Option<String>, String> {
     // Diagnostic sessions (the `aokie-dongle` listen/call tools) are an EXPLICIT
-    // operator action to exercise pairing, so the window is treated as open.
-    handle_hci_event_with_codec(transport, pairing_store, event, None, true)
+    // operator action to exercise pairing: window treated as open, legacy PIN
+    // available, SSP auto-confirmed (PairingPolicy::diagnostic()).
+    Ok(
+        handle_hci_event_with_policy(
+            transport,
+            pairing_store,
+            event,
+            None,
+            PairingPolicy::diagnostic(),
+        )?
+        .map(|outcome| match outcome {
+            PairingOutcome::Logged(action) => action,
+            // Unreachable with operator_confirm=false, but stay total.
+            PairingOutcome::ConfirmationPending { address, .. } => {
+                format!("pairing confirmation pending for {}", address)
+            }
+        }),
+    )
 }
 
-pub(crate) fn handle_hci_event_with_codec(
+pub(crate) fn handle_hci_event_with_policy(
     transport: &AokieHciTransport,
     pairing_store: &mut AokiePairingStore,
     event: &hci::HciEvent,
     selected_codec: Option<&(String, u16)>,
-    pairing_open: bool,
-) -> Result<Option<String>, String> {
-    if let Some(action) = handle_diagnostic_pairing_event(transport, pairing_store, event, pairing_open)? {
-        return Ok(Some(action));
+    policy: PairingPolicy,
+) -> Result<Option<PairingOutcome>, String> {
+    if let Some(outcome) = handle_pairing_event(transport, pairing_store, event, policy)? {
+        return Ok(Some(outcome));
     }
+    let pairing_open = policy.pairing_open;
+    let logged = |s: String| Ok(Some(PairingOutcome::Logged(s)));
 
     match event {
         hci::HciEvent::ConnectionRequest {
@@ -959,14 +1072,15 @@ pub(crate) fn handle_hci_event_with_codec(
             if !may_accept_acl_connection(is_bonded, pairing_open) {
                 let command = hci::reject_connection_request_command(address)?;
                 transport.write_command(&command)?;
-                return Ok(Some(
-                    "rejected incoming ACL from unknown device (no pairing window open)".to_string(),
-                ));
+                return logged(
+                    "rejected incoming ACL from unknown device (no pairing window open)"
+                        .to_string(),
+                );
             }
             let command =
                 hci::accept_connection_request_command(address, hci::ACCEPT_ROLE_REMAIN_SLAVE)?;
             transport.write_command(&command)?;
-            Ok(Some("accepted incoming ACL connection request".to_string()))
+            logged("accepted incoming ACL connection request".to_string())
         }
         hci::HciEvent::ConnectionRequest {
             address, link_type, ..
@@ -982,15 +1096,15 @@ pub(crate) fn handle_hci_event_with_codec(
                 params.packet_types,
             )?;
             transport.write_command(&command)?;
-            Ok(Some(format!(
+            logged(format!(
                 "accepted incoming SCO/eSCO connection request ({})",
                 params.codec_label
-            )))
+            ))
         }
-        hci::HciEvent::ConnectionRequest { link_type, .. } => Ok(Some(format!(
+        hci::HciEvent::ConnectionRequest { link_type, .. } => logged(format!(
             "ignored unsupported connection request link type {}",
             link_type
-        ))),
+        )),
         _ => Ok(None),
     }
 }
@@ -1328,6 +1442,29 @@ mod tests {
         assert!(
             !may_complete_new_bond(false),
             "no new bond can complete at rest, even for a device mid-handshake"
+        );
+    }
+
+    #[test]
+    fn pairing_policy_postures_match_pair_001() {
+        // PAIR-001 acceptance: production holds SSP for the operator (numeric
+        // comparison) and refuses the fixed legacy PIN unless the compat
+        // setting is explicitly on; diagnostic CLIs stay just-works.
+        let diag = PairingPolicy::diagnostic();
+        assert!(diag.pairing_open, "a diag session IS the operator action");
+        assert!(diag.legacy_pin_allowed, "bench dongles keep the PIN path");
+        assert!(!diag.operator_confirm, "diag auto-confirms just-works");
+
+        let at_rest = PairingPolicy::runtime(false, false);
+        assert!(!at_rest.pairing_open);
+        assert!(!at_rest.legacy_pin_allowed, "legacy PIN is OFF by default");
+        assert!(at_rest.operator_confirm, "production always holds SSP");
+
+        let compat = PairingPolicy::runtime(true, true);
+        assert!(compat.pairing_open && compat.legacy_pin_allowed);
+        assert!(
+            compat.operator_confirm,
+            "the compat setting must not disable numeric comparison for SSP peers"
         );
     }
 
