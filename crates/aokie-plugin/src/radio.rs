@@ -574,7 +574,7 @@ pub fn spawn(
                     return;
                 }
             };
-            let mode = crate::event_bridge::EmitMode::from_ack(ack_mode);
+            let mode = crate::event_bridge::EmitMode::for_host(ack_mode, crate::event_bridge::legacy_host_allowed());
             let mut sink = crate::event_bridge::StdoutSink::new();
             // Exit supervision (audit AOK-RUN-001): the spawner returned long
             // ago — if the loop panics or returns, readiness must flip
