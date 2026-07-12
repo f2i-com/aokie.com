@@ -1,0 +1,13 @@
+[package]
+name = "package-signer"
+version = "0.1.0"
+edition = "2021"
+description = "First-party Ed25519 package-manifest signing for Aokie release bundles (TRUST-001)"
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["signature", "rand_core"] }
+base64 = "0.22"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+getrandom = "0.2"

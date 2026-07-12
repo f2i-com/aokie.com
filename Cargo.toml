@@ -10,6 +10,10 @@ members = [
     "crates/aokie-voice-server",
     "crates/aokie-receptionist",
     "crates/aokie-plugin",
+    # First-party Ed25519 bundle signing (TRUST-001): writes package-manifest.json
+    # pinning every release-bundle file's digest; FormLogic Desktop pins the public
+    # key and refuses to launch tampered plugin directories.
+    "crates/package-signer",
     # Vendored fork of andrewleech/transcribe-rs — the ONNX ASR engines
     # (Moonshine, Qwen3-ASR, …). A member so the workspace shares one
     # lock + bundled-SQLite/ort version; kept out of default-members

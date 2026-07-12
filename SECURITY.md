@@ -21,3 +21,19 @@ Pre-1.0: only `main` and the latest release receive fixes.
   the plugin at build time; a byte of drift refuses to elevate. The
   self-signed driver-trust path is a development affordance — production
   driver signing is tracked in the FormLogic repo's `LAUNCH_CHECKLIST.md`.
+
+## Release bundle signing (TRUST-001)
+
+Release bundles carry a first-party `package-manifest.json`: an Ed25519
+signature (key id `fl-aokie-2026a`) over the SHA-256 + size of every bundle
+file, produced by `crates/package-signer` in the release pipeline. FormLogic
+Desktop pins the PUBLIC key and refuses to launch a plugin directory whose
+signature or digests do not verify (tampered = quarantined). The signing seed
+lives only in the CI secret store (`AOKIE_PACKAGE_SIGNING_KEY`) and the
+operator's offline key file — never in this repository. Tag releases FAIL
+without both the Authenticode certificate and the package signing key; verify
+a downloaded bundle offline with:
+
+```
+cargo run -p package-signer -- verify --dir <bundle> --pubkey n832sELL2yC6UksKhiz4C4UY7P9//mf8JfeFJRcuk5s=
+```
