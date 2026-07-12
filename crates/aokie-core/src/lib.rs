@@ -18,6 +18,7 @@
 pub mod consent;
 pub mod crashlog;
 pub mod dongle_catalog;
+pub mod dpapi;
 pub mod events;
 pub mod model_verify_cache;
 pub mod paths;

@@ -14,6 +14,9 @@ pub mod preferred_dongle;
 /// Re-exported so the plugin can hold a lock-free handle to the radio's pairing
 /// window (AOK-BT-001) without a direct aokie-bluetooth dependency.
 pub use aokie_bluetooth::aokie_radio::runtime::PairingWindow;
+/// Re-exported so the plugin can surface the held SSP numeric comparison in
+/// `phone.status` without a direct aokie-bluetooth dependency (PAIR-001).
+pub use aokie_bluetooth::aokie_radio::runtime::{PairingConfirmSlot, PendingPairingConfirm};
 
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +55,13 @@ pub enum BluetoothEvent {
     /// the AG.
     SmsSent {
         recipient_phone: String,
+    },
+    /// PAIR-001: SSP numeric comparison held for the operator — both the
+    /// phone and the Desktop UI show `numeric_value`; the operator answers
+    /// via `confirm_pairing`.
+    PairingConfirmRequired {
+        address: String,
+        numeric_value: u32,
     },
     Error(String),
 }
@@ -218,9 +228,21 @@ impl BluetoothManager {
     }
 
     /// AOK-BT-001: forget a bonded device so it can no longer reconnect
-    /// without pairing again. Returns whether a link key was removed.
+    /// without pairing again. Disconnects an active session for that device
+    /// first (PAIR-001). Returns whether a link key was removed.
     pub fn remove_paired(&self, address: &str) -> Result<bool, String> {
         self.runtime.remove_paired(address.to_string())
+    }
+
+    /// PAIR-001: a clone of the shared pending-confirmation slot for
+    /// lock-free `phone.status` reads.
+    pub fn pairing_confirm_slot(&self) -> PairingConfirmSlot {
+        self.runtime.pairing_confirm_slot()
+    }
+
+    /// PAIR-001: resolve the held SSP numeric comparison for `address`.
+    pub fn confirm_pairing(&self, address: &str, accept: bool) -> Result<(), String> {
+        self.runtime.confirm_pairing(address.to_string(), accept)
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -329,6 +351,13 @@ fn bluetooth_event_from_runtime(
             msg_type,
         }),
         RuntimeEvent::SmsSent { recipient_phone } => BluetoothEvent::SmsSent { recipient_phone },
+        RuntimeEvent::PairingConfirmRequired {
+            address,
+            numeric_value,
+        } => BluetoothEvent::PairingConfirmRequired {
+            address,
+            numeric_value,
+        },
         RuntimeEvent::Error(e) => BluetoothEvent::Error(e),
     }
 }

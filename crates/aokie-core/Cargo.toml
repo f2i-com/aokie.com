@@ -31,6 +31,9 @@ windows-sys = { version = "0.59", features = [
     # CreateFileW's signature references SECURITY_ATTRIBUTES, so the
     # Storage_FileSystem binding needs Win32_Security enabled too.
     "Win32_Security",
+    # dpapi.rs (PAIR-001): CryptProtectData / CryptUnprotectData for
+    # sealing small credentials (Bluetooth link keys) at rest.
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
 ] }

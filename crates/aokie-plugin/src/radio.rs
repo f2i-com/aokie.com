@@ -77,6 +77,13 @@ pub enum RadioControl {
         address: String,
         reply: std::sync::mpsc::Sender<Result<bool, String>>,
     },
+    /// PAIR-001: resolve the held SSP numeric comparison for `address` —
+    /// `accept` completes the bond, `false` refuses it.
+    ConfirmPairing {
+        address: String,
+        accept: bool,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
     /// AOK-BT-001: list bonded (revocable) device addresses; answered over `reply`.
     ListBonded {
         reply: std::sync::mpsc::Sender<Vec<String>>,
@@ -170,6 +177,10 @@ pub struct RadioStatus {
     /// radio starts. Lets `phone.status` report pairing state (remaining seconds)
     /// without round-tripping the radio thread. `None` until the radio is up.
     pub pairing_window: Mutex<Option<aokie_dongle::bluetooth::PairingWindow>>,
+    /// PAIR-001: a lock-free handle to the held SSP numeric comparison, set
+    /// once the radio starts. Lets `phone.status` surface {address,
+    /// numericValue} for the operator confirm prompt without an RPC.
+    pub pairing_confirm: Mutex<Option<aokie_dongle::bluetooth::PairingConfirmSlot>>,
     /// AOK-VOICE-001: the last KNOWN speech-to-text failure (missing/corrupt
     /// model, ORT DLL gone, engine load error). `None` = no known failure.
     /// Seeded by the startup asset preflight, updated by live engine loads.
@@ -277,6 +288,31 @@ impl RadioHandle {
         self.send(RadioControl::ListBonded { reply: tx })?;
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|_| "the radio did not answer the listPaired request".to_string())
+    }
+
+    /// PAIR-001: the held SSP numeric comparison awaiting the operator, if
+    /// any (lock-free slot read; expired prompts read as None).
+    pub fn pending_pairing_confirm(
+        &self,
+    ) -> Option<aokie_dongle::bluetooth::PendingPairingConfirm> {
+        self.status
+            .pairing_confirm
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(|s| s.get()))
+    }
+
+    /// PAIR-001: resolve the held SSP numeric comparison (blocks briefly on
+    /// the radio thread, which owns the HCI transport).
+    pub fn confirm_pairing(&self, address: String, accept: bool) -> Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send(RadioControl::ConfirmPairing {
+            address,
+            accept,
+            reply: tx,
+        })?;
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "the radio did not answer the confirmPairing request".to_string())?
     }
 }
 
@@ -556,6 +592,8 @@ pub fn spawn(
             // AOK-BT-001: publish the shared pairing window so phone.status can
             // report pairing state lock-free.
             *status_thread.pairing_window.lock().unwrap() = Some(bt.pairing_window());
+            // PAIR-001: publish the shared pending-confirmation slot the same way.
+            *status_thread.pairing_confirm.lock().unwrap() = Some(bt.pairing_confirm_slot());
             // Second connection to the same outbox file (see module docs).
             // Fail CLOSED (audit AOK-RUN-001): call/SMS events are the
             // business record — if they can't be durably queued, the radio
@@ -2409,6 +2447,13 @@ fn run_loop(
                 Ok(RadioControl::RemovePaired { address, reply }) => {
                     let _ = reply.send(bt.remove_paired(&address));
                 }
+                Ok(RadioControl::ConfirmPairing {
+                    address,
+                    accept,
+                    reply,
+                }) => {
+                    let _ = reply.send(bt.confirm_pairing(&address, accept));
+                }
                 Ok(RadioControl::ListBonded { reply }) => {
                     let _ = reply.send(bt.bonded_addresses());
                 }
@@ -2673,6 +2718,29 @@ fn handle_event(
                     crate::contract::events::SMS_SENT,
                     &message_id,
                     json!({"messageId": message_id, "to": recipient_phone, "at": now_iso8601()}),
+                ),
+            );
+        }
+        E::PairingConfirmRequired {
+            address,
+            numeric_value,
+        } => {
+            // PAIR-001: surface the held SSP numeric comparison so the Desktop
+            // pairing UI can prompt the operator (phone.status carries the same
+            // data for pollers). Not essential/outboxed — the prompt expires in
+            // seconds, so replaying it after a host restart would be wrong.
+            emit(
+                outbox,
+                sink,
+                aokie_event_occurrence(
+                    crate::contract::events::PHONE_PAIRING_CONFIRM_REQUIRED,
+                    "radio",
+                    &occurrence_id(),
+                    json!({
+                        "address": address,
+                        "numericValue": numeric_value,
+                        "at": now_iso8601(),
+                    }),
                 ),
             );
         }
