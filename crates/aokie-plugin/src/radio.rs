@@ -193,6 +193,13 @@ pub struct RadioStatus {
     /// degrades plugin.health and blocks auto-answer (never answer into
     /// silence).
     pub tts_error: Mutex<Option<String>>,
+    /// PROC-001: the last KNOWN LLM-reachability failure. Only meaningful when
+    /// the IN-PLUGIN agent owns replies (`aiReceptionist` on): a background
+    /// probe re-checks the resolved endpoint (aiEndpoint / llama :8080 /
+    /// ollama :11434) every ~30s so a dead brain is visible BEFORE a call,
+    /// degrades plugin.health, and blocks auto-answer — a receptionist that
+    /// can hear and speak but cannot think must not pick up.
+    pub llm_error: Mutex<Option<String>>,
 }
 
 /// Handle held by the [`Plugin`](crate::connector::Plugin): send control
@@ -250,6 +257,11 @@ impl RadioHandle {
     /// AOK-VOICE-001: the last known TTS failure (None = no known failure).
     pub fn tts_error(&self) -> Option<String> {
         self.status.tts_error.lock().unwrap().clone()
+    }
+    /// PROC-001: the last known LLM-reachability failure (None = reachable or
+    /// not probed — the probe only runs while the in-plugin agent owns replies).
+    pub fn llm_error(&self) -> Option<String> {
+        self.status.llm_error.lock().unwrap().clone()
     }
 
     /// AOK-BT-001: seconds left in the pairing window, 0 when closed or the radio
@@ -1474,10 +1486,68 @@ fn run_loop(
     // flow binding must be disabled so the caller isn't answered twice.
     #[cfg(feature = "voice")]
     let agent_enabled = std::env::var_os("AOKIE_AI_RECEPTIONIST").is_some();
+    // Shared with the LLM readiness probe thread (PROC-001): Configure updates
+    // land here so the probe always checks the CURRENT endpoint setting.
     #[cfg(feature = "voice")]
-    let mut agent_endpoint = std::env::var("AOKIE_AI_ENDPOINT")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let agent_endpoint: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(
+        std::env::var("AOKIE_AI_ENDPOINT")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+    ));
+    // PROC-001: background LLM readiness probe. Runs ONLY while the in-plugin
+    // agent owns replies: re-resolves the endpoint every ~30s and records the
+    // outcome in status.llm_error, so a dead/unloaded LLM shows up in
+    // plugin.health (and blocks auto-answer below) BEFORE a caller finds out.
+    // The keep-alive sender lives in this scope — when the radio loop returns,
+    // it drops, the probe's recv_timeout disconnects, and the thread exits.
+    #[cfg(feature = "voice")]
+    let _llm_probe_stop_tx: Option<std::sync::mpsc::Sender<()>> = if agent_enabled {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let status_probe = status.clone();
+        let endpoint_probe = agent_endpoint.clone();
+        let spawned = std::thread::Builder::new()
+            .name("aokie-llm-probe".to_string())
+            .spawn(move || {
+                loop {
+                    let configured = endpoint_probe.lock().unwrap().clone();
+                    let reachable = crate::agent::discover_endpoint(configured.as_deref());
+                    let new_error = match reachable {
+                        Some(_) => None,
+                        None => Some(match &configured {
+                            Some(ep) => format!("LLM endpoint {ep} is not answering"),
+                            None => "no reachable LLM (tried llama.cpp :8080 and ollama :11434)"
+                                .to_string(),
+                        }),
+                    };
+                    {
+                        let mut slot = status_probe.llm_error.lock().unwrap();
+                        if *slot != new_error {
+                            match &new_error {
+                                Some(e) => eprintln!(
+                                    "[aokie-plugin] LLM readiness: DOWN — {e}; auto-answer is blocked until it recovers"
+                                ),
+                                None => eprintln!("[aokie-plugin] LLM readiness: ok"),
+                            }
+                            *slot = new_error;
+                        }
+                    }
+                    match stop_rx.recv_timeout(Duration::from_secs(30)) {
+                        // A message or a dropped sender both mean the radio is done.
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => Some(stop_tx),
+            Err(e) => {
+                eprintln!("[aokie-plugin] LLM readiness probe thread failed to start: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // System prompt / script (AOKIE_AI_PERSONA from the `persona` setting, or a flow
     // push). Editable live via RadioControl::Configure. The default is a real
     // receptionist SCRIPT â€” greet, get the caller's name + reason, capture details,
@@ -1719,7 +1789,17 @@ fn run_loop(
                     let voice_block: Option<String> = {
                         let tts = status.tts_error.lock().unwrap().clone();
                         let stt = status.stt_error.lock().unwrap().clone();
-                        tts.or(stt)
+                        // PROC-001: when the IN-PLUGIN agent owns replies, a dead
+                        // LLM blocks auto-answer too — hearing and speaking without
+                        // thinking is still answering the caller into a dead line.
+                        // Flow-responder mode (agent off) is not gated here: replies
+                        // come from host flows the plugin cannot probe.
+                        let llm = if agent_enabled {
+                            status.llm_error.lock().unwrap().clone()
+                        } else {
+                            None
+                        };
+                        tts.or(stt).or(llm)
                     };
                     #[cfg(not(feature = "voice"))]
                     let voice_block: Option<String> = None;
@@ -2002,7 +2082,8 @@ fn run_loop(
                         }
                         // Lazily connect to the local LLM on the first caller turn.
                         if agent_client.is_none() {
-                            match crate::agent::discover_endpoint(agent_endpoint.as_deref()) {
+                            let configured = agent_endpoint.lock().unwrap().clone();
+                            match crate::agent::discover_endpoint(configured.as_deref()) {
                                 Some(ep) => {
                                     let c = crate::agent::LlmClient::new(ep, agent_model.clone());
                                     eprintln!(
@@ -2011,10 +2092,18 @@ fn run_loop(
                                         c.model()
                                     );
                                     agent_client = Some(c);
+                                    // PROC-001: a live connect is fresher than the probe.
+                                    *status.llm_error.lock().unwrap() = None;
                                 }
-                                None => eprintln!(
-                                    "[aokie-plugin] voice agent: no local LLM reachable (:8080/:11434)"
-                                ),
+                                None => {
+                                    eprintln!(
+                                        "[aokie-plugin] voice agent: no local LLM reachable (:8080/:11434)"
+                                    );
+                                    *status.llm_error.lock().unwrap() = Some(
+                                        "no reachable LLM at reply time (tried llama.cpp :8080 and ollama :11434)"
+                                            .to_string(),
+                                    );
+                                }
                             }
                         }
                         if let Some(client) = agent_client.as_ref() {
@@ -2405,8 +2494,9 @@ fn run_loop(
                         if let Some(e) = endpoint {
                             let e = e.trim().to_string();
                             let new = if e.is_empty() { None } else { Some(e) };
-                            if new != agent_endpoint {
-                                agent_endpoint = new;
+                            let mut current = agent_endpoint.lock().unwrap();
+                            if new != *current {
+                                *current = new;
                                 client_stale = true;
                             }
                         }
