@@ -21,7 +21,14 @@ use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForS
 /// elevated helper can confirm it is binding the EXACT approved device
 /// instance and installing the EXACT approved INF bytes, and added the
 /// `restore-driver` mode.
-const JOB_FORMAT_VERSION: u32 = 3;
+///
+/// v4 (DRIVER-001) made `instance_id`/`inf_sha256` MANDATORY on install
+/// (the helper refuses empty fields instead of skipping the check), added
+/// `hardware_id` (must match the id the helper derives from vid/pid) and
+/// `allow_dev_self_sign` (production default false: an install with no
+/// shipped signed catalog is refused rather than minting a machine-trusted
+/// self-signed certificate), and pinned the instance id on restore jobs.
+const JOB_FORMAT_VERSION: u32 = 4;
 
 /// Pin for the helper exe's SHA-256, baked at build time.
 ///
@@ -79,6 +86,40 @@ struct DriverJob<'a> {
     /// mismatch, so a job pointing at a swapped INF can't stage a
     /// different driver. Empty for `remove-certs` / `restore-driver`.
     inf_sha256: &'a str,
+    /// DRIVER-001: the expected hardware id (`USB\VID_xxxx&PID_xxxx`);
+    /// the helper refuses a job whose vid/pid derive to something else.
+    /// Empty for `remove-certs`.
+    hardware_id: &'a str,
+    /// DRIVER-001: whether DEVELOPER self-signing (minting a local
+    /// catalog-signing cert trusted machine-wide) is authorised for this
+    /// install. Debug builds default on; release builds refuse unless the
+    /// operator explicitly set `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`.
+    allow_dev_self_sign: bool,
+}
+
+/// DRIVER-001: is developer self-signing allowed for this dispatch?
+/// Debug builds: yes (a dev box installing its own WinUSB rebind).
+/// Release builds: only with the explicit `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`
+/// override, which is audited — the production default is a properly
+/// signed driver package, never a locally-minted root of trust.
+fn dev_self_sign_allowed() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    let forced = std::env::var("AOKIE_ALLOW_SELF_SIGNED_DRIVER").as_deref() == Ok("1");
+    if forced {
+        aokie_core::redact::audit(
+            "driver_self_sign_override",
+            "AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 on a release build — a locally-generated \
+             signing certificate will be trusted machine-wide for this install"
+                .to_string(),
+        );
+        eprintln!(
+            "[installer] ⚠️ AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 — release build will self-sign \
+             the driver catalog and trust it via LocalMachine\\Root (dev override)"
+        );
+    }
+    forced
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +201,9 @@ pub fn install_winusb(vid: u16, pid: u16, work_dir: &Path) -> Result<InstallOutc
 /// full clean-up.
 pub fn restore_original_driver(vid: u16, pid: u16, work_dir: &Path) -> Result<(), String> {
     let _lock = InstallLock::acquire()?;
+    // DRIVER-001: run the unelevated policy gate and pin the exact live
+    // instance into the restore job — the helper re-verifies both.
+    let device = super::evaluate_present_target(vid, pid, super::allow_unknown_dongle())?;
     let helper_path = helper_path().ok_or_else(|| {
         "could not locate aokie-driver-helper.exe — set AOKIE_WINUSB_HELPER \
          to override, otherwise it must be present next to the running app exe"
@@ -167,7 +211,7 @@ pub fn restore_original_driver(vid: u16, pid: u16, work_dir: &Path) -> Result<()
     })?;
     std::fs::create_dir_all(work_dir)
         .map_err(|e| format!("could not create helper work dir {:?}: {}", work_dir, e))?;
-    run_helper_restore(vid, pid, work_dir, &helper_path)
+    run_helper_restore(vid, pid, &device.instance_id, work_dir, &helper_path)
 }
 
 /// Named-mutex guard. The name lives in the per-session local namespace
@@ -243,6 +287,7 @@ fn run_helper_install(
     helper_path: &Path,
 ) -> Result<InstallOutcome, String> {
     let job_path = work_dir.join("aokie_driver_job.json");
+    let hardware_id = super::winusb::hardware_id(vid, pid);
     let job = DriverJob {
         version: JOB_FORMAT_VERSION,
         mode: "install",
@@ -251,6 +296,8 @@ fn run_helper_install(
         inf_path,
         instance_id,
         inf_sha256,
+        hardware_id: &hardware_id,
+        allow_dev_self_sign: dev_self_sign_allowed(),
     };
     let job_json = serde_json::to_string_pretty(&job)
         .map_err(|e| format!("could not serialize driver helper job: {}", e))?;
@@ -311,6 +358,8 @@ fn run_helper_remove_certs(work_dir: &Path, helper_path: &Path) -> Result<(), St
         inf_path: &placeholder_inf,
         instance_id: "",
         inf_sha256: "",
+        hardware_id: "",
+        allow_dev_self_sign: false,
     };
     let job_json = serde_json::to_string_pretty(&job)
         .map_err(|e| format!("could not serialize cert-removal helper job: {}", e))?;
@@ -343,6 +392,7 @@ fn run_helper_remove_certs(work_dir: &Path, helper_path: &Path) -> Result<(), St
 fn run_helper_restore(
     vid: u16,
     pid: u16,
+    instance_id: &str,
     work_dir: &Path,
     helper_path: &Path,
 ) -> Result<(), String> {
@@ -352,14 +402,17 @@ fn run_helper_restore(
     // that started honouring it fails closed rather than touching a real
     // file.
     let placeholder_inf = work_dir.join("aokie_restore_placeholder.inf");
+    let hardware_id = super::winusb::hardware_id(vid, pid);
     let job = DriverJob {
         version: JOB_FORMAT_VERSION,
         mode: "restore-driver",
         vid,
         pid,
         inf_path: &placeholder_inf,
-        instance_id: "",
+        instance_id,
         inf_sha256: "",
+        hardware_id: &hardware_id,
+        allow_dev_self_sign: false,
     };
     let job_json = serde_json::to_string_pretty(&job)
         .map_err(|e| format!("could not serialize restore-driver helper job: {}", e))?;
