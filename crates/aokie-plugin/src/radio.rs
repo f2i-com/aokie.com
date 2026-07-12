@@ -1304,10 +1304,23 @@ fn run_loop(
         std::thread::Builder::new()
             .name("aokie-stt".into())
             .spawn(move || {
+                // CONSENT-001: the operator denied the `transcription` scope —
+                // NO caller audio may reach any STT engine (in-process or HTTP).
+                // Set by the connector before radio start from the consent gate;
+                // frames are dropped here at the last hop before an engine.
+                let stt_disabled = std::env::var("AOKIE_STT_DISABLED")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                if stt_disabled {
+                    eprintln!(
+                        "[aokie-plugin] transcription consent DENIED — STT worker will drop all audio"
+                    );
+                }
                 let mut engine: Option<crate::voice::SttEngine> = None;
                 let mut http_stt = HttpSpeechFallback::new(initial_stt_endpoint);
                 while let Ok(work) = utter_rx.recv() {
                     let (generation, utterance, buf) = match work {
+                        SttWork::Utterance { .. } if stt_disabled => continue,
                         SttWork::Utterance {
                             generation,
                             utterance,
