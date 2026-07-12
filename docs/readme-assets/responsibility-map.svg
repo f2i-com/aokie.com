@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="590" viewBox="0 0 1600 590" role="img" aria-labelledby="title desc">
+  <title id="title">Aokie, FormLogic Desktop and FormLogic responsibility map</title>
+  <desc id="desc">Aokie owns the phone bridge and voice loop, FormLogic Desktop supervises plugins and local services, and FormLogic owns the business records, permissions, dashboards and workflows.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#090f1d"/><stop offset="1" stop-color="#10182b"/></linearGradient>
+    <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#8b73ff"/><stop offset="1" stop-color="#6847eb"/></linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#70d9e7"/><stop offset="1" stop-color="#198fb2"/></linearGradient>
+    <linearGradient id="lime" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#dcff96"/><stop offset="1" stop-color="#92c83e"/></linearGradient>
+    <filter id="shadow" x="-25%" y="-30%" width="150%" height="180%"><feDropShadow dx="0" dy="22" stdDeviation="20" flood-color="#000713" flood-opacity=".5"/></filter>
+    <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse"><path d="M50 0H0V50" fill="none" stroke="#fff" stroke-opacity=".032"/></pattern>
+  </defs>
+  <rect width="1600" height="590" rx="30" fill="url(#bg)"/>
+  <rect width="1600" height="590" rx="30" fill="url(#grid)"/>
+  <circle cx="800" cy="315" r="320" fill="#7657f6" opacity=".06"/>
+
+  <g filter="url(#shadow)">
+    <rect x="80" y="92" width="430" height="390" rx="26" fill="#121a2e" stroke="#927cff" stroke-opacity=".46"/>
+    <rect x="585" y="92" width="430" height="390" rx="26" fill="#121a2e" stroke="#4cc7d8" stroke-opacity=".46"/>
+    <rect x="1090" y="92" width="430" height="390" rx="26" fill="#121a2e" stroke="#c9fb68" stroke-opacity=".43"/>
+  </g>
+
+  <g font-family="Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif">
+    <!-- Aokie -->
+    <rect x="116" y="126" width="66" height="66" rx="19" fill="url(#violet)"/>
+    <path d="M130 160h4m5-12v24m7-35v46m8-32v18m8-25v32m8-18v9" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+    <text x="204" y="153" fill="#a795ff" font-size="13" font-weight="750" letter-spacing="2.2">PHONE + VOICE</text>
+    <text x="204" y="185" fill="#f4f6fb" font-size="30" font-weight="750">Aokie</text>
+    <text x="116" y="233" fill="#aab4c6" font-size="16">Owns the real-time conversation boundary.</text>
+    <g font-size="15" fill="#d9deea">
+      <circle cx="125" cy="278" r="5" fill="#927cff"/><text x="142" y="284">WinUSB Bluetooth radio</text>
+      <circle cx="125" cy="320" r="5" fill="#927cff"/><text x="142" y="326">HFP/SCO call state + audio</text>
+      <circle cx="125" cy="362" r="5" fill="#927cff"/><text x="142" y="368">Speech → LLM → voice loop</text>
+      <circle cx="125" cy="404" r="5" fill="#927cff"/><text x="142" y="410">Durable call/SMS events</text>
+    </g>
+    <rect x="116" y="437" width="164" height="31" rx="15.5" fill="#7657f6" opacity=".16"/>
+    <text x="138" y="458" fill="#cbbfff" font-size="13" font-weight="650">Local child process</text>
+
+    <!-- Desktop -->
+    <rect x="621" y="126" width="66" height="66" rx="19" fill="url(#cyan)"/>
+    <rect x="636" y="142" width="36" height="29" rx="3" fill="none" stroke="#fff" stroke-width="3"/>
+    <path d="M648 179h12M654 171v8" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+    <text x="709" y="153" fill="#7cd6e4" font-size="13" font-weight="750" letter-spacing="2.2">LOCAL CAPABILITY</text>
+    <text x="709" y="185" fill="#f4f6fb" font-size="30" font-weight="750">FormLogic Desktop</text>
+    <text x="621" y="233" fill="#aab4c6" font-size="16">Supervises local power and permissions.</text>
+    <g font-size="15" fill="#d9deea">
+      <circle cx="630" cy="278" r="5" fill="#4cc7d8"/><text x="647" y="284">Plugin lifecycle + health</text>
+      <circle cx="630" cy="320" r="5" fill="#4cc7d8"/><text x="647" y="326">Models and speech services</text>
+      <circle cx="630" cy="362" r="5" fill="#4cc7d8"/><text x="647" y="368">Capability-aware relay</text>
+      <circle cx="630" cy="404" r="5" fill="#4cc7d8"/><text x="647" y="410">Headless flow execution</text>
+    </g>
+    <rect x="621" y="437" width="169" height="31" rx="15.5" fill="#4cc7d8" opacity=".14"/>
+    <text x="643" y="458" fill="#afeaf1" font-size="13" font-weight="650">Windows control centre</text>
+
+    <!-- FormLogic -->
+    <rect x="1126" y="126" width="66" height="66" rx="19" fill="url(#lime)"/>
+    <path d="M1144 173v-18h7v18M1156 173v-31h7v31M1168 173v-24h7v24" fill="none" stroke="#18220d" stroke-width="3" stroke-linecap="round"/>
+    <text x="1214" y="153" fill="#c3ec7d" font-size="13" font-weight="750" letter-spacing="2.2">BUSINESS WORK</text>
+    <text x="1214" y="185" fill="#f4f6fb" font-size="30" font-weight="750">FormLogic</text>
+    <text x="1126" y="233" fill="#aab4c6" font-size="16">Turns conversations into useful operations.</text>
+    <g font-size="15" fill="#d9deea">
+      <circle cx="1135" cy="278" r="5" fill="#c9fb68"/><text x="1152" y="284">Callers, transcripts + requests</text>
+      <circle cx="1135" cy="320" r="5" fill="#c9fb68"/><text x="1152" y="326">Roles, apps and remote views</text>
+      <circle cx="1135" cy="362" r="5" fill="#c9fb68"/><text x="1152" y="368">Dashboards and reports</text>
+      <circle cx="1135" cy="404" r="5" fill="#c9fb68"/><text x="1152" y="410">Records, flows + follow-up</text>
+    </g>
+    <rect x="1126" y="437" width="153" height="31" rx="15.5" fill="#c9fb68" opacity=".12"/>
+    <text x="1148" y="458" fill="#ddff9d" font-size="13" font-weight="650">Source of truth</text>
+
+    <!-- Arrows -->
+    <g fill="none" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M528 285h39m-13-12 13 12-13 12" stroke="#927cff"/>
+      <path d="M1033 285h39m-13-12 13 12-13 12" stroke="#69d2df"/>
+    </g>
+    <rect x="480" y="518" width="640" height="43" rx="21.5" fill="#fff" opacity=".055" stroke="#fff" stroke-opacity=".1"/>
+    <circle cx="512" cy="539" r="5" fill="#c9fb68"/>
+    <text x="534" y="545" fill="#d9dfeb" font-size="15" font-weight="650">Clear boundaries · one connected receptionist experience</text>
+  </g>
+</svg>
