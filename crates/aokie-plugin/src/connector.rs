@@ -1774,6 +1774,41 @@ impl Plugin {
             "bluetoothAllowed": !consent_decision.is_denied(),
             "blocked": self.consent_blocked,
         });
+        // PROC-001 item 4: the RESPONDER — whatever produces the receptionist's
+        // replies — is part of readiness, not just ears (STT) and mouth (TTS).
+        //   agent mode (aiReceptionist on): the in-plugin agent needs a live LLM;
+        //     the radio's background probe records reachability in llm_error and
+        //     auto-answer is blocked while it is set.
+        //   flow mode: replies come from HOST flows — the plugin can't probe the
+        //     host's flow link from here, so health names where to look instead
+        //     of guessing.
+        let agent_mode = self
+            .store
+            .config
+            .settings
+            .get("aiReceptionist")
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false);
+        let llm_err = self.radio.as_ref().and_then(|r| r.llm_error());
+        if agent_mode {
+            if let Some(e) = &llm_err {
+                reasons.push(format!(
+                    "responder: {e} — auto-answer is blocked (calls ring through) until the LLM recovers"
+                ));
+            }
+        }
+        let responder = json!({
+            "mode": if agent_mode { "agent" } else { "flow" },
+            // Flow mode reads `ready` (the plugin can't disprove it); the note
+            // says where the real check lives.
+            "ready": !agent_mode || llm_err.is_none(),
+            "llmError": llm_err,
+            "note": if agent_mode {
+                Value::Null
+            } else {
+                json!("replies are produced by host flows — check the desktop's FormLogic link and the reply flow binding")
+            },
+        });
         json!({
             "status": if reasons.is_empty() { "ok" } else { "degraded" },
             "detail": if reasons.is_empty() { Value::Null } else { json!(reasons.join("; ")) },
@@ -1781,6 +1816,7 @@ impl Plugin {
                 "voice": voice,
                 "devMode": self.dev_mode,
                 "radio": radio,
+                "responder": responder,
                 "consent": consent,
                 "outbox": {
                     "pending": counts.pending,
@@ -2783,6 +2819,36 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["status"], json!("degraded"));
+    }
+
+    /// PROC-001 item 4: the responder (whatever produces replies) is part of
+    /// readiness. Default settings = flow mode (host flows reply — the plugin
+    /// points at the real check instead of guessing); aiReceptionist=true =
+    /// agent mode, whose readiness is the LLM probe's llm_error slot (no radio
+    /// in this test → no recorded failure → ready).
+    #[test]
+    fn health_names_the_responder_mode() {
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink::default();
+
+        let health = plugin.build_health();
+        let responder = &health["components"]["responder"];
+        assert_eq!(responder["mode"], json!("flow"), "default = flow responder");
+        assert_eq!(responder["ready"], json!(true));
+        assert!(
+            responder["note"].as_str().unwrap().contains("host flows"),
+            "flow mode names where the real readiness check lives"
+        );
+
+        plugin
+            .dispatch_command("settings.set", &json!({"aiReceptionist": true}), &mut sink)
+            .unwrap();
+        let health = plugin.build_health();
+        let responder = &health["components"]["responder"];
+        assert_eq!(responder["mode"], json!("agent"));
+        // No radio in dev mode → no probe → no recorded LLM failure → ready.
+        assert_eq!(responder["ready"], json!(true));
+        assert_eq!(responder["llmError"], Value::Null);
     }
 
     /// AOK-CONSENT-001: in enforce mode, sensitive commands are refused until
