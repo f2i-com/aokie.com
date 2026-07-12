@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="520" viewBox="0 0 1600 520" role="img" aria-labelledby="title desc">
+  <title id="title">How an Aokie call becomes FormLogic work</title>
+  <desc id="desc">A call rings on the business mobile, crosses the local Bluetooth bridge, runs through the local voice loop, enters a durable event outbox and becomes FormLogic records and flows.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#090f1d"/>
+      <stop offset="1" stop-color="#10182b"/>
+    </linearGradient>
+    <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8b73ff"/>
+      <stop offset="1" stop-color="#6847eb"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#70d9e7"/>
+      <stop offset="1" stop-color="#198fb2"/>
+    </linearGradient>
+    <linearGradient id="lime" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#dcff96"/>
+      <stop offset="1" stop-color="#92c83e"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%">
+      <feDropShadow dx="0" dy="20" stdDeviation="18" flood-color="#000713" flood-opacity=".48"/>
+    </filter>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" fill="none" stroke="#fff" stroke-opacity=".035"/>
+    </pattern>
+  </defs>
+
+  <rect width="1600" height="520" rx="30" fill="url(#bg)"/>
+  <rect width="1600" height="520" rx="30" fill="url(#grid)"/>
+  <circle cx="160" cy="90" r="260" fill="#7657f6" opacity=".08"/>
+  <circle cx="1490" cy="470" r="270" fill="#4cc7d8" opacity=".065"/>
+
+  <g filter="url(#shadow)">
+    <rect x="55" y="92" width="270" height="305" rx="24" fill="#121a2e" stroke="#927cff" stroke-opacity=".38"/>
+    <rect x="360" y="92" width="270" height="305" rx="24" fill="#121a2e" stroke="#7657f6" stroke-opacity=".36"/>
+    <rect x="665" y="92" width="270" height="305" rx="24" fill="#121a2e" stroke="#4cc7d8" stroke-opacity=".38"/>
+    <rect x="970" y="92" width="270" height="305" rx="24" fill="#121a2e" stroke="#4cc7d8" stroke-opacity=".32"/>
+    <rect x="1275" y="92" width="270" height="305" rx="24" fill="#121a2e" stroke="#c9fb68" stroke-opacity=".4"/>
+  </g>
+
+  <g font-family="Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif">
+    <!-- 1 Phone -->
+    <rect x="86" y="123" width="58" height="58" rx="17" fill="url(#violet)"/>
+    <path d="M104 139c0 17 10 27 27 27l5-8-8-5-5 5c-6-2-10-6-12-12l5-5-5-8z" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="86" y="218" fill="#a795ff" font-size="13" font-weight="750" letter-spacing="2">01 · CALL RINGS</text>
+    <text x="86" y="256" fill="#f4f6fb" font-size="25" font-weight="750">Business mobile</text>
+    <text x="86" y="289" fill="#aab4c6" font-size="15">The number and SIM you</text>
+    <text x="86" y="314" fill="#aab4c6" font-size="15">already use stay in place.</text>
+    <rect x="86" y="342" width="127" height="31" rx="15.5" fill="#7657f6" opacity=".16"/>
+    <text x="106" y="363" fill="#cbbfff" font-size="13" font-weight="650">No number port</text>
+
+    <!-- 2 Bluetooth -->
+    <rect x="391" y="123" width="58" height="58" rx="17" fill="#7657f6" opacity=".82"/>
+    <path d="M420 132v40l14-12-14-12 14-12-14-12M406 141l28 24M406 163l28-24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="391" y="218" fill="#a795ff" font-size="13" font-weight="750" letter-spacing="2">02 · BRIDGE</text>
+    <text x="391" y="256" fill="#f4f6fb" font-size="25" font-weight="750">Bluetooth link</text>
+    <text x="391" y="289" fill="#aab4c6" font-size="15">A supported USB dongle</text>
+    <text x="391" y="314" fill="#aab4c6" font-size="15">carries HFP/SCO audio.</text>
+    <rect x="391" y="342" width="132" height="31" rx="15.5" fill="#7657f6" opacity=".16"/>
+    <text x="412" y="363" fill="#cbbfff" font-size="13" font-weight="650">Local hardware</text>
+
+    <!-- 3 Voice -->
+    <rect x="696" y="123" width="58" height="58" rx="17" fill="url(#cyan)"/>
+    <path d="M708 154h3m5-8v16m6-24v32m6-25v18m6-12v7m6-11v15" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+    <text x="696" y="218" fill="#7cd6e4" font-size="13" font-weight="750" letter-spacing="2">03 · CONVERSE</text>
+    <text x="696" y="256" fill="#f4f6fb" font-size="25" font-weight="750">Local voice loop</text>
+    <text x="696" y="289" fill="#aab4c6" font-size="15">Speech → language model</text>
+    <text x="696" y="314" fill="#aab4c6" font-size="15">→ spoken reply.</text>
+    <rect x="696" y="342" width="130" height="31" rx="15.5" fill="#4cc7d8" opacity=".14"/>
+    <text x="719" y="363" fill="#afeaf1" font-size="13" font-weight="650">Local by default</text>
+
+    <!-- 4 Outbox -->
+    <rect x="1001" y="123" width="58" height="58" rx="17" fill="#4cc7d8" opacity=".78"/>
+    <path d="M1015 137h30v30h-30zM1021 145h18M1021 152h18M1021 159h11" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="1001" y="218" fill="#7cd6e4" font-size="13" font-weight="750" letter-spacing="2">04 · DELIVER</text>
+    <text x="1001" y="256" fill="#f4f6fb" font-size="25" font-weight="750">Durable events</text>
+    <text x="1001" y="289" fill="#aab4c6" font-size="15">Write-before-emit outbox,</text>
+    <text x="1001" y="314" fill="#aab4c6" font-size="15">acknowledgement and replay.</text>
+    <rect x="1001" y="342" width="124" height="31" rx="15.5" fill="#4cc7d8" opacity=".14"/>
+    <text x="1022" y="363" fill="#afeaf1" font-size="13" font-weight="650">Crash resilient</text>
+
+    <!-- 5 FormLogic -->
+    <rect x="1306" y="123" width="58" height="58" rx="17" fill="url(#lime)"/>
+    <path d="M1321 160v-14h6v14M1332 160v-24h6v24M1343 160v-18h6v18" fill="none" stroke="#18220d" stroke-width="3" stroke-linecap="round"/>
+    <text x="1306" y="218" fill="#c3ec7d" font-size="13" font-weight="750" letter-spacing="2">05 · ACT</text>
+    <text x="1306" y="256" fill="#f4f6fb" font-size="25" font-weight="750">FormLogic work</text>
+    <text x="1306" y="289" fill="#aab4c6" font-size="15">Records, requests, alerts,</text>
+    <text x="1306" y="314" fill="#aab4c6" font-size="15">dashboards and flows.</text>
+    <rect x="1306" y="342" width="130" height="31" rx="15.5" fill="#c9fb68" opacity=".12"/>
+    <text x="1327" y="363" fill="#ddff9d" font-size="13" font-weight="650">Ready for action</text>
+
+    <!-- Arrows -->
+    <g fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M332 244h18m-8-8 8 8-8 8" stroke="#927cff"/>
+      <path d="M637 244h18m-8-8 8 8-8 8" stroke="#927cff"/>
+      <path d="M942 244h18m-8-8 8 8-8 8" stroke="#5bcbd9"/>
+      <path d="M1247 244h18m-8-8 8 8-8 8" stroke="#9edc52"/>
+    </g>
+
+    <rect x="376" y="437" width="848" height="46" rx="23" fill="#fff" opacity=".055" stroke="#fff" stroke-opacity=".1"/>
+    <circle cx="408" cy="460" r="5" fill="#c9fb68"/>
+    <text x="430" y="466" fill="#d9dfeb" font-size="15" font-weight="650">Your phone keeps the number · Aokie handles the conversation · FormLogic handles the work</text>
+  </g>
+</svg>
