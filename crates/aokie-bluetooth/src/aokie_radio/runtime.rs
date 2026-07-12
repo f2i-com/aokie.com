@@ -2073,22 +2073,23 @@ fn run_runtime(
             }
         }
 
-        // PAIR-001: a held SSP confirmation the operator never answered (or whose
-        // pairing window closed underneath it) is refused on its deadline — the
-        // handshake never completes silently.
+        // PAIR-001: a held SSP confirmation the operator never answered is refused
+        // on its 25s deadline. Window state is DELIBERATELY not part of this: the
+        // ACL for a fresh pairing comes up (so status shows "connected") a beat
+        // before the numeric-comparison request, and the Desktop UI can auto-close
+        // the window in that gap — but once a code has been shown to the operator,
+        // only their answer, the deadline, or the peer walking away
+        // (SimplePairingComplete / DisconnectionComplete, handled below) may resolve
+        // it. Tying it to the window turned every real pairing into an instant
+        // "refused — pairing window closed".
         if let Some((pending_addr, deadline)) = &pending_ssp_confirm {
-            if Instant::now() >= *deadline || !status.pairing_window.is_open() {
-                let reason = if status.pairing_window.is_open() {
-                    "operator did not confirm in time"
-                } else {
-                    "pairing window closed"
-                };
+            if Instant::now() >= *deadline {
                 match hci::user_confirmation_request_negative_reply_command(pending_addr)
                     .and_then(|cmd| transport.write_command(&cmd))
                 {
                     Ok(()) => eprintln!(
-                        "[AokieRadio] refused SSP numeric comparison for {} — {}",
-                        pending_addr, reason
+                        "[AokieRadio] refused SSP numeric comparison for {} — operator did not confirm in time",
+                        pending_addr
                     ),
                     Err(e) => eprintln!(
                         "[AokieRadio] SSP negative reply for {} failed ({}) — \
