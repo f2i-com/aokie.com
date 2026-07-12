@@ -263,6 +263,20 @@ impl Plugin {
                 self.consent_blocked = None;
             }
         }
+        // CONSENT-001 transcription gate: `bluetooth` may be granted while
+        // `transcription` is denied — calls still connect, but NO caller
+        // audio may reach an STT engine. The radio's STT worker honours
+        // AOKIE_STT_DISABLED at startup and drops every frame before an
+        // engine (in-process or HTTP) could see it.
+        match self.consent_gate(crate::consent::Scope::Transcription) {
+            crate::consent::ConsentDecision::Deny(reason) => {
+                std::env::set_var("AOKIE_STT_DISABLED", "1");
+                eprintln!("[aokie-plugin] transcription consent denied — STT disabled: {reason}");
+            }
+            _ => {
+                std::env::set_var("AOKIE_STT_DISABLED", "0");
+            }
+        }
         // HFP-codec override (settings.hfpCodec: "auto" | "cvsd" | "wbs").
         // Some dongles (e.g. Broadcom BCM20702) need CVSD-only — mSBC's SCO
         // path is non-functional on them. The aokie_radio runtime reads the
@@ -506,9 +520,10 @@ impl Plugin {
         )))
     }
 
-    /// AOK-CONSENT-001: the enforcement posture from the `consentMode`
-    /// setting (safe default `warn`). Dev mode never enforces — it never
-    /// touches real hardware or a real caller.
+    /// CONSENT-001: the enforcement posture from the `consentMode` setting.
+    /// Production DEFAULT is `enforce`; `warn` is the explicit developer/
+    /// beta override. Dev mode never enforces — it never touches real
+    /// hardware or a real caller.
     fn consent_mode(&self) -> crate::consent::ConsentMode {
         if self.dev_mode {
             return crate::consent::ConsentMode::Off;
@@ -522,15 +537,32 @@ impl Plugin {
         )
     }
 
+    /// CONSENT-001: the Desktop-provided Ed25519 verify key for consent
+    /// grants (set by the parent Desktop at spawn). Present ⇒ ONLY grants
+    /// signed by THIS Desktop install satisfy the gate — the per-install key
+    /// is the device binding. Absent (legacy host) ⇒ plain grants accepted.
+    fn consent_verify_key(&self) -> Option<String> {
+        std::env::var("FORMLOGIC_CONSENT_VERIFY_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// The verified consent record (grant is `None` when nothing VALID is
+    /// recorded — missing, unsigned-under-a-signing-desktop, or tampered).
+    fn consent_loaded(&self) -> crate::consent::LoadedConsent {
+        let key = self.consent_verify_key();
+        crate::consent::load_verified(&self.data_dir, key.as_deref())
+    }
+
     /// AOK-CONSENT-001: run the pure consent gate for `scope` against the
-    /// recorded grant + current mode.
+    /// verified grant + current mode.
     fn consent_gate(&self, scope: crate::consent::Scope) -> crate::consent::ConsentDecision {
-        let grant = crate::consent::load(&self.data_dir);
         crate::consent::evaluate(
-            grant.as_ref(),
+            self.consent_loaded().grant.as_ref(),
             crate::consent::CURRENT_CONSENT_VERSION,
             self.consent_mode(),
             scope,
+            &aokie_core::events::now_iso8601(),
         )
     }
 
@@ -556,18 +588,22 @@ impl Plugin {
     /// decision for the bluetooth scope — so FormLogic can show consent
     /// status and whether sensitive processing is currently permitted.
     fn consent_get(&self) -> Result<Value, CmdError> {
-        let grant = crate::consent::load(&self.data_dir);
+        let loaded = self.consent_loaded();
         let mode = self.consent_mode();
         let decision = crate::consent::evaluate(
-            grant.as_ref(),
+            loaded.grant.as_ref(),
             crate::consent::CURRENT_CONSENT_VERSION,
             mode,
             crate::consent::Scope::Bluetooth,
+            &aokie_core::events::now_iso8601(),
         );
         Ok(json!({
-            "grant": grant,
+            "grant": loaded.grant,
+            "signed": loaded.signed,
+            "note": loaded.note,
             "requiredVersion": crate::consent::CURRENT_CONSENT_VERSION,
             "mode": mode.as_str(),
+            "signatureRequired": self.consent_verify_key().is_some(),
             "bluetooth": { "allowed": !decision.is_denied(), "reason": decision.reason() },
             "blocked": self.consent_blocked,
         }))
@@ -581,6 +617,39 @@ impl Plugin {
         let obj = payload
             .as_object()
             .ok_or_else(|| CmdError::failed("consent.set requires an object body"))?;
+
+        // CONSENT-001 signed path: a Desktop that provisioned a verify key
+        // REQUIRES a signed envelope — verify it, then persist the signed
+        // bytes VERBATIM (the gate re-verifies from disk on every check, so
+        // file tampering breaks the signature).
+        if let Some(key) = self.consent_verify_key() {
+            let envelope_val = obj.get("envelope").ok_or_else(|| {
+                CmdError::failed(
+                    "consent.set: this Desktop signs consent grants — send {envelope: <signed grant>} \
+                     (issued by the Desktop consent wizard), not a plain grant",
+                )
+            })?;
+            let envelope: crate::consent::SignedConsent =
+                serde_json::from_value(envelope_val.clone())
+                    .map_err(|e| CmdError::failed(format!("consent.set invalid envelope: {e}")))?;
+            let grant = crate::consent::verify_envelope(&envelope, &key)
+                .map_err(|e| CmdError::failed(format!("consent.set: {e}")))?;
+            crate::consent::save_signed(&self.data_dir, &envelope).map_err(CmdError::failed)?;
+            self.consent_blocked = None;
+            self.ensure_radio_started();
+            return Ok(json!({
+                "recorded": true,
+                "signed": true,
+                "version": grant.version,
+                "acceptedAt": grant.accepted_at,
+                "expiresAt": grant.expires_at,
+                "mode": self.consent_mode().as_str(),
+                "radioStarted": self.radio.is_some(),
+                "blocked": self.consent_blocked,
+            }));
+        }
+
+        // Legacy unsigned path (host without a signing key).
         let scopes: crate::consent::ConsentScopes =
             serde_json::from_value(obj.get("scopes").cloned().unwrap_or_else(|| json!({})))
                 .map_err(|e| CmdError::failed(format!("consent.set invalid scopes: {e}")))?;
@@ -602,6 +671,7 @@ impl Plugin {
             scopes,
             accepted_at: String::new(), // stamped by save()
             accepted_by,
+            expires_at: None,
             signature,
         };
         let saved = crate::consent::save(&self.data_dir, grant).map_err(CmdError::failed)?;
@@ -1314,6 +1384,28 @@ impl Plugin {
                 for (key, value) in obj {
                     validate_setting(key, value)?;
                 }
+                // CONSENT-001 destination enforcement: under `enforce` with a
+                // recorded grant, a NON-LOOPBACK ai/stt/tts endpoint must be
+                // one the operator consented to (grant.scopes.destinations) —
+                // pointing transcripts at a new remote processor is a material
+                // change that requires re-consent, not a silent settings edit.
+                if self.consent_mode() == crate::consent::ConsentMode::Enforce {
+                    if let Some(grant) = self.consent_loaded().grant.as_ref() {
+                        for key in ["aiEndpoint", "sttEndpoint", "ttsEndpoint"] {
+                            let Some(url) = obj.get(key).and_then(Value::as_str) else { continue };
+                            let url = url.trim();
+                            if url.is_empty() || is_loopback_endpoint(url) {
+                                continue; // clearing / local processing needs no destination grant
+                            }
+                            if !grant.scopes.destinations.iter().any(|d| d.trim() == url) {
+                                return Err(CmdError::failed(format!(
+                                    "{key}: {url} is not a consented destination — re-run the \
+                                     FormLogic consent wizard to add it before use"
+                                )));
+                            }
+                        }
+                    }
+                }
                 for (key, value) in obj {
                     self.store
                         .config
@@ -1603,12 +1695,14 @@ impl Plugin {
         // grant) or an unrecorded-consent warning both degrade readiness so
         // the operator sees WHY the phone is offline / at risk.
         let consent_mode = self.consent_mode();
-        let consent_grant = crate::consent::load(&self.data_dir);
+        let consent_loaded = self.consent_loaded();
+        let consent_grant = consent_loaded.grant.clone();
         let consent_decision = crate::consent::evaluate(
             consent_grant.as_ref(),
             crate::consent::CURRENT_CONSENT_VERSION,
             consent_mode,
             crate::consent::Scope::Bluetooth,
+            &aokie_core::events::now_iso8601(),
         );
         // Only a DENY (enforce mode, actually blocking the radio) degrades
         // readiness. In `warn` mode the operator can't act on it yet (no
@@ -1949,6 +2043,22 @@ fn setting_spec(key: &str) -> Option<&'static SettingSpec> {
 /// persisting — driven entirely by [`SETTING_SPECS`]. Unknown keys stay
 /// allowed but must be scalar and bounded — a typo'd key can't smuggle a
 /// megabyte of JSON. `null` always passes: it means "clear this setting".
+/// CONSENT-001: true when a speech/AI endpoint URL points at THIS machine
+/// (loopback host) — local processing needs no remote-destination consent.
+fn is_loopback_endpoint(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split(']').next().unwrap_or(inner)
+    } else {
+        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
 fn validate_setting(key: &str, value: &Value) -> Result<(), CmdError> {
     if matches!(value, Value::Null) {
         return Ok(());
@@ -2622,9 +2732,21 @@ mod tests {
 
     /// AOK-CONSENT-001: in enforce mode, sensitive commands are refused until
     /// a scoped grant is recorded; consent.set unblocks them; consent.revoke
+    /// FORMLOGIC_CONSENT_VERIFY_KEY is process-global: every test that sets
+    /// OR depends on its absence takes this lock so parallel runs can't leak
+    /// a signing requirement into a legacy-path test.
+    fn consent_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     /// clears the grant + disables auto-answer.
     #[test]
     fn consent_enforce_blocks_then_records_then_revokes() {
+        let _env = consent_env_lock();
+        std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
         let mut plugin = Plugin::ephemeral(false); // non-dev → consent is live
         let mut sink = VecSink::default();
 
@@ -3083,13 +3205,168 @@ mod tests {
         assert!(call.get("active").is_none());
     }
 
+    // ---- CONSENT-001: enforce-by-default + signed grants + destinations ----
+
+    #[test]
+    fn consent_enforce_is_the_default_and_denies_sensitive_commands() {
+        // A REAL-mode plugin with no consentMode setting and no grant must
+        // DENY sensitive commands (production default = enforce, never warn).
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "+61432123456", "body": "hi"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("consent"), "{}", err.message);
+        assert!(sink.lines.is_empty(), "no event for a consent-denied send");
+    }
+
+    #[test]
+    fn consent_set_requires_signed_envelope_under_a_signing_desktop() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let _env = consent_env_lock();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let pub_b64 = base64::engine::general_purpose::STANDARD
+            .encode(key.verifying_key().to_bytes());
+        std::env::set_var("FORMLOGIC_CONSENT_VERIFY_KEY", &pub_b64);
+
+        let dir = std::env::temp_dir().join(format!(
+            "aokie-consent-conn-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut plugin = Plugin::new(false, dir.clone()).unwrap();
+        let mut sink = VecSink::default();
+
+        // A plain (unsigned) consent.set is refused outright.
+        let err = plugin
+            .dispatch_command(
+                "consent.set",
+                &json!({"scopes": {"bluetooth": true, "sms": true}}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("signs consent grants"), "{}", err.message);
+
+        // A correctly signed envelope records + satisfies the gate.
+        let grant = crate::consent::ConsentGrant {
+            version: crate::consent::CURRENT_CONSENT_VERSION,
+            scopes: crate::consent::ConsentScopes {
+                bluetooth: true,
+                sms: true,
+                transcription: true,
+                contacts: false,
+                recording: false,
+                retention_days: Some(90),
+                destinations: vec!["https://api.example.com/v1".into()],
+            },
+            accepted_at: "2026-07-12T00:00:00Z".into(),
+            accepted_by: Some("op@example.com".into()),
+            expires_at: Some("2027-07-12T00:00:00Z".into()),
+            signature: None,
+        };
+        let payload = serde_json::to_vec(&grant).unwrap();
+        let sig = key.sign(&payload);
+        let envelope = json!({
+            "format": 1,
+            "alg": "Ed25519",
+            "keyId": "desktop-test",
+            "payloadB64": base64::engine::general_purpose::STANDARD.encode(&payload),
+            "signature": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes()),
+        });
+        let out = plugin
+            .dispatch_command("consent.set", &json!({"envelope": envelope}), &mut sink)
+            .unwrap();
+        assert_eq!(out["recorded"], json!(true));
+        assert_eq!(out["signed"], json!(true));
+
+        // A TAMPERED envelope (payload swapped for wider scopes) is refused.
+        let mut wider = grant.clone();
+        wider.scopes.recording = true;
+        let forged = json!({
+            "format": 1,
+            "alg": "Ed25519",
+            "keyId": "desktop-test",
+            "payloadB64": base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&wider).unwrap()),
+            "signature": envelope["signature"],
+        });
+        let err = plugin
+            .dispatch_command("consent.set", &json!({"envelope": forged}), &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("verification failed"), "{}", err.message);
+
+        // CONSENT-001 destinations: with the signed grant recorded, a remote
+        // endpoint NOT in grant.destinations is refused at settings.set…
+        let err = plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"aiEndpoint": "https://rogue.example.net/v1"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("not a consented destination"), "{}", err.message);
+        // …a consented one is accepted, and loopback needs no destination grant.
+        plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"aiEndpoint": "https://api.example.com/v1"}),
+                &mut sink,
+            )
+            .unwrap();
+        plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"sttEndpoint": "http://127.0.0.1:17920/v1"}),
+                &mut sink,
+            )
+            .unwrap();
+
+        // Revocation stops enforcement satisfaction immediately (no restart):
+        // the next sensitive command denies again.
+        plugin
+            .dispatch_command("consent.revoke", &Value::Null, &mut sink)
+            .unwrap();
+        sink.lines.clear();
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "+61432123456", "body": "hi"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("consent"), "{}", err.message);
+
+        std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loopback_endpoint_detection() {
+        assert!(is_loopback_endpoint("http://127.0.0.1:17920/v1"));
+        assert!(is_loopback_endpoint("http://localhost:8080"));
+        assert!(is_loopback_endpoint("http://[::1]:9000/x"));
+        assert!(!is_loopback_endpoint("https://api.example.com/v1"));
+        assert!(!is_loopback_endpoint("http://192.168.1.10:8080"));
+        assert!(!is_loopback_endpoint("http://localhost.evil.com/v1"));
+    }
+
     #[test]
     fn sms_send_real_mode_without_radio_is_a_typed_outage_never_queued() {
         // FL-CONN-001: the canonical fake success — a real-mode plugin whose
         // radio never started must NOT report an SMS as queued (nor emit
         // sms.sent); the caller was promised a message that could never exist.
+        // consentMode=warn (the explicit dev override) so the RADIO outage is
+        // what surfaces — the enforce-default consent denial has its own test.
         let mut plugin = Plugin::ephemeral(false);
         let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
         let err = plugin
             .dispatch_command(
                 "sms.send",
@@ -3294,9 +3571,13 @@ mod tests {
     fn phone_pairing_real_mode_without_radio_fails_typed() {
         // FL-CONN-001 + AOK-BT-001: a real-mode plugin whose radio never started
         // must not report a pairing session the phone can never see, and neither
-        // start nor stop pairing can silently succeed.
+        // start nor stop pairing can silently succeed. consentMode=warn so the
+        // radio outage (not the enforce-default consent denial) is under test.
         let mut plugin = Plugin::ephemeral(false);
         let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
 
         let err = plugin
             .dispatch_command("phone.startPairing", &Value::Null, &mut sink)

@@ -166,6 +166,8 @@ dependencies = [
  "aokie-ai",
  "aokie-core",
  "aokie-dongle",
+ "base64 0.22.1",
+ "ed25519-dalek",
  "jsonschema",
  "reqwest 0.11.27",
  "rusqlite",

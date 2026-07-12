@@ -30,6 +30,11 @@ aokie-dongle = { path = "../aokie-dongle" }
 aokie-ai = { path = "../aokie-ai", features = ["onnx"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# CONSENT-001: verify the Desktop-issued signature on consent grants (the
+# verify key arrives via the parent process env; grants that don't verify
+# never satisfy the consent gate).
+ed25519-dalek = { version = "2", features = ["signature"] }
+base64 = "0.22"
 # Same major as the legacy app (aokie-desktop pins 0.31) so the two
 # don't fight over bundled-SQLite versions when built side by side.
 rusqlite = { version = "0.31", features = ["bundled"] }
