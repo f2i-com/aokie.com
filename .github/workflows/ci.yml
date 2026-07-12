@@ -15,18 +15,23 @@ on:
   # pull_request:
   #   branches: [main]
 
+# TRUST-001: least privilege by default — read-only token everywhere; the one
+# job that publishes release assets asks for contents:write itself.
+permissions:
+  contents: read
+
 jobs:
   plugin:
     name: aokie-plugin (tests, default features)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # The WHOLE shipping workspace (audit AOK-CI-001): core, bluetooth, db,
       # audio, ai, dongle, voice-server, receptionist AND the plugin — the
@@ -40,13 +45,13 @@ jobs:
     name: aokie-plugin (check, voice features)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # The voice build compiles a distinct cfg surface (agent, AEC, TTS/STT
       # runtimes) that the default build never touches — check BOTH, always
@@ -63,11 +68,11 @@ jobs:
     name: cargo clippy (deny-level lints)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets
 
@@ -82,35 +87,39 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
           tool: cargo-audit
       # Accepted transitive advisories are listed with rationale in
       # .cargo/audit.toml; every NEW advisory still fails the job.
       - run: cargo audit
 
-  # Audit PKG-001 (best-effort until signing infrastructure exists): a
-  # reproducible RELEASE plugin bundle — helper built first so its post-build
-  # SHA-256 can be pinned into the plugin (the aokie-dongle release gate),
-  # then plugin (voice) + helper + manifest + checksums as one artifact.
-  # Signing mirrors the desktop pipeline: applied when the WINDOWS_CERT_*
-  # secrets exist, loudly UNSIGNED otherwise. Tag/manual builds only — the
-  # test jobs stay the required gate on every push.
+  # Audit PKG-001 + TRUST-001 + DIST-001: the RELEASE bundle — helper built
+  # first so its post-build SHA-256 can be pinned into the plugin (the
+  # aokie-dongle release gate), then plugin (voice) + helper + VOICE SERVER +
+  # manifests + checksums, first-party-signed (package-manifest.json) and, on
+  # tags, published as a DURABLE release asset. Tag builds FAIL without the
+  # required signing credentials (Authenticode cert + package signing key);
+  # workflow_dispatch smoke builds may proceed unsigned with loud warnings.
   plugin-release:
     name: aokie-plugin release bundle
     runs-on: windows-latest
     needs: [plugin, plugin-voice]
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    permissions:
+      # gh release create/upload on tag builds — the ONLY write surface in
+      # this workflow, isolated to this job (TRUST-001 item 5).
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # Audit AOK-REL-001: the ONLY correct order is
       #   build helper → SIGN helper → VERIFY signature → hash the SIGNED
@@ -126,6 +135,13 @@ jobs:
           CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
           CERT_PASS: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
+          # TRUST-001: a PUBLIC TAG RELEASE without the Authenticode cert is a
+          # hard failure — never an "unsigned flavour". Manual dispatch smoke
+          # builds may proceed unsigned (loudly) for pipeline testing.
+          if (-not $env:CERT_B64 -and '${{ github.ref_type }}' -eq 'tag') {
+            throw "TRUST-001: tag releases require WINDOWS_CERT_PFX_B64/WINDOWS_CERT_PASSWORD — refusing to produce an unsigned public release"
+          }
+
           cargo build -p aokie-dongle --bin aokie-driver-helper --release
           if ($LASTEXITCODE -ne 0) { throw "helper build failed" }
 
@@ -140,7 +156,7 @@ jobs:
             & $signtool verify /pa target/release/aokie-driver-helper.exe
             if ($LASTEXITCODE -ne 0) { throw "helper signature verification failed" }
           } else {
-            Write-Warning "no signing certificate configured — UNSIGNED release flavour (hash pinning still enforced)"
+            Write-Warning "no signing certificate configured — UNSIGNED smoke build (never a tag release)"
           }
 
           # Hash the FINAL helper bytes (post-sign when a cert exists) and
@@ -152,11 +168,19 @@ jobs:
           cargo build -p aokie-plugin --features voice --release
           if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
 
+          # DIST-001: the voice SERVER ships in the same bundle — FormLogic's
+          # voice-service template expects aokie-voice-server.exe beside the
+          # plugin, and a bundle without it was a phone with no speech stack.
+          cargo build -p aokie-voice-server --release
+          if ($LASTEXITCODE -ne 0) { throw "voice server build failed" }
+
           if ($signtool) {
-            & $signtool sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/aokie-plugin.exe
-            if ($LASTEXITCODE -ne 0) { throw "plugin signing failed" }
-            & $signtool verify /pa target/release/aokie-plugin.exe
-            if ($LASTEXITCODE -ne 0) { throw "plugin signature verification failed" }
+            foreach ($exe in @('target/release/aokie-plugin.exe', 'target/release/aokie-voice-server.exe')) {
+              & $signtool sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe
+              if ($LASTEXITCODE -ne 0) { throw "signing failed: $exe" }
+              & $signtool verify /pa $exe
+              if ($LASTEXITCODE -ne 0) { throw "signature verification failed: $exe" }
+            }
             Remove-Item $pfx
           }
 
@@ -172,7 +196,12 @@ jobs:
           New-Item -ItemType Directory -Force bundle | Out-Null
           Copy-Item target/release/aokie-plugin.exe bundle/
           Copy-Item target/release/aokie-driver-helper.exe bundle/
+          Copy-Item target/release/aokie-voice-server.exe bundle/
           Copy-Item crates/aokie-plugin/manifest.json bundle/
+          # DIST-001: the model-bundle manifest (required voice models with
+          # pinned digests) rides in every release so installers can verify
+          # staged model files byte-for-byte.
+          Copy-Item docs/models-manifest.json bundle/
           $dll = Get-ChildItem target/release -Filter 'onnxruntime*.dll' -ErrorAction SilentlyContinue
           if (-not $dll) { throw "AOK-REL-002: voice release requires onnxruntime*.dll beside the plugin exe — none found; the packaged receptionist could not transcribe or speak" }
           $dll | Copy-Item -Destination bundle/
@@ -198,6 +227,27 @@ jobs:
         env:
           CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
 
+      # TRUST-001: first-party Ed25519 package manifest over every bundle
+      # file. FormLogic Desktop pins the public key (fl-aokie-2026a) and
+      # refuses to launch a plugin directory whose signature or digests do
+      # not verify. A TAG release without the signing key is a hard failure;
+      # dispatch smoke builds warn and stay unsigned.
+      - name: Sign package manifest (package-signer)
+        shell: pwsh
+        env:
+          AOKIE_PACKAGE_SIGNING_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY }}
+        run: |
+          if (-not $env:AOKIE_PACKAGE_SIGNING_KEY) {
+            if ('${{ github.ref_type }}' -eq 'tag') {
+              throw "TRUST-001: tag releases require the AOKIE_PACKAGE_SIGNING_KEY secret (package-signer keygen seed) — refusing an unsigned public release"
+            }
+            Write-Warning "AOKIE_PACKAGE_SIGNING_KEY not set — smoke bundle ships WITHOUT a package manifest (Desktop will show it as unsigned)"
+            exit 0
+          }
+          $version = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { "dev-$env:GITHUB_SHA" }
+          cargo run -p package-signer --release -- sign --dir bundle --name aokie-plugin --version $version --key-id fl-aokie-2026a --key-env AOKIE_PACKAGE_SIGNING_KEY
+          if ($LASTEXITCODE -ne 0) { throw "package signing failed" }
+
       - name: Checksums
         shell: pwsh
         working-directory: bundle
@@ -209,9 +259,23 @@ jobs:
           Get-Content SHA256SUMS.txt
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: aokie-plugin-windows
           path: bundle/*
           if-no-files-found: error
           retention-days: 30
+
+      # DIST-001: tag builds publish a DURABLE release asset (the temp Actions
+      # artifact above expires in 30 days — that is a smoke-test convenience,
+      # not a distribution channel). Zip name carries the tag for stable URLs.
+      - name: Publish release assets (tags only)
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "aokie-plugin-windows-${{ github.ref_name }}.zip"
+          Compress-Archive -Path bundle/* -DestinationPath $zip
+          gh release create '${{ github.ref_name }}' --verify-tag --title 'Aokie ${{ github.ref_name }}' --notes 'Signed Aokie plugin bundle (plugin + driver helper + voice server + manifests + checksums). Verify with SHA256SUMS.txt and the package-manifest.json publisher signature.' $zip bundle/SHA256SUMS.txt bundle/release-manifest.json bundle/package-manifest.json
+          if ($LASTEXITCODE -ne 0) { throw "release publish failed" }
