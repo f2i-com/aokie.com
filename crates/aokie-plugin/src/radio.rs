@@ -119,7 +119,7 @@ const END_CALL_INSTRUCTION: &str = "\n\nEnding the call: ONLY when the caller's 
 /// is the broken half, the hangup still happens (silence must END, never
 /// stretch on).
 #[cfg(feature = "voice")]
-const FALLBACK_LINE: &str = "I'm sorry — I'm having technical trouble taking your call right now. \
+const FALLBACK_LINE: &str = "I'm sorry, I'm having technical trouble taking your call right now. \
 Please call back shortly. Goodbye.";
 
 /// VOICE-001, pure for tests: after a reply attempt, is the caller sitting in
@@ -1386,7 +1386,7 @@ fn run_loop(
                 || std::env::var("AOKIE_TTS_ENDPOINT").is_ok_and(|v| !v.trim().is_empty())
             {
                 Some(
-                    "skipped: HTTP speech endpoint(s) configured — the local-engine loopback does not cover them"
+                    "skipped: HTTP speech endpoint(s) configured - the local-engine loopback does not cover them"
                         .to_string(),
                 )
             } else if preflight_failed {
@@ -1423,7 +1423,7 @@ fn run_loop(
                                 ok: true,
                                 at: aokie_core::events::now_iso8601(),
                                 duration_ms: started.elapsed().as_millis() as u64,
-                                detail: format!("loopback ok — heard {heard:?}"),
+                                detail: format!("loopback ok - heard {heard:?}"),
                             },
                             Err(e) => VoiceSelfTest {
                                 ok: false,
