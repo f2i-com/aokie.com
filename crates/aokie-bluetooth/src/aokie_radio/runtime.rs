@@ -32,6 +32,7 @@ use crate::aokie_radio::map_mas::{
 use crate::aokie_radio::map_mns::{MnsEvent, MnsServer, MnsState};
 use crate::aokie_radio::map_runtime::{MapRuntime, MapRuntimeEvent};
 use crate::aokie_radio::pairing_store::AokiePairingStore;
+use crate::aokie_radio::hfp_connect::{HfpConnectEvent, HfpConnectRuntime};
 use crate::aokie_radio::pbap_runtime::{PbapRuntime, PbapRuntimeEvent};
 use crate::aokie_radio::rfcomm::{
     build_modem_status_command, build_ua, build_uih, server_channel_dlci, RfcommState,
@@ -219,6 +220,18 @@ enum ControlCommand {
     /// reconnects (working inbound direction). Replies whether a live link
     /// for that address was actually disconnected.
     Disconnect {
+        address: String,
+        reply: stdmpsc::Sender<Result<bool, String>>,
+    },
+    /// HARD-001: reconnect a BONDED phone from our side — page it, then
+    /// drive SDP → RFCOMM → HFP SLC ourselves (Bluedroid initiates no
+    /// profiles when it was the paged side; see `hfp_connect.rs`).
+    /// Replies `Ok(true)` when the page was started (the authoritative
+    /// outcome is the phone.connected event once the SLC lands),
+    /// `Ok(false)` when that phone is already connected, `Err` when the
+    /// address isn't bonded, another phone holds the link, or the HCI
+    /// write failed.
+    Connect {
         address: String,
         reply: stdmpsc::Sender<Result<bool, String>>,
     },
@@ -646,6 +659,24 @@ impl AokieRuntime {
         reply_rx
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| "aokie-radio runtime did not answer the disconnect request".to_string())?
+    }
+
+    /// HARD-001: reconnect a bonded phone from OUR side — page it, then drive
+    /// the SDP/RFCOMM/HFP setup the phone won't initiate when paged. Returns
+    /// `Ok(true)` when the page started (the phone.connected event is the
+    /// authoritative outcome), `Ok(false)` when that phone is already
+    /// connected, `Err` for not-bonded / link-busy / HCI failures.
+    pub fn connect(&self, address: String) -> Result<bool, String> {
+        let (reply_tx, reply_rx) = stdmpsc::channel();
+        self.control_tx
+            .send(ControlCommand::Connect {
+                address,
+                reply: reply_tx,
+            })
+            .map_err(|_| "aokie-radio runtime is no longer running".to_string())?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "aokie-radio runtime did not answer the connect request".to_string())?
     }
 
     /// PAIR-001: a clone of the shared pending-confirmation slot so callers can
@@ -1294,6 +1325,25 @@ fn run_runtime(
     // a parallel fetch — annoying but harmless, except we also lose
     // the L2CAP channel CIDs the previous attempt allocated.
     let mut pbap_runtime: Option<PbapRuntime> = None;
+    // HARD-001 outbound reconnect (`phone.connect`). `manual_connect_pending`
+    // = a Create_Connection we issued and are awaiting ConnectionComplete
+    // for (addr + when, for the page-budget watchdog). Once the ACL lands,
+    // `hfp_connect_runtime` drives SDP → RFCOMM → SLC kickoff, and
+    // `outbound_connect_session` stays true for the life of that ACL so an
+    // SLC failure tears the link down (a paged link with no SLC is a dead
+    // half-link the phone won't repair on its own — the old
+    // AUTO_RECONNECT_OUTBOUND_PAGE symptom).
+    let mut manual_connect_pending: Option<(String, Instant)> = None;
+    // After the page lands, WE must drive LMP authentication + encryption
+    // before any profile L2CAP traffic — on the inbound path the phone (as
+    // the paging master) does this, and a Security-Mode-4 phone that sees
+    // unauthenticated RFCOMM from us tears the link down with 0x05. Tracks
+    // the Authentication_Requested → Set_Connection_Encryption handshake;
+    // `awaiting_encryption` = auth done, Encryption_Change pending. SDP
+    // starts only once the link is encrypted.
+    let mut manual_connect_auth: Option<ManualConnectAuth> = None;
+    let mut hfp_connect_runtime: Option<HfpConnectRuntime> = None;
+    let mut outbound_connect_session = false;
     // Phase 4e: a single MapRuntime slot for sequential MAS operations
     // (subscribe, fetch new SMS body, push reply). Each MapRuntime
     // tears its own L2CAP/RFCOMM channels up and down; running two
@@ -1508,6 +1558,10 @@ fn run_runtime(
     /// 15.4s) so the controller has time to surface its own timeout
     /// first.
     const AUTO_RECONNECT_PAGE_BUDGET: Duration = Duration::from_secs(18);
+    /// HARD-001 phone.connect: authentication + encryption on the link we
+    /// paged must complete within this budget or we tear the ACL down (a
+    /// paged-but-unsecured link is a dead half-link the phone won't repair).
+    const MANUAL_CONNECT_AUTH_BUDGET: Duration = Duration::from_secs(10);
     let mut auto_reconnect_target_index: usize = 0;
     let mut auto_reconnect_pending_since: Option<Instant> = None;
     let mut auto_reconnect_pending_addr: Option<String> = None;
@@ -1676,6 +1730,21 @@ fn run_runtime(
                         let _ = event_tx.send(RuntimeEvent::Error(format!("stall drain: {}", e)));
                     }
                 }
+                // HARD-001: an SLC failure on a link WE paged is a dead
+                // half-link — tear the ACL down so the UI never shows a
+                // "connected" phone that can't take calls.
+                if outbound_connect_session {
+                    if let HfpEvent::ServiceLevelConnectionFailed(_) = &hfp_event {
+                        if let Some(handle) = active_acl_handle {
+                            eprintln!(
+                                "[AokieRadio] phone.connect: SLC failed on our paged link — disconnecting handle {:#06x}",
+                                handle
+                            );
+                            let _ = transport.write_command(&hci::disconnect_command(handle, 0x13));
+                        }
+                        outbound_connect_session = false;
+                    }
+                }
                 forward_hfp_event(hfp_event, &event_tx, &status, &interface.path);
             }
 
@@ -1768,6 +1837,49 @@ fn run_runtime(
                             }
                         }
                     }
+                }
+            }
+
+            // ── phone.connect page-budget watchdog ──────────────────
+            // A Create_Connection we issued for a manual reconnect that
+            // never produced ConnectionComplete (dongle dropped it /
+            // phone out of range with a controller that stays silent).
+            // Clear the pending slot so the next phone.connect isn't
+            // refused as "already in progress".
+            if let Some((addr, started)) = &manual_connect_pending {
+                if started.elapsed() >= AUTO_RECONNECT_PAGE_BUDGET {
+                    eprintln!(
+                        "[AokieRadio] phone.connect: page budget elapsed for {} — giving up",
+                        addr
+                    );
+                    let _ = event_tx.send(RuntimeEvent::Error(format!(
+                        "phone.connect: no answer from {} (page timed out)",
+                        addr
+                    )));
+                    manual_connect_pending = None;
+                }
+            }
+
+            // ── phone.connect auth-budget watchdog ──────────────────
+            // Authentication/encryption on the link we paged never
+            // resolved (controller swallowed the event, phone went
+            // silent mid-LMP). A paged-but-unsecured ACL is a dead
+            // half-link — tear it down so either side can reconnect
+            // cleanly.
+            if let Some(auth) = &manual_connect_auth {
+                if auth.started_at.elapsed() >= MANUAL_CONNECT_AUTH_BUDGET {
+                    eprintln!(
+                        "[AokieRadio] phone.connect: auth budget elapsed for {} (handle {:#06x}) — disconnecting",
+                        auth.address, auth.connection_handle
+                    );
+                    let _ = event_tx.send(RuntimeEvent::Error(format!(
+                        "phone.connect: securing the link to {} timed out — try again",
+                        auth.address
+                    )));
+                    let _ = transport
+                        .write_command(&hci::disconnect_command(auth.connection_handle, 0x13));
+                    manual_connect_auth = None;
+                    outbound_connect_session = false;
                 }
             }
 
@@ -2149,6 +2261,49 @@ fn run_runtime(
                     };
                     let _ = reply.send(result);
                 }
+                Ok(ControlCommand::Connect { address, reply }) => {
+                    // HARD-001 outbound reconnect: page the bonded phone; the
+                    // ConnectionComplete arm below starts the SDP/RFCOMM/SLC
+                    // driving. Truthful accepted-only semantics — the
+                    // phone.connected event is the outcome.
+                    let result = if !pairing_store.contains(&address) {
+                        Err(format!(
+                            "{} is not a paired phone — pair it from the phone's Bluetooth settings first",
+                            address
+                        ))
+                    } else if active_acl_handle.is_some() {
+                        let remote_is_target = status
+                            .addresses
+                            .read()
+                            .map(|a| a.remote.eq_ignore_ascii_case(&address))
+                            .unwrap_or(false);
+                        if remote_is_target {
+                            Ok(false) // already connected — no-op, not an error
+                        } else {
+                            Err("another phone currently holds the link — disconnect it first"
+                                .to_string())
+                        }
+                    } else if manual_connect_pending.is_some() {
+                        Err("a reconnect attempt is already in progress".to_string())
+                    } else {
+                        match hci::create_connection_command_default(&address) {
+                            Ok(cmd) => match transport.write_command(&cmd) {
+                                Ok(()) => {
+                                    eprintln!(
+                                        "[AokieRadio] phone.connect: paging bonded device {} (HCI Create_Connection)",
+                                        address
+                                    );
+                                    manual_connect_pending =
+                                        Some((address.clone(), Instant::now()));
+                                    Ok(true)
+                                }
+                                Err(e) => Err(format!("HCI Create_Connection write failed: {e}")),
+                            },
+                            Err(e) => Err(format!("bad BD_ADDR: {e}")),
+                        }
+                    };
+                    let _ = reply.send(result);
+                }
                 Ok(ControlCommand::ConfirmPairing {
                     address,
                     accept,
@@ -2310,7 +2465,19 @@ fn run_runtime(
                     Ok(None) => {}
                     Err(e) => {
                         eprintln!("[AokieRadio] HCI event handler error: {} — continuing", e);
-                        let _ = event_tx.send(RuntimeEvent::Error(format!("hci event: {}", e)));
+                        // A transient pipe-read timeout inside a
+                        // command-status wait (Win32 121 under heavy
+                        // event traffic, e.g. during a connect) is NOT a
+                        // hardware issue — the command almost always
+                        // landed and everything proceeds. Surfacing it
+                        // as RuntimeEvent::Error raised a scary
+                        // "hardware issue" toast and left health
+                        // degraded until restart (live report
+                        // 2026-07-13). Real failures still surface.
+                        if !manager::is_timeout_error(&e) {
+                            let _ =
+                                event_tx.send(RuntimeEvent::Error(format!("hci event: {}", e)));
+                        }
                         continue;
                     }
                 }
@@ -2516,6 +2683,66 @@ fn run_runtime(
                             ),
                         }
                     }
+                    // HARD-001 phone.connect: the page WE issued answered.
+                    // Before ANY profile traffic we must drive LMP
+                    // authentication + encryption ourselves — inbound, the
+                    // phone (as paging master) does this, and skipping it
+                    // outbound makes the phone tear the link down with 0x05
+                    // at our first RFCOMM ConnectionRequest. SDP → RFCOMM →
+                    // SLC starts from the Encryption_Change arm below. No
+                    // role switch: we stay master (standard for the paging
+                    // HF; the phone may request its own switch via LMP).
+                    if let Some((pending_addr, _)) = &manual_connect_pending {
+                        if pending_addr.eq_ignore_ascii_case(address)
+                            && *link_type == hci::LINK_TYPE_ACL
+                        {
+                            if *cstatus == 0 {
+                                eprintln!(
+                                    "[AokieRadio] phone.connect: {} answered our page (handle {:#06x}) — authenticating the link",
+                                    address, connection_handle
+                                );
+                                outbound_connect_session = true;
+                                // MAP/MNS/PBAP ride client DLCIs attached to a
+                                // server-mode RFCOMM mux; on an outbound session
+                                // WE own the mux via the HFP client, so skip the
+                                // SLC-ready MAP subscribe — SMS sync resumes on
+                                // the next phone-initiated reconnect.
+                                mns_subscription_attempted_for_acl = true;
+                                let cmd =
+                                    hci::authentication_requested_command(*connection_handle);
+                                match transport.write_command(&cmd) {
+                                    Ok(()) => {
+                                        manual_connect_auth = Some(ManualConnectAuth {
+                                            connection_handle: *connection_handle,
+                                            address: address.clone(),
+                                            awaiting_encryption: false,
+                                            started_at: Instant::now(),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(RuntimeEvent::Error(format!(
+                                            "phone.connect: Authentication_Requested write failed: {}",
+                                            e
+                                        )));
+                                        let _ = transport.write_command(
+                                            &hci::disconnect_command(*connection_handle, 0x13),
+                                        );
+                                        outbound_connect_session = false;
+                                    }
+                                }
+                            } else {
+                                eprintln!(
+                                    "[AokieRadio] phone.connect: page to {} failed status 0x{:02x}",
+                                    address, cstatus
+                                );
+                                let _ = event_tx.send(RuntimeEvent::Error(format!(
+                                    "phone.connect: {} did not answer the page (status 0x{:02x}) — make sure the phone is nearby with Bluetooth on",
+                                    address, cstatus
+                                )));
+                            }
+                            manual_connect_pending = None;
+                        }
+                    }
                     // Clear auto-reconnect pending state regardless of
                     // success/failure — the page either landed (and we
                     // now have an ACL we want to keep) or it didn't (and
@@ -2580,6 +2807,119 @@ fn run_runtime(
                         }
                     }
                 }
+                // HARD-001 phone.connect step 2: authentication resolved.
+                // Success → ask for link encryption; failure → the phone
+                // most likely deleted the bond (or the stored key is
+                // stale), so tear down truthfully and tell the user to
+                // re-pair rather than leaving a dead half-link up.
+                if let hci::HciEvent::AuthenticationComplete {
+                    status: astatus,
+                    connection_handle,
+                } = &event
+                {
+                    let matches_auth = manual_connect_auth.as_ref().is_some_and(|a| {
+                        a.connection_handle == *connection_handle && !a.awaiting_encryption
+                    });
+                    if matches_auth {
+                        if *astatus == 0 {
+                            let auth = manual_connect_auth.as_mut().expect("checked above");
+                            eprintln!(
+                                "[AokieRadio] phone.connect: {} authenticated — enabling link encryption",
+                                auth.address
+                            );
+                            let cmd = hci::set_connection_encryption_command(
+                                *connection_handle,
+                                true,
+                            );
+                            match transport.write_command(&cmd) {
+                                Ok(()) => auth.awaiting_encryption = true,
+                                Err(e) => {
+                                    let _ = event_tx.send(RuntimeEvent::Error(format!(
+                                        "phone.connect: Set_Connection_Encryption write failed: {}",
+                                        e
+                                    )));
+                                    let _ = transport.write_command(
+                                        &hci::disconnect_command(*connection_handle, 0x13),
+                                    );
+                                    manual_connect_auth = None;
+                                    outbound_connect_session = false;
+                                }
+                            }
+                        } else {
+                            let auth = manual_connect_auth.take().expect("checked above");
+                            eprintln!(
+                                "[AokieRadio] phone.connect: authentication with {} FAILED status 0x{:02x}",
+                                auth.address, astatus
+                            );
+                            let _ = event_tx.send(RuntimeEvent::Error(format!(
+                                "phone.connect: {} rejected our stored pairing (authentication failure 0x{:02x}) — forget Aokie on the phone and pair again",
+                                auth.address, astatus
+                            )));
+                            // 0x05 = Authentication Failure: the honest reason.
+                            let _ = transport.write_command(&hci::disconnect_command(
+                                *connection_handle,
+                                0x05,
+                            ));
+                            outbound_connect_session = false;
+                        }
+                    }
+                }
+                // HARD-001 phone.connect step 3: the link is encrypted —
+                // NOW start the profile driving (SDP → RFCOMM → SLC).
+                if let hci::HciEvent::EncryptionChange {
+                    status: estatus,
+                    connection_handle,
+                    encryption_enabled,
+                } = &event
+                {
+                    let matches_auth = manual_connect_auth.as_ref().is_some_and(|a| {
+                        a.connection_handle == *connection_handle && a.awaiting_encryption
+                    });
+                    if matches_auth {
+                        let auth = manual_connect_auth.take().expect("checked above");
+                        if *estatus == 0 && *encryption_enabled != 0 {
+                            eprintln!(
+                                "[AokieRadio] phone.connect: link to {} encrypted — driving HFP setup",
+                                auth.address
+                            );
+                            let mut runtime =
+                                HfpConnectRuntime::new(*connection_handle, wbs_supported);
+                            match runtime.start(&mut l2cap_state) {
+                                Ok(packets) => {
+                                    let mut started = true;
+                                    for packet in &packets {
+                                        if let Err(e) = transport.write_acl(packet) {
+                                            let _ = event_tx.send(RuntimeEvent::Error(
+                                                format!("phone.connect SDP start: {}", e),
+                                            ));
+                                            started = false;
+                                            break;
+                                        }
+                                    }
+                                    if started {
+                                        hfp_connect_runtime = Some(runtime);
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(RuntimeEvent::Error(format!(
+                                        "phone.connect: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        } else {
+                            let _ = event_tx.send(RuntimeEvent::Error(format!(
+                                "phone.connect: encrypting the link to {} failed (status 0x{:02x}) — try again, or re-pair if it keeps failing",
+                                auth.address, estatus
+                            )));
+                            let _ = transport.write_command(&hci::disconnect_command(
+                                *connection_handle,
+                                0x13,
+                            ));
+                            outbound_connect_session = false;
+                        }
+                    }
+                }
                 if let hci::HciEvent::DisconnectionComplete {
                     status: dstatus,
                     connection_handle,
@@ -2604,6 +2944,18 @@ fn run_runtime(
                                 );
                             }
                             pbap_runtime = None;
+                            // HARD-001: an in-flight outbound HFP connect dies
+                            // with its ACL; the session flag resets so inbound
+                            // reconnects get normal MAP/MNS behaviour again.
+                            if hfp_connect_runtime.is_some() {
+                                eprintln!(
+                                    "[AokieRadio] ACL handle {:#06x} dropped — discarding in-flight HFP connect runtime",
+                                    connection_handle
+                                );
+                            }
+                            hfp_connect_runtime = None;
+                            manual_connect_auth = None;
+                            outbound_connect_session = false;
                             // Phase 4e: tear down MAP state too. We
                             // preserve fresh SendReply *and* FetchMessage
                             // ops (under SEND_REPLY_RETAIN_TTL) so the
@@ -2891,6 +3243,16 @@ fn run_runtime(
             // there's no live fetch — the Option keeps this a
             // single-pointer load on the steady-state path.
             drive_pbap_runtime(&mut pbap_runtime, &mut l2cap_state, &transport, &event_tx);
+            // HARD-001: drive the outbound HFP connect (phone.connect)
+            // with the same cadence — SDP/RFCOMM progress lands on the
+            // wire as soon as the phone's bytes arrive.
+            drive_hfp_connect_runtime(
+                &mut hfp_connect_runtime,
+                active_acl_handle,
+                &mut l2cap_state,
+                &transport,
+                &event_tx,
+            );
             // Phase 4e: drain MnsServer events the inbound RFCOMM
             // closure may have produced as a side effect of the
             // ACL packet we just processed. NewMessage rows turn
@@ -2940,6 +3302,20 @@ fn run_runtime(
                 )?;
                 for packet in &control_packets {
                     transport.write_acl(packet)?;
+                }
+                // HARD-001: same dead-half-link teardown as the heartbeat
+                // drain — SLC failure on a link we paged drops the ACL.
+                if outbound_connect_session {
+                    if let HfpEvent::ServiceLevelConnectionFailed(_) = &hfp_event {
+                        if let Some(handle) = active_acl_handle {
+                            eprintln!(
+                                "[AokieRadio] phone.connect: SLC failed on our paged link — disconnecting handle {:#06x}",
+                                handle
+                            );
+                            let _ = transport.write_command(&hci::disconnect_command(handle, 0x13));
+                        }
+                        outbound_connect_session = false;
+                    }
                 }
                 if matches!(hfp_event, HfpEvent::ServiceLevelConnectionReady) {
                     // Subscribe MAP first; defer PBAP until MNS is Connected (see pbap_pending_for_acl).
@@ -2996,6 +3372,16 @@ fn run_runtime(
         // calling drive_pbap_runtime, and PBAP sits in DrivingPbap{,Shared}
         // forever (blocking MAP because of `pbap_busy`).
         drive_pbap_runtime(&mut pbap_runtime, &mut l2cap_state, &transport, &event_tx);
+        // HARD-001: tick the outbound HFP connect off the idle path too,
+        // so its inactivity watchdog fires even when the phone goes
+        // silent (no inbound ACL to wake the drain above).
+        drive_hfp_connect_runtime(
+            &mut hfp_connect_runtime,
+            active_acl_handle,
+            &mut l2cap_state,
+            &transport,
+            &event_tx,
+        );
         drive_map_runtime(
             active_acl_handle,
             &mut map_runtime,
@@ -3417,6 +3803,88 @@ fn start_pbap_fetch_if_idle(
         Err(e) => {
             let _ = event_tx.send(RuntimeEvent::Error(format!("PBAP start: {}", e)));
         }
+    }
+}
+
+/// HARD-001 phone.connect: the security handshake WE drive on a link we
+/// paged, between ConnectionComplete and SDP. Sequence: send
+/// Authentication_Requested (controller resolves the Link_Key_Request
+/// from the pairing store) → Authentication_Complete → send
+/// Set_Connection_Encryption → Encryption_Change → start the HFP
+/// connect runtime. The phone does all of this itself on the inbound
+/// path; skipping it outbound made the phone drop the link with 0x05
+/// the moment our RFCOMM ConnectionRequest arrived.
+struct ManualConnectAuth {
+    connection_handle: u16,
+    address: String,
+    /// false = Authentication_Complete pending; true = it landed OK and
+    /// Encryption_Change is pending.
+    awaiting_encryption: bool,
+    started_at: Instant,
+}
+
+/// HARD-001: drive the outbound HFP connect runtime by one tick.
+/// Mirrors `drive_pbap_runtime`, with one difference on failure: a
+/// paged ACL whose profile setup failed is a dead half-link the phone
+/// will neither use nor repair, so we disconnect it (0x13) instead of
+/// leaving a misleading "connected" LED. The SLC outcome itself flows
+/// through `take_hfp_events` like any inbound connection.
+fn drive_hfp_connect_runtime(
+    hfp_connect_runtime: &mut Option<HfpConnectRuntime>,
+    active_acl_handle: Option<u16>,
+    l2cap_state: &mut l2cap::L2capState,
+    transport: &AokieHciTransport,
+    event_tx: &UnboundedSender<RuntimeEvent>,
+) {
+    let Some(runtime) = hfp_connect_runtime.as_mut() else {
+        return;
+    };
+    match runtime.tick(l2cap_state) {
+        Ok(packets) => {
+            for packet in &packets {
+                if let Err(e) = transport.write_acl(packet) {
+                    let _ = event_tx.send(RuntimeEvent::Error(format!(
+                        "HFP connect tick ACL write: {}",
+                        e
+                    )));
+                    *hfp_connect_runtime = None;
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[AokieRadio] HFP connect tick error: {}", e);
+            *hfp_connect_runtime = None;
+            return;
+        }
+    }
+    for ev in runtime.take_events() {
+        match ev {
+            HfpConnectEvent::SlcKicked => {
+                eprintln!("[AokieRadio] phone.connect: outbound SLC kicked");
+            }
+            HfpConnectEvent::Failed(reason) => {
+                let _ = event_tx.send(RuntimeEvent::Error(format!(
+                    "phone.connect failed: {}",
+                    reason
+                )));
+                // Tear the half-open ACL down so the phone can cleanly
+                // reconnect (either direction) rather than sitting on a
+                // dead link.
+                if let Some(handle) = active_acl_handle {
+                    let cmd = hci::disconnect_command(handle, 0x13);
+                    if let Err(e) = transport.write_command(&cmd) {
+                        eprintln!(
+                            "[AokieRadio] phone.connect: teardown disconnect write failed: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if runtime.is_done() || runtime.is_failed() {
+        *hfp_connect_runtime = None;
     }
 }
 

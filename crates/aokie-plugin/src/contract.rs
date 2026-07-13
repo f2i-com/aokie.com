@@ -115,6 +115,7 @@ pub mod commands {
         "phone.listPaired",
         "phone.removePaired",
         "phone.disconnect",
+        "phone.connect",
         "call.current",
         "call.answer",
         "call.reject",

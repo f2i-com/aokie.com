@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::{hfp, rfcomm, sdp};
+use super::{hfp, hfp_client, rfcomm, sdp};
 
 /// PSM handler. Receives the channel (so RFCOMM-style handlers can
 /// touch per-channel state) and the L2CAP payload; returns zero or
@@ -209,6 +209,15 @@ pub struct L2capChannel {
     /// takes over for the ConfigureRequest leg.
     pub outbound_connect_identifier: Option<u8>,
     pub rfcomm_state: Option<rfcomm::RfcommState>,
+    /// Initiator-side HFP state for an OUTBOUND RFCOMM channel we
+    /// opened toward the phone's Hands-Free AG (the `phone.connect`
+    /// reconnect path). Mutually exclusive with `rfcomm_state` in
+    /// practice — an outbound HFP channel installs an upper handler
+    /// that routes here, so the global PSM handler never creates a
+    /// server-mode RfcommState on it. Drained by the same
+    /// `take_hfp_events` / `build_hfp_call_control_packets` /
+    /// `tick_hfp_stalls` surfaces as the server path.
+    pub hfp_client: Option<hfp_client::HfpClientState>,
     /// Per-channel payload handler. When present, takes precedence
     /// over the global PSM handler in `psm_handlers`. Phase 3c of the
     /// MAP/PBAP plan: the runtime can install a profile-specific
@@ -498,6 +507,9 @@ impl L2capState {
             if let Some(rfcomm_state) = channel.rfcomm_state.as_mut() {
                 events.extend(rfcomm_state.take_hfp_events());
             }
+            if let Some(hfp_client) = channel.hfp_client.as_mut() {
+                events.extend(hfp_client.take_hfp_events());
+            }
         }
         events
     }
@@ -511,6 +523,9 @@ impl L2capState {
         for channel in self.channels.values_mut() {
             if let Some(rfcomm_state) = channel.rfcomm_state.as_mut() {
                 rfcomm_state.tick_hfp_stall(now, timeout);
+            }
+            if let Some(hfp_client) = channel.hfp_client.as_mut() {
+                hfp_client.tick_hfp_stall(now, timeout);
             }
         }
     }
@@ -561,6 +576,9 @@ impl L2capState {
                     self.orphan_hfp_events
                         .extend(rfcomm_state.take_hfp_events());
                 }
+                if let Some(hfp_client) = channel.hfp_client.as_mut() {
+                    self.orphan_hfp_events.extend(hfp_client.take_hfp_events());
+                }
                 self.orphan_hfp_events
                     .push(hfp::HfpEvent::ServiceLevelConnectionFailed(format!(
                     "L2CAP ConfigureRequest on cid 0x{:04x} (PSM 0x{:04x}) timed out after {:?}",
@@ -590,8 +608,16 @@ impl L2capState {
             .values_mut()
             .filter(|channel| channel.psm == PSM_RFCOMM && channel.state == ChannelState::Open)
             .find_map(|channel| {
-                let rfcomm_state = channel.rfcomm_state.as_mut()?;
-                let frame = rfcomm_state.build_call_control_command(command.clone())?;
+                // Server-mode HFP (phone connected to us) or client-mode
+                // HFP (we reconnected outbound via phone.connect) —
+                // whichever owns the live SLC produces the frame.
+                let frame = if let Some(rfcomm_state) = channel.rfcomm_state.as_mut() {
+                    rfcomm_state.build_call_control_command(command.clone())
+                } else if let Some(hfp_client) = channel.hfp_client.as_mut() {
+                    hfp_client.build_call_control_command(command.clone())
+                } else {
+                    None
+                }?;
                 Some((channel.connection_handle, channel.remote_cid, frame))
             })
         else {
@@ -874,6 +900,7 @@ impl L2capState {
                 // a no-op and the MNS DLCI would never be reachable for
                 // inbound notification PNs from the phone.
                 rfcomm_state: None,
+                hfp_client: None,
                 upper_handler: None,
             },
         );
@@ -1023,6 +1050,7 @@ impl L2capState {
                 local_config_sent_at: Some(Instant::now()),
                 outbound_connect_identifier: Some(identifier),
                 rfcomm_state: None,
+                hfp_client: None,
                 upper_handler,
             },
         );
@@ -1038,6 +1066,46 @@ impl L2capState {
             &signaling,
         );
         (local_cid, acl)
+    }
+
+    /// Install an initiator-side HFP state on an OUTBOUND RFCOMM
+    /// channel (the `phone.connect` reconnect path) and originate the
+    /// multiplexer SABM. Returns the ACL packet to write. The channel
+    /// must be Open (L2CAP configured) and must have been opened with
+    /// the hfp_connect upper handler so inbound bytes route into the
+    /// client state.
+    pub fn start_hfp_client(
+        &mut self,
+        local_cid: u16,
+        server_channel: u8,
+        wbs_supported: bool,
+    ) -> Result<Vec<u8>, String> {
+        let channel = self
+            .channels
+            .get_mut(&local_cid)
+            .ok_or_else(|| format!("L2CAP channel 0x{:04x} not found", local_cid))?;
+        if channel.state != ChannelState::Open {
+            return Err(format!(
+                "L2CAP channel 0x{:04x} not Open (state {:?})",
+                local_cid, channel.state
+            ));
+        }
+        if channel.hfp_client.is_some() {
+            return Err(format!(
+                "L2CAP channel 0x{:04x} already has an HFP client",
+                local_cid
+            ));
+        }
+        let mut client = hfp_client::HfpClientState::new(server_channel, wbs_supported);
+        let sabm = client.kickoff()?;
+        channel.hfp_client = Some(client);
+        let basic = build_basic_frame(channel.remote_cid, &sabm);
+        Ok(build_acl_packet(
+            channel.connection_handle,
+            ACL_PACKET_BOUNDARY_FIRST_NON_FLUSHABLE,
+            ACL_BROADCAST_POINT_TO_POINT,
+            &basic,
+        ))
     }
 
     /// Wrap an upper-layer payload in a basic frame + ACL packet on

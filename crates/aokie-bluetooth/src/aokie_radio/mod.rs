@@ -15,6 +15,8 @@
 pub mod bmessage;
 pub mod hci;
 pub mod hfp;
+pub mod hfp_client;
+pub mod hfp_connect;
 pub mod l2cap;
 pub mod manager;
 pub mod map_listing;

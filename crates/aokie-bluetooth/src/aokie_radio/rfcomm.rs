@@ -995,7 +995,28 @@ pub struct RfcommClientState {
     /// True once we've replied to the peer's MSC CMD with our MSC RSP.
     msc_remote_received: bool,
     pending_events: Vec<RfcommClientEvent>,
+    /// Credit-based flow control negotiated (the peer's PN response
+    /// carried the CFC-accepted frame type 0xe0). Bluedroid ALWAYS runs
+    /// CFC and obeys it strictly for its own transmissions — the
+    /// HARD-001 outbound-SLC failure was the AG queuing +BRSF forever
+    /// because our PN granted it ZERO initial credits and we never
+    /// topped it up: it DISC'd the DLCI after its 5s SLC timer.
+    credit_flow: bool,
+    /// Credits WE may spend on target-DLCI data frames (granted by the
+    /// peer's PN response + inbound credit bytes). Only meaningful when
+    /// `credit_flow`.
+    tx_credits: u16,
+    /// Credits the PEER currently holds toward us (granted by our PN
+    /// command + our top-up frames). Refilled as data arrives so the
+    /// peer never stalls the way the AG stalled on us.
+    rx_credits_outstanding: u16,
 }
+
+/// Initial credits we grant the peer in the PN command (BTstack/BlueZ
+/// default), and the low-water mark that triggers a zero-length credit
+/// top-up UIH back to the peer.
+const CLIENT_INITIAL_CREDITS: u8 = 7;
+const CLIENT_CREDIT_REFILL_THRESHOLD: u16 = 3;
 
 impl RfcommClientState {
     /// Construct a client state targeting `server_channel` (e.g. the
@@ -1011,7 +1032,19 @@ impl RfcommClientState {
             msc_local_pending: false,
             msc_remote_received: false,
             pending_events: Vec::new(),
+            credit_flow: false,
+            tx_credits: 0,
+            rx_credits_outstanding: 0,
         }
+    }
+
+    /// False while credit-based flow control is active and the peer has
+    /// granted us no transmit credits — data sent anyway would be a
+    /// protocol violation the peer may silently discard. Callers with a
+    /// command queue (the HFP client) hold the next frame until this
+    /// turns true; the peer's credit grant arrives via `handle_packet`.
+    pub fn can_send_data(&self) -> bool {
+        !self.credit_flow || self.tx_credits > 0
     }
 
     pub fn server_channel(&self) -> u8 {
@@ -1084,16 +1117,51 @@ impl RfcommClientState {
             }
             (RfcommFrameKind::Uih, RFCOMM_DLCI_MULTIPLEXER) => self.on_mux_uih(frame.payload),
             (RfcommFrameKind::Uih, dlci) if dlci == self.target_dlci => {
-                if self.is_open() {
-                    self.pending_events
-                        .push(RfcommClientEvent::Payload(frame.payload.to_vec()));
-                } else {
-                    eprintln!(
-                        "[AokieRadio] RFCOMM client UIH on dlci {} ignored — channel not yet Open (phase {:?})",
-                        dlci, self.phase
-                    );
+                let mut out = Vec::new();
+                // Credit byte (UIH with P/F=1) — the peer topping up our
+                // transmit budget. Zero-length credit frames are how
+                // Bluedroid delivers the REAL initial grant right after
+                // the channel opens (its PN response says 0).
+                if let Some(granted) = frame.credits {
+                    if granted > 0 {
+                        self.tx_credits = self.tx_credits.saturating_add(u16::from(granted));
+                        eprintln!(
+                            "[AokieRadio] RFCOMM client dlci {} credit grant +{} (tx_credits now {})",
+                            dlci, granted, self.tx_credits
+                        );
+                    }
                 }
-                Ok(Vec::new())
+                if !frame.payload.is_empty() {
+                    if self.is_open() {
+                        self.pending_events
+                            .push(RfcommClientEvent::Payload(frame.payload.to_vec()));
+                    } else {
+                        eprintln!(
+                            "[AokieRadio] RFCOMM client UIH on dlci {} ignored — channel not yet Open (phase {:?})",
+                            dlci, self.phase
+                        );
+                    }
+                    // Each data frame consumes one of the credits we
+                    // granted; refill BEFORE the peer runs dry — an AG
+                    // mid-SLC (or a PSE streaming a phonebook) that hits
+                    // zero credits simply stops talking, which is
+                    // exactly the stall we're preventing.
+                    if self.credit_flow {
+                        self.rx_credits_outstanding = self.rx_credits_outstanding.saturating_sub(1);
+                        if self.rx_credits_outstanding <= CLIENT_CREDIT_REFILL_THRESHOLD {
+                            let refill =
+                                u16::from(CLIENT_INITIAL_CREDITS) - self.rx_credits_outstanding;
+                            self.rx_credits_outstanding += refill;
+                            out.push(build_uih(
+                                self.target_dlci,
+                                true,
+                                Some(refill as u8),
+                                &[],
+                            ));
+                        }
+                    }
+                }
+                Ok(out)
             }
             _ => {
                 eprintln!(
@@ -1112,9 +1180,20 @@ impl RfcommClientState {
         // Multiplexer up. Send PN command for our target DLCI before
         // SABM-ing the channel — most AGs (Pixel/iPhone/etc.) require
         // PN first or they reply DM to the SABM. priority 7 matches
-        // typical PBAP/MAP values; 0 credits lets the peer choose.
+        // typical PBAP/MAP values. The 0xf0 frame type is the spec's
+        // CFC *request* (live-proven SABM-compatible on the own-mux
+        // path), and the credits byte is the peer's INITIAL transmit
+        // budget toward us: it MUST be non-zero — granting 0 left the
+        // Bluedroid AG unable to send +BRSF during the HARD-001
+        // outbound SLC, so it sat mute for 5s and DISC'd the channel.
         self.phase = RfcommClientPhase::AwaitingPnResponse;
-        let pn = build_parameter_negotiation_command(self.target_dlci, 7, self.max_frame_size, 0);
+        self.rx_credits_outstanding = u16::from(CLIENT_INITIAL_CREDITS);
+        let pn = build_parameter_negotiation_command(
+            self.target_dlci,
+            7,
+            self.max_frame_size,
+            CLIENT_INITIAL_CREDITS,
+        );
         Ok(vec![build_uih(RFCOMM_DLCI_MULTIPLEXER, true, None, &pn)])
     }
 
@@ -1136,15 +1215,28 @@ impl RfcommClientState {
             RfcommMuxCommand::ParameterNegotiation {
                 is_response: true,
                 dlci,
+                frame_type,
                 max_frame_size,
+                credits,
                 ..
             } if dlci == self.target_dlci
                 && matches!(self.phase, RfcommClientPhase::AwaitingPnResponse) =>
             {
                 // PN response settled — clamp the negotiated frame size
                 // to our supported window and SABM the target DLCI.
+                // Frame type 0xe0 = the peer ACCEPTED credit-based flow
+                // control (Bluedroid always does); its credits byte is
+                // our initial transmit budget — usually 0, with the
+                // real grant arriving as a credit UIH after the channel
+                // opens, so data senders must gate on `can_send_data`.
                 self.max_frame_size =
                     max_frame_size.clamp(RFCOMM_MIN_MAX_FRAME_SIZE, RFCOMM_DEFAULT_MAX_FRAME_SIZE);
+                self.credit_flow = frame_type == RFCOMM_PN_BLUETOOTH_FRAME_TYPE_CFC;
+                self.tx_credits = u16::from(credits);
+                eprintln!(
+                    "[AokieRadio] RFCOMM client PN response: frame_type=0x{:02x} cfc={} initial_tx_credits={}",
+                    frame_type, self.credit_flow, self.tx_credits
+                );
                 self.phase = RfcommClientPhase::AwaitingTargetUa;
                 Ok(vec![build_sabm(self.target_dlci, true)])
             }
@@ -1190,12 +1282,19 @@ impl RfcommClientState {
     /// Wrap an upper-layer payload (e.g. an OBEX request) in a UIH
     /// frame on the negotiated DLCI. Errors if the channel isn't Open
     /// — callers must wait for `RfcommClientEvent::Opened` first.
-    pub fn build_outbound_uih(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+    /// Consumes one transmit credit under credit-based flow control;
+    /// queue-driven callers should check `can_send_data()` first (a
+    /// frame built at zero credits is sent anyway — some peers
+    /// tolerate the violation, but Bluedroid may discard it).
+    pub fn build_outbound_uih(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
         if !self.is_open() {
             return Err(format!(
                 "RFCOMM client UIH attempted in phase {:?}",
                 self.phase
             ));
+        }
+        if self.credit_flow {
+            self.tx_credits = self.tx_credits.saturating_sub(1);
         }
         // CR=true: we are the multiplexer initiator; commands from the
         // initiator carry C/R = 1.
@@ -1417,6 +1516,26 @@ pub fn build_parameter_negotiation_response(
         RFCOMM_MUX_PN_RSP,
         dlci,
         RFCOMM_PN_BLUETOOTH_FRAME_TYPE,
+        priority,
+        max_frame_size,
+        credits,
+    )
+}
+
+/// PN response declaring credit-based flow control ACCEPTED (frame type
+/// 0xe0) — what Bluedroid actually answers our client PN with. The
+/// credits byte is the initial transmit budget it grants us (usually 0,
+/// with the real grant following as a credit UIH once the DLCI opens).
+pub fn build_parameter_negotiation_response_cfc(
+    dlci: u8,
+    priority: u8,
+    max_frame_size: u16,
+    credits: u8,
+) -> Vec<u8> {
+    build_parameter_negotiation(
+        RFCOMM_MUX_PN_RSP,
+        dlci,
+        RFCOMM_PN_BLUETOOTH_FRAME_TYPE_CFC,
         priority,
         max_frame_size,
         credits,
@@ -2063,7 +2182,9 @@ mod tests {
                 frame_type: RFCOMM_PN_BLUETOOTH_FRAME_TYPE,
                 priority: 7,
                 max_frame_size: RFCOMM_DEFAULT_MAX_FRAME_SIZE,
-                credits: 0,
+                // Initial credits we grant the peer — must be non-zero
+                // or a CFC peer (Bluedroid AG) can never speak first.
+                credits: 7,
             }
         );
         assert!(matches!(
