@@ -100,6 +100,19 @@ pub struct HfpHandsFreeState {
     callsetup_indicator_index: u8,
     call_active: bool,
     incoming_call: bool,
+    /// `callsetup: 0` arrived while ringing with the `call` indicator still 0.
+    /// That transition is AMBIGUOUS — the ring phase ends for BOTH an
+    /// abandoned ring AND an answered call, and some AGs send `callsetup,0`
+    /// BEFORE `call,1` (observed live 2026-07-13: the old immediate
+    /// CallTerminated killed the plugin's call session ~4s into a REAL
+    /// answered call — the phone call stayed up but every subsequent audio
+    /// frame was dropped and the receptionist went deaf, AOK-CTRL-001). The
+    /// verdict is HELD here until the `call` indicator speaks: a `call,1`
+    /// CIEV (or a CIND? snapshot showing call=1) resolves it as the answer;
+    /// a `call,0` CIEV, a call=0 snapshot (the ACL-keepalive poll arrives
+    /// within ~8s of a quiet line) or a fresh callsetup resolves it as the
+    /// abandon and emits the terminate then.
+    terminate_pending: bool,
     selected_codec: Option<u8>,
 }
 
@@ -114,6 +127,7 @@ impl Default for HfpHandsFreeState {
             callsetup_indicator_index: 3,
             call_active: false,
             incoming_call: false,
+            terminate_pending: false,
             selected_codec: None,
         }
     }
@@ -146,6 +160,9 @@ impl HfpHandsFreeState {
             }
             HfpAgResult::Ring => {
                 self.incoming_call = true;
+                // A live RING while a terminate verdict was held means the
+                // ring never actually ended — drop the held verdict.
+                self.terminate_pending = false;
                 vec![HfpEvent::IncomingCall, HfpEvent::Ringing]
             }
             HfpAgResult::Indicators(indicators) => {
@@ -228,8 +245,22 @@ impl HfpHandsFreeState {
     /// fields silently and rely on the next +CIEV transition (or RING)
     /// to emit user-visible call events.
     fn apply_indicator_status(&mut self, values: &[i32]) -> Vec<HfpEvent> {
+        let mut events = Vec::new();
         if let Some(call) = indicator_status_value(values, self.call_indicator_index) {
             let active = *call != 0;
+            // The snapshot stays silent EXCEPT to resolve a held ring
+            // verdict (see `terminate_pending`): the `+CIEV: call` edge that
+            // would decide answer-vs-abandon may have been lost, and the
+            // consumer is owed exactly one resolution. The ACL-keepalive
+            // AT+CIND? poll makes this land within ~8s of a quiet line.
+            if self.terminate_pending {
+                self.terminate_pending = false;
+                if active && !self.call_active {
+                    events.push(HfpEvent::CallAnswered);
+                } else if !active {
+                    events.push(HfpEvent::CallTerminated);
+                }
+            }
             self.call_active = active;
             if active {
                 // An already-active call at SLC time — make sure
@@ -243,7 +274,7 @@ impl HfpHandsFreeState {
             // (3) aren't relevant for the HF's snapshot view.
             self.incoming_call = *callsetup == 1 && !self.call_active;
         }
-        Vec::new()
+        events
     }
 
     fn apply_indicator(&mut self, index: u8, value: i32) -> Vec<HfpEvent> {
@@ -260,11 +291,15 @@ impl HfpHandsFreeState {
         match value {
             0 => {
                 if self.incoming_call && !self.call_active {
+                    // AMBIGUOUS: the ring phase ends on BOTH abandon and
+                    // answer, and `call,1` may arrive AFTER this (observed
+                    // live — see `terminate_pending`). Never guess
+                    // "terminated" here: hold the verdict for the `call`
+                    // indicator (CIEV edge or CIND? snapshot) to decide.
                     self.incoming_call = false;
-                    vec![HfpEvent::CallTerminated]
-                } else {
-                    Vec::new()
+                    self.terminate_pending = true;
                 }
+                Vec::new()
             }
             1 => {
                 // A fresh incoming-call setup while the AG `call` indicator
@@ -284,7 +319,12 @@ impl HfpHandsFreeState {
                 // boundary; emitting CallTerminated first also lets the
                 // stranded prior call finish its post-call processing.
                 let mut events = Vec::new();
-                if self.call_active {
+                if self.terminate_pending {
+                    // A NEW ring while the previous ring's verdict was still
+                    // held: nothing ever answered it — that ring is over.
+                    self.terminate_pending = false;
+                    events.push(HfpEvent::CallTerminated);
+                } else if self.call_active {
                     self.call_active = false;
                     events.push(HfpEvent::CallTerminated);
                 }
@@ -298,7 +338,18 @@ impl HfpHandsFreeState {
     }
 
     fn update_call_state(&mut self, active: bool) -> Vec<HfpEvent> {
+        if active {
+            // Resolves a held callsetup-drop: it was the ANSWER transition
+            // (the AG just sent `callsetup,0` before `call,1`).
+            self.terminate_pending = false;
+        }
         if active == self.call_active {
+            if !active && self.terminate_pending {
+                // `call: 0` while a verdict is held is the AG's explicit
+                // word that nothing is active — the ring was ABANDONED.
+                self.terminate_pending = false;
+                return vec![HfpEvent::CallTerminated];
+            }
             return Vec::new();
         }
 
@@ -649,6 +700,134 @@ mod tests {
         );
         assert!(!state.call_active());
         assert!(state.incoming_call());
+    }
+
+    // ── AOK-CTRL-001: callsetup-drop is a HELD verdict, never a guess ──────
+    // Live bug (2026-07-13): the phone sent `+CIEV: callsetup,0` BEFORE
+    // `+CIEV: call,1` when the auto-answer connected; the old code read the
+    // drop as "ring abandoned" → CallTerminated, the plugin killed its call
+    // session (outcome "missed", 0s) and dropped every audio frame of a call
+    // that was actually up — the receptionist heard nothing for the rest of
+    // the call. The drop must wait for the `call` indicator to decide.
+
+    #[test]
+    fn callsetup_drop_before_call_up_is_the_answer_not_a_terminate() {
+        let mut state = HfpHandsFreeState::new();
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 }),
+            vec![HfpEvent::IncomingCall]
+        );
+        // The ambiguous drop: NO terminate may fire here.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
+            Vec::<HfpEvent>::new()
+        );
+        // The call indicator resolves it as the ANSWER.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 }),
+            vec![HfpEvent::CallAnswered]
+        );
+        assert!(state.call_active());
+        // And the eventual hangup still terminates exactly once.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 }),
+            vec![HfpEvent::CallTerminated]
+        );
+    }
+
+    #[test]
+    fn abandoned_ring_resolves_terminated_via_the_cind_snapshot() {
+        // Caller gave up before the answer: callsetup drops, `call` never
+        // rises. The ACL-keepalive AT+CIND? poll (~8s later) shows call=0
+        // and resolves the held verdict as the abandon.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
+            Vec::<HfpEvent>::new()
+        );
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 0, 0])),
+            vec![HfpEvent::CallTerminated]
+        );
+        assert!(!state.call_active());
+        // The verdict is consumed — the next snapshot stays silent.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 0, 0])),
+            Vec::<HfpEvent>::new()
+        );
+    }
+
+    #[test]
+    fn abandoned_ring_resolves_terminated_via_an_explicit_call_zero_ciev() {
+        // Some AGs confirm the abandon with `+CIEV: call,0` even though the
+        // call never went active — that explicit word resolves the verdict.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 }),
+            vec![HfpEvent::CallTerminated]
+        );
+    }
+
+    #[test]
+    fn lost_call_edge_resolves_answered_via_the_cind_snapshot() {
+        // The `+CIEV: call,1` was lost entirely; the keepalive snapshot shows
+        // call=1 while the verdict is held → the consumer is owed exactly one
+        // CallAnswered (the snapshot is otherwise silent by design).
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 1, 0])),
+            vec![HfpEvent::CallAnswered]
+        );
+        assert!(state.call_active());
+        // A late duplicate `call,1` CIEV stays silent (edge guard).
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 }),
+            Vec::<HfpEvent>::new()
+        );
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 }),
+            vec![HfpEvent::CallTerminated]
+        );
+    }
+
+    #[test]
+    fn a_new_ring_while_the_verdict_is_held_terminates_the_prior_ring() {
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 });
+        // Nothing ever answered ring A; ring B starting is its boundary.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 }),
+            vec![HfpEvent::CallTerminated, HfpEvent::IncomingCall]
+        );
+        assert!(state.incoming_call());
+    }
+
+    #[test]
+    fn a_live_ring_line_drops_the_held_verdict() {
+        // RING still arriving after a callsetup blip = the ring never ended;
+        // the answer that follows must fire cleanly with no phantom terminate.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::Ring),
+            vec![HfpEvent::IncomingCall, HfpEvent::Ringing]
+        );
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 }),
+            vec![HfpEvent::CallAnswered]
+        );
+        // The dropped verdict must not resurface at the eventual hangup.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 }),
+            vec![HfpEvent::CallTerminated]
+        );
     }
 
     #[test]
