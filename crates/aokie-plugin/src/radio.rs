@@ -37,6 +37,19 @@ use crate::outbox::Outbox;
 /// variant is fire-and-forget: the *result* of the action arrives back as an
 /// asynchronous `aokie.*` event from the radio thread, matching the mock
 /// contract (`call.answer` â†’ later `aokie.call.answered`, etc.).
+/// §9.3 call-scoped agent configuration (`call.configureAgent`): a caller-
+/// specific persona/greeting bound to ONE call id. Held in `run_loop` and
+/// wiped in the per-call reset block, so a failed or raced next-call setup
+/// can never leak the previous caller's personalization into a different
+/// caller's conversation (the durable `settings.set` path remains for
+/// caller-INDEPENDENT config).
+#[cfg(feature = "voice")]
+struct CallAgentOverlay {
+    call_id: String,
+    persona: Option<String>,
+    greeting: Option<String>,
+}
+
 pub enum RadioControl {
     /// AOK-CTRL-001: call controls carry the operation id minted by the
     /// connector when it ACCEPTED the command, so the radio can attribute an
@@ -75,6 +88,17 @@ pub enum RadioControl {
         endpoint: Option<String>,
         stt_endpoint: Option<String>,
         tts_endpoint: Option<String>,
+    },
+    /// §9.3 call-scoped agent config (`call.configureAgent`): persona /
+    /// greeting for ONE named call, wiped at the call boundary. The
+    /// connector validated the call id, but the radio re-checks against the
+    /// CURRENT session before applying — the command may have raced the
+    /// call's end, and applying it to the next call is the exact failure
+    /// this command exists to prevent.
+    ConfigureCallAgent {
+        call_id: String,
+        persona: Option<String>,
+        greeting: Option<String>,
     },
     /// AOK-BT-001: open a bounded, discoverable pairing window for `seconds`. At
     /// rest the radio is connectable-only, so an unknown phone can only pair while
@@ -2801,6 +2825,9 @@ fn run_loop(
         .filter(|s| !s.trim().is_empty());
     #[cfg(feature = "voice")]
     let mut agent_client: Option<crate::agent::LlmClient> = None;
+    // §9.3 call-scoped agent overlay — see [`CallAgentOverlay`].
+    #[cfg(feature = "voice")]
+    let mut call_agent_overlay: Option<CallAgentOverlay> = None;
     // Conversation history for the agent (OpenAI chat messages), reset per call.
     #[cfg(feature = "voice")]
     let mut history: Vec<serde_json::Value> = Vec::new();
@@ -3046,6 +3073,9 @@ fn run_loop(
             spec_utterance = None;
             stale_specs.clear();
             last_cut_context = None;
+            // §9.3: the call-scoped agent overlay dies WITH its call — the
+            // next caller can never inherit the previous caller's persona.
+            call_agent_overlay = None;
             // Drop the echo canceller entirely rather than just resetting its
             // FIFOs (review sweep): it was built at the FIRST call's SCO rate
             // and reset() keeps that rate + filter length. Back-to-back calls
@@ -3178,7 +3208,13 @@ fn run_loop(
                         "[aokie-plugin] full-duplex barge-in ON (AEC @ {sr}Hz, rms>{barge_rms})"
                     );
                 }
-                if let Some(text) = greeting.as_deref() {
+                // §9.3: a call-scoped greeting (personalize-caller) wins for
+                // ITS call; the configured global greeting is the fallback.
+                let overlay_greeting = call_agent_overlay
+                    .as_ref()
+                    .filter(|o| o.call_id == corr)
+                    .and_then(|o| o.greeting.as_deref());
+                if let Some(text) = overlay_greeting.or(greeting.as_deref()) {
                     // In barge-in mode the caller can talk over the greeting;
                     // in half-duplex we mute STT for its playout instead.
                     let (aec_ref, brms) = if barge_in {
@@ -3818,10 +3854,18 @@ fn run_loop(
                             // mutating agent_persona, which a live Configure could
                             // replace): spoken-delivery/markers always, the
                             // end-call marker only when agentHangup is on.
+                            // §9.3 call-scoped overlay: a caller-specific
+                            // persona (personalize-caller) applies to THIS
+                            // call only — wiped at the call boundary, it can
+                            // never leak into the next caller's conversation.
+                            let persona_now: &str = call_agent_overlay
+                                .as_ref()
+                                .and_then(|o| o.persona.as_deref())
+                                .unwrap_or(&agent_persona);
                             let mut system_prompt = if agent_hangup {
-                                format!("{agent_persona}{SPEECH_STYLE_INSTRUCTION}{END_CALL_INSTRUCTION}")
+                                format!("{persona_now}{SPEECH_STYLE_INSTRUCTION}{END_CALL_INSTRUCTION}")
                             } else {
-                                format!("{agent_persona}{SPEECH_STYLE_INSTRUCTION}")
+                                format!("{persona_now}{SPEECH_STYLE_INSTRUCTION}")
                             };
                             // The nudge: the caller interrupted the previous
                             // reply — hand the model its unspoken tail so the
@@ -4948,6 +4992,38 @@ fn run_loop(
                         "[aokie-plugin] operatorSpeak ({} chars) â€” voice feature not built",
                         text.chars().count()
                     );
+                }
+                Ok(RadioControl::ConfigureCallAgent {
+                    call_id,
+                    persona,
+                    greeting,
+                }) => {
+                    #[cfg(feature = "voice")]
+                    {
+                        // Apply only to the CURRENT call — a push that raced
+                        // the call's end dies here instead of configuring the
+                        // next caller (the point of call-scoped config).
+                        if tracker.current().is_some_and(|s| s.id == call_id) {
+                            let persona = persona.filter(|p| !p.trim().is_empty());
+                            let greeting = greeting.filter(|s| !s.trim().is_empty());
+                            eprintln!(
+                                "[aokie-plugin] call-scoped agent config for {call_id} (persona {}, greeting {})",
+                                persona.is_some(),
+                                greeting.is_some()
+                            );
+                            call_agent_overlay = Some(CallAgentOverlay {
+                                call_id,
+                                persona,
+                                greeting,
+                            });
+                        } else {
+                            eprintln!(
+                                "[aokie-plugin] call-scoped agent config DROPPED — {call_id} is not the current call"
+                            );
+                        }
+                    }
+                    #[cfg(not(feature = "voice"))]
+                    let _ = (call_id, persona, greeting);
                 }
                 Ok(RadioControl::Configure {
                     persona,
