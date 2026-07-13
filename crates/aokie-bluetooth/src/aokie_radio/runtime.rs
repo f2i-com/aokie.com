@@ -1939,6 +1939,21 @@ fn run_runtime(
                     }
                 }
                 Ok(ControlCommand::SendAudio(samples)) => {
+                    // No active SCO = no call that can hear this. Refuse the
+                    // queue instead of buffering: audio synthesized for a call
+                    // whose link just died would otherwise sit in the TX queue
+                    // and PLAY INTO THE NEXT CALL's fresh SCO (observed live
+                    // 2026-07-13: a new call opened with the tail of the
+                    // previous call's cut-off reply). Every legitimate speaker
+                    // (greeting, agent replies, operatorSpeak) already gates
+                    // on sample_rate > 0, so pre-SCO queuing is never wanted.
+                    if active_sco_handle.is_none() {
+                        eprintln!(
+                            "[AokieRadio] SCO TX: DROPPED {} samples — no active SCO link (stale call audio must not leak into the next call)",
+                            samples.len()
+                        );
+                        continue;
+                    }
                     // Audio level on the way in. If the caller hears
                     // silence and this is also silence, the upstream
                     // TTS is producing zeros; if it has level here but
@@ -2256,6 +2271,19 @@ fn run_runtime(
                         active_sco_tx_packet_len = Some(*tx_packet_length as usize);
                         last_sco_rx_bytes_at = None;
                         sco_rx_silence_logged_at = None;
+                        // Every call's audio starts from an EMPTY queue —
+                        // belt-and-braces over the no-SCO SendAudio refusal
+                        // and the drop-time clear: whatever anyone queued
+                        // between links (a reply cut off by a dead link, a
+                        // race with teardown), the next caller must never
+                        // hear the previous call's leftovers.
+                        if !sco_tx_queue.is_empty() {
+                            eprintln!(
+                                "[AokieRadio] SCO establish: discarding {} stale queued TX samples from a previous call",
+                                sco_tx_queue.len()
+                            );
+                            sco_tx_queue.clear();
+                        }
                         // Mirror BTStack's `usb_sco_start`: the SetCurrentAlternateSetting
                         // + RegisterIsochBuffer + IN-ring bootstrap fire here, AFTER
                         // SynchronousConnectionComplete delivers a valid

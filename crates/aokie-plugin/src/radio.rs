@@ -2754,6 +2754,14 @@ fn run_loop(
                             // the reply, but the transcript must not label an
                             // operator action as "caller interrupted".
                             let mut operator_ended = false;
+                            // AOK-CTRL-001 follow-up: the call's audio channel
+                            // died mid-reply (link loss / SCO teardown). Nobody
+                            // can hear the rest — and speaking it anyway queued
+                            // stale audio that played into the NEXT call
+                            // (observed live 2026-07-13). Stops the pump; also
+                            // suppresses the dead-air fail-safe and the agent
+                            // hangup (both would act on a dead link).
+                            let mut line_dead = false;
                             // Set when the reply carried the [[END_CALL]] marker: the
                             // agent finalized the call and should hang up after the
                             // goodbye plays (unless the caller barged in over it).
@@ -2816,6 +2824,20 @@ fn run_loop(
                             let started = Instant::now();
                             let mut stream_outcome: Option<Result<String, String>> = None;
                             'pump: loop {
+                                // The audio channel is gone (SCO teardown /
+                                // link loss): abandon the reply NOW — the
+                                // outer loop's event drain will run the real
+                                // call teardown. `sr > 0` guards the (never
+                                // legitimate) reply-started-without-audio
+                                // case, which the dead-air fail-safe owns.
+                                if sr > 0 && bt.get_sample_rate() == 0 {
+                                    eprintln!(
+                                        "[aokie-plugin] call audio channel gone mid-reply — abandoning the rest of the reply"
+                                    );
+                                    reply_cancel.store(true, Ordering::Relaxed);
+                                    line_dead = true;
+                                    break 'pump;
+                                }
                                 // Urgent controls act immediately — no stream
                                 // progress required (audit AK-003 + AOK-CTRL-001);
                                 // everything else parks for the main control loop.
@@ -2969,7 +2991,9 @@ fn run_loop(
                                     // annotated with WHY — the full generation
                                     // includes sentences the caller never heard, and
                                     // an operator hangup is not a caller interruption.
-                                    let cut = if barged {
+                                    let cut = if line_dead {
+                                        Some(" [call dropped mid-reply]")
+                                    } else if barged {
                                         Some(" [caller interrupted]")
                                     } else if operator_ended {
                                         Some(" [ended by the operator]")
@@ -2995,11 +3019,15 @@ fn run_loop(
                                     // VOICE-001: nothing audible + no barge/operator
                                     // context = the caller is in DEAD AIR — an empty
                                     // generation or fully-silent synthesis both count.
-                                    if reply_left_dead_air(
-                                        reply_dur > Duration::ZERO,
-                                        barged,
-                                        operator_ended,
-                                    ) {
+                                    // A dead LINE is not dead air: there is no channel
+                                    // left to apologise on.
+                                    if !line_dead
+                                        && reply_left_dead_air(
+                                            reply_dur > Duration::ZERO,
+                                            barged,
+                                            operator_ended,
+                                        )
+                                    {
                                         dead_air_cause = Some(if heard.is_empty() {
                                             "the assistant produced an empty reply".to_string()
                                         } else {
@@ -3013,7 +3041,9 @@ fn run_loop(
                                     // nothing instead of the full generation.
                                     if !heard.is_empty() && reply_dur > Duration::ZERO {
                                         // AOK-CTRL-001: structured per-turn delivery.
-                                        let delivery = if barged {
+                                        let delivery = if line_dead {
+                                            "error"
+                                        } else if barged {
                                             "interrupted"
                                         } else if operator_ended {
                                             "operator_ended"
@@ -3074,7 +3104,9 @@ fn run_loop(
                                         );
                                         turn_index += 1;
                                         last_bot_reply = heard;
-                                    } else if reply_left_dead_air(false, barged, operator_ended) {
+                                    } else if !line_dead
+                                        && reply_left_dead_air(false, barged, operator_ended)
+                                    {
                                         // VOICE-001: total failure — the caller heard
                                         // nothing at all. Record it as a definitive
                                         // live LLM failure (health degrades; the
@@ -3172,16 +3204,23 @@ fn run_loop(
                             // the farewell's remaining playout drain, replacing the
                             // old fixed-delay hangup that could cut a goodbye short
                             // or fire before one was proven audible.
-                            match agent_hangup_verdict(
-                                hangup_requested,
-                                barged,
-                                operator_ended,
-                                ended_by_failsafe,
-                                reply_dur > Duration::ZERO,
-                                t0,
-                                reply_dur,
-                                Instant::now(),
-                            ) {
+                            let verdict = if line_dead {
+                                // No link left to hang up on — the outer loop's
+                                // event drain runs the real teardown.
+                                HangupVerdict::Skip("the call's audio link is gone")
+                            } else {
+                                agent_hangup_verdict(
+                                    hangup_requested,
+                                    barged,
+                                    operator_ended,
+                                    ended_by_failsafe,
+                                    reply_dur > Duration::ZERO,
+                                    t0,
+                                    reply_dur,
+                                    Instant::now(),
+                                )
+                            };
+                            match verdict {
                                 HangupVerdict::Proceed { wait } => {
                                     if !wait.is_zero() {
                                         std::thread::sleep(wait);
