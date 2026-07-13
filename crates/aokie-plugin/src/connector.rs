@@ -68,6 +68,15 @@ impl CmdError {
             message: message.into(),
         }
     }
+
+    /// §9.2: the speech answers an OLDER caller turn in the SAME call — the
+    /// conversation moved on. Benign skip, never a fallback trigger.
+    pub fn stale_turn(message: impl Into<String>) -> Self {
+        CmdError {
+            code: crate::contract::errors::STALE_TURN,
+            message: message.into(),
+        }
+    }
 }
 
 /// Mock call lifecycle state (dev mode / simulated calls only).
@@ -1391,12 +1400,24 @@ impl Plugin {
                 Ok(json!({"accepted": true, "ended": true}))
             }
             "call.operatorSpeak" => {
-                let obj = expect_fields(payload, &["text", "callId"])?;
+                let obj = expect_fields(payload, &["text", "callId", "inResponseTo"])?;
                 let text = require_str(&obj, "text")?;
                 if text.trim().is_empty() {
                     return Err(CmdError::failed("text is empty"));
                 }
                 let call_id = optional_str(&obj, "callId")?;
+                // §9.2 within-call staleness: the TURN NUMBER of the caller
+                // turn this speech answers (`aokie.call.turn.final`'s `turn`
+                // field). Optional — an operator typing live has no specific
+                // turn; flows replying to a turn event should carry it.
+                let in_response_to = match obj.get("inResponseTo") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.as_u64().ok_or_else(|| {
+                        CmdError::failed(
+                            "inResponseTo must be the caller turn NUMBER this speech answers",
+                        )
+                    })?),
+                };
                 if let Some(radio) = self.radio.as_ref() {
                     // Truthfulness gate (audit INT-006/C-15): a build without
                     // voice output can only LOG the text — never claim it was
@@ -1420,6 +1441,13 @@ impl Plugin {
                         ));
                     }
                     check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
+                    check_in_response_to(
+                        in_response_to,
+                        radio
+                            .status
+                            .last_caller_turn
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )?;
                     // Acceptance only: the bot `call.turn.final` event confirms
                     // the text actually played; a silent synthesis emits
                     // `hardware.error` code `speak_failed` with this id.
@@ -2266,6 +2294,22 @@ fn call_json(call: &MockCall) -> Value {
 /// desktop callers that predate call identity). A mismatch — or a `callId`
 /// with no live call behind it — is the typed `stale_call` error and the
 /// phone is NOT touched (audit C-01).
+/// §9.2 within-call staleness: a reply that names the caller turn it answers
+/// is refused (typed `stale_turn`) once a NEWER caller turn exists — the
+/// conversation moved on, and speaking the stale answer into the newer turn
+/// is worse than staying silent. Omitted = legacy behaviour (speak now).
+/// The mock path never simulates caller turns, so only the radio arm checks.
+fn check_in_response_to(provided: Option<u64>, last_caller_turn: u32) -> Result<(), CmdError> {
+    if let Some(n) = provided {
+        if n != u64::from(last_caller_turn) {
+            return Err(CmdError::stale_turn(format!(
+                "the speech answers caller turn {n}, but the newest caller turn is {last_caller_turn} — the conversation moved on (skip the reply; do NOT speak a fallback)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn check_call_id(provided: Option<&str>, current: Option<&str>) -> Result<(), CmdError> {
     match (provided, current) {
         (None, _) => Ok(()),
@@ -2318,6 +2362,14 @@ fn expect_fields(payload: &Value, allowed: &[&str]) -> Result<Map<String, Value>
     }
 }
 
+/// §3.11 bounds reconciliation: ONE validated range for `sttEndpointMs`,
+/// shared by the settings spec (what `settings.set` accepts) and the radio's
+/// env parse (what the runtime honours). They used to disagree (spec
+/// 100–5000, runtime 150–2000): an ACCEPTED value like 3000 silently fell
+/// back to the 450 ms default — the worst kind of knob.
+pub(crate) const STT_ENDPOINT_MS_MIN: u64 = 100;
+pub(crate) const STT_ENDPOINT_MS_MAX: u64 = 5000;
+
 /// Settings the running radio applies immediately via `RadioControl::Configure`
 /// (audit AK-006 `appliedLive`); everything else known takes effect at the
 /// next connect (`appliesAtReconnect` — read once at radio spawn).
@@ -2353,7 +2405,7 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     SettingSpec { key: "legacyPairingPin", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "mockCalls", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "bargeSensitivity", kind: SettingKind::Int { min: 50, max: 5000 }, applies_live: false },
-    SettingSpec { key: "sttEndpointMs", kind: SettingKind::Int { min: 100, max: 5000 }, applies_live: false },
+    SettingSpec { key: "sttEndpointMs", kind: SettingKind::Int { min: STT_ENDPOINT_MS_MIN as i64, max: STT_ENDPOINT_MS_MAX as i64 }, applies_live: false },
     // AOK-CTRL-001: seconds of MUTUAL silence before the agent checks in, then
     // (after a second silent window) says goodbye and hangs up. 0 = disabled.
     SettingSpec { key: "maxSilenceSecs", kind: SettingKind::Int { min: 0, max: 600 }, applies_live: false },
@@ -2967,6 +3019,50 @@ mod tests {
             MockCallState::Ended
         );
         assert_eq!(plugin.mock.sms_threads.len(), 1);
+    }
+
+    #[test]
+    fn in_response_to_staleness_and_shape() {
+        // Pure check: omitted = legacy OK; matching = fresh; older = stale_turn.
+        assert!(check_in_response_to(None, 7).is_ok());
+        assert!(check_in_response_to(Some(7), 7).is_ok());
+        let err = check_in_response_to(Some(5), 7).unwrap_err();
+        assert_eq!(err.code, crate::contract::errors::STALE_TURN);
+        let err = check_in_response_to(Some(9), 0).unwrap_err();
+        assert_eq!(err.code, crate::contract::errors::STALE_TURN);
+
+        // Dispatch shape: a non-numeric inResponseTo is refused typed; a
+        // numeric one passes the mock path (which has no caller turns to
+        // compare against — staleness lives on the radio arm).
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("dongle.diagnostics", &json!({"simulate": "call"}), &mut sink)
+            .unwrap();
+        {
+            let call = plugin.mock.current_call.as_mut().unwrap();
+            call.state = MockCallState::Incoming;
+            call.correlation_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+        }
+        plugin
+            .dispatch_command("call.answer", &Value::Null, &mut sink)
+            .unwrap();
+        let err = plugin
+            .dispatch_command(
+                "call.operatorSpeak",
+                &json!({"text": "Hi", "inResponseTo": "turn seven"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("inResponseTo"), "{}", err.message);
+        let data = plugin
+            .dispatch_command(
+                "call.operatorSpeak",
+                &json!({"text": "Hi", "inResponseTo": 4}),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(data["spoken"], json!(true));
     }
 
     #[test]
