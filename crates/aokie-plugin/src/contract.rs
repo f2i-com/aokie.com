@@ -122,6 +122,7 @@ pub mod commands {
         "call.reject",
         "call.hangup",
         "call.operatorSpeak",
+        "call.configureAgent",
         "sms.threads",
         "sms.thread",
         "sms.send",

@@ -1445,6 +1445,54 @@ impl Plugin {
                 // a TTS round-trip result.
                 Ok(json!({"accepted": true, "spoken": true, "mock": true}))
             }
+            "call.configureAgent" => {
+                // §9.3 call-scoped agent config: caller-specific persona /
+                // greeting bound to ONE named call. The radio wipes the
+                // overlay at the call boundary, so a failed or raced
+                // next-call setup can never leak the previous caller's
+                // personalization (unlike the durable settings.set path,
+                // which stays for caller-INDEPENDENT config). `callId` is
+                // REQUIRED — a new surface gets no legacy-compat window.
+                let obj = expect_fields(payload, &["callId", "persona", "greeting"])?;
+                let call_id = require_str(&obj, "callId")?;
+                let persona = optional_str(&obj, "persona")?;
+                let greeting = optional_str(&obj, "greeting")?;
+                if persona.as_deref().is_none_or(|p| p.trim().is_empty())
+                    && greeting.as_deref().is_none_or(|g| g.trim().is_empty())
+                {
+                    return Err(CmdError::failed(
+                        "call.configureAgent needs a persona and/or greeting to apply",
+                    ));
+                }
+                if let Some(radio) = self.radio.as_ref() {
+                    if !cfg!(feature = "voice") {
+                        return Err(CmdError::failed(
+                            "this plugin build has no voice agent (voice feature not compiled) — call-scoped agent config has nothing to apply to",
+                        ));
+                    }
+                    check_call_id(Some(&call_id), radio.current_call_id().as_deref())?;
+                    radio
+                        .send(crate::radio::RadioControl::ConfigureCallAgent {
+                            call_id: call_id.clone(),
+                            persona,
+                            greeting,
+                        })
+                        .map_err(CmdError::failed)?;
+                    return Ok(json!({
+                        "accepted": true,
+                        "queued": true,
+                        "via": "radio",
+                        "callId": call_id,
+                    }));
+                }
+                self.require_radio_or_dev("call.configureAgent")?;
+                check_call_id(Some(&call_id), self.mock_call_id().as_deref())?;
+                self.require_call(
+                    &[MockCallState::Incoming, MockCallState::Active],
+                    "call.configureAgent",
+                )?;
+                Ok(json!({"accepted": true, "mock": true, "callId": call_id}))
+            }
             "sms.threads" => {
                 expect_fields(payload, &[])?;
                 // FL-CONN-001: this reads the dev simulator's in-memory threads —
@@ -2919,6 +2967,61 @@ mod tests {
             MockCallState::Ended
         );
         assert_eq!(plugin.mock.sms_threads.len(), 1);
+    }
+
+    #[test]
+    fn call_configure_agent_is_call_scoped_and_validated() {
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("dongle.diagnostics", &json!({"simulate": "call"}), &mut sink)
+            .unwrap();
+        {
+            let call = plugin.mock.current_call.as_mut().unwrap();
+            call.state = MockCallState::Incoming;
+            call.correlation_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+        }
+        plugin
+            .dispatch_command("call.answer", &Value::Null, &mut sink)
+            .unwrap();
+        let current = plugin.mock_call_id().unwrap();
+
+        // callId is REQUIRED — no legacy-compat window on a new surface.
+        let err = plugin
+            .dispatch_command("call.configureAgent", &json!({"persona": "P"}), &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("callId"), "{}", err.message);
+
+        // A stale call id is refused typed; the phone state is untouched.
+        let err = plugin
+            .dispatch_command(
+                "call.configureAgent",
+                &json!({"callId": "call_gone", "persona": "P"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, crate::contract::errors::STALE_CALL);
+
+        // Nothing to apply is refused, not silently accepted.
+        let err = plugin
+            .dispatch_command(
+                "call.configureAgent",
+                &json!({"callId": current, "persona": "  "}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("persona"), "{}", err.message);
+
+        // The current call accepts a real config.
+        let data = plugin
+            .dispatch_command(
+                "call.configureAgent",
+                &json!({"callId": current, "persona": "P", "greeting": "Hi Sam!"}),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(data["accepted"], json!(true));
+        assert_eq!(data["callId"], json!(current));
     }
 
     #[test]
