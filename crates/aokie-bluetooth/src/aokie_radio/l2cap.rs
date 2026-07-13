@@ -317,10 +317,19 @@ impl L2capState {
                 channel.connection_handle == connection_handle
                     && channel.psm == PSM_RFCOMM
                     && channel.state == ChannelState::Open
-                    && channel
+                    // Either mux role qualifies as the shared mux: the
+                    // inbound (phone-initiated) RfcommState, or the
+                    // outbound HARD-001 HfpClientState — Bluedroid runs
+                    // ONE RFCOMM session per peer, so whichever exists
+                    // is the only one OBEX profiles may ride.
+                    && (channel
                         .rfcomm_state
                         .as_ref()
                         .is_some_and(|s| s.multiplexer_open())
+                        || channel
+                            .hfp_client
+                            .as_ref()
+                            .is_some_and(|c| c.mux_is_open()))
             })
             .map(|(cid, _)| *cid)
     }
@@ -348,11 +357,18 @@ impl L2capState {
         }
         let connection_handle = channel.connection_handle;
         let remote_cid = channel.remote_cid;
-        let rfcomm_state = channel
-            .rfcomm_state
-            .as_mut()
-            .ok_or_else(|| format!("L2CAP channel 0x{:04x} has no RfcommState", local_cid))?;
-        let (dlci, frame) = rfcomm_state.attach_client_dlci(server_channel)?;
+        // Whichever mux role lives on this channel does the attach: the
+        // inbound RfcommState or the outbound HfpClientState (HARD-001).
+        let (dlci, frame) = if let Some(rfcomm_state) = channel.rfcomm_state.as_mut() {
+            rfcomm_state.attach_client_dlci(server_channel)?
+        } else if let Some(hfp_client) = channel.hfp_client.as_mut() {
+            hfp_client.attach_client_dlci(server_channel)?
+        } else {
+            return Err(format!(
+                "L2CAP channel 0x{:04x} has no RFCOMM mux state",
+                local_cid
+            ));
+        };
         let basic = build_basic_frame(remote_cid, &frame);
         let acl = build_acl_packet(
             connection_handle,
@@ -369,48 +385,63 @@ impl L2capState {
     /// `take_rfcomm_client_events_for_dlci` instead when more than one
     /// runtime rides the same shared mux.
     pub fn take_rfcomm_client_events(&mut self, local_cid: u16) -> Vec<rfcomm::ClientDlciEvent> {
-        self.channels
-            .get_mut(&local_cid)
-            .and_then(|c| c.rfcomm_state.as_mut())
-            .map(|s| s.take_client_events())
-            .unwrap_or_default()
+        let Some(channel) = self.channels.get_mut(&local_cid) else {
+            return Vec::new();
+        };
+        if let Some(s) = channel.rfcomm_state.as_mut() {
+            return s.take_client_events();
+        }
+        // No cross-mux drain equivalent on the initiator mux: sharing
+        // runtimes must use the dlci-filtered variant below (they do).
+        Vec::new()
     }
 
     /// Drain only those client-DLCI events whose `dlci` matches.
     /// Events for other DLCIs stay queued so a sibling runtime sharing
     /// the same mux can claim them on its own tick. Required when MAP
-    /// and PBAP ride the inbound HFP channel concurrently.
+    /// and PBAP ride the inbound HFP channel concurrently. Works on
+    /// either mux role (inbound RfcommState / outbound HfpClientState).
     pub fn take_rfcomm_client_events_for_dlci(
         &mut self,
         local_cid: u16,
         dlci: u8,
     ) -> Vec<rfcomm::ClientDlciEvent> {
-        self.channels
-            .get_mut(&local_cid)
-            .and_then(|c| c.rfcomm_state.as_mut())
-            .map(|s| s.take_client_events_for_dlci(dlci))
-            .unwrap_or_default()
+        let Some(channel) = self.channels.get_mut(&local_cid) else {
+            return Vec::new();
+        };
+        if let Some(s) = channel.rfcomm_state.as_mut() {
+            return s.take_client_events_for_dlci(dlci);
+        }
+        if let Some(c) = channel.hfp_client.as_mut() {
+            return c.take_client_events_for_dlci(dlci);
+        }
+        Vec::new()
     }
 
     /// Wrap an OBEX (or other upper-layer) payload as a UIH frame on
     /// `dlci` and turn it into an L2CAP-on-ACL packet ready for
-    /// `transport.write_acl`. Errors propagate from
-    /// `RfcommState::build_uih_on_client_dlci`.
+    /// `transport.write_acl`. Works on either mux role. (&mut because
+    /// the initiator mux tracks per-DLCI transmit credits on send.)
     pub fn rfcomm_send_uih_on_client_dlci(
-        &self,
+        &mut self,
         local_cid: u16,
         dlci: u8,
         payload: &[u8],
     ) -> Result<Vec<u8>, String> {
         let channel = self
             .channels
-            .get(&local_cid)
+            .get_mut(&local_cid)
             .ok_or_else(|| format!("L2CAP channel 0x{:04x} not found", local_cid))?;
-        let rfcomm_state = channel
-            .rfcomm_state
-            .as_ref()
-            .ok_or_else(|| format!("L2CAP channel 0x{:04x} has no RfcommState", local_cid))?;
-        let frame = rfcomm_state.build_uih_on_client_dlci(dlci, payload)?;
+        let frame = if let Some(rfcomm_state) = channel.rfcomm_state.as_ref() {
+            rfcomm_state.build_uih_on_client_dlci(dlci, payload)?
+        } else if let Some(hfp_client) = channel.hfp_client.as_mut() {
+            hfp_client.build_uih_on_client_dlci(dlci, payload)?
+        } else {
+            return Err(format!(
+                "L2CAP channel 0x{:04x} has no RFCOMM mux state",
+                local_cid
+            ));
+        };
         let basic = build_basic_frame(channel.remote_cid, &frame);
         Ok(build_acl_packet(
             channel.connection_handle,
@@ -430,11 +461,16 @@ impl L2capState {
             .ok_or_else(|| format!("L2CAP channel 0x{:04x} not found", local_cid))?;
         let connection_handle = channel.connection_handle;
         let remote_cid = channel.remote_cid;
-        let rfcomm_state = channel
-            .rfcomm_state
-            .as_mut()
-            .ok_or_else(|| format!("L2CAP channel 0x{:04x} has no RfcommState", local_cid))?;
-        let frame = rfcomm_state.build_disc_for_client_dlci(dlci)?;
+        let frame = if let Some(rfcomm_state) = channel.rfcomm_state.as_mut() {
+            rfcomm_state.build_disc_for_client_dlci(dlci)?
+        } else if let Some(hfp_client) = channel.hfp_client.as_mut() {
+            hfp_client.build_force_disc_secondary_dlci(dlci)
+        } else {
+            return Err(format!(
+                "L2CAP channel 0x{:04x} has no RFCOMM mux state",
+                local_cid
+            ));
+        };
         let basic = build_basic_frame(remote_cid, &frame);
         Ok(build_acl_packet(
             connection_handle,
@@ -469,11 +505,18 @@ impl L2capState {
             .ok_or_else(|| format!("L2CAP channel 0x{:04x} not found", local_cid))?;
         let connection_handle = channel.connection_handle;
         let remote_cid = channel.remote_cid;
-        let rfcomm_state = channel
-            .rfcomm_state
-            .as_mut()
-            .ok_or_else(|| format!("L2CAP channel 0x{:04x} has no RfcommState", local_cid))?;
-        let frame = rfcomm_state.build_force_disc_dlci(dlci);
+        let frame = if let Some(rfcomm_state) = channel.rfcomm_state.as_mut() {
+            rfcomm_state.build_force_disc_dlci(dlci)
+        } else if let Some(hfp_client) = channel.hfp_client.as_mut() {
+            // Initiator mux: only secondary (OBEX) DLCIs are ours to
+            // force-DISC — the primary carries the live HFP link.
+            hfp_client.build_force_disc_secondary_dlci(dlci)
+        } else {
+            return Err(format!(
+                "L2CAP channel 0x{:04x} has no RFCOMM mux state",
+                local_cid
+            ));
+        };
         let basic = build_basic_frame(remote_cid, &frame);
         Ok(build_acl_packet(
             connection_handle,

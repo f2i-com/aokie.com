@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::hfp;
-use super::rfcomm::{RfcommClientEvent, RfcommClientState};
+use super::rfcomm::{ClientDlciEvent, RfcommClientEvent, RfcommClientState};
 
 pub struct HfpClientState {
     client: RfcommClientState,
@@ -69,6 +69,44 @@ impl HfpClientState {
 
     pub fn is_open(&self) -> bool {
         self.client.is_open() && !self.closed
+    }
+
+    /// True while this session's multiplexer is up — the shared-mux
+    /// discovery hook for MAP/PBAP. Bluedroid allows ONE RFCOMM session
+    /// per peer, so on an outbound-connected phone the OBEX profiles
+    /// MUST ride this mux instead of opening their own (a second
+    /// PSM-0x0003 session is config-acked and then never SABM-answered;
+    /// live 2026-07-13 that stall ate the first kickoff SMS AND pulled
+    /// the phone's HFP traffic onto the dead channel).
+    pub fn mux_is_open(&self) -> bool {
+        self.client.mux_is_open() && !self.closed
+    }
+
+    /// Attach an outbound DLCI for another profile (MAP MAS, PBAP PSE)
+    /// on this session's multiplexer. Delegates to the underlying
+    /// initiator-mux machinery; see `RfcommClientState::attach_client_dlci`.
+    pub fn attach_client_dlci(&mut self, server_channel: u8) -> Result<(u8, Vec<u8>), String> {
+        if self.closed {
+            return Err("attach_client_dlci: HFP client session is closed".to_string());
+        }
+        self.client.attach_client_dlci(server_channel)
+    }
+
+    /// Drain secondary-DLCI events for `dlci` (same contract as
+    /// `RfcommState::take_client_events_for_dlci`).
+    pub fn take_client_events_for_dlci(&mut self, dlci: u8) -> Vec<ClientDlciEvent> {
+        self.client.take_client_events_for_dlci(dlci)
+    }
+
+    /// Build an OBEX-bearing UIH on a secondary DLCI.
+    pub fn build_uih_on_client_dlci(&mut self, dlci: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
+        self.client.build_uih_on_client_dlci(dlci, payload)
+    }
+
+    /// Force-DISC a secondary DLCI (MAS-stall recovery). Never touches
+    /// the primary HFP DLCI.
+    pub fn build_force_disc_secondary_dlci(&mut self, dlci: u8) -> Vec<u8> {
+        self.client.build_force_disc_secondary_dlci(dlci)
     }
 
     pub fn service_level_ready(&self) -> bool {
@@ -520,6 +558,164 @@ mod tests {
                 .map(|f| frame_payload_string(f))
                 .any(|p| p.contains("AT+BCS=2")),
             "+BCS must be answered with AT+BCS: {out:?}"
+        );
+    }
+
+    // ── Shared initiator mux: MAP/PBAP secondary DLCIs (2026-07-13) ──
+    // Bluedroid runs ONE RFCOMM session per peer, so on an outbound-
+    // connected phone the OBEX profiles must ride the HFP client's mux.
+    // These walk the exact attach → PN → SABM → MSC → Open → payload
+    // sequence the live MAS runtime drives via the L2capState accessors.
+
+    use super::super::rfcomm::{build_dm, ClientDlciEvent};
+
+    const MAS_CHANNEL: u8 = 5; // Pixel advertises MAP MAS on channel 5.
+
+    fn mas_dlci() -> u8 {
+        server_channel_dlci(MAS_CHANNEL, true)
+    }
+
+    /// Walk a secondary DLCI to Open on an already-open HFP client mux.
+    fn open_mas_dlci(state: &mut HfpClientState) -> u8 {
+        let (dlci, pn_frame) = state.attach_client_dlci(MAS_CHANNEL).expect("attach");
+        assert_eq!(dlci, mas_dlci());
+        let pn = parse_frame(&pn_frame).expect("pn frame");
+        assert_eq!(pn.kind, RfcommFrameKind::Uih);
+        assert_eq!(pn.dlci, RFCOMM_DLCI_MULTIPLEXER);
+
+        // PN response (CFC accepted, 0 initial credits — Bluedroid's
+        // observed shape) → our SABM on the MAS DLCI.
+        let pn_rsp = build_parameter_negotiation_response_cfc(dlci, 7, 127, 0);
+        let out = state
+            .handle_packet(&build_uih(RFCOMM_DLCI_MULTIPLEXER, false, None, &pn_rsp))
+            .expect("pn rsp");
+        let sabm = out
+            .iter()
+            .map(|f| parse_frame(f).expect("frame"))
+            .find(|f| f.kind == RfcommFrameKind::Sabm)
+            .expect("SABM after PN response");
+        assert_eq!(sabm.dlci, dlci);
+
+        // UA(MAS) → our MSC CMD; peer MSC RSP + CMD → Opened.
+        let out = state.handle_packet(&build_ua(dlci, false)).expect("ua");
+        assert_eq!(out.len(), 1, "expected MSC CMD after MAS UA");
+        let msc_rsp = build_modem_status_response(dlci, 0x8d);
+        state
+            .handle_packet(&build_uih(RFCOMM_DLCI_MULTIPLEXER, false, None, &msc_rsp))
+            .expect("msc rsp");
+        let msc_cmd = build_modem_status_command(dlci, 0x8d);
+        state
+            .handle_packet(&build_uih(RFCOMM_DLCI_MULTIPLEXER, false, None, &msc_cmd))
+            .expect("msc cmd");
+        let events = state.take_client_events_for_dlci(dlci);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClientDlciEvent::Opened { .. })),
+            "expected Opened for the MAS DLCI: {events:?}"
+        );
+        dlci
+    }
+
+    #[test]
+    fn mas_dlci_opens_on_the_shared_initiator_mux_and_carries_obex() {
+        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        open_channel(&mut state);
+        assert!(state.mux_is_open());
+        let dlci = open_mas_dlci(&mut state);
+
+        // Credit grant, then OBEX both ways.
+        state
+            .handle_packet(&build_uih(dlci, false, Some(7), &[]))
+            .expect("credit grant");
+        let uih = state
+            .build_uih_on_client_dlci(dlci, b"obex-connect")
+            .expect("obex uih");
+        let f = parse_frame(&uih).expect("frame");
+        assert_eq!(f.dlci, dlci);
+        assert_eq!(f.kind, RfcommFrameKind::Uih);
+
+        state
+            .handle_packet(&build_uih(dlci, false, None, b"obex-response"))
+            .expect("obex payload");
+        let events = state.take_client_events_for_dlci(dlci);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClientDlciEvent::Payload { .. })),
+            "expected the OBEX payload event: {events:?}"
+        );
+        // HFP untouched throughout.
+        assert!(state.is_open());
+    }
+
+    #[test]
+    fn mas_refusal_fails_only_the_mas_dlci_never_the_hfp_session() {
+        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        open_channel(&mut state);
+        let (dlci, _) = state.attach_client_dlci(MAS_CHANNEL).expect("attach");
+        // Peer refuses with DM on the MAS DLCI.
+        state
+            .handle_packet(&build_dm(dlci, false))
+            .expect("dm on mas");
+        let events = state.take_client_events_for_dlci(dlci);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClientDlciEvent::Failed { .. })),
+            "expected Failed for the MAS DLCI: {events:?}"
+        );
+        // The phone link must survive an OBEX refusal.
+        assert!(state.is_open(), "HFP must stay open after a MAS DM");
+        assert!(state.mux_is_open());
+    }
+
+    #[test]
+    fn hfp_at_traffic_still_flows_while_a_mas_dlci_is_mid_handshake() {
+        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        open_channel(&mut state);
+        let _ = state.attach_client_dlci(MAS_CHANNEL).expect("attach");
+        // An unsolicited RING on the HFP DLCI mid-MAS-handshake must
+        // still surface — this is the live 2026-07-13 regression shape
+        // (the duplicate-session path swallowed HFP frames entirely).
+        state.take_hfp_events();
+        ag_payload(&mut state, "\r\nRING\r\n");
+        let events = state.take_hfp_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, hfp::HfpEvent::Ringing | hfp::HfpEvent::IncomingCall)),
+            "RING must reach the HFP pump during a MAS handshake: {events:?}"
+        );
+    }
+
+    #[test]
+    fn force_disc_frees_the_dlci_for_a_fresh_attach() {
+        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        open_channel(&mut state);
+        let dlci = open_mas_dlci(&mut state);
+        let disc = state.build_force_disc_secondary_dlci(dlci);
+        let f = parse_frame(&disc).expect("disc frame");
+        assert_eq!(f.kind, RfcommFrameKind::Disc);
+        assert_eq!(f.dlci, dlci);
+        // Tracking dropped → re-attach works (fresh PN).
+        let (again, _) = state.attach_client_dlci(MAS_CHANNEL).expect("re-attach");
+        assert_eq!(again, dlci);
+    }
+
+    #[test]
+    fn attach_refuses_when_the_mux_is_not_open_or_the_dlci_is_taken() {
+        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        assert!(state.attach_client_dlci(MAS_CHANNEL).is_err(), "no mux yet");
+        open_channel(&mut state);
+        let _ = state.attach_client_dlci(MAS_CHANNEL).expect("attach");
+        assert!(
+            state.attach_client_dlci(MAS_CHANNEL).is_err(),
+            "dlci already in use"
+        );
+        assert!(
+            state.attach_client_dlci(AG_CHANNEL).is_err(),
+            "the primary HFP dlci is never attachable"
         );
     }
 }
