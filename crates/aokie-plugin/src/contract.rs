@@ -85,14 +85,15 @@ pub mod events {
     /// Declared events with no live emit site yet (kept declared because
     /// pack flow bindings / the mock surface may reference them; audited
     /// so a "declared but never emitted" drift is deliberate, not silent):
-    /// `driver_required`, `dongle.error`, `phone.paired`, `turn.partial`,
-    /// `sms.failed` — see AOKIE_PLUGIN_CONTRACT.md §events.
+    /// `driver_required`, `dongle.error`, `phone.paired`, `turn.partial`
+    /// — see AOKIE_PLUGIN_CONTRACT.md §events. (`sms.failed` gained its
+    /// live emit site 2026-07-13: the radio surfaces abandoned outbound
+    /// SMS sends instead of dropping them silently.)
     pub const DECLARED_NOT_YET_EMITTED: &[&str] = &[
         DONGLE_DRIVER_REQUIRED,
         DONGLE_ERROR,
         PHONE_PAIRED,
         CALL_TURN_PARTIAL,
-        SMS_FAILED,
     ];
 }
 

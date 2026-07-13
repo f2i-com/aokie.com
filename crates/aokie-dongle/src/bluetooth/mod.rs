@@ -56,6 +56,13 @@ pub enum BluetoothEvent {
     SmsSent {
         recipient_phone: String,
     },
+    /// An outbound SMS was abandoned (MAS PUT failed / aged out across
+    /// recovery cycles) — surfaced so the host can record the truth
+    /// instead of a silent loss.
+    SmsSendFailed {
+        recipient_phone: String,
+        reason: String,
+    },
     /// PAIR-001: SSP numeric comparison held for the operator — both the
     /// phone and the Desktop UI show `numeric_value`; the operator answers
     /// via `confirm_pairing`.
@@ -380,6 +387,13 @@ fn bluetooth_event_from_runtime(
             msg_type,
         }),
         RuntimeEvent::SmsSent { recipient_phone } => BluetoothEvent::SmsSent { recipient_phone },
+        RuntimeEvent::SmsSendFailed {
+            recipient_phone,
+            reason,
+        } => BluetoothEvent::SmsSendFailed {
+            recipient_phone,
+            reason,
+        },
         RuntimeEvent::PairingConfirmRequired {
             address,
             numeric_value,

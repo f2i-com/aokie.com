@@ -107,6 +107,14 @@ pub enum RuntimeEvent {
     SmsSent {
         recipient_phone: String,
     },
+    /// An outbound SMS was ABANDONED — the MAS session failed the PUT,
+    /// or the queued op aged past its retain TTL across recovery
+    /// cycles. Emitted so the message is never lost silently (audit
+    /// C-16: a caller was once promised an SMS that never existed).
+    SmsSendFailed {
+        recipient_phone: String,
+        reason: String,
+    },
     /// PAIR-001: SSP numeric comparison is HELD for the operator — the
     /// phone shows the same `numeric_value`; the operator answers via
     /// `confirm_pairing(address, accept)`. Expires with a negative reply
@@ -1448,12 +1456,6 @@ fn run_runtime(
     // stage-1 a fair shot before we tear the ACL down; the previous
     // 20 s window just delayed the customer-visible recovery.
     const MAS_STALL_ESCALATION: Duration = Duration::from_secs(5);
-    /// How long a queued `SendReply` survives an ACL teardown. A reply
-    /// generated seconds before a stage-2 recovery is still worth
-    /// sending once the user reconnects; one queued five minutes ago
-    /// is stale and a surprise late delivery would be worse than
-    /// silence.
-    const SEND_REPLY_RETAIN_TTL: Duration = Duration::from_secs(120);
     let mut mas_recovery_attempted_at: Option<Instant> = None;
     // Tracks the "MAP work pending" state across loop iterations so
     // we can detect the idle→active edge. When work transitions from
@@ -1743,6 +1745,24 @@ fn run_runtime(
                             let _ = transport.write_command(&hci::disconnect_command(handle, 0x13));
                         }
                         outbound_connect_session = false;
+                    }
+                }
+                // MAP subscribe on SLC ready — SAME trigger as the
+                // inbound-ACL drain below. WHICH drain surfaces the
+                // ready event is timing-dependent (an outbound
+                // session's final SLC OK routinely lands here), and
+                // before 2026-07-13 only the other drain queued the
+                // Subscribe — so outbound-connected phones never got
+                // MAP/MNS at all. The attempted-for-acl guard keeps the
+                // two sites from double-queueing.
+                if matches!(hfp_event, HfpEvent::ServiceLevelConnectionReady)
+                    && !mns_subscription_attempted_for_acl
+                {
+                    pending_map_ops.push_front(PendingMapOp::Subscribe);
+                    mns_subscription_attempted_for_acl = true;
+                    if PBAP_AUTO_FETCH_ON_RECONNECT {
+                        pbap_pending_for_acl = true;
+                        pbap_pending_since = Some(Instant::now());
                     }
                 }
                 forward_hfp_event(hfp_event, &event_tx, &status, &interface.path);
@@ -2038,7 +2058,42 @@ fn run_runtime(
                         }
                     }
                     map_runtime = None;
-                    active_map_op = None;
+                    // The ACTIVE op dies with the runtime — but a fresh
+                    // SendReply/FetchMessage must be RE-QUEUED, not
+                    // dropped (live 2026-07-13: the first kickoff SMS
+                    // was silently lost exactly here). Stale SendReplys
+                    // surface as SmsSendFailed so nothing dies quietly.
+                    if let Some(op) = active_map_op.take() {
+                        match &op {
+                            PendingMapOp::SendReply {
+                                queued_at,
+                                recipient_phone,
+                                ..
+                            } => {
+                                if queued_at.elapsed() < SEND_REPLY_RETAIN_TTL {
+                                    eprintln!(
+                                        "[AokieRadio] MAS stall recovery: re-queueing the in-flight SendReply (queued {:.1}s ago)",
+                                        queued_at.elapsed().as_secs_f32()
+                                    );
+                                    pending_map_ops.push_back(op);
+                                } else {
+                                    let _ = event_tx.send(RuntimeEvent::SmsSendFailed {
+                                        recipient_phone: recipient_phone.clone(),
+                                        reason: format!(
+                                            "abandoned after {:.0}s of MAS-stall recovery cycles",
+                                            queued_at.elapsed().as_secs_f32()
+                                        ),
+                                    });
+                                }
+                            }
+                            PendingMapOp::FetchMessage { queued_at, .. } => {
+                                if queued_at.elapsed() < SEND_REPLY_RETAIN_TTL {
+                                    pending_map_ops.push_back(op);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     map_idle_since = None;
                     if let Ok(mut g) = mns_server.lock() {
                         g.reset();
@@ -2702,12 +2757,12 @@ fn run_runtime(
                                     address, connection_handle
                                 );
                                 outbound_connect_session = true;
-                                // MAP/MNS/PBAP ride client DLCIs attached to a
-                                // server-mode RFCOMM mux; on an outbound session
-                                // WE own the mux via the HFP client, so skip the
-                                // SLC-ready MAP subscribe — SMS sync resumes on
-                                // the next phone-initiated reconnect.
-                                mns_subscription_attempted_for_acl = true;
+                                // MAP/MNS now ride secondary client DLCIs on the
+                                // HFP client's own multiplexer (2026-07-13:
+                                // RfcommClientState::attach_client_dlci), so the
+                                // SLC-ready MAP subscribe runs on outbound
+                                // sessions too — SMS send/receive no longer
+                                // waits for a phone-initiated reconnect.
                                 let cmd =
                                     hci::authentication_requested_command(*connection_handle);
                                 match transport.write_command(&cmd) {
@@ -2971,9 +3026,40 @@ fn run_runtime(
                             // in the prior session is still valid against
                             // the new MAS session.
                             let pre_count = pending_map_ops.len();
+                            // The ACTIVE op joins the retention pass too —
+                            // a SendReply mid-PUT when the ACL died is
+                            // exactly the reply worth retrying (it was
+                            // silently dropped here before 2026-07-13).
+                            if let Some(op) = active_map_op.take() {
+                                if matches!(
+                                    op,
+                                    PendingMapOp::SendReply { .. } | PendingMapOp::FetchMessage { .. }
+                                ) {
+                                    pending_map_ops.push_front(op);
+                                }
+                            }
                             pending_map_ops.retain(|op| match op {
-                                PendingMapOp::SendReply { queued_at, .. }
-                                | PendingMapOp::FetchMessage { queued_at, .. } => {
+                                PendingMapOp::SendReply {
+                                    queued_at,
+                                    recipient_phone,
+                                    ..
+                                } => {
+                                    if queued_at.elapsed() < SEND_REPLY_RETAIN_TTL {
+                                        true
+                                    } else {
+                                        // Aged out: surface it — a customer
+                                        // was told a text was coming.
+                                        let _ = event_tx.send(RuntimeEvent::SmsSendFailed {
+                                            recipient_phone: recipient_phone.clone(),
+                                            reason: format!(
+                                                "abandoned {:.0}s after queueing (ACL lost before the phone acked the send)",
+                                                queued_at.elapsed().as_secs_f32()
+                                            ),
+                                        });
+                                        false
+                                    }
+                                }
+                                PendingMapOp::FetchMessage { queued_at, .. } => {
                                     queued_at.elapsed() < SEND_REPLY_RETAIN_TTL
                                 }
                                 _ => false,
@@ -4312,6 +4398,14 @@ fn pending_op_to_mas_operation(op: &PendingMapOp) -> MasOperation {
     }
 }
 
+/// How long a queued `SendReply` survives an ACL teardown or a failed
+/// MAS attempt. A reply generated seconds before a stall recovery is
+/// still worth sending once a healthy session is back; one queued
+/// minutes ago is stale, and a surprise late delivery would be worse
+/// than the honest `SmsSendFailed` it surfaces as. (Module-level so
+/// both the radio loop and `handle_map_runtime_event` share one TTL.)
+const SEND_REPLY_RETAIN_TTL: Duration = Duration::from_secs(120);
+
 /// How often to poll the inbox listing as a backstop for dropped MNS
 /// pushes. Pixel's MAP intermittency is unpredictable — sometimes
 /// every notification arrives, sometimes one in three. 45 s strikes a
@@ -4432,10 +4526,35 @@ fn handle_map_runtime_event(
         },
         MapRuntimeEvent::Failed(reason) => {
             eprintln!("[AokieRadio] MAP runtime failed: {}", reason);
-            // Subscribe failures don't surface — they're best-effort
-            // (the phone just won't push notifications). FetchMessage
-            // and SendReply failures get logged but we don't bubble
-            // a hard error up either; the Tauri layer can retry.
+            // Subscribe/PollInbox failures don't surface — they're
+            // best-effort (the SLC handler and the poll timer re-drive
+            // them). A failed SendReply is DIFFERENT: it's a customer's
+            // text. Fresh ones re-queue for the next MAS session
+            // (bounded by SEND_REPLY_RETAIN_TTL, so a deterministic
+            // refusal can't loop forever); aged ones surface as
+            // SmsSendFailed so nothing dies silently.
+            if let Some(op @ PendingMapOp::SendReply { .. }) = active_map_op.as_ref() {
+                let (queued_at, recipient_phone) = match op {
+                    PendingMapOp::SendReply {
+                        queued_at,
+                        recipient_phone,
+                        ..
+                    } => (*queued_at, recipient_phone.clone()),
+                    _ => unreachable!(),
+                };
+                if queued_at.elapsed() < SEND_REPLY_RETAIN_TTL {
+                    eprintln!(
+                        "[AokieRadio] re-queueing failed SendReply (queued {:.1}s ago)",
+                        queued_at.elapsed().as_secs_f32()
+                    );
+                    pending_map_ops.push_back(op.clone());
+                } else {
+                    let _ = event_tx.send(RuntimeEvent::SmsSendFailed {
+                        recipient_phone,
+                        reason: format!("MAS session failed the send: {}", reason),
+                    });
+                }
+            }
         }
     }
 }

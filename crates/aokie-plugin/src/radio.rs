@@ -4059,6 +4059,29 @@ fn handle_event(
                 ),
             );
         }
+        E::SmsSendFailed {
+            recipient_phone,
+            reason,
+        } => {
+            // The radio abandoned an outbound SMS (MAS PUT failed / aged out
+            // across recovery cycles). Surface it truthfully — a queued send
+            // that quietly evaporates is audit C-16's exact failure mode.
+            let message_id = format!("sms_{}", uuid::Uuid::new_v4().simple());
+            emit(
+                outbox,
+                sink,
+                aokie_event(
+                    crate::contract::events::SMS_FAILED,
+                    &message_id,
+                    json!({
+                        "messageId": message_id,
+                        "to": recipient_phone,
+                        "reason": reason,
+                        "at": now_iso8601(),
+                    }),
+                ),
+            );
+        }
         E::PairingConfirmRequired {
             address,
             numeric_value,
