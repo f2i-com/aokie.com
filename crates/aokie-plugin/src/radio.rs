@@ -144,6 +144,15 @@ pub const DEFAULT_GREETING: &str = "Hello, thanks for calling. How can I help yo
 #[cfg(feature = "voice")]
 const END_CALL_INSTRUCTION: &str = "\n\nEnding the call: ONLY when the caller's request is fully handled and there is nothing left to do, give a brief, warm goodbye and then append the exact marker [[END_CALL]] at the very end of that same final message. Never write the marker mid-conversation or while a question is still open — it hangs up the call.";
 
+/// Appended to the system prompt in agent mode: how the model participates in
+/// spoken delivery (validated pacing markers, the [[WAIT]] intentional-silence
+/// marker, and continuation over backchannels). All markers are UNTRUSTED
+/// input — the speech planner clamps rates, caps protection and strips every
+/// bracketed token before anything is spoken or recorded. Plain ASCII (the
+/// text is model-facing but lives next to caller-spoken constants).
+#[cfg(feature = "voice")]
+const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read aloud to the caller by a voice synthesizer.\n- Phone numbers and codes are automatically read slowly, digit by digit; you do not need to do anything special for them.\n- You may wrap a short critical detail in [[slow]]...[[/slow]] to have it spoken more slowly.\n- Rarely, you may wrap ONE short vital sentence in [[important]]...[[/important]] so a brief overlap does not cut it off. The caller can always stop you by saying stop or wait.\n- If the caller asks you to wait, says they are thinking, or clearly needs a moment, reply with exactly [[WAIT]] and nothing else - staying silent is the right response. Never fill their pause with chatter; when they speak again, continue naturally.\n- If the caller's words were only a brief acknowledgement (yeah, okay, mm-hm) while you were talking, continue where you left off instead of starting over.\nThe double-bracket markers are never spoken and never shown to anyone.";
+
 /// VOICE-001 fail-safe: what the caller hears when the responder breaks
 /// MID-call (LLM died / synthesis went silent) — a plain apology, then a
 /// clean hangup. Local + fixed so it needs nothing but TTS; when TTS itself
@@ -778,6 +787,26 @@ fn emit_turn_with_delivery(
     text: &str,
     delivery: Option<&str>,
 ) {
+    emit_turn_full(outbox, sink, corr, turn_index, speaker, text, delivery, None)
+}
+
+/// Full turn emitter: `kind: Some("control")` marks a caller turn that was a
+/// FLOOR COMMAND ("wait", "stop", "slower") handled deterministically by the
+/// duplex coordinator — recorded truthfully in the transcript, but flows and
+/// downstream logic can (and should) skip business handling for it. Additive
+/// payload field — existing consumers ignore it.
+#[cfg(feature = "voice")]
+#[allow(clippy::too_many_arguments)]
+fn emit_turn_full(
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+    corr: &str,
+    turn_index: u32,
+    speaker: &str,
+    text: &str,
+    delivery: Option<&str>,
+    kind: Option<&str>,
+) {
     let mut payload = json!({
         "callId": corr,
         "turn": turn_index,
@@ -787,6 +816,9 @@ fn emit_turn_with_delivery(
     });
     if let Some(d) = delivery {
         payload["delivery"] = json!(d);
+    }
+    if let Some(k) = kind {
+        payload["kind"] = json!(k);
     }
     emit(
         outbox,
@@ -1435,11 +1467,20 @@ struct TtsChunkPlayback {
     sample_rate: u16,
     /// AOK-CTRL-001: an urgent control stopped playback (see [`ControlProbe`]).
     cancelled: bool,
+    /// Interrupt policy for THIS span: `None` = yield the instant a barge
+    /// trips (the classic behaviour); `Some(budget)` = a finish-the-span
+    /// span (phone number, `[[important]]` detail) keeps playing for at
+    /// most `budget` after the overlap started, then yields. Caller speech
+    /// is captured throughout either way, and urgent controls (hangup /
+    /// reject) still cut at chunk granularity.
+    finish_extra: Option<std::time::Duration>,
+    /// When the barge first tripped (starts the finish budget).
+    barged_at: Option<std::time::Instant>,
 }
 
 #[cfg(all(target_os = "windows", feature = "voice"))]
 impl TtsChunkPlayback {
-    fn new(sample_rate: u16) -> Self {
+    fn new(sample_rate: u16, finish_extra: Option<std::time::Duration>) -> Self {
         let t0 = std::time::Instant::now();
         Self {
             t0,
@@ -1455,6 +1496,27 @@ impl TtsChunkPlayback {
             speech_start: None,
             sample_rate,
             cancelled: false,
+            finish_extra,
+            barged_at: None,
+        }
+    }
+
+    /// Should playback stop NOW? Cancelled always stops; a barge stops a
+    /// yield-policy span immediately and a finish-policy span once its
+    /// bounded extension is spent.
+    fn stop_playback_now(&self) -> bool {
+        if self.cancelled {
+            return true;
+        }
+        if !self.barged {
+            return false;
+        }
+        match self.finish_extra {
+            None => true,
+            Some(budget) => self
+                .barged_at
+                .map(|at| at.elapsed() >= budget)
+                .unwrap_or(false),
         }
     }
 
@@ -1507,7 +1569,8 @@ impl TtsChunkPlayback {
 
         // Full-duplex: drain + echo-cancel the mic as we feed (keeps the
         // reference FIFO aligned with capture) and watch for the caller talking
-        // over us.
+        // over us. The batch is drained fully even after a trip — a finish-
+        // policy span keeps playing (and keeps capturing) through its budget.
         if let (Some(a), Some(thr)) = (aec.as_deref_mut(), barge_rms) {
             let armed = self.t_first.elapsed() >= self.grace;
             while let Some(rx) = bt.try_recv_audio() {
@@ -1521,14 +1584,15 @@ impl TtsChunkPlayback {
                     self.need,
                     &mut self.captured,
                     &mut self.speech_start,
-                ) {
+                ) && !self.barged
+                {
                     self.barged = true;
-                    break;
+                    self.barged_at = Some(std::time::Instant::now());
                 }
             }
             self.trim_idle_capture();
         }
-        !self.barged
+        !self.stop_playback_now()
     }
 
     fn finish(
@@ -1545,9 +1609,10 @@ impl TtsChunkPlayback {
         // Playout monitor (full-duplex): synthesis can outrun realtime, so a
         // short reply may still be draining from the SCO queue after the chunks
         // have all been queued. Keep polling the mic through the AEC until it
-        // has played out.
+        // has played out — or, for a finish-policy span that was barged, until
+        // its bounded extension is spent (the caller then flushes the tail).
         if let (Some(a), Some(thr)) = (aec.as_deref_mut(), barge_rms) {
-            if !self.barged && !self.cancelled {
+            if !self.stop_playback_now() {
                 let playout =
                     Duration::from_secs_f32(self.samples as f32 / sample_rate.max(1) as f32);
                 let deadline = self.t_first + playout;
@@ -1573,12 +1638,13 @@ impl TtsChunkPlayback {
                             self.need,
                             &mut self.captured,
                             &mut self.speech_start,
-                        ) {
+                        ) && !self.barged
+                        {
                             self.barged = true;
-                            break;
+                            self.barged_at = Some(std::time::Instant::now());
                         }
                     }
-                    if self.barged {
+                    if self.stop_playback_now() {
                         break;
                     }
                     self.trim_idle_capture();
@@ -1658,6 +1724,11 @@ fn note_tts_outcome(status: &RadioStatus, out: &SpeakOutcome) {
 /// `barged: true` and stopping early if so. With them `None` it's the plain
 /// half-duplex stream (caller relies on the mute). No-op with no SCO channel
 /// (sample_rate 0) or empty text.
+///
+/// `rate` is the span's speaking-speed multiplier (1.0 = normal): non-unity
+/// rates run a pitch-preserving WSOLA stretch on the synthesized waveform
+/// BEFORE the SCO resample, so a slowed phone number keeps the same voice.
+/// `finish_extra` is the span's interrupt policy (see [`TtsChunkPlayback`]).
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 fn tts_speak(
@@ -1669,6 +1740,8 @@ fn tts_speak(
     mut aec: Option<&mut crate::aec::EchoCanceller>,
     barge_rms: Option<f32>,
     mut ctl: Option<&mut ControlProbe<'_>>,
+    rate: f32,
+    finish_extra: Option<std::time::Duration>,
 ) -> SpeakOutcome {
     use std::time::Duration;
     let none = SpeakOutcome {
@@ -1680,6 +1753,8 @@ fn tts_speak(
     if sample_rate == 0 || text.trim().is_empty() {
         return none;
     }
+    let rate = aokie_core::time_stretch::clamp_rate(rate);
+    let rated = (rate - 1.0).abs() >= 0.01;
     // Speech-normalize ONCE at the chokepoint (greeting, agent sentences and
     // operatorSpeak all funnel through here): "10 a.m.," → "10 AM," — dotted
     // abbreviations against punctuation make the TTS stutter audibly.
@@ -1698,12 +1773,20 @@ fn tts_speak(
         };
         match http_tts_synthesize(&tts_client, &endpoint, text, &voice) {
             Ok(wav) => {
+                // Stretch at the provider's native rate (full quality), then
+                // resample down to the SCO rate. Applied HERE — never asked
+                // of the provider — so every endpoint behaves identically.
+                let samples = if rated {
+                    aokie_core::time_stretch::stretch_i16(&wav.samples, wav.sample_rate, rate)
+                } else {
+                    wav.samples
+                };
                 let pcm = crate::speech_wire::resample_i16_mono(
-                    &wav.samples,
+                    &samples,
                     wav.sample_rate,
                     sample_rate as u32,
                 );
-                let mut playback = TtsChunkPlayback::new(sample_rate);
+                let mut playback = TtsChunkPlayback::new(sample_rate, finish_extra);
                 for chunk in pcm.chunks(http_tts_chunk_samples(sample_rate)) {
                     if !playback.push(bt, &mut aec, barge_rms, &mut ctl, chunk) {
                         break;
@@ -1736,9 +1819,31 @@ fn tts_speak(
         Some(e) => e,
         None => return none,
     };
+    if rated {
+        // Rated spans are short (a phone number, a slowed detail): synthesize
+        // whole, stretch at the model's native rate, then chunk-play with the
+        // same barge/control monitoring as the streaming path.
+        let (native_pcm, native_rate) = match engine.synthesize_native(text, &voice) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[aokie-plugin] TTS synthesis failed: {e}");
+                return none;
+            }
+        };
+        let stretched = aokie_core::time_stretch::stretch_i16(&native_pcm, native_rate, rate);
+        let pcm =
+            crate::speech_wire::resample_i16_mono(&stretched, native_rate, sample_rate as u32);
+        let mut playback = TtsChunkPlayback::new(sample_rate, finish_extra);
+        for chunk in pcm.chunks(http_tts_chunk_samples(sample_rate)) {
+            if !playback.push(bt, &mut aec, barge_rms, &mut ctl, chunk) {
+                break;
+            }
+        }
+        return playback.finish(bt, &mut aec, barge_rms, &mut ctl, text, sample_rate);
+    }
     // Stream each chunk to the SCO queue as synthesized so the caller hears the
     // reply start on the first chunk (~0.3s).
-    let mut playback = TtsChunkPlayback::new(sample_rate);
+    let mut playback = TtsChunkPlayback::new(sample_rate, finish_extra);
     let synth = engine.synthesize_streaming(text, &voice, sample_rate as u32, |pcm| {
         playback.push(bt, &mut aec, barge_rms, &mut ctl, pcm)
     });
@@ -1747,6 +1852,96 @@ fn tts_speak(
         return none;
     }
     playback.finish(bt, &mut aec, barge_rms, &mut ctl, text, sample_rate)
+}
+
+/// The outcome of speaking one PLANNED utterance (a sequence of validated
+/// [`crate::speech_plan::SpeechSpan`]s): the aggregated playback outcome,
+/// the marker-free text of the whole plan, and the marker-free text of the
+/// spans that actually PLAYED (what transcripts/history may record).
+#[cfg(all(target_os = "windows", feature = "voice"))]
+struct PlannedSpeech {
+    outcome: SpeakOutcome,
+    /// Everything the plan intended to say (markers stripped).
+    text: String,
+    /// The spans that audibly played, in order (markers stripped).
+    played_text: String,
+}
+
+/// Speak `raw_text` through the span planner: strips/validates any control
+/// markup, slows + digit-expands phone-number/code runs, applies per-span
+/// interrupt policy, and plays the spans in order. ONE pipeline for every
+/// speech origin — the built-in agent, the greeting, flow/operator speech —
+/// so pacing and duplex behaviour never depend on where words came from.
+///
+/// Stops early on a barge (after the barged span finishes its bounded
+/// extension, if any) or an urgent control; the remaining spans are never
+/// spoken (yield: the caller has the floor).
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
+fn speak_planned(
+    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    tts: &mut Option<crate::voice::TtsEngine>,
+    http_tts: &mut HttpTtsRuntime,
+    raw_text: &str,
+    sample_rate: u16,
+    mut aec: Option<&mut crate::aec::EchoCanceller>,
+    barge_rms: Option<f32>,
+    mut ctl: Option<&mut ControlProbe<'_>>,
+    pace: &crate::speech_plan::PaceState,
+    protected_max_ms: u32,
+) -> PlannedSpeech {
+    use std::time::Duration;
+    let spans = crate::speech_plan::plan_spans(raw_text, pace, protected_max_ms);
+    let text = crate::speech_plan::clean_text(&spans);
+    let mut outcome = SpeakOutcome {
+        dur: Duration::ZERO,
+        barged: false,
+        captured_speech: Vec::new(),
+        cancelled: false,
+    };
+    let mut played: Vec<&str> = Vec::new();
+    for span in &spans {
+        let finish_extra = match span.policy {
+            crate::speech_plan::InterruptPolicy::Yield => None,
+            crate::speech_plan::InterruptPolicy::FinishSpan { max_extra_ms } => {
+                Some(Duration::from_millis(max_extra_ms as u64))
+            }
+        };
+        let out = tts_speak(
+            bt,
+            tts,
+            http_tts,
+            &span.tts_text,
+            sample_rate,
+            aec.as_deref_mut(),
+            barge_rms,
+            ctl.as_deref_mut(),
+            span.rate,
+            finish_extra,
+        );
+        outcome.dur += out.dur;
+        if out.dur > Duration::ZERO {
+            played.push(&span.text);
+        }
+        if !out.captured_speech.is_empty() {
+            outcome.captured_speech.extend_from_slice(&out.captured_speech);
+        }
+        if out.cancelled {
+            outcome.cancelled = true;
+            break;
+        }
+        if out.barged {
+            // The span itself honoured its policy (yield or bounded finish);
+            // everything AFTER it always yields — the caller has the floor.
+            outcome.barged = true;
+            break;
+        }
+    }
+    PlannedSpeech {
+        outcome,
+        text,
+        played_text: played.join(" "),
+    }
 }
 
 /// Execute an urgent control the [`ControlProbe`] caught mid-playback: note
@@ -2213,6 +2408,22 @@ fn run_loop(
     // The echo canceller, built lazily once we know the negotiated SCO rate.
     #[cfg(feature = "voice")]
     let mut aec: Option<crate::aec::EchoCanceller> = None;
+    // Call-local speaking pace (base + detail rates, settings-seeded), mutated
+    // live by the caller's "slower"/"faster"/"normal speed" voice commands and
+    // reset at every call boundary.
+    #[cfg(feature = "voice")]
+    let mut pace = crate::speech_plan::PaceState::from_env();
+    // Operator cap on how long an [[important]] span may resist an overlap.
+    #[cfg(feature = "voice")]
+    let protected_max_ms = crate::speech_plan::protected_max_ms_from_env();
+    // The duplex floor state: PausedByCaller means "say NOTHING until the
+    // caller speaks again or asks to continue" (intentional silence).
+    #[cfg(feature = "voice")]
+    let mut dialogue = crate::duplex::DialogueState::new();
+    // The last bot line as clean SPEAKABLE text (no truncation tags) — what
+    // "repeat that (slower)" replays. last_bot_reply keeps the echo-guard role.
+    #[cfg(feature = "voice")]
+    let mut last_bot_speech = String::new();
     // Monotonic transcript turn index (caller + bot share one sequence), reset
     // per call. 1-based to match the simulated-call convention (`turn.1.final`,
     // `turn.2.final`, â€¦) so real + simulated calls dedup + display identically.
@@ -2359,11 +2570,16 @@ fn run_loop(
             turn_index = 1;
             history.clear();
             last_bot_reply.clear();
+            last_bot_speech.clear();
             stt_buf.clear();
             stt_had_speech = false;
             stt_silence = Duration::ZERO;
             mute_stt_until = None;
             silence_timer = None;
+            // Pace + floor state are strictly per-call: the next caller gets
+            // the configured defaults, never the last caller's "slower".
+            pace = crate::speech_plan::PaceState::from_env();
+            dialogue.reset();
             // Drop the echo canceller entirely rather than just resetting its
             // FIFOs (review sweep): it was built at the FIRST call's SCO rate
             // and reset() keeps that rate + filter length. Back-to-back calls
@@ -2505,9 +2721,11 @@ fn run_loop(
                         (None, None)
                     };
                     // AOK-CTRL-001: a hangup/reject arriving DURING the
-                    // greeting cuts it at chunk granularity.
+                    // greeting cuts it at chunk granularity. The greeting runs
+                    // through the same span planner as every other speech
+                    // origin (pacing + digit handling included).
                     let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
-                    let out = tts_speak(
+                    let planned = speak_planned(
                         bt,
                         &mut tts,
                         &mut http_tts,
@@ -2516,8 +2734,11 @@ fn run_loop(
                         aec_ref,
                         brms,
                         Some(&mut probe),
+                        &pace,
+                        protected_max_ms,
                     );
-                    if !text.trim().is_empty() {
+                    let out = planned.outcome;
+                    if !planned.text.trim().is_empty() {
                         note_tts_outcome(&status, &out);
                     }
                     if let Some(action) = probe.action.take() {
@@ -2535,16 +2756,18 @@ fn run_loop(
                     stt_buf.clear();
                     stt_had_speech = false;
                     stt_silence = Duration::ZERO;
-                    // AK-008: the caller talked over the greeting — seed their
-                    // turn with the echo-cancelled audio captured while we were
-                    // speaking, so its leading words aren't lost to detection.
-                    if out.barged && !out.captured_speech.is_empty() {
+                    // AK-008 + scratchpad: seed the caller's turn with EVERY
+                    // piece of echo-cancelled speech captured while we were
+                    // talking — barge or not — so words spoken over the
+                    // greeting are heard, never discarded.
+                    if !out.captured_speech.is_empty() {
                         stt_buf = crate::voice::to_f32_16k(&out.captured_speech, sr as u32);
                         stt_had_speech = true;
                     }
                     // Truthful transcript (audit AOK-VOICE-001/002): record the
-                    // greeting only when synthesis actually produced audio.
-                    if out.dur > Duration::ZERO {
+                    // greeting only when synthesis actually produced audio —
+                    // and only the spans that PLAYED.
+                    if out.dur > Duration::ZERO && !planned.played_text.is_empty() {
                         let delivery = if out.barged {
                             "interrupted"
                         } else if out.cancelled {
@@ -2558,12 +2781,15 @@ fn run_loop(
                             &corr,
                             turn_index,
                             "bot",
-                            text,
+                            &planned.played_text,
                             Some(delivery),
                         );
                         turn_index += 1;
-                        history.push(serde_json::json!({ "role": "assistant", "content": text }));
-                        last_bot_reply = text.to_string();
+                        history.push(
+                            serde_json::json!({ "role": "assistant", "content": planned.played_text }),
+                        );
+                        last_bot_reply = planned.played_text.clone();
+                        last_bot_speech = planned.played_text;
                     } else {
                         eprintln!(
                             "[aokie-plugin] greeting produced NO audio (TTS failed) — not recorded as a spoken turn"
@@ -2734,16 +2960,259 @@ fn run_loop(
             if let Some((corr, text)) = flushed_turn {
                 idle = false;
                 {
-                    eprintln!("[aokie-plugin] heard [turn {turn_index}]: {}", content_for_log(&text));
-                    emit_turn(outbox, sink, &corr, turn_index, "caller", &text);
+                    // Duplex floor coordination: parse the caller's words for a
+                    // deterministic FLOOR COMMAND before any model runs. "Wait"
+                    // / "stop" / "let me think" produce INTENTIONAL SILENCE
+                    // (the most human response is sometimes nothing at all);
+                    // pace commands and replays are handled without burning a
+                    // generation. Ambiguity always reads as Content.
+                    let intent = if agent_enabled {
+                        crate::duplex::parse_caller_intent(&text)
+                    } else {
+                        crate::duplex::CallerIntent::Content
+                    };
+                    let is_control = intent != crate::duplex::CallerIntent::Content;
+                    eprintln!(
+                        "[aokie-plugin] heard [turn {turn_index}]{}: {}",
+                        if is_control {
+                            format!(" (control: {intent:?})")
+                        } else {
+                            String::new()
+                        },
+                        content_for_log(&text)
+                    );
+                    // Control turns are recorded truthfully but tagged, so
+                    // flows/business logic can skip them.
+                    emit_turn_full(
+                        outbox,
+                        sink,
+                        &corr,
+                        turn_index,
+                        "caller",
+                        &text,
+                        None,
+                        if is_control { Some("control") } else { None },
+                    );
                     turn_index += 1;
 
+                    // Whether to fall through to the normal LLM reply path.
+                    let mut respond_with_llm = false;
                     if agent_enabled {
                         history.push(serde_json::json!({ "role": "user", "content": text }));
                         if history.len() > 24 {
                             let drop = history.len() - 24;
                             history.drain(..drop);
                         }
+                        match dialogue.apply(intent) {
+                            crate::duplex::DialogueAction::ReplyNormally => {
+                                respond_with_llm = true;
+                            }
+                            crate::duplex::DialogueAction::StaySilent => {
+                                // The caller asked for the floor to stay open
+                                // ("wait", "stop", "let me think"): keep
+                                // listening, generate nothing, speak nothing.
+                                eprintln!(
+                                    "[aokie-plugin] caller holds the floor ({intent:?}) — waiting silently"
+                                );
+                            }
+                            crate::duplex::DialogueAction::AdjustPace(cmd) => {
+                                let line = match cmd {
+                                    crate::duplex::PaceCommand::Slower => {
+                                        pace.slower();
+                                        "Sure, I'll slow down."
+                                    }
+                                    crate::duplex::PaceCommand::Faster => {
+                                        pace.faster();
+                                        "Sure, I'll speed up."
+                                    }
+                                    crate::duplex::PaceCommand::Normal => {
+                                        pace.reset();
+                                        "Okay, back to normal speed."
+                                    }
+                                };
+                                eprintln!(
+                                    "[aokie-plugin] caller pace command {cmd:?} — base rate now {:.2}",
+                                    pace.base()
+                                );
+                                let sr = bt.get_sample_rate();
+                                if sr > 0 {
+                                    let mut probe =
+                                        ControlProbe::new(&control_rx, &mut pending_controls);
+                                    let (aec_ref, brms) = if barge_in {
+                                        (aec.as_mut(), Some(barge_rms))
+                                    } else {
+                                        (None, None)
+                                    };
+                                    // The ack itself plays at the NEW pace —
+                                    // the confirmation demonstrates the change.
+                                    let out = tts_speak(
+                                        bt,
+                                        &mut tts,
+                                        &mut http_tts,
+                                        line,
+                                        sr,
+                                        aec_ref,
+                                        brms,
+                                        Some(&mut probe),
+                                        pace.base(),
+                                        None,
+                                    );
+                                    note_tts_outcome(&status, &out);
+                                    if !barge_in {
+                                        mute_stt_until = Some(
+                                            Instant::now() + out.dur + Duration::from_millis(400),
+                                        );
+                                    }
+                                    if out.barged {
+                                        bt.flush_tx_audio();
+                                    }
+                                    if !out.captured_speech.is_empty() {
+                                        let mut seeded = crate::voice::to_f32_16k(
+                                            &out.captured_speech,
+                                            sr as u32,
+                                        );
+                                        seeded.extend_from_slice(&stt_buf);
+                                        stt_buf = seeded;
+                                        stt_had_speech = true;
+                                        stt_silence = Duration::ZERO;
+                                    }
+                                    if out.dur > Duration::ZERO {
+                                        let delivery = if out.barged {
+                                            "interrupted"
+                                        } else if out.cancelled {
+                                            "operator_ended"
+                                        } else {
+                                            "complete"
+                                        };
+                                        emit_turn_with_delivery(
+                                            outbox, sink, &corr, turn_index, "bot", line,
+                                            Some(delivery),
+                                        );
+                                        turn_index += 1;
+                                        history.push(serde_json::json!({
+                                            "role": "assistant",
+                                            "content": line,
+                                        }));
+                                        last_bot_reply = line.to_string();
+                                    }
+                                    if let Some(action) = probe.action.take() {
+                                        perform_cancel_action(
+                                            action, bt, &mut tracker, outbox, sink,
+                                        );
+                                    }
+                                }
+                            }
+                            crate::duplex::DialogueAction::Replay { slower } => {
+                                if last_bot_speech.is_empty() {
+                                    // Nothing to replay yet — let the model
+                                    // answer the request instead.
+                                    respond_with_llm = true;
+                                } else {
+                                    let replay_pace = if slower {
+                                        pace.replay_slower()
+                                    } else {
+                                        pace.clone()
+                                    };
+                                    eprintln!(
+                                        "[aokie-plugin] replaying the last reply{} (deterministic)",
+                                        if slower { " slower" } else { "" }
+                                    );
+                                    let sr = bt.get_sample_rate();
+                                    if sr > 0 {
+                                        let replay_text = last_bot_speech.clone();
+                                        let mut probe =
+                                            ControlProbe::new(&control_rx, &mut pending_controls);
+                                        let (aec_ref, brms) = if barge_in {
+                                            (aec.as_mut(), Some(barge_rms))
+                                        } else {
+                                            (None, None)
+                                        };
+                                        let planned = speak_planned(
+                                            bt,
+                                            &mut tts,
+                                            &mut http_tts,
+                                            &replay_text,
+                                            sr,
+                                            aec_ref,
+                                            brms,
+                                            Some(&mut probe),
+                                            &replay_pace,
+                                            protected_max_ms,
+                                        );
+                                        let out = planned.outcome;
+                                        note_tts_outcome(&status, &out);
+                                        if !barge_in {
+                                            mute_stt_until = Some(
+                                                Instant::now()
+                                                    + out.dur
+                                                    + Duration::from_millis(400),
+                                            );
+                                        }
+                                        if out.barged {
+                                            bt.flush_tx_audio();
+                                        }
+                                        if !out.captured_speech.is_empty() {
+                                            let mut seeded = crate::voice::to_f32_16k(
+                                                &out.captured_speech,
+                                                sr as u32,
+                                            );
+                                            seeded.extend_from_slice(&stt_buf);
+                                            stt_buf = seeded;
+                                            stt_had_speech = true;
+                                            stt_silence = Duration::ZERO;
+                                        }
+                                        if out.dur > Duration::ZERO
+                                            && !planned.played_text.is_empty()
+                                        {
+                                            let delivery = if out.barged {
+                                                "interrupted"
+                                            } else if out.cancelled {
+                                                "operator_ended"
+                                            } else {
+                                                "complete"
+                                            };
+                                            emit_turn_with_delivery(
+                                                outbox,
+                                                sink,
+                                                &corr,
+                                                turn_index,
+                                                "bot",
+                                                &planned.played_text,
+                                                Some(delivery),
+                                            );
+                                            turn_index += 1;
+                                            history.push(serde_json::json!({
+                                                "role": "assistant",
+                                                "content": planned.played_text,
+                                            }));
+                                            last_bot_reply = planned.played_text;
+                                        }
+                                        if let Some(action) = probe.action.take() {
+                                            perform_cancel_action(
+                                                action, bt, &mut tracker, outbox, sink,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // The silence watchdog follows the floor state: a
+                        // DELIBERATE pause stretches the window (never nag a
+                        // caller who asked for quiet); everything else runs
+                        // the normal window from now.
+                        if !silence_window.is_zero()
+                            && tracker.current().is_some_and(|s| s.is_active())
+                        {
+                            let w = if dialogue.is_paused() {
+                                silence_window * 3
+                            } else {
+                                silence_window
+                            };
+                            silence_timer = Some(SilenceTimer::new(w, Instant::now()));
+                        }
+                    }
+
+                    if agent_enabled && respond_with_llm {
                         // Lazily connect to the local LLM on the first caller turn.
                         if agent_client.is_none() {
                             let configured = agent_endpoint.lock().unwrap().clone();
@@ -2772,13 +3241,14 @@ fn run_loop(
                         }
                         if let Some(client) = agent_client.as_ref() {
                             let sr = bt.get_sample_rate();
-                            // Add the end-call instruction at reply time (not by mutating
-                            // agent_persona, which a live Configure could replace) so the
-                            // agent can emit the [[END_CALL]] marker when it's done.
+                            // Add the standing instructions at reply time (not by
+                            // mutating agent_persona, which a live Configure could
+                            // replace): spoken-delivery/markers always, the
+                            // end-call marker only when agentHangup is on.
                             let system_prompt = if agent_hangup {
-                                format!("{agent_persona}{END_CALL_INSTRUCTION}")
+                                format!("{agent_persona}{SPEECH_STYLE_INSTRUCTION}{END_CALL_INSTRUCTION}")
                             } else {
-                                agent_persona.clone()
+                                format!("{agent_persona}{SPEECH_STYLE_INSTRUCTION}")
                             };
                             let mut messages = vec![
                                 serde_json::json!({ "role": "system", "content": system_prompt }),
@@ -2795,10 +3265,12 @@ fn run_loop(
                             let t0 = Instant::now();
                             let mut reply_dur = Duration::ZERO;
                             let mut barged = false;
-                            // AK-008: what the caller said WHILE Aokie spoke,
-                            // captured by the barge path — prepended to their
-                            // turn after the reply so no leading words are lost.
-                            let mut barge_capture: Vec<i16> = Vec::new();
+                            // AK-008 + scratchpad: what the caller said WHILE
+                            // Aokie spoke — EVERYTHING above the speech gate is
+                            // captured (barge or not) and prepended to their
+                            // turn after the reply, so no overlapped words are
+                            // ever lost. Listening never stops.
+                            let mut overlap_capture: Vec<i16> = Vec::new();
                             // Distinguish a CALLER barge-in from an OPERATOR
                             // hangup/reject mid-reply (review sweep): both stop
                             // the reply, but the transcript must not label an
@@ -2816,6 +3288,11 @@ fn run_loop(
                             // agent finalized the call and should hang up after the
                             // goodbye plays (unless the caller barged in over it).
                             let mut hangup_requested = false;
+                            // Set when the reply carried the [[WAIT]] marker: the
+                            // model chose INTENTIONAL SILENCE (the caller asked for
+                            // a moment / is thinking). An empty waited reply is NOT
+                            // dead air, and the floor stays with the caller.
+                            let mut wait_requested = false;
                             // What the caller actually HEARD: sentences that
                             // reached the speaker (audit AK-008 + sweep). The
                             // history/turn record uses this, never the full
@@ -2939,6 +3416,10 @@ fn run_loop(
                                         if had_marker {
                                             hangup_requested = true;
                                         }
+                                        // [[WAIT]] = the model chose intentional silence.
+                                        if crate::speech_plan::has_wait_marker(&spoken_text) {
+                                            wait_requested = true;
+                                        }
                                         eprintln!(
                                             "[aokie-plugin] agent sentence (+{:?}): {}",
                                             t0.elapsed(),
@@ -2951,7 +3432,10 @@ fn run_loop(
                                         } else {
                                             (None, None)
                                         };
-                                        let out = tts_speak(
+                                        // The span planner validates/strips any model
+                                        // markers, slows + digit-expands details, and
+                                        // applies per-span interrupt policy.
+                                        let planned = speak_planned(
                                             bt,
                                             &mut tts,
                                             &mut http_tts,
@@ -2960,21 +3444,31 @@ fn run_loop(
                                             aec_ref,
                                             brms,
                                             Some(&mut probe),
+                                            &pace,
+                                            protected_max_ms,
                                         );
-                                        if !spoken_text.trim().is_empty() {
+                                        let out = planned.outcome;
+                                        if !planned.text.trim().is_empty() {
                                             note_tts_outcome(&status, &out);
                                         }
                                         reply_dur += out.dur;
-                                        // Truthful transcript (AOK-VOICE-001):
-                                        // a sentence whose synthesis produced no
-                                        // audio was never heard — don't record it.
-                                        if !spoken_text.is_empty() && out.dur > Duration::ZERO {
-                                            spoken.push(spoken_text.clone());
+                                        // Truthful transcript (AOK-VOICE-001): record
+                                        // only the spans that audibly PLAYED.
+                                        if !planned.played_text.is_empty()
+                                            && out.dur > Duration::ZERO
+                                        {
+                                            spoken.push(planned.played_text.clone());
                                         }
                                         if !barge_in {
                                             let plays_until = (t0 + reply_dur).max(Instant::now());
                                             mute_stt_until =
                                                 Some(plays_until + Duration::from_millis(600));
+                                        }
+                                        // Scratchpad: keep whatever the caller said over
+                                        // this sentence, even when it didn't barge.
+                                        if !out.captured_speech.is_empty() {
+                                            overlap_capture
+                                                .extend_from_slice(&out.captured_speech);
                                         }
                                         if let Some(action) = probe.action.take() {
                                             // Operator hangup/reject landed mid-SENTENCE
@@ -2987,7 +3481,6 @@ fn run_loop(
                                             break 'pump;
                                         }
                                         if out.barged {
-                                            barge_capture = out.captured_speech;
                                             bt.flush_tx_audio(); // stop the queued tail now
                                             barged = true;
                                             reply_cancel.store(true, Ordering::Relaxed);
@@ -3050,28 +3543,36 @@ fn run_loop(
                                     } else {
                                         None
                                     };
+                                    // Marker fallbacks in the FULL generation, in case
+                                    // a stream split hid one from the per-sentence
+                                    // detection above.
+                                    let (_, had) = strip_end_call_marker(&full);
+                                    if had {
+                                        hangup_requested = true;
+                                    }
+                                    if crate::speech_plan::has_wait_marker(&full) {
+                                        wait_requested = true;
+                                    }
+                                    // The transcript records what audibly PLAYED
+                                    // (span-planned, marker-free) — never the raw
+                                    // generation, which may carry control markup
+                                    // and sentences the caller never heard.
+                                    let played = spoken.join(" ").trim().to_string();
                                     let heard = match cut {
-                                        Some(tag) => {
-                                            let h = spoken.join(" ").trim().to_string();
-                                            if h.is_empty() { h } else { format!("{h}{tag}") }
+                                        Some(tag) if !played.is_empty() => {
+                                            format!("{played}{tag}")
                                         }
-                                        // Strip the marker from the recorded reply too, and
-                                        // arm the hangup as a fallback in case a stream split
-                                        // hid it from the per-sentence strip above.
-                                        None => {
-                                            let (clean, had) = strip_end_call_marker(&full);
-                                            if had {
-                                                hangup_requested = true;
-                                            }
-                                            clean
-                                        }
+                                        _ => played.clone(),
                                     };
                                     // VOICE-001: nothing audible + no barge/operator
                                     // context = the caller is in DEAD AIR — an empty
                                     // generation or fully-silent synthesis both count.
-                                    // A dead LINE is not dead air: there is no channel
-                                    // left to apologise on.
+                                    // A dead LINE is not dead air (no channel left to
+                                    // apologise on) — and neither is INTENTIONAL
+                                    // silence: a [[WAIT]] reply means the model chose
+                                    // to leave the caller their thinking room.
                                     if !line_dead
+                                        && !wait_requested
                                         && reply_left_dead_air(
                                             reply_dur > Duration::ZERO,
                                             barged,
@@ -3114,19 +3615,24 @@ fn run_loop(
                                         );
                                         turn_index += 1;
                                         last_bot_reply = heard;
+                                        // Clean playable text — what "repeat that
+                                        // (slower)" replays. No truncation tags.
+                                        last_bot_speech = played;
                                     } else if !heard.is_empty() {
                                         eprintln!(
                                             "[aokie-plugin] agent reply produced NO audio (TTS failed) — not recorded as a spoken turn"
                                         );
                                     }
-                                    if !barged {
-                                        // Discard anything captured while we replied.
-                                        // On barge-in, KEEP it: the caller's interrupting
-                                        // speech is already accumulating as their next turn.
+                                    if !barged && overlap_capture.is_empty() {
+                                        // Nothing was said over us: discard the
+                                        // residue captured while we replied. With
+                                        // overlap captured (barge or scratchpad),
+                                        // KEEP the buffer — it's the caller's turn
+                                        // in progress and is seeded below.
                                         stt_buf.clear();
                                         stt_had_speech = false;
                                         stt_silence = Duration::ZERO;
-                                    } else {
+                                    } else if barged {
                                         eprintln!(
                                             "[aokie-plugin] caller barged in â€” reply cut short"
                                         );
@@ -3153,6 +3659,9 @@ fn run_loop(
                                             Some("error"),
                                         );
                                         turn_index += 1;
+                                        last_bot_speech = heard
+                                            .trim_end_matches(" [reply cut short by an error]")
+                                            .to_string();
                                         last_bot_reply = heard;
                                     } else if !line_dead
                                         && reply_left_dead_air(false, barged, operator_ended)
@@ -3172,15 +3681,21 @@ fn run_loop(
                                     }
                                 }
                             }
-                            // AK-008: the caller interrupted — their words spoken
-                            // OVER the reply were captured (echo-cancelled) by the
-                            // barge path. Prepend them to the utterance buffer so
-                            // the STT hears the WHOLE turn ("zero four two one…"),
-                            // not just what followed the barge trip. The post-trip
-                            // audio keeps accumulating via the main loop as before.
-                            if barged && !barge_capture.is_empty() {
+                            // AK-008 + scratchpad: EVERYTHING the caller said over
+                            // the reply was captured (echo-cancelled) — barge or
+                            // not. Prepend it to the utterance buffer so the STT
+                            // hears the WHOLE turn ("zero four two one…", a quick
+                            // "wait" that never tripped the barge, a "yeah" spoken
+                            // over a sentence). Overlapped speech is never lost.
+                            if !overlap_capture.is_empty() {
+                                if !barged {
+                                    eprintln!(
+                                        "[aokie-plugin] scratchpad: captured {}ms of overlapped caller speech (no barge) — transcribing",
+                                        overlap_capture.len() * 1000 / (sr.max(1) as usize)
+                                    );
+                                }
                                 let mut seeded =
-                                    crate::voice::to_f32_16k(&barge_capture, sr as u32);
+                                    crate::voice::to_f32_16k(&overlap_capture, sr as u32);
                                 seeded.extend_from_slice(&stt_buf);
                                 stt_buf = seeded;
                                 stt_had_speech = true;
@@ -3198,6 +3713,8 @@ fn run_loop(
                                     "[aokie-plugin] responder failed mid-call ({cause}) — speaking the fallback line and ending the call (VOICE-001)"
                                 );
                                 let fb_t0 = Instant::now();
+                                // The fail-safe stays maximally simple: plain rate,
+                                // no planning, no barge monitoring.
                                 let out = tts_speak(
                                     bt,
                                     &mut tts,
@@ -3206,6 +3723,8 @@ fn run_loop(
                                     sr,
                                     None,
                                     None,
+                                    None,
+                                    1.0,
                                     None,
                                 );
                                 note_tts_outcome(&status, &out);
@@ -3309,6 +3828,20 @@ fn run_loop(
                             if let Some(t) = silence_timer.as_mut() {
                                 t.note_activity(Instant::now());
                             }
+                            // The model chose intentional silence ([[WAIT]]): the
+                            // floor stays with the caller — hold the pause state
+                            // and stretch the silence watchdog so a deliberately
+                            // quiet caller isn't nagged mid-thought.
+                            if wait_requested && !barged && !operator_ended && !line_dead {
+                                eprintln!(
+                                    "[aokie-plugin] agent chose to wait silently ([[WAIT]]) — the caller has the floor"
+                                );
+                                dialogue.apply(crate::duplex::CallerIntent::Pause);
+                                if !silence_window.is_zero() {
+                                    silence_timer =
+                                        Some(SilenceTimer::new(silence_window * 3, Instant::now()));
+                                }
+                            }
                         }
                     }
                 }
@@ -3348,6 +3881,8 @@ fn run_loop(
                             aec_ref,
                             brms,
                             Some(&mut probe),
+                            pace.base(),
+                            None,
                         );
                         note_tts_outcome(&status, &out);
                         if barge_in {
@@ -3357,12 +3892,14 @@ fn run_loop(
                                 if let Some(t) = silence_timer.as_mut() {
                                     t.note_activity(Instant::now());
                                 }
-                                if !out.captured_speech.is_empty() {
-                                    stt_buf =
-                                        crate::voice::to_f32_16k(&out.captured_speech, sr as u32);
-                                    stt_had_speech = true;
-                                    stt_silence = Duration::ZERO;
-                                }
+                            }
+                            // Scratchpad: anything said over the prompt (barge or
+                            // not) seeds the caller's next turn.
+                            if !out.captured_speech.is_empty() {
+                                stt_buf =
+                                    crate::voice::to_f32_16k(&out.captured_speech, sr as u32);
+                                stt_had_speech = true;
+                                stt_silence = Duration::ZERO;
                             }
                         } else {
                             mute_stt_until =
@@ -3414,6 +3951,8 @@ fn run_loop(
                             None,
                             None,
                             Some(&mut probe),
+                            pace.base(),
+                            None,
                         );
                         note_tts_outcome(&status, &out);
                         if out.barged {
@@ -3551,9 +4090,14 @@ fn run_loop(
                     } else {
                         let sr = bt.get_sample_rate();
                         // AOK-CTRL-001: a hangup/reject queued behind this speak
-                        // cuts it at chunk granularity.
+                        // cuts it at chunk granularity. Flow/operator speech runs
+                        // through the SAME span planner as the built-in agent —
+                        // markers ([[slow]]/[[rate=…]]/[[important]]) are
+                        // validated + clamped identically, digit runs slow down
+                        // identically: the coordinator doesn't care where the
+                        // words came from.
                         let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
-                        let out = tts_speak(
+                        let planned = speak_planned(
                             bt,
                             &mut tts,
                             &mut http_tts,
@@ -3562,8 +4106,11 @@ fn run_loop(
                             None,
                             None,
                             Some(&mut probe),
+                            &pace,
+                            protected_max_ms,
                         );
-                        if sr > 0 && !text.trim().is_empty() {
+                        let out = planned.outcome;
+                        if sr > 0 && !planned.text.trim().is_empty() {
                             note_tts_outcome(&status, &out);
                         }
                         mute_stt_until =
@@ -3573,10 +4120,8 @@ fn run_loop(
                         stt_silence = Duration::ZERO;
                         // Truthful transcript (audit AOK-VOICE-002): record a
                         // bot turn ONLY when synthesis actually produced audio
-                        // for the caller. A zero-duration outcome means TTS
-                        // failed — the transcript must not claim speech the
-                        // caller never heard.
-                        if out.dur > Duration::ZERO {
+                        // for the caller — and only the spans that played.
+                        if out.dur > Duration::ZERO && !planned.played_text.is_empty() {
                             if let Some(corr) = tracker.call_id().map(str::to_string) {
                                 let delivery = if out.cancelled {
                                     "operator_ended"
@@ -3589,7 +4134,7 @@ fn run_loop(
                                     &corr,
                                     turn_index,
                                     "bot",
-                                    &text,
+                                    &planned.played_text,
                                     Some(delivery),
                                 );
                                 turn_index += 1;
@@ -3598,7 +4143,7 @@ fn run_loop(
                             if let Some(t) = silence_timer.as_mut() {
                                 t.note_activity(Instant::now());
                             }
-                        } else if !out.cancelled && sr > 0 && !text.trim().is_empty() {
+                        } else if !out.cancelled && sr > 0 && !planned.text.trim().is_empty() {
                             eprintln!(
                                 "[aokie-plugin] operatorSpeak produced NO audio (TTS failed) — not recorded as a spoken turn: {}",
                                 content_for_log(&text)
@@ -4406,6 +4951,35 @@ mod tests {
         assert_eq!(speech_start, Some(frame * 5), "speech starts where the loud audio began");
         // The loud chunk was captured too — nothing was consumed by detection.
         assert_eq!(captured.len(), frame * 8);
+    }
+
+    /// Span interrupt policy: a Yield span stops the instant the barge trips;
+    /// a FinishSpan span (phone number, [[important]] detail) keeps playing
+    /// through its bounded extension and then stops; an urgent control
+    /// (hangup/reject) stops everything regardless of policy.
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[test]
+    fn playback_policy_yield_vs_finish_span() {
+        use std::time::{Duration, Instant};
+        // Yield: barge = stop now.
+        let mut p = TtsChunkPlayback::new(8000, None);
+        assert!(!p.stop_playback_now(), "nothing happened yet");
+        p.barged = true;
+        p.barged_at = Some(Instant::now());
+        assert!(p.stop_playback_now(), "yield stops on the trip");
+
+        // FinishSpan: barge = keep going until the budget is spent.
+        let mut p = TtsChunkPlayback::new(8000, Some(Duration::from_millis(1500)));
+        p.barged = true;
+        p.barged_at = Some(Instant::now());
+        assert!(!p.stop_playback_now(), "inside the finish budget");
+        p.barged_at = Some(Instant::now() - Duration::from_millis(1600));
+        assert!(p.stop_playback_now(), "budget spent — yield");
+
+        // Cancelled (urgent control) always stops, policy notwithstanding.
+        let mut p = TtsChunkPlayback::new(8000, Some(Duration::from_secs(5)));
+        p.cancelled = true;
+        assert!(p.stop_playback_now(), "hangup/reject beats protection");
     }
 
     /// AK-008: un-armed frames (AEC convergence grace) are still captured —

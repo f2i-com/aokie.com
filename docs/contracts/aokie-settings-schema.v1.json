@@ -59,6 +59,27 @@
       "appliesLive": false
     },
     {
+      "key": "defaultSpeechRate",
+      "type": "int",
+      "min": 60,
+      "max": 140,
+      "appliesLive": false
+    },
+    {
+      "key": "detailSpeechRate",
+      "type": "int",
+      "min": 50,
+      "max": 100,
+      "appliesLive": false
+    },
+    {
+      "key": "protectedSpeechMaxMs",
+      "type": "int",
+      "min": 500,
+      "max": 5000,
+      "appliesLive": false
+    },
+    {
       "key": "hfpCodec",
       "type": "enum",
       "options": [

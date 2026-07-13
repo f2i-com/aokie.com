@@ -36,12 +36,14 @@ pub mod config;
 pub mod connector;
 pub mod consent;
 pub mod contract;
+pub mod duplex;
 #[cfg(feature = "voice")]
 pub mod endpoint_http;
 pub mod event_bridge;
 pub mod outbox;
 pub mod radio;
 pub mod rpc;
+pub mod speech_plan;
 pub mod speech_wire;
 #[cfg(feature = "voice")]
 pub mod voice;
