@@ -18,6 +18,9 @@
 /// This runs ONLY on the text handed to the synthesizer — transcripts, history
 /// and records keep the original wording.
 pub fn normalize_speech_text(input: &str) -> String {
+    // Clock times first, so the meridiem pass sees the cleaned form:
+    // "10:00 AM" -> "10 AM" -> "10 a em".
+    let input = &normalize_clock_times(input);
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
@@ -82,6 +85,64 @@ pub fn normalize_speech_text(input: &str) -> String {
     cleaned
 }
 
+/// Rewrite `H:MM` clock times into forms the TTS reads naturally — the colon
+/// made it spell the minutes out ("10:00" read as "ten zero zero" / colon
+/// noises, live report 2026-07-13):
+///   "10:00" → "10"        (on-the-hour: just the hour)
+///   "10:15" → "10 15"     ("ten fifteen")
+///   "10:05" → "10 oh 5"   ("ten oh five")
+/// Strictly shaped: 1-2 digit hour (0-23), exactly 2-digit minutes (00-59),
+/// no digit on either side — "3:1" (a ratio), "10:154" and "100:30" are
+/// untouched. Runs only on synthesizer text, never on transcripts/records.
+fn normalize_clock_times(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        // Candidate start: a digit with no digit immediately before it.
+        if chars[i].is_ascii_digit() && (i == 0 || !chars[i - 1].is_ascii_digit()) {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            let hour_len = j - i;
+            let is_time = hour_len <= 2
+                && j < chars.len()
+                && chars[j] == ':'
+                && j + 2 < chars.len() + 1
+                && chars.get(j + 1).is_some_and(|c| c.is_ascii_digit())
+                && chars.get(j + 2).is_some_and(|c| c.is_ascii_digit())
+                && chars.get(j + 3).is_none_or(|c| !c.is_ascii_digit());
+            if is_time {
+                let hour: u32 = chars[i..j].iter().collect::<String>().parse().unwrap_or(99);
+                let m1 = chars[j + 1];
+                let m2 = chars[j + 2];
+                let minutes: u32 = format!("{m1}{m2}").parse().unwrap_or(99);
+                if hour <= 23 && minutes <= 59 {
+                    for k in i..j {
+                        out.push(chars[k]);
+                    }
+                    if minutes == 0 {
+                        // on the hour: drop ":00" entirely
+                    } else if minutes < 10 {
+                        out.push_str(" oh ");
+                        out.push(m2);
+                    } else {
+                        out.push(' ');
+                        out.push(m1);
+                        out.push(m2);
+                    }
+                    i = j + 3;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Append a phonetic meridiem, inserting a space when the text ran straight off
 /// a digit ("9pm" → "9 pee em", but "10 pm" keeps its single space).
 fn push_phonetic(out: &mut String, phonetic: &str) {
@@ -120,11 +181,25 @@ mod tests {
     fn bare_am_pm_only_converts_after_a_time() {
         assert_eq!(normalize_speech_text("see you at 10 AM."), "see you at 10 a em.");
         assert_eq!(normalize_speech_text("booked for 10am sharp"), "booked for 10 a em sharp");
-        assert_eq!(normalize_speech_text("at 10:30 PM tonight"), "at 10:30 pee em tonight");
+        assert_eq!(normalize_speech_text("at 10:30 PM tonight"), "at 10 30 pee em tonight");
         // NOT times — never rewritten.
         assert_eq!(normalize_speech_text("I AM HERE"), "I AM HERE");
         assert_eq!(normalize_speech_text("am I early?"), "am I early?");
         assert_eq!(normalize_speech_text("the PM will visit"), "the PM will visit");
+    }
+
+    #[test]
+    fn clock_times_read_naturally() {
+        // The reported bug: "10:00" spoken as "ten zero zero" / colon noise.
+        assert_eq!(normalize_speech_text("booked for 10:00 AM."), "booked for 10 a em.");
+        assert_eq!(normalize_speech_text("see you at 10:15."), "see you at 10 15.");
+        assert_eq!(normalize_speech_text("at 10:05 pm"), "at 10 oh 5 pee em");
+        assert_eq!(normalize_speech_text("open 9:00 to 17:30"), "open 9 to 17 30");
+        // NOT clock times — untouched.
+        assert_eq!(normalize_speech_text("a 3:1 ratio"), "a 3:1 ratio");
+        assert_eq!(normalize_speech_text("code 10:154 please"), "code 10:154 please");
+        assert_eq!(normalize_speech_text("item 100:30 stays"), "item 100:30 stays");
+        assert_eq!(normalize_speech_text("at 75:00 minutes?"), "at 75:00 minutes?");
     }
 
     #[test]
