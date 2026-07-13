@@ -1011,6 +1011,9 @@ impl Plugin {
                                     // already over (audit C-05) — non-zero is fine,
                                     // growth per call is worth investigating.
                                     "staleSttResults": radio.stale_stt_results(),
+                                    // Round 4: how often each full-duplex
+                                    // mechanism fired (content-free tuning data).
+                                    "duplex": radio.duplex_counters(),
                                     // AOK-VOICE-001: known voice-pipeline failures
                                     // (None = no known failure; set = auto-answer
                                     // is blocked + health degraded).
@@ -1861,6 +1864,7 @@ impl Plugin {
                     "phoneConnected": r.is_connected(),
                     "callActive": r.is_call_active(),
                     "staleSttResults": r.stale_stt_results(),
+                    "duplex": r.duplex_counters(),
                     "error": r.last_error(),
                     "voiceRuntime": {
                         "ready": stt_err.is_none() && tts_err.is_none()

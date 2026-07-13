@@ -544,6 +544,16 @@ pub struct RadioStatus {
     /// Skip cases (HTTP endpoints, env override, non-voice build) record an
     /// ok report with the skip reason so arming isn't held hostage.
     pub self_test: Mutex<Option<VoiceSelfTest>>,
+    /// Duplex/floor tuning counters (round 4, content-free): how often each
+    /// full-duplex mechanism fired — observable via dongle.diagnostics so
+    /// live behaviour is tuned from numbers, not vibes.
+    pub early_stt_hits: AtomicU64,
+    pub probes_sent: AtomicU64,
+    pub probe_commands: AtomicU64,
+    pub boundary_yields: AtomicU64,
+    pub gap_yields: AtomicU64,
+    pub semantic_cuts: AtomicU64,
+    pub barge_cuts: AtomicU64,
     /// AOK-CTRL-001: whether the RUNNING radio's in-plugin agent owns replies
     /// (the env snapshot the radio actually started with, not the settings bag
     /// which may have changed since). The connector refuses `call.operatorSpeak`
@@ -644,6 +654,21 @@ impl RadioHandle {
     /// VOICE-001: the loopback self-test outcome (None = still running).
     pub fn self_test(&self) -> Option<VoiceSelfTest> {
         self.status.self_test.lock().unwrap().clone()
+    }
+
+    /// Round 4: content-free duplex/floor counters — how often each
+    /// full-duplex mechanism fired, for dongle.diagnostics tuning.
+    pub fn duplex_counters(&self) -> serde_json::Value {
+        let s = &self.status;
+        json!({
+            "earlySttHits": s.early_stt_hits.load(Ordering::Relaxed),
+            "probesSent": s.probes_sent.load(Ordering::Relaxed),
+            "probeCommands": s.probe_commands.load(Ordering::Relaxed),
+            "boundaryYields": s.boundary_yields.load(Ordering::Relaxed),
+            "gapYields": s.gap_yields.load(Ordering::Relaxed),
+            "semanticCuts": s.semantic_cuts.load(Ordering::Relaxed),
+            "bargeCuts": s.barge_cuts.load(Ordering::Relaxed),
+        })
     }
 
     /// AOK-BT-001: seconds left in the pairing window, 0 when closed or the radio
@@ -778,7 +803,7 @@ fn emit_turn(
     speaker: &str,
     text: &str,
 ) {
-    emit_turn_with_delivery(outbox, sink, corr, turn_index, speaker, text, None)
+    emit_turn_with_delivery(outbox, sink, corr, turn_index, speaker, text, None, None)
 }
 
 /// AOK-CTRL-001: bot turns carry a structured per-turn DELIVERY status —
@@ -789,6 +814,7 @@ fn emit_turn(
 /// may be shorter than the generation. Additive payload field — existing
 /// consumers ignore it. Caller turns have no delivery dimension (`None`).
 #[cfg(feature = "voice")]
+#[allow(clippy::too_many_arguments)]
 fn emit_turn_with_delivery(
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
@@ -797,9 +823,12 @@ fn emit_turn_with_delivery(
     speaker: &str,
     text: &str,
     delivery: Option<&str>,
+    // Speech-START stamp (None = now): bot turns are emitted when the reply
+    // FINISHES, but their place in the conversation is when they began.
+    at: Option<&str>,
 ) {
     emit_turn_full(
-        outbox, sink, corr, turn_index, speaker, text, delivery, None, false, None,
+        outbox, sink, corr, turn_index, speaker, text, delivery, None, false, at,
     )
 }
 
@@ -1906,6 +1935,7 @@ fn may_queue_more(
 struct SttProbeLane<'a> {
     stt_tx: &'a std::sync::mpsc::Sender<SttWork>,
     results: &'a std::sync::mpsc::Receiver<SttResult>,
+    status: &'a RadioStatus,
     generation: u64,
     last_probe_at: Option<std::time::Instant>,
     probed_len: usize,
@@ -1923,6 +1953,7 @@ impl<'a> SttProbeLane<'a> {
         stt_tx: &'a std::sync::mpsc::Sender<SttWork>,
         results: &'a std::sync::mpsc::Receiver<SttResult>,
         generation: u64,
+        status: &'a RadioStatus,
     ) -> Self {
         // Discard results from a PREVIOUS span: a "wait" heard over sentence
         // 3 must not cut sentence 4 seconds later — probes are instant-or-
@@ -1931,6 +1962,7 @@ impl<'a> SttProbeLane<'a> {
         Self {
             stt_tx,
             results,
+            status,
             generation,
             last_probe_at: None,
             probed_len: 0,
@@ -1983,6 +2015,7 @@ impl<'a> SttProbeLane<'a> {
         self.last_probe_at = Some(std::time::Instant::now());
         self.probed_len = playback.captured.len();
         self.in_flight += 1;
+        self.status.probes_sent.fetch_add(1, Ordering::Relaxed);
         let _ = self.stt_tx.send(SttWork::Probe {
             generation: self.generation,
             samples: snapshot,
@@ -2007,6 +2040,7 @@ impl<'a> SttProbeLane<'a> {
                     "[aokie-plugin] probe caught a spoken floor command ({intent:?}): {}",
                     content_for_log(&res.text)
                 );
+                self.status.probe_commands.fetch_add(1, Ordering::Relaxed);
                 self.pending_command = Some(intent);
             } else if res.text.trim().len() > self.content.trim().len() {
                 self.content = res.text;
@@ -2099,7 +2133,6 @@ fn tts_speak(
             }
         }
         if playback.cancelled {
-            stopped = true;
             break;
         }
         // Collect whatever the worker produced (non-blocking).
@@ -2150,7 +2183,6 @@ fn tts_speak(
             }
         }
         if playback.stop_playback_now() {
-            stopped = true;
             break;
         }
         // Natural end: synthesis finished, everything queued, playout done.
@@ -3129,8 +3161,10 @@ fn run_loop(
                     // origin (pacing + digit handling + the probe lane, so a
                     // spoken "wait" cuts even the greeting).
                     let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
-                    let mut lane = SttProbeLane::new(&stt_tx, &probe_result_rx, voice_call_gen);
+                    let mut lane =
+                        SttProbeLane::new(&stt_tx, &probe_result_rx, voice_call_gen, &status);
                     let lane_ref = if barge_in { Some(&mut lane) } else { None };
+                    let speak_started = Instant::now();
                     let planned = speak_planned(
                         bt,
                         &synth,
@@ -3201,6 +3235,7 @@ fn run_loop(
                             "bot",
                             &planned.played_text,
                             Some(delivery),
+                            Some(&aokie_core::events::iso8601_ago_ms(speak_started.elapsed().as_millis() as u64)),
                         );
                         turn_index += 1;
                         history.push(
@@ -3320,6 +3355,7 @@ fn run_loop(
                 if spec_utterance.take().is_some() {
                     // The speculation IS this utterance (nothing new was said
                     // since it was sent) — never transcribe it twice.
+                    status.early_stt_hits.fetch_add(1, Ordering::Relaxed);
                     stt_buf.clear();
                 } else if stt_buf.len() >= 16_000 / 5 {
                     // Stamp the job with the call it belongs to (audit C-05).
@@ -3522,6 +3558,7 @@ fn run_loop(
                                     };
                                     // The ack itself plays at the NEW pace —
                                     // the confirmation demonstrates the change.
+                                    let ack_started = Instant::now();
                                     let out = tts_speak(
                                         bt,
                                         &synth,
@@ -3570,6 +3607,9 @@ fn run_loop(
                                         emit_turn_with_delivery(
                                             outbox, sink, &corr, turn_index, "bot", line,
                                             Some(delivery),
+                                            Some(&aokie_core::events::iso8601_ago_ms(
+                                                ack_started.elapsed().as_millis() as u64,
+                                            )),
                                         );
                                         turn_index += 1;
                                         history.push(serde_json::json!({
@@ -3614,9 +3654,11 @@ fn run_loop(
                                             &stt_tx,
                                             &probe_result_rx,
                                             voice_call_gen,
+                                            &status,
                                         );
                                         let lane_ref =
                                             if barge_in { Some(&mut lane) } else { None };
+                                        let replay_started = Instant::now();
                                         let planned = speak_planned(
                                             bt,
                                             &synth,
@@ -3676,6 +3718,9 @@ fn run_loop(
                                                 "bot",
                                                 &planned.played_text,
                                                 Some(delivery),
+                                                Some(&aokie_core::events::iso8601_ago_ms(
+                                                    replay_started.elapsed().as_millis() as u64,
+                                                )),
                                             );
                                             turn_index += 1;
                                             history.push(serde_json::json!({
@@ -3788,8 +3833,12 @@ fn run_loop(
                             // sentences so boundary decisions see everything
                             // said so far, and a command heard at the tail of
                             // one sentence still cuts the next.
-                            let mut reply_lane =
-                                SttProbeLane::new(&stt_tx, &probe_result_rx, voice_call_gen);
+                            let mut reply_lane = SttProbeLane::new(
+                                &stt_tx,
+                                &probe_result_rx,
+                                voice_call_gen,
+                                &status,
+                            );
                             // Distinguish a CALLER barge-in from an OPERATOR
                             // hangup/reject mid-reply (review sweep): both stop
                             // the reply, but the transcript must not label an
@@ -3965,6 +4014,7 @@ fn run_loop(
                                             eprintln!(
                                                 "[aokie-plugin] caller spoke between sentences — reply cut"
                                             );
+                                            status.gap_yields.fetch_add(1, Ordering::Relaxed);
                                             bt.flush_tx_audio();
                                             reply_cancel.store(true, Ordering::Relaxed);
                                             break 'pump;
@@ -4012,6 +4062,7 @@ fn run_loop(
                                             eprintln!(
                                                 "[aokie-plugin] caller speaking as the next sentence arrived — yielding to them"
                                             );
+                                            status.gap_yields.fetch_add(1, Ordering::Relaxed);
                                             barged = true;
                                             reply_cancel.store(true, Ordering::Relaxed);
                                             break 'pump;
@@ -4082,6 +4133,13 @@ fn run_loop(
                                             break 'pump;
                                         }
                                         if out.barged {
+                                            if out.commanded.is_some() {
+                                                status
+                                                    .semantic_cuts
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            } else {
+                                                status.barge_cuts.fetch_add(1, Ordering::Relaxed);
+                                            }
                                             bt.flush_tx_audio(); // stop the queued tail now
                                             barged = true;
                                             reply_cancel.store(true, Ordering::Relaxed);
@@ -4107,6 +4165,9 @@ fn run_loop(
                                                 "[aokie-plugin] scratchpad steering: yielding at the sentence boundary to {}",
                                                 content_for_log(&said)
                                             );
+                                            status
+                                                .boundary_yields
+                                                .fetch_add(1, Ordering::Relaxed);
                                             bt.flush_tx_audio();
                                             barged = true;
                                             reply_cancel.store(true, Ordering::Relaxed);
@@ -4260,6 +4321,9 @@ fn run_loop(
                                             "bot",
                                             &heard,
                                             Some(delivery),
+                                            Some(&aokie_core::events::iso8601_ago_ms(
+                                                t0.elapsed().as_millis() as u64,
+                                            )),
                                         );
                                         turn_index += 1;
                                         last_bot_reply = heard;
@@ -4305,6 +4369,9 @@ fn run_loop(
                                             "bot",
                                             &heard,
                                             Some("error"),
+                                            Some(&aokie_core::events::iso8601_ago_ms(
+                                                t0.elapsed().as_millis() as u64,
+                                            )),
                                         );
                                         turn_index += 1;
                                         last_bot_speech = heard
@@ -4390,6 +4457,9 @@ fn run_loop(
                                         "bot",
                                         FALLBACK_LINE,
                                         Some("complete"),
+                                        Some(&aokie_core::events::iso8601_ago_ms(
+                                            fb_t0.elapsed().as_millis() as u64,
+                                        )),
                                     );
                                     turn_index += 1;
                                     // AOK-CTRL-001: drain the QUEUED apology before
@@ -4528,6 +4598,7 @@ fn run_loop(
                         } else {
                             (None, None)
                         };
+                        let check_started = Instant::now();
                         let out = tts_speak(
                             bt,
                             &synth,
@@ -4583,6 +4654,9 @@ fn run_loop(
                                     "bot",
                                     SILENCE_CHECK_LINE,
                                     Some(delivery),
+                                    Some(&aokie_core::events::iso8601_ago_ms(
+                                        check_started.elapsed().as_millis() as u64,
+                                    )),
                                 );
                                 turn_index += 1;
                             }
@@ -4636,6 +4710,9 @@ fn run_loop(
                                         "bot",
                                         SILENCE_GOODBYE_LINE,
                                         Some("complete"),
+                                        Some(&aokie_core::events::iso8601_ago_ms(
+                                            gb_t0.elapsed().as_millis() as u64,
+                                        )),
                                     );
                                     turn_index += 1;
                                 }
@@ -4758,6 +4835,7 @@ fn run_loop(
                         // identically: the coordinator doesn't care where the
                         // words came from.
                         let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
+                        let op_started = Instant::now();
                         let planned = speak_planned(
                             bt,
                             &synth,
@@ -4797,6 +4875,9 @@ fn run_loop(
                                     "bot",
                                     &planned.played_text,
                                     Some(delivery),
+                                    Some(&aokie_core::events::iso8601_ago_ms(
+                                        op_started.elapsed().as_millis() as u64,
+                                    )),
                                 );
                                 turn_index += 1;
                             }
