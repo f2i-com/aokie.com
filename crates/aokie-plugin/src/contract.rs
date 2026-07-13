@@ -34,6 +34,13 @@ pub mod events {
     pub const CALL_INCOMING: &str = "aokie.call.incoming";
     pub const CALL_RINGING: &str = "aokie.call.ringing";
     pub const CALL_ANSWERED: &str = "aokie.call.answered";
+    /// The caller's number the moment it is KNOWN — {callId, from, at}. With
+    /// instant auto-answer the ringing-phase +CLIP usually loses the race, so
+    /// `call.incoming` often carries `from: ""`; the AT+CLCC rescue delivers
+    /// the number ~1s after answer and this event announces it (once per
+    /// call) so flows can personalize the live call — e.g. match the caller
+    /// against a Customers form and greet them by name.
+    pub const CALL_CALLER_ID: &str = "aokie.call.caller_id";
     pub const CALL_REJECTED: &str = "aokie.call.rejected";
     pub const CALL_AUDIO_CONNECTED: &str = "aokie.call.audio.connected";
     pub const CALL_AUDIO_DISCONNECTED: &str = "aokie.call.audio.disconnected";
@@ -62,6 +69,7 @@ pub mod events {
         CALL_INCOMING,
         CALL_RINGING,
         CALL_ANSWERED,
+        CALL_CALLER_ID,
         CALL_REJECTED,
         CALL_AUDIO_CONNECTED,
         CALL_AUDIO_DISCONNECTED,

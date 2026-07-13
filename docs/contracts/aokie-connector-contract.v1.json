@@ -16,6 +16,7 @@
     "aokie.call.incoming",
     "aokie.call.ringing",
     "aokie.call.answered",
+    "aokie.call.caller_id",
     "aokie.call.rejected",
     "aokie.call.audio.connected",
     "aokie.call.audio.disconnected",

@@ -3797,7 +3797,35 @@ fn handle_event(
             }
         }
         E::CallerId(num) => {
+            // The FIRST time this call learns a (non-empty) number, announce
+            // it: with instant auto-answer the ringing-phase +CLIP usually
+            // loses the race, so `call.incoming` often went out with an empty
+            // `from` — this event (fed by +CLIP or the AT+CLCC rescue) is
+            // what lets flows personalize the LIVE call (greet a matched
+            // customer by name). Emitted at most once per call: +CLIP repeats
+            // per ring and +CLCC answers too, and the idempotency key
+            // (corr + `caller_id` step) must be minted exactly once.
+            let newly_known = !num.trim().is_empty()
+                && tracker
+                    .current()
+                    .is_some_and(|s| s.caller_id.as_deref().unwrap_or("").is_empty());
             tracker.caller_id(num.clone());
+            if newly_known {
+                // Lifecycle order (AOK-LIF-001): the number is known now, so
+                // the held `incoming` can flush WITH it — and must go first.
+                flush_incoming_if_pending(tracker, outbox, sink);
+                if let Some(corr) = tracker.call_id() {
+                    emit(
+                        outbox,
+                        sink,
+                        aokie_event(
+                            crate::contract::events::CALL_CALLER_ID,
+                            corr,
+                            json!({"callId": corr, "from": num.clone(), "at": now_iso8601()}),
+                        ),
+                    );
+                }
+            }
             *status.current_caller.lock().unwrap() = Some(num);
         }
         E::CallRinging => {
@@ -4506,6 +4534,76 @@ mod tests {
         let incoming_at = names.iter().position(|n| n == crate::contract::events::CALL_INCOMING);
         let ended_at = names.iter().position(|n| n == crate::contract::events::CALL_ENDED);
         assert!(incoming_at.is_some() && incoming_at < ended_at, "incoming precedes ended, got {names:?}");
+    }
+
+    /// `aokie.call.caller_id` announces the number the FIRST time this call
+    /// learns it (fed by +CLIP or the AT+CLCC rescue) — exactly once per call
+    /// (+CLIP repeats per ring; the idempotency key is corr-scoped), never for
+    /// an empty number, and always AFTER the call's `incoming`.
+    #[test]
+    fn caller_id_event_fires_once_per_call_with_the_number() {
+        use crate::event_bridge::VecSink;
+        use aokie_dongle::bluetooth::BluetoothEvent as E;
+
+        let status = Arc::new(RadioStatus::default());
+        let mut sink = VecSink::default();
+        let mut tracker = crate::call_session::SessionTracker::new();
+
+        handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+        handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
+        sink.lines.clear();
+
+        // The number lands (CLCC rescue) → announced once, with the number.
+        handle_event(
+            E::CallerId("0491570156".to_string()),
+            &mut tracker,
+            None,
+            &mut sink,
+            &status,
+        );
+        let events: Vec<serde_json::Value> = sink
+            .lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let caller_id: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|v| {
+                v["params"]["event"]["name"] == json!(crate::contract::events::CALL_CALLER_ID)
+            })
+            .collect();
+        assert_eq!(caller_id.len(), 1, "announced exactly once: {events:?}");
+        assert_eq!(
+            caller_id[0]["params"]["event"]["data"]["from"],
+            json!("0491570156")
+        );
+        assert_eq!(
+            caller_id[0]["params"]["event"]["data"]["callId"].as_str(),
+            tracker.call_id()
+        );
+
+        // A repeated +CLIP for the same call must NOT re-announce (the
+        // corr-scoped idempotency key may only be minted once).
+        sink.lines.clear();
+        handle_event(
+            E::CallerId("0491570156".to_string()),
+            &mut tracker,
+            None,
+            &mut sink,
+            &status,
+        );
+        assert!(sink.lines.is_empty(), "no re-announce: {:?}", sink.lines);
+
+        // An empty caller id (withheld) never announces.
+        handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
+        handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+        sink.lines.clear();
+        handle_event(E::CallerId(String::new()), &mut tracker, None, &mut sink, &status);
+        assert!(
+            !sink.lines.iter().any(|l| l.contains("caller_id")),
+            "withheld id stays silent: {:?}",
+            sink.lines
+        );
     }
 
     /// AOK-CTRL-001: an ANSWER landing on an idle tracker while the phone is
