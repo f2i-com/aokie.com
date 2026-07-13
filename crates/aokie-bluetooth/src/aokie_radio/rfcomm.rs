@@ -1269,7 +1269,15 @@ impl RfcommClientState {
                 self.fail_secondary(dlci, format!("RFCOMM peer sent DISC on dlci {}", dlci));
                 Ok(vec![build_ua(dlci, false)])
             }
-            (RfcommFrameKind::Dm, dlci) => {
+            // Session-fatal Dm/Disc ONLY for the mux itself or our primary
+            // target DLCI. A stray Dm/Disc for any OTHER dlci (e.g. the
+            // phone answering DM to a stall-recovery DISC of an MNS dlci
+            // that was never open here) must never kill the phone link —
+            // live 2026-07-13: exactly that DM tore down a healthy HFP
+            // session mid-conversation.
+            (RfcommFrameKind::Dm, dlci)
+                if dlci == RFCOMM_DLCI_MULTIPLEXER || dlci == self.target_dlci =>
+            {
                 // DM = "go away". Treat as a hard fail so the caller
                 // tears the L2CAP channel down. Don't auto-recover —
                 // PBAP/MAP refusals are usually permanent (bond denied,
@@ -1277,10 +1285,27 @@ impl RfcommClientState {
                 self.fail(format!("RFCOMM peer sent DM on dlci {}", dlci));
                 Ok(Vec::new())
             }
-            (RfcommFrameKind::Disc, dlci) => {
+            (RfcommFrameKind::Disc, dlci)
+                if dlci == RFCOMM_DLCI_MULTIPLEXER || dlci == self.target_dlci =>
+            {
                 self.phase = RfcommClientPhase::Closed;
                 self.pending_events.push(RfcommClientEvent::Closed);
                 Ok(vec![build_ua(dlci, false)])
+            }
+            (RfcommFrameKind::Dm, dlci) => {
+                eprintln!(
+                    "[AokieRadio] RFCOMM client ignoring DM for untracked dlci {} (session unaffected)",
+                    dlci
+                );
+                Ok(Vec::new())
+            }
+            (RfcommFrameKind::Disc, dlci) => {
+                // RFCOMM: DISC for a DLCI that isn't open answers DM.
+                eprintln!(
+                    "[AokieRadio] RFCOMM client answering DM to DISC for untracked dlci {} (session unaffected)",
+                    dlci
+                );
+                Ok(vec![build_dm(dlci, false)])
             }
             (RfcommFrameKind::Uih, RFCOMM_DLCI_MULTIPLEXER) => self.on_mux_uih(frame.payload),
             (RfcommFrameKind::Uih, dlci) if dlci == self.target_dlci => {
