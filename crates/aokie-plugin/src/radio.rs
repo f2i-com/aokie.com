@@ -3787,6 +3787,13 @@ fn handle_event(
         E::DeviceConnected(addr) => {
             status.connected.store(true, Ordering::Relaxed);
             *status.connected_address.lock().unwrap() = Some(addr.clone());
+            // A working phone link supersedes whatever transient error last
+            // landed (a stalled reconnect attempt, a keepalive hiccup): the
+            // slot otherwise held health "degraded — radio error: …" FOREVER
+            // with no way to clear it (live report 2026-07-13). The full
+            // history stays in the Hardware Events records + desktop log;
+            // this slot means "why the line is not working RIGHT NOW".
+            *status.last_error.lock().unwrap() = None;
             {
                 let mut paired = status.paired.lock().unwrap();
                 if !paired.iter().any(|d| d.address == addr) {
