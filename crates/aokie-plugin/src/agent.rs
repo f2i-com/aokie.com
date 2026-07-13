@@ -85,7 +85,11 @@ impl LlmClient {
             "messages": messages,
             "stream": true,
             "max_tokens": 120,
-            "temperature": 0.5,
+            // 0.35 (was 0.5): live calls showed real booking dates getting
+            // scrambled on read-back ("Sunday, July 12th at 10 AM" for a
+            // Sunday-July-19-6PM record) — factual precision beats sparkle
+            // on a phone line.
+            "temperature": 0.35,
             // Qwen3-class reasoning models otherwise burn the budget on a hidden
             // <think> block; ignored by models without a thinking mode.
             "chat_template_kwargs": { "enable_thinking": false },
