@@ -1235,7 +1235,18 @@ pub(crate) fn hfp_call_control_packets_for_event(
         }
         hfp::HfpEvent::CallAnswered => {
             *answer_sent_for_call = true;
-            Ok(Vec::new())
+            // Caller-id rescue (2026-07-13): instant auto-answer races the
+            // ringing-phase +CLIP — several live calls ended with NO caller
+            // id at all. AT+CLCC returns the active call's number
+            // deterministically; its +CLCC response feeds the same CallerId
+            // pipeline as +CLIP, so the plugin/session/records pick it up
+            // exactly as if the +CLIP had landed.
+            let packets =
+                l2cap_state.build_hfp_call_control_packets(hfp::HfpAtCommand::ListCurrentCalls)?;
+            if !packets.is_empty() {
+                report.last_action = Some("sent AT+CLCC caller-id query".to_string());
+            }
+            Ok(packets)
         }
         hfp::HfpEvent::IncomingCall | hfp::HfpEvent::Ringing
             if report.auto_answer_enabled && !*answer_sent_for_call =>

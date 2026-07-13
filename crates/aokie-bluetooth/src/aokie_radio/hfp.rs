@@ -55,6 +55,11 @@ pub enum HfpAtCommand {
     Answer,
     RejectOrHangup,
     ConfirmCodec(u8),
+    /// `AT+CLCC` — list current calls. Sent right after a call is answered:
+    /// instant auto-answer races the ringing-phase `+CLIP` (several live
+    /// calls ended with no caller id at all, 2026-07-13), and the +CLCC
+    /// response carries the active call's number deterministically.
+    ListCurrentCalls,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,6 +405,7 @@ pub fn build_at_command(command: HfpAtCommand) -> Vec<u8> {
         HfpAtCommand::Answer => "ATA\r".to_string(),
         HfpAtCommand::RejectOrHangup => "AT+CHUP\r".to_string(),
         HfpAtCommand::ConfirmCodec(codec) => format!("AT+BCS={}\r", codec),
+        HfpAtCommand::ListCurrentCalls => "AT+CLCC\r".to_string(),
     };
     line.into_bytes()
 }
@@ -445,6 +451,14 @@ fn parse_ag_result_line(line: &str) -> Option<HfpAgResult> {
         }
     }
     if let Some(value) = line.strip_prefix("+CLIP:") {
+        return extract_first_quoted(value).map(HfpAgResult::CallerId);
+    }
+    if let Some(value) = line.strip_prefix("+CLCC:") {
+        // AT+CLCC (list current calls) response — the call's number rides in
+        // the first quoted field. Feeds the SAME CallerId pipeline as +CLIP:
+        // this is the rescue path when instant auto-answer races +CLIP out of
+        // existence (observed live 2026-07-13: several calls ended with no
+        // caller id at all). A number-less +CLCC line is silently ignored.
         return extract_first_quoted(value).map(HfpAgResult::CallerId);
     }
     if let Some(value) = line.strip_prefix("+BCS:") {
@@ -828,6 +842,22 @@ mod tests {
             state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 }),
             vec![HfpEvent::CallTerminated]
         );
+    }
+
+    /// AT+CLCC rescue (2026-07-13): the +CLCC response's quoted number feeds
+    /// the SAME CallerId pipeline as +CLIP — the deterministic caller-id
+    /// source when instant auto-answer races the ringing-phase +CLIP away.
+    #[test]
+    fn clcc_response_feeds_the_caller_id_pipeline() {
+        let results =
+            parse_ag_results(b"\r\n+CLCC: 1,1,0,0,0,\"0491570156\",129\r\nOK\r\n").unwrap();
+        assert!(results.contains(&HfpAgResult::CallerId("0491570156".to_string())));
+        // A number-less +CLCC (withheld caller id) parses to nothing —
+        // never an Unknown-noise result, never a phantom empty CallerId.
+        let results = parse_ag_results(b"\r\n+CLCC: 1,1,0,0,0\r\n").unwrap();
+        assert_eq!(results, Vec::<HfpAgResult>::new());
+        // And the command renders per spec.
+        assert_eq!(build_at_command(HfpAtCommand::ListCurrentCalls), b"AT+CLCC\r".to_vec());
     }
 
     #[test]
