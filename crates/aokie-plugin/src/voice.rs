@@ -97,6 +97,25 @@ impl TtsEngine {
             .collect())
     }
 
+    /// Synthesize `text` to mono i16 PCM at the model's NATIVE rate (returned
+    /// alongside). Callers that post-process the waveform (pitch-preserving
+    /// time stretch for per-span speaking rates) use this so the stretch runs
+    /// at full quality BEFORE the SCO downsample.
+    pub fn synthesize_native(&mut self, text: &str, voice: &str) -> Result<(Vec<i16>, u32), String> {
+        let mut f32_samples: Vec<f32> = Vec::new();
+        self.rt.synthesize_stream(text, voice, |chunk, _rate| {
+            f32_samples.extend_from_slice(chunk);
+            true
+        })?;
+        Ok((
+            f32_samples
+                .iter()
+                .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                .collect(),
+            self.native_rate,
+        ))
+    }
+
     /// Streaming synthesis: calls `on_pcm` with mono i16 PCM at `target_rate` as
     /// each TTS chunk is produced, so playback can start on the first chunk
     /// (~0.3 s) instead of after the whole utterance. `on_pcm` returns `false` to

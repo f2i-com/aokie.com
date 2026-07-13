@@ -327,6 +327,20 @@ impl Plugin {
             eprintln!("[aokie-plugin] maxSilenceSecs setting → AOKIE_MAX_SILENCE_SECS={secs}");
         }
 
+        // Speech pacing: per-call baseline + detail speaking rates (percent)
+        // and the protected-span overlap cap. The radio reads these at spawn
+        // (speech_plan::PaceState::from_env / protected_max_ms_from_env).
+        for (key, var) in [
+            ("defaultSpeechRate", "AOKIE_SPEECH_RATE_PCT"),
+            ("detailSpeechRate", "AOKIE_DETAIL_RATE_PCT"),
+            ("protectedSpeechMaxMs", "AOKIE_PROTECTED_MAX_MS"),
+        ] {
+            if let Some(v) = self.store.config.settings.get(key).and_then(|v| v.as_u64()) {
+                std::env::set_var(var, v.to_string());
+                eprintln!("[aokie-plugin] {key} setting → {var}={v}");
+            }
+        }
+
         // In-plugin real-time voice agent: when `aiReceptionist` is truthy, the
         // plugin streams the local LLM + speaks the reply itself (low latency)
         // instead of routing through a flow. `aiEndpoint` pins the LLM URL (else
@@ -2291,6 +2305,14 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     // AOK-CTRL-001: seconds of MUTUAL silence before the agent checks in, then
     // (after a second silent window) says goodbye and hangs up. 0 = disabled.
     SettingSpec { key: "maxSilenceSecs", kind: SettingKind::Int { min: 0, max: 600 }, applies_live: false },
+    // Speech pacing (percent of normal speed): the call-baseline rate and the
+    // rate for detail spans (phone numbers/codes, read digit-by-digit). The
+    // caller can still say "slower"/"faster" live; these set each call's start.
+    SettingSpec { key: "defaultSpeechRate", kind: SettingKind::Int { min: 60, max: 140 }, applies_live: false },
+    SettingSpec { key: "detailSpeechRate", kind: SettingKind::Int { min: 50, max: 100 }, applies_live: false },
+    // Cap on how long an [[important]] span may keep playing once the caller
+    // has started talking over it (explicit controls always cut instantly).
+    SettingSpec { key: "protectedSpeechMaxMs", kind: SettingKind::Int { min: 500, max: 5000 }, applies_live: false },
     SettingSpec { key: "hfpCodec", kind: SettingKind::Enum(&["auto", "cvsd", "wbs"]), applies_live: false },
     SettingSpec { key: "persona", kind: SettingKind::Str { max_chars: 4000 }, applies_live: true },
     SettingSpec { key: "greeting", kind: SettingKind::Str { max_chars: 1000 }, applies_live: true },
