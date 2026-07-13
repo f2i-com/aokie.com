@@ -142,7 +142,7 @@ pub const DEFAULT_GREETING: &str = "Hello, thanks for calling. How can I help yo
 /// to emit an [[END_CALL]] marker at the very end of its farewell so the plugin
 /// knows the conversation is complete and can hang up after the goodbye plays.
 #[cfg(feature = "voice")]
-const END_CALL_INSTRUCTION: &str = "\n\nEnding the call: when the caller's request is fully handled, FIRST ask whether they need anything else (for example \"Is there anything else I can help you with?\") with NO marker. Only after the caller confirms they are done (or says goodbye themselves), reply with a brief, warm goodbye and append the exact marker [[END_CALL]] at the very end of that goodbye. The goodbye carrying the marker must never contain a question - the system refuses to hang up while a question is waiting for an answer. Never write the marker mid-conversation.";
+const END_CALL_INSTRUCTION: &str = "\n\nEnding the call: when the caller's request is fully handled, FIRST ask whether they need anything else (for example \"Is there anything else I can help you with?\") with NO marker. Only after the caller confirms they are done (or says goodbye themselves), reply with a brief, warm goodbye and append the exact marker [[END_CALL]] at the very end of that goodbye. Replies like \"no, that's all\", \"that's everything, thanks\" or \"no thank you\" ARE that confirmation - say the goodbye and append the marker then; never ask the same anything-else question twice in a row. The goodbye carrying the marker must never contain a question - the system refuses to hang up while a question is waiting for an answer. Never write the marker mid-conversation.";
 
 /// Appended to the system prompt in agent mode: how the model participates in
 /// spoken delivery (validated pacing markers, the [[WAIT]] intentional-silence
@@ -151,7 +151,7 @@ const END_CALL_INSTRUCTION: &str = "\n\nEnding the call: when the caller's reque
 /// bracketed token before anything is spoken or recorded. Plain ASCII (the
 /// text is model-facing but lives next to caller-spoken constants).
 #[cfg(feature = "voice")]
-const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read aloud to the caller by a voice synthesizer.\n- Phone numbers and codes are automatically read slowly, digit by digit; you do not need to do anything special for them.\n- You may wrap a short critical detail in [[slow]]...[[/slow]] to have it spoken more slowly.\n- Rarely, you may wrap ONE short vital sentence in [[important]]...[[/important]] so a brief overlap does not cut it off. The caller can always stop you by saying stop or wait.\n- If the caller asks you to wait, says they are thinking, or clearly needs a moment, reply with exactly [[WAIT]] and nothing else - staying silent is the right response. Never fill their pause with chatter; when they speak again, continue naturally.\n- If the caller's words were only a brief acknowledgement (yeah, okay, mm-hm) while you were talking, continue where you left off instead of starting over.\nThe double-bracket markers are never spoken and never shown to anyone.";
+const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read aloud to the caller by a voice synthesizer.\n- This is a LIVE phone conversation: keep every reply to ONE or TWO short sentences, then let the caller speak. Long replies get talked over and feel rude. Ask at most one question per reply. Only go longer when reading back details the caller asked for.\n- Phone numbers and codes are automatically read slowly, digit by digit; you do not need to do anything special for them.\n- You may wrap a short critical detail in [[slow]]...[[/slow]] to have it spoken more slowly.\n- Rarely, you may wrap ONE short vital sentence in [[important]]...[[/important]] so a brief overlap does not cut it off. The caller can always stop you by saying stop or wait.\n- If the caller asks you to wait, says they are thinking, or clearly needs a moment, reply with exactly [[WAIT]] and nothing else - staying silent is the right response. Never fill their pause with chatter; when they speak again, continue naturally.\n- If the caller's words were only a brief acknowledgement (yeah, okay, mm-hm) while you were talking, continue where you left off instead of starting over - or reply with [[WAIT]] if nothing needs saying.\nThe double-bracket markers are never spoken and never shown to anyone.";
 
 /// VOICE-001 fail-safe: what the caller hears when the responder breaks
 /// MID-call (LLM died / synthesis went silent) — a plain apology, then a
@@ -798,7 +798,9 @@ fn emit_turn_with_delivery(
     text: &str,
     delivery: Option<&str>,
 ) {
-    emit_turn_full(outbox, sink, corr, turn_index, speaker, text, delivery, None)
+    emit_turn_full(
+        outbox, sink, corr, turn_index, speaker, text, delivery, None, false,
+    )
 }
 
 /// Full turn emitter: `kind: Some("control")` marks a caller turn that was a
@@ -817,6 +819,7 @@ fn emit_turn_full(
     text: &str,
     delivery: Option<&str>,
     kind: Option<&str>,
+    overlapped: bool,
 ) {
     let mut payload = json!({
         "callId": corr,
@@ -830,6 +833,13 @@ fn emit_turn_full(
     }
     if let Some(k) = kind {
         payload["kind"] = json!(k);
+    }
+    // Truthful ordering (live report 2026-07-13): a turn seeded from OVERLAP
+    // capture is recorded when it flushes — AFTER the bot line it was spoken
+    // over. The flag says "this began while the bot was talking", so readers
+    // don't misread the record order as the speech order. Additive field.
+    if overlapped {
+        payload["overlapped"] = json!(true);
     }
     emit(
         outbox,
@@ -1018,6 +1028,44 @@ fn ends_with_unfinished_number(text: &str) -> bool {
     )
 }
 
+/// General turn-completion heuristic (plan §6.2, live 2026-07-13: "Um no" +
+/// "That's all really" arrived as two turns and each got its own reply): a
+/// turn is held open for the continuation window when it still sounds
+/// mid-thought — a number tail, a bare hesitation, a trailing connective, or
+/// a short fragment that OPENS with a filler.
+#[cfg(feature = "voice")]
+fn turn_looks_unfinished(text: &str) -> bool {
+    if ends_with_unfinished_number(text) {
+        return true;
+    }
+    if crate::duplex::is_hesitation(text) {
+        return true;
+    }
+    let words: Vec<String> = text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
+    if matches!(
+        words.last().map(String::as_str),
+        Some("but" | "because" | "then" | "or" | "well" | "also")
+    ) {
+        return true;
+    }
+    // "Um no", "Uh maybe Tuesday" — a short fragment opening with a filler
+    // usually continues after the breath.
+    if words.len() <= 3
+        && matches!(
+            words.first().map(String::as_str),
+            Some("uh" | "um" | "er" | "ah" | "hmm" | "well" | "erm")
+        )
+    {
+        return true;
+    }
+    false
+}
+
 /// A caller turn being merged across STT utterances (audit AK-008). `corr` is
 /// pinned at first fragment so a turn that outlives its call (hangup inside
 /// the hold window) still lands against the right call record.
@@ -1186,6 +1234,11 @@ struct SpeakOutcome {
     /// AOK-CTRL-001: playback was cut short by an urgent control (the probe's
     /// `action` says which) — the caller executes it right after this returns.
     cancelled: bool,
+    /// Phase 2 probe lane: the caller spoke a FLOOR COMMAND ("wait"/"stop")
+    /// over this speech and the priority STT probe caught it mid-sentence —
+    /// playback was cut (even through a protected span; explicit commands
+    /// always win) and the dialogue should enter its pause state NOW.
+    commanded: Option<crate::duplex::CallerIntent>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1256,6 +1309,17 @@ enum SttWork {
         utterance: u32,
         samples: Vec<f32>,
     },
+    /// Priority control probe (phase 2 + §3.2): a SNAPSHOT of the caller's
+    /// overlap speech while Aokie is talking, transcribed so a spoken
+    /// "wait"/"stop" can cut playback mid-sentence instead of after the
+    /// reply. Local-engine ONLY (a probe must never widen audio egress to an
+    /// HTTP endpoint), answered on the dedicated probe channel, and NEVER
+    /// consuming/truncating the content buffer — the full utterance still
+    /// arrives as a normal `Utterance` at its endpoint.
+    Probe {
+        generation: u64,
+        samples: Vec<f32>,
+    },
     Configure {
         endpoint: Option<String>,
     },
@@ -1271,26 +1335,50 @@ struct SttResult {
     text: String,
 }
 
+/// The HTTP-TTS endpoint with its sticky per-call fallback. Owned by the
+/// synth WORKER since phase 2 (crate::synth) — the radio thread only forwards
+/// configure/reset messages.
 #[cfg(feature = "voice")]
-struct HttpTtsRuntime {
+pub(crate) struct HttpTtsRuntime {
     fallback: HttpSpeechFallback,
 }
 
 #[cfg(feature = "voice")]
 impl HttpTtsRuntime {
-    fn from_env(var: &str) -> Self {
+    pub(crate) fn from_env(var: &str) -> Self {
         Self {
             fallback: HttpSpeechFallback::from_env(var),
         }
     }
 
-    fn configure(&mut self, endpoint: Option<String>) {
+    pub(crate) fn configure(&mut self, endpoint: Option<String>) {
         self.fallback.configure(endpoint);
     }
 
-    fn reset_call(&mut self) {
+    pub(crate) fn reset_call(&mut self) {
         self.fallback.reset_call();
     }
+
+    pub(crate) fn endpoint_for_call(&self) -> Option<String> {
+        self.fallback.endpoint_for_call().map(str::to_string)
+    }
+
+    pub(crate) fn mark_failed_for_call(&mut self) -> bool {
+        self.fallback.mark_failed_for_call()
+    }
+}
+
+/// One whole-utterance HTTP TTS request against a hardened per-endpoint
+/// client (AOK-ENDPOINT-001). Worker-side entry point (crate::synth).
+#[cfg(feature = "voice")]
+pub(crate) fn http_tts_synthesize_at(
+    endpoint: &str,
+    text: &str,
+    voice: &str,
+) -> Result<crate::speech_wire::WavPcm, String> {
+    let client = http_speech_client(endpoint)
+        .map_err(|e| format!("TTS endpoint rejected ({e})"))?;
+    http_tts_synthesize(&client, endpoint, text, voice)
 }
 
 /// Hardened per-endpoint speech client (audit AOK-ENDPOINT-001): redirects disabled,
@@ -1402,7 +1490,8 @@ fn detect_barge(
     aec: &mut crate::aec::EchoCanceller,
     mic: &[i16],
     frame: usize,
-    thr: f32,
+    capture_thr: f32,
+    trip_thr: f32,
     armed: bool,
     speech_frames: &mut u32,
     need: u32,
@@ -1413,7 +1502,8 @@ fn detect_barge(
     scan_barge_frames(
         &cleaned,
         frame,
-        thr,
+        capture_thr,
+        trip_thr,
         armed,
         speech_frames,
         need,
@@ -1422,15 +1512,26 @@ fn detect_barge(
     )
 }
 
+/// The scratchpad's own speech gate — the same level as the main VAD's
+/// SPEECH_RMS. Live finding 2026-07-13: the echo canceller suppresses
+/// near-end speech while the bot plays, so normal-volume overlap often sits
+/// BETWEEN the VAD gate and the barge threshold — marking capture at the
+/// barge threshold made the bot deaf to it. Capture marks at THIS gate; the
+/// acoustic barge still requires the sustained, higher `trip_thr`.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+const CAPTURE_RMS: f32 = 350.0;
+
 /// Pure scan half of [`detect_barge`] (unit-testable without an AEC): append
-/// `cleaned` to the capture buffer, note the first above-threshold frame, and
-/// report whether sustained speech tripped the barge.
+/// `cleaned` to the capture buffer, note the first frame above the CAPTURE
+/// gate (armed or not — the scratchpad always hears), and report whether
+/// sustained speech above the TRIP threshold barged (armed only).
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 fn scan_barge_frames(
     cleaned: &[i16],
     frame: usize,
-    thr: f32,
+    capture_thr: f32,
+    trip_thr: f32,
     armed: bool,
     speech_frames: &mut u32,
     need: u32,
@@ -1439,15 +1540,16 @@ fn scan_barge_frames(
 ) -> bool {
     let base = captured.len();
     captured.extend_from_slice(cleaned);
-    if !armed {
-        return false;
-    }
     let mut tripped = false;
     for (i, f) in cleaned.chunks(frame).enumerate() {
-        if crate::voice::frame_rms(f) > thr {
-            if speech_start.is_none() {
-                *speech_start = Some(base + i * frame);
-            }
+        let rms = crate::voice::frame_rms(f);
+        if rms > capture_thr && speech_start.is_none() {
+            *speech_start = Some(base + i * frame);
+        }
+        if !armed {
+            continue;
+        }
+        if rms > trip_thr {
             *speech_frames += 1;
             if *speech_frames >= need {
                 tripped = true;
@@ -1487,7 +1589,24 @@ struct TtsChunkPlayback {
     finish_extra: Option<std::time::Duration>,
     /// When the barge first tripped (starts the finish budget).
     barged_at: Option<std::time::Instant>,
+    /// The probe lane caught a spoken floor command ("wait"/"stop") in the
+    /// overlap capture: stop NOW — an explicit command beats every policy,
+    /// protected spans included.
+    semantic: Option<crate::duplex::CallerIntent>,
+    /// DUCKING (the "nudge" texture): caller speech was detected while THIS
+    /// span was audibly playing — outbound gain ramps down to make room
+    /// while the floor decision (finish clause / yield / barge) plays out.
+    speech_during_playback: bool,
+    /// Current outbound gain (1.0 → DUCK_GAIN over ~100 ms once ducked).
+    duck_gain: f32,
 }
+
+/// Ducked outbound level once the caller talks over a playing span, and the
+/// per-chunk (~20 ms) ramp step toward it.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+const DUCK_GAIN: f32 = 0.35;
+#[cfg(all(target_os = "windows", feature = "voice"))]
+const DUCK_RAMP_STEP: f32 = 0.15;
 
 #[cfg(all(target_os = "windows", feature = "voice"))]
 impl TtsChunkPlayback {
@@ -1509,14 +1628,18 @@ impl TtsChunkPlayback {
             cancelled: false,
             finish_extra,
             barged_at: None,
+            semantic: None,
+            speech_during_playback: false,
+            duck_gain: 1.0,
         }
     }
 
-    /// Should playback stop NOW? Cancelled always stops; a barge stops a
-    /// yield-policy span immediately and a finish-policy span once its
-    /// bounded extension is spent.
+    /// Should playback stop NOW? Cancelled and spoken floor commands always
+    /// stop (protected spans included); a barge stops a yield-policy span
+    /// immediately and a finish-policy span once its bounded extension is
+    /// spent.
     fn stop_playback_now(&self) -> bool {
-        if self.cancelled {
+        if self.cancelled || self.semantic.is_some() {
             return true;
         }
         if !self.barged {
@@ -1528,6 +1651,53 @@ impl TtsChunkPlayback {
                 .barged_at
                 .map(|at| at.elapsed() >= budget)
                 .unwrap_or(false),
+        }
+    }
+
+    /// Drain + echo-cancel whatever the mic delivered, watching for the
+    /// caller talking over us (keeps the AEC reference FIFO aligned with
+    /// capture and the scratchpad fed). Runs every paced-loop iteration —
+    /// listening never stops, even while synthesis is still decoding.
+    fn poll_mic(
+        &mut self,
+        bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+        aec: &mut Option<&mut crate::aec::EchoCanceller>,
+        barge_rms: Option<f32>,
+    ) {
+        if let (Some(a), Some(thr)) = (aec.as_deref_mut(), barge_rms) {
+            // Arm only once audio is actually PLAYING (+ the AEC-convergence
+            // grace from the first frame). The paced loop polls the mic while
+            // synthesis is still warming up — first live test 2026-07-13: a
+            // caller's "hello?" into that pre-audio silence tripped a false
+            // barge and cancelled the greeting before its first sample, so
+            // the call answered into dead air. Pre-audio speech is still
+            // CAPTURED (scratchpad); it just never cancels what hasn't begun.
+            let armed = !self.first && self.t_first.elapsed() >= self.grace;
+            let had_speech = self.speech_start.is_some();
+            while let Some(rx) = bt.try_recv_audio() {
+                if detect_barge(
+                    a,
+                    &rx.samples,
+                    self.frame,
+                    CAPTURE_RMS,
+                    thr,
+                    armed,
+                    &mut self.speech_frames,
+                    self.need,
+                    &mut self.captured,
+                    &mut self.speech_start,
+                ) && !self.barged
+                {
+                    self.barged = true;
+                    self.barged_at = Some(std::time::Instant::now());
+                }
+            }
+            // Speech that STARTED while this span was audibly playing ducks
+            // the output (pre-audio speech never does — nothing to duck).
+            if !had_speech && self.speech_start.is_some() && !self.first {
+                self.speech_during_playback = true;
+            }
+            self.trim_idle_capture();
         }
     }
 
@@ -1562,7 +1732,7 @@ impl TtsChunkPlayback {
             }
         }
         if pcm.is_empty() {
-            return !self.barged;
+            return !self.stop_playback_now();
         }
         if self.first {
             eprintln!(
@@ -1572,104 +1742,57 @@ impl TtsChunkPlayback {
             self.first = false;
             self.t_first = std::time::Instant::now();
         }
-        if let Some(a) = aec.as_deref_mut() {
-            a.feed_reference(pcm);
+        // The nudge: the caller is talking over this span — duck the output
+        // (ramped, click-free) so the bot audibly makes room while the floor
+        // decision (finish the clause / yield / barge) plays out. The AEC
+        // reference gets the SAME scaled samples that actually play.
+        if self.speech_during_playback && self.duck_gain > DUCK_GAIN {
+            self.duck_gain = (self.duck_gain - DUCK_RAMP_STEP).max(DUCK_GAIN);
         }
-        bt.send_audio(pcm);
+        if self.duck_gain < 0.999 {
+            let ducked: Vec<i16> = pcm
+                .iter()
+                .map(|&s| (s as f32 * self.duck_gain) as i16)
+                .collect();
+            if let Some(a) = aec.as_deref_mut() {
+                a.feed_reference(&ducked);
+            }
+            bt.send_audio(&ducked);
+        } else {
+            if let Some(a) = aec.as_deref_mut() {
+                a.feed_reference(pcm);
+            }
+            bt.send_audio(pcm);
+        }
         self.samples += pcm.len();
 
         // Full-duplex: drain + echo-cancel the mic as we feed (keeps the
         // reference FIFO aligned with capture) and watch for the caller talking
         // over us. The batch is drained fully even after a trip — a finish-
         // policy span keeps playing (and keeps capturing) through its budget.
-        if let (Some(a), Some(thr)) = (aec.as_deref_mut(), barge_rms) {
-            let armed = self.t_first.elapsed() >= self.grace;
-            while let Some(rx) = bt.try_recv_audio() {
-                if detect_barge(
-                    a,
-                    &rx.samples,
-                    self.frame,
-                    thr,
-                    armed,
-                    &mut self.speech_frames,
-                    self.need,
-                    &mut self.captured,
-                    &mut self.speech_start,
-                ) && !self.barged
-                {
-                    self.barged = true;
-                    self.barged_at = Some(std::time::Instant::now());
-                }
-            }
-            self.trim_idle_capture();
-        }
+        self.poll_mic(bt, aec, barge_rms);
         !self.stop_playback_now()
     }
 
-    fn finish(
-        mut self,
-        bt: &mut aokie_dongle::bluetooth::BluetoothManager,
-        aec: &mut Option<&mut crate::aec::EchoCanceller>,
-        barge_rms: Option<f32>,
-        ctl: &mut Option<&mut ControlProbe<'_>>,
-        text: &str,
-        sample_rate: u16,
-    ) -> SpeakOutcome {
-        use std::time::Duration;
-
-        // Playout monitor (full-duplex): synthesis can outrun realtime, so a
-        // short reply may still be draining from the SCO queue after the chunks
-        // have all been queued. Keep polling the mic through the AEC until it
-        // has played out — or, for a finish-policy span that was barged, until
-        // its bounded extension is spent (the caller then flushes the tail).
-        if let (Some(a), Some(thr)) = (aec.as_deref_mut(), barge_rms) {
-            if !self.stop_playback_now() {
-                let playout =
-                    Duration::from_secs_f32(self.samples as f32 / sample_rate.max(1) as f32);
-                let deadline = self.t_first + playout;
-                while std::time::Instant::now() < deadline {
-                    // Urgent controls interrupt the playout tail too.
-                    if let Some(probe) = ctl.as_deref_mut() {
-                        if probe.poll() {
-                            self.cancelled = true;
-                            break;
-                        }
-                    }
-                    let armed = self.t_first.elapsed() >= self.grace;
-                    let mut got = false;
-                    while let Some(rx) = bt.try_recv_audio() {
-                        got = true;
-                        if detect_barge(
-                            a,
-                            &rx.samples,
-                            self.frame,
-                            thr,
-                            armed,
-                            &mut self.speech_frames,
-                            self.need,
-                            &mut self.captured,
-                            &mut self.speech_start,
-                        ) && !self.barged
-                        {
-                            self.barged = true;
-                            self.barged_at = Some(std::time::Instant::now());
-                        }
-                    }
-                    if self.stop_playback_now() {
-                        break;
-                    }
-                    self.trim_idle_capture();
-                    if !got {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                }
-            }
+    /// True once everything queued has PLAYED OUT (the paced loop owns the
+    /// playout monitor since phase 2).
+    fn played_out(&self) -> bool {
+        if self.first {
+            return true; // nothing was ever queued
         }
+        let playout =
+            std::time::Duration::from_secs_f32(self.samples as f32 / self.sample_rate.max(1) as f32);
+        self.t_first.elapsed() >= playout
+    }
 
+    /// Consume the playback into its outcome (phase 2: no monitor loop here —
+    /// the paced loop in `tts_speak` already ran playout to completion or cut).
+    fn into_outcome(mut self, text: &str, sample_rate: u16) -> SpeakOutcome {
+        use std::time::Duration;
         // AK-008: hand back what the caller said while we were talking, from a
         // short pre-roll before their first above-threshold frame. The caller
-        // (run_loop) prepends it to the STT buffer on a barge so the utterance
-        // is complete — detection no longer eats the leading words.
+        // (run_loop) prepends it to the STT buffer so the utterance is
+        // complete — detection no longer eats the leading words.
         let captured_speech = match self.speech_start {
             Some(start) => {
                 let pre_roll = self.frame * 30; // ~300 ms
@@ -1679,12 +1802,13 @@ impl TtsChunkPlayback {
         };
 
         eprintln!(
-            "[aokie-plugin] spoke ({} chars -> {} samples @ {}Hz, synth {:?}{}{})",
+            "[aokie-plugin] spoke ({} chars -> {} samples @ {}Hz, span {:?}{}{}{})",
             text.chars().count(),
             self.samples,
             sample_rate,
             self.t0.elapsed(),
             if self.barged { ", BARGED-IN" } else { "" },
+            if self.semantic.is_some() { ", SPOKEN COMMAND" } else { "" },
             if captured_speech.is_empty() {
                 String::new()
             } else {
@@ -1696,9 +1820,11 @@ impl TtsChunkPlayback {
         );
         SpeakOutcome {
             dur: Duration::from_secs_f32(self.samples as f32 / sample_rate.max(1) as f32),
-            barged: self.barged,
+            // A spoken command IS the caller taking the floor.
+            barged: self.barged || self.semantic.is_some(),
             captured_speech,
             cancelled: self.cancelled,
+            commanded: self.semantic,
         }
     }
 }
@@ -1727,25 +1853,192 @@ fn note_tts_outcome(status: &RadioStatus, out: &SpeakOutcome) {
     }
 }
 
-/// Voice build only: synthesize + stream `text` to SCO with the in-process TTS
-/// engine (loaded lazily on first use). When `aec`/`barge_rms` are set (full-
-/// duplex mode) it feeds each played chunk as the echo reference, echo-cancels
-/// the inbound mic, and watches for the caller starting to speak over Aokie â€”
-/// both while synthesizing AND through the queued playout tail â€” returning
-/// `barged: true` and stopping early if so. With them `None` it's the plain
-/// half-duplex stream (caller relies on the mute). No-op with no SCO channel
-/// (sample_rate 0) or empty text.
+/// How far ahead of real playout the SCO TX queue is kept topped up (phase 2).
+/// Small enough that a cancel/flush silences the line almost immediately;
+/// large enough to ride out pump-iteration jitter without underruns.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+const PLAYOUT_LEAD: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Pure pacing decision: may another chunk be queued yet? The first chunk
+/// always may (it starts the playout clock); after that the queued total may
+/// lead the playout clock by at most [`PLAYOUT_LEAD`].
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn may_queue_more(
+    first: bool,
+    queued_samples: usize,
+    sample_rate: u16,
+    elapsed_since_first: std::time::Duration,
+    lead: std::time::Duration,
+) -> bool {
+    if first {
+        return true;
+    }
+    let queued =
+        std::time::Duration::from_secs_f32(queued_samples as f32 / sample_rate.max(1) as f32);
+    queued < elapsed_since_first + lead
+}
+
+/// The priority STT control lane (phase 2 + plan §3.2): while Aokie speaks,
+/// SNAPSHOT the caller's overlap capture every ~500 ms and have the STT
+/// worker transcribe it on the dedicated probe channel. A probe that parses
+/// to a hard floor command ("wait"/"stop") cuts playback MID-SENTENCE — even
+/// through a protected span. Probes never touch the content buffer; the full
+/// utterance still arrives at its normal endpoint.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+struct SttProbeLane<'a> {
+    stt_tx: &'a std::sync::mpsc::Sender<SttWork>,
+    results: &'a std::sync::mpsc::Receiver<SttResult>,
+    generation: u64,
+    last_probe_at: Option<std::time::Instant>,
+    probed_len: usize,
+    in_flight: u32,
+    /// The live scratchpad TEXT: the latest content partial heard over the
+    /// bot's speech. Read at sentence boundaries so the reply can yield to
+    /// substantive caller speech instead of finishing a stale paragraph.
+    content: String,
+    pending_command: Option<crate::duplex::CallerIntent>,
+}
+
+#[cfg(all(target_os = "windows", feature = "voice"))]
+impl<'a> SttProbeLane<'a> {
+    fn new(
+        stt_tx: &'a std::sync::mpsc::Sender<SttWork>,
+        results: &'a std::sync::mpsc::Receiver<SttResult>,
+        generation: u64,
+    ) -> Self {
+        // Discard results from a PREVIOUS span: a "wait" heard over sentence
+        // 3 must not cut sentence 4 seconds later — probes are instant-or-
+        // nothing; the turn-level grammar still catches the command.
+        while results.try_recv().is_ok() {}
+        Self {
+            stt_tx,
+            results,
+            generation,
+            last_probe_at: None,
+            probed_len: 0,
+            in_flight: 0,
+            content: String::new(),
+            pending_command: None,
+        }
+    }
+
+    /// Ship a probe when speech has been running long enough and enough NEW
+    /// audio arrived since the last one.
+    fn maybe_probe(&mut self, playback: &TtsChunkPlayback) {
+        let Some(start) = playback.speech_start else {
+            return;
+        };
+        let sr = playback.sample_rate.max(1) as usize;
+        let since_speech = playback.captured.len().saturating_sub(start);
+        if since_speech < (sr * 2) / 5 {
+            return; // <400 ms of speech so far
+        }
+        if let Some(at) = self.last_probe_at {
+            if at.elapsed() < std::time::Duration::from_millis(700) {
+                return;
+            }
+        }
+        // At most ONE probe in flight (live regression 2026-07-13: probes
+        // queueing ahead of the caller's REAL utterance on the serial STT
+        // worker delayed every reply). A lost result unblocks after 1.5 s
+        // via the last_probe_at gate above falling through here.
+        if self.in_flight > 0 {
+            match self.last_probe_at {
+                Some(at) if at.elapsed() >= std::time::Duration::from_millis(1500) => {
+                    self.in_flight = 0;
+                }
+                _ => return,
+            }
+        }
+        if playback.captured.len() <= self.probed_len {
+            return; // nothing new since the last probe
+        }
+        // Last ~1.2 s window, from a little before speech onset.
+        let window = sr + sr / 5;
+        let from = start
+            .saturating_sub(playback.frame * 30)
+            .max(playback.captured.len().saturating_sub(window));
+        let snapshot = crate::voice::to_f32_16k(
+            &playback.captured[from..],
+            playback.sample_rate as u32,
+        );
+        self.last_probe_at = Some(std::time::Instant::now());
+        self.probed_len = playback.captured.len();
+        self.in_flight += 1;
+        let _ = self.stt_tx.send(SttWork::Probe {
+            generation: self.generation,
+            samples: snapshot,
+        });
+    }
+
+    /// Fold newly-arrived probe transcripts into the lane: hard floor
+    /// commands park in `pending_command`; everything else becomes the
+    /// current scratchpad content (latest, longest partial wins).
+    fn drain(&mut self) {
+        while let Ok(res) = self.results.try_recv() {
+            self.in_flight = self.in_flight.saturating_sub(1);
+            if res.generation != self.generation {
+                continue;
+            }
+            let intent = crate::duplex::parse_caller_intent(&res.text);
+            if matches!(
+                intent,
+                crate::duplex::CallerIntent::Pause | crate::duplex::CallerIntent::StopSpeaking
+            ) {
+                eprintln!(
+                    "[aokie-plugin] probe caught a spoken floor command ({intent:?}): {}",
+                    content_for_log(&res.text)
+                );
+                self.pending_command = Some(intent);
+            } else if res.text.trim().len() > self.content.trim().len() {
+                self.content = res.text;
+            }
+        }
+    }
+
+    /// A probe transcript that parses to a hard floor command.
+    fn check(&mut self) -> Option<crate::duplex::CallerIntent> {
+        self.drain();
+        self.pending_command.take()
+    }
+
+    /// Sentence-boundary steering: SUBSTANTIVE caller speech on the
+    /// scratchpad (≥3 words, not a backchannel, not the bot's own echo)
+    /// means the reply should yield here and respond to it.
+    fn substantive_content(&mut self, bot_text_so_far: &str) -> Option<String> {
+        self.drain();
+        let text = self.content.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let words = text.split_whitespace().count();
+        if words < 3 || crate::duplex::is_backchannel(text) {
+            return None;
+        }
+        if looks_like_echo(text, bot_text_so_far) {
+            return None;
+        }
+        Some(text.to_string())
+    }
+}
+
+/// Voice build only: speak `text` through the phase-2 paced engine. Synthesis
+/// runs on the synth WORKER (crate::synth); this loop — on the radio thread —
+/// paces the produced PCM into the SCO TX queue no more than
+/// [`PLAYOUT_LEAD`] ahead of real playout while continuously draining the mic
+/// (AEC + barge + scratchpad capture) and, when a probe lane is provided,
+/// shipping overlap snapshots to the STT worker so a spoken "wait"/"stop"
+/// cuts playback mid-sentence. With `aec`/`barge_rms` `None` it's the plain
+/// half-duplex path (caller relies on the mute), still gaining the ~200 ms
+/// cancel latency. No-op with no SCO channel (sample_rate 0) or empty text.
 ///
-/// `rate` is the span's speaking-speed multiplier (1.0 = normal): non-unity
-/// rates run a pitch-preserving WSOLA stretch on the synthesized waveform
-/// BEFORE the SCO resample, so a slowed phone number keeps the same voice.
-/// `finish_extra` is the span's interrupt policy (see [`TtsChunkPlayback`]).
+/// `rate` is the span's speaking-speed multiplier (1.0 = normal; WSOLA on the
+/// worker). `finish_extra` is the span's interrupt policy.
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 fn tts_speak(
     bt: &mut aokie_dongle::bluetooth::BluetoothManager,
-    tts: &mut Option<crate::voice::TtsEngine>,
-    http_tts: &mut HttpTtsRuntime,
+    synth: &crate::synth::SynthHandle,
     text: &str,
     sample_rate: u16,
     mut aec: Option<&mut crate::aec::EchoCanceller>,
@@ -1753,6 +2046,7 @@ fn tts_speak(
     mut ctl: Option<&mut ControlProbe<'_>>,
     rate: f32,
     finish_extra: Option<std::time::Duration>,
+    mut probe: Option<&mut SttProbeLane<'_>>,
 ) -> SpeakOutcome {
     use std::time::Duration;
     let none = SpeakOutcome {
@@ -1760,109 +2054,104 @@ fn tts_speak(
         barged: false,
         captured_speech: Vec::new(),
         cancelled: false,
+        commanded: None,
     };
     if sample_rate == 0 || text.trim().is_empty() {
         return none;
     }
-    let rate = aokie_core::time_stretch::clamp_rate(rate);
-    let rated = (rate - 1.0).abs() >= 0.01;
     // Speech-normalize ONCE at the chokepoint (greeting, agent sentences and
     // operatorSpeak all funnel through here): "10 a.m.," → "10 AM," — dotted
     // abbreviations against punctuation make the TTS stutter audibly.
     let text = &crate::speech_wire::normalize_speech_text(text);
     // Voice from AOKIE_TTS_VOICE, shared by HTTP and in-process synthesis.
     let voice = std::env::var("AOKIE_TTS_VOICE").unwrap_or_default();
-    if let Some(endpoint) = http_tts.fallback.endpoint_for_call().map(str::to_string) {
-        let tts_client = match http_speech_client(&endpoint) {
-            Ok(c) => c,
-            Err(e) => {
-                if http_tts.fallback.mark_failed_for_call() {
-                    eprintln!("[aokie-radio] TTS endpoint rejected ({e}) — falling back in-process for this call");
-                }
-                return none;
-            }
-        };
-        match http_tts_synthesize(&tts_client, &endpoint, text, &voice) {
-            Ok(wav) => {
-                // Stretch at the provider's native rate (full quality), then
-                // resample down to the SCO rate. Applied HERE — never asked
-                // of the provider — so every endpoint behaves identically.
-                let samples = if rated {
-                    aokie_core::time_stretch::stretch_i16(&wav.samples, wav.sample_rate, rate)
-                } else {
-                    wav.samples
-                };
-                let pcm = crate::speech_wire::resample_i16_mono(
-                    &samples,
-                    wav.sample_rate,
-                    sample_rate as u32,
-                );
-                let mut playback = TtsChunkPlayback::new(sample_rate, finish_extra);
-                for chunk in pcm.chunks(http_tts_chunk_samples(sample_rate)) {
-                    if !playback.push(bt, &mut aec, barge_rms, &mut ctl, chunk) {
-                        break;
-                    }
-                }
-                return playback.finish(bt, &mut aec, barge_rms, &mut ctl, text, sample_rate);
-            }
-            Err(e) => {
-                if http_tts.fallback.mark_failed_for_call() {
-                    eprintln!(
-                        "[aokie-plugin] HTTP TTS failed at {endpoint}: {e}; falling back to in-process TTS for this call"
-                    );
-                }
+    let epoch = synth.begin(text, &voice, rate, sample_rate as u32);
+
+    let mut playback = TtsChunkPlayback::new(sample_rate, finish_extra);
+    let mut pending: std::collections::VecDeque<i16> = std::collections::VecDeque::new();
+    let mut synth_done = false;
+    let mut synth_err: Option<String> = None;
+    let chunk = http_tts_chunk_samples(sample_rate); // ~20 ms
+    let mut stopped = false;
+    loop {
+        // Urgent controls cut even while we're idling between frames.
+        if let Some(p) = ctl.as_deref_mut() {
+            if p.poll() {
+                playback.cancelled = true;
             }
         }
-    }
-    if tts.is_none() {
-        match crate::voice::TtsEngine::load() {
-            Ok(e) => {
-                eprintln!("[aokie-plugin] TTS engine loaded");
-                *tts = Some(e);
-            }
-            Err(e) => {
-                eprintln!("[aokie-plugin] TTS load failed: {e}");
-                return none;
+        if playback.cancelled {
+            stopped = true;
+            break;
+        }
+        // Collect whatever the worker produced (non-blocking).
+        loop {
+            match synth.out_rx.try_recv() {
+                Ok(crate::synth::SynthOut::Frames { epoch: e, pcm }) if e == epoch => {
+                    pending.extend(pcm);
+                }
+                Ok(crate::synth::SynthOut::Done { epoch: e }) if e == epoch => {
+                    synth_done = true;
+                }
+                Ok(crate::synth::SynthOut::Failed { epoch: e, error }) if e == epoch => {
+                    synth_done = true;
+                    synth_err = Some(error);
+                }
+                Ok(_) => {} // stale epoch — discard
+                Err(_) => break,
             }
         }
-    }
-    let engine = match tts.as_mut() {
-        Some(e) => e,
-        None => return none,
-    };
-    if rated {
-        // Rated spans are short (a phone number, a slowed detail): synthesize
-        // whole, stretch at the model's native rate, then chunk-play with the
-        // same barge/control monitoring as the streaming path.
-        let (native_pcm, native_rate) = match engine.synthesize_native(text, &voice) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[aokie-plugin] TTS synthesis failed: {e}");
-                return none;
-            }
-        };
-        let stretched = aokie_core::time_stretch::stretch_i16(&native_pcm, native_rate, rate);
-        let pcm =
-            crate::speech_wire::resample_i16_mono(&stretched, native_rate, sample_rate as u32);
-        let mut playback = TtsChunkPlayback::new(sample_rate, finish_extra);
-        for chunk in pcm.chunks(http_tts_chunk_samples(sample_rate)) {
-            if !playback.push(bt, &mut aec, barge_rms, &mut ctl, chunk) {
+        // Top up the SCO TX queue, bounded to the playout lead.
+        while !pending.is_empty()
+            && may_queue_more(
+                playback.first,
+                playback.samples,
+                sample_rate,
+                if playback.first { Duration::ZERO } else { playback.t_first.elapsed() },
+                PLAYOUT_LEAD,
+            )
+        {
+            let n = chunk.min(pending.len());
+            let frame: Vec<i16> = pending.drain(..n).collect();
+            if !playback.push(bt, &mut aec, barge_rms, &mut ctl, &frame) {
+                stopped = true;
                 break;
             }
         }
-        return playback.finish(bt, &mut aec, barge_rms, &mut ctl, text, sample_rate);
+        if stopped {
+            break;
+        }
+        // Listening never stops: drain the mic even with nothing to queue.
+        playback.poll_mic(bt, &mut aec, barge_rms);
+        // Priority control lane: snapshot overlap speech + act on a spoken
+        // floor command mid-sentence (beats protected spans by design).
+        if let Some(lane) = probe.as_deref_mut() {
+            lane.maybe_probe(&playback);
+            if let Some(intent) = lane.check() {
+                playback.semantic = Some(intent);
+            }
+        }
+        if playback.stop_playback_now() {
+            stopped = true;
+            break;
+        }
+        // Natural end: synthesis finished, everything queued, playout done.
+        if synth_done && pending.is_empty() && playback.played_out() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
-    // Stream each chunk to the SCO queue as synthesized so the caller hears the
-    // reply start on the first chunk (~0.3s).
-    let mut playback = TtsChunkPlayback::new(sample_rate, finish_extra);
-    let synth = engine.synthesize_streaming(text, &voice, sample_rate as u32, |pcm| {
-        playback.push(bt, &mut aec, barge_rms, &mut ctl, pcm)
-    });
-    if let Err(e) = synth {
-        eprintln!("[aokie-plugin] TTS synthesis failed: {e}");
-        return none;
+    // A cut span leaves the worker mid-stream: invalidate its epoch so it
+    // aborts at the next chunk instead of synthesizing into the void.
+    if playback.cancelled || playback.barged || playback.semantic.is_some() || !synth_done {
+        synth.cancel();
     }
-    playback.finish(bt, &mut aec, barge_rms, &mut ctl, text, sample_rate)
+    if let Some(e) = synth_err {
+        if playback.samples == 0 {
+            eprintln!("[aokie-plugin] TTS synthesis failed: {e}");
+        }
+    }
+    playback.into_outcome(text, sample_rate)
 }
 
 /// The outcome of speaking one PLANNED utterance (a sequence of validated
@@ -1891,8 +2180,7 @@ struct PlannedSpeech {
 #[allow(clippy::too_many_arguments)]
 fn speak_planned(
     bt: &mut aokie_dongle::bluetooth::BluetoothManager,
-    tts: &mut Option<crate::voice::TtsEngine>,
-    http_tts: &mut HttpTtsRuntime,
+    synth: &crate::synth::SynthHandle,
     raw_text: &str,
     sample_rate: u16,
     mut aec: Option<&mut crate::aec::EchoCanceller>,
@@ -1900,6 +2188,7 @@ fn speak_planned(
     mut ctl: Option<&mut ControlProbe<'_>>,
     pace: &crate::speech_plan::PaceState,
     protected_max_ms: u32,
+    mut probe: Option<&mut SttProbeLane<'_>>,
 ) -> PlannedSpeech {
     use std::time::Duration;
     let spans = crate::speech_plan::plan_spans(raw_text, pace, protected_max_ms);
@@ -1909,6 +2198,7 @@ fn speak_planned(
         barged: false,
         captured_speech: Vec::new(),
         cancelled: false,
+        commanded: None,
     };
     let mut played: Vec<&str> = Vec::new();
     for span in &spans {
@@ -1920,8 +2210,7 @@ fn speak_planned(
         };
         let out = tts_speak(
             bt,
-            tts,
-            http_tts,
+            synth,
             &span.tts_text,
             sample_rate,
             aec.as_deref_mut(),
@@ -1929,6 +2218,7 @@ fn speak_planned(
             ctl.as_deref_mut(),
             span.rate,
             finish_extra,
+            probe.as_deref_mut(),
         );
         outcome.dur += out.dur;
         if out.dur > Duration::ZERO {
@@ -1936,6 +2226,9 @@ fn speak_planned(
         }
         if !out.captured_speech.is_empty() {
             outcome.captured_speech.extend_from_slice(&out.captured_speech);
+        }
+        if out.commanded.is_some() {
+            outcome.commanded = out.commanded;
         }
         if out.cancelled {
             outcome.cancelled = true;
@@ -2008,13 +2301,12 @@ fn run_loop(
     #[cfg(feature = "voice")]
     use std::time::Instant;
 
-    // Lazily-loaded in-process TTS (voice build only). Loaded on the first thing
-    // Aokie needs to say (greeting or operatorSpeak) so a call with no speech
-    // never pays the ~200 MB model-load cost.
+    // Phase 2: synthesis runs on the synth WORKER (in-process engine loaded
+    // lazily there on the first thing Aokie says; the HTTP TTS endpoint +
+    // its sticky per-call fallback live there too). The radio thread paces
+    // the worker's PCM into SCO ~200 ms ahead of playout — see tts_speak.
     #[cfg(feature = "voice")]
-    let mut tts: Option<crate::voice::TtsEngine> = None;
-    #[cfg(feature = "voice")]
-    let mut http_tts = HttpTtsRuntime::from_env("AOKIE_TTS_ENDPOINT");
+    let synth = crate::synth::SynthHandle::spawn();
     let _ = &greeting; // used only in the voice build / greeting block below
 
     // AOK-VOICE-001: fast asset preflight (presence-only — radio start stays
@@ -2149,9 +2441,12 @@ fn run_loop(
     #[cfg(feature = "voice")]
     let stt_current_gen = Arc::new(AtomicU64::new(0));
     #[cfg(feature = "voice")]
-    let (stt_tx, stt_result_rx) = {
+    let (stt_tx, stt_result_rx, probe_result_rx) = {
         let (utter_tx, utter_rx) = std::sync::mpsc::channel::<SttWork>();
         let (res_tx, res_rx) = std::sync::mpsc::channel::<SttResult>();
+        // Dedicated probe-result channel: control probes must never be
+        // confused with (or consume) final-utterance results.
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel::<SttResult>();
         let initial_stt_endpoint = std::env::var("AOKIE_STT_ENDPOINT").ok();
         let worker_gen = stt_current_gen.clone();
         let worker_status = status.clone();
@@ -2173,6 +2468,46 @@ fn run_loop(
                 let mut engine: Option<crate::voice::SttEngine> = None;
                 let mut http_stt = HttpSpeechFallback::new(initial_stt_endpoint);
                 while let Ok(work) = utter_rx.recv() {
+                    // Control probes first: local engine only (no HTTP egress),
+                    // answered on the probe channel, generation-gated like
+                    // everything else. Best-effort — a failed probe is silence,
+                    // never an error path.
+                    if let SttWork::Probe { generation, samples } = &work {
+                        if stt_disabled || *generation != worker_gen.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        if engine.is_none() {
+                            match crate::voice::SttEngine::load() {
+                                Ok(e) => {
+                                    eprintln!("[aokie-plugin] STT engine loaded");
+                                    *worker_status.stt_error.lock().unwrap() = None;
+                                    engine = Some(e);
+                                }
+                                Err(e) => {
+                                    eprintln!("[aokie-plugin] STT load failed (probe): {e}");
+                                    *worker_status.stt_error.lock().unwrap() =
+                                        Some(format!("the STT engine failed to load: {e}"));
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(eng) = engine.as_mut() {
+                            match eng.transcribe(samples) {
+                                Ok(text) if !text.is_empty() => {
+                                    let _ = probe_tx.send(SttResult {
+                                        generation: *generation,
+                                        utterance: 0,
+                                        text,
+                                    });
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    eprintln!("[aokie-plugin] STT probe transcribe failed: {e}")
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let (generation, utterance, buf) = match work {
                         SttWork::Utterance { .. } if stt_disabled => continue,
                         SttWork::Utterance {
@@ -2180,6 +2515,7 @@ fn run_loop(
                             utterance,
                             samples,
                         } => (generation, utterance, samples),
+                        SttWork::Probe { .. } => continue, // handled above
                         SttWork::Configure { endpoint } => {
                             http_stt.configure(endpoint);
                             continue;
@@ -2255,7 +2591,7 @@ fn run_loop(
                 }
             })
             .ok();
-        (utter_tx, res_rx)
+        (utter_tx, res_rx, probe_rx)
     };
     // VAD / utterance accumulator (all in 16 kHz mono f32, the STT engine's rate).
     #[cfg(feature = "voice")]
@@ -2435,6 +2771,11 @@ fn run_loop(
     // "repeat that (slower)" replays. last_bot_reply keeps the echo-guard role.
     #[cfg(feature = "voice")]
     let mut last_bot_speech = String::new();
+    // The NEXT caller turn began as OVERLAP capture (spoken while the bot was
+    // talking): recorded on the turn so readers don't misread record order as
+    // speech order. Set at every overlap-seed site, cleared when a turn flushes.
+    #[cfg(feature = "voice")]
+    let mut turn_overlapped = false;
     // Monotonic transcript turn index (caller + bot share one sequence), reset
     // per call. 1-based to match the simulated-call convention (`turn.1.final`,
     // `turn.2.final`, â€¦) so real + simulated calls dedup + display identically.
@@ -2481,7 +2822,7 @@ fn run_loop(
             if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallTerminated)
                 && tracker.current().is_some()
             {
-                if stt_had_speech && stt_buf.len() >= 16_000 / 3 {
+                if stt_had_speech && stt_buf.len() >= 16_000 / 5 {
                     if let Some(s) = tracker.current_mut() {
                         let utterance = s.next_utterance_id();
                         if stt_tx
@@ -2572,7 +2913,8 @@ fn run_loop(
             }
             voice_call_gen = tracker.generation();
             stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
-            http_tts.reset_call();
+            synth.reset_call();
+            while probe_result_rx.try_recv().is_ok() {}
             let _ = stt_tx.send(SttWork::ResetCall);
             // Self-healing (AOK-LIF-002): skipped/empty STT jobs never send a
             // result, so the in-flight counter resets at every call boundary
@@ -2591,6 +2933,7 @@ fn run_loop(
             // the configured defaults, never the last caller's "slower".
             pace = crate::speech_plan::PaceState::from_env();
             dialogue.reset();
+            turn_overlapped = false;
             // Drop the echo canceller entirely rather than just resetting its
             // FIFOs (review sweep): it was built at the FIRST call's SCO rate
             // and reset() keeps that rate + filter length. Back-to-back calls
@@ -2734,12 +3077,14 @@ fn run_loop(
                     // AOK-CTRL-001: a hangup/reject arriving DURING the
                     // greeting cuts it at chunk granularity. The greeting runs
                     // through the same span planner as every other speech
-                    // origin (pacing + digit handling included).
+                    // origin (pacing + digit handling + the probe lane, so a
+                    // spoken "wait" cuts even the greeting).
                     let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
+                    let mut lane = SttProbeLane::new(&stt_tx, &probe_result_rx, voice_call_gen);
+                    let lane_ref = if barge_in { Some(&mut lane) } else { None };
                     let planned = speak_planned(
                         bt,
-                        &mut tts,
-                        &mut http_tts,
+                        &synth,
                         text,
                         sr,
                         aec_ref,
@@ -2747,6 +3092,7 @@ fn run_loop(
                         Some(&mut probe),
                         &pace,
                         protected_max_ms,
+                        lane_ref,
                     );
                     let out = planned.outcome;
                     if !planned.text.trim().is_empty() {
@@ -2754,6 +3100,14 @@ fn run_loop(
                     }
                     if let Some(action) = probe.action.take() {
                         perform_cancel_action(action, bt, &mut tracker, outbox, sink);
+                    }
+                    // A spoken floor command over the greeting = the caller
+                    // holds the floor from the very first words.
+                    if let Some(intent) = out.commanded {
+                        dialogue.apply(intent);
+                        eprintln!(
+                            "[aokie-plugin] caller commanded {intent:?} over the greeting — holding the floor"
+                        );
                     }
                     if barge_in {
                         if out.barged {
@@ -2774,6 +3128,7 @@ fn run_loop(
                     if !out.captured_speech.is_empty() {
                         stt_buf = crate::voice::to_f32_16k(&out.captured_speech, sr as u32);
                         stt_had_speech = true;
+                        turn_overlapped = true;
                     }
                     // Truthful transcript (audit AOK-VOICE-001/002): record the
                     // greeting only when synthesis actually produced audio —
@@ -2877,7 +3232,7 @@ fn run_loop(
                 }
             }
             if stt_had_speech && stt_silence >= endpoint {
-                if stt_buf.len() >= 16_000 / 3 {
+                if stt_buf.len() >= 16_000 / 5 {
                     // Stamp the job with the call it belongs to (audit C-05).
                     if let Some(s) = tracker.current_mut() {
                         let utterance = s.next_utterance_id();
@@ -2950,7 +3305,7 @@ fn run_loop(
                     }
                 }
                 let p = pending_turn.as_mut().expect("just set");
-                if p.text.len() < CONTINUATION_MAX_CHARS && ends_with_unfinished_number(&p.text) {
+                if p.text.len() < CONTINUATION_MAX_CHARS && turn_looks_unfinished(&p.text) {
                     p.flush_at = Instant::now() + CONTINUATION_HOLD;
                     eprintln!(
                         "[aokie-plugin] holding turn open (looks unfinished): {}",
@@ -3003,12 +3358,25 @@ fn run_loop(
                         &text,
                         None,
                         if is_control { Some("control") } else { None },
+                        turn_overlapped,
                     );
+                    turn_overlapped = false;
                     turn_index += 1;
+
+                    // A bare hesitation ("Uh", "Well...") that outlived the
+                    // continuation hold is the caller THINKING: record it,
+                    // reply with NOTHING, keep listening. Filler never
+                    // reaches the model — as history or as a prompt.
+                    let hesitation = !is_control && crate::duplex::is_hesitation(&text);
+                    if agent_enabled && hesitation {
+                        eprintln!(
+                            "[aokie-plugin] caller hesitation — staying quiet while they finish thinking"
+                        );
+                    }
 
                     // Whether to fall through to the normal LLM reply path.
                     let mut respond_with_llm = false;
-                    if agent_enabled {
+                    if agent_enabled && !hesitation {
                         history.push(serde_json::json!({ "role": "user", "content": text }));
                         if history.len() > 24 {
                             let drop = history.len() - 24;
@@ -3058,14 +3426,14 @@ fn run_loop(
                                     // the confirmation demonstrates the change.
                                     let out = tts_speak(
                                         bt,
-                                        &mut tts,
-                                        &mut http_tts,
+                                        &synth,
                                         line,
                                         sr,
                                         aec_ref,
                                         brms,
                                         Some(&mut probe),
                                         pace.base(),
+                                        None,
                                         None,
                                     );
                                     note_tts_outcome(&status, &out);
@@ -3086,6 +3454,7 @@ fn run_loop(
                                         stt_buf = seeded;
                                         stt_had_speech = true;
                                         stt_silence = Duration::ZERO;
+                                        turn_overlapped = true;
                                     }
                                     if out.dur > Duration::ZERO {
                                         let delivery = if out.barged {
@@ -3138,10 +3507,16 @@ fn run_loop(
                                         } else {
                                             (None, None)
                                         };
+                                        let mut lane = SttProbeLane::new(
+                                            &stt_tx,
+                                            &probe_result_rx,
+                                            voice_call_gen,
+                                        );
+                                        let lane_ref =
+                                            if barge_in { Some(&mut lane) } else { None };
                                         let planned = speak_planned(
                                             bt,
-                                            &mut tts,
-                                            &mut http_tts,
+                                            &synth,
                                             &replay_text,
                                             sr,
                                             aec_ref,
@@ -3149,6 +3524,7 @@ fn run_loop(
                                             Some(&mut probe),
                                             &replay_pace,
                                             protected_max_ms,
+                                            lane_ref,
                                         );
                                         let out = planned.outcome;
                                         note_tts_outcome(&status, &out);
@@ -3171,6 +3547,7 @@ fn run_loop(
                                             stt_buf = seeded;
                                             stt_had_speech = true;
                                             stt_silence = Duration::ZERO;
+                                            turn_overlapped = true;
                                         }
                                         if out.dur > Duration::ZERO
                                             && !planned.played_text.is_empty()
@@ -3282,6 +3659,20 @@ fn run_loop(
                             // turn after the reply, so no overlapped words are
                             // ever lost. Listening never stops.
                             let mut overlap_capture: Vec<i16> = Vec::new();
+                            // Phase 2: the gaps BETWEEN sentences (LLM still
+                            // streaming) are listened to as well — sustained
+                            // speech there barges exactly like speech over a
+                            // sentence. State for the gap-scan.
+                            let mut gap_frames: u32 = 0;
+                            let mut gap_start: Option<usize> = None;
+                            let mut overlap_has_speech = false;
+                            // ONE probe lane for the whole reply (the live
+                            // scratchpad): partials accumulate across
+                            // sentences so boundary decisions see everything
+                            // said so far, and a command heard at the tail of
+                            // one sentence still cuts the next.
+                            let mut reply_lane =
+                                SttProbeLane::new(&stt_tx, &probe_result_rx, voice_call_gen);
                             // Distinguish a CALLER barge-in from an OPERATOR
                             // hangup/reject mid-reply (review sweep): both stop
                             // the reply, but the transcript must not label an
@@ -3416,6 +3807,53 @@ fn run_loop(
                                     reply_cancel.store(true, Ordering::Relaxed);
                                     break 'pump;
                                 }
+                                // Phase 2: listening never stops — drain the mic
+                                // even BETWEEN sentences (while the LLM is still
+                                // thinking/streaming). Sustained caller speech in
+                                // a gap barges the reply exactly like speech over
+                                // a playing sentence, and everything heard rides
+                                // the scratchpad into their next turn.
+                                if barge_in {
+                                    if let Some(a) = aec.as_mut() {
+                                        let gap_frame = (sr as usize / 100).max(80);
+                                        while let Some(rxa) = bt.try_recv_audio() {
+                                            let cleaned = a.process_capture(&rxa.samples);
+                                            if cleaned.is_empty() {
+                                                continue;
+                                            }
+                                            if scan_barge_frames(
+                                                &cleaned,
+                                                gap_frame,
+                                                CAPTURE_RMS,
+                                                barge_rms,
+                                                true,
+                                                &mut gap_frames,
+                                                22,
+                                                &mut overlap_capture,
+                                                &mut gap_start,
+                                            ) {
+                                                barged = true;
+                                            }
+                                        }
+                                        // Idle-trim: while nothing in the buffer is
+                                        // speech, only a short pre-roll tail matters.
+                                        if !overlap_has_speech && gap_start.is_none() {
+                                            let keep = (sr as usize).saturating_mul(2).max(1);
+                                            if overlap_capture.len() > keep * 2 {
+                                                overlap_capture
+                                                    .drain(..overlap_capture.len() - keep);
+                                            }
+                                        }
+                                        if barged {
+                                            eprintln!(
+                                                "[aokie-plugin] caller spoke between sentences — reply cut"
+                                            );
+                                            bt.flush_tx_audio();
+                                            reply_cancel.store(true, Ordering::Relaxed);
+                                            break 'pump;
+                                        }
+                                    }
+                                }
                                 match reply_rx.recv_timeout(Duration::from_millis(25)) {
                                     Ok(ReplyMsg::Sentence(sentence)) => {
                                         // Strip any [[END_CALL]] marker BEFORE synthesis so the
@@ -3443,13 +3881,34 @@ fn run_loop(
                                         } else {
                                             (None, None)
                                         };
+                                        // The caller started talking while the LLM was
+                                        // still composing this sentence (gap capture,
+                                        // ≥250 ms above the speech gate): yield instead
+                                        // of speaking over them — their words are
+                                        // already on the scratchpad.
+                                        if barge_in
+                                            && gap_start.map_or(false, |s| {
+                                                overlap_capture.len().saturating_sub(s)
+                                                    >= (sr as usize) / 4
+                                            })
+                                        {
+                                            eprintln!(
+                                                "[aokie-plugin] caller speaking as the next sentence arrived — yielding to them"
+                                            );
+                                            barged = true;
+                                            reply_cancel.store(true, Ordering::Relaxed);
+                                            break 'pump;
+                                        }
                                         // The span planner validates/strips any model
                                         // markers, slows + digit-expands details, and
-                                        // applies per-span interrupt policy.
+                                        // applies per-span interrupt policy. The probe
+                                        // lane rides along: a spoken "wait"/"stop" cuts
+                                        // the sentence mid-playback.
+                                        let lane_ref =
+                                            if barge_in { Some(&mut reply_lane) } else { None };
                                         let planned = speak_planned(
                                             bt,
-                                            &mut tts,
-                                            &mut http_tts,
+                                            &synth,
                                             &spoken_text,
                                             sr,
                                             aec_ref,
@@ -3457,8 +3916,21 @@ fn run_loop(
                                             Some(&mut probe),
                                             &pace,
                                             protected_max_ms,
+                                            lane_ref,
                                         );
                                         let out = planned.outcome;
+                                        // A spoken floor command mid-sentence pauses the
+                                        // dialogue IMMEDIATELY (the final transcript will
+                                        // re-apply it — idempotent).
+                                        if let Some(intent) = out.commanded {
+                                            dialogue.apply(intent);
+                                            if !silence_window.is_zero() {
+                                                silence_timer = Some(SilenceTimer::new(
+                                                    silence_window * 3,
+                                                    Instant::now(),
+                                                ));
+                                            }
+                                        }
                                         if !planned.text.trim().is_empty() {
                                             note_tts_outcome(&status, &out);
                                         }
@@ -3480,6 +3952,7 @@ fn run_loop(
                                         if !out.captured_speech.is_empty() {
                                             overlap_capture
                                                 .extend_from_slice(&out.captured_speech);
+                                            overlap_has_speech = true;
                                         }
                                         if let Some(action) = probe.action.take() {
                                             // Operator hangup/reject landed mid-SENTENCE
@@ -3496,6 +3969,31 @@ fn run_loop(
                                             barged = true;
                                             reply_cancel.store(true, Ordering::Relaxed);
                                             break 'pump; // stop pulling from the LLM
+                                        }
+                                        // SENTENCE-BOUNDARY STEERING (the live
+                                        // scratchpad): the caller said something
+                                        // SUBSTANTIVE over that sentence — even below
+                                        // the acoustic barge threshold. Yield here, at
+                                        // a natural pause, so the next thing spoken
+                                        // answers THEM instead of finishing a stale
+                                        // paragraph. Backchannels and echo never steer.
+                                        let bot_so_far = {
+                                            let mut b = spoken.join(" ");
+                                            b.push(' ');
+                                            b.push_str(&planned.text);
+                                            b
+                                        };
+                                        if let Some(said) =
+                                            reply_lane.substantive_content(&bot_so_far)
+                                        {
+                                            eprintln!(
+                                                "[aokie-plugin] scratchpad steering: yielding at the sentence boundary to {}",
+                                                content_for_log(&said)
+                                            );
+                                            bt.flush_tx_audio();
+                                            barged = true;
+                                            reply_cancel.store(true, Ordering::Relaxed);
+                                            break 'pump;
                                         }
                                     }
                                     Ok(ReplyMsg::Done(res)) => {
@@ -3711,6 +4209,7 @@ fn run_loop(
                                 stt_buf = seeded;
                                 stt_had_speech = true;
                                 stt_silence = Duration::ZERO;
+                                turn_overlapped = true;
                             }
                             // VOICE-001 fail-safe: the caller asked something and heard
                             // NOTHING — the responder is broken mid-call. Never leave
@@ -3728,14 +4227,14 @@ fn run_loop(
                                 // no planning, no barge monitoring.
                                 let out = tts_speak(
                                     bt,
-                                    &mut tts,
-                                    &mut http_tts,
+                                    &synth,
                                     FALLBACK_LINE,
                                     sr,
                                     None,
                                     None,
                                     None,
                                     1.0,
+                                    None,
                                     None,
                                 );
                                 note_tts_outcome(&status, &out);
@@ -3889,14 +4388,14 @@ fn run_loop(
                         };
                         let out = tts_speak(
                             bt,
-                            &mut tts,
-                            &mut http_tts,
+                            &synth,
                             SILENCE_CHECK_LINE,
                             sr,
                             aec_ref,
                             brms,
                             Some(&mut probe),
                             pace.base(),
+                            None,
                             None,
                         );
                         note_tts_outcome(&status, &out);
@@ -3915,6 +4414,7 @@ fn run_loop(
                                     crate::voice::to_f32_16k(&out.captured_speech, sr as u32);
                                 stt_had_speech = true;
                                 stt_silence = Duration::ZERO;
+                                turn_overlapped = true;
                             }
                         } else {
                             mute_stt_until =
@@ -3959,14 +4459,14 @@ fn run_loop(
                         let gb_t0 = Instant::now();
                         let out = tts_speak(
                             bt,
-                            &mut tts,
-                            &mut http_tts,
+                            &synth,
                             SILENCE_GOODBYE_LINE,
                             sr,
                             None,
                             None,
                             Some(&mut probe),
                             pace.base(),
+                            None,
                             None,
                         );
                         note_tts_outcome(&status, &out);
@@ -4114,8 +4614,7 @@ fn run_loop(
                         let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
                         let planned = speak_planned(
                             bt,
-                            &mut tts,
-                            &mut http_tts,
+                            &synth,
                             &text,
                             sr,
                             None,
@@ -4123,6 +4622,7 @@ fn run_loop(
                             Some(&mut probe),
                             &pace,
                             protected_max_ms,
+                            None,
                         );
                         let out = planned.outcome;
                         if sr > 0 && !planned.text.trim().is_empty() {
@@ -4247,7 +4747,7 @@ fn run_loop(
                             let _ = stt_tx.send(SttWork::Configure { endpoint: Some(e) });
                         }
                         if let Some(e) = tts_endpoint {
-                            http_tts.configure(Some(e));
+                            synth.configure(Some(e));
                         }
                         eprintln!("[aokie-plugin] agent reconfigured (persona/greeting/voice/model/endpoints)");
                     }
@@ -4967,7 +5467,8 @@ mod tests {
         // 1) Silence first: captured grows, no speech start, no trip.
         let silence = vec![0i16; frame * 5];
         let tripped = scan_barge_frames(
-            &silence, frame, 500.0, true, &mut speech_frames, 3, &mut captured, &mut speech_start,
+            &silence, frame, 350.0, 500.0, true, &mut speech_frames, 3, &mut captured,
+            &mut speech_start,
         );
         assert!(!tripped);
         assert_eq!(captured.len(), frame * 5);
@@ -4978,12 +5479,26 @@ mod tests {
         //    and 3 sustained frames trip the barge.
         let loud = vec![8000i16; frame * 3];
         let tripped = scan_barge_frames(
-            &loud, frame, 500.0, true, &mut speech_frames, 3, &mut captured, &mut speech_start,
+            &loud, frame, 350.0, 500.0, true, &mut speech_frames, 3, &mut captured,
+            &mut speech_start,
         );
         assert!(tripped);
         assert_eq!(speech_start, Some(frame * 5), "speech starts where the loud audio began");
         // The loud chunk was captured too — nothing was consumed by detection.
         assert_eq!(captured.len(), frame * 8);
+
+        // 3) QUIET speech (above the capture gate, below the trip threshold —
+        //    the AEC-suppressed-overlap band): marked + captured for the
+        //    scratchpad, but never barges.
+        let mut frames2 = 0u32;
+        let mut cap2: Vec<i16> = Vec::new();
+        let mut start2: Option<usize> = None;
+        let quiet = vec![420i16; frame * 6];
+        let tripped = scan_barge_frames(
+            &quiet, frame, 350.0, 500.0, true, &mut frames2, 3, &mut cap2, &mut start2,
+        );
+        assert!(!tripped, "sub-trip speech never barges");
+        assert_eq!(start2, Some(0), "but the scratchpad hears it");
     }
 
     /// Span interrupt policy: a Yield span stops the instant the barge trips;
@@ -5013,11 +5528,38 @@ mod tests {
         let mut p = TtsChunkPlayback::new(8000, Some(Duration::from_secs(5)));
         p.cancelled = true;
         assert!(p.stop_playback_now(), "hangup/reject beats protection");
+
+        // A spoken floor command (probe lane) also beats protection — the
+        // caller's explicit "stop" cuts even an [[important]] span instantly.
+        let mut p = TtsChunkPlayback::new(8000, Some(Duration::from_secs(5)));
+        p.barged = true;
+        p.barged_at = Some(Instant::now());
+        assert!(!p.stop_playback_now(), "ordinary overlap rides the budget");
+        p.semantic = Some(crate::duplex::CallerIntent::StopSpeaking);
+        assert!(p.stop_playback_now(), "spoken command beats protection");
     }
 
-    /// AK-008: un-armed frames (AEC convergence grace) are still captured —
-    /// they may hold the caller's first word — but never trip the barge or
-    /// mark a speech start.
+    /// Phase 2 pacing: the first chunk always goes (it starts the playout
+    /// clock); after that the queued total may lead real playout by at most
+    /// the configured lead — cancel latency is bounded by that lead.
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[test]
+    fn playout_pacing_bounds_the_queue_lead() {
+        use std::time::Duration;
+        let lead = Duration::from_millis(200);
+        // First chunk: always allowed.
+        assert!(may_queue_more(true, 0, 8000, Duration::ZERO, lead));
+        // 1s queued, 900ms played: 100ms ahead — under the lead, may queue.
+        assert!(may_queue_more(false, 8000, 8000, Duration::from_millis(900), lead));
+        // 1s queued, 700ms played: 300ms ahead — over the lead, must wait.
+        assert!(!may_queue_more(false, 8000, 8000, Duration::from_millis(700), lead));
+        // Exactly at the boundary: not strictly under — wait.
+        assert!(!may_queue_more(false, 8000, 8000, Duration::from_millis(800), lead));
+    }
+
+    /// AK-008: un-armed frames (AEC convergence grace / pre-first-audio) are
+    /// still captured AND marked for the scratchpad — they may hold the
+    /// caller's first words — but never trip the barge.
     #[cfg(all(target_os = "windows", feature = "voice"))]
     #[test]
     fn barge_scan_unarmed_captures_but_never_trips() {
@@ -5027,12 +5569,13 @@ mod tests {
         let mut speech_start: Option<usize> = None;
         let loud = vec![8000i16; frame * 10];
         let tripped = scan_barge_frames(
-            &loud, frame, 500.0, false, &mut speech_frames, 3, &mut captured, &mut speech_start,
+            &loud, frame, 350.0, 500.0, false, &mut speech_frames, 3, &mut captured,
+            &mut speech_start,
         );
         assert!(!tripped);
         assert_eq!(captured.len(), frame * 10);
-        assert_eq!(speech_start, None);
-        assert_eq!(speech_frames, 0);
+        assert_eq!(speech_start, Some(0), "the scratchpad hears pre-audio speech");
+        assert_eq!(speech_frames, 0, "but the barge counter never arms");
     }
 
     /// Audit AK-008: the continuation heuristic must hold a turn open exactly
@@ -5058,6 +5601,40 @@ mod tests {
         // A word after the digits releases the hold.
         assert!(!ends_with_unfinished_number("nine thirty tomorrow"));
         assert!(!ends_with_unfinished_number("0412 345 678 thanks"));
+    }
+
+    /// Plan §6.2 (live 2026-07-13): the general turn-completion hold — number
+    /// tails (as before), bare hesitations, trailing connectives and short
+    /// filler-opened fragments all hold for a continuation; complete answers
+    /// still flush instantly.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn general_turn_completion_hold() {
+        // The live failure: "Um no" + "That's all really" split into two turns.
+        assert!(turn_looks_unfinished("Um no"));
+        assert!(turn_looks_unfinished("Uh"));
+        assert!(turn_looks_unfinished("Well"));
+        assert!(turn_looks_unfinished("I want to change it but"));
+        assert!(turn_looks_unfinished("we could do Tuesday or"));
+        // Number tails still hold (the original AK-008 behaviour).
+        assert!(turn_looks_unfinished("my number is 0412"));
+        // Complete answers flush immediately.
+        assert!(!turn_looks_unfinished("That's good."));
+        assert!(!turn_looks_unfinished("No, that's all really"));
+        assert!(!turn_looks_unfinished("I'd like to book a haircut for Tuesday"));
+        assert!(!turn_looks_unfinished("yes"));
+    }
+
+    /// Bare hesitations are the caller THINKING: recorded, never answered.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn hesitations_are_silence_not_turns() {
+        for s in ["Uh", "um", "Well...", "hmm", "uh um"] {
+            assert!(crate::duplex::is_hesitation(s), "{s:?}");
+        }
+        for s in ["Um no", "well yes", "no", "that's all", ""] {
+            assert!(!crate::duplex::is_hesitation(s), "{s:?}");
+        }
     }
 
     /// Audit C-01/C-02/AK-001: the radio publishes the current call's identity
