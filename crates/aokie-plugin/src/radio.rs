@@ -799,7 +799,7 @@ fn emit_turn_with_delivery(
     delivery: Option<&str>,
 ) {
     emit_turn_full(
-        outbox, sink, corr, turn_index, speaker, text, delivery, None, false,
+        outbox, sink, corr, turn_index, speaker, text, delivery, None, false, None,
     )
 }
 
@@ -820,13 +820,17 @@ fn emit_turn_full(
     delivery: Option<&str>,
     kind: Option<&str>,
     overlapped: bool,
+    at_override: Option<&str>,
 ) {
     let mut payload = json!({
         "callId": corr,
         "turn": turn_index,
         "speaker": speaker,
         "text": text,
-        "at": aokie_core::events::now_iso8601(),
+        // Overlap turns carry their SPEECH-START estimate, not commit time.
+        "at": at_override
+            .map(str::to_string)
+            .unwrap_or_else(aokie_core::events::now_iso8601),
     });
     if let Some(d) = delivery {
         payload["delivery"] = json!(d);
@@ -1599,6 +1603,10 @@ struct TtsChunkPlayback {
     speech_during_playback: bool,
     /// Current outbound gain (1.0 → DUCK_GAIN over ~100 ms once ducked).
     duck_gain: f32,
+    /// When the current duck began — after a short window the gain ramps
+    /// BACK up, so a brief backchannel doesn't leave the rest of the
+    /// sentence whispering. Sustained loud speech re-triggers it.
+    ducked_at: Option<std::time::Instant>,
 }
 
 /// Ducked outbound level once the caller talks over a playing span, and the
@@ -1631,6 +1639,7 @@ impl TtsChunkPlayback {
             semantic: None,
             speech_during_playback: false,
             duck_gain: 1.0,
+            ducked_at: None,
         }
     }
 
@@ -1746,8 +1755,17 @@ impl TtsChunkPlayback {
         // (ramped, click-free) so the bot audibly makes room while the floor
         // decision (finish the clause / yield / barge) plays out. The AEC
         // reference gets the SAME scaled samples that actually play.
-        if self.speech_during_playback && self.duck_gain > DUCK_GAIN {
-            self.duck_gain = (self.duck_gain - DUCK_RAMP_STEP).max(DUCK_GAIN);
+        if (self.speech_during_playback && self.ducked_at.is_none()) || self.speech_frames >= 3 {
+            self.ducked_at = Some(std::time::Instant::now());
+        }
+        let duck_target = match self.ducked_at {
+            Some(at) if at.elapsed() < std::time::Duration::from_millis(1200) => DUCK_GAIN,
+            _ => 1.0,
+        };
+        if self.duck_gain > duck_target {
+            self.duck_gain = (self.duck_gain - DUCK_RAMP_STEP).max(duck_target);
+        } else if self.duck_gain < duck_target {
+            self.duck_gain = (self.duck_gain + DUCK_RAMP_STEP).min(duck_target);
         }
         if self.duck_gain < 0.999 {
             let ducked: Vec<i16> = pcm
@@ -2601,6 +2619,15 @@ fn run_loop(
     // so the caller's last words land BEFORE call.ended.
     #[cfg(feature = "voice")]
     let mut stt_outstanding: usize = 0;
+    // Early-start STT (round 3): the utterance is transcribed SPECULATIVELY
+    // after a SHORT silence so its text is ready AT the endpoint instead of
+    // an STT-latency after it. Resumed speech invalidates the speculation
+    // (the grown utterance re-transcribes whole; the stale result is dropped
+    // by id, never merged).
+    #[cfg(feature = "voice")]
+    let mut spec_utterance: Option<u32> = None;
+    #[cfg(feature = "voice")]
+    let mut stale_specs: Vec<u32> = Vec::new();
     #[cfg(feature = "voice")]
     let mut stt_had_speech = false;
     #[cfg(feature = "voice")]
@@ -2776,6 +2803,15 @@ fn run_loop(
     // speech order. Set at every overlap-seed site, cleared when a turn flushes.
     #[cfg(feature = "voice")]
     let mut turn_overlapped = false;
+    // Back-dated speech-start estimate for that overlap turn (its audio began
+    // roughly its own duration before it was seeded).
+    #[cfg(feature = "voice")]
+    let mut turn_overlap_at: Option<String> = None;
+    // The nudge (round 3): an interrupted reply leaves its UNSPOKEN tail here
+    // so the next generation can weave the pending point in naturally instead
+    // of restarting the thought. Consumed by exactly one generation.
+    #[cfg(feature = "voice")]
+    let mut last_cut_context: Option<String> = None;
     // Monotonic transcript turn index (caller + bot share one sequence), reset
     // per call. 1-based to match the simulated-call convention (`turn.1.final`,
     // `turn.2.final`, â€¦) so real + simulated calls dedup + display identically.
@@ -2823,7 +2859,10 @@ fn run_loop(
                 && tracker.current().is_some()
             {
                 if stt_had_speech && stt_buf.len() >= 16_000 / 5 {
-                    if let Some(s) = tracker.current_mut() {
+                    if spec_utterance.take().is_some() {
+                        // Already in flight speculatively — the drain below
+                        // waits for that result; never send it twice.
+                    } else if let Some(s) = tracker.current_mut() {
                         let utterance = s.next_utterance_id();
                         if stt_tx
                             .send(SttWork::Utterance {
@@ -2852,8 +2891,14 @@ fn run_loop(
                         break;
                     }
                     match stt_result_rx.recv_timeout(left) {
-                        Ok(SttResult { generation, text, .. }) => {
+                        Ok(SttResult { generation, utterance, text }) => {
                             stt_outstanding = stt_outstanding.saturating_sub(1);
+                            if let Some(pos) =
+                                stale_specs.iter().position(|&u| u == utterance)
+                            {
+                                stale_specs.remove(pos);
+                                continue;
+                            }
                             if generation != gen_now {
                                 status.stale_stt_results.fetch_add(1, Ordering::Relaxed);
                                 continue;
@@ -2934,6 +2979,10 @@ fn run_loop(
             pace = crate::speech_plan::PaceState::from_env();
             dialogue.reset();
             turn_overlapped = false;
+            turn_overlap_at = None;
+            spec_utterance = None;
+            stale_specs.clear();
+            last_cut_context = None;
             // Drop the echo canceller entirely rather than just resetting its
             // FIFOs (review sweep): it was built at the FIRST call's SCO rate
             // and reset() keeps that rate + filter length. Back-to-back calls
@@ -3129,6 +3178,9 @@ fn run_loop(
                         stt_buf = crate::voice::to_f32_16k(&out.captured_speech, sr as u32);
                         stt_had_speech = true;
                         turn_overlapped = true;
+                        turn_overlap_at = Some(aokie_core::events::iso8601_ago_ms(
+                            (out.captured_speech.len() * 1000 / (sr as usize).max(1)) as u64,
+                        ));
                     }
                     // Truthful transcript (audit AOK-VOICE-001/002): record the
                     // greeting only when synthesis actually produced audio —
@@ -3218,6 +3270,11 @@ fn run_loop(
                 if rms > SPEECH_RMS {
                     stt_had_speech = true;
                     stt_silence = Duration::ZERO;
+                    // Speech resumed after a speculative send: that spec no
+                    // longer matches the utterance — drop its result by id.
+                    if let Some(id) = spec_utterance.take() {
+                        stale_specs.push(id);
+                    }
                     stt_buf.extend_from_slice(&f16);
                     // AOK-CTRL-001: live caller audio resets the max-silence window.
                     if let Some(t) = silence_timer.as_mut() {
@@ -3229,10 +3286,42 @@ fn run_loop(
                 }
                 if stt_buf.len() > 16_000 * 15 {
                     stt_silence = endpoint; // force-flush a runaway (~15 s) utterance
+                    if let Some(id) = spec_utterance.take() {
+                        stale_specs.push(id);
+                    }
+                }
+            }
+            // Speculative early transcription: 200 ms into the pause (well
+            // before the endpoint), ship the buffer as-is. If the caller
+            // stays quiet, the endpoint below has NOTHING left to do — the
+            // text is already in flight (or back).
+            if stt_had_speech
+                && spec_utterance.is_none()
+                && stt_silence >= Duration::from_millis(200)
+                && stt_silence < endpoint
+                && stt_buf.len() >= 16_000 / 5
+            {
+                if let Some(s) = tracker.current_mut() {
+                    let utterance = s.next_utterance_id();
+                    if stt_tx
+                        .send(SttWork::Utterance {
+                            generation: s.generation,
+                            utterance,
+                            samples: stt_buf.clone(),
+                        })
+                        .is_ok()
+                    {
+                        stt_outstanding += 1;
+                        spec_utterance = Some(utterance);
+                    }
                 }
             }
             if stt_had_speech && stt_silence >= endpoint {
-                if stt_buf.len() >= 16_000 / 5 {
+                if spec_utterance.take().is_some() {
+                    // The speculation IS this utterance (nothing new was said
+                    // since it was sent) — never transcribe it twice.
+                    stt_buf.clear();
+                } else if stt_buf.len() >= 16_000 / 5 {
                     // Stamp the job with the call it belongs to (audit C-05).
                     if let Some(s) = tracker.current_mut() {
                         let utterance = s.next_utterance_id();
@@ -3269,6 +3358,13 @@ fn run_loop(
             {
                 idle = false;
                 stt_outstanding = stt_outstanding.saturating_sub(1);
+                // A superseded speculative transcription (its utterance grew
+                // after it was sent): the whole utterance re-transcribed —
+                // drop this partial result, never merge it.
+                if let Some(pos) = stale_specs.iter().position(|&u| u == utterance) {
+                    stale_specs.remove(pos);
+                    continue;
+                }
                 // Stale-result gate (audit C-05): only text whose generation IS
                 // the current call may be recorded or answered. A slow result
                 // from a previous call is dropped and counted — never spoken
@@ -3359,8 +3455,10 @@ fn run_loop(
                         None,
                         if is_control { Some("control") } else { None },
                         turn_overlapped,
+                        turn_overlap_at.as_deref(),
                     );
                     turn_overlapped = false;
+                    turn_overlap_at = None;
                     turn_index += 1;
 
                     // A bare hesitation ("Uh", "Well...") that outlived the
@@ -3455,6 +3553,11 @@ fn run_loop(
                                         stt_had_speech = true;
                                         stt_silence = Duration::ZERO;
                                         turn_overlapped = true;
+                                        turn_overlap_at = Some(aokie_core::events::iso8601_ago_ms(
+                                            (out.captured_speech.len() * 1000
+                                                / (sr as usize).max(1))
+                                                as u64,
+                                        ));
                                     }
                                     if out.dur > Duration::ZERO {
                                         let delivery = if out.barged {
@@ -3548,6 +3651,12 @@ fn run_loop(
                                             stt_had_speech = true;
                                             stt_silence = Duration::ZERO;
                                             turn_overlapped = true;
+                                            turn_overlap_at =
+                                                Some(aokie_core::events::iso8601_ago_ms(
+                                                    (out.captured_speech.len() * 1000
+                                                        / (sr as usize).max(1))
+                                                        as u64,
+                                                ));
                                         }
                                         if out.dur > Duration::ZERO
                                             && !planned.played_text.is_empty()
@@ -3633,11 +3742,19 @@ fn run_loop(
                             // mutating agent_persona, which a live Configure could
                             // replace): spoken-delivery/markers always, the
                             // end-call marker only when agentHangup is on.
-                            let system_prompt = if agent_hangup {
+                            let mut system_prompt = if agent_hangup {
                                 format!("{agent_persona}{SPEECH_STYLE_INSTRUCTION}{END_CALL_INSTRUCTION}")
                             } else {
                                 format!("{agent_persona}{SPEECH_STYLE_INSTRUCTION}")
                             };
+                            // The nudge: the caller interrupted the previous
+                            // reply — hand the model its unspoken tail so the
+                            // join sounds like one flowing thought.
+                            if let Some(tail) = last_cut_context.take() {
+                                system_prompt.push_str(&format!(
+                                    "\n\nThe caller interrupted your previous reply. You were about to say: \"{tail}\". Respond to what they just said, weaving that pending point in ONLY if it is still relevant. Never repeat what you already said and never restart the reply."
+                                ));
+                            }
                             let mut messages = vec![
                                 serde_json::json!({ "role": "system", "content": system_prompt }),
                             ];
@@ -4073,6 +4190,28 @@ fn run_loop(
                                         }
                                         _ => played.clone(),
                                     };
+                                    // The nudge: keep the interrupted reply's
+                                    // unspoken tail for the NEXT generation.
+                                    if barged && !full.trim().is_empty() {
+                                        let (clean0, _) = strip_end_call_marker(&full);
+                                        let clean_full = crate::speech_plan::clean_text(
+                                            &crate::speech_plan::plan_spans(
+                                                &clean0,
+                                                &pace,
+                                                protected_max_ms,
+                                            ),
+                                        );
+                                        let played_words = played.split_whitespace().count();
+                                        let tail: Vec<&str> = clean_full
+                                            .split_whitespace()
+                                            .skip(played_words)
+                                            .collect();
+                                        if !tail.is_empty() {
+                                            let mut t = tail.join(" ");
+                                            t.truncate(240);
+                                            last_cut_context = Some(t);
+                                        }
+                                    }
                                     // VOICE-001: nothing audible + no barge/operator
                                     // context = the caller is in DEAD AIR — an empty
                                     // generation or fully-silent synthesis both count.
@@ -4210,6 +4349,9 @@ fn run_loop(
                                 stt_had_speech = true;
                                 stt_silence = Duration::ZERO;
                                 turn_overlapped = true;
+                                turn_overlap_at = Some(aokie_core::events::iso8601_ago_ms(
+                                    (overlap_capture.len() * 1000 / (sr as usize).max(1)) as u64,
+                                ));
                             }
                             // VOICE-001 fail-safe: the caller asked something and heard
                             // NOTHING — the responder is broken mid-call. Never leave
@@ -4415,6 +4557,10 @@ fn run_loop(
                                 stt_had_speech = true;
                                 stt_silence = Duration::ZERO;
                                 turn_overlapped = true;
+                                turn_overlap_at = Some(aokie_core::events::iso8601_ago_ms(
+                                    (out.captured_speech.len() * 1000 / (sr as usize).max(1))
+                                        as u64,
+                                ));
                             }
                         } else {
                             mute_stt_until =

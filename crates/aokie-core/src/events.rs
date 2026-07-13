@@ -79,6 +79,14 @@ pub fn iso8601_after_secs(secs: i64) -> String {
     (Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// `now - ms` in the same shape — used to BACK-DATE events whose true start
+/// is known from elapsed audio (an overlap-captured caller turn began about
+/// its own duration before it was committed to the transcript).
+pub fn iso8601_ago_ms(ms: u64) -> String {
+    (Utc::now() - chrono::Duration::milliseconds(ms as i64))
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 /// Build the Aokie idempotency key: `aokie:<correlationId>:<step>:v1`.
 ///
 /// `step` is the event name minus the `aokie.` prefix, with the
