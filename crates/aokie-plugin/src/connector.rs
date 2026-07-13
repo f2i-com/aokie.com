@@ -1744,6 +1744,18 @@ impl Plugin {
                     reasons.push(format!("radio error: {e}"));
                 } else if !r.is_initialized() {
                     reasons.push("radio starting (dongle not initialised yet)".to_string());
+                } else if !r.is_connected() {
+                    // A receptionist line with no phone linked CANNOT take
+                    // calls — health must not read "ok" on a dead line
+                    // (observed live 2026-07-13: a mid-call Bluetooth
+                    // supervision timeout dropped the link and the phone
+                    // never reconnected; health stayed green while every
+                    // subsequent call rang unanswered). The fix is on the
+                    // phone: reconnect to the dongle from Bluetooth settings.
+                    reasons.push(
+                        "no phone connected — the receptionist cannot take calls; reconnect the phone to 'Aokie AI Assistant' in its Bluetooth settings"
+                            .to_string(),
+                    );
                 }
                 // AOK-VOICE-001: a KNOWN voice failure (asset preflight / live
                 // engine or synthesis failure) is a concrete degraded state —
