@@ -711,6 +711,33 @@ mod tests {
     }
 
     #[test]
+    fn stray_dm_or_disc_for_an_unknown_dlci_never_kills_the_session() {
+        // Live 2026-07-13: stall recovery DISC'd the (never-open) MNS
+        // dlci 4; the phone's DM answer hit the session-wide catch-all
+        // and tore down a healthy HFP link mid-conversation.
+        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        open_channel(&mut state);
+        state
+            .handle_packet(&build_dm(4, false))
+            .expect("stray dm");
+        assert!(state.is_open(), "HFP must survive a DM for dlci 4");
+        assert!(state.mux_is_open());
+        let out = state
+            .handle_packet(&super::super::rfcomm::build_disc(4, false))
+            .expect("stray disc");
+        assert!(state.is_open(), "HFP must survive a DISC for dlci 4");
+        // The DISC gets the spec's DM answer, not a session teardown.
+        let reply = parse_frame(&out[0]).expect("dm reply");
+        assert_eq!(reply.kind, RfcommFrameKind::Dm);
+        assert_eq!(reply.dlci, 4);
+        // The primary DLCI still fails the session, as before.
+        state
+            .handle_packet(&build_dm(target_dlci(), false))
+            .expect("dm on primary");
+        assert!(!state.is_open(), "a DM on the HFP DLCI is still fatal");
+    }
+
+    #[test]
     fn attach_refuses_when_the_mux_is_not_open_or_the_dlci_is_taken() {
         let mut state = HfpClientState::new(AG_CHANNEL, false);
         assert!(state.attach_client_dlci(MAS_CHANNEL).is_err(), "no mux yet");

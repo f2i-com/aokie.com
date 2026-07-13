@@ -2080,17 +2080,28 @@ fn run_runtime(
                             eprintln!("[AokieRadio] MAS stall recovery: dlci 11 DISC build: {}", e)
                         }
                     }
-                    match l2cap_state.rfcomm_force_disc_dlci(rfcomm_cid, 4) {
-                        Ok(packet) => {
-                            if let Err(e) = transport.write_acl(&packet) {
-                                let _ = event_tx.send(RuntimeEvent::Error(format!(
-                                    "MAS stall recovery: dlci 4 DISC write: {}",
-                                    e
-                                )));
+                    // Only DISC the MNS dlci when MNS actually connected
+                    // this session — on initiator-mux sessions it never
+                    // does, and DISCing a never-open dlci just provokes
+                    // a DM from the phone (harmless now that unknown-dlci
+                    // DMs are ignored, but pointless traffic).
+                    let mns_ever_up = mns_server
+                        .lock()
+                        .map(|g| !matches!(*g.state(), MnsState::AwaitingConnect))
+                        .unwrap_or(false);
+                    if mns_ever_up {
+                        match l2cap_state.rfcomm_force_disc_dlci(rfcomm_cid, 4) {
+                            Ok(packet) => {
+                                if let Err(e) = transport.write_acl(&packet) {
+                                    let _ = event_tx.send(RuntimeEvent::Error(format!(
+                                        "MAS stall recovery: dlci 4 DISC write: {}",
+                                        e
+                                    )));
+                                }
                             }
-                        }
-                        Err(e) => {
-                            eprintln!("[AokieRadio] MAS stall recovery: dlci 4 DISC build: {}", e)
+                            Err(e) => {
+                                eprintln!("[AokieRadio] MAS stall recovery: dlci 4 DISC build: {}", e)
+                            }
                         }
                     }
                     map_runtime = None;
