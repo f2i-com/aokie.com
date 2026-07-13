@@ -1036,9 +1036,15 @@ impl Plugin {
                             "expiresEpochSecs": p.expires_epoch_secs,
                         })
                     });
+                    // The connected phone's real friendly name/model (captured
+                    // via HCI Remote Name Request ~1s after connect), falling
+                    // back to a generic label until it lands.
+                    let device_name = radio
+                        .connected_name()
+                        .unwrap_or_else(|| "Paired phone".to_string());
                     return Ok(json!({
                         "paired": addr.is_some(),
-                        "device": addr.as_ref().map(|a| json!({"address": a, "name": "Paired phone"})),
+                        "device": addr.as_ref().map(|a| json!({"address": a, "name": device_name})),
                         "connected": radio.is_connected(),
                         "initialized": radio.is_initialized(),
                         "callActive": radio.is_call_active(),
@@ -1130,12 +1136,24 @@ impl Plugin {
                 if let Some(radio) = self.radio.as_ref() {
                     // AOK-BT-001: the BONDED devices in the pairing store are the
                     // revocable identities (removePaired targets these) — not the
-                    // live-session connection view.
+                    // live-session connection view. Each carries its captured
+                    // friendly name/model (disambiguates multiple phones) + a
+                    // `connected` flag for the one live now.
+                    let connected = radio.connected_address();
                     let devices: Vec<Value> = radio
                         .list_bonded()
                         .map_err(CmdError::failed)?
                         .into_iter()
-                        .map(|address| json!({"address": address}))
+                        .map(|(address, name)| {
+                            let is_connected = connected
+                                .as_deref()
+                                .is_some_and(|c| c.eq_ignore_ascii_case(&address));
+                            json!({
+                                "address": address,
+                                "name": name,
+                                "connected": is_connected,
+                            })
+                        })
                         .collect();
                     return Ok(json!({"devices": devices}));
                 }
@@ -1154,6 +1172,24 @@ impl Plugin {
                 }
                 // Dev mode: nothing bonded to remove.
                 Ok(json!({"removed": false, "address": address, "simulated": true}))
+            }
+            "phone.disconnect" => {
+                // Disconnect the connected phone but KEEP the bond (remote
+                // reconnect / unstick a wedged link). The phone — for which we
+                // stay connectable — typically re-pages us and reconnects, so
+                // this doubles as the remote "reconnect". Bluetooth scope, same
+                // as the other phone controls.
+                let obj = expect_fields(payload, &["address"])?;
+                let address = require_str(&obj, "address")?;
+                self.check_consent("phone.disconnect", crate::consent::Scope::Bluetooth)?;
+                self.require_radio_or_dev("phone.disconnect")?;
+                if let Some(radio) = self.radio.as_ref() {
+                    let disconnected =
+                        radio.disconnect(address.clone()).map_err(CmdError::failed)?;
+                    return Ok(json!({"disconnected": disconnected, "address": address}));
+                }
+                // Dev mode: nothing connected to drop.
+                Ok(json!({"disconnected": false, "address": address, "simulated": true}))
             }
             "phone.confirmPairing" => {
                 // PAIR-001: the operator's answer to the SSP numeric comparison
@@ -3934,6 +3970,12 @@ mod tests {
         // removePaired is likewise gated on a running radio.
         let err = plugin
             .dispatch_command("phone.removePaired", &json!({"address": "00:11:22:33:44:55"}), &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("radio is not running"));
+
+        // phone.disconnect (remote reconnect/unstick) is gated the same way.
+        let err = plugin
+            .dispatch_command("phone.disconnect", &json!({"address": "00:11:22:33:44:55"}), &mut sink)
             .unwrap_err();
         assert!(err.message.contains("radio is not running"));
 

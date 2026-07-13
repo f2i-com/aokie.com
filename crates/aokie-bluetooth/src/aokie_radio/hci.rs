@@ -30,6 +30,7 @@ pub enum HciPacket<'a> {
 pub const OPCODE_RESET: u16 = 0x0c03;
 pub const OPCODE_CREATE_CONNECTION: u16 = 0x0405;
 pub const OPCODE_DISCONNECT: u16 = 0x0406;
+pub const OPCODE_REMOTE_NAME_REQUEST: u16 = 0x0419;
 pub const OPCODE_ACCEPT_CONNECTION_REQUEST: u16 = 0x0409;
 pub const OPCODE_REJECT_CONNECTION_REQUEST: u16 = 0x040a;
 pub const OPCODE_ACCEPT_SYNCHRONOUS_CONNECTION_REQUEST: u16 = 0x0429;
@@ -427,6 +428,24 @@ pub fn create_connection_command(
     out[12] = 0; // Reserved (per spec)
     out[13..15].copy_from_slice(&clock_offset.to_le_bytes());
     out[15] = allow_role_switch;
+    Ok(out)
+}
+
+/// HCI Remote Name Request (Core Spec v5.4 Vol 4 Part E §7.1.19): ask a
+/// reachable device for its user-friendly name (e.g. "Lance's Pixel 8"). We
+/// issue this right after a phone's ACL comes up so the Device Setup UI can
+/// show the phone MODEL instead of a bare MAC — the `RemoteNameRequestComplete`
+/// event carries the name back. Page-scan-repetition-mode R1 + unknown clock
+/// offset match the create-connection defaults; a device already connected
+/// answers from the active link without a fresh page.
+pub fn remote_name_request_command(address: &str) -> Result<[u8; 13], String> {
+    let mut out = [0u8; 13];
+    out[0..2].copy_from_slice(&OPCODE_REMOTE_NAME_REQUEST.to_le_bytes());
+    out[2] = 10;
+    out[3..9].copy_from_slice(&parse_bd_addr(address)?);
+    out[9] = 0x01; // Page Scan Repetition Mode R1
+    out[10] = 0x00; // Reserved (was Page Scan Mode)
+    out[11..13].copy_from_slice(&0u16.to_le_bytes()); // Clock offset unknown
     Ok(out)
 }
 
@@ -1405,6 +1424,18 @@ mod tests {
         assert_eq!(&bytes[13..15], &[0x00, 0x00]);
         // Allow role switch.
         assert_eq!(bytes[15], 0x01);
+    }
+
+    #[test]
+    fn remote_name_request_command_packs_address_and_defaults() {
+        let bytes = remote_name_request_command("04:C8:B0:E1:3F:F3").unwrap();
+        // Opcode 0x0419 little-endian, then param length 10.
+        assert_eq!(&bytes[0..3], &[0x19, 0x04, 0x0a]);
+        // BD_ADDR little-endian.
+        assert_eq!(&bytes[3..9], &[0xf3, 0x3f, 0xe1, 0xb0, 0xc8, 0x04]);
+        assert_eq!(bytes[9], 0x01); // PSRM R1
+        assert_eq!(bytes[10], 0x00); // reserved
+        assert_eq!(&bytes[11..13], &[0x00, 0x00]); // clock offset unknown
     }
 
     #[test]
