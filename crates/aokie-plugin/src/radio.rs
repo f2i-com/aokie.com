@@ -3776,12 +3776,37 @@ fn handle_event(
             }
         }
         E::CallAnswered => {
+            // AOK-CTRL-001 recovery: an answer with NO tracked session means
+            // an earlier indicator was misread as a terminate (or events were
+            // lost) while the phone call is genuinely up — without a session
+            // every audio frame is dropped and the receptionist goes deaf on
+            // a LIVE call (observed 2026-07-13; the HFP held-verdict fix
+            // prevents the known ordering, this catches any other). Rebuild a
+            // session so the call is heard; the greeting replays, which also
+            // tells the caller the line reset. Gated on the phone still being
+            // CONNECTED: a stale answered queued behind a device-loss
+            // termination must never build a phantom session on a dead link
+            // (AOK-LIF-003).
+            if tracker.current().is_none() && status.connected.load(Ordering::Relaxed) {
+                let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                eprintln!(
+                    "[aokie-plugin] call ANSWERED with no tracked session — recovering as {id} (a terminate was misread or events were lost)"
+                );
+                if let Some(s) = tracker.ring(id, now_iso8601()) {
+                    *status.current_caller.lock().unwrap() = None;
+                    *status.current_call_id.lock().unwrap() = Some(s.id.clone());
+                    *status.call_started_at.lock().unwrap() = Some(s.started_at_iso.clone());
+                }
+            }
             // Lifecycle order (audit AOK-LIF-001): incoming ALWAYS precedes
             // answered — even when the caller-ID hold hasn't elapsed yet.
             flush_incoming_if_pending(tracker, outbox, sink);
-            status.call_active.store(true, Ordering::Relaxed);
             tracker.answered();
             if let Some(corr) = tracker.call_id() {
+                // Only a TRACKED call may read as active — an orphaned
+                // answer that wasn't recovered (dead link) must not leave
+                // `call_active` true with no session behind it.
+                status.call_active.store(true, Ordering::Relaxed);
                 emit(
                     outbox,
                     sink,
@@ -4442,6 +4467,59 @@ mod tests {
         let incoming_at = names.iter().position(|n| n == crate::contract::events::CALL_INCOMING);
         let ended_at = names.iter().position(|n| n == crate::contract::events::CALL_ENDED);
         assert!(incoming_at.is_some() && incoming_at < ended_at, "incoming precedes ended, got {names:?}");
+    }
+
+    /// AOK-CTRL-001: an ANSWER landing on an idle tracker while the phone is
+    /// still connected rebuilds a session (the live-call deafness bug: a
+    /// misread terminate killed the session, the late answer was a no-op and
+    /// every frame of a real call was dropped). After a device loss the same
+    /// stale answer must NOT build a phantom session (AOK-LIF-003).
+    #[test]
+    fn orphaned_answer_recovers_a_session_only_while_connected() {
+        use crate::event_bridge::VecSink;
+        use aokie_dongle::bluetooth::BluetoothEvent as E;
+
+        let status = Arc::new(RadioStatus::default());
+        let mut sink = VecSink::default();
+        let mut tracker = crate::call_session::SessionTracker::new();
+
+        // Connected phone, no session (a terminate was misread earlier).
+        status.connected.store(true, Ordering::Relaxed);
+        handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
+        assert!(tracker.current().is_some(), "session rebuilt");
+        assert!(tracker.current().unwrap().is_active(), "and answered");
+        assert!(status.call_active.load(Ordering::Relaxed));
+        assert_eq!(
+            status.current_call_id.lock().unwrap().as_deref(),
+            tracker.call_id()
+        );
+        let names: Vec<String> = sink
+            .lines
+            .iter()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["params"]["event"]["name"].as_str().unwrap_or("").to_string()
+            })
+            .collect();
+        let incoming_at = names.iter().position(|n| n == crate::contract::events::CALL_INCOMING);
+        let answered_at = names.iter().position(|n| n == crate::contract::events::CALL_ANSWERED);
+        assert!(
+            incoming_at.is_some() && incoming_at < answered_at,
+            "recovered session still emits incoming before answered: {names:?}"
+        );
+        // Clean up: terminate the recovered call normally.
+        handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
+
+        // Disconnected: the stale answer is dropped — no phantom session.
+        status.connected.store(false, Ordering::Relaxed);
+        sink.lines.clear();
+        handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
+        assert!(tracker.current().is_none(), "no phantom session on a dead link");
+        assert!(sink.lines.is_empty(), "and no events");
+        assert!(
+            !status.call_active.load(Ordering::Relaxed),
+            "an unrecovered orphan answer never reads as an active call"
+        );
     }
 
     /// Audit AOK-LIF-003: losing the phone/radio link under a live call
