@@ -63,7 +63,8 @@
   "errors": [
     "command_failed",
     "connector_missing",
-    "stale_call"
+    "stale_call",
+    "stale_turn"
   ],
   "callStates": [
     "ringing",

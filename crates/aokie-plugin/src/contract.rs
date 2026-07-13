@@ -143,6 +143,12 @@ pub mod errors {
     /// current call (stale browser tab / raced lifecycle) — the phone
     /// state was NOT touched (audit C-01).
     pub const STALE_CALL: &str = "stale_call";
+    /// §9.2 within-call staleness: the speech named the caller turn it
+    /// answers (`inResponseTo`), but a NEWER caller turn exists — the
+    /// conversation moved on. The reply was NOT spoken. Callers must treat
+    /// this as a benign skip, never as a failure that triggers fallback
+    /// speech (that would speak ANOTHER stale answer).
+    pub const STALE_TURN: &str = "stale_turn";
 }
 
 /// Canonical `call.current` / event call states (audit C-02): the ONLY
@@ -222,7 +228,12 @@ mod tests {
         assert_eq!(arr("commands"), super::commands::ALL, "fixture commands drifted from contract.rs");
         assert_eq!(
             arr("errors"),
-            [super::errors::COMMAND_FAILED, super::errors::CONNECTOR_MISSING, super::errors::STALE_CALL],
+            [
+                super::errors::COMMAND_FAILED,
+                super::errors::CONNECTOR_MISSING,
+                super::errors::STALE_CALL,
+                super::errors::STALE_TURN,
+            ],
             "fixture errors drifted"
         );
         assert_eq!(

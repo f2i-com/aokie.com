@@ -20,7 +20,7 @@
 //! The whole radio surface is Windows-only (WinUSB); on other targets
 //! [`spawn`] returns an error and the plugin simply never has a radio.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "voice")]
@@ -578,6 +578,12 @@ pub struct RadioStatus {
     pub gap_yields: AtomicU64,
     pub semantic_cuts: AtomicU64,
     pub barge_cuts: AtomicU64,
+    /// §9.2 within-call staleness: the turn number of the NEWEST caller turn
+    /// emitted for the current call (0 = none yet / call boundary). The
+    /// connector validates `call.operatorSpeak`'s optional `inResponseTo`
+    /// against this — a flow reply to an older turn gets a typed
+    /// `stale_turn` instead of speaking into a conversation that moved on.
+    pub last_caller_turn: AtomicU32,
     /// AOK-CTRL-001: whether the RUNNING radio's in-plugin agent owns replies
     /// (the env snapshot the radio actually started with, not the settings bag
     /// which may have changed since). The connector refuses `call.operatorSpeak`
@@ -2723,12 +2729,18 @@ fn run_loop(
     // their turn as finished and transcribe. Lower = snappier replies but risks
     // cutting off mid-sentence pauses. Tunable via AOKIE_STT_ENDPOINT_MS (set from
     // the `sttEndpointMs` connector setting); default 450 ms.
+    // §3.11 bounds reconciliation: honour exactly the range `settings.set`
+    // accepts (shared consts) — an accepted value must never silently fall
+    // back to the default.
     #[cfg(feature = "voice")]
     let stt_endpoint = std::time::Duration::from_millis(
         std::env::var("AOKIE_STT_ENDPOINT_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&m| (150..=2000).contains(&m))
+            .filter(|&m| {
+                (crate::connector::STT_ENDPOINT_MS_MIN..=crate::connector::STT_ENDPOINT_MS_MAX)
+                    .contains(&m)
+            })
             .unwrap_or(450),
     );
 
@@ -3048,6 +3060,9 @@ fn run_loop(
             }
             voice_call_gen = tracker.generation();
             stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
+            // §9.2: no caller turns exist yet in the new call — any reply
+            // still naming the previous call's turn number must read stale.
+            status.last_caller_turn.store(0, Ordering::Relaxed);
             synth.reset_call();
             while probe_result_rx.try_recv().is_ok() {}
             let _ = stt_tx.send(SttWork::ResetCall);
@@ -3560,6 +3575,9 @@ fn run_loop(
                         turn_overlapped,
                         turn_overlap_at.as_deref(),
                     );
+                    // §9.2: this is now the newest caller turn — a flow reply
+                    // naming an older one is stale (typed refusal upstream).
+                    status.last_caller_turn.store(turn_index, Ordering::Relaxed);
                     turn_overlapped = false;
                     turn_overlap_at = None;
                     turn_index += 1;
