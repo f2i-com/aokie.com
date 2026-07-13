@@ -1372,6 +1372,14 @@ fn run_runtime(
     // Phase 4e: dedupe SLC-fired Subscribe enqueues. Reset on ACL
     // disconnect so the next pairing re-subscribes.
     let mut mns_subscription_attempted_for_acl = false;
+    // When the Subscribe was queued — the MNS-absence grace clock. On
+    // outbound (initiator-mux) sessions the phone cannot open its MNS
+    // notification DLCI toward us yet, so MNS stays AwaitingConnect for
+    // the whole ACL; once this clock passes MNS_ABSENT_POLL_GRACE the
+    // inbox poll stops waiting for MNS and becomes the inbound-SMS
+    // channel itself (live 2026-07-13: a customer's reply sat unread
+    // for 25 minutes because the poll was gated on MNS Connected).
+    let mut mns_subscribe_attempted_at: Option<Instant> = None;
     // Inbox-poll fallback for dropped MNS pushes. seen_handles tracks
     // every handle we've ever queued FetchMessage for in this ACL
     // session so neither MNS nor poll double-fetches. inbox_poll_seeded
@@ -1457,6 +1465,9 @@ fn run_runtime(
     // 20 s window just delayed the customer-visible recovery.
     const MAS_STALL_ESCALATION: Duration = Duration::from_secs(5);
     let mut mas_recovery_attempted_at: Option<Instant> = None;
+    // When the CURRENT active_map_op went in flight — the per-op
+    // deadline clock (see the op_overdue check in the watchdog).
+    let mut active_map_op_since: Option<Instant> = None;
     // Tracks the "MAP work pending" state across loop iterations so
     // we can detect the idle→active edge. When work transitions from
     // none to some, we reset `last_acl_inbound_at` so the stall
@@ -1760,6 +1771,7 @@ fn run_runtime(
                 {
                     pending_map_ops.push_front(PendingMapOp::Subscribe);
                     mns_subscription_attempted_for_acl = true;
+                    mns_subscribe_attempted_at = Some(Instant::now());
                     if PBAP_AUTO_FETCH_ON_RECONNECT {
                         pbap_pending_for_acl = true;
                         pbap_pending_since = Some(Instant::now());
@@ -1941,6 +1953,30 @@ fn run_runtime(
             }
             prev_map_work_pending = map_work_pending;
             let acl_silent = last_acl_inbound_at.elapsed() >= MAS_STALL_THRESHOLD;
+            // Per-op deadline (2026-07-13): ACL silence alone can't catch
+            // an op wedged mid-OBEX on an otherwise-healthy link — the
+            // AT+CIND? keepalive replies keep refreshing the inbound
+            // stamp forever (live: a mangled listing response left
+            // PollInbox in AwaitingFirstGet permanently, blocking every
+            // future poll behind active_map_op). Healthy ops finish in
+            // under a second; 30s of no completion = wedged.
+            if active_map_op.is_some() && active_map_op_since.is_none() {
+                active_map_op_since = Some(Instant::now());
+            }
+            if active_map_op.is_none() {
+                active_map_op_since = None;
+            }
+            let op_overdue = active_map_op_since
+                .is_some_and(|t| t.elapsed() >= MAP_OP_DEADLINE);
+            if op_overdue {
+                if let Some(op) = active_map_op.as_ref() {
+                    eprintln!(
+                        "[AokieRadio] MAP op {} exceeded the {:?} op deadline on a healthy ACL — forcing stall recovery",
+                        op.log_summary(),
+                        MAP_OP_DEADLINE
+                    );
+                }
+            }
 
             // Drop the stage-1 timestamp as soon as Pixel responds to
             // anything — the recovery worked, no need to escalate.
@@ -1954,7 +1990,7 @@ fn run_runtime(
                 mas_recovery_attempted_at = None;
             }
 
-            if active_acl_handle.is_some() && map_work_pending && acl_silent {
+            if active_acl_handle.is_some() && map_work_pending && (acl_silent || op_overdue) {
                 if let Some(stage1_at) = mas_recovery_attempted_at {
                     // Stage 2: stage-1 fired but Pixel still hasn't
                     // responded. Escalate to ACL teardown.
@@ -3081,6 +3117,7 @@ fn run_runtime(
                             active_map_op = None;
                             map_idle_since = None;
                             mns_subscription_attempted_for_acl = false;
+                            mns_subscribe_attempted_at = None;
                             pbap_pending_for_acl = false;
                             pbap_pending_since = None;
                             // Keep `seen_handles` and `inbox_poll_seeded`
@@ -3410,6 +3447,7 @@ fn run_runtime(
                     if !mns_subscription_attempted_for_acl {
                         pending_map_ops.push_front(PendingMapOp::Subscribe);
                         mns_subscription_attempted_for_acl = true;
+                        mns_subscribe_attempted_at = Some(Instant::now());
                         // PBAP is currently disabled by default on reconnect.
                         // Pixel's PSE flips SRM=enable on the first GET response,
                         // and our PCE doesn't honor SRM — so the phone stops
@@ -3499,6 +3537,19 @@ fn run_runtime(
                 .lock()
                 .map(|g| matches!(*g.state(), MnsState::Connected | MnsState::AssemblingPut))
                 .unwrap_or(false);
+            // MNS that never arrived: on an outbound (initiator-mux)
+            // session the phone cannot open its notification DLCI
+            // toward us, so MNS sits AwaitingConnect for the whole ACL.
+            // Past the grace window the poll IS the inbound-SMS channel
+            // — gating it on MNS Connected left a customer's reply
+            // unread for the rest of the session (live 2026-07-13).
+            // MAS itself is demonstrably healthy on these sessions
+            // (Subscribe + SendReply complete in <1s), so the original
+            // "don't poke a wedged phone" rationale doesn't apply.
+            let mns_never_arrived = !mns_active
+                && mns_subscribe_attempted_at
+                    .is_some_and(|t| t.elapsed() >= MNS_ABSENT_POLL_GRACE);
+            let poll_channel_ready = mns_active || mns_never_arrived;
             // Defer PollInbox if a SendReply finished recently. See
             // POLL_SKIP_AFTER_REPLY: poking dlci 11 with a SETPATH
             // while Pixel's MAS is still committing the just-PUT SMS
@@ -3507,7 +3558,7 @@ fn run_runtime(
                 None => true,
                 Some(ts) => ts.elapsed() >= POLL_SKIP_AFTER_REPLY,
             };
-            if mns_active && send_reply_quiet {
+            if poll_channel_ready && send_reply_quiet {
                 let due = match last_inbox_poll {
                     None => true,
                     Some(ts) => ts.elapsed() >= INBOX_POLL_INTERVAL,
@@ -3519,7 +3570,7 @@ fn run_runtime(
                         seed_attempts = seed_attempts.saturating_add(1);
                     }
                 }
-            } else if mns_active && !send_reply_quiet {
+            } else if poll_channel_ready && !send_reply_quiet {
                 // Make the gate visible in logs once per cycle:
                 // suppresses one log per 5s heartbeat-aligned window so
                 // we can see "we wanted to poll but we were holding
@@ -4406,6 +4457,21 @@ fn pending_op_to_mas_operation(op: &PendingMapOp) -> MasOperation {
 /// both the radio loop and `handle_map_runtime_event` share one TTL.)
 const SEND_REPLY_RETAIN_TTL: Duration = Duration::from_secs(120);
 
+/// How long after queueing the MAP Subscribe we keep waiting for the
+/// phone's MNS connection before the inbox poll takes over as THE
+/// inbound-SMS channel. On phone-initiated sessions MNS connects within
+/// ~2s of the Subscribe ack, so 20s cleanly separates "still coming"
+/// from "not coming on this session shape" (outbound/initiator-mux
+/// sessions, where the phone cannot open its notification DLCI to us).
+const MNS_ABSENT_POLL_GRACE: Duration = Duration::from_secs(20);
+
+/// How long one MAS op may stay in flight before the watchdog treats
+/// it as wedged even though the ACL itself is healthy (keepalive
+/// replies keep the link-silence clock fresh, so ACL silence alone
+/// never fires for a mid-OBEX wedge). Healthy ops — including the
+/// 5-entry inbox listing — complete in well under a second.
+const MAP_OP_DEADLINE: Duration = Duration::from_secs(30);
+
 /// How often to poll the inbox listing as a backstop for dropped MNS
 /// pushes. Pixel's MAP intermittency is unpredictable — sometimes
 /// every notification arrives, sometimes one in three. 45 s strikes a
@@ -4574,6 +4640,27 @@ fn handle_map_runtime_event(
 /// arrived during the dead session is most likely sitting at the top
 /// of the listing, and silently dropping it is exactly the symptom
 /// the recovery cycle is meant to fix.
+/// True when a listing entry's local timestamp falls within the last
+/// hour of OUR local wall clock. MAP datetimes are ISO-8601 basic with
+/// the PHONE's local time ("20260713T185500+1000"); the phone and this
+/// desktop share a room, so comparing local wall-clock prefixes is
+/// reliable in practice. Entries with no/short datetime pass (a phone
+/// that omits the attribute must not block the catch-up).
+fn entry_is_recent(entry: &crate::aokie_radio::map_listing::MessageEntry) -> bool {
+    let Some(dt) = entry.datetime.as_deref() else {
+        return true;
+    };
+    // get(..15) — never panics on a non-char-boundary (the listing body
+    // is from_utf8_lossy'd, so garbage bytes become multibyte chars).
+    let Some(prefix) = dt.get(..15) else {
+        return true;
+    };
+    let cutoff = (chrono::Local::now() - chrono::Duration::hours(1))
+        .format("%Y%m%dT%H%M%S")
+        .to_string();
+    prefix >= cutoff.as_str()
+}
+
 fn handle_inbox_listing(
     bytes: &[u8],
     pending_map_ops: &mut VecDeque<PendingMapOp>,
@@ -4590,12 +4677,24 @@ fn handle_inbox_listing(
         let catchup_handle = if seed_attempts >= 2 {
             entries.first().map(|e| e.handle.clone())
         } else {
-            None
+            // First seed: an UNREAD top-of-inbox message that arrived
+            // RECENTLY is very likely one the customer sent while our
+            // inbound path was down (plugin restart, or an MNS-less
+            // outbound session before the poll's first pass — live
+            // 2026-07-13: a follow-up reply sat stranded exactly here).
+            // One bounded catch-up fetch; read history is never touched,
+            // and anything older than the recency window stays seeded
+            // ("a surprise late reply is worse than silence").
+            entries
+                .first()
+                .filter(|e| e.read == Some(false) && entry_is_recent(e))
+                .map(|e| e.handle.clone())
         };
         if let Some(handle) = catchup_handle {
             eprintln!(
-                "[AokieRadio] inbox poll seeded with {} existing handle(s) on retry attempt #{} \
-                 — fetching top entry {} as catch-up for the dead session window",
+                "[AokieRadio] inbox poll seeded with {} existing handle(s) (attempt #{}) \
+                 — fetching top entry {} as catch-up (retry seed, or unread+recent arrival \
+                 from the window before the first poll)",
                 entries.len(),
                 seed_attempts,
                 handle
