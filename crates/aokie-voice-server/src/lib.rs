@@ -82,7 +82,7 @@ impl VoiceServer {
             .map_err(|e| AppError::new(500, format!("STT transcribe failed: {e}")))
     }
 
-    fn synthesize_wav(&self, input: &str, voice: &str) -> Result<Vec<u8>, AppError> {
+    fn synthesize_wav(&self, input: &str, voice: &str, speed: f32) -> Result<Vec<u8>, AppError> {
         if !self.paths.tts_files_present() {
             return Err(AppError::new(
                 503,
@@ -121,6 +121,9 @@ impl VoiceServer {
             .iter()
             .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
             .collect();
+        // Pitch-preserving rate change at the model's native sample rate
+        // (a no-op at speed 1.0).
+        let pcm = aokie_core::time_stretch::stretch_i16(&pcm, sample_rate, speed);
         write_pcm16_wav(&pcm, sample_rate)
             .map_err(|e| AppError::new(500, format!("WAV encode failed: {e}")))
     }
@@ -383,11 +386,36 @@ fn handle_speech(
         }
     }
 
+    // OpenAI-compatible `speed`: a speaking-rate multiplier applied as a
+    // pitch-preserving WSOLA time stretch on the synthesized waveform
+    // (Pocket-TTS has no native tempo control). Validated, not clamped —
+    // a wildly out-of-band request is a caller bug worth surfacing.
+    let speed = match request.speed {
+        None => 1.0f32,
+        Some(s)
+            if s.is_finite()
+                && (aokie_core::time_stretch::MIN_RATE..=aokie_core::time_stretch::MAX_RATE)
+                    .contains(&(s as f32)) =>
+        {
+            s as f32
+        }
+        Some(_) => {
+            return Err(AppError::new(
+                400,
+                format!(
+                    "speed must be between {} and {}",
+                    aokie_core::time_stretch::MIN_RATE,
+                    aokie_core::time_stretch::MAX_RATE
+                ),
+            ))
+        }
+    };
+
     let voice = request.voice.as_deref().unwrap_or("");
     // Speech-normalize ("10 a.m.," -> "10 AM,") so every consumer of this
     // service gets stutter-free synthesis, same rewrite as the plugin's TTS.
     let input = aokie_core::speech::normalize_speech_text(input);
-    Ok(HttpResponse::wav(server.synthesize_wav(&input, voice)?))
+    Ok(HttpResponse::wav(server.synthesize_wav(&input, voice, speed)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -405,6 +433,9 @@ struct SpeechJson {
     #[allow(dead_code)]
     model: Option<String>,
     response_format: Option<String>,
+    /// OpenAI-compatible speaking-rate multiplier (1.0 = normal); applied as
+    /// a pitch-preserving time stretch. Bounds: aokie_core::time_stretch.
+    speed: Option<f64>,
 }
 
 fn header_value<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
@@ -1194,6 +1225,39 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("TTS model files"));
+    }
+
+    /// OpenAI-compatible `speed`: validated BEFORE any engine work — an
+    /// out-of-band value is a 400 naming the bounds; an in-band value on a
+    /// modelless server still reaches the graceful 503 (i.e. it parsed).
+    #[test]
+    fn speech_speed_is_validated() {
+        let (_tmp, server) = test_server(MAX_BODY_BYTES);
+        for bad in ["0.1", "3.5", "-1", "0"] {
+            let body = format!(r#"{{"input":"hello","speed":{bad}}}"#);
+            let response = handle_request(
+                &server,
+                "POST",
+                "/v1/audio/speech",
+                &json_header(),
+                body.as_bytes(),
+            );
+            assert_eq!(response.status, 400, "speed {bad} must be rejected");
+            let value = decode_json(&response.body);
+            assert!(
+                value["error"]["message"].as_str().unwrap().contains("speed"),
+                "error names the field: {value}"
+            );
+        }
+        // Valid speed passes validation (503 = models absent, not a speed error).
+        let response = handle_request(
+            &server,
+            "POST",
+            "/v1/audio/speech",
+            &json_header(),
+            br#"{"input":"hello","speed":0.75}"#,
+        );
+        assert_eq!(response.status, 503);
     }
 
     #[test]
