@@ -1229,6 +1229,7 @@ fn describe_at_command(command: &hfp::HfpAtCommand) -> &'static str {
         hfp::HfpAtCommand::Answer => "ATA",
         hfp::HfpAtCommand::RejectOrHangup => "AT+CHUP",
         hfp::HfpAtCommand::ConfirmCodec(_) => "AT+BCS",
+        hfp::HfpAtCommand::ListCurrentCalls => "AT+CLCC",
     }
 }
 
