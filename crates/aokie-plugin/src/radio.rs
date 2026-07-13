@@ -1286,6 +1286,25 @@ fn greeting_tone(sample_rate: u16) -> Vec<i16> {
 /// it trips, so without this capture the first words of an interruption (the
 /// leading digits of a phone number, classically) were used for detection and
 /// then thrown away — the STT only ever saw the part spoken after the trip.
+/// Delivery-truth v1 (architecture guide §6.3): the numbers needed to
+/// conservatively estimate how much of a CUT span the caller actually heard.
+/// The engine knows exactly what was QUEUED to the SCO and how long audio had
+/// been flowing when the cut landed; remote playout stays an estimate.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CutEstimate {
+    /// Estimated audible playout at the cut: wall time since the first audio
+    /// frame, capped by what was queued (audio can't play faster than it was
+    /// fed).
+    audible_ms: u64,
+    /// Everything pushed to the SCO TX queue (includes up to ~PLAYOUT_LEAD of
+    /// audio that was flushed unplayed by the cut).
+    queued_ms: u64,
+    /// The span's TOTAL synthesized duration — known exactly only when
+    /// synthesis finished before the cut (queued + discarded pending PCM).
+    synthesized_ms: Option<u64>,
+}
+
 #[cfg(all(target_os = "windows", feature = "voice"))]
 struct SpeakOutcome {
     dur: std::time::Duration,
@@ -1302,6 +1321,11 @@ struct SpeakOutcome {
     /// playback was cut (even through a protected span; explicit commands
     /// always win) and the dialogue should enter its pause state NOW.
     commanded: Option<crate::duplex::CallerIntent>,
+    /// §6.3 delivery truth: set when playback was CUT SHORT (barge / spoken
+    /// command / urgent control) after some audio played — the numbers a
+    /// consumer needs to estimate the audible prefix. `None` = the span
+    /// played to its natural end, or nothing played at all.
+    cut_est: Option<CutEstimate>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1928,6 +1952,9 @@ impl TtsChunkPlayback {
             captured_speech,
             cancelled: self.cancelled,
             commanded: self.semantic,
+            // The paced loop (tts_speak) fills this in — only IT knows whether
+            // the loop exited early and how much synthesized PCM it discarded.
+            cut_est: None,
         }
     }
 }
@@ -1954,6 +1981,50 @@ fn note_tts_outcome(status: &RadioStatus, out: &SpeakOutcome) {
                 .to_string(),
         );
     }
+}
+
+/// §6.3 delivery-truth v1 (alignment fallback #4 — conservative duration-
+/// weighted estimation): which PREFIX of a cut span's display text did the
+/// caller plausibly hear? The local engines expose no word/phoneme alignment,
+/// so the estimate is deliberately conservative — UNDERCLAIM, never overclaim:
+/// duration-weighted against the span's exact synthesized total when synthesis
+/// finished before the cut, intersected with a chars-per-second ceiling
+/// (~14 cps at rate 1.0), then FLOORED to a word boundary (never half a word).
+/// The fraction maps display chars, not TTS-normalized chars — digit expansion
+/// skews seconds-per-display-char, which the floor + min() absorb for v1.
+/// Returns the prefix and whether the boundary is uncertain (true for
+/// anything short of a full play). Underclaiming costs only a little natural
+/// redundancy in the repair; overclaiming loses information the caller never
+/// heard.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn estimate_audible_prefix(text: &str, rate: f32, cut: &CutEstimate) -> (String, bool) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() || cut.audible_ms == 0 {
+        return (String::new(), true);
+    }
+    if let Some(total) = cut.synthesized_ms {
+        if cut.audible_ms >= total {
+            // The cut landed after everything queued had played out — the
+            // whole span was plausibly heard.
+            return (text.to_string(), false);
+        }
+    }
+    let cps = 14.0f32 * rate.max(0.1);
+    let by_cps = (cut.audible_ms as f32 / 1000.0 * cps) as usize;
+    let est = match cut.synthesized_ms {
+        Some(total) if total > 0 => {
+            let frac = (cut.audible_ms as f32 / total as f32).min(1.0);
+            ((frac * chars.len() as f32) as usize).min(by_cps)
+        }
+        _ => by_cps,
+    };
+    if est >= chars.len() {
+        return (text.to_string(), true);
+    }
+    // Floor to the previous word boundary — never claim half a word.
+    let prefix: String = chars[..est].iter().collect();
+    let cut_at = prefix.rfind(char::is_whitespace).unwrap_or(0);
+    (prefix[..cut_at].trim_end().to_string(), true)
 }
 
 /// How far ahead of real playout the SCO TX queue is kept topped up (phase 2).
@@ -2163,6 +2234,7 @@ fn tts_speak(
         captured_speech: Vec::new(),
         cancelled: false,
         commanded: None,
+        cut_est: None,
     };
     if sample_rate == 0 || text.trim().is_empty() {
         return none;
@@ -2181,6 +2253,9 @@ fn tts_speak(
     let mut synth_err: Option<String> = None;
     let chunk = http_tts_chunk_samples(sample_rate); // ~20 ms
     let mut stopped = false;
+    // §6.3 delivery truth: did playback run to completion, or was it cut?
+    // Only the CUT case needs an audible-prefix estimate.
+    let mut natural_end = false;
     loop {
         let now = std::time::Instant::now();
         // Urgent controls cut even while we're idling between frames.
@@ -2248,6 +2323,7 @@ fn tts_speak(
         }
         // Natural end: synthesis finished, everything queued, playout done.
         if synth_done && pending.is_empty() && playback.played_out(now) {
+            natural_end = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -2257,12 +2333,34 @@ fn tts_speak(
     if playback.cancelled || playback.barged || playback.semantic.is_some() || !synth_done {
         synth.cancel();
     }
-    if let Some(e) = synth_err {
+    if let Some(e) = synth_err.as_ref() {
         if playback.samples == 0 {
             eprintln!("[aokie-plugin] TTS synthesis failed: {e}");
         }
     }
-    playback.into_outcome(text, sample_rate)
+    // §6.3 delivery truth: a cut span records the numbers needed to estimate
+    // its audible prefix — what was queued, how long audio flowed, and (when
+    // synthesis finished first) the exact synthesized total.
+    let cut_est = if !natural_end && !playback.first && playback.samples > 0 {
+        let sr = sample_rate.max(1) as u64;
+        let queued_ms = playback.samples as u64 * 1000 / sr;
+        let audible_ms = (playback.t_first.elapsed().as_millis() as u64).min(queued_ms);
+        let synthesized_ms = if synth_done && synth_err.is_none() {
+            Some(queued_ms + pending.len() as u64 * 1000 / sr)
+        } else {
+            None
+        };
+        Some(CutEstimate {
+            audible_ms,
+            queued_ms,
+            synthesized_ms,
+        })
+    } else {
+        None
+    };
+    let mut out = playback.into_outcome(text, sample_rate);
+    out.cut_est = cut_est;
+    out
 }
 
 /// The outcome of speaking one PLANNED utterance (a sequence of validated
@@ -2274,8 +2372,15 @@ struct PlannedSpeech {
     outcome: SpeakOutcome,
     /// Everything the plan intended to say (markers stripped).
     text: String,
-    /// The spans that audibly played, in order (markers stripped).
+    /// §6.3 estimated-AUDIBLE text (markers stripped): full spans that played
+    /// to their natural end, plus a CONSERVATIVE word-floored prefix of the
+    /// cut span. What transcripts, history and the nudge may claim was heard.
     played_text: String,
+    /// §6.3 text SENT toward the phone (markers stripped): the full text of
+    /// every span that produced audio, cut span included — the comparator for
+    /// the echo guard and deterministic replay, where the flushed-but-echoed
+    /// tail must still match.
+    sent_text: String,
 }
 
 /// Speak `raw_text` through the span planner: strips/validates any control
@@ -2310,8 +2415,10 @@ fn speak_planned(
         captured_speech: Vec::new(),
         cancelled: false,
         commanded: None,
+        cut_est: None,
     };
-    let mut played: Vec<&str> = Vec::new();
+    let mut played: Vec<String> = Vec::new();
+    let mut sent: Vec<String> = Vec::new();
     for span in &spans {
         let finish_extra = match span.policy {
             crate::speech_plan::InterruptPolicy::Yield => None,
@@ -2333,7 +2440,20 @@ fn speak_planned(
         );
         outcome.dur += out.dur;
         if out.dur > Duration::ZERO {
-            played.push(&span.text);
+            sent.push(span.text.clone());
+            match &out.cut_est {
+                // Cut mid-span: claim only the conservative audible prefix
+                // (§6.3) — overclaiming loses whatever the caller never heard
+                // from the transcript, the history AND the nudge tail.
+                Some(cut) => {
+                    let (prefix, _uncertain) =
+                        estimate_audible_prefix(&span.text, span.rate, cut);
+                    if !prefix.is_empty() {
+                        played.push(prefix);
+                    }
+                }
+                None => played.push(span.text.clone()),
+            }
         }
         if !out.captured_speech.is_empty() {
             outcome.captured_speech.extend_from_slice(&out.captured_speech);
@@ -2356,6 +2476,7 @@ fn speak_planned(
         outcome,
         text,
         played_text: played.join(" "),
+        sent_text: sent.join(" "),
     }
 }
 
@@ -3323,8 +3444,10 @@ fn run_loop(
                         history.push(
                             serde_json::json!({ "role": "assistant", "content": planned.played_text }),
                         );
-                        last_bot_reply = planned.played_text.clone();
-                        last_bot_speech = planned.played_text;
+                        // Echo guard + replay compare against what was SENT —
+                        // the flushed-but-echoed tail must still match (§6.3).
+                        last_bot_reply = planned.sent_text.clone();
+                        last_bot_speech = planned.sent_text;
                     } else {
                         eprintln!(
                             "[aokie-plugin] greeting produced NO audio (TTS failed) — not recorded as a spoken turn"
@@ -3812,7 +3935,7 @@ fn run_loop(
                                                 "role": "assistant",
                                                 "content": planned.played_text,
                                             }));
-                                            last_bot_reply = planned.played_text;
+                                            last_bot_reply = planned.sent_text;
                                         }
                                         if let Some(action) = probe.action.take() {
                                             perform_cancel_action(
@@ -3960,6 +4083,11 @@ fn run_loop(
                             // generation — populated in BOTH duplex modes so a
                             // mid-reply failure/hangup records what played.
                             let mut spoken: Vec<String> = Vec::new();
+                            // §6.3: the SENT twin of `spoken` — full span text
+                            // that produced audio (echo guard / replay), while
+                            // `spoken` holds the conservative audible estimate
+                            // (transcript / history / nudge).
+                            let mut sent_spans: Vec<String> = Vec::new();
                             eprintln!("[aokie-plugin] agent replying (streaming)â€¦");
                             // AOK-CTRL-001: the LLM stream runs on a DETACHED
                             // worker; this thread pumps sentences + controls, so
@@ -4198,10 +4326,13 @@ fn run_loop(
                                         reply_dur += out.dur;
                                         // Truthful transcript (AOK-VOICE-001): record
                                         // only the spans that audibly PLAYED.
-                                        if !planned.played_text.is_empty()
-                                            && out.dur > Duration::ZERO
-                                        {
-                                            spoken.push(planned.played_text.clone());
+                                        if out.dur > Duration::ZERO {
+                                            if !planned.played_text.is_empty() {
+                                                spoken.push(planned.played_text.clone());
+                                            }
+                                            if !planned.sent_text.is_empty() {
+                                                sent_spans.push(planned.sent_text.clone());
+                                            }
                                         }
                                         if !barge_in {
                                             let plays_until = (t0 + reply_dur).max(Instant::now());
@@ -4246,7 +4377,11 @@ fn run_loop(
                                         // answers THEM instead of finishing a stale
                                         // paragraph. Backchannels and echo never steer.
                                         let bot_so_far = {
-                                            let mut b = spoken.join(" ");
+                                            // Echo comparison wants the SENT
+                                            // text (§6.3) — echo returns from
+                                            // audio that left us, estimated
+                                            // heard or not.
+                                            let mut b = sent_spans.join(" ");
                                             b.push(' ');
                                             b.push_str(&planned.text);
                                             b
@@ -4419,10 +4554,25 @@ fn run_loop(
                                             )),
                                         );
                                         turn_index += 1;
-                                        last_bot_reply = heard;
-                                        // Clean playable text — what "repeat that
-                                        // (slower)" replays. No truncation tags.
-                                        last_bot_speech = played;
+                                        // Echo guard + replay compare/replay what
+                                        // was SENT (§6.3) — the flushed-but-echoed
+                                        // tail must still match; the transcript
+                                        // above stays the conservative estimate.
+                                        let sent_full =
+                                            sent_spans.join(" ").trim().to_string();
+                                        last_bot_reply = if sent_full.is_empty() {
+                                            heard
+                                        } else {
+                                            match cut {
+                                                Some(tag) => format!("{sent_full}{tag}"),
+                                                None => sent_full.clone(),
+                                            }
+                                        };
+                                        last_bot_speech = if sent_full.is_empty() {
+                                            played
+                                        } else {
+                                            sent_full
+                                        };
                                     } else if !heard.is_empty() {
                                         eprintln!(
                                             "[aokie-plugin] agent reply produced NO audio (TTS failed) — not recorded as a spoken turn"
@@ -5892,6 +6042,71 @@ mod tests {
         assert!(!p.stop_playback_now(now), "ordinary overlap rides the budget");
         p.semantic = Some(crate::duplex::CallerIntent::StopSpeaking);
         assert!(p.stop_playback_now(now), "spoken command beats protection");
+    }
+
+    /// §6.3 delivery-truth v1: the audible-prefix estimator UNDERCLAIMS —
+    /// duration-weighted against exact totals when synthesis finished,
+    /// capped by a chars-per-second ceiling, floored to a word boundary.
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[test]
+    fn audible_prefix_estimate_is_conservative() {
+        let text = "Your appointment is on Thursday at ten in the morning";
+        // Cut ~40% through a 4s span whose synthesis finished: claims a
+        // word-floored prefix, never the whole sentence, flagged uncertain.
+        let (prefix, uncertain) = estimate_audible_prefix(
+            text,
+            1.0,
+            &CutEstimate { audible_ms: 1600, queued_ms: 1800, synthesized_ms: Some(4000) },
+        );
+        assert!(uncertain);
+        assert!(text.starts_with(&prefix), "estimate must be a prefix");
+        assert!(prefix.len() < text.len(), "a mid-span cut must not claim everything");
+        assert!(!prefix.is_empty(), "1.6s of audio heard something");
+        assert!(!prefix.ends_with(char::is_whitespace));
+        // The prefix always ends on a WORD boundary of the original text.
+        assert!(text[prefix.len()..].starts_with(' '), "must cut at a word boundary");
+
+        // The cut landed after everything played out: the whole span was
+        // plausibly heard — full text, certain.
+        let (all, uncertain) = estimate_audible_prefix(
+            text,
+            1.0,
+            &CutEstimate { audible_ms: 4000, queued_ms: 4000, synthesized_ms: Some(4000) },
+        );
+        assert_eq!(all, text);
+        assert!(!uncertain);
+
+        // Synthesis NOT finished (total unknown): the chars-per-second
+        // ceiling alone drives it — 300ms at rate 1.0 is a couple of words
+        // at most, never half the sentence.
+        let (short, uncertain) = estimate_audible_prefix(
+            text,
+            1.0,
+            &CutEstimate { audible_ms: 300, queued_ms: 500, synthesized_ms: None },
+        );
+        assert!(uncertain);
+        assert!(short.len() <= 5, "300ms cannot claim more than ~4 chars, got {short:?}");
+
+        // Nothing audible = nothing claimed.
+        let (none, _) = estimate_audible_prefix(
+            text,
+            1.0,
+            &CutEstimate { audible_ms: 0, queued_ms: 0, synthesized_ms: None },
+        );
+        assert!(none.is_empty());
+
+        // A slower span rate lowers the ceiling proportionally.
+        let (slow, _) = estimate_audible_prefix(
+            text,
+            0.5,
+            &CutEstimate { audible_ms: 1000, queued_ms: 1200, synthesized_ms: None },
+        );
+        let (fast, _) = estimate_audible_prefix(
+            text,
+            1.0,
+            &CutEstimate { audible_ms: 1000, queued_ms: 1200, synthesized_ms: None },
+        );
+        assert!(slow.len() <= fast.len());
     }
 
     /// Phase 2 pacing: the first chunk always goes (it starts the playout
