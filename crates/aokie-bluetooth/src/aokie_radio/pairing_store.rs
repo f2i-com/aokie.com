@@ -39,6 +39,20 @@ struct StoredLinkKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_sealed: Option<String>,
     key_type: u8,
+    /// The device's user-friendly name / model (e.g. "Lance's Pixel 8"),
+    /// captured via HCI Remote Name Request on connection. NOT a credential
+    /// (plaintext), so the "avoid confusion between multiple phones" list can
+    /// show it. `None` for records bonded before this field existed (serde
+    /// default) — the name fills in the next time the device connects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+/// One bonded device for the "paired phones" UI: address + (captured) name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedDeviceRecord {
+    pub address: String,
+    pub name: Option<String>,
 }
 
 const STORE_VERSION_PLAINTEXT: u8 = 1;
@@ -115,6 +129,35 @@ impl AokiePairingStore {
         self.records.keys().cloned().collect()
     }
 
+    /// Every bonded device with its captured name (for the "paired phones" UI).
+    /// Link keys are never exposed — only address + friendly name.
+    pub fn list_devices(&self) -> Vec<PairedDeviceRecord> {
+        self.records
+            .iter()
+            .map(|(address, record)| PairedDeviceRecord {
+                address: address.clone(),
+                name: record.name.clone(),
+            })
+            .collect()
+    }
+
+    /// Store/refresh a bonded device's friendly name (HCI Remote Name Request
+    /// result). No-op (returns false) when the device isn't bonded or the name
+    /// is unchanged — so a redundant name-request never rewrites the file.
+    pub fn set_name(&mut self, address: &str, name: &str) -> Result<bool, String> {
+        let name = name.trim();
+        let Some(record) = self.records.get_mut(&normalize_address(address)) else {
+            return Ok(false);
+        };
+        let new = if name.is_empty() { None } else { Some(name.to_string()) };
+        if record.name == new {
+            return Ok(false);
+        }
+        record.name = new;
+        self.save()?;
+        Ok(true)
+    }
+
     /// True when a link key is stored for `address` — i.e. this is a bonded
     /// ("known") device. AOK-BT-001 lets bonded devices reconnect even when
     /// the pairing window is closed; strangers can't.
@@ -164,6 +207,12 @@ impl AokiePairingStore {
     }
 
     pub fn put(&mut self, address: &str, link_key: [u8; 16], key_type: u8) -> Result<(), String> {
+        // Preserve a previously-captured name across a re-bond (re-pairing the
+        // same phone must not blank its friendly name in the list).
+        let name = self
+            .records
+            .get(&normalize_address(address))
+            .and_then(|r| r.name.clone());
         let record = if aokie_core::dpapi::platform_supported() {
             // Windows: sealing is mandatory — a bond we can't protect is a
             // bond we refuse to store (the phone will just re-pair).
@@ -171,6 +220,7 @@ impl AokiePairingStore {
                 key_hex: None,
                 key_sealed: Some(aokie_core::dpapi::protect(&link_key)?),
                 key_type,
+                name,
             }
         } else {
             // Non-Windows dev transport: 0600 plaintext file (atomic_write).
@@ -178,6 +228,7 @@ impl AokiePairingStore {
                 key_hex: Some(encode_link_key_hex(&link_key)),
                 key_sealed: None,
                 key_type,
+                name,
             }
         };
         self.records.insert(normalize_address(address), record);
@@ -289,6 +340,40 @@ mod tests {
 
         let reloaded = AokiePairingStore::load(&path).unwrap();
         assert_eq!(reloaded.len(), 0, "removal survived a reload");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn device_names_persist_and_survive_a_rebond() {
+        let path = temp_store_path("names");
+        let _ = std::fs::remove_file(&path);
+
+        let mut store = AokiePairingStore::load(&path).unwrap();
+        store.put("04:c8:b0:e1:3f:f3", [0x11; 16], 0x05).unwrap();
+        // No name yet → the list shows the bare address.
+        assert_eq!(store.list_devices()[0].name, None);
+
+        // Capture the name (Remote Name Request result); it persists.
+        assert!(store.set_name("04:C8:B0:E1:3F:F3", "Lance's Pixel 8").unwrap());
+        // A redundant set is a no-op (never rewrites the file).
+        assert!(!store.set_name("04:c8:b0:e1:3f:f3", "Lance's Pixel 8").unwrap());
+        // Naming an unbonded device is a no-op, not an error.
+        assert!(!store.set_name("aa:bb:cc:dd:ee:ff", "Ghost").unwrap());
+
+        let reloaded = AokiePairingStore::load(&path).unwrap();
+        let dev = &reloaded.list_devices()[0];
+        assert_eq!(dev.address, "04:C8:B0:E1:3F:F3");
+        assert_eq!(dev.name.as_deref(), Some("Lance's Pixel 8"));
+
+        // Re-pairing the SAME phone keeps its name.
+        let mut reloaded = reloaded;
+        reloaded.put("04:C8:B0:E1:3F:F3", [0x22; 16], 0x06).unwrap();
+        assert_eq!(
+            reloaded.list_devices()[0].name.as_deref(),
+            Some("Lance's Pixel 8"),
+            "a re-bond must not blank the captured name"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

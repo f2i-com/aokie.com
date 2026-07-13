@@ -89,6 +89,12 @@ pub enum RadioControl {
         address: String,
         reply: std::sync::mpsc::Sender<Result<bool, String>>,
     },
+    /// Disconnect the connected phone but KEEP the bond (remote reconnect/
+    /// unstick); replies whether a live link was actually dropped.
+    Disconnect {
+        address: String,
+        reply: std::sync::mpsc::Sender<Result<bool, String>>,
+    },
     /// PAIR-001: resolve the held SSP numeric comparison for `address` —
     /// `accept` completes the bond, `false` refuses it.
     ConfirmPairing {
@@ -96,9 +102,14 @@ pub enum RadioControl {
         accept: bool,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
-    /// AOK-BT-001: list bonded (revocable) device addresses; answered over `reply`.
+    /// AOK-BT-001: list bonded (revocable) devices with names; answered over
+    /// `reply` as (address, friendly-name).
     ListBonded {
-        reply: std::sync::mpsc::Sender<Vec<String>>,
+        reply: std::sync::mpsc::Sender<Vec<(String, Option<String>)>>,
+    },
+    /// The connected phone's captured friendly name/model, if known yet.
+    ConnectedName {
+        reply: std::sync::mpsc::Sender<Option<String>>,
     },
     Shutdown,
 }
@@ -637,12 +648,34 @@ impl RadioHandle {
             .map_err(|_| "the radio did not answer the removePaired request".to_string())?
     }
 
-    /// AOK-BT-001: list bonded (revocable) device addresses.
-    pub fn list_bonded(&self) -> Result<Vec<String>, String> {
+    /// Bonded (revocable) devices with their captured friendly names
+    /// (address, name) — round-trips the radio thread, which owns the store.
+    pub fn list_bonded(&self) -> Result<Vec<(String, Option<String>)>, String> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.send(RadioControl::ListBonded { reply: tx })?;
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|_| "the radio did not answer the listPaired request".to_string())
+    }
+
+    /// The connected phone's captured friendly name/model, if known yet.
+    /// Round-trips the radio thread (the name lives in the radio runtime).
+    pub fn connected_name(&self) -> Option<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self.send(RadioControl::ConnectedName { reply: tx }).is_err() {
+            return None;
+        }
+        rx.recv_timeout(std::time::Duration::from_secs(3))
+            .ok()
+            .flatten()
+    }
+
+    /// Disconnect the connected phone but KEEP the bond (remote reconnect/
+    /// unstick). Blocks briefly on the radio thread.
+    pub fn disconnect(&self, address: String) -> Result<bool, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send(RadioControl::Disconnect { address, reply: tx })?;
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "the radio did not answer the disconnect request".to_string())?
     }
 
     /// PAIR-001: the held SSP numeric comparison awaiting the operator, if
@@ -3666,6 +3699,9 @@ fn run_loop(
                 Ok(RadioControl::RemovePaired { address, reply }) => {
                     let _ = reply.send(bt.remove_paired(&address));
                 }
+                Ok(RadioControl::Disconnect { address, reply }) => {
+                    let _ = reply.send(bt.disconnect(&address));
+                }
                 Ok(RadioControl::ConfirmPairing {
                     address,
                     accept,
@@ -3674,7 +3710,10 @@ fn run_loop(
                     let _ = reply.send(bt.confirm_pairing(&address, accept));
                 }
                 Ok(RadioControl::ListBonded { reply }) => {
-                    let _ = reply.send(bt.bonded_addresses());
+                    let _ = reply.send(bt.bonded_devices());
+                }
+                Ok(RadioControl::ConnectedName { reply }) => {
+                    let _ = reply.send(bt.connected_name());
                 }
                 Ok(RadioControl::Shutdown) => return,
                 Err(TryRecvError::Empty) => break,
