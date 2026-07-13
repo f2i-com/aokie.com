@@ -28,11 +28,17 @@ fn main() {
         ]);
         let t0 = std::time::Instant::now();
         eprintln!("\n[agent-smoke] user: {user:?}");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
         let full = client
-            .stream_reply(messages, |s| {
-                eprintln!("  [+{:?}] sentence: {s:?}", t0.elapsed());
-                true
-            })
+            .stream_reply(
+                messages,
+                &cancel,
+                || {},
+                |s| {
+                    eprintln!("  [+{:?}] sentence: {s:?}", t0.elapsed());
+                    true
+                },
+            )
             .unwrap_or_else(|e| {
                 eprintln!("[agent-smoke] FAILED: {e}");
                 String::new()

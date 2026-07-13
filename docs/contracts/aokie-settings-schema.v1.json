@@ -52,6 +52,13 @@
       "appliesLive": false
     },
     {
+      "key": "maxSilenceSecs",
+      "type": "int",
+      "min": 0,
+      "max": 600,
+      "appliesLive": false
+    },
+    {
       "key": "hfpCodec",
       "type": "enum",
       "options": [
