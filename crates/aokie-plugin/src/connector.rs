@@ -312,6 +312,21 @@ impl Plugin {
             eprintln!("[aokie-plugin] sttEndpointMs setting → AOKIE_STT_ENDPOINT_MS={ms}");
         }
 
+        // AOK-CTRL-001: call-level max-silence window (seconds of MUTUAL
+        // silence before the agent checks in, then hangs up after a second
+        // silent window). 0 disables; the radio clamps non-zero values to
+        // 10–600 and defaults to 30 when unset.
+        if let Some(secs) = self
+            .store
+            .config
+            .settings
+            .get("maxSilenceSecs")
+            .and_then(|v| v.as_u64())
+        {
+            std::env::set_var("AOKIE_MAX_SILENCE_SECS", secs.to_string());
+            eprintln!("[aokie-plugin] maxSilenceSecs setting → AOKIE_MAX_SILENCE_SECS={secs}");
+        }
+
         // In-plugin real-time voice agent: when `aiReceptionist` is truthy, the
         // plugin streams the local LLM + speaks the reply itself (low latency)
         // instead of routing through a flow. `aiEndpoint` pins the LLM URL (else
@@ -1191,12 +1206,24 @@ impl Plugin {
                 let call_id = optional_str(&obj, "callId")?;
                 if let Some(radio) = self.radio.as_ref() {
                     check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
+                    // AOK-CTRL-001: the result reports ACCEPTANCE, never the
+                    // final verb — the phone hasn't acted yet. The authoritative
+                    // confirmation is the `aokie.call.answered` event (or a
+                    // `hardware.error` code `control_failed` carrying this
+                    // operationId if the radio action fails).
+                    let op = operation_id();
                     radio
-                        .send(crate::radio::RadioControl::Answer)
+                        .send(crate::radio::RadioControl::Answer {
+                            op: Some(op.clone()),
+                        })
                         .map_err(CmdError::failed)?;
-                    return Ok(
-                        json!({"answered": true, "via": "radio", "callId": radio.current_call_id()}),
-                    );
+                    return Ok(json!({
+                        "accepted": true,
+                        "queued": true,
+                        "operationId": op,
+                        "via": "radio",
+                        "callId": radio.current_call_id(),
+                    }));
                 }
                 self.require_radio_or_dev("call.answer")?;
                 check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
@@ -1208,17 +1235,28 @@ impl Plugin {
                 };
                 let ev = aokie_event(crate::contract::events::CALL_ANSWERED, &corr, json!({"at": now_iso8601()}));
                 emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
-                Ok(json!({"answered": true, "call": snapshot}))
+                Ok(json!({"accepted": true, "answered": true, "call": snapshot}))
             }
             "call.reject" => {
                 let obj = expect_fields(payload, &["callId"])?;
                 let call_id = optional_str(&obj, "callId")?;
                 if let Some(radio) = self.radio.as_ref() {
                     check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
+                    // AOK-CTRL-001: acceptance only — `aokie.call.ended`
+                    // (outcome "rejected") is the authoritative confirmation.
+                    let op = operation_id();
                     radio
-                        .send(crate::radio::RadioControl::Reject)
+                        .send(crate::radio::RadioControl::Reject {
+                            op: Some(op.clone()),
+                        })
                         .map_err(CmdError::failed)?;
-                    return Ok(json!({"rejected": true, "via": "radio"}));
+                    return Ok(json!({
+                        "accepted": true,
+                        "queued": true,
+                        "operationId": op,
+                        "via": "radio",
+                        "callId": radio.current_call_id(),
+                    }));
                 }
                 self.require_radio_or_dev("call.reject")?;
                 check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
@@ -1227,17 +1265,28 @@ impl Plugin {
                 let corr = call.correlation_id.clone();
                 let ev = aokie_event(crate::contract::events::CALL_REJECTED, &corr, json!({"at": now_iso8601()}));
                 emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
-                Ok(json!({"rejected": true}))
+                Ok(json!({"accepted": true, "rejected": true}))
             }
             "call.hangup" => {
                 let obj = expect_fields(payload, &["callId"])?;
                 let call_id = optional_str(&obj, "callId")?;
                 if let Some(radio) = self.radio.as_ref() {
                     check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
+                    // AOK-CTRL-001: acceptance only — `aokie.call.ended` is the
+                    // authoritative confirmation the call actually ended.
+                    let op = operation_id();
                     radio
-                        .send(crate::radio::RadioControl::Hangup)
+                        .send(crate::radio::RadioControl::Hangup {
+                            op: Some(op.clone()),
+                        })
                         .map_err(CmdError::failed)?;
-                    return Ok(json!({"ended": true, "via": "radio"}));
+                    return Ok(json!({
+                        "accepted": true,
+                        "queued": true,
+                        "operationId": op,
+                        "via": "radio",
+                        "callId": radio.current_call_id(),
+                    }));
                 }
                 self.require_radio_or_dev("call.hangup")?;
                 check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
@@ -1263,7 +1312,7 @@ impl Plugin {
                     }),
                 );
                 emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
-                Ok(json!({"ended": true}))
+                Ok(json!({"accepted": true, "ended": true}))
             }
             "call.operatorSpeak" => {
                 let obj = expect_fields(payload, &["text", "callId"])?;
@@ -1281,11 +1330,36 @@ impl Plugin {
                             "this plugin build has no voice output (voice feature not compiled) — operatorSpeak cannot be spoken",
                         ));
                     }
+                    // AOK-CTRL-001: while the RUNNING radio's in-plugin agent
+                    // owns replies, the radio drops operatorSpeak (the caller
+                    // must not be answered twice) — so accepting it here would
+                    // be a lie. Refuse typed instead.
+                    if radio
+                        .status
+                        .agent_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return Err(CmdError::failed(
+                            "the in-plugin AI receptionist owns replies on this install — operatorSpeak would talk over it and is refused (disable the aiReceptionist setting to speak manually)",
+                        ));
+                    }
                     check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
+                    // Acceptance only: the bot `call.turn.final` event confirms
+                    // the text actually played; a silent synthesis emits
+                    // `hardware.error` code `speak_failed` with this id.
+                    let op = operation_id();
                     radio
-                        .send(crate::radio::RadioControl::Speak { text: text.clone() })
+                        .send(crate::radio::RadioControl::Speak {
+                            text: text.clone(),
+                            op: Some(op.clone()),
+                        })
                         .map_err(CmdError::failed)?;
-                    return Ok(json!({"spoken": true, "via": "radio"}));
+                    return Ok(json!({
+                        "accepted": true,
+                        "queued": true,
+                        "operationId": op,
+                        "via": "radio",
+                    }));
                 }
                 self.require_radio_or_dev("call.operatorSpeak")?;
                 check_call_id(call_id.as_deref(), self.mock_call_id().as_deref())?;
@@ -1293,7 +1367,7 @@ impl Plugin {
                 call.turns += 1;
                 // Mock: no audio path yet — acknowledge without faking
                 // a TTS round-trip result.
-                Ok(json!({"spoken": true, "mock": true}))
+                Ok(json!({"accepted": true, "spoken": true, "mock": true}))
             }
             "sms.threads" => {
                 expect_fields(payload, &[])?;
@@ -2077,6 +2151,15 @@ fn connector_error_line(id: &Value, err: &CmdError) -> String {
     )
 }
 
+/// AOK-CTRL-001: a fresh operation id for an ACCEPTED call control. Returned
+/// in the `accepted/queued` command result and carried by the radio thread so
+/// an asynchronous failure (`aokie.hardware.error` code `control_failed` /
+/// `speak_failed`) correlates back to exactly this request. Completion is
+/// confirmed by the call-lifecycle events themselves (answered/ended/turn).
+fn operation_id() -> String {
+    format!("op_{}", uuid::Uuid::new_v4().simple())
+}
+
 /// Payload validation: `null`/missing means "no payload"; objects may
 /// only carry the allowed keys. Anything else (arrays, scalars,
 /// unknown fields) is rejected — commands must validate defensively.
@@ -2134,6 +2217,9 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     SettingSpec { key: "mockCalls", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "bargeSensitivity", kind: SettingKind::Int { min: 50, max: 5000 }, applies_live: false },
     SettingSpec { key: "sttEndpointMs", kind: SettingKind::Int { min: 100, max: 5000 }, applies_live: false },
+    // AOK-CTRL-001: seconds of MUTUAL silence before the agent checks in, then
+    // (after a second silent window) says goodbye and hangs up. 0 = disabled.
+    SettingSpec { key: "maxSilenceSecs", kind: SettingKind::Int { min: 0, max: 600 }, applies_live: false },
     SettingSpec { key: "hfpCodec", kind: SettingKind::Enum(&["auto", "cvsd", "wbs"]), applies_live: false },
     SettingSpec { key: "persona", kind: SettingKind::Str { max_chars: 4000 }, applies_live: true },
     SettingSpec { key: "greeting", kind: SettingKind::Str { max_chars: 1000 }, applies_live: true },
@@ -3344,6 +3430,106 @@ mod tests {
         assert!(call.get("correlationId").is_none());
         assert!(call.get("caller").is_none());
         assert!(call.get("active").is_none());
+    }
+
+    /// AOK-CTRL-001: RADIO-backed call controls report ACCEPTANCE (accepted/
+    /// queued + operationId), never the final verb — the phone hasn't acted
+    /// when the result returns. The queued RadioControl carries the SAME
+    /// operation id so an asynchronous `control_failed` correlates back, and
+    /// `call.operatorSpeak` is refused typed while the running radio's
+    /// in-plugin agent owns replies (the radio would drop it).
+    #[test]
+    fn radio_call_controls_report_acceptance_not_final_verbs() {
+        let mut plugin = Plugin::ephemeral(true);
+        let (handle, control_rx) = crate::radio::RadioHandle::test_handle();
+        *handle.status.current_call_id.lock().unwrap() = Some("call_live1".to_string());
+        plugin.radio = Some(handle);
+        let mut sink = VecSink::default();
+
+        let data = plugin
+            .dispatch_command("call.answer", &json!({"callId": "call_live1"}), &mut sink)
+            .unwrap();
+        assert_eq!(data["accepted"], json!(true));
+        assert_eq!(data["queued"], json!(true));
+        let op = data["operationId"].as_str().unwrap().to_string();
+        assert!(op.starts_with("op_"), "{op}");
+        assert!(
+            data.get("answered").is_none(),
+            "the final verb must wait for the phone's confirmation event: {data}"
+        );
+        match control_rx.try_recv().unwrap() {
+            crate::radio::RadioControl::Answer { op: sent } => {
+                assert_eq!(sent.as_deref(), Some(op.as_str()))
+            }
+            _ => panic!("expected the Answer control"),
+        }
+
+        let data = plugin
+            .dispatch_command("call.hangup", &json!({"callId": "call_live1"}), &mut sink)
+            .unwrap();
+        assert_eq!(data["accepted"], json!(true));
+        assert!(data.get("ended").is_none(), "{data}");
+        assert!(matches!(
+            control_rx.try_recv().unwrap(),
+            crate::radio::RadioControl::Hangup { op: Some(_) }
+        ));
+
+        let data = plugin
+            .dispatch_command("call.reject", &json!({"callId": "call_live1"}), &mut sink)
+            .unwrap();
+        assert_eq!(data["accepted"], json!(true));
+        assert!(data.get("rejected").is_none(), "{data}");
+        assert!(matches!(
+            control_rx.try_recv().unwrap(),
+            crate::radio::RadioControl::Reject { op: Some(_) }
+        ));
+
+        // operatorSpeak: voice builds accept (queued, op id) unless the agent
+        // owns replies; non-voice builds refuse outright (INT-006 gate).
+        let speak = plugin.dispatch_command(
+            "call.operatorSpeak",
+            &json!({"text": "One moment", "callId": "call_live1"}),
+            &mut sink,
+        );
+        #[cfg(feature = "voice")]
+        {
+            let data = speak.unwrap();
+            assert_eq!(data["accepted"], json!(true));
+            assert!(data.get("spoken").is_none(), "{data}");
+            assert!(matches!(
+                control_rx.try_recv().unwrap(),
+                crate::radio::RadioControl::Speak { op: Some(_), .. }
+            ));
+
+            // Agent owns replies → typed refusal, nothing queued.
+            plugin
+                .radio
+                .as_ref()
+                .unwrap()
+                .status
+                .agent_enabled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let err = plugin
+                .dispatch_command(
+                    "call.operatorSpeak",
+                    &json!({"text": "One moment", "callId": "call_live1"}),
+                    &mut sink,
+                )
+                .unwrap_err();
+            assert!(err.message.contains("owns replies"), "{}", err.message);
+            assert!(control_rx.try_recv().is_err(), "nothing may be queued");
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let err = speak.unwrap_err();
+            assert!(err.message.contains("no voice output"), "{}", err.message);
+        }
+
+        // The callId guard still applies to accepted controls.
+        let err = plugin
+            .dispatch_command("call.answer", &json!({"callId": "call_stale"}), &mut sink)
+            .unwrap_err();
+        assert_eq!(err.code, "stale_call");
     }
 
     // ---- CONSENT-001: enforce-by-default + signed grants + destinations ----
