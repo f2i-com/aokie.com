@@ -2400,6 +2400,7 @@ fn run_runtime(
                 if let hci::HciEvent::DisconnectionComplete {
                     status: dstatus,
                     connection_handle,
+                    reason,
                     ..
                 } = &event
                 {
@@ -2565,7 +2566,19 @@ fn run_runtime(
                             // Cleared on ACL drop (truly new peer state)
                             // and overwritten on the next CodecSelected.
                             let _ = event_tx.send(RuntimeEvent::AudioDisconnected);
-                            let _ = event_tx.send(RuntimeEvent::CallTerminated);
+                            // A supervision timeout (0x08) or remote power-off
+                            // (0x15) on the SCO handle means the whole RF link
+                            // died — the ACL DisconnectionComplete lands right
+                            // behind this one and the consumer's device-loss
+                            // path owns the truthful teardown (call.ended
+                            // reason "device_lost"). A CallTerminated here
+                            // would mislabel the dropped link as a normal
+                            // remote/operator hangup (observed live
+                            // 2026-07-13: mid-call supervision timeout was
+                            // recorded as reason remote_or_operator).
+                            if !matches!(*reason, 0x08 | 0x15) {
+                                let _ = event_tx.send(RuntimeEvent::CallTerminated);
+                            }
                         }
                     }
                 }
