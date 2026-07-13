@@ -110,6 +110,9 @@ impl LlmClient {
         let mut full = String::new();
         let mut buf = String::new();
         let mut aborted = false;
+        // True once ANY chunk was handed to synthesis (gates the eager
+        // first-clause flush below to the reply's very first words).
+        let mut flushed_any = false;
         // Failure observability (audit AOK-LLM-001): when the stream dies,
         // the error names WHICH phase — never produced a first token, or
         // stalled mid-reply — instead of a bare read error. Malformed chunks
@@ -188,9 +191,27 @@ impl LlmClient {
                     aborted = true;
                     break;
                 }
+                flushed_any = true;
             }
             if aborted {
                 break;
+            }
+            // Eager FIRST clause (round 4): nothing has been spoken yet and
+            // the model opened with a long sentence — flush at the first
+            // clause break so the caller hears the reply start ~a clause
+            // earlier. Only ever the first chunk; sentences rule after that.
+            if !flushed_any {
+                if let Some(idx) = first_clause_end(&buf) {
+                    let done: String = buf.drain(..=idx).collect();
+                    let done = done.trim();
+                    if !done.is_empty() {
+                        if !on_sentence(done) {
+                            aborted = true;
+                            break;
+                        }
+                        flushed_any = true;
+                    }
+                }
             }
         }
         // Speak any trailing partial sentence.
@@ -234,15 +255,37 @@ fn sentence_end(s: &str) -> Option<usize> {
     None
 }
 
+/// Byte index of the first CLAUSE break (comma/semicolon/colon followed by
+/// whitespace) at least `MIN` chars in — used to start speaking a long
+/// opening sentence a clause early. The next-char-arrived rule keeps "1,250"
+/// and "9:30" intact (streaming-safe, same discipline as [`sentence_end`]).
+fn first_clause_end(s: &str) -> Option<usize> {
+    const MIN: usize = 24;
+    let mut it = s.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        if i < MIN {
+            continue;
+        }
+        if matches!(c, ',' | ';' | ':')
+            && it.peek().is_some_and(|&(_, next)| next.is_whitespace())
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::sentence_end;
 
     /// Split `text` the way stream_reply does, feeding `delta`-sized pieces —
-    /// returns the spoken chunks including the trailing flush.
+    /// returns the spoken chunks including the eager first clause and the
+    /// trailing flush.
     fn chunks(text: &str, delta: usize) -> Vec<String> {
         let mut buf = String::new();
         let mut out = Vec::new();
+        let mut flushed_any = false;
         let bytes: Vec<char> = text.chars().collect();
         for piece in bytes.chunks(delta) {
             buf.extend(piece);
@@ -252,6 +295,17 @@ mod tests {
                 if !done.is_empty() {
                     out.push(done.to_string());
                 }
+                flushed_any = true;
+            }
+            if !flushed_any {
+                if let Some(idx) = super::first_clause_end(&buf) {
+                    let done: String = buf.drain(..=idx).collect();
+                    let done = done.trim();
+                    if !done.is_empty() {
+                        out.push(done.to_string());
+                        flushed_any = true;
+                    }
+                }
             }
         }
         let rest = buf.trim();
@@ -259,6 +313,39 @@ mod tests {
             out.push(rest.to_string());
         }
         out
+    }
+
+    /// Round 4: a long OPENING sentence starts speaking at its first clause
+    /// break; later sentences stay whole, and commas inside numbers or short
+    /// openers never split.
+    #[test]
+    fn eager_first_clause_starts_speech_early() {
+        assert_eq!(
+            chunks("I can certainly book that table for ye, right after I check the tides.", 4),
+            vec![
+                "I can certainly book that table for ye,",
+                "right after I check the tides.",
+            ]
+        );
+        // Only the FIRST chunk is eager — the second sentence keeps its commas.
+        assert_eq!(
+            chunks("Aye that works for me matey, good choice. We open at nine, ten on Sundays.", 5),
+            vec![
+                "Aye that works for me matey,",
+                "good choice.",
+                "We open at nine, ten on Sundays.",
+            ]
+        );
+        // Short openers ("Hi Lance, ...") never split at the comma.
+        assert_eq!(
+            chunks("Hi Lance, welcome back to the diner today!", 3),
+            vec!["Hi Lance, welcome back to the diner today!"]
+        );
+        // Digits around ':' / ',' stay intact.
+        assert_eq!(
+            chunks("The total for the party comes to 1,250 doubloons exactly.", 4),
+            vec!["The total for the party comes to 1,250 doubloons exactly."]
+        );
     }
 
     /// The live-call bug: "…9 A.M. …" must never split between "A." and "M."
