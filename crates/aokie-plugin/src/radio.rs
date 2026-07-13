@@ -575,6 +575,10 @@ pub struct RadioStatus {
     pub probes_sent: AtomicU64,
     pub probe_commands: AtomicU64,
     pub boundary_yields: AtomicU64,
+    /// Clause-level replanning (guide §7): substantive overlap content cut a
+    /// span MID-SENTENCE (policy-aware soft barge) instead of waiting for the
+    /// sentence boundary.
+    pub mid_span_yields: AtomicU64,
     pub gap_yields: AtomicU64,
     pub semantic_cuts: AtomicU64,
     pub barge_cuts: AtomicU64,
@@ -695,6 +699,7 @@ impl RadioHandle {
             "probesSent": s.probes_sent.load(Ordering::Relaxed),
             "probeCommands": s.probe_commands.load(Ordering::Relaxed),
             "boundaryYields": s.boundary_yields.load(Ordering::Relaxed),
+            "midSpanYields": s.mid_span_yields.load(Ordering::Relaxed),
             "gapYields": s.gap_yields.load(Ordering::Relaxed),
             "semanticCuts": s.semantic_cuts.load(Ordering::Relaxed),
             "bargeCuts": s.barge_cuts.load(Ordering::Relaxed),
@@ -2072,6 +2077,12 @@ struct SttProbeLane<'a> {
     /// substantive caller speech instead of finishing a stale paragraph.
     content: String,
     pending_command: Option<crate::duplex::CallerIntent>,
+    /// What the bot has said/is saying — the echo comparator for the
+    /// mid-span substantive check (the caller sets it before each span).
+    bot_context: String,
+    /// The mid-span yield fires at most once per lane: after it, the span
+    /// is already yielding and the reply path owns the floor decision.
+    mid_span_fired: bool,
 }
 
 #[cfg(all(target_os = "windows", feature = "voice"))]
@@ -2096,7 +2107,39 @@ impl<'a> SttProbeLane<'a> {
             in_flight: 0,
             content: String::new(),
             pending_command: None,
+            bot_context: String::new(),
+            mid_span_fired: false,
         }
+    }
+
+    /// The bot text spoken so far (+ the sentence about to play): the echo
+    /// comparator for [`Self::substantive_overlap`].
+    fn set_bot_context(&mut self, ctx: String) {
+        self.bot_context = ctx;
+    }
+
+    /// Clause-level replanning (guide §7.2): SUBSTANTIVE overlap content
+    /// (≥3 words, not a backchannel, not the bot's own echo) takes the floor
+    /// like an acoustic barge — the CURRENT span yields under its own
+    /// interrupt policy instead of playing on to its sentence boundary,
+    /// which is what made a mid-sentence comment feel ignored for seconds.
+    /// Fires at most once per lane; counted as `midSpanYields`.
+    fn substantive_overlap(&mut self) -> bool {
+        if self.mid_span_fired {
+            return false;
+        }
+        let ctx = std::mem::take(&mut self.bot_context);
+        let hit = self.substantive_content(&ctx).is_some();
+        self.bot_context = ctx;
+        if hit {
+            self.mid_span_fired = true;
+            self.status.mid_span_yields.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[aokie-plugin] substantive overlap mid-span — yielding the clause to {}",
+                content_for_log(self.content.trim())
+            );
+        }
+        hit
     }
 
     /// Ship a probe when speech has been running long enough and enough NEW
@@ -2107,11 +2150,14 @@ impl<'a> SttProbeLane<'a> {
         };
         let sr = playback.sample_rate.max(1) as usize;
         let since_speech = playback.captured.len().saturating_sub(start);
-        if since_speech < (sr * 2) / 5 {
-            return; // <400 ms of speech so far
+        if since_speech < (sr * 3) / 10 {
+            return; // <300 ms of speech so far
         }
+        // 450 ms cadence (was 700): the mid-span substantive yield is only as
+        // fast as the probes feeding it. Still ≤1 in flight — the serial STT
+        // worker regression stays fixed; a shorter gate just re-arms sooner.
         if let Some(at) = self.last_probe_at {
-            if at.elapsed() < std::time::Duration::from_millis(700) {
+            if at.elapsed() < std::time::Duration::from_millis(450) {
                 return;
             }
         }
@@ -2316,6 +2362,13 @@ fn tts_speak(
             lane.maybe_probe(&playback);
             if let Some(intent) = lane.check() {
                 playback.semantic = Some(intent);
+            } else if !playback.barged && lane.substantive_overlap() {
+                // A substantive comment takes the floor NOW — as a POLICY-AWARE
+                // soft barge (a protected/digit span still finishes its bounded
+                // extension), unlike the hard cut of a spoken "wait"/"stop".
+                // The cut tail rides the nudge into the next reply.
+                playback.barged = true;
+                playback.barged_at = Some(now);
             }
         }
         if playback.stop_playback_now(now) {
@@ -3366,6 +3419,7 @@ fn run_loop(
                     let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
                     let mut lane =
                         SttProbeLane::new(&stt_tx, &probe_result_rx, voice_call_gen, &status);
+                    lane.set_bot_context(text.to_string());
                     let lane_ref = if barge_in { Some(&mut lane) } else { None };
                     let speak_started = Instant::now();
                     let planned = speak_planned(
@@ -3864,6 +3918,7 @@ fn run_loop(
                                             voice_call_gen,
                                             &status,
                                         );
+                                        lane.set_bot_context(replay_text.clone());
                                         let lane_ref =
                                             if barge_in { Some(&mut lane) } else { None };
                                         let replay_started = Instant::now();
@@ -4293,6 +4348,15 @@ fn run_loop(
                                         // applies per-span interrupt policy. The probe
                                         // lane rides along: a spoken "wait"/"stop" cuts
                                         // the sentence mid-playback.
+                                        // The mid-span check compares overlap
+                                        // against everything SENT so far plus
+                                        // the sentence about to play.
+                                        reply_lane.set_bot_context({
+                                            let mut b = sent_spans.join(" ");
+                                            b.push(' ');
+                                            b.push_str(&spoken_text);
+                                            b
+                                        });
                                         let lane_ref =
                                             if barge_in { Some(&mut reply_lane) } else { None };
                                         let planned = speak_planned(
@@ -7077,5 +7141,21 @@ mod synthetic_audio {
             lane.substantive_content("the weather is lovely today").as_deref(),
             Some("actually I need to change my order")
         );
+
+        // Clause-level replanning (§7): the same substantive content trips
+        // the MID-SPAN yield against the lane's bot context — once. A fresh
+        // lane with only a backchannel on the pad never trips it.
+        lane.set_bot_context("the weather is lovely today".to_string());
+        assert!(lane.substantive_overlap(), "substantive comment must take the floor");
+        assert!(!lane.substantive_overlap(), "fires at most once per lane");
+
+        let (_stt_tx2, _r) = std::sync::mpsc::channel::<SttWork>();
+        let (res_tx2, res_rx2) = std::sync::mpsc::channel();
+        let mut lane2 = SttProbeLane::new(&_stt_tx2, &res_rx2, 7, &status);
+        lane2.set_bot_context("your booking is confirmed".to_string());
+        res_tx2
+            .send(SttResult { generation: 7, utterance: 0, text: "yeah".into() })
+            .unwrap();
+        assert!(!lane2.substantive_overlap(), "a backchannel never steals the floor");
     }
 }
