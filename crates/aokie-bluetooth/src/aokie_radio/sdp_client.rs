@@ -34,6 +34,13 @@ use super::sdp::{
 // Service-class UUIDs we'll query for.
 // =============================================================================
 
+/// Hands-Free Audio Gateway (the role the phone plays in HFP). Queried
+/// by the outbound-connect path (`hfp_connect`) to find the AG's RFCOMM
+/// channel after WE page the phone — Bluedroid never initiates profile
+/// setup when it was the paged side, so a headset-style reconnect must
+/// discover and drive the SLC itself. NOT 0x111E — that's the HF role
+/// (us; it's what our own SDP server advertises in `sdp.rs`).
+pub const UUID_HANDSFREE_AG: u16 = 0x111F;
 /// Phonebook Access — Phone Server Equipment (the role the phone plays).
 pub const UUID_PBAP_PSE: u16 = 0x112F;
 /// MAP — Message Access Server (the role the phone plays).

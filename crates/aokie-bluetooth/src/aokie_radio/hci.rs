@@ -35,6 +35,8 @@ pub const OPCODE_ACCEPT_CONNECTION_REQUEST: u16 = 0x0409;
 pub const OPCODE_REJECT_CONNECTION_REQUEST: u16 = 0x040a;
 pub const OPCODE_ACCEPT_SYNCHRONOUS_CONNECTION_REQUEST: u16 = 0x0429;
 pub const OPCODE_LINK_KEY_REQUEST_REPLY: u16 = 0x040b;
+pub const OPCODE_AUTHENTICATION_REQUESTED: u16 = 0x0411;
+pub const OPCODE_SET_CONNECTION_ENCRYPTION: u16 = 0x0413;
 pub const OPCODE_LINK_KEY_REQUEST_NEGATIVE_REPLY: u16 = 0x040c;
 pub const OPCODE_PIN_CODE_REQUEST_REPLY: u16 = 0x040d;
 pub const OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY: u16 = 0x040e;
@@ -101,6 +103,8 @@ pub const SCO_PACKET_TYPES_HFP_CVSD_ESCO_COMMAND: u16 =
 pub const EVENT_CONNECTION_COMPLETE: u8 = 0x03;
 pub const EVENT_CONNECTION_REQUEST: u8 = 0x04;
 pub const EVENT_DISCONNECTION_COMPLETE: u8 = 0x05;
+pub const EVENT_AUTHENTICATION_COMPLETE: u8 = 0x06;
+pub const EVENT_ENCRYPTION_CHANGE: u8 = 0x08;
 pub const EVENT_REMOTE_NAME_REQUEST_COMPLETE: u8 = 0x07;
 pub const EVENT_COMMAND_COMPLETE: u8 = 0x0e;
 pub const EVENT_COMMAND_STATUS: u8 = 0x0f;
@@ -158,6 +162,15 @@ pub enum HciEvent {
         connection_handle: u16,
         reason: u8,
     },
+    AuthenticationComplete {
+        status: u8,
+        connection_handle: u16,
+    },
+    EncryptionChange {
+        status: u8,
+        connection_handle: u16,
+        encryption_enabled: u8,
+    },
     RemoteNameRequestComplete {
         status: u8,
         address: String,
@@ -210,6 +223,8 @@ impl HciEvent {
             Self::ConnectionComplete { .. } => EVENT_CONNECTION_COMPLETE,
             Self::ConnectionRequest { .. } => EVENT_CONNECTION_REQUEST,
             Self::DisconnectionComplete { .. } => EVENT_DISCONNECTION_COMPLETE,
+            Self::AuthenticationComplete { .. } => EVENT_AUTHENTICATION_COMPLETE,
+            Self::EncryptionChange { .. } => EVENT_ENCRYPTION_CHANGE,
             Self::RemoteNameRequestComplete { .. } => EVENT_REMOTE_NAME_REQUEST_COMPLETE,
             Self::PinCodeRequest { .. } => EVENT_PIN_CODE_REQUEST,
             Self::LinkKeyRequest { .. } => EVENT_LINK_KEY_REQUEST,
@@ -229,6 +244,8 @@ impl HciEvent {
             Self::ConnectionComplete { .. } => "Connection Complete",
             Self::ConnectionRequest { .. } => "Connection Request",
             Self::DisconnectionComplete { .. } => "Disconnection Complete",
+            Self::AuthenticationComplete { .. } => "Authentication Complete",
+            Self::EncryptionChange { .. } => "Encryption Change",
             Self::RemoteNameRequestComplete { .. } => "Remote Name Request Complete",
             Self::PinCodeRequest { .. } => "PIN Code Request",
             Self::LinkKeyRequest { .. } => "Link Key Request",
@@ -277,6 +294,25 @@ impl HciEvent {
                 format!(
                     "handle 0x{:04x}, reason 0x{:02x}, status 0x{:02x}",
                     connection_handle, reason, status
+                )
+            }
+            Self::AuthenticationComplete {
+                status,
+                connection_handle,
+            } => {
+                format!(
+                    "handle 0x{:04x}, status 0x{:02x}",
+                    connection_handle, status
+                )
+            }
+            Self::EncryptionChange {
+                status,
+                connection_handle,
+                encryption_enabled,
+            } => {
+                format!(
+                    "handle 0x{:04x}, enabled {}, status 0x{:02x}",
+                    connection_handle, encryption_enabled, status
                 )
             }
             Self::ConnectionRequest {
@@ -503,6 +539,38 @@ pub fn disconnect_command(connection_handle: u16, reason: u8) -> [u8; 6] {
     out[2] = 3;
     out[3..5].copy_from_slice(&connection_handle.to_le_bytes());
     out[5] = reason;
+    out
+}
+
+/// HCI Authentication_Requested (Core Spec v5.4 Vol 4 Part E §7.1.15).
+/// Kicks LMP authentication on an existing ACL link. HARD-001
+/// (`phone.connect`): on the inbound path the PHONE — as the paging
+/// master — drives authentication before it opens any profile channel;
+/// when WE page a bonded phone, nobody does it for us, and RFCOMM setup
+/// on an unauthenticated link makes the phone tear the ACL down with
+/// reason 0x05 (Authentication Failure). So the outbound-connect path
+/// sends this immediately after ConnectionComplete; the controller
+/// answers with Link_Key_Request (satisfied from the pairing store) and
+/// then Authentication_Complete.
+pub fn authentication_requested_command(connection_handle: u16) -> [u8; 5] {
+    let mut out = [0u8; 5];
+    out[0..2].copy_from_slice(&OPCODE_AUTHENTICATION_REQUESTED.to_le_bytes());
+    out[2] = 2;
+    out[3..5].copy_from_slice(&connection_handle.to_le_bytes());
+    out
+}
+
+/// HCI Set_Connection_Encryption (Core Spec v5.4 Vol 4 Part E §7.1.16).
+/// Turns link-level encryption on after a successful authentication —
+/// the second half of the security procedure the paging side owns
+/// (Security Mode 4 phones refuse profile L2CAP channels on an
+/// unencrypted link). Outcome arrives as an Encryption_Change event.
+pub fn set_connection_encryption_command(connection_handle: u16, enable: bool) -> [u8; 6] {
+    let mut out = [0u8; 6];
+    out[0..2].copy_from_slice(&OPCODE_SET_CONNECTION_ENCRYPTION.to_le_bytes());
+    out[2] = 3;
+    out[3..5].copy_from_slice(&connection_handle.to_le_bytes());
+    out[5] = if enable { 0x01 } else { 0x00 };
     out
 }
 
@@ -899,6 +967,21 @@ pub fn parse_event_params(event_code: u8, params: &[u8]) -> Result<HciEvent, Str
                 reason: params[3],
             })
         }
+        EVENT_AUTHENTICATION_COMPLETE => {
+            require_len(params, 3, "Authentication Complete")?;
+            Ok(HciEvent::AuthenticationComplete {
+                status: params[0],
+                connection_handle: u16::from_le_bytes([params[1], params[2]]),
+            })
+        }
+        EVENT_ENCRYPTION_CHANGE => {
+            require_len(params, 4, "Encryption Change")?;
+            Ok(HciEvent::EncryptionChange {
+                status: params[0],
+                connection_handle: u16::from_le_bytes([params[1], params[2]]),
+                encryption_enabled: params[3],
+            })
+        }
         EVENT_REMOTE_NAME_REQUEST_COMPLETE => {
             require_len(params, 7, "Remote Name Request Complete")?;
             Ok(HciEvent::RemoteNameRequestComplete {
@@ -1254,6 +1337,51 @@ mod tests {
             HciPacket::Event {
                 event_code: 0x0e,
                 params: &[0x01, 0x03, 0x0c, 0x00],
+            }
+        );
+    }
+
+    #[test]
+    fn builds_authentication_requested_command() {
+        let command = authentication_requested_command(0x002a);
+        assert_eq!(command, [0x11, 0x04, 0x02, 0x2a, 0x00]);
+    }
+
+    #[test]
+    fn builds_set_connection_encryption_command() {
+        let command = set_connection_encryption_command(0x002a, true);
+        assert_eq!(command, [0x13, 0x04, 0x03, 0x2a, 0x00, 0x01]);
+        let command = set_connection_encryption_command(0x002a, false);
+        assert_eq!(command, [0x13, 0x04, 0x03, 0x2a, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn parses_authentication_complete_event() {
+        assert_eq!(
+            parse_typed_event(&[0x06, 0x03, 0x00, 0x2a, 0x00]).unwrap(),
+            HciEvent::AuthenticationComplete {
+                status: 0,
+                connection_handle: 0x002a,
+            }
+        );
+        // 0x05 = Authentication Failure (phone deleted the bond).
+        assert_eq!(
+            parse_typed_event(&[0x06, 0x03, 0x05, 0x2a, 0x00]).unwrap(),
+            HciEvent::AuthenticationComplete {
+                status: 0x05,
+                connection_handle: 0x002a,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_encryption_change_event() {
+        assert_eq!(
+            parse_typed_event(&[0x08, 0x04, 0x00, 0x2a, 0x00, 0x01]).unwrap(),
+            HciEvent::EncryptionChange {
+                status: 0,
+                connection_handle: 0x002a,
+                encryption_enabled: 1,
             }
         );
     }

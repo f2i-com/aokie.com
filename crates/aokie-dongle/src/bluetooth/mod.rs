@@ -256,6 +256,13 @@ impl BluetoothManager {
         self.runtime.disconnect(address.to_string())
     }
 
+    /// HARD-001: reconnect a bonded phone from OUR side (page + outbound
+    /// HFP setup). `Ok(true)` = attempt started; the phone.connected event
+    /// is the authoritative outcome. `Ok(false)` = already connected.
+    pub fn connect(&self, address: &str) -> Result<bool, String> {
+        self.runtime.connect(address.to_string())
+    }
+
     /// PAIR-001: a clone of the shared pending-confirmation slot for
     /// lock-free `phone.status` reads.
     pub fn pairing_confirm_slot(&self) -> PairingConfirmSlot {

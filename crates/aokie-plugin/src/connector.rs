@@ -1191,6 +1191,29 @@ impl Plugin {
                 // Dev mode: nothing connected to drop.
                 Ok(json!({"disconnected": false, "address": address, "simulated": true}))
             }
+            "phone.connect" => {
+                // HARD-001: reconnect a bonded phone from OUR side — the radio
+                // pages it and drives the SDP/RFCOMM/HFP setup itself (the
+                // phone initiates nothing when it was the paged side).
+                // Accepted-only semantics: `accepted:true` means the page
+                // started; the authoritative outcome is the phone.connected
+                // event (or a hardware.error if the attempt dies). Bluetooth
+                // scope, same as the other phone controls.
+                let obj = expect_fields(payload, &["address"])?;
+                let address = require_str(&obj, "address")?;
+                self.check_consent("phone.connect", crate::consent::Scope::Bluetooth)?;
+                self.require_radio_or_dev("phone.connect")?;
+                if let Some(radio) = self.radio.as_ref() {
+                    let accepted = radio.connect(address.clone()).map_err(CmdError::failed)?;
+                    return Ok(json!({
+                        "accepted": accepted,
+                        "alreadyConnected": !accepted,
+                        "address": address,
+                    }));
+                }
+                // Dev mode: pretend the attempt started.
+                Ok(json!({"accepted": true, "address": address, "simulated": true}))
+            }
             "phone.confirmPairing" => {
                 // PAIR-001: the operator's answer to the SSP numeric comparison
                 // (phone.status.pairingConfirm / the pairing_confirm_required
@@ -3976,6 +3999,12 @@ mod tests {
         // phone.disconnect (remote reconnect/unstick) is gated the same way.
         let err = plugin
             .dispatch_command("phone.disconnect", &json!({"address": "00:11:22:33:44:55"}), &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("radio is not running"));
+
+        // phone.connect (HARD-001 outbound reconnect) is gated the same way.
+        let err = plugin
+            .dispatch_command("phone.connect", &json!({"address": "00:11:22:33:44:55"}), &mut sink)
             .unwrap_err();
         assert!(err.message.contains("radio is not running"));
 
