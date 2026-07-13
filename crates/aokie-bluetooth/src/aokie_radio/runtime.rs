@@ -1517,9 +1517,25 @@ fn run_runtime(
             // ACL keepalive (see decl above): once the ACL has been quiet for a
             // few seconds while connected, send AT+CIND? to draw a +CIND reply,
             // which resets the link-supervision timer and holds the call up.
+            //
+            // MUCH more aggressive while a call's SCO is up (observed
+            // 2026-07-13: two consecutive calls died mid-reply with reason
+            // 0x08 at ~8-10s of ACL quiet — the RX path faded during long
+            // sustained mSBC TTS transmits, and the single ~7s keepalive was
+            // the link's only ARQ-retransmitted traffic before both
+            // supervision timers gave up). ACL packets retry until
+            // acknowledged, so on a marginal link a 2s CIND? cadence is
+            // cheap insurance that keeps BOTH sides' supervision timers fed
+            // through a fade the fixed-rate SCO stream can't survive alone.
+            // Idle (no-call) links keep the old lazy cadence.
+            let (keepalive_idle, keepalive_gap) = if active_sco_handle.is_some() {
+                (Duration::from_secs(2), Duration::from_secs(2))
+            } else {
+                (Duration::from_secs(6), Duration::from_secs(4))
+            };
             if active_acl_handle.is_some()
-                && last_acl_inbound_at.elapsed() >= Duration::from_secs(6)
-                && last_hfp_keepalive.elapsed() >= Duration::from_secs(4)
+                && last_acl_inbound_at.elapsed() >= keepalive_idle
+                && last_hfp_keepalive.elapsed() >= keepalive_gap
             {
                 match l2cap_state
                     .build_hfp_call_control_packets(HfpAtCommand::RetrieveIndicatorStatus)
