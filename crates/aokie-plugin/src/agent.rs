@@ -8,8 +8,14 @@
 //! tokio runtime.
 
 use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// Cloneable so a reply can run on a detached worker thread (AOK-CTRL-001):
+/// the radio loop hands a clone to the worker and stays free to service
+/// hangup/reject while the stream runs. reqwest clients are Arc inside, so a
+/// clone shares the pinned, hardened connection pool.
+#[derive(Clone)]
 pub struct LlmClient {
     /// Err(reason) when the endpoint failed hardening (AOK-ENDPOINT-001) — every request
     /// then fails with that reason instead of silently using an unvalidated client.
@@ -59,9 +65,20 @@ impl LlmClient {
     /// Stream a reply for `messages` (an OpenAI chat array). Calls `on_sentence`
     /// with each complete sentence as it's produced; return `false` from it to
     /// abort (barge-in / hangup). Returns the full reply text.
+    ///
+    /// AOK-CTRL-001 cancellation contract: `cancel` is checked on EVERY SSE
+    /// line — a punctuation-free stream (which never yields a sentence, so
+    /// never invokes `on_sentence`) still aborts within one delta of the flag
+    /// being set. `on_activity` fires on every line read from the socket; the
+    /// caller's watchdog uses it as the liveness signal for the per-read idle
+    /// deadline (reqwest 0.11 has no per-read timeout — only the whole-request
+    /// deadline set in [`LlmClient::new`], which remains the hard backstop for
+    /// a worker abandoned mid-read).
     pub fn stream_reply(
         &self,
         messages: serde_json::Value,
+        cancel: &AtomicBool,
+        mut on_activity: impl FnMut(),
         mut on_sentence: impl FnMut(&str) -> bool,
     ) -> Result<String, String> {
         let mut body = serde_json::json!({
@@ -115,6 +132,14 @@ impl LlmClient {
                     ),
                 }
             })?;
+            on_activity();
+            // Per-line cancellation (AOK-CTRL-001): the caller hung up /
+            // rejected / timed the reply out — stop pulling the stream now,
+            // even if no sentence boundary ever arrives.
+            if cancel.load(Ordering::Relaxed) {
+                aborted = true;
+                break;
+            }
             let data = match line.strip_prefix("data:") {
                 Some(d) => d.trim(),
                 None => continue,

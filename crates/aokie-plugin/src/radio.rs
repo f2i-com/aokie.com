@@ -38,17 +38,29 @@ use crate::outbox::Outbox;
 /// asynchronous `aokie.*` event from the radio thread, matching the mock
 /// contract (`call.answer` â†’ later `aokie.call.answered`, etc.).
 pub enum RadioControl {
-    Answer,
-    Reject,
-    Hangup,
+    /// AOK-CTRL-001: call controls carry the operation id minted by the
+    /// connector when it ACCEPTED the command, so the radio can attribute an
+    /// asynchronous failure (`aokie.hardware.error` code `control_failed`) to
+    /// the exact request. `None` = internally-generated (no caller waiting).
+    Answer {
+        op: Option<String>,
+    },
+    Reject {
+        op: Option<String>,
+    },
+    Hangup {
+        op: Option<String>,
+    },
     SendSms {
         to: String,
         body: String,
     },
-    /// Speak text to the caller. Stage 1 acknowledges + logs; the TTS â†’
-    /// SCO audio path is wired in Stage 2.
+    /// Speak text to the caller. The connector result is `accepted/queued`;
+    /// the bot `call.turn.final` event is the authoritative confirmation the
+    /// text actually played (a silent synthesis emits `speak_failed` instead).
     Speak {
         text: String,
+        op: Option<String>,
     },
     /// Live-reconfigure the in-plugin voice agent without a reconnect. Each
     /// field is `Some` only when it changed; `None` leaves the current value
@@ -159,6 +171,275 @@ fn strip_end_call_marker(s: &str) -> (String, bool) {
     (out.trim().to_string(), found)
 }
 
+// ── AOK-CTRL-001: cancellable, deadline-bounded call control ────────────────
+//
+// The pieces below are PURE (fake-clock testable — every decision takes `now`
+// as a parameter, which is the clock seam the VOICE-001 deferral asked for):
+// the reply-deadline watchdog, the call-level silence timer, the agent-hangup
+// policy and the playout-drain math. The impure halves (the reply worker
+// thread, the control probe inside TTS playback) live in `run_loop`.
+
+/// An urgent operator action observed while speech was playing — detected by
+/// [`ControlProbe`] inside the TTS chunk loop, EXECUTED by the caller right
+/// after the speak returns (the `BluetoothManager` is mutably borrowed for
+/// the whole playback, so the probe can only record the intent).
+#[cfg(feature = "voice")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CancelAction {
+    Hangup { op: Option<String> },
+    Reject { op: Option<String> },
+}
+
+/// Control-channel probe threaded through speech playback so a hangup/reject
+/// lands mid-SENTENCE (within ~one audio chunk, ≈20 ms) instead of waiting for
+/// the sentence to finish playing. Urgent actions stop playback and are
+/// recorded in `action`; every other control is parked, in arrival order, for
+/// the main control loop (same contract as the old per-sentence poll).
+#[cfg(feature = "voice")]
+struct ControlProbe<'a> {
+    rx: &'a std::sync::mpsc::Receiver<RadioControl>,
+    parked: &'a mut std::collections::VecDeque<RadioControl>,
+    action: Option<CancelAction>,
+}
+
+#[cfg(feature = "voice")]
+impl<'a> ControlProbe<'a> {
+    fn new(
+        rx: &'a std::sync::mpsc::Receiver<RadioControl>,
+        parked: &'a mut std::collections::VecDeque<RadioControl>,
+    ) -> Self {
+        Self {
+            rx,
+            parked,
+            action: None,
+        }
+    }
+
+    /// Drain newly-arrived controls; `true` = an urgent action wants playback
+    /// stopped NOW (sticky once set).
+    fn poll(&mut self) -> bool {
+        if self.action.is_some() {
+            return true;
+        }
+        while let Ok(c) = self.rx.try_recv() {
+            match c {
+                RadioControl::Hangup { op } => {
+                    self.action = Some(CancelAction::Hangup { op });
+                    return true;
+                }
+                RadioControl::Reject { op } => {
+                    self.action = Some(CancelAction::Reject { op });
+                    return true;
+                }
+                other => self.parked.push_back(other),
+            }
+        }
+        false
+    }
+}
+
+/// One message from the detached reply worker to the radio thread. The
+/// bounded channel (see `REPLY_CHANNEL_BOUND`) is the backpressure: synthesis
+/// paces consumption, so a runaway generation blocks the WORKER, never grows
+/// a queue.
+#[cfg(feature = "voice")]
+enum ReplyMsg {
+    Sentence(String),
+    /// The stream finished (full text) or failed (reason). Always the last
+    /// message the worker sends.
+    Done(Result<String, String>),
+}
+
+#[cfg(feature = "voice")]
+const REPLY_CHANNEL_BOUND: usize = 8;
+
+/// Deadlines for one agent reply, enforced by the radio thread's pump (the
+/// worker may be stuck in a blocking read — reqwest 0.11 has no per-read
+/// timeout — so the PUMP owns the deadline and abandons the worker, whose
+/// whole-request timeout is the eventual backstop).
+#[cfg(feature = "voice")]
+struct ReplyDeadlines {
+    /// The endpoint accepted the request but produced NO stream data yet.
+    first_activity: std::time::Duration,
+    /// Mid-stream: no data for this long (the per-read idle deadline).
+    idle: std::time::Duration,
+    /// Whole-reply cap, regardless of progress.
+    total: std::time::Duration,
+}
+
+#[cfg(feature = "voice")]
+const REPLY_DEADLINES: ReplyDeadlines = ReplyDeadlines {
+    first_activity: std::time::Duration::from_secs(10),
+    idle: std::time::Duration::from_secs(8),
+    total: std::time::Duration::from_secs(60),
+};
+
+/// Pure deadline verdict: `Some(reason)` when the reply must be abandoned.
+/// `last_activity` is `None` until the stream's first line arrives.
+#[cfg(feature = "voice")]
+fn reply_deadline_exceeded(
+    cfg: &ReplyDeadlines,
+    started: std::time::Instant,
+    last_activity: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<String> {
+    if now.duration_since(started) >= cfg.total {
+        return Some(format!(
+            "the reply exceeded the total deadline ({}s) — abandoned",
+            cfg.total.as_secs()
+        ));
+    }
+    match last_activity {
+        None if now.duration_since(started) >= cfg.first_activity => Some(format!(
+            "the LLM produced no stream data within {}s (first-activity deadline)",
+            cfg.first_activity.as_secs()
+        )),
+        Some(at) if now.duration_since(at) >= cfg.idle => Some(format!(
+            "the LLM stream stalled — no data for {}s (idle deadline)",
+            cfg.idle.as_secs()
+        )),
+        _ => None,
+    }
+}
+
+/// Spoken once when the caller has been silent for a whole window (agent mode).
+#[cfg(feature = "voice")]
+const SILENCE_CHECK_LINE: &str = "Hello? Are you still there?";
+/// Spoken before the max-silence hangup — plain ASCII (TTS + health-path safe).
+#[cfg(feature = "voice")]
+const SILENCE_GOODBYE_LINE: &str = "I haven't heard anything for a while, so I'll hang up now. \
+Please call back if you still need us. Goodbye.";
+
+/// What the silence timer wants done when a window expires.
+#[cfg(feature = "voice")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SilenceAction {
+    /// First expiry: check in with the caller ("are you still there?").
+    Prompt,
+    /// A second window elapsed with still nothing: say goodbye and hang up.
+    HangUp,
+}
+
+/// Call-level max-silence timer (VOICE-001 deferral → AOK-CTRL-001): a live
+/// call where NEITHER side has produced audio activity for `window` gets a
+/// check-in prompt, then — if the silence persists a second window — a polite
+/// goodbye and a clean hangup, so a dead line never holds the phone forever.
+/// Pure: both mutators take `now`, so tests drive it with fabricated instants.
+#[cfg(feature = "voice")]
+struct SilenceTimer {
+    window: std::time::Duration,
+    last_activity: std::time::Instant,
+    prompted: bool,
+}
+
+#[cfg(feature = "voice")]
+impl SilenceTimer {
+    fn new(window: std::time::Duration, now: std::time::Instant) -> Self {
+        Self {
+            window,
+            last_activity: now,
+            prompted: false,
+        }
+    }
+
+    /// Any conversational activity (caller speech, a spoken reply) resets the
+    /// window AND forgives an earlier check-in prompt.
+    fn note_activity(&mut self, now: std::time::Instant) {
+        self.last_activity = now;
+        self.prompted = false;
+    }
+
+    fn check(&mut self, now: std::time::Instant) -> Option<SilenceAction> {
+        if self.window.is_zero() || now.duration_since(self.last_activity) < self.window {
+            return None;
+        }
+        if self.prompted {
+            Some(SilenceAction::HangUp)
+        } else {
+            // The prompt itself restarts the window (its playback is also
+            // stamped by the caller, belt-and-braces).
+            self.prompted = true;
+            self.last_activity = now;
+            Some(SilenceAction::Prompt)
+        }
+    }
+}
+
+/// The configured max-silence window: `maxSilenceSecs` setting →
+/// AOKIE_MAX_SILENCE_SECS env (set by the connector at radio start).
+/// 0 disables; anything else clamps to a sane band. Default 30s.
+#[cfg(feature = "voice")]
+fn max_silence_window() -> std::time::Duration {
+    let secs = std::env::var("AOKIE_MAX_SILENCE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|v| if v == 0 { 0 } else { v.clamp(10, 600) })
+        .unwrap_or(30);
+    std::time::Duration::from_secs(secs)
+}
+
+/// How long to let the SCO queue drain audio that was QUEUED (synthesis often
+/// outruns realtime playout) before an intentional hangup cuts the channel:
+/// the remaining playout computed from what was actually queued, plus a small
+/// margin, bounded — never the old blind 900 ms guess, never unbounded.
+#[cfg(feature = "voice")]
+fn playout_drain_wait(
+    t0: std::time::Instant,
+    queued: std::time::Duration,
+    now: std::time::Instant,
+) -> std::time::Duration {
+    // The cap must clear a full spoken farewell/apology (~6s) — it only
+    // guards against a pathological queue, never a normal goodbye.
+    const MARGIN: std::time::Duration = std::time::Duration::from_millis(400);
+    const CAP: std::time::Duration = std::time::Duration::from_secs(8);
+    (t0 + queued + MARGIN).saturating_duration_since(now).min(CAP)
+}
+
+/// The agent-hangup POLICY (AOK-CTRL-001): the LLM's end-call marker is only a
+/// REQUEST — this validates it against what actually happened on the call
+/// before the plugin may hang up. `Proceed.wait` is the computed farewell
+/// playout drain.
+#[cfg(feature = "voice")]
+#[derive(Debug, PartialEq, Eq)]
+enum HangupVerdict {
+    Proceed { wait: std::time::Duration },
+    Skip(&'static str),
+}
+
+#[cfg(feature = "voice")]
+#[allow(clippy::too_many_arguments)]
+fn agent_hangup_verdict(
+    requested: bool,
+    barged: bool,
+    operator_ended: bool,
+    ended_by_failsafe: bool,
+    farewell_audible: bool,
+    t0: std::time::Instant,
+    reply_dur: std::time::Duration,
+    now: std::time::Instant,
+) -> HangupVerdict {
+    if !requested {
+        return HangupVerdict::Skip("no hangup requested");
+    }
+    if barged {
+        return HangupVerdict::Skip("the caller barged in — they may have more to say");
+    }
+    if operator_ended {
+        return HangupVerdict::Skip("an operator action already owns the call");
+    }
+    if ended_by_failsafe {
+        return HangupVerdict::Skip("the dead-air fail-safe already ended the call");
+    }
+    if !farewell_audible {
+        // Nothing played: the dead-air fail-safe fires for this reply attempt
+        // (apology + hangup) — proceeding here would race it.
+        return HangupVerdict::Skip("the farewell never played — the fail-safe owns the ending");
+    }
+    HangupVerdict::Proceed {
+        wait: playout_drain_wait(t0, reply_dur, now),
+    }
+}
+
 /// Live radio status, shared (via `Arc`) between the radio thread (writer)
 /// and the main RPC thread (reader) so `phone.status` / `dongle.diagnostics`
 /// answer without round-tripping the radio thread.
@@ -224,6 +505,12 @@ pub struct RadioStatus {
     /// Skip cases (HTTP endpoints, env override, non-voice build) record an
     /// ok report with the skip reason so arming isn't held hostage.
     pub self_test: Mutex<Option<VoiceSelfTest>>,
+    /// AOK-CTRL-001: whether the RUNNING radio's in-plugin agent owns replies
+    /// (the env snapshot the radio actually started with, not the settings bag
+    /// which may have changed since). The connector refuses `call.operatorSpeak`
+    /// against this — the radio would silently drop it anyway (double-responder
+    /// guard), and an accepted-then-dropped command is a lie.
+    pub agent_enabled: AtomicBool,
 }
 
 /// VOICE-001: one loopback self-test outcome (always compiled — non-voice
@@ -248,6 +535,21 @@ pub struct RadioHandle {
 }
 
 impl RadioHandle {
+    /// Test-only: a handle wired to a bare channel (no radio thread) so
+    /// connector tests can exercise the radio-backed command paths —
+    /// acceptance results, operation ids and the agent-owns-replies refusal.
+    #[cfg(test)]
+    pub fn test_handle() -> (RadioHandle, std::sync::mpsc::Receiver<RadioControl>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (
+            RadioHandle {
+                control_tx: tx,
+                status: Arc::new(RadioStatus::default()),
+            },
+            rx,
+        )
+    }
+
     pub fn send(&self, c: RadioControl) -> Result<(), String> {
         self.control_tx
             .send(c)
@@ -406,21 +708,40 @@ fn emit_turn(
     speaker: &str,
     text: &str,
 ) {
+    emit_turn_with_delivery(outbox, sink, corr, turn_index, speaker, text, None)
+}
+
+/// AOK-CTRL-001: bot turns carry a structured per-turn DELIVERY status —
+/// `complete` (every recorded sentence audibly played), `interrupted` (caller
+/// barge-in cut it short), `operator_ended` (an operator action stopped it) or
+/// `error` (synthesis/stream failure mid-reply). The `text` is already only
+/// what actually played (the truthful-transcript rule); `delivery` says WHY it
+/// may be shorter than the generation. Additive payload field — existing
+/// consumers ignore it. Caller turns have no delivery dimension (`None`).
+#[cfg(feature = "voice")]
+fn emit_turn_with_delivery(
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+    corr: &str,
+    turn_index: u32,
+    speaker: &str,
+    text: &str,
+    delivery: Option<&str>,
+) {
+    let mut payload = json!({
+        "callId": corr,
+        "turn": turn_index,
+        "speaker": speaker,
+        "text": text,
+        "at": aokie_core::events::now_iso8601(),
+    });
+    if let Some(d) = delivery {
+        payload["delivery"] = json!(d);
+    }
     emit(
         outbox,
         sink,
-        aokie_core::events::aokie_turn_event(
-            true,
-            corr,
-            turn_index,
-            json!({
-                "callId": corr,
-                "turn": turn_index,
-                "speaker": speaker,
-                "text": text,
-                "at": aokie_core::events::now_iso8601(),
-            }),
-        ),
+        aokie_core::events::aokie_turn_event(true, corr, turn_index, payload),
     );
 }
 
@@ -487,6 +808,40 @@ fn emit_call_ended(
                 "durationMs": ended.duration_ms as u64,
                 "outcome": ended.outcome,
                 "configVersion": config_version,
+            }),
+        ),
+    );
+}
+
+/// AOK-CTRL-001: the authoritative FAILURE record for an accepted call
+/// control. The connector's command result only ever says `accepted/queued`
+/// (the enqueue succeeded); when the radio later fails to act on the phone,
+/// this emits `aokie.hardware.error` carrying `code: "control_failed"`, the
+/// action and the operation id from the accepted result — so a flow/UI can
+/// correlate "my command didn't happen" instead of trusting a premature verb.
+#[cfg(target_os = "windows")]
+fn emit_control_failed(
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+    tracker: &crate::call_session::SessionTracker,
+    action: &str,
+    op: Option<&str>,
+    error: &str,
+) {
+    use aokie_core::events::{aokie_event_occurrence, occurrence_id};
+    let corr = tracker.call_id().unwrap_or("radio").to_string();
+    emit(
+        outbox,
+        sink,
+        aokie_event_occurrence(
+            crate::contract::events::HARDWARE_ERROR,
+            &corr,
+            &occurrence_id(),
+            json!({
+                "message": format!("{action} failed on the radio: {error}"),
+                "code": "control_failed",
+                "action": action,
+                "operationId": op,
             }),
         ),
     );
@@ -735,6 +1090,9 @@ struct SpeakOutcome {
     /// starting a short pre-roll before their first above-threshold frame.
     /// Empty when nothing crossed the speech threshold (or half-duplex mode).
     captured_speech: Vec<i16>,
+    /// AOK-CTRL-001: playback was cut short by an urgent control (the probe's
+    /// `action` says which) — the caller executes it right after this returns.
+    cancelled: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1025,6 +1383,8 @@ struct TtsChunkPlayback {
     /// Offset in `captured` of the caller's first above-threshold frame.
     speech_start: Option<usize>,
     sample_rate: u16,
+    /// AOK-CTRL-001: an urgent control stopped playback (see [`ControlProbe`]).
+    cancelled: bool,
 }
 
 #[cfg(all(target_os = "windows", feature = "voice"))]
@@ -1044,6 +1404,7 @@ impl TtsChunkPlayback {
             captured: Vec::new(),
             speech_start: None,
             sample_rate,
+            cancelled: false,
         }
     }
 
@@ -1066,8 +1427,17 @@ impl TtsChunkPlayback {
         bt: &mut aokie_dongle::bluetooth::BluetoothManager,
         aec: &mut Option<&mut crate::aec::EchoCanceller>,
         barge_rms: Option<f32>,
+        ctl: &mut Option<&mut ControlProbe<'_>>,
         pcm: &[i16],
     ) -> bool {
+        // AOK-CTRL-001: an urgent control (hangup/reject) cuts playback at
+        // CHUNK granularity (~20 ms) — the old worst case was a whole sentence.
+        if let Some(probe) = ctl.as_deref_mut() {
+            if probe.poll() {
+                self.cancelled = true;
+                return false;
+            }
+        }
         if pcm.is_empty() {
             return !self.barged;
         }
@@ -1116,6 +1486,7 @@ impl TtsChunkPlayback {
         bt: &mut aokie_dongle::bluetooth::BluetoothManager,
         aec: &mut Option<&mut crate::aec::EchoCanceller>,
         barge_rms: Option<f32>,
+        ctl: &mut Option<&mut ControlProbe<'_>>,
         text: &str,
         sample_rate: u16,
     ) -> SpeakOutcome {
@@ -1126,11 +1497,18 @@ impl TtsChunkPlayback {
         // have all been queued. Keep polling the mic through the AEC until it
         // has played out.
         if let (Some(a), Some(thr)) = (aec.as_deref_mut(), barge_rms) {
-            if !self.barged {
+            if !self.barged && !self.cancelled {
                 let playout =
                     Duration::from_secs_f32(self.samples as f32 / sample_rate.max(1) as f32);
                 let deadline = self.t_first + playout;
                 while std::time::Instant::now() < deadline {
+                    // Urgent controls interrupt the playout tail too.
+                    if let Some(probe) = ctl.as_deref_mut() {
+                        if probe.poll() {
+                            self.cancelled = true;
+                            break;
+                        }
+                    }
                     let armed = self.t_first.elapsed() >= self.grace;
                     let mut got = false;
                     while let Some(rx) = bt.try_recv_audio() {
@@ -1193,6 +1571,7 @@ impl TtsChunkPlayback {
             dur: Duration::from_secs_f32(self.samples as f32 / sample_rate.max(1) as f32),
             barged: self.barged,
             captured_speech,
+            cancelled: self.cancelled,
         }
     }
 }
@@ -1213,7 +1592,7 @@ fn note_tts_outcome(status: &RadioStatus, out: &SpeakOutcome) {
     let mut slot = status.tts_error.lock().unwrap();
     if out.dur > std::time::Duration::ZERO {
         *slot = None;
-    } else if !out.barged {
+    } else if !out.barged && !out.cancelled {
         *slot = Some(
             "the last speech attempt produced no audio (TTS engine/endpoint failure) — check the voice models and the plugin log"
                 .to_string(),
@@ -1230,6 +1609,7 @@ fn note_tts_outcome(status: &RadioStatus, out: &SpeakOutcome) {
 /// half-duplex stream (caller relies on the mute). No-op with no SCO channel
 /// (sample_rate 0) or empty text.
 #[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
 fn tts_speak(
     bt: &mut aokie_dongle::bluetooth::BluetoothManager,
     tts: &mut Option<crate::voice::TtsEngine>,
@@ -1238,12 +1618,14 @@ fn tts_speak(
     sample_rate: u16,
     mut aec: Option<&mut crate::aec::EchoCanceller>,
     barge_rms: Option<f32>,
+    mut ctl: Option<&mut ControlProbe<'_>>,
 ) -> SpeakOutcome {
     use std::time::Duration;
     let none = SpeakOutcome {
         dur: Duration::ZERO,
         barged: false,
         captured_speech: Vec::new(),
+        cancelled: false,
     };
     if sample_rate == 0 || text.trim().is_empty() {
         return none;
@@ -1273,11 +1655,11 @@ fn tts_speak(
                 );
                 let mut playback = TtsChunkPlayback::new(sample_rate);
                 for chunk in pcm.chunks(http_tts_chunk_samples(sample_rate)) {
-                    if !playback.push(bt, &mut aec, barge_rms, chunk) {
+                    if !playback.push(bt, &mut aec, barge_rms, &mut ctl, chunk) {
                         break;
                     }
                 }
-                return playback.finish(bt, &mut aec, barge_rms, text, sample_rate);
+                return playback.finish(bt, &mut aec, barge_rms, &mut ctl, text, sample_rate);
             }
             Err(e) => {
                 if http_tts.fallback.mark_failed_for_call() {
@@ -1308,13 +1690,44 @@ fn tts_speak(
     // reply start on the first chunk (~0.3s).
     let mut playback = TtsChunkPlayback::new(sample_rate);
     let synth = engine.synthesize_streaming(text, &voice, sample_rate as u32, |pcm| {
-        playback.push(bt, &mut aec, barge_rms, pcm)
+        playback.push(bt, &mut aec, barge_rms, &mut ctl, pcm)
     });
     if let Err(e) = synth {
         eprintln!("[aokie-plugin] TTS synthesis failed: {e}");
         return none;
     }
-    playback.finish(bt, &mut aec, barge_rms, text, sample_rate)
+    playback.finish(bt, &mut aec, barge_rms, &mut ctl, text, sample_rate)
+}
+
+/// Execute an urgent control the [`ControlProbe`] caught mid-playback: note
+/// the termination intent (so `call.ended` reads the right outcome), flush
+/// the queued audio tail, and act on the phone. A failed radio action emits
+/// the authoritative `control_failed` diagnostic against the operation id.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn perform_cancel_action(
+    action: CancelAction,
+    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    tracker: &mut crate::call_session::SessionTracker,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+) {
+    bt.flush_tx_audio();
+    match action {
+        CancelAction::Hangup { op } => {
+            tracker.note_intent(crate::call_session::TerminationIntent::OperatorHangup);
+            if let Err(e) = bt.hangup() {
+                eprintln!("[aokie-plugin] mid-playback hangup failed: {e}");
+                emit_control_failed(outbox, sink, tracker, "call.hangup", op.as_deref(), &e);
+            }
+        }
+        CancelAction::Reject { op } => {
+            tracker.note_intent(crate::call_session::TerminationIntent::OperatorReject);
+            if let Err(e) = bt.reject_call() {
+                eprintln!("[aokie-plugin] mid-playback reject failed: {e}");
+                emit_control_failed(outbox, sink, tracker, "call.reject", op.as_deref(), &e);
+            }
+        }
+    }
 }
 
 /// The radio poll loop: drain events â†’ map+emit; buffer the incoming-call
@@ -1621,6 +2034,12 @@ fn run_loop(
     // flow binding must be disabled so the caller isn't answered twice.
     #[cfg(feature = "voice")]
     let agent_enabled = std::env::var_os("AOKIE_AI_RECEPTIONIST").is_some();
+    // AOK-CTRL-001: publish the RUNNING radio's responder ownership so the
+    // connector can refuse operatorSpeak truthfully (the radio would drop it).
+    #[cfg(feature = "voice")]
+    status
+        .agent_enabled
+        .store(agent_enabled, Ordering::Relaxed);
     // Shared with the LLM readiness probe thread (PROC-001): Configure updates
     // land here so the probe always checks the CURRENT endpoint setting.
     #[cfg(feature = "voice")]
@@ -1766,6 +2185,12 @@ fn run_loop(
     // call OR idle) resets per-call voice state and re-stamps the STT gate.
     #[cfg(feature = "voice")]
     let mut voice_call_gen: u64 = 0;
+    // AOK-CTRL-001: call-level max-silence watchdog (agent mode). Created when
+    // the greeting arms the conversation, dropped at every call boundary.
+    #[cfg(feature = "voice")]
+    let silence_window = max_silence_window();
+    #[cfg(feature = "voice")]
+    let mut silence_timer: Option<SilenceTimer> = None;
 
     loop {
         let mut idle = true;
@@ -1888,6 +2313,7 @@ fn run_loop(
             stt_had_speech = false;
             stt_silence = Duration::ZERO;
             mute_stt_until = None;
+            silence_timer = None;
             // Drop the echo canceller entirely rather than just resetting its
             // FIFOs (review sweep): it was built at the FIRST call's SCO rate
             // and reset() keeps that rate + filter length. Back-to-back calls
@@ -2028,9 +2454,24 @@ fn run_loop(
                     } else {
                         (None, None)
                     };
-                    let out = tts_speak(bt, &mut tts, &mut http_tts, text, sr, aec_ref, brms);
+                    // AOK-CTRL-001: a hangup/reject arriving DURING the
+                    // greeting cuts it at chunk granularity.
+                    let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
+                    let out = tts_speak(
+                        bt,
+                        &mut tts,
+                        &mut http_tts,
+                        text,
+                        sr,
+                        aec_ref,
+                        brms,
+                        Some(&mut probe),
+                    );
                     if !text.trim().is_empty() {
                         note_tts_outcome(&status, &out);
+                    }
+                    if let Some(action) = probe.action.take() {
+                        perform_cancel_action(action, bt, &mut tracker, outbox, sink);
                     }
                     if barge_in {
                         if out.barged {
@@ -2054,7 +2495,22 @@ fn run_loop(
                     // Truthful transcript (audit AOK-VOICE-001/002): record the
                     // greeting only when synthesis actually produced audio.
                     if out.dur > Duration::ZERO {
-                        emit_turn(outbox, sink, &corr, turn_index, "bot", text);
+                        let delivery = if out.barged {
+                            "interrupted"
+                        } else if out.cancelled {
+                            "operator_ended"
+                        } else {
+                            "complete"
+                        };
+                        emit_turn_with_delivery(
+                            outbox,
+                            sink,
+                            &corr,
+                            turn_index,
+                            "bot",
+                            text,
+                            Some(delivery),
+                        );
                         turn_index += 1;
                         history.push(serde_json::json!({ "role": "assistant", "content": text }));
                         last_bot_reply = text.to_string();
@@ -2063,6 +2519,12 @@ fn run_loop(
                             "[aokie-plugin] greeting produced NO audio (TTS failed) — not recorded as a spoken turn"
                         );
                     }
+                }
+                // AOK-CTRL-001: the conversation is live from here — start the
+                // call-level max-silence watchdog (agent mode only; in flow
+                // mode the host owns pacing).
+                if agent_enabled {
+                    silence_timer = Some(SilenceTimer::new(silence_window, Instant::now()));
                 }
             }
             idle = false;
@@ -2115,6 +2577,10 @@ fn run_loop(
                     stt_had_speech = true;
                     stt_silence = Duration::ZERO;
                     stt_buf.extend_from_slice(&f16);
+                    // AOK-CTRL-001: live caller audio resets the max-silence window.
+                    if let Some(t) = silence_timer.as_mut() {
+                        t.note_activity(Instant::now());
+                    }
                 } else if stt_had_speech {
                     stt_silence += frame_dur;
                     stt_buf.extend_from_slice(&f16); // keep trailing silence for context
@@ -2299,61 +2765,129 @@ fn run_loop(
                             // mid-reply failure/hangup records what played.
                             let mut spoken: Vec<String> = Vec::new();
                             eprintln!("[aokie-plugin] agent replying (streaming)â€¦");
-                            let outcome =
-                                client.stream_reply(serde_json::json!(messages), |sentence| {
-                                    // Audit AK-003: the radio loop is inside this
-                                    // stream — without this poll a Hangup waits for
-                                    // the WHOLE reply. Hangup/Reject act right here
-                                    // (worst-case latency: one sentence); everything
-                                    // else is parked for the main control loop.
-                                    while let Ok(ctl) = control_rx.try_recv() {
-                                        match ctl {
-                                            RadioControl::Hangup => {
-                                                tracker.note_intent(
-                                                    crate::call_session::TerminationIntent::OperatorHangup,
+                            // AOK-CTRL-001: the LLM stream runs on a DETACHED
+                            // worker; this thread pumps sentences + controls, so
+                            // a hangup/reject acts within ~25 ms even against a
+                            // stalled or punctuation-free stream (the old poll
+                            // only ran per SENTENCE, and a stream that never
+                            // yields one blocked cancellation entirely). The
+                            // bounded channel is the backpressure — synthesis
+                            // paces the worker, a runaway generation blocks the
+                            // WORKER, never grows a queue. The shared activity
+                            // stamp feeds the idle-deadline watchdog below. An
+                            // abandoned worker aborts at its next stream line
+                            // (cancel flag) or, if stuck mid-read, at the
+                            // client's whole-request timeout.
+                            let (reply_tx, reply_rx) =
+                                std::sync::mpsc::sync_channel::<ReplyMsg>(REPLY_CHANNEL_BOUND);
+                            let reply_cancel = Arc::new(AtomicBool::new(false));
+                            let reply_activity: Arc<Mutex<Option<Instant>>> =
+                                Arc::new(Mutex::new(None));
+                            {
+                                let client = client.clone();
+                                let cancel = reply_cancel.clone();
+                                let activity = reply_activity.clone();
+                                let messages = serde_json::json!(messages);
+                                // A failed spawn drops reply_tx → the pump sees
+                                // Disconnected and reports a reply failure.
+                                let _ = std::thread::Builder::new()
+                                    .name("aokie-agent-reply".to_string())
+                                    .spawn(move || {
+                                        let res = client.stream_reply(
+                                            messages,
+                                            &cancel,
+                                            || {
+                                                *activity.lock().unwrap() = Some(Instant::now());
+                                            },
+                                            |sentence| {
+                                                reply_tx
+                                                    .send(ReplyMsg::Sentence(sentence.to_string()))
+                                                    .is_ok()
+                                            },
+                                        );
+                                        let _ = reply_tx.send(ReplyMsg::Done(res));
+                                    })
+                                    .map_err(|e| {
+                                        eprintln!(
+                                            "[aokie-plugin] reply worker failed to start: {e}"
+                                        )
+                                    });
+                            }
+                            let started = Instant::now();
+                            let mut stream_outcome: Option<Result<String, String>> = None;
+                            'pump: loop {
+                                // Urgent controls act immediately — no stream
+                                // progress required (audit AK-003 + AOK-CTRL-001);
+                                // everything else parks for the main control loop.
+                                while let Ok(ctl) = control_rx.try_recv() {
+                                    match ctl {
+                                        RadioControl::Hangup { op } => {
+                                            tracker.note_intent(
+                                                crate::call_session::TerminationIntent::OperatorHangup,
+                                            );
+                                            bt.flush_tx_audio();
+                                            if let Err(e) = bt.hangup() {
+                                                eprintln!("[aokie-plugin] mid-reply hangup failed: {e}");
+                                                emit_control_failed(
+                                                    outbox, sink, &tracker, "call.hangup",
+                                                    op.as_deref(), &e,
                                                 );
-                                                bt.flush_tx_audio();
-                                                if let Err(e) = bt.hangup() {
-                                                    eprintln!("[aokie-plugin] mid-reply hangup failed: {e}");
-                                                }
-                                                operator_ended = true; // record only what played, not "caller interrupted"
-                                                return false; // abort the reply now
                                             }
-                                            RadioControl::Reject => {
-                                                tracker.note_intent(
-                                                    crate::call_session::TerminationIntent::OperatorReject,
-                                                );
-                                                bt.flush_tx_audio();
-                                                if let Err(e) = bt.reject_call() {
-                                                    eprintln!("[aokie-plugin] mid-reply reject failed: {e}");
-                                                }
-                                                operator_ended = true;
-                                                return false;
-                                            }
-                                            other => pending_controls.push_back(other),
+                                            operator_ended = true; // record only what played, not "caller interrupted"
                                         }
+                                        RadioControl::Reject { op } => {
+                                            tracker.note_intent(
+                                                crate::call_session::TerminationIntent::OperatorReject,
+                                            );
+                                            bt.flush_tx_audio();
+                                            if let Err(e) = bt.reject_call() {
+                                                eprintln!("[aokie-plugin] mid-reply reject failed: {e}");
+                                                emit_control_failed(
+                                                    outbox, sink, &tracker, "call.reject",
+                                                    op.as_deref(), &e,
+                                                );
+                                            }
+                                            operator_ended = true;
+                                        }
+                                        other => pending_controls.push_back(other),
                                     }
-                                    // Strip any [[END_CALL]] marker BEFORE synthesis so the
-                                    // caller never hears it and it never lands in the
-                                    // transcript; its presence arms the post-reply hangup.
-                                    let (spoken_text, had_marker) = strip_end_call_marker(sentence);
-                                    if had_marker {
-                                        hangup_requested = true;
-                                    }
-                                    eprintln!(
-                                        "[aokie-plugin] agent sentence (+{:?}): {}",
-                                        t0.elapsed(),
-                                        content_for_log(&spoken_text)
-                                    );
-                                    if barge_in {
+                                }
+                                if operator_ended {
+                                    reply_cancel.store(true, Ordering::Relaxed);
+                                    break 'pump;
+                                }
+                                match reply_rx.recv_timeout(Duration::from_millis(25)) {
+                                    Ok(ReplyMsg::Sentence(sentence)) => {
+                                        // Strip any [[END_CALL]] marker BEFORE synthesis so the
+                                        // caller never hears it and it never lands in the
+                                        // transcript; its presence arms the post-reply hangup
+                                        // REQUEST (validated by agent_hangup_verdict below).
+                                        let (spoken_text, had_marker) =
+                                            strip_end_call_marker(&sentence);
+                                        if had_marker {
+                                            hangup_requested = true;
+                                        }
+                                        eprintln!(
+                                            "[aokie-plugin] agent sentence (+{:?}): {}",
+                                            t0.elapsed(),
+                                            content_for_log(&spoken_text)
+                                        );
+                                        let mut probe =
+                                            ControlProbe::new(&control_rx, &mut pending_controls);
+                                        let (aec_ref, brms) = if barge_in {
+                                            (aec.as_mut(), Some(barge_rms))
+                                        } else {
+                                            (None, None)
+                                        };
                                         let out = tts_speak(
                                             bt,
                                             &mut tts,
                                             &mut http_tts,
                                             &spoken_text,
                                             sr,
-                                            aec.as_mut(),
-                                            Some(barge_rms),
+                                            aec_ref,
+                                            brms,
+                                            Some(&mut probe),
                                         );
                                         if !spoken_text.trim().is_empty() {
                                             note_tts_outcome(&status, &out);
@@ -2365,35 +2899,61 @@ fn run_loop(
                                         if !spoken_text.is_empty() && out.dur > Duration::ZERO {
                                             spoken.push(spoken_text.clone());
                                         }
+                                        if !barge_in {
+                                            let plays_until = (t0 + reply_dur).max(Instant::now());
+                                            mute_stt_until =
+                                                Some(plays_until + Duration::from_millis(600));
+                                        }
+                                        if let Some(action) = probe.action.take() {
+                                            // Operator hangup/reject landed mid-SENTENCE
+                                            // (chunk-granular, AOK-CTRL-001).
+                                            perform_cancel_action(
+                                                action, bt, &mut tracker, outbox, sink,
+                                            );
+                                            operator_ended = true;
+                                            reply_cancel.store(true, Ordering::Relaxed);
+                                            break 'pump;
+                                        }
                                         if out.barged {
                                             barge_capture = out.captured_speech;
                                             bt.flush_tx_audio(); // stop the queued tail now
                                             barged = true;
-                                            return false; // stop pulling from the LLM
+                                            reply_cancel.store(true, Ordering::Relaxed);
+                                            break 'pump; // stop pulling from the LLM
                                         }
-                                    } else {
-                                        let out = tts_speak(
-                                            bt,
-                                            &mut tts,
-                                            &mut http_tts,
-                                            &spoken_text,
-                                            sr,
-                                            None,
-                                            None,
-                                        );
-                                        if !spoken_text.trim().is_empty() {
-                                            note_tts_outcome(&status, &out);
-                                        }
-                                        reply_dur += out.dur;
-                                        if !spoken_text.is_empty() && out.dur > Duration::ZERO {
-                                            spoken.push(spoken_text.clone());
-                                        }
-                                        let plays_until = (t0 + reply_dur).max(Instant::now());
-                                        mute_stt_until =
-                                            Some(plays_until + Duration::from_millis(600));
                                     }
-                                    true
-                                });
+                                    Ok(ReplyMsg::Done(res)) => {
+                                        stream_outcome = Some(res);
+                                        break 'pump;
+                                    }
+                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                        // Named deadlines (the VOICE-001-deferred
+                                        // per-read idle deadline lives here): a
+                                        // reply that stops making progress is
+                                        // abandoned and takes the dead-air path.
+                                        let last = *reply_activity.lock().unwrap();
+                                        if let Some(reason) = reply_deadline_exceeded(
+                                            &REPLY_DEADLINES,
+                                            started,
+                                            last,
+                                            Instant::now(),
+                                        ) {
+                                            reply_cancel.store(true, Ordering::Relaxed);
+                                            stream_outcome = Some(Err(reason));
+                                            break 'pump;
+                                        }
+                                    }
+                                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                        stream_outcome = Some(Err(
+                                            "the reply worker exited without a result".to_string(),
+                                        ));
+                                        break 'pump;
+                                    }
+                                }
+                            }
+                            // Early exits (barge / operator) have no stream result;
+                            // their transcript comes from `spoken` via the cut path.
+                            let outcome = stream_outcome.unwrap_or_else(|| Ok(String::new()));
                             if !barge_in {
                                 // Cover audio still queued after the last chunk synthesized.
                                 let plays_until = (t0 + reply_dur).max(Instant::now());
@@ -2452,10 +3012,26 @@ fn run_loop(
                                     // audio AT ALL was never heard — record
                                     // nothing instead of the full generation.
                                     if !heard.is_empty() && reply_dur > Duration::ZERO {
+                                        // AOK-CTRL-001: structured per-turn delivery.
+                                        let delivery = if barged {
+                                            "interrupted"
+                                        } else if operator_ended {
+                                            "operator_ended"
+                                        } else {
+                                            "complete"
+                                        };
                                         history.push(
                                             serde_json::json!({ "role": "assistant", "content": heard }),
                                         );
-                                        emit_turn(outbox, sink, &corr, turn_index, "bot", &heard);
+                                        emit_turn_with_delivery(
+                                            outbox,
+                                            sink,
+                                            &corr,
+                                            turn_index,
+                                            "bot",
+                                            &heard,
+                                            Some(delivery),
+                                        );
                                         turn_index += 1;
                                         last_bot_reply = heard;
                                     } else if !heard.is_empty() {
@@ -2487,7 +3063,15 @@ fn run_loop(
                                         history.push(
                                             serde_json::json!({ "role": "assistant", "content": heard }),
                                         );
-                                        emit_turn(outbox, sink, &corr, turn_index, "bot", &heard);
+                                        emit_turn_with_delivery(
+                                            outbox,
+                                            sink,
+                                            &corr,
+                                            turn_index,
+                                            "bot",
+                                            &heard,
+                                            Some("error"),
+                                        );
                                         turn_index += 1;
                                         last_bot_reply = heard;
                                     } else if reply_left_dead_air(false, barged, operator_ended) {
@@ -2531,6 +3115,7 @@ fn run_loop(
                                 eprintln!(
                                     "[aokie-plugin] responder failed mid-call ({cause}) — speaking the fallback line and ending the call (VOICE-001)"
                                 );
+                                let fb_t0 = Instant::now();
                                 let out = tts_speak(
                                     bt,
                                     &mut tts,
@@ -2539,14 +3124,29 @@ fn run_loop(
                                     sr,
                                     None,
                                     None,
+                                    None,
                                 );
                                 note_tts_outcome(&status, &out);
                                 if out.dur > Duration::ZERO {
                                     // Truthful transcript: the apology WAS heard.
-                                    emit_turn(outbox, sink, &corr, turn_index, "bot", FALLBACK_LINE);
+                                    emit_turn_with_delivery(
+                                        outbox,
+                                        sink,
+                                        &corr,
+                                        turn_index,
+                                        "bot",
+                                        FALLBACK_LINE,
+                                        Some("complete"),
+                                    );
                                     turn_index += 1;
-                                    // Let the SCO buffer drain the tail before CHUP.
-                                    std::thread::sleep(Duration::from_millis(900));
+                                    // AOK-CTRL-001: drain the QUEUED apology before
+                                    // CHUP — computed from what was actually queued
+                                    // (the blind 900 ms cut a long apology short).
+                                    let wait =
+                                        playout_drain_wait(fb_t0, out.dur, Instant::now());
+                                    if !wait.is_zero() {
+                                        std::thread::sleep(wait);
+                                    }
                                 } else {
                                     eprintln!(
                                         "[aokie-plugin] fallback line also produced no audio — hanging up without it"
@@ -2565,26 +3165,219 @@ fn run_loop(
                                 }
                                 ended_by_failsafe = true;
                             }
-                            // Agent-initiated hangup: the reply carried the end-call
-                            // marker, so the call is fully handled. Respect a barge-in
-                            // (the caller may have more to say) and any operator action
-                            // that already ended it. The farewell played in real time via
-                            // tts_speak; give the SCO buffer a brief moment to drain its
-                            // tail before AT+CHUP cuts the channel.
-                            if hangup_requested && !barged && !operator_ended && !ended_by_failsafe {
-                                std::thread::sleep(Duration::from_millis(900));
-                                tracker.note_intent(
-                                    crate::call_session::TerminationIntent::AgentHangup,
-                                );
-                                match bt.hangup() {
-                                    Ok(()) => eprintln!(
-                                        "[aokie-plugin] agent finalized the call — hung up (AT+CHUP)"
-                                    ),
-                                    Err(e) => eprintln!("[aokie-plugin] agent hangup failed: {e}"),
+                            // Agent-initiated hangup (AOK-CTRL-001): the end-call
+                            // marker is only a REQUEST — the pure policy validates
+                            // it against what actually happened (barge, operator
+                            // action, fail-safe, farewell audibility) and computes
+                            // the farewell's remaining playout drain, replacing the
+                            // old fixed-delay hangup that could cut a goodbye short
+                            // or fire before one was proven audible.
+                            match agent_hangup_verdict(
+                                hangup_requested,
+                                barged,
+                                operator_ended,
+                                ended_by_failsafe,
+                                reply_dur > Duration::ZERO,
+                                t0,
+                                reply_dur,
+                                Instant::now(),
+                            ) {
+                                HangupVerdict::Proceed { wait } => {
+                                    if !wait.is_zero() {
+                                        std::thread::sleep(wait);
+                                    }
+                                    tracker.note_intent(
+                                        crate::call_session::TerminationIntent::AgentHangup,
+                                    );
+                                    match bt.hangup() {
+                                        Ok(()) => eprintln!(
+                                            "[aokie-plugin] agent finalized the call — hung up (AT+CHUP)"
+                                        ),
+                                        Err(e) => {
+                                            eprintln!("[aokie-plugin] agent hangup failed: {e}");
+                                            emit_control_failed(
+                                                outbox,
+                                                sink,
+                                                &tracker,
+                                                "agent.hangup",
+                                                None,
+                                                &e,
+                                            );
+                                        }
+                                    }
                                 }
+                                HangupVerdict::Skip(reason) => {
+                                    if hangup_requested {
+                                        eprintln!(
+                                            "[aokie-plugin] agent hangup request skipped: {reason}"
+                                        );
+                                    }
+                                }
+                            }
+                            // AOK-CTRL-001: a finished reply attempt (audible or
+                            // not) is conversational activity — the max-silence
+                            // window measures from here.
+                            if let Some(t) = silence_timer.as_mut() {
+                                t.note_activity(Instant::now());
                             }
                         }
                     }
+                }
+            }
+
+            // AOK-CTRL-001: call-level max-silence watchdog (agent mode). A
+            // live, answered call where NEITHER side has produced audio for a
+            // whole window gets a check-in prompt; a second silent window gets
+            // a polite goodbye and a clean hangup — a dead line never holds
+            // the phone open indefinitely.
+            if agent_enabled && tracker.current().is_some_and(|s| s.is_active()) {
+                let sr = bt.get_sample_rate();
+                let action = if sr > 0 {
+                    silence_timer.as_mut().and_then(|t| t.check(Instant::now()))
+                } else {
+                    None
+                };
+                match action {
+                    Some(SilenceAction::Prompt) => {
+                        idle = false;
+                        eprintln!(
+                            "[aokie-plugin] max-silence: no activity for {}s — checking in with the caller",
+                            silence_window.as_secs()
+                        );
+                        let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
+                        let (aec_ref, brms) = if barge_in {
+                            (aec.as_mut(), Some(barge_rms))
+                        } else {
+                            (None, None)
+                        };
+                        let out = tts_speak(
+                            bt,
+                            &mut tts,
+                            &mut http_tts,
+                            SILENCE_CHECK_LINE,
+                            sr,
+                            aec_ref,
+                            brms,
+                            Some(&mut probe),
+                        );
+                        note_tts_outcome(&status, &out);
+                        if barge_in {
+                            if out.barged {
+                                bt.flush_tx_audio();
+                                // The caller spoke over the prompt — that IS activity.
+                                if let Some(t) = silence_timer.as_mut() {
+                                    t.note_activity(Instant::now());
+                                }
+                                if !out.captured_speech.is_empty() {
+                                    stt_buf =
+                                        crate::voice::to_f32_16k(&out.captured_speech, sr as u32);
+                                    stt_had_speech = true;
+                                    stt_silence = Duration::ZERO;
+                                }
+                            }
+                        } else {
+                            mute_stt_until =
+                                Some(Instant::now() + out.dur + Duration::from_millis(400));
+                        }
+                        if out.dur > Duration::ZERO {
+                            if let Some(corr) = tracker.call_id().map(str::to_string) {
+                                let delivery = if out.barged {
+                                    "interrupted"
+                                } else if out.cancelled {
+                                    "operator_ended"
+                                } else {
+                                    "complete"
+                                };
+                                emit_turn_with_delivery(
+                                    outbox,
+                                    sink,
+                                    &corr,
+                                    turn_index,
+                                    "bot",
+                                    SILENCE_CHECK_LINE,
+                                    Some(delivery),
+                                );
+                                turn_index += 1;
+                            }
+                            history.push(serde_json::json!({
+                                "role": "assistant",
+                                "content": SILENCE_CHECK_LINE,
+                            }));
+                            last_bot_reply = SILENCE_CHECK_LINE.to_string();
+                        }
+                        if let Some(action) = probe.action.take() {
+                            perform_cancel_action(action, bt, &mut tracker, outbox, sink);
+                        }
+                    }
+                    Some(SilenceAction::HangUp) => {
+                        idle = false;
+                        eprintln!(
+                            "[aokie-plugin] max-silence: still nothing after the check-in — saying goodbye and ending the call"
+                        );
+                        let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
+                        let gb_t0 = Instant::now();
+                        let out = tts_speak(
+                            bt,
+                            &mut tts,
+                            &mut http_tts,
+                            SILENCE_GOODBYE_LINE,
+                            sr,
+                            None,
+                            None,
+                            Some(&mut probe),
+                        );
+                        note_tts_outcome(&status, &out);
+                        if out.barged {
+                            // The caller came back at the last moment — keep the call.
+                            bt.flush_tx_audio();
+                            if let Some(t) = silence_timer.as_mut() {
+                                t.note_activity(Instant::now());
+                            }
+                        } else if let Some(action) = probe.action.take() {
+                            // An operator action owns the ending instead.
+                            perform_cancel_action(action, bt, &mut tracker, outbox, sink);
+                        } else {
+                            if out.dur > Duration::ZERO {
+                                if let Some(corr) = tracker.call_id().map(str::to_string) {
+                                    emit_turn_with_delivery(
+                                        outbox,
+                                        sink,
+                                        &corr,
+                                        turn_index,
+                                        "bot",
+                                        SILENCE_GOODBYE_LINE,
+                                        Some("complete"),
+                                    );
+                                    turn_index += 1;
+                                }
+                                let wait = playout_drain_wait(gb_t0, out.dur, Instant::now());
+                                if !wait.is_zero() {
+                                    std::thread::sleep(wait);
+                                }
+                            }
+                            tracker.note_intent(
+                                crate::call_session::TerminationIntent::AgentHangup,
+                            );
+                            match bt.hangup() {
+                                Ok(()) => eprintln!(
+                                    "[aokie-plugin] max-silence hangup complete (AT+CHUP)"
+                                ),
+                                Err(e) => {
+                                    eprintln!("[aokie-plugin] max-silence hangup failed: {e}");
+                                    emit_control_failed(
+                                        outbox,
+                                        sink,
+                                        &tracker,
+                                        "agent.hangup",
+                                        None,
+                                        &e,
+                                    );
+                                }
+                            }
+                            silence_timer = None;
+                        }
+                    }
+                    None => {}
                 }
             }
         }
@@ -2597,24 +3390,29 @@ fn run_loop(
                 None => control_rx.try_recv(),
             };
             match next {
-                Ok(RadioControl::Answer) => {
+                Ok(RadioControl::Answer { op }) => {
                     if let Err(e) = bt.answer_call() {
                         eprintln!("[aokie-plugin] radio answer failed: {e}");
+                        // AOK-CTRL-001: the command result only said "accepted" —
+                        // this is the authoritative failure record for it.
+                        emit_control_failed(outbox, sink, &tracker, "call.answer", op.as_deref(), &e);
                     }
                 }
-                Ok(RadioControl::Reject) => {
+                Ok(RadioControl::Reject { op }) => {
                     // Record WHY before the phone acts, so the eventual
                     // CallTerminated reads outcome "rejected", never "missed"
                     // (audit AK-001/AK-01).
                     tracker.note_intent(crate::call_session::TerminationIntent::OperatorReject);
                     if let Err(e) = bt.reject_call() {
                         eprintln!("[aokie-plugin] radio reject failed: {e}");
+                        emit_control_failed(outbox, sink, &tracker, "call.reject", op.as_deref(), &e);
                     }
                 }
-                Ok(RadioControl::Hangup) => {
+                Ok(RadioControl::Hangup { op }) => {
                     tracker.note_intent(crate::call_session::TerminationIntent::OperatorHangup);
                     if let Err(e) = bt.hangup() {
                         eprintln!("[aokie-plugin] radio hangup failed: {e}");
+                        emit_control_failed(outbox, sink, &tracker, "call.hangup", op.as_deref(), &e);
                     }
                 }
                 Ok(RadioControl::SendSms { to, body }) => {
@@ -2631,20 +3429,51 @@ fn run_loop(
                         );
                     }
                 }
-                Ok(RadioControl::Speak { text }) => {
+                Ok(RadioControl::Speak { text, op }) => {
+                    #[cfg(not(feature = "voice"))]
+                    let _ = &op;
                     #[cfg(feature = "voice")]
                     if agent_enabled {
-                        // The in-plugin agent owns the conversation, so ignore any
-                        // operatorSpeak the flow still emits (its binding may be a
-                        // stale enabled-copy in the desktop's runtime cache) â€”
-                        // otherwise the caller is answered twice.
+                        // Belt-and-suspenders: the connector now REFUSES
+                        // operatorSpeak while the agent owns replies
+                        // (AOK-CTRL-001), so this only catches a request that
+                        // raced a radio restart. Never spoken (the caller must
+                        // not be answered twice) — and never silently either:
+                        // the accepted command gets its authoritative failure.
                         eprintln!(
-                            "[aokie-plugin] ignoring operatorSpeak (agent owns replies): {}",
+                            "[aokie-plugin] dropping operatorSpeak (agent owns replies): {}",
                             content_for_log(&text)
+                        );
+                        emit(
+                            outbox,
+                            sink,
+                            aokie_core::events::aokie_event_occurrence(
+                                crate::contract::events::HARDWARE_ERROR,
+                                tracker.call_id().unwrap_or("radio"),
+                                &aokie_core::events::occurrence_id(),
+                                json!({
+                                    "message": "call.operatorSpeak was dropped: the in-plugin AI receptionist owns replies on this install",
+                                    "code": "speak_failed",
+                                    "action": "call.operatorSpeak",
+                                    "operationId": op,
+                                }),
+                            ),
                         );
                     } else {
                         let sr = bt.get_sample_rate();
-                        let out = tts_speak(bt, &mut tts, &mut http_tts, &text, sr, None, None);
+                        // AOK-CTRL-001: a hangup/reject queued behind this speak
+                        // cuts it at chunk granularity.
+                        let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
+                        let out = tts_speak(
+                            bt,
+                            &mut tts,
+                            &mut http_tts,
+                            &text,
+                            sr,
+                            None,
+                            None,
+                            Some(&mut probe),
+                        );
                         if sr > 0 && !text.trim().is_empty() {
                             note_tts_outcome(&status, &out);
                         }
@@ -2660,14 +3489,51 @@ fn run_loop(
                         // caller never heard.
                         if out.dur > Duration::ZERO {
                             if let Some(corr) = tracker.call_id().map(str::to_string) {
-                                emit_turn(outbox, sink, &corr, turn_index, "bot", &text);
+                                let delivery = if out.cancelled {
+                                    "operator_ended"
+                                } else {
+                                    "complete"
+                                };
+                                emit_turn_with_delivery(
+                                    outbox,
+                                    sink,
+                                    &corr,
+                                    turn_index,
+                                    "bot",
+                                    &text,
+                                    Some(delivery),
+                                );
                                 turn_index += 1;
                             }
-                        } else {
+                            // Spoken audio is conversational activity.
+                            if let Some(t) = silence_timer.as_mut() {
+                                t.note_activity(Instant::now());
+                            }
+                        } else if !out.cancelled && sr > 0 && !text.trim().is_empty() {
                             eprintln!(
                                 "[aokie-plugin] operatorSpeak produced NO audio (TTS failed) — not recorded as a spoken turn: {}",
                                 content_for_log(&text)
                             );
+                            // AOK-CTRL-001: the accepted command's authoritative
+                            // failure — the text was NOT spoken to the caller.
+                            emit(
+                                outbox,
+                                sink,
+                                aokie_core::events::aokie_event_occurrence(
+                                    crate::contract::events::HARDWARE_ERROR,
+                                    tracker.call_id().unwrap_or("radio"),
+                                    &aokie_core::events::occurrence_id(),
+                                    json!({
+                                        "message": "call.operatorSpeak produced no audio (TTS failure) — the text was NOT spoken to the caller",
+                                        "code": "speak_failed",
+                                        "action": "call.operatorSpeak",
+                                        "operationId": op,
+                                    }),
+                                ),
+                            );
+                        }
+                        if let Some(action) = probe.action.take() {
+                            perform_cancel_action(action, bt, &mut tracker, outbox, sink);
                         }
                     }
                     #[cfg(not(feature = "voice"))]
@@ -3098,6 +3964,192 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── AOK-CTRL-001: fake-clock deadline / silence / hangup-policy tests ──
+    // Every decision function takes `now` (the clock seam): tests fabricate
+    // instants by offsetting one base Instant — fully deterministic.
+
+    #[cfg(feature = "voice")]
+    use std::time::{Duration as D, Instant};
+
+    /// The reply watchdog names WHICH deadline expired: first-activity (the
+    /// endpoint accepted but never produced stream data), idle (mid-stream
+    /// stall — the per-read deadline VOICE-001 deferred), or total.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn reply_deadlines_fire_by_phase_and_stay_quiet_on_progress() {
+        let cfg = ReplyDeadlines {
+            first_activity: D::from_secs(10),
+            idle: D::from_secs(8),
+            total: D::from_secs(60),
+        };
+        let t0 = Instant::now();
+
+        // Healthy: fresh activity, inside every window.
+        assert_eq!(
+            reply_deadline_exceeded(&cfg, t0, Some(t0 + D::from_secs(29)), t0 + D::from_secs(30)),
+            None
+        );
+        // No first token yet, but still inside the first-activity window.
+        assert_eq!(reply_deadline_exceeded(&cfg, t0, None, t0 + D::from_secs(9)), None);
+        // First-activity deadline.
+        let msg = reply_deadline_exceeded(&cfg, t0, None, t0 + D::from_secs(10)).unwrap();
+        assert!(msg.contains("first-activity"), "{msg}");
+        // Idle (per-read) deadline: activity happened, then the stream stalled.
+        let msg = reply_deadline_exceeded(
+            &cfg,
+            t0,
+            Some(t0 + D::from_secs(5)),
+            t0 + D::from_secs(13),
+        )
+        .unwrap();
+        assert!(msg.contains("idle deadline"), "{msg}");
+        // Total deadline wins even with fresh activity (a stream that trickles
+        // forever must still end).
+        let msg = reply_deadline_exceeded(
+            &cfg,
+            t0,
+            Some(t0 + D::from_secs(59)),
+            t0 + D::from_secs(60),
+        )
+        .unwrap();
+        assert!(msg.contains("total deadline"), "{msg}");
+    }
+
+    /// The max-silence timer: first expiry prompts, a second silent window
+    /// hangs up, any activity resets BOTH the window and the prompt state,
+    /// and a zero window disables the timer entirely.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn silence_timer_prompts_then_hangs_up_and_activity_resets() {
+        let t0 = Instant::now();
+        let mut timer = SilenceTimer::new(D::from_secs(30), t0);
+
+        assert_eq!(timer.check(t0 + D::from_secs(29)), None);
+        assert_eq!(timer.check(t0 + D::from_secs(30)), Some(SilenceAction::Prompt));
+        // The prompt restarted the window — not an instant hangup.
+        assert_eq!(timer.check(t0 + D::from_secs(31)), None);
+        assert_eq!(
+            timer.check(t0 + D::from_secs(60)),
+            Some(SilenceAction::HangUp)
+        );
+
+        // Activity after a prompt forgives it: the next expiry prompts again.
+        let mut timer = SilenceTimer::new(D::from_secs(30), t0);
+        assert_eq!(timer.check(t0 + D::from_secs(30)), Some(SilenceAction::Prompt));
+        timer.note_activity(t0 + D::from_secs(40));
+        assert_eq!(timer.check(t0 + D::from_secs(69)), None);
+        assert_eq!(timer.check(t0 + D::from_secs(70)), Some(SilenceAction::Prompt));
+
+        // Zero window = disabled.
+        let mut off = SilenceTimer::new(D::ZERO, t0);
+        assert_eq!(off.check(t0 + D::from_secs(3600)), None);
+    }
+
+    /// The agent-hangup POLICY: the LLM's marker is only a request — barge,
+    /// operator ownership, the fail-safe and an unproven farewell all veto it;
+    /// a valid request waits out the farewell's computed playout drain.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn agent_hangup_policy_vetoes_and_computes_the_drain() {
+        let t0 = Instant::now();
+        let dur = D::from_secs(2);
+
+        // No request → skip.
+        assert!(matches!(
+            agent_hangup_verdict(false, false, false, false, true, t0, dur, t0),
+            HangupVerdict::Skip(_)
+        ));
+        // Barge / operator / fail-safe veto.
+        for (barged, operator, failsafe) in
+            [(true, false, false), (false, true, false), (false, false, true)]
+        {
+            assert!(matches!(
+                agent_hangup_verdict(true, barged, operator, failsafe, true, t0, dur, t0),
+                HangupVerdict::Skip(_)
+            ));
+        }
+        // Farewell never played → the dead-air fail-safe owns the ending.
+        assert!(matches!(
+            agent_hangup_verdict(true, false, false, false, false, t0, D::ZERO, t0),
+            HangupVerdict::Skip(_)
+        ));
+        // Valid: the wait is the REMAINING playout + margin (queued 2s, 1s
+        // already elapsed → ~1.4s), bounded.
+        let HangupVerdict::Proceed { wait } =
+            agent_hangup_verdict(true, false, false, false, true, t0, dur, t0 + D::from_secs(1))
+        else {
+            panic!("expected Proceed");
+        };
+        assert_eq!(wait, D::from_millis(1400));
+    }
+
+    /// Drain math: remaining playout + margin, zero once already drained,
+    /// capped for pathological durations.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn playout_drain_wait_is_remaining_playout_bounded() {
+        let t0 = Instant::now();
+        // 3s queued, 1s elapsed → 2s remaining + 400ms margin.
+        assert_eq!(
+            playout_drain_wait(t0, D::from_secs(3), t0 + D::from_secs(1)),
+            D::from_millis(2400)
+        );
+        // Fully drained long ago → zero (no blind sleep).
+        assert_eq!(
+            playout_drain_wait(t0, D::from_secs(1), t0 + D::from_secs(10)),
+            D::ZERO
+        );
+        // Pathological queue → capped.
+        assert_eq!(
+            playout_drain_wait(t0, D::from_secs(120), t0),
+            D::from_secs(8)
+        );
+    }
+
+    /// The control probe: hangup/reject stop playback and are recorded (sticky);
+    /// every other control parks in arrival order for the main loop.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn control_probe_catches_urgent_actions_and_parks_the_rest() {
+        let (tx, rx) = std::sync::mpsc::channel::<RadioControl>();
+        let mut parked = std::collections::VecDeque::new();
+        let mut probe = ControlProbe::new(&rx, &mut parked);
+
+        assert!(!probe.poll(), "no controls yet");
+
+        tx.send(RadioControl::StopPairing).unwrap();
+        tx.send(RadioControl::Hangup {
+            op: Some("op_1".into()),
+        })
+        .unwrap();
+        tx.send(RadioControl::StartPairing { seconds: 30 }).unwrap();
+
+        assert!(probe.poll(), "hangup must stop playback");
+        assert_eq!(
+            probe.action,
+            Some(CancelAction::Hangup {
+                op: Some("op_1".into())
+            })
+        );
+        // Sticky once set, and the pre-hangup control was parked in order.
+        assert!(probe.poll());
+        drop(probe);
+        assert!(matches!(parked.front(), Some(RadioControl::StopPairing)));
+
+        // Reject is urgent too.
+        let mut parked = std::collections::VecDeque::new();
+        let mut probe = ControlProbe::new(&rx, &mut parked);
+        // The StartPairing sent above is still queued — it parks first.
+        tx.send(RadioControl::Reject { op: None }).unwrap();
+        assert!(probe.poll());
+        assert_eq!(probe.action, Some(CancelAction::Reject { op: None }));
+        drop(probe);
+        assert!(matches!(
+            parked.front(),
+            Some(RadioControl::StartPairing { seconds: 30 })
+        ));
+    }
 
     /// VOICE-001: the dead-air decision — the fail-safe (apologise + hang up)
     /// fires ONLY when nothing audibly played and nothing else explains the
