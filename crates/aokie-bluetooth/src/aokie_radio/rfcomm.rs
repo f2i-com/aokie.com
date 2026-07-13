@@ -1010,6 +1010,34 @@ pub struct RfcommClientState {
     /// command + our top-up frames). Refilled as data arrives so the
     /// peer never stalls the way the AG stalled on us.
     rx_credits_outstanding: u16,
+    /// Secondary outbound DLCIs riding THIS (initiator) multiplexer —
+    /// MAP MAS / PBAP PSE attach here when the outbound HFP client owns
+    /// the mux. Bluedroid allows ONE RFCOMM session per peer: a second
+    /// L2CAP/PSM-0x0003 session gets its L2CAP config acked and then
+    /// the mux SABM is never answered (live 2026-07-13: the first
+    /// kickoff SMS died in exactly that stall, and the phone rebound
+    /// its HFP traffic onto the dead session's channel, deafening call
+    /// handling). Keyed by target DLCI.
+    secondary_dlcis: BTreeMap<u8, SecondaryDlci>,
+    /// Events from secondary-DLCI transitions, drained by the sharing
+    /// runtimes (MAP/PBAP) via `take_client_events_for_dlci` — the same
+    /// contract `RfcommState` offers on the inbound mux, so the OBEX
+    /// runtimes are mux-role agnostic.
+    client_events: Vec<ClientDlciEvent>,
+}
+
+/// One secondary outbound DLCI on the initiator mux. The same
+/// PN → SABM → MSC ⇄ MSC state walk as `RfcommState::ClientDlci`, plus
+/// per-DLCI credit budgets (the primary DLCI's credits must never be
+/// spent on OBEX frames or vice versa).
+#[derive(Debug)]
+struct SecondaryDlci {
+    phase: ClientDlciPhase,
+    msc_local_pending: bool,
+    msc_remote_received: bool,
+    credit_flow: bool,
+    tx_credits: u16,
+    rx_credits_outstanding: u16,
 }
 
 /// Initial credits we grant the peer in the PN command (BTstack/BlueZ
@@ -1035,7 +1063,132 @@ impl RfcommClientState {
             credit_flow: false,
             tx_credits: 0,
             rx_credits_outstanding: 0,
+            secondary_dlcis: BTreeMap::new(),
+            client_events: Vec::new(),
         }
+    }
+
+    /// True once the multiplexer SABM/UA has settled and the session is
+    /// still alive — the precondition for attaching secondary DLCIs.
+    /// (Any phase past `AwaitingMultiplexerUa` implies the mux is up;
+    /// Closed/Failed mean the whole session is gone.)
+    pub fn mux_is_open(&self) -> bool {
+        !matches!(
+            self.phase,
+            RfcommClientPhase::Idle
+                | RfcommClientPhase::AwaitingMultiplexerUa
+                | RfcommClientPhase::Closed
+                | RfcommClientPhase::Failed(_)
+        )
+    }
+
+    /// Attach a new outbound DLCI on this initiator multiplexer (the
+    /// twin of `RfcommState::attach_client_dlci` for sessions WE
+    /// initiated — HARD-001 outbound reconnects). Returns the target
+    /// DLCI and the PN command framed as a UIH-on-DLCI-0, ready for
+    /// L2CAP wrapping. Wait for `ClientDlciEvent::Opened` before
+    /// sending OBEX via `build_uih_on_client_dlci`.
+    pub fn attach_client_dlci(&mut self, server_channel: u8) -> Result<(u8, Vec<u8>), String> {
+        if !self.mux_is_open() {
+            return Err(format!(
+                "attach_client_dlci: initiator mux not open (phase {:?})",
+                self.phase
+            ));
+        }
+        // Same D-bit as the primary target: we initiated the mux, so a
+        // remote server channel maps to DLCI = 2*scn + 1 (this is the
+        // case where the spec rule and Bluedroid's empirical behaviour
+        // agree — see RfcommState::attach_client_dlci for the shared-
+        // inbound-mux divergence story).
+        let target_dlci = server_channel_dlci(server_channel, true);
+        if target_dlci == self.target_dlci || self.secondary_dlcis.contains_key(&target_dlci) {
+            return Err(format!(
+                "attach_client_dlci: dlci {} already in use",
+                target_dlci
+            ));
+        }
+        self.secondary_dlcis.insert(
+            target_dlci,
+            SecondaryDlci {
+                phase: ClientDlciPhase::AwaitingPnRsp,
+                msc_local_pending: false,
+                msc_remote_received: false,
+                credit_flow: false,
+                tx_credits: 0,
+                rx_credits_outstanding: u16::from(CLIENT_INITIAL_CREDITS),
+            },
+        );
+        // CFC PN frame type (0xe0): attaching to an ALREADY-RUNNING mux
+        // is the case where Bluedroid acks a legacy 0xf0 PN and then
+        // silently drops the SABM that follows (proven on the inbound
+        // shared mux) — declare credit-based flow control up front.
+        let pn = build_parameter_negotiation_command_cfc(
+            target_dlci,
+            7,
+            self.max_frame_size,
+            CLIENT_INITIAL_CREDITS,
+        );
+        eprintln!(
+            "[AokieRadio] RFCOMM initiator-mux DLCI {} attached (server channel {})",
+            target_dlci, server_channel
+        );
+        // C/R = 1: we are the mux initiator issuing a command.
+        Ok((target_dlci, build_uih(RFCOMM_DLCI_MULTIPLEXER, true, None, &pn)))
+    }
+
+    /// Drain pending secondary-DLCI events whose `dlci` matches; events
+    /// for other DLCIs stay queued for their own runtime — identical
+    /// contract to `RfcommState::take_client_events_for_dlci`.
+    pub fn take_client_events_for_dlci(&mut self, dlci: u8) -> Vec<ClientDlciEvent> {
+        let all = std::mem::take(&mut self.client_events);
+        let mut taken = Vec::new();
+        let mut remaining = Vec::new();
+        for ev in all {
+            let ev_dlci = match &ev {
+                ClientDlciEvent::Opened { dlci } => *dlci,
+                ClientDlciEvent::Failed { dlci, .. } => *dlci,
+                ClientDlciEvent::Payload { dlci, .. } => *dlci,
+            };
+            if ev_dlci == dlci {
+                taken.push(ev);
+            } else {
+                remaining.push(ev);
+            }
+        }
+        self.client_events = remaining;
+        taken
+    }
+
+    /// Build a UIH frame on a secondary `dlci` carrying `payload`
+    /// (OBEX bytes). Errors unless the DLCI reached `Open`. Consumes
+    /// one transmit credit under credit-based flow control.
+    pub fn build_uih_on_client_dlci(&mut self, dlci: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let client = self
+            .secondary_dlcis
+            .get_mut(&dlci)
+            .ok_or_else(|| format!("build_uih_on_client_dlci: dlci {} not tracked", dlci))?;
+        if !matches!(client.phase, ClientDlciPhase::Open) {
+            return Err(format!(
+                "build_uih_on_client_dlci: dlci {} not Open (phase {:?})",
+                dlci, client.phase
+            ));
+        }
+        if client.credit_flow {
+            client.tx_credits = client.tx_credits.saturating_sub(1);
+        }
+        // C/R = 1: initiator-mux command (same rule as the primary DLCI).
+        Ok(build_uih(dlci, true, None, payload))
+    }
+
+    /// Force-tear-down a secondary DLCI (MAS-stall recovery). Idempotent:
+    /// emits the DISC even when the DLCI isn't tracked so half-open
+    /// peer-side state can clear; tracking is dropped so a fresh
+    /// `attach_client_dlci` can re-PN from scratch. Never touches the
+    /// primary (HFP) DLCI — recovery must not kill the phone link.
+    pub fn build_force_disc_secondary_dlci(&mut self, dlci: u8) -> Vec<u8> {
+        self.secondary_dlcis.remove(&dlci);
+        // C/R = 1: initiator command.
+        build_disc(dlci, true)
     }
 
     /// False while credit-based flow control is active and the peer has
@@ -1102,6 +1255,20 @@ impl RfcommClientState {
         match (frame.kind, frame.dlci) {
             (RfcommFrameKind::Ua, RFCOMM_DLCI_MULTIPLEXER) => self.on_ua_multiplexer(),
             (RfcommFrameKind::Ua, dlci) if dlci == self.target_dlci => self.on_ua_target(),
+            // Secondary-DLCI arms come BEFORE the session-wide Dm/Disc
+            // catch-alls: a refused/closed MAS or PBAP DLCI must fail
+            // only ITSELF — never the HFP session sharing the mux.
+            (RfcommFrameKind::Ua, dlci) if self.secondary_dlcis.contains_key(&dlci) => {
+                self.on_ua_secondary(dlci)
+            }
+            (RfcommFrameKind::Dm, dlci) if self.secondary_dlcis.contains_key(&dlci) => {
+                self.fail_secondary(dlci, format!("RFCOMM peer sent DM on dlci {}", dlci));
+                Ok(Vec::new())
+            }
+            (RfcommFrameKind::Disc, dlci) if self.secondary_dlcis.contains_key(&dlci) => {
+                self.fail_secondary(dlci, format!("RFCOMM peer sent DISC on dlci {}", dlci));
+                Ok(vec![build_ua(dlci, false)])
+            }
             (RfcommFrameKind::Dm, dlci) => {
                 // DM = "go away". Treat as a hard fail so the caller
                 // tears the L2CAP channel down. Don't auto-recover —
@@ -1163,6 +1330,9 @@ impl RfcommClientState {
                 }
                 Ok(out)
             }
+            (RfcommFrameKind::Uih, dlci) if self.secondary_dlcis.contains_key(&dlci) => {
+                Ok(self.on_uih_secondary(dlci, frame.credits, frame.payload))
+            }
             _ => {
                 eprintln!(
                     "[AokieRadio] RFCOMM client ignored frame kind {:?} on dlci {}",
@@ -1171,6 +1341,83 @@ impl RfcommClientState {
                 Ok(Vec::new())
             }
         }
+    }
+
+    fn on_ua_secondary(&mut self, dlci: u8) -> Result<Vec<Vec<u8>>, String> {
+        let Some(client) = self.secondary_dlcis.get_mut(&dlci) else {
+            return Ok(Vec::new());
+        };
+        if !matches!(client.phase, ClientDlciPhase::AwaitingTargetUa) {
+            return Ok(Vec::new());
+        }
+        // SABM acked — MSC exchange next, both directions, before the
+        // DLCI counts as Open (same conservative walk as the primary).
+        client.phase = ClientDlciPhase::AwaitingMscExchange;
+        client.msc_local_pending = true;
+        let msc = build_modem_status_command(dlci, RFCOMM_LOCAL_MODEM_STATUS);
+        Ok(vec![build_uih(RFCOMM_DLCI_MULTIPLEXER, true, None, &msc)])
+    }
+
+    fn on_uih_secondary(&mut self, dlci: u8, credits: Option<u8>, payload: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let Some(client) = self.secondary_dlcis.get_mut(&dlci) else {
+            return out;
+        };
+        if let Some(granted) = credits {
+            if granted > 0 {
+                client.tx_credits = client.tx_credits.saturating_add(u16::from(granted));
+                eprintln!(
+                    "[AokieRadio] RFCOMM initiator-mux dlci {} credit grant +{} (tx_credits now {})",
+                    dlci, granted, client.tx_credits
+                );
+            }
+        }
+        if !payload.is_empty() {
+            self.client_events.push(ClientDlciEvent::Payload {
+                dlci,
+                payload: payload.to_vec(),
+            });
+            // Refill the peer's budget before it runs dry — a PSE/MSE
+            // at zero credits simply stops talking mid-listing.
+            if let Some(client) = self.secondary_dlcis.get_mut(&dlci) {
+                if client.credit_flow {
+                    client.rx_credits_outstanding =
+                        client.rx_credits_outstanding.saturating_sub(1);
+                    if client.rx_credits_outstanding <= CLIENT_CREDIT_REFILL_THRESHOLD {
+                        let refill =
+                            u16::from(CLIENT_INITIAL_CREDITS) - client.rx_credits_outstanding;
+                        client.rx_credits_outstanding += refill;
+                        out.push(build_uih(dlci, true, Some(refill as u8), &[]));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn maybe_open_secondary(&mut self, dlci: u8) {
+        let Some(client) = self.secondary_dlcis.get_mut(&dlci) else {
+            return;
+        };
+        if matches!(client.phase, ClientDlciPhase::AwaitingMscExchange)
+            && !client.msc_local_pending
+            && client.msc_remote_received
+        {
+            client.phase = ClientDlciPhase::Open;
+            eprintln!("[AokieRadio] RFCOMM initiator-mux dlci {} open", dlci);
+            self.client_events.push(ClientDlciEvent::Opened { dlci });
+        }
+    }
+
+    fn fail_secondary(&mut self, dlci: u8, reason: String) {
+        if let Some(client) = self.secondary_dlcis.get_mut(&dlci) {
+            client.phase = ClientDlciPhase::Failed(reason.clone());
+        }
+        eprintln!(
+            "[AokieRadio] RFCOMM initiator-mux dlci {} failed: {}",
+            dlci, reason
+        );
+        self.client_events.push(ClientDlciEvent::Failed { dlci, reason });
     }
 
     fn on_ua_multiplexer(&mut self) -> Result<Vec<Vec<u8>>, String> {
@@ -1256,6 +1503,51 @@ impl RfcommClientState {
             } if dlci == self.target_dlci => {
                 self.msc_remote_received = true;
                 self.maybe_emit_opened();
+                let rsp = build_modem_status_response(dlci, signals);
+                Ok(vec![build_uih(RFCOMM_DLCI_MULTIPLEXER, false, None, &rsp)])
+            }
+            // ── Secondary-DLCI mux commands (MAP/PBAP on this mux) ──
+            RfcommMuxCommand::ParameterNegotiation {
+                is_response: true,
+                dlci,
+                frame_type,
+                credits,
+                ..
+            } if self
+                .secondary_dlcis
+                .get(&dlci)
+                .is_some_and(|c| matches!(c.phase, ClientDlciPhase::AwaitingPnRsp)) =>
+            {
+                let client = self.secondary_dlcis.get_mut(&dlci).expect("guard checked");
+                client.credit_flow = frame_type == RFCOMM_PN_BLUETOOTH_FRAME_TYPE_CFC;
+                client.tx_credits = u16::from(credits);
+                client.phase = ClientDlciPhase::AwaitingTargetUa;
+                eprintln!(
+                    "[AokieRadio] RFCOMM initiator-mux dlci {} PN response: cfc={} initial_tx_credits={}",
+                    dlci, client.credit_flow, client.tx_credits
+                );
+                Ok(vec![build_sabm(dlci, true)])
+            }
+            RfcommMuxCommand::ModemStatus {
+                is_response: true,
+                dlci,
+                ..
+            } if self.secondary_dlcis.contains_key(&dlci) => {
+                if let Some(client) = self.secondary_dlcis.get_mut(&dlci) {
+                    client.msc_local_pending = false;
+                }
+                self.maybe_open_secondary(dlci);
+                Ok(Vec::new())
+            }
+            RfcommMuxCommand::ModemStatus {
+                is_response: false,
+                dlci,
+                signals,
+            } if self.secondary_dlcis.contains_key(&dlci) => {
+                if let Some(client) = self.secondary_dlcis.get_mut(&dlci) {
+                    client.msc_remote_received = true;
+                }
+                self.maybe_open_secondary(dlci);
                 let rsp = build_modem_status_response(dlci, signals);
                 Ok(vec![build_uih(RFCOMM_DLCI_MULTIPLEXER, false, None, &rsp)])
             }
