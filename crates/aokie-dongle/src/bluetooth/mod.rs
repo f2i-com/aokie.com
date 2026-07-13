@@ -227,11 +227,33 @@ impl BluetoothManager {
         self.runtime.bonded_addresses()
     }
 
+    /// Bonded devices as (address, captured friendly name) — the "paired
+    /// phones" list disambiguates multiple phones by model.
+    pub fn bonded_devices(&self) -> Vec<(String, Option<String>)> {
+        self.runtime
+            .bonded_devices()
+            .into_iter()
+            .map(|d| (d.address, d.name))
+            .collect()
+    }
+
+    /// The connected phone's captured friendly name/model, if known yet.
+    pub fn connected_name(&self) -> Option<String> {
+        self.runtime.connected_name()
+    }
+
     /// AOK-BT-001: forget a bonded device so it can no longer reconnect
     /// without pairing again. Disconnects an active session for that device
     /// first (PAIR-001). Returns whether a link key was removed.
     pub fn remove_paired(&self, address: &str) -> Result<bool, String> {
         self.runtime.remove_paired(address.to_string())
+    }
+
+    /// Disconnect the connected phone but KEEP the bond (unlike Forget) —
+    /// clears a wedged link; the phone reconnects. Returns whether a live
+    /// link for `address` was actually disconnected.
+    pub fn disconnect(&self, address: &str) -> Result<bool, String> {
+        self.runtime.disconnect(address.to_string())
     }
 
     /// PAIR-001: a clone of the shared pending-confirmation slot for

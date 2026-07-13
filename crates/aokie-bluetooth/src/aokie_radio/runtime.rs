@@ -214,6 +214,14 @@ enum ControlCommand {
         address: String,
         reply: stdmpsc::Sender<Result<bool, String>>,
     },
+    /// Disconnect the active ACL for `address` but KEEP the bond (unlike
+    /// RemovePaired). Clears a wedged link; the phone re-pages us and
+    /// reconnects (working inbound direction). Replies whether a live link
+    /// for that address was actually disconnected.
+    Disconnect {
+        address: String,
+        reply: stdmpsc::Sender<Result<bool, String>>,
+    },
     /// PAIR-001: resolve a held SSP numeric confirmation. `accept` sends the
     /// positive reply (bond proceeds); `false` sends the negative reply. `Err`
     /// when nothing is pending for `address` (expired / wrong address).
@@ -358,10 +366,11 @@ pub struct RuntimeStatus {
     /// runtime loop reconciles the controller's scan-enable to `is_open()` and
     /// passes it to the HCI pairing gate.
     pairing_window: PairingWindow,
-    /// AOK-BT-001: a snapshot of the pairing store's bonded BD_ADDRs (never link
-    /// keys), refreshed at startup and after every bond/removal, so `phone.listPaired`
-    /// can show revocable identities without touching the runtime thread's store.
-    bonded_addresses: RwLock<Vec<String>>,
+    /// AOK-BT-001: a snapshot of the pairing store's bonded devices (BD_ADDR +
+    /// captured friendly name, never link keys), refreshed at startup and after
+    /// every bond/removal/name-capture, so `phone.listPaired` can show revocable
+    /// identities WITH device names without touching the runtime thread's store.
+    bonded_devices: RwLock<Vec<super::pairing_store::PairedDeviceRecord>>,
     /// PAIR-001: the held SSP numeric comparison awaiting the operator, if any.
     /// Written by the runtime loop, read by `phone.status` via the slot clone.
     pairing_confirm: PairingConfirmSlot,
@@ -379,6 +388,9 @@ const AUDIO_CHANNEL_DEPTH: usize = 256;
 struct Addresses {
     local: String,
     remote: String,
+    /// The connected phone's friendly name/model, captured via HCI Remote Name
+    /// Request after the ACL comes up. Empty until it lands (~1s after connect).
+    remote_name: Option<String>,
 }
 
 pub struct AokieRuntime {
@@ -593,10 +605,47 @@ impl AokieRuntime {
     /// identities `phone.listPaired` surfaces.
     pub fn bonded_addresses(&self) -> Vec<String> {
         self.status
-            .bonded_addresses
+            .bonded_devices
             .read()
-            .map(|a| a.clone())
+            .map(|d| d.iter().map(|r| r.address.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// The bonded devices with their captured friendly names (address + name)
+    /// so `phone.listPaired` can disambiguate multiple phones by model.
+    pub fn bonded_devices(&self) -> Vec<super::pairing_store::PairedDeviceRecord> {
+        self.status
+            .bonded_devices
+            .read()
+            .map(|d| d.clone())
+            .unwrap_or_default()
+    }
+
+    /// The connected phone's captured friendly name, if known yet.
+    pub fn connected_name(&self) -> Option<String> {
+        self.status
+            .addresses
+            .read()
+            .ok()
+            .and_then(|a| a.remote_name.clone())
+    }
+
+    /// Disconnect the currently-connected phone (KEEP the bond, unlike Forget).
+    /// A wedged HFP link is cleared this way; the phone — for which we stay
+    /// connectable — typically re-pages us and re-establishes the link (the
+    /// working inbound direction), so this doubles as a remote reconnect.
+    /// Returns true when a live link for `address` was actually disconnected.
+    pub fn disconnect(&self, address: String) -> Result<bool, String> {
+        let (reply_tx, reply_rx) = stdmpsc::channel();
+        self.control_tx
+            .send(ControlCommand::Disconnect {
+                address,
+                reply: reply_tx,
+            })
+            .map_err(|_| "aokie-radio runtime is no longer running".to_string())?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "aokie-radio runtime did not answer the disconnect request".to_string())?
     }
 
     /// PAIR-001: a clone of the shared pending-confirmation slot so callers can
@@ -1114,8 +1163,8 @@ fn run_runtime(
     let mut pairing_store = AokiePairingStore::load(pairing_store_path)?;
     // AOK-BT-001: publish the initial bonded-device snapshot so phone.listPaired
     // reflects the store from the first RPC.
-    if let Ok(mut snap) = status.bonded_addresses.write() {
-        *snap = pairing_store.list_addresses();
+    if let Ok(mut snap) = status.bonded_devices.write() {
+        *snap = pairing_store.list_devices();
     }
     // Track the advertised scan-enable so the loop only writes the controller when
     // the pairing window actually changes state (opened / expired / closed). The
@@ -2057,11 +2106,47 @@ fn run_runtime(
                     // refresh the snapshot so listPaired reflects it immediately.
                     let result = pairing_store.remove(&address);
                     if matches!(result, Ok(true)) {
-                        if let Ok(mut snap) = status.bonded_addresses.write() {
-                            *snap = pairing_store.list_addresses();
+                        if let Ok(mut snap) = status.bonded_devices.write() {
+                            *snap = pairing_store.list_devices();
                         }
                         eprintln!("[AokieRadio] removed bonded device {address}");
                     }
+                    let _ = reply.send(result);
+                }
+                Ok(ControlCommand::Disconnect { address, reply }) => {
+                    // Disconnect the live link WITHOUT dropping the bond. Only
+                    // acts when the target is the currently-connected phone
+                    // (the runtime tracks a single active ACL). The phone,
+                    // for which we stay connectable, typically re-pages us and
+                    // reconnects — so this is the remote "reconnect if wedged".
+                    let remote_is_target = status
+                        .addresses
+                        .read()
+                        .map(|a| a.remote.eq_ignore_ascii_case(&address))
+                        .unwrap_or(false);
+                    let result = if remote_is_target {
+                        if let Some(handle) = active_acl_handle {
+                            let cmd = hci::disconnect_command(handle, 0x13);
+                            match transport.write_command(&cmd) {
+                                Ok(()) => {
+                                    eprintln!(
+                                        "[AokieRadio] disconnect {}: tore down active ACL \
+                                         (handle {:#06x}); bond kept — the phone can reconnect",
+                                        address, handle
+                                    );
+                                    Ok(true)
+                                }
+                                Err(e) => Err(format!("ACL disconnect write failed: {e}")),
+                            }
+                        } else {
+                            // Connected per status but no handle tracked — nothing to cut.
+                            Ok(false)
+                        }
+                    } else {
+                        // Not the connected phone (or nothing connected): a no-op,
+                        // not an error — the UI shows it as already disconnected.
+                        Ok(false)
+                    };
                     let _ = reply.send(result);
                 }
                 Ok(ControlCommand::ConfirmPairing {
@@ -2246,8 +2331,8 @@ fn run_runtime(
                 // auto-close the pairing window — one device per window, so a
                 // successful pair doesn't leave us discoverable for the full timeout.
                 if pairing_store.len() != bonds_before {
-                    if let Ok(mut snap) = status.bonded_addresses.write() {
-                        *snap = pairing_store.list_addresses();
+                    if let Ok(mut snap) = status.bonded_devices.write() {
+                        *snap = pairing_store.list_devices();
                     }
                     if pairing_store.len() > bonds_before {
                         status.pairing_window.close();
@@ -2361,6 +2446,40 @@ fn run_runtime(
                         );
                     }
                 }
+                // Device name/model capture: the phone answered our
+                // Remote Name Request (issued on ConnectionComplete). Persist
+                // it against the bond so the "paired phones" list shows the
+                // model, refresh the snapshot, and mirror it live for the
+                // connected phone. status != 0 (name unavailable) is ignored.
+                if let hci::HciEvent::RemoteNameRequestComplete {
+                    status: nstatus,
+                    address,
+                    name,
+                } = &event
+                {
+                    let name = name.trim();
+                    if *nstatus == 0 && !name.is_empty() {
+                        eprintln!("[AokieRadio] remote name for {address}: {name:?}");
+                        // Live name for the CURRENTLY connected phone.
+                        if let Ok(mut a) = status.addresses.write() {
+                            if a.remote.eq_ignore_ascii_case(address) {
+                                a.remote_name = Some(name.to_string());
+                            }
+                        }
+                        // Persist against the bond (if bonded) + refresh snapshot.
+                        match pairing_store.set_name(address, name) {
+                            Ok(true) => {
+                                if let Ok(mut snap) = status.bonded_devices.write() {
+                                    *snap = pairing_store.list_devices();
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => eprintln!(
+                                "[AokieRadio] failed to persist device name for {address}: {e}"
+                            ),
+                        }
+                    }
+                }
                 // Phase 3e: track the ACL handle for PbapRuntime. We
                 // set it here (not inside forward_hci_event) because
                 // forward_hci_event has no access to the IO-loop
@@ -2376,6 +2495,26 @@ fn run_runtime(
                 {
                     if *cstatus == 0 && *link_type == hci::LINK_TYPE_ACL {
                         active_acl_handle = Some(*connection_handle);
+                        // Ask the phone for its friendly name/model so Device
+                        // Setup can show "Lance's Pixel 8" instead of a bare
+                        // MAC (disambiguates multiple bonded phones). Best
+                        // effort — a failure just leaves the address showing.
+                        // Clear any stale name from a previous peer first.
+                        if let Ok(mut a) = status.addresses.write() {
+                            a.remote_name = None;
+                        }
+                        match hci::remote_name_request_command(address) {
+                            Ok(cmd) => {
+                                if let Err(e) = transport.write_command(&cmd) {
+                                    eprintln!(
+                                        "[AokieRadio] remote name request write failed for {address}: {e}"
+                                    );
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "[AokieRadio] remote name request build failed for {address}: {e}"
+                            ),
+                        }
                     }
                     // Clear auto-reconnect pending state regardless of
                     // success/failure — the page either landed (and we
@@ -3211,6 +3350,7 @@ fn forward_hci_event(
             );
             if let Ok(mut a) = status.addresses.write() {
                 a.remote.clear();
+                a.remote_name = None;
             }
             status.connected.store(false, Ordering::Relaxed);
             let _ = event_tx.send(RuntimeEvent::DeviceDisconnected(remote));
