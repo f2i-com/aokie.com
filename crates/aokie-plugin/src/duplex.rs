@@ -184,6 +184,42 @@ fn phrase_command(tokens: &[String], phrases: &[&[&str]], max_leftover: usize) -
     leftover_count(tokens, &table_words) <= max_leftover
 }
 
+/// True when an utterance is a PURE backchannel — a brief acknowledgement
+/// ("yeah", "oh cool", "that's awesome") that keeps the floor with the
+/// current speaker. Used by the live scratchpad to decide whether overlap
+/// speech should steer the reply (substantive) or ride along (backchannel).
+pub fn is_backchannel(text: &str) -> bool {
+    let tokens = words(text);
+    if tokens.is_empty() || tokens.len() > 4 {
+        return false;
+    }
+    tokens.iter().all(|t| {
+        matches!(
+            t.as_str(),
+            "yeah" | "yep" | "yes" | "ok" | "okay" | "mm" | "mhm" | "hmm" | "uh" | "huh" | "right"
+                | "sure" | "cool" | "awesome" | "great" | "nice" | "good" | "oh" | "ah" | "wow"
+                | "alright" | "thanks" | "thank" | "you" | "got" | "it" | "totally" | "exactly"
+                | "perfect" | "fantastic" | "lovely" | "brilliant" | "that's" | "thats" | "so"
+        )
+    })
+}
+
+/// True when an utterance is a BARE HESITATION — a thinking sound ("Uh",
+/// "Um", "Well...") with no content. The right response is silence: the
+/// caller is composing, not asking. (Live 2026-07-13: "Uh" fragments were
+/// each answered with chatter, derailing the goodbye.)
+pub fn is_hesitation(text: &str) -> bool {
+    let tokens = words(text);
+    !tokens.is_empty()
+        && tokens.len() <= 2
+        && tokens.iter().all(|t| {
+            matches!(
+                t.as_str(),
+                "uh" | "um" | "er" | "ah" | "hmm" | "mm" | "well" | "so" | "like" | "erm"
+            )
+        })
+}
+
 /// Parse one final caller utterance into a floor intent.
 ///
 /// Conservative by construction: negations and question leads disqualify,
