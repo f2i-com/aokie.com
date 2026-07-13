@@ -1410,9 +1410,13 @@ impl RfcommClientState {
     }
 
     fn fail_secondary(&mut self, dlci: u8, reason: String) {
-        if let Some(client) = self.secondary_dlcis.get_mut(&dlci) {
-            client.phase = ClientDlciPhase::Failed(reason.clone());
-        }
+        // REMOVE the tracking entry rather than tombstoning it: a peer
+        // DM/DISC means the DLCI is dead on their side, and the next
+        // MAP/PBAP attempt must be able to re-PN from scratch (live
+        // 2026-07-13: a Failed tombstone wedged every subsequent
+        // PollInbox with 'dlci 11 already in use'). Stray late frames
+        // for the removed DLCI fall into the ignore arm harmlessly.
+        self.secondary_dlcis.remove(&dlci);
         eprintln!(
             "[AokieRadio] RFCOMM initiator-mux dlci {} failed: {}",
             dlci, reason
