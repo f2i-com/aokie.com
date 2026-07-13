@@ -668,6 +668,13 @@ mod tests {
         // The phone link must survive an OBEX refusal.
         assert!(state.is_open(), "HFP must stay open after a MAS DM");
         assert!(state.mux_is_open());
+        // And the DLCI slot must be reusable — a Failed tombstone would
+        // wedge every later poll with 'dlci already in use' (live
+        // 2026-07-13: the PollInbox retry loop died exactly this way).
+        let (again, _) = state
+            .attach_client_dlci(MAS_CHANNEL)
+            .expect("re-attach after a peer DM");
+        assert_eq!(again, dlci);
     }
 
     #[test]
