@@ -142,7 +142,7 @@ pub const DEFAULT_GREETING: &str = "Hello, thanks for calling. How can I help yo
 /// to emit an [[END_CALL]] marker at the very end of its farewell so the plugin
 /// knows the conversation is complete and can hang up after the goodbye plays.
 #[cfg(feature = "voice")]
-const END_CALL_INSTRUCTION: &str = "\n\nEnding the call: ONLY when the caller's request is fully handled and there is nothing left to do, give a brief, warm goodbye and then append the exact marker [[END_CALL]] at the very end of that same final message. Never write the marker mid-conversation or while a question is still open — it hangs up the call.";
+const END_CALL_INSTRUCTION: &str = "\n\nEnding the call: when the caller's request is fully handled, FIRST ask whether they need anything else (for example \"Is there anything else I can help you with?\") with NO marker. Only after the caller confirms they are done (or says goodbye themselves), reply with a brief, warm goodbye and append the exact marker [[END_CALL]] at the very end of that goodbye. The goodbye carrying the marker must never contain a question - the system refuses to hang up while a question is waiting for an answer. Never write the marker mid-conversation.";
 
 /// Appended to the system prompt in agent mode: how the model participates in
 /// spoken delivery (validated pacing markers, the [[WAIT]] intentional-silence
@@ -442,6 +442,7 @@ fn agent_hangup_verdict(
     operator_ended: bool,
     ended_by_failsafe: bool,
     farewell_audible: bool,
+    farewell_asks_question: bool,
     t0: std::time::Instant,
     reply_dur: std::time::Duration,
     now: std::time::Instant,
@@ -462,6 +463,16 @@ fn agent_hangup_verdict(
         // Nothing played: the dead-air fail-safe fires for this reply attempt
         // (apology + hangup) — proceeding here would race it.
         return HangupVerdict::Skip("the farewell never played — the fail-safe owns the ending");
+    }
+    if farewell_asks_question {
+        // Live report 2026-07-13: the model appended [[END_CALL]] to
+        // "Is there anything else I can help you with?" and the call hung up
+        // on its own question. A farewell that ASKS the caller anything is
+        // not a farewell — stay on the line for the answer; the next clean
+        // goodbye (no question) carries the hangup.
+        return HangupVerdict::Skip(
+            "the farewell asks the caller a question — waiting for their answer",
+        );
     }
     HangupVerdict::Proceed {
         wait: playout_drain_wait(t0, reply_dur, now),
@@ -3784,6 +3795,10 @@ fn run_loop(
                                     operator_ended,
                                     ended_by_failsafe,
                                     reply_dur > Duration::ZERO,
+                                    // Any question in what actually PLAYED means
+                                    // the model expects an answer — never hang up
+                                    // on the caller mid-question.
+                                    spoken.iter().any(|s| s.contains('?')),
                                     t0,
                                     reply_dur,
                                     Instant::now(),
@@ -4773,8 +4788,9 @@ mod tests {
     }
 
     /// The agent-hangup POLICY: the LLM's marker is only a request — barge,
-    /// operator ownership, the fail-safe and an unproven farewell all veto it;
-    /// a valid request waits out the farewell's computed playout drain.
+    /// operator ownership, the fail-safe, an unproven farewell and a farewell
+    /// that ASKS A QUESTION all veto it; a valid request waits out the
+    /// farewell's computed playout drain.
     #[cfg(feature = "voice")]
     #[test]
     fn agent_hangup_policy_vetoes_and_computes_the_drain() {
@@ -4783,7 +4799,7 @@ mod tests {
 
         // No request → skip.
         assert!(matches!(
-            agent_hangup_verdict(false, false, false, false, true, t0, dur, t0),
+            agent_hangup_verdict(false, false, false, false, true, false, t0, dur, t0),
             HangupVerdict::Skip(_)
         ));
         // Barge / operator / fail-safe veto.
@@ -4791,20 +4807,37 @@ mod tests {
             [(true, false, false), (false, true, false), (false, false, true)]
         {
             assert!(matches!(
-                agent_hangup_verdict(true, barged, operator, failsafe, true, t0, dur, t0),
+                agent_hangup_verdict(true, barged, operator, failsafe, true, false, t0, dur, t0),
                 HangupVerdict::Skip(_)
             ));
         }
         // Farewell never played → the dead-air fail-safe owns the ending.
         assert!(matches!(
-            agent_hangup_verdict(true, false, false, false, false, t0, D::ZERO, t0),
+            agent_hangup_verdict(true, false, false, false, false, false, t0, D::ZERO, t0),
             HangupVerdict::Skip(_)
         ));
+        // Live report 2026-07-13: "Is there anything else I can help you
+        // with? [[END_CALL]]" hung up on its own question — a farewell that
+        // asks anything must WAIT for the answer instead.
+        let verdict =
+            agent_hangup_verdict(true, false, false, false, true, true, t0, dur, t0);
+        let HangupVerdict::Skip(reason) = verdict else {
+            panic!("a questioning farewell must not hang up");
+        };
+        assert!(reason.contains("question"), "reason names the cause: {reason}");
         // Valid: the wait is the REMAINING playout + margin (queued 2s, 1s
         // already elapsed → ~1.4s), bounded.
-        let HangupVerdict::Proceed { wait } =
-            agent_hangup_verdict(true, false, false, false, true, t0, dur, t0 + D::from_secs(1))
-        else {
+        let HangupVerdict::Proceed { wait } = agent_hangup_verdict(
+            true,
+            false,
+            false,
+            false,
+            true,
+            false,
+            t0,
+            dur,
+            t0 + D::from_secs(1),
+        ) else {
             panic!("expected Proceed");
         };
         assert_eq!(wait, D::from_millis(1400));
