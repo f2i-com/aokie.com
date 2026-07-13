@@ -46,4 +46,6 @@ pub mod rpc;
 pub mod speech_plan;
 pub mod speech_wire;
 #[cfg(feature = "voice")]
+pub mod synth;
+#[cfg(feature = "voice")]
 pub mod voice;
