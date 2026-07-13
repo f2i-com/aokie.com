@@ -95,6 +95,14 @@ pub enum RadioControl {
         address: String,
         reply: std::sync::mpsc::Sender<Result<bool, String>>,
     },
+    /// HARD-001: reconnect a bonded phone from OUR side — the radio pages it
+    /// and drives the HFP setup itself. Replies whether the attempt started
+    /// (true) or the phone was already connected (false); errors for
+    /// not-bonded / busy / HCI failures.
+    Connect {
+        address: String,
+        reply: std::sync::mpsc::Sender<Result<bool, String>>,
+    },
     /// PAIR-001: resolve the held SSP numeric comparison for `address` —
     /// `accept` completes the bond, `false` refuses it.
     ConfirmPairing {
@@ -676,6 +684,15 @@ impl RadioHandle {
         self.send(RadioControl::Disconnect { address, reply: tx })?;
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|_| "the radio did not answer the disconnect request".to_string())?
+    }
+
+    /// HARD-001: reconnect a bonded phone from OUR side (page + outbound HFP
+    /// setup). Blocks briefly on the radio thread; true = attempt started.
+    pub fn connect(&self, address: String) -> Result<bool, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send(RadioControl::Connect { address, reply: tx })?;
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|_| "the radio did not answer the connect request".to_string())?
     }
 
     /// PAIR-001: the held SSP numeric comparison awaiting the operator, if
@@ -3701,6 +3718,9 @@ fn run_loop(
                 }
                 Ok(RadioControl::Disconnect { address, reply }) => {
                     let _ = reply.send(bt.disconnect(&address));
+                }
+                Ok(RadioControl::Connect { address, reply }) => {
+                    let _ = reply.send(bt.connect(&address));
                 }
                 Ok(RadioControl::ConfirmPairing {
                     address,

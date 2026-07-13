@@ -183,7 +183,7 @@ impl MapRuntime {
         match phase {
             MapRuntimePhase::Resting {
                 local_cid,
-                client,
+                mut client,
                 mut session,
                 obex_buffer,
             } => {
@@ -262,7 +262,7 @@ impl MapRuntime {
         match phase {
             MapRuntimePhase::Resting {
                 local_cid,
-                client,
+                mut client,
                 mut session,
                 obex_buffer,
             } => {
