@@ -245,11 +245,24 @@ impl HfpClientState {
                         if let Some(frame) = self.next_command_frame()? {
                             responses.push(frame);
                         } else if self.pending_commands.is_empty() {
-                            // Only an EMPTY queue means the SLC sequence
-                            // finished — a command held back by credit
-                            // flow control must not fake readiness.
-                            if let Some(event) = self.hfp_state.mark_service_level_ready() {
-                                self.events.push(event);
+                            // Lost/garbled +CIND=? definitions (phantom-answer
+                            // incidents): re-request ONCE before readiness —
+                            // ringing on default indices misreads as answered.
+                            if self.hfp_state.needs_indicator_definitions_retry() {
+                                self.pending_commands
+                                    .push_back(hfp::HfpAtCommand::RetrieveIndicators);
+                                self.pending_commands
+                                    .push_back(hfp::HfpAtCommand::RetrieveIndicatorStatus);
+                                if let Some(frame) = self.next_command_frame()? {
+                                    responses.push(frame);
+                                }
+                            } else {
+                                // Only an EMPTY queue means the SLC sequence
+                                // finished — a command held back by credit
+                                // flow control must not fake readiness.
+                                if let Some(event) = self.hfp_state.mark_service_level_ready() {
+                                    self.events.push(event);
+                                }
                             }
                         }
                     }
