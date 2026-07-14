@@ -4269,7 +4269,16 @@ fn run_loop(
             last_cut_context = None;
             // §9.3: the call-scoped agent overlay dies WITH its call — the
             // next caller can never inherit the previous caller's persona.
-            call_agent_overlay = None;
+            // EXCEPT an overlay already bound to THIS (new) call: a
+            // plugin-dialed outbound call sets its opening-line/purpose
+            // overlay at DIAL time, one loop pass before this reset sees the
+            // generation change (live bug 2026-07-14, first outbound test
+            // call 2821e7e2: this unconditional wipe threw the overlay away
+            // and the agent greeted the callee with the INBOUND greeting,
+            // knowing nothing about the call it had just placed).
+            if call_agent_overlay.as_ref().map(|o| o.call_id.as_str()) != tracker.call_id() {
+                call_agent_overlay = None;
+            }
             greet_hold_started = None;
             answer_hold_started = None;
             live_hyp = None;
