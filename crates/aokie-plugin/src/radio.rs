@@ -2238,6 +2238,45 @@ fn begin_business_lookup(
     Some((id, rx, Instant::now() + std::time::Duration::from_millis(5000)))
 }
 
+/// True when a reply ANNOUNCES a data check to the caller ("let me check the
+/// calendar for...") — used as a marker-forgotten fallback: the model's
+/// spoken history strips markers, so it imitated its own announce-only turns
+/// and left callers in dead air waiting on a check that never ran (call
+/// acadcecc — twice in one call for "the 16th of August").
+fn looks_like_lookup_announcement(reply: &str) -> bool {
+    let r = reply.to_lowercase();
+    [
+        "let me check",
+        "let me look",
+        "let me pull up",
+        "i'll check",
+        "i will check",
+        "checking the calendar",
+        "checking our records",
+    ]
+    .iter()
+    .any(|p| r.contains(p))
+}
+
+#[cfg(test)]
+mod lookup_announcement_tests {
+    use super::looks_like_lookup_announcement as ann;
+
+    #[test]
+    fn announce_phrases_detected() {
+        assert!(ann("Let me check the calendar for the 16th of August for you."));
+        assert!(ann("Aye, I'll check our records for that date, matey."));
+        assert!(ann("One second - checking the calendar now."));
+    }
+
+    #[test]
+    fn ordinary_replies_do_not_trigger() {
+        assert!(!ann("Saturday 8 August looks open. Would you like me to put a booking request in?"));
+        assert!(!ann("We're open Monday to Friday, nine to five."));
+        assert!(!ann("I'll have the team confirm that for you."));
+    }
+}
+
 /// Returns `(digest_text, spoken)`. `spoken` is a ready-to-speak sentence the
 /// FLOW composed deterministically for date-availability questions — when it
 /// is present the caller hears it VERBATIM and no LLM round runs (live calls
@@ -5320,6 +5359,18 @@ fn run_loop(
                                         // if the syntax isn't — look up the
                                         // caller's own words.
                                         lookup_requested = Some(text.clone());
+                                    } else if looks_like_lookup_announcement(&full) {
+                                        // The model TOLD the caller it would
+                                        // check but forgot the marker (call
+                                        // acadcecc: 'Let me check the calendar
+                                        // for the 16th of August' TWICE, no
+                                        // marker, no flow, dead air). The
+                                        // intent is unambiguous — run the
+                                        // lookup on the caller's own words.
+                                        eprintln!(
+                                            "[aokie-plugin] lookup announcement without a marker — looking up the caller's words"
+                                        );
+                                        lookup_requested = Some(text.clone());
                                     }
                                     // The transcript records what audibly PLAYED
                                     // (span-planned, marker-free) — never the raw
@@ -5393,8 +5444,21 @@ fn run_loop(
                                         } else {
                                             "complete"
                                         };
+                                        // The model's OWN history keeps the
+                                        // lookup marker even though speech
+                                        // strips it: without this, its context
+                                        // showed announce-WITHOUT-marker turns
+                                        // being answered, and in-context
+                                        // imitation beat the instruction —
+                                        // later "checks" were announced with
+                                        // no marker at all (call acadcecc).
+                                        // The transcript stays marker-free.
+                                        let hist_content = match &lookup_requested {
+                                            Some(lq) => format!("{heard} [[LOOKUP: {lq}]]"),
+                                            None => heard.clone(),
+                                        };
                                         history.push(
-                                            serde_json::json!({ "role": "assistant", "content": heard }),
+                                            serde_json::json!({ "role": "assistant", "content": hist_content }),
                                         );
                                         emit_turn_with_delivery(
                                             outbox,
