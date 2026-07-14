@@ -5501,6 +5501,14 @@ fn run_loop(
             // follow-up replies read the better text. Corrections for an
             // ended call still emit; only the history patch is current-call.
             while let Ok((cid, tidx, raw, stt)) = heard_rx.try_recv() {
+                if sanitize_heard(&raw, &stt).is_none() {
+                    // Content-free by design: "agreed" covers unchanged AND
+                    // empty/oversized model output — either way the STT text
+                    // stands and no event is emitted.
+                    eprintln!(
+                        "[aokie-plugin] audio transcript agreed with STT [turn {tidx}] — no correction"
+                    );
+                }
                 if let Some(heard) = sanitize_heard(&raw, &stt) {
                     eprintln!(
                         "[aokie-plugin] audio transcript correction [turn {tidx}]: {}",
@@ -5670,16 +5678,32 @@ fn run_loop(
                     // 'turn_done above, so a PIN utterance structurally
                     // cannot reach this request. Best-effort: no connected
                     // client / no captured audio = silent no-op.
-                    if audio_transcript && !last_turn_audio.is_empty() {
+                    if audio_transcript {
                         let heard_client = agent_client
                             .clone()
                             .or_else(|| pending_agent_client.lock().unwrap().clone());
-                        if let Some(hc) = heard_client {
+                        // Every skip logs its reason — a silent lane is
+                        // indistinguishable from a broken one (live call
+                        // be56c70c: zero corrections and no way to tell why).
+                        if last_turn_audio.is_empty() {
+                            eprintln!(
+                                "[aokie-plugin] audio transcript check skipped [turn {turn_index}]: no paired audio for this turn"
+                            );
+                        } else if heard_client.is_none() {
+                            eprintln!(
+                                "[aokie-plugin] audio transcript check skipped [turn {turn_index}]: no connected LLM client yet"
+                            );
+                        }
+                        if let (Some(hc), false) = (heard_client, last_turn_audio.is_empty()) {
                             let pcm = last_turn_audio.clone();
                             let cid = corr.clone();
                             let stt = text.clone();
                             let tidx = turn_index;
                             let tx = heard_tx.clone();
+                            eprintln!(
+                                "[aokie-plugin] audio transcript check spawned [turn {tidx}] ({} samples)",
+                                pcm.len()
+                            );
                             std::thread::spawn(move || {
                                 let b64 = crate::agent::LlmClient::wav_base64(&pcm, 16_000);
                                 match hc.transcribe_turn(&b64, &stt) {
