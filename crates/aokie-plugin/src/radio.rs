@@ -189,11 +189,18 @@ Booking rule: a booking or message is INCOMPLETE without the caller's name. If y
 /// real generations stay identically primed. A missing/failed lookup flow
 /// degrades gracefully — the injected result says UNAVAILABLE and the model
 /// answers from its notes.
-const TOOL_INSTRUCTION: &str = "\n\nLive lookups: when the caller asks for business information you genuinely do NOT have in your notes (availability beyond the listed days, order or record lookups), reply with EXACTLY [[LOOKUP: one clear question]] and nothing else - the system runs the lookup and hands you the result to answer from. Use it at most once per caller turn, and never for things already in your notes.";
+const TOOL_INSTRUCTION: &str = "\n\nLive lookups: when the caller asks for business DATA you genuinely do NOT have in your notes (availability beyond the listed days, records), reply with EXACTLY [[LOOKUP: one clear data question]] and nothing else - the SYSTEM runs the lookup and hands you the result to answer from. The lookup question is addressed to a DATABASE, never to the caller: if you need to ask the CALLER something (to clarify a date, for example), just ask them normally WITHOUT the marker. At most one lookup per caller turn; never for things already in your notes.";
 
 /// Spoken while the lookup flow runs (1-4 s): silence there reads as a dead
 /// line. Persona-neutral on purpose.
 const LOOKUP_FILLER_LINE: &str = "One moment - let me check that for you.";
+
+/// Spoken when the model asks for ANOTHER lookup after already receiving one
+/// (or the line can't take a lookup): an honest handoff beats silence — the
+/// silent path ended in the technical-difficulties fail-safe on a live call
+/// (73325204).
+const LOOKUP_HANDOFF_LINE: &str =
+    "I couldn't find that just now - I'll have the team check and get back to you. Is there anything else I can help with?";
 
 const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read aloud to the caller by a voice synthesizer.\n- This is a LIVE phone conversation: keep every reply to ONE or TWO short sentences, then let the caller speak. Long replies get talked over and feel rude. Ask at most one question per reply. Only go longer when reading back details the caller asked for.\n- When reading back dates, times or booking details from your notes, copy them EXACTLY as written - never approximate, merge or reorder them. If a detail is not in your notes, say you will have the team confirm it rather than guessing.\n- Phone numbers and codes are automatically read slowly, digit by digit; you do not need to do anything special for them.\n- You may wrap a short critical detail in [[slow]]...[[/slow]] to have it spoken more slowly.\n- Rarely, you may wrap ONE short vital sentence in [[important]]...[[/important]] so a brief overlap does not cut it off. The caller can always stop you by saying stop or wait.\n- If the caller asks you to wait, says they are thinking, or clearly needs a moment, reply with exactly [[WAIT]] and nothing else - staying silent is the right response. Never fill their pause with chatter; when they speak again, continue naturally.\n- If the caller's words were only a brief acknowledgement (yeah, okay, mm-hm) while you were talking, continue where you left off instead of starting over - or reply with [[WAIT]] if nothing needs saying.\nThe double-bracket markers are never spoken and never shown to anyone.";
 
@@ -5049,6 +5056,19 @@ fn run_loop(
                                         // applies per-span interrupt policy. The probe
                                         // lane rides along: a spoken "wait"/"stop" cuts
                                         // the sentence mid-playback.
+                                        if spoken_text.contains("[[LOOKUP") {
+                                            // A lookup marker leaking through
+                                            // the stream (often UNCLOSED — the
+                                            // sentence chunker cut it before
+                                            // the ]]) must never be spoken;
+                                            // the whole-reply detection owns
+                                            // the verdict (live: the caller
+                                            // heard "LOOKUP: Are ye looking…").
+                                            eprintln!(
+                                                "[aokie-plugin] holding a lookup-marker sentence back from speech"
+                                            );
+                                            continue;
+                                        }
                                         // The mid-span check compares overlap
                                         // against everything SENT so far plus
                                         // the sentence about to play.
@@ -5233,12 +5253,16 @@ fn run_loop(
                                     if crate::speech_plan::has_wait_marker(&full) {
                                         wait_requested = true;
                                     }
-                                    if lookup_rounds == 0 {
-                                        if let Some(q) =
-                                            crate::speech_plan::parse_lookup_marker(&full)
-                                        {
-                                            lookup_requested = Some(q);
-                                        }
+                                    if let Some(q) =
+                                        crate::speech_plan::parse_lookup_marker(&full)
+                                    {
+                                        lookup_requested = Some(q);
+                                    } else if full.contains("[[LOOKUP") {
+                                        // Garbled/unclosed marker (live call
+                                        // 73325204): the intent is clear even
+                                        // if the syntax isn't — look up the
+                                        // caller's own words.
+                                        lookup_requested = Some(text.clone());
                                     }
                                     // The transcript records what audibly PLAYED
                                     // (span-planned, marker-free) — never the raw
@@ -5592,6 +5616,69 @@ fn run_loop(
                             // explicit UNAVAILABLE so the model answers from
                             // its notes instead of guessing.
                             if let Some(q) = lookup_requested.take() {
+                                if lookup_rounds > 0
+                                    && !line_dead
+                                    && !operator_ended
+                                    && bt.get_sample_rate() > 0
+                                {
+                                    // The model wants a SECOND lookup after
+                                    // already receiving one: speak an honest
+                                    // handoff instead of silently regenerating
+                                    // (or worse, saying nothing).
+                                    eprintln!(
+                                        "[aokie-plugin] repeat lookup request — speaking the handoff line"
+                                    );
+                                    let sr_now = bt.get_sample_rate();
+                                    let mut hprobe = ControlProbe::new(
+                                        &control_rx,
+                                        &mut pending_controls,
+                                    );
+                                    let (aec_ref, brms) = if barge_in {
+                                        (aec.as_mut(), Some(barge_rms))
+                                    } else {
+                                        (None, None)
+                                    };
+                                    let h_started = Instant::now();
+                                    let planned = speak_planned(
+                                        bt,
+                                        &synth,
+                                        LOOKUP_HANDOFF_LINE,
+                                        sr_now,
+                                        aec_ref,
+                                        brms,
+                                        Some(&mut hprobe),
+                                        &pace,
+                                        protected_max_ms,
+                                        None,
+                                    );
+                                    if let Some(action) = hprobe.action.take() {
+                                        perform_cancel_action(
+                                            action, bt, &mut tracker, outbox, sink,
+                                        );
+                                    }
+                                    if planned.outcome.dur > Duration::ZERO
+                                        && !planned.played_text.is_empty()
+                                    {
+                                        history.push(serde_json::json!({
+                                            "role": "assistant",
+                                            "content": planned.played_text,
+                                        }));
+                                        emit_turn_with_delivery(
+                                            outbox,
+                                            sink,
+                                            &corr,
+                                            turn_index,
+                                            "bot",
+                                            &planned.played_text,
+                                            Some("complete"),
+                                            Some(&aokie_core::events::iso8601_ago_ms(
+                                                h_started.elapsed().as_millis() as u64,
+                                            )),
+                                        );
+                                        turn_index += 1;
+                                    }
+                                    break 'reply_rounds;
+                                }
                                 if lookup_rounds == 0
                                     && !line_dead
                                     && !operator_ended
