@@ -29,6 +29,10 @@ use super::rfcomm::{ClientDlciEvent, RfcommClientEvent, RfcommClientState};
 pub struct HfpClientState {
     client: RfcommClientState,
     hfp_state: hfp::HfpHandsFreeState,
+    /// Incomplete trailing AT line carried across UIH frames (the live
+    /// 2026-07-14 phantom-answer incident hit THIS path: the +CIND=?
+    /// definitions line fragmented on the initiator mux).
+    line_carry: String,
     pending_commands: VecDeque<hfp::HfpAtCommand>,
     in_flight_command: Option<hfp::HfpAtCommand>,
     in_flight_sent_at: Option<Instant>,
@@ -45,6 +49,7 @@ impl HfpClientState {
         Self {
             client: RfcommClientState::new(server_channel),
             hfp_state: hfp::HfpHandsFreeState::new(),
+            line_carry: String::new(),
             pending_commands: VecDeque::new(),
             in_flight_command: None,
             in_flight_sent_at: None,
@@ -230,7 +235,7 @@ impl HfpClientState {
 
     fn handle_ag_payload(&mut self, payload: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         let mut responses = Vec::new();
-        for result in hfp::parse_ag_results(payload)? {
+        for result in hfp::parse_ag_results_buffered(&mut self.line_carry, payload)? {
             self.events.extend(self.hfp_state.apply_result(&result));
             match result {
                 hfp::HfpAgResult::Ok => {

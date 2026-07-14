@@ -4191,6 +4191,10 @@ fn run_loop(
     // already cancelled — the CHUP is sent exactly once per attempt (ids are
     // never reused, so no reset is needed).
     let mut dial_cancel_sent: Option<String> = None;
+    // Consecutive CallIncoming events observed while the tracker held an
+    // ACTIVE inbound session — the phantom-answer self-heal counter (see the
+    // guard in the event loop).
+    let mut phantom_ring_count: u32 = 0;
     // Phase 3: the per-call manager PIN gate (reset at every call boundary).
     #[cfg(feature = "voice")]
     let mut manager_gate = ManagerGate::default();
@@ -4436,6 +4440,37 @@ fn run_loop(
             // the greeting synthesizes hot and the first reply starts fast (a
             // cold TTS engine after a plugin restart cost seconds live, and
             // the STT engine used to load lazily mid-call).
+            // Self-heal for a PHANTOM "answered" session (live incident
+            // 2026-07-14): a scrambled indicator mapping on one bad SLC made
+            // a ringing CIEV read as CallAnswered — the tracker held an
+            // ACTIVE call that never existed, auto-answer's !is_active()
+            // guard then skipped every REAL ring, and only a manual
+            // reconnect recovered the line. RING repeats every ~5 s while
+            // ringing, and this line has no call-waiting: a second
+            // CallIncoming over an "active" inbound session is proof the
+            // answer was phantom. Drop the stale session (the normal
+            // terminate path — its record closes truthfully) so the ring
+            // re-mints a session and auto-answer takes the call.
+            if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallIncoming) {
+                if tracker.current().is_some_and(|s| s.is_active() && !s.outbound) {
+                    phantom_ring_count += 1;
+                    if phantom_ring_count >= 2 {
+                        eprintln!(
+                            "[aokie-plugin] RING repeating over an 'active' call — the answer was a PHANTOM (misread indicator); dropping the stale session so this call can be answered"
+                        );
+                        phantom_ring_count = 0;
+                        handle_event(
+                            aokie_dongle::bluetooth::BluetoothEvent::CallTerminated,
+                            &mut tracker,
+                            outbox,
+                            sink,
+                            &status,
+                        );
+                    }
+                } else {
+                    phantom_ring_count = 0;
+                }
+            }
             #[cfg(all(target_os = "windows", feature = "voice"))]
             if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallIncoming) {
                 let _ = stt_tx.send(SttWork::Warm);

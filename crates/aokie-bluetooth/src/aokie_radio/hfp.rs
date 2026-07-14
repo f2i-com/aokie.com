@@ -491,9 +491,35 @@ pub fn build_at_command(command: HfpAtCommand) -> Vec<u8> {
 }
 
 pub fn parse_ag_results(payload: &[u8]) -> Result<Vec<HfpAgResult>, String> {
+    let mut carry = String::new();
+    parse_ag_results_buffered(&mut carry, payload)
+}
+
+/// Per-frame AT parsing with an incomplete trailing line CARRIED to the next
+/// frame. AT responses are \r\n framed, but one response line can span two
+/// RFCOMM UIH frames — observed live 2026-07-14: the +CIND=? indicator
+/// DEFINITIONS line fragmented on an initiator-mux SLC, the mapping fell
+/// back to the built-in call/callsetup indices, and on a phone whose real
+/// order differs every ringing CIEV then misread as CallAnswered — the
+/// phantom "active" session made auto-answer skip every real ring until a
+/// manual reconnect. Everything after the last \r/\n is held (bounded 1 KiB
+/// — a pathological unterminated stream loses that line, same as before)
+/// and prepended to the next frame, so a split line reassembles instead of
+/// parsing as two garbage halves.
+pub fn parse_ag_results_buffered(
+    carry: &mut String,
+    payload: &[u8],
+) -> Result<Vec<HfpAgResult>, String> {
     let text =
         std::str::from_utf8(payload).map_err(|err| format!("HFP payload is not UTF-8: {err}"))?;
-    Ok(text
+    let mut whole = std::mem::take(carry);
+    whole.push_str(text);
+    let cut = whole.rfind(['\r', '\n']).map(|i| i + 1).unwrap_or(0);
+    let tail = whole.split_off(cut);
+    if tail.len() <= 1024 {
+        *carry = tail;
+    }
+    Ok(whole
         .split('\r')
         .flat_map(|part| part.split('\n'))
         .filter_map(parse_ag_result_line)
@@ -652,6 +678,59 @@ mod tests {
             })
             .unwrap();
         assert_eq!(indicators, &vec!["service", "call", "callsetup"]);
+    }
+
+    #[test]
+    fn cind_definitions_split_across_frames_reassemble(){
+        // Live incident 2026-07-14 (phantom answer): the +CIND=? DEFINITIONS
+        // line fragmented at the mux MTU; per-frame parsing saw two garbage
+        // halves, the default call/callsetup indices stood, and a phone with
+        // Android's order (call FIRST) had every ringing CIEV misread as
+        // CallAnswered. The carry buffer must reassemble the split line.
+        let mut carry = String::new();
+        let first = parse_ag_results_buffered(
+            &mut carry,
+            b"\r\n+CIND: (\"call\",(0,1)),(\"callsetup\",(0-3)),(\"serv",
+        )
+        .unwrap();
+        // The fragment is HELD, not parsed as a half-line.
+        assert!(first.is_empty(), "fragment must not parse: {first:?}");
+        let second = parse_ag_results_buffered(
+            &mut carry,
+            b"ice\",(0,1)),(\"signal\",(0-5))\r\nOK\r\n",
+        )
+        .unwrap();
+        let indicators = second
+            .iter()
+            .find_map(|r| match r {
+                HfpAgResult::Indicators(v) => Some(v.clone()),
+                _ => None,
+            })
+            .expect("reassembled definitions line parses");
+        assert_eq!(indicators, vec!["call", "callsetup", "service", "signal"]);
+        assert!(second.contains(&HfpAgResult::Ok));
+        // Applied to the state machine, the ANDROID order maps correctly:
+        // CIEV 2,1 is callsetup (ringing), NEVER a phantom CallAnswered.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::Indicators(indicators));
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 }),
+            vec![HfpEvent::IncomingCall]
+        );
+        assert!(!state.call_active());
+    }
+
+    #[test]
+    fn carry_is_bounded_against_unterminated_streams() {
+        let mut carry = String::new();
+        let junk = vec![b'x'; 4096];
+        let results = parse_ag_results_buffered(&mut carry, &junk).unwrap();
+        assert!(results.is_empty());
+        // An unterminated 4 KiB blob is dropped, not held forever.
+        assert!(carry.is_empty());
+        // Normal traffic keeps flowing afterwards.
+        let ok = parse_ag_results_buffered(&mut carry, b"\r\nOK\r\n").unwrap();
+        assert!(ok.contains(&HfpAgResult::Ok));
     }
 
     #[test]
