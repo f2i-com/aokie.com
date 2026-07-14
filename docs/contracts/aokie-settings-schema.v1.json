@@ -57,6 +57,12 @@
       "appliesLive": true
     },
     {
+      "key": "managerNumbers",
+      "type": "string",
+      "maxChars": 2000,
+      "appliesLive": true
+    },
+    {
       "key": "outboundEnabled",
       "type": "bool",
       "appliesLive": true
