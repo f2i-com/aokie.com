@@ -46,6 +46,12 @@
       "appliesLive": true
     },
     {
+      "key": "blockedMessage",
+      "type": "string",
+      "maxChars": 500,
+      "appliesLive": true
+    },
+    {
       "key": "agentHangup",
       "type": "bool",
       "appliesLive": false

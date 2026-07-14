@@ -4449,14 +4449,15 @@ fn run_loop(
                 // optional screen message, then hangup. Enforced HERE because
                 // it is universally correct: phones that only deliver the id
                 // post-answer (this Pixel) still get screened within ~1.5s.
+                let screen_msg = screen_policy.message_for(reason);
                 eprintln!("[aokie-plugin] call screened ({reason}) — {}",
-                    if screen_policy.message.trim().is_empty() { "hanging up" } else { "message + hangup" });
-                if !screen_policy.message.trim().is_empty() {
+                    if screen_msg.is_empty() { "hanging up" } else { "message + hangup" });
+                if !screen_msg.is_empty() {
                     let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
                     let _ = speak_planned(
                         bt,
                         &synth,
-                        screen_policy.message.trim(),
+                        screen_msg,
                         sr,
                         None,
                         None,
