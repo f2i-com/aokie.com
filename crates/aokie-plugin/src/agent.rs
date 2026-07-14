@@ -131,7 +131,7 @@ impl LlmClient {
         };
         let mut body = serde_json::json!({
             "messages": [
-                { "role": "system", "content": "You transcribe one short phone-call utterance from its audio. A speech recognizer's draft and the recent conversation are provided; correct any words the recognizer got wrong using the audio, and use the conversation only to resolve unclear or ambiguous words toward what the caller plainly meant to say. Never import words from the conversation that the audio does not support. Reply with ONLY the corrected transcription - the caller's exact words, no quotes, no commentary." },
+                { "role": "system", "content": "You transcribe one short phone-call utterance from its audio. A speech recognizer's draft and the recent conversation are provided; correct any words the recognizer got wrong using the audio, and use the conversation only to resolve unclear or ambiguous words toward what the caller plainly meant to say. Never import words from the conversation that the audio does not support. When the draft already reads as fluent natural speech, prefer it - change only words the audio clearly contradicts. If the audio is silence or a filler sound, output the draft unchanged. Reply with ONLY the corrected transcription - the caller's exact words, no quotes, no commentary." },
                 { "role": "user", "content": [
                     { "type": "input_audio", "input_audio": { "data": wav_b64, "format": "wav" } },
                     { "type": "text", "text": hint },
