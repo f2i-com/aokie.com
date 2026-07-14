@@ -375,6 +375,183 @@ impl DialogueState {
     }
 }
 
+// ── FloorManager, SHADOW slice (guide §7.1/P1-8) ─────────────────────────────
+//
+// A single fused floor decision from typed evidence — the user's
+// confidence-fusion idea. Runs in SHADOW: the live paths (energy barge,
+// probe-lane commands, mid-span substantive yield, ducking) keep making the
+// real decisions while this logs what the FUSED decision-maker would have
+// done, plus a divergence counter at span end. Promote it to owning the
+// floor only once the shadow telemetry agrees with good calls and disagrees
+// with the known failure modes (echo barges, ignored comments).
+
+/// Everything the shadow decision-maker sees for one playback instant.
+/// Assembled in the span pump from state the live paths already track.
+pub struct FloorEvidence {
+    /// The span has produced audible output (post first-chunk).
+    pub bot_audible: bool,
+    /// Consecutive mic frames over the capture gate right now.
+    pub speech_frames: u32,
+    /// How long the current overlap speech has been running (0 = none).
+    pub overlap_ms: u32,
+    /// Latest probe-lane transcript of the overlap ("" = none yet).
+    pub stable_text: String,
+    /// The probe text passed the substantive gate (≥3 words, not a
+    /// backchannel, not the bot's own echo).
+    pub substantive: bool,
+    /// The playing span holds a FinishSpan/protected interrupt policy.
+    pub protected_span: bool,
+    /// The live energy/soft barge has tripped for this span.
+    pub barge_energy: bool,
+}
+
+/// §7.1 floor actions. Shadow-only today; the variants map onto the live
+/// mechanisms (CutNow = hard barge, YieldAtBoundary = policy-aware soft
+/// barge, Duck = output duck, PauseAndRetain = spoken "wait", StaySilent =
+/// the bot has no claim on the floor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorDecision {
+    Continue,
+    Duck,
+    YieldAtBoundary,
+    CutNow,
+    PauseAndRetain,
+    StaySilent,
+}
+
+/// Severity rank for span-level aggregation (worst decision wins).
+pub fn floor_decision_rank(d: FloorDecision) -> u8 {
+    match d {
+        FloorDecision::Continue | FloorDecision::StaySilent => 0,
+        FloorDecision::Duck => 1,
+        FloorDecision::YieldAtBoundary => 2,
+        FloorDecision::CutNow | FloorDecision::PauseAndRetain => 3,
+    }
+}
+
+/// The fused decision (guide §7.2 interruption matrix), privacy-safe reason
+/// code alongside. Pure — trivially table-testable, no clocks, no state.
+pub fn shadow_floor_decision(ev: &FloorEvidence) -> (FloorDecision, &'static str) {
+    if !ev.bot_audible {
+        // Nothing is playing: the floor is the caller's by default.
+        return (FloorDecision::StaySilent, "bot_silent");
+    }
+    if !ev.stable_text.is_empty() {
+        // Explicit spoken controls beat everything, protected spans included
+        // (matrix rows 1-2 — matches the live probe-lane hard cut).
+        match parse_caller_intent(&ev.stable_text) {
+            CallerIntent::StopSpeaking => return (FloorDecision::CutNow, "explicit_stop"),
+            CallerIntent::Pause => return (FloorDecision::PauseAndRetain, "explicit_wait"),
+            CallerIntent::Slower
+            | CallerIntent::Faster
+            | CallerIntent::NormalSpeed
+            | CallerIntent::Repeat
+            | CallerIntent::RepeatSlower
+            | CallerIntent::Resume => {
+                return (FloorDecision::YieldAtBoundary, "pace_or_replay_command")
+            }
+            CallerIntent::Content => {}
+        }
+        if is_hesitation(&ev.stable_text) {
+            // Matrix row "hesitation only": give the caller room, keep going.
+            return (FloorDecision::Continue, "hesitation_only");
+        }
+        if is_backchannel(&ev.stable_text) {
+            return (FloorDecision::Duck, "short_backchannel");
+        }
+        if ev.substantive {
+            return if ev.protected_span {
+                (FloorDecision::YieldAtBoundary, "substantive_over_protected")
+            } else {
+                (FloorDecision::CutNow, "substantive_overlap")
+            };
+        }
+        // Transcribed but short and echo-suspect: the live paths ignore it.
+        return (FloorDecision::Continue, "short_or_echo");
+    }
+    if ev.barge_energy {
+        return if ev.protected_span {
+            (FloorDecision::YieldAtBoundary, "energy_over_protected")
+        } else {
+            (FloorDecision::CutNow, "energy_barge")
+        };
+    }
+    if ev.speech_frames > 0 || ev.overlap_ms > 0 {
+        // Speech is forming but no transcript yet: make audible room while
+        // the probe lane classifies it (matches the live duck).
+        return if ev.overlap_ms >= 300 {
+            (FloorDecision::Duck, "unclassified_overlap")
+        } else {
+            (FloorDecision::Continue, "overlap_forming")
+        };
+    }
+    (FloorDecision::Continue, "quiet")
+}
+
+#[cfg(test)]
+mod floor_shadow_tests {
+    use super::*;
+
+    fn ev() -> FloorEvidence {
+        FloorEvidence {
+            bot_audible: true,
+            speech_frames: 0,
+            overlap_ms: 0,
+            stable_text: String::new(),
+            substantive: false,
+            protected_span: false,
+            barge_energy: false,
+        }
+    }
+
+    #[test]
+    fn matrix_rows_map_to_decisions() {
+        // Quiet line → keep the floor.
+        assert_eq!(shadow_floor_decision(&ev()).0, FloorDecision::Continue);
+        // Explicit stop cuts even a protected span.
+        let stop = FloorEvidence { stable_text: "stop talking".into(), protected_span: true, ..ev() };
+        assert_eq!(shadow_floor_decision(&stop), (FloorDecision::CutNow, "explicit_stop"));
+        // "Wait" pauses and retains.
+        let wait = FloorEvidence { stable_text: "hold on a second".into(), ..ev() };
+        assert_eq!(shadow_floor_decision(&wait).0, FloorDecision::PauseAndRetain);
+        // Backchannel ducks, hesitation continues.
+        let yeah = FloorEvidence { stable_text: "yeah".into(), ..ev() };
+        assert_eq!(shadow_floor_decision(&yeah), (FloorDecision::Duck, "short_backchannel"));
+        let uh = FloorEvidence { stable_text: "um".into(), ..ev() };
+        assert_eq!(shadow_floor_decision(&uh), (FloorDecision::Continue, "hesitation_only"));
+        // Substantive comment: cut a yield span, boundary-yield a protected one.
+        let subst = FloorEvidence { stable_text: "no wait not thursday".into(), substantive: true, ..ev() };
+        assert_eq!(shadow_floor_decision(&subst).0, FloorDecision::CutNow);
+        let subst_prot = FloorEvidence { protected_span: true, ..subst };
+        assert_eq!(
+            shadow_floor_decision(&subst_prot),
+            (FloorDecision::YieldAtBoundary, "substantive_over_protected")
+        );
+        // Energy barge with no transcript yet.
+        let energy = FloorEvidence { barge_energy: true, ..ev() };
+        assert_eq!(shadow_floor_decision(&energy), (FloorDecision::CutNow, "energy_barge"));
+        // Forming speech: continue briefly, duck once it persists.
+        let forming = FloorEvidence { speech_frames: 2, overlap_ms: 120, ..ev() };
+        assert_eq!(shadow_floor_decision(&forming).0, FloorDecision::Continue);
+        let persisting = FloorEvidence { speech_frames: 2, overlap_ms: 450, ..ev() };
+        assert_eq!(shadow_floor_decision(&persisting), (FloorDecision::Duck, "unclassified_overlap"));
+        // Bot silent → the caller owns the floor.
+        let silent = FloorEvidence { bot_audible: false, stable_text: "stop".into(), ..ev() };
+        assert_eq!(shadow_floor_decision(&silent).0, FloorDecision::StaySilent);
+        // Short echo-suspect fragment → the live paths ignore it; so do we.
+        let echo = FloorEvidence { stable_text: "booked at".into(), ..ev() };
+        assert_eq!(shadow_floor_decision(&echo), (FloorDecision::Continue, "short_or_echo"));
+    }
+
+    #[test]
+    fn severity_ranks_order() {
+        assert!(floor_decision_rank(FloorDecision::CutNow) > floor_decision_rank(FloorDecision::YieldAtBoundary));
+        assert!(floor_decision_rank(FloorDecision::YieldAtBoundary) > floor_decision_rank(FloorDecision::Duck));
+        assert!(floor_decision_rank(FloorDecision::Duck) > floor_decision_rank(FloorDecision::Continue));
+        assert_eq!(floor_decision_rank(FloorDecision::PauseAndRetain), 3);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
