@@ -3396,9 +3396,22 @@ fn run_loop(
             if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallIncoming) {
                 let _ = stt_tx.send(SttWork::Warm);
                 synth.warm();
+                // LLM warm-up runs OFF-THREAD: endpoint discovery is HTTP and
+                // can block for seconds — doing it here delayed the ANSWER
+                // itself (live report 2026-07-14). The probe warms DNS/TCP and
+                // the health slot; the reply path still owns the connect (its
+                // discovery is instant once llama has been probed).
                 if agent_enabled && agent_client.is_none() {
-                    agent_client =
-                        connect_agent_client(&agent_endpoint, agent_model.clone(), &status);
+                    let ep = agent_endpoint.clone();
+                    let st = status.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("aokie-llm-ring-warm".into())
+                        .spawn(move || {
+                            let configured = ep.lock().unwrap().clone();
+                            if crate::agent::discover_endpoint(configured.as_deref()).is_some() {
+                                *st.llm_error.lock().unwrap() = None;
+                            }
+                        });
                 }
             }
             #[cfg(feature = "voice")]
@@ -3758,6 +3771,14 @@ fn run_loop(
                     .filter(|o| o.call_id == corr)
                     .and_then(|o| o.greeting.as_deref());
                 if let Some(text) = overlay_greeting.or(greeting.as_deref()) {
+                    // The caller often says "hello" OVER the greeting (both
+                    // parties greeting at once is normal telephony) — live
+                    // 2026-07-14 that energy-barged the greeting after ONE
+                    // word. Speak it as a protected span: ordinary overlap
+                    // rides the bounded budget; a spoken "wait"/"stop" or an
+                    // operator control still cuts instantly, and the overlap
+                    // is still captured for the scratchpad either way.
+                    let text = &format!("[[important]]{text}[[/important]]");
                     // In barge-in mode the caller can talk over the greeting;
                     // in half-duplex we mute STT for its playout instead.
                     let (aec_ref, brms) = if barge_in {
