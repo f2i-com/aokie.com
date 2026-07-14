@@ -253,6 +253,24 @@ fn next_bracket_token(s: &str, from: usize) -> Option<(usize, usize, String)> {
     None
 }
 
+/// Live business lookup (guide P1-16): the model may reply with EXACTLY
+/// `[[LOOKUP: <question>]]` to have the host run the read-only lookup flow
+/// and hand the result back for a second generation. Like every bracketed
+/// token it is ALWAYS stripped from speech/transcripts by [`plan_spans`], so
+/// even a leaked marker is never spoken. Tolerant scan: the marker is found
+/// anywhere in the text (models sometimes wrap it in whitespace/punctuation).
+pub fn parse_lookup_marker(text: &str) -> Option<String> {
+    let start = text.find("[[LOOKUP:")?;
+    let rest = &text[start + "[[LOOKUP:".len()..];
+    let end = rest.find("]]")?;
+    let q = rest[..end].trim();
+    if q.is_empty() {
+        None
+    } else {
+        Some(q.to_string())
+    }
+}
+
 /// True when the text carries a `[[WAIT]]` / `[WAIT]` marker — the model's
 /// way of choosing INTENTIONAL SILENCE ("the caller is thinking; say
 /// nothing"). The marker itself is always stripped by [`plan_spans`].
