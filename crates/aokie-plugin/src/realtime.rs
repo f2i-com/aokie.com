@@ -29,6 +29,7 @@ pub struct RealtimeLane {
     last_partial_at: Option<std::time::Instant>,
     partial_revision: u64,
     turn_id: u64,
+    delivery_revision: u64,
     last_phase: Option<&'static str>,
 }
 
@@ -43,6 +44,7 @@ impl RealtimeLane {
             last_partial_at: None,
             partial_revision: 0,
             turn_id: 1,
+            delivery_revision: 0,
             last_phase: None,
         }
     }
@@ -103,7 +105,26 @@ impl RealtimeLane {
     pub fn turn_final(&mut self) {
         self.turn_id += 1;
         self.partial_revision = 0;
+        self.delivery_revision = 0;
         self.last_partial_at = None;
+    }
+
+    /// One frame per SPOKEN reply sentence (sentence-rate is inherently
+    /// bounded — no throttle needed). `state` per the guide: sent_to_sco /
+    /// estimated_playing / interrupted.
+    pub fn delivery(&mut self, text: &str, state: &str, now: std::time::Instant) -> Option<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        self.delivery_revision += 1;
+        let clipped: String = text.chars().take(MAX_PARTIAL_CHARS).collect();
+        Some(self.line(
+            "assistant.delivery",
+            json!({ "turnId": format!("t{}", self.turn_id), "revision": self.delivery_revision }),
+            json!({ "text": clipped, "state": state, "boundaryUncertain": false }),
+            now,
+        ))
     }
 
     /// Session phase transitions (listening/thinking/speaking/paused) —
@@ -157,6 +178,23 @@ mod tests {
         let f = lane.phase("thinking", t0).unwrap();
         assert!(f.contains("\"session.phase\""));
         assert!(f.contains("\"thinking\""));
+    }
+
+    #[test]
+    fn delivery_frames_carry_state_and_reset_per_turn() {
+        let t0 = Instant::now();
+        let mut lane = RealtimeLane::new("c".into(), 1, t0);
+        let a = lane.delivery("Ahoy there!", "sent_to_sco", t0).unwrap();
+        assert!(a.contains("\"assistant.delivery\""));
+        assert!(a.contains("\"sent_to_sco\""));
+        assert!(a.contains("\"revision\":1"));
+        let b = lane.delivery("Second sentence.", "sent_to_sco", t0).unwrap();
+        assert!(b.contains("\"revision\":2"));
+        lane.turn_final();
+        let c = lane.delivery("Next reply.", "sent_to_sco", t0).unwrap();
+        assert!(c.contains("\"turnId\":\"t2\""));
+        assert!(c.contains("\"revision\":1"));
+        assert!(lane.delivery("  ", "sent_to_sco", t0).is_none());
     }
 
     #[test]
