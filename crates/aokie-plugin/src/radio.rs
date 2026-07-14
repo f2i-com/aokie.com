@@ -1363,6 +1363,16 @@ fn sanitize_heard(raw: &str, stt: &str) -> Option<String> {
     if collapsed == stt.trim() {
         return None;
     }
+    // Length-ratio guard: a short utterance cannot honestly become a long
+    // sentence — that shape is the model transcribing the conversation
+    // CONTEXT instead of the audio (live call de1834ef: 'Uh' → a ten-word
+    // sentence copied from an earlier turn). Generous bound: real
+    // corrections change words, they don't multiply them.
+    let stt_words = stt.split_whitespace().count();
+    let heard_words = collapsed.split_whitespace().count();
+    if heard_words > stt_words * 3 + 4 {
+        return None;
+    }
     Some(collapsed)
 }
 
@@ -2825,6 +2835,30 @@ mod sanitize_heard_tests {
     #[test]
     fn oversized_output_is_rejected() {
         assert_eq!(sanitize_heard(&"word ".repeat(300), "short"), None);
+    }
+
+    #[test]
+    fn context_hallucination_shape_is_rejected() {
+        // Live call de1834ef: 'Uh' came back as a full sentence copied from
+        // the conversation context — a short utterance can never honestly
+        // become a long one.
+        assert_eq!(
+            sanitize_heard("Hi, I just want to check my appointments for next week", "Uh"),
+            None
+        );
+        // Real corrections of comparable length still pass.
+        assert_eq!(
+            sanitize_heard(
+                "We already have an appointment booked, don't I?",
+                "already have a ploint book don't I?"
+            ),
+            Some("We already have an appointment booked, don't I?".to_string())
+        );
+        // A fast mumble legitimately expanding a little passes too.
+        assert_eq!(
+            sanitize_heard("next Tuesday please", "nex"),
+            Some("next Tuesday please".to_string())
+        );
     }
 }
 
@@ -5772,7 +5806,20 @@ fn run_loop(
                     // 'turn_done above, so a PIN utterance structurally
                     // cannot reach this request. Best-effort: no connected
                     // client / no captured audio = silent no-op.
-                    if audio_transcript {
+                    // Hesitations and 1-2 word turns are SKIPPED outright:
+                    // there is nothing worth correcting, and near-silent
+                    // audio invites the model to hallucinate a "transcript"
+                    // out of the conversation context instead (live call
+                    // de1834ef: two 'Uh' turns came back as full sentences
+                    // copied from earlier turns).
+                    let heard_worthwhile = !crate::duplex::is_hesitation(&text)
+                        && text.split_whitespace().count() > 2;
+                    if audio_transcript && !heard_worthwhile {
+                        eprintln!(
+                            "[aokie-plugin] audio transcript check skipped [turn {turn_index}]: hesitation/too short"
+                        );
+                    }
+                    if audio_transcript && heard_worthwhile {
                         let heard_client = agent_client
                             .clone()
                             .or_else(|| pending_agent_client.lock().unwrap().clone());
