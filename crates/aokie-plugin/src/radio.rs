@@ -189,7 +189,7 @@ Booking rule: a booking or message is INCOMPLETE without the caller's name. If y
 /// real generations stay identically primed. A missing/failed lookup flow
 /// degrades gracefully — the injected result says UNAVAILABLE and the model
 /// answers from its notes.
-const TOOL_INSTRUCTION: &str = "\n\nLive lookups: when the caller asks for business DATA you genuinely do NOT have in your notes (availability beyond the listed days, records), reply with EXACTLY [[LOOKUP: one clear data question]] and nothing else - the SYSTEM runs the lookup and hands you the result to answer from. The lookup question is addressed to a DATABASE, never to the caller: if you need to ask the CALLER something (to clarify a date, for example), just ask them normally WITHOUT the marker. At most one lookup per caller turn; never for things already in your notes. Dates beyond your calendar window are EXACTLY what lookups are for - run one instead of deferring to the team. When the question involves specific dates, work each one out from today's date and write it in plain YYYY-MM-DD form inside the lookup question (for example [[LOOKUP: availability 2026-08-01]]) - the system answers exact dates directly. NEVER tell the caller you will check or look something up without putting the [[LOOKUP: ...]] marker in that SAME reply - announcing a check without the marker strands the caller in silence waiting for an answer that never comes.";
+const TOOL_INSTRUCTION: &str = "\n\nLive lookups: when the caller asks for business DATA you genuinely do NOT have in your notes (availability beyond the listed days, records), reply with EXACTLY [[LOOKUP: one clear data question]] and nothing else - the SYSTEM runs the lookup and hands you the result to answer from. The lookup question is addressed to a DATABASE, never to the caller: if you need to ask the CALLER something (to clarify a date, for example), just ask them normally WITHOUT the marker. At most one lookup per caller turn; never for things already in your notes. Dates beyond your calendar window are EXACTLY what lookups are for - run one instead of deferring to the team. When the question involves specific dates, work each one out from today's date and write it in plain YYYY-MM-DD form inside the lookup question (for example [[LOOKUP: availability 2026-08-01]]) - the system answers exact dates directly. NEVER tell the caller you will check or look something up without putting the [[LOOKUP: ...]] marker in that SAME reply - announcing a check without the marker strands the caller in silence waiting for an answer that never comes. NEVER defer a date or availability question to the team without running the lookup FIRST - the calendar is right there; if the caller has not named a date yet, ask them for the date instead of deferring.";
 
 /// Spoken while the lookup flow runs (1-4 s): silence there reads as a dead
 /// line. Persona-neutral on purpose.
@@ -2258,9 +2258,85 @@ fn looks_like_lookup_announcement(reply: &str) -> bool {
     .any(|p| r.contains(p))
 }
 
+/// True when a reply DEFERS to the team ("I'll have the team confirm...") —
+/// combined with a date in the caller's words this is the model taking its
+/// safe exit instead of running the lookup it has (call c01b7dcf: 'what
+/// about twenty first of August?' → 'I'll have the team confirm' until the
+/// caller said 'can you look it up please').
+fn looks_like_team_deferral(reply: &str) -> bool {
+    let r = reply.to_lowercase();
+    (r.contains("the team") || r.contains("our team"))
+        && (r.contains("confirm") || r.contains("check") || r.contains("get back"))
+}
+
+/// True when caller text plausibly names a calendar date: a month name on a
+/// word boundary, an ISO date, or a day number with an ordinal suffix
+/// ("21st"). Deliberately loose — a false positive only costs one read-only
+/// lookup — but bounded so "do you do catering?" never triggers.
+fn mentions_a_date(text: &str) -> bool {
+    let t = format!(" {} ", text.to_lowercase());
+    const MONTHS: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    for m in MONTHS {
+        if let Some(pos) = t.find(m) {
+            let before_ok = t[..pos]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphabetic());
+            let after_ok = t[pos + m.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphabetic());
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    let chars: Vec<char> = t.chars().collect();
+    for i in 0..chars.len() {
+        if !chars[i].is_ascii_digit() {
+            continue;
+        }
+        // ISO "2026-08-21".
+        let ten: String = chars[i..].iter().take(10).collect();
+        if ten.chars().count() == 10
+            && ten
+                .chars()
+                .enumerate()
+                .all(|(j, c)| if j == 4 || j == 7 { c == '-' } else { c.is_ascii_digit() })
+        {
+            return true;
+        }
+        // "21st" / "3rd" / "22nd".
+        let mut k = i;
+        while k < chars.len() && chars[k].is_ascii_digit() {
+            k += 1;
+        }
+        let suf: String = chars[k..].iter().take(2).collect();
+        if k - i <= 2 && matches!(suf.as_str(), "st" | "nd" | "rd" | "th") {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod lookup_announcement_tests {
     use super::looks_like_lookup_announcement as ann;
+    use super::looks_like_team_deferral as defer;
+    use super::mentions_a_date as dateish;
 
     #[test]
     fn announce_phrases_detected() {
@@ -2274,6 +2350,23 @@ mod lookup_announcement_tests {
         assert!(!ann("Saturday 8 August looks open. Would you like me to put a booking request in?"));
         assert!(!ann("We're open Monday to Friday, nine to five."));
         assert!(!ann("I'll have the team confirm that for you."));
+    }
+
+    #[test]
+    fn team_deferral_phrases_detected() {
+        assert!(defer("I'll have the team confirm the exact availability for you, mate."));
+        assert!(defer("The team will check and get back to you."));
+        assert!(!defer("Saturday 22 August looks open. Would you like me to put a booking request in?"));
+        assert!(!defer("Our chef makes it fresh daily."));
+    }
+
+    #[test]
+    fn dateish_caller_text_detected() {
+        assert!(dateish("what about twenty first of August?"));
+        assert!(dateish("anything on the 21st?"));
+        assert!(dateish("availability 2026-08-21"));
+        assert!(!dateish("do you do catering?"));
+        assert!(!dateish("maybe later")); // 'may' inside a word never counts
     }
 }
 
@@ -5369,6 +5462,23 @@ fn run_loop(
                                         // lookup on the caller's own words.
                                         eprintln!(
                                             "[aokie-plugin] lookup announcement without a marker — looking up the caller's words"
+                                        );
+                                        lookup_requested = Some(text.clone());
+                                    } else if lookup_rounds == 0
+                                        && looks_like_team_deferral(&full)
+                                        && mentions_a_date(&text)
+                                    {
+                                        // The model DEFERRED a dated question
+                                        // to the team without even trying the
+                                        // lookup (call c01b7dcf: 'what about
+                                        // twenty first of August?' → 'I'll
+                                        // have the team confirm' until the
+                                        // caller pushed 'can you look it up
+                                        // please'). Round 0 only: a post-
+                                        // lookup deferral can be legitimate
+                                        // (beyond-horizon answers say it).
+                                        eprintln!(
+                                            "[aokie-plugin] date question deferred to the team without a lookup — looking up the caller's words"
                                         );
                                         lookup_requested = Some(text.clone());
                                     }
