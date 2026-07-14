@@ -40,6 +40,10 @@ enum SynthJob {
         endpoint: Option<String>,
     },
     ResetCall,
+    /// Ring-time pre-warm (2026-07-14): load the in-process TTS engine NOW —
+    /// while the phone is still ringing — so the greeting synthesizes hot.
+    /// A cold engine after a plugin restart cost seconds on a live call.
+    Warm,
 }
 
 /// Worker → radio: epoch-tagged PCM blocks and the span's terminal outcome.
@@ -119,6 +123,13 @@ impl SynthHandle {
         let _ = self.job_tx.send(SynthJob::Configure { endpoint });
     }
 
+    /// Ring-time pre-warm: load the in-process TTS engine while the phone is
+    /// still ringing (no-op when already loaded or when the queue is busy —
+    /// the worker just services it in order).
+    pub fn warm(&self) {
+        let _ = self.job_tx.send(SynthJob::Warm);
+    }
+
     /// Call boundary: clear the HTTP endpoint's sticky per-call fallback and
     /// invalidate any in-flight span.
     pub fn reset_call(&self) {
@@ -139,6 +150,17 @@ fn worker(
         match job {
             SynthJob::Configure { endpoint } => http.configure(endpoint),
             SynthJob::ResetCall => http.reset_call(),
+            SynthJob::Warm => {
+                if tts.is_none() {
+                    match crate::voice::TtsEngine::load() {
+                        Ok(engine) => {
+                            eprintln!("[aokie-plugin] TTS engine pre-warmed (ring)");
+                            tts = Some(engine);
+                        }
+                        Err(err) => eprintln!("[aokie-plugin] TTS pre-warm failed: {err}"),
+                    }
+                }
+            }
             SynthJob::Span {
                 epoch: e,
                 text,
