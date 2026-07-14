@@ -1366,6 +1366,44 @@ fn sanitize_heard(raw: &str, stt: &str) -> Option<String> {
     Some(collapsed)
 }
 
+/// audioTranscript: the last few conversation turns as a compact text block
+/// for the correction request — dialogue context resolves ambiguous audio
+/// toward the right domain words ("ointments" → "appointments" at a dental
+/// receptionist). Text only, clipped per turn, markers stripped (assistant
+/// history entries keep their [[markers]] by design — they must never reach
+/// another prompt as instructions).
+#[cfg(feature = "voice")]
+fn heard_context(history: &[serde_json::Value]) -> String {
+    let mut turns: Vec<String> = history
+        .iter()
+        .rev()
+        .filter_map(|m| {
+            let role = m.get("role").and_then(serde_json::Value::as_str)?;
+            let content = m.get("content").and_then(serde_json::Value::as_str)?;
+            let who = match role {
+                "assistant" => "Receptionist",
+                "user" => "Caller",
+                _ => return None,
+            };
+            let mut c = content.replace('\n', " ");
+            while let (Some(a), Some(rel)) =
+                (c.find("[["), c.find("[[").and_then(|a| c[a..].find("]]")))
+            {
+                c.replace_range(a..a + rel + 2, " ");
+            }
+            let c = c.split_whitespace().collect::<Vec<_>>().join(" ");
+            if c.is_empty() {
+                return None;
+            }
+            let clipped: String = c.chars().take(160).collect();
+            Some(format!("{who}: {clipped}"))
+        })
+        .take(4)
+        .collect();
+    turns.reverse();
+    turns.join("\n")
+}
+
 /// Heuristic self-echo guard for the in-plugin agent: true when `caller` (a fresh
 /// transcript) is mostly the same words as Aokie's last spoken reply `bot` â€” i.e.
 /// Aokie's own TTS leaked back into the mic and STT transcribed it. Keeps Aokie
@@ -2714,6 +2752,34 @@ fn mentions_a_date(text: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod heard_context_tests {
+    use super::heard_context;
+
+    #[test]
+    fn recent_turns_compact_with_markers_stripped() {
+        let history = vec![
+            serde_json::json!({"role": "user", "content": "old turn that falls off"}),
+            serde_json::json!({"role": "user", "content": "Do I have any appointments?"}),
+            serde_json::json!({"role": "assistant", "content": "You have a checkup Wednesday. [[LOOKUP: availability 2026-07-22]]"}),
+            serde_json::json!({"role": "user", "content": "What\ntime is\nit at?"}),
+            serde_json::json!({"role": "assistant", "content": "It's at 3 PM."}),
+        ];
+        let ctx = heard_context(&history);
+        assert_eq!(
+            ctx,
+            "Caller: Do I have any appointments?\nReceptionist: You have a checkup Wednesday.\nCaller: What time is it at?\nReceptionist: It's at 3 PM."
+        );
+        assert!(!ctx.contains("old turn"), "capped at the last 4 turns");
+        assert!(!ctx.contains("[["), "markers never reach another prompt");
+    }
+
+    #[test]
+    fn empty_history_means_empty_context() {
+        assert_eq!(heard_context(&[]), "");
+    }
 }
 
 #[cfg(test)]
@@ -5698,6 +5764,10 @@ fn run_loop(
                             let pcm = last_turn_audio.clone();
                             let cid = corr.clone();
                             let stt = text.clone();
+                            // Dialogue context disambiguates unclear audio
+                            // ("ointments" → "appointments"); this turn is
+                            // not yet in history, so this is the PRIOR turns.
+                            let ctx = heard_context(&history);
                             let tidx = turn_index;
                             let tx = heard_tx.clone();
                             eprintln!(
@@ -5706,7 +5776,7 @@ fn run_loop(
                             );
                             std::thread::spawn(move || {
                                 let b64 = crate::agent::LlmClient::wav_base64(&pcm, 16_000);
-                                match hc.transcribe_turn(&b64, &stt) {
+                                match hc.transcribe_turn(&b64, &stt, &ctx) {
                                     Ok(raw) => {
                                         let _ = tx.send((cid, tidx, raw, stt));
                                     }
