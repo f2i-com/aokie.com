@@ -430,11 +430,20 @@ fn norm_word(w: &str) -> String {
 fn hypothesis_stable(prev: &str, cur: &str) -> bool {
     let p: Vec<String> = prev.split_whitespace().map(norm_word).collect();
     let c: Vec<String> = cur.split_whitespace().map(norm_word).collect();
-    if p.len() < 4 || c.len() < p.len() {
+    if p.len() < 3 || c.len() < p.len() {
         return false;
     }
-    let matches = p.iter().zip(&c).filter(|(a, b)| a == b).count();
-    matches + 1 >= p.len()
+    // The HEAD is what must have stopped changing — the tail of a partial is
+    // the unstable zone by definition, so requiring the WHOLE previous
+    // partial to hold never fired on real calls (specLlmStarted stayed 0).
+    // Compare the first min(4, len) words, one STT wobble tolerated.
+    let head = p.len().min(4);
+    let matches = p[..head]
+        .iter()
+        .zip(&c[..head])
+        .filter(|(a, b)| a == b)
+        .count();
+    matches + 1 >= head
 }
 
 /// Guide phase 5: may the speculative generation answer the FINAL turn? The
@@ -2202,13 +2211,13 @@ impl Drop for SttBusyGuard {
 /// failure path returns an explicit UNAVAILABLE string: the model is told to
 /// answer from its notes and offer the team, never to guess.
 #[cfg(all(target_os = "windows", feature = "voice"))]
-fn run_business_lookup(
+fn begin_business_lookup(
     host: &Arc<crate::host_rpc::HostRpc>,
     sink: &mut dyn Sink,
     question: &str,
     call_id: &str,
     from: &str,
-) -> String {
+) -> Option<(u64, std::sync::mpsc::Receiver<crate::host_rpc::HostResult>, Instant)> {
     let params = serde_json::json!({
         "flowSlug": "business-lookup",
         "input": { "question": question, "callId": call_id, "from": from },
@@ -2219,9 +2228,20 @@ fn run_business_lookup(
     let (id, line, rx) = host.begin("flow.run", params);
     if sink.send_line(&line).is_err() {
         host.forget(id);
-        return "LOOKUP UNAVAILABLE (host offline)".to_string();
+        return None;
     }
-    match rx.recv_timeout(std::time::Duration::from_millis(4500)) {
+    Some((id, rx, Instant::now() + std::time::Duration::from_millis(5000)))
+}
+
+fn finish_business_lookup(
+    host: &Arc<crate::host_rpc::HostRpc>,
+    pending: Option<(u64, std::sync::mpsc::Receiver<crate::host_rpc::HostResult>, Instant)>,
+) -> String {
+    let Some((id, rx, deadline)) = pending else {
+        return "LOOKUP UNAVAILABLE (host offline)".to_string();
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(left) {
         Ok(Ok(v)) => {
             let ok = v.get("status").and_then(serde_json::Value::as_str) == Some("succeeded");
             let digest = v
@@ -4292,6 +4312,17 @@ fn run_loop(
                     }
                     live_hyp_prev = live_hyp.take();
                     live_hyp = Some(res.text);
+                    // Content-free tuning telemetry: how often consecutive
+                    // partials look stable on REAL calls (specLlmStarted was
+                    // 0 for a whole evening before this existed).
+                    if let (Some(p), Some(c)) = (live_hyp_prev.as_deref(), live_hyp.as_deref()) {
+                        eprintln!(
+                            "[aokie-plugin] hypothesis pair: {}w -> {}w, stable: {}",
+                            p.split_whitespace().count(),
+                            c.split_whitespace().count(),
+                            hypothesis_stable(p, c)
+                        );
+                    }
                 }
                 // A stable, intent-sized hypothesis starts the reply EARLY —
                 // the generation streams while the caller finishes; the turn
@@ -5690,6 +5721,18 @@ fn run_loop(
                                         "[aokie-plugin] agent lookup: {}",
                                         content_for_log(&q)
                                     );
+                                    // Fire the flow BEFORE speaking the filler:
+                                    // the desktop runs it WHILE the filler
+                                    // plays, so the caller's mic-dark window
+                                    // shrinks to whatever remains after ~2.5 s
+                                    // of audible speech (usually nothing).
+                                    let lu_from = tracker
+                                        .current()
+                                        .and_then(|s| s.caller_id.clone())
+                                        .unwrap_or_default();
+                                    let pending_lookup = begin_business_lookup(
+                                        &host_rpc, sink, &q, &corr, &lu_from,
+                                    );
                                     let sr_now = bt.get_sample_rate();
                                     let mut fprobe = ControlProbe::new(
                                         &control_rx,
@@ -5722,9 +5765,8 @@ fn run_loop(
                                         .current()
                                         .and_then(|s| s.caller_id.clone())
                                         .unwrap_or_default();
-                                    let result_text = run_business_lookup(
-                                        &host_rpc, sink, &q, &corr, &from_num,
-                                    );
+                                    let result_text =
+                                        finish_business_lookup(&host_rpc, pending_lookup);
                                     eprintln!(
                                         "[aokie-plugin] lookup result: [{} chars]",
                                         result_text.chars().count()
@@ -7017,6 +7059,14 @@ mod tests {
         assert!(hypothesis_stable(
             "do you have any tables",
             "do you have eny tables free"
+        ));
+        // Head-focused (2026-07-14 tune): a 3-word stable head speculates,
+        // and a long prev whose TAIL flickers still counts — only the head
+        // must hold.
+        assert!(hypothesis_stable("book a table", "book a table for two"));
+        assert!(hypothesis_stable(
+            "do you have any tables free maybe Friday",
+            "do you have any tables free on Friday night"
         ));
 
         // Adoption: the final said what the hypothesis said (+ short tail).
