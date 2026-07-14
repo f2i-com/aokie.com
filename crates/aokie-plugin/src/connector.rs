@@ -1740,7 +1740,11 @@ impl Plugin {
                 let screening_key = obj.keys().any(|k| {
                     matches!(
                         k.as_str(),
-                        "blockedNumbers" | "acceptPattern" | "rejectPrivate" | "screenMessage"
+                        "blockedNumbers"
+                            | "acceptPattern"
+                            | "rejectPrivate"
+                            | "screenMessage"
+                            | "blockedMessage"
                     )
                 });
                 if screening_key {
@@ -2447,6 +2451,7 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     SettingSpec { key: "acceptPattern", kind: SettingKind::Str { max_chars: 200 }, applies_live: true },
     SettingSpec { key: "rejectPrivate", kind: SettingKind::Bool, applies_live: true },
     SettingSpec { key: "screenMessage", kind: SettingKind::Str { max_chars: 500 }, applies_live: true },
+    SettingSpec { key: "blockedMessage", kind: SettingKind::Str { max_chars: 500 }, applies_live: true },
     SettingSpec { key: "agentHangup", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "reenumerateHwid", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "legacyPairingPin", kind: SettingKind::Bool, applies_live: false },
@@ -2508,6 +2513,7 @@ fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
         ("blockedNumbers", "AOKIE_BLOCKED_NUMBERS"),
         ("acceptPattern", "AOKIE_ACCEPT_PATTERN"),
         ("screenMessage", "AOKIE_SCREEN_MESSAGE"),
+        ("blockedMessage", "AOKIE_BLOCKED_MESSAGE"),
     ] {
         let v = settings
             .get(key)
