@@ -2271,6 +2271,17 @@ fn looks_like_lookup_announcement(reply: &str) -> bool {
     .any(|p| r.contains(p))
 }
 
+/// True when a reply CLAIMS availability ("...looks open", "we have
+/// availability") — combined with a dated caller question and NO lookup this
+/// is a hallucinated calendar claim (call 2c00cac0: 'Monday 10 August looks
+/// open' asserted from thin air); the lookup fallback verifies it.
+fn looks_like_availability_claim(reply: &str) -> bool {
+    let r = reply.to_lowercase();
+    ["looks open", "is available", "we have availability", "looks free", "is free on", "have an opening"]
+        .iter()
+        .any(|p| r.contains(p))
+}
+
 /// True when a reply DEFERS to the team ("I'll have the team confirm...") —
 /// combined with a date in the caller's words this is the model taking its
 /// safe exit instead of running the lookup it has (call c01b7dcf: 'what
@@ -2363,6 +2374,15 @@ mod lookup_announcement_tests {
         assert!(!ann("Saturday 8 August looks open. Would you like me to put a booking request in?"));
         assert!(!ann("We're open Monday to Friday, nine to five."));
         assert!(!ann("I'll have the team confirm that for you."));
+    }
+
+    #[test]
+    fn availability_claims_detected() {
+        use super::looks_like_availability_claim as claim;
+        assert!(claim("Monday 10 August looks open. Would you like me to book it?"));
+        assert!(claim("We have availability on Friday."));
+        assert!(!claim("Let me check the calendar for you."));
+        assert!(!claim("We are open from 11am to 9pm daily."));
     }
 
     #[test]
@@ -5248,6 +5268,7 @@ fn run_loop(
                             // dead air, and the floor stays with the caller.
                             let mut wait_requested = false;
                             let mut wait_regen_done = false;
+                            let mut empty_retry_done = false;
                             // Set when the generation was a [[LOOKUP:]] verdict
                             // (round 0 only): run the flow + regenerate.
                             let mut lookup_requested: Option<String> = None;
@@ -5703,6 +5724,21 @@ fn run_loop(
                                         );
                                         lookup_requested = Some(text.clone());
                                     } else if lookup_rounds == 0
+                                        && looks_like_availability_claim(&full)
+                                        && mentions_a_date(&text)
+                                    {
+                                        // The model ASSERTED availability
+                                        // without running the lookup (call
+                                        // 2c00cac0: 'Monday 10 August looks
+                                        // open' from thin air). Verify: run
+                                        // the lookup on the caller's words —
+                                        // the deterministic answer replaces
+                                        // the guess.
+                                        eprintln!(
+                                            "[aokie-plugin] availability claimed without a lookup — verifying against the calendar"
+                                        );
+                                        lookup_requested = Some(text.clone());
+                                    } else if lookup_rounds == 0
                                         && looks_like_team_deferral(&full)
                                         && mentions_a_date(&text)
                                     {
@@ -5770,6 +5806,22 @@ fn run_loop(
                                             operator_ended,
                                         )
                                     {
+                                        if heard.is_empty() && !empty_retry_done {
+                                            // One retry for an EMPTY generation
+                                            // (live call 2c00cac0: Gemma 4 hit
+                                            // a repetition spiral, emitted an
+                                            // empty reply, and the fail-safe
+                                            // hung up on a recoverable hiccup).
+                                            eprintln!(
+                                                "[aokie-plugin] empty generation — retrying once before the fail-safe"
+                                            );
+                                            history.push(serde_json::json!({
+                                                "role": "user",
+                                                "content": "[SYSTEM NOTE - not the caller speaking] Your previous reply was empty. Answer the caller now in one short sentence.",
+                                            }));
+                                            empty_retry_done = true;
+                                            continue 'reply_rounds;
+                                        }
                                         dead_air_cause = Some(if heard.is_empty() {
                                             "the assistant produced an empty reply".to_string()
                                         } else {
@@ -5990,9 +6042,12 @@ fn run_loop(
                                     crate::call_session::TerminationIntent::AgentHangup,
                                 );
                                 match bt.hangup() {
-                                    Ok(()) => eprintln!(
-                                        "[aokie-plugin] fail-safe hangup complete (AT+CHUP)"
-                                    ),
+                                    Ok(()) => {
+                                        agent_hung_up = true;
+                                        eprintln!(
+                                            "[aokie-plugin] fail-safe hangup complete (AT+CHUP)"
+                                        );
+                                    }
                                     Err(e) => {
                                         eprintln!("[aokie-plugin] fail-safe hangup failed: {e}")
                                     }
@@ -6507,9 +6562,12 @@ fn run_loop(
                                 crate::call_session::TerminationIntent::AgentHangup,
                             );
                             match bt.hangup() {
-                                Ok(()) => eprintln!(
-                                    "[aokie-plugin] max-silence hangup complete (AT+CHUP)"
-                                ),
+                                Ok(()) => {
+                                    agent_hung_up = true;
+                                    eprintln!(
+                                        "[aokie-plugin] max-silence hangup complete (AT+CHUP)"
+                                    );
+                                }
                                 Err(e) => {
                                     eprintln!("[aokie-plugin] max-silence hangup failed: {e}");
                                     emit_control_failed(

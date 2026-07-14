@@ -149,6 +149,11 @@ impl LlmClient {
             // Sunday-July-19-6PM record) — factual precision beats sparkle
             // on a phone line.
             "temperature": 0.35,
+            // Anti-template-spiral (live call 2c00cac0: Gemma 4 answered three
+            // turns in a row with the identical deferral sentence, then
+            // degenerated to an EMPTY reply). llama.cpp-native; other
+            // providers ignore unknown fields.
+            "repeat_penalty": 1.15,
             // llama.cpp prompt/KV caching: with the ring-time prefix warm the
             // real reply's first token only pays for the caller's NEW words.
             // Providers without the extension ignore the field.
