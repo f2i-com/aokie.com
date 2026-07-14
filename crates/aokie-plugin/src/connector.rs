@@ -182,6 +182,10 @@ pub struct Plugin {
     /// plugin.health and command errors so an operator sees WHY the phone is
     /// offline (vs a hardware fault). Cleared once consent is satisfied.
     pub consent_blocked: Option<String>,
+    /// Plugin → Desktop request corridor (guide P1-14): shared with the
+    /// stdio loop (which routes responses back) and the radio (which makes
+    /// mid-call `flow.run` lookups through it).
+    pub host_rpc: std::sync::Arc<crate::host_rpc::HostRpc>,
 }
 
 impl Plugin {
@@ -189,6 +193,8 @@ impl Plugin {
     /// eagerly — a plugin that can't persist essential events must
     /// fail the handshake, not lose records later.
     pub fn new(dev_mode: bool, data_dir: PathBuf) -> Result<Self, String> {
+        // (host_rpc is initialized in the struct literal below via Default-ish
+        // construction — see the `host_rpc` field.)
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
         let store = ConfigStore::load(&data_dir);
@@ -207,6 +213,7 @@ impl Plugin {
             ack_mode: false,
             replay_heartbeat: None,
             consent_blocked: None,
+            host_rpc: crate::host_rpc::HostRpc::new(),
         })
     }
 
@@ -232,6 +239,7 @@ impl Plugin {
             ack_mode: false,
             replay_heartbeat: None,
             consent_blocked: None,
+            host_rpc: crate::host_rpc::HostRpc::new(),
         }
     }
 

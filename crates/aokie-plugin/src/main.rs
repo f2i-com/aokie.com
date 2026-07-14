@@ -117,6 +117,15 @@ fn main() {
                 if text.is_empty() {
                     continue;
                 }
+                // Guide P1-14 (bidirectional stdio): RESPONSES to requests
+                // WE made (flow.run lookups) arrive on the same stdin —
+                // id + result/error, no method. Route them to the waiting
+                // caller; everything else dispatches as before.
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                    if plugin.host_rpc.try_route_response(&v) {
+                        continue;
+                    }
+                }
                 let response = match rpc::parse_line(text) {
                     Ok(msg) => plugin.handle_rpc(msg, &mut sink),
                     Err(e) => Some(rpc::error_line(e.id.as_ref(), e.code, &e.message, None)),
