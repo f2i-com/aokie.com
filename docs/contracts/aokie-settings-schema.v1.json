@@ -63,6 +63,12 @@
       "appliesLive": true
     },
     {
+      "key": "managerPin",
+      "type": "string",
+      "maxChars": 32,
+      "appliesLive": true
+    },
+    {
       "key": "outboundEnabled",
       "type": "bool",
       "appliesLive": true

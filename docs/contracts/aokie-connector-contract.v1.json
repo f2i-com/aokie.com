@@ -27,6 +27,7 @@
     "aokie.sms.received",
     "aokie.sms.sent",
     "aokie.sms.failed",
+    "aokie.manager.action",
     "aokie.hardware.error"
   ],
   "commands": [

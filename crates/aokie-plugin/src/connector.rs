@@ -1939,6 +1939,7 @@ impl Plugin {
                             | "blockedMessage"
                             | "autoBlockAbuse"
                             | "managerNumbers"
+                            | "managerPin"
                     )
                 });
                 if screening_key {
@@ -2656,6 +2657,10 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     // additionally require the spoken PIN). Applies live via the screening
     // reload machinery.
     SettingSpec { key: "managerNumbers", kind: SettingKind::Str { max_chars: 2000 }, applies_live: true },
+    // Phase 3 slice 2: the spoken PIN that unlocks manager WRITE actions
+    // (verified by deterministic digit comparison, never the model). Read at
+    // PIN time from env like the other screening-family keys.
+    SettingSpec { key: "managerPin", kind: SettingKind::Str { max_chars: 32 }, applies_live: true },
     // Phase 2 outbound guardrails — read at DISPATCH time (call.dial), so
     // they apply immediately with no reconnect. outboundEnabled is the kill
     // switch and DEFAULTS OFF: the receptionist can never place a call until
@@ -2747,6 +2752,7 @@ fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
         ("screenMessage", "AOKIE_SCREEN_MESSAGE"),
         ("blockedMessage", "AOKIE_BLOCKED_MESSAGE"),
         ("managerNumbers", "AOKIE_MANAGER_NUMBERS"),
+        ("managerPin", "AOKIE_MANAGER_PIN"),
     ] {
         let v = settings
             .get(key)
