@@ -305,6 +305,127 @@ enum ReplyMsg {
 #[cfg(feature = "voice")]
 const REPLY_CHANNEL_BOUND: usize = 8;
 
+/// One in-flight agent generation: the detached worker streaming sentences
+/// into a bounded channel (see [`ReplyMsg`]), plus the caller text it is
+/// answering. Speculative generation (guide phase 5) makes this a first-class
+/// value: a stream started from a STABLE live-STT hypothesis mid-utterance is
+/// ADOPTED by the reply path when the final turn says the same thing — the
+/// first sentence is then already waiting in the channel.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+struct ReplyStream {
+    rx: std::sync::mpsc::Receiver<ReplyMsg>,
+    cancel: Arc<AtomicBool>,
+    activity: Arc<Mutex<Option<Instant>>>,
+    /// The caller text this generation answers (final turn text, or the
+    /// live-STT hypothesis it speculated from).
+    answering: String,
+    started: Instant,
+}
+
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn spawn_reply_stream(
+    client: &crate::agent::LlmClient,
+    messages: serde_json::Value,
+    answering: String,
+) -> ReplyStream {
+    let (reply_tx, rx) = std::sync::mpsc::sync_channel::<ReplyMsg>(REPLY_CHANNEL_BOUND);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let activity: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    {
+        let client = client.clone();
+        let c = cancel.clone();
+        let a = activity.clone();
+        // A failed spawn drops reply_tx → the pump sees Disconnected and
+        // reports a reply failure.
+        let _ = std::thread::Builder::new()
+            .name("aokie-agent-reply".to_string())
+            .spawn(move || {
+                let res = client.stream_reply(
+                    messages,
+                    &c,
+                    || {
+                        *a.lock().unwrap() = Some(Instant::now());
+                    },
+                    |sentence| reply_tx.send(ReplyMsg::Sentence(sentence.to_string())).is_ok(),
+                );
+                let _ = reply_tx.send(ReplyMsg::Done(res));
+            })
+            .map_err(|e| eprintln!("[aokie-plugin] reply worker failed to start: {e}"));
+    }
+    ReplyStream {
+        rx,
+        cancel,
+        activity,
+        answering,
+        started: Instant::now(),
+    }
+}
+
+/// The agent's system prompt at reply time: persona (call-scoped overlay wins
+/// over the global one, §9.3) + the standing spoken-delivery instructions +
+/// the end-call marker when agent hangup is on + the nudge tail when the
+/// previous reply was interrupted. ONE composer for the real reply AND the
+/// speculative start, so the adopted generation was primed identically.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn compose_agent_system_prompt(
+    persona: &str,
+    agent_hangup: bool,
+    cut_context: Option<&str>,
+) -> String {
+    let mut p = if agent_hangup {
+        format!("{persona}{SPEECH_STYLE_INSTRUCTION}{END_CALL_INSTRUCTION}")
+    } else {
+        format!("{persona}{SPEECH_STYLE_INSTRUCTION}")
+    };
+    if let Some(tail) = cut_context {
+        p.push_str(&format!(
+            "\n\nThe caller interrupted your previous reply. You were about to say: \"{tail}\". Respond to what they just said, weaving that pending point in ONLY if it is still relevant. Never repeat what you already said and never restart the reply."
+        ));
+    }
+    p
+}
+
+/// Case/punctuation-insensitive word for hypothesis comparison.
+#[cfg(feature = "voice")]
+fn norm_word(w: &str) -> String {
+    w.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Guide phase 5: is the live hypothesis STABLE enough to speculate on? The
+/// previous partial's words must still be the (near-)prefix of the current
+/// one — the head of the utterance stopped changing — and long enough to
+/// carry an intent (≥4 words). One mid-prefix wobble is tolerated (STT
+/// partials flicker on homophones).
+#[cfg(feature = "voice")]
+fn hypothesis_stable(prev: &str, cur: &str) -> bool {
+    let p: Vec<String> = prev.split_whitespace().map(norm_word).collect();
+    let c: Vec<String> = cur.split_whitespace().map(norm_word).collect();
+    if p.len() < 4 || c.len() < p.len() {
+        return false;
+    }
+    let matches = p.iter().zip(&c).filter(|(a, b)| a == b).count();
+    matches + 1 >= p.len()
+}
+
+/// Guide phase 5: may the speculative generation answer the FINAL turn? The
+/// hypothesis must be a (near-)prefix of the final text — one wobble
+/// tolerated — with at most a short tail the model never saw ("...please").
+/// Anything else is a material revision: cancel and regenerate; speaking a
+/// reply to something the caller revised is worse than the ~1 s regen cost.
+#[cfg(feature = "voice")]
+fn hypothesis_covers(hyp: &str, fin: &str) -> bool {
+    let h: Vec<String> = hyp.split_whitespace().map(norm_word).collect();
+    let f: Vec<String> = fin.split_whitespace().map(norm_word).collect();
+    if h.is_empty() || f.is_empty() || f.len() < h.len() {
+        return false;
+    }
+    let matches = h.iter().zip(&f).filter(|(a, b)| a == b).count();
+    matches + 1 >= h.len() && f.len() - h.len() <= 3
+}
+
 /// Deadlines for one agent reply, enforced by the radio thread's pump (the
 /// worker may be stuck in a blocking read — reqwest 0.11 has no per-read
 /// timeout — so the PUMP owns the deadline and abandons the worker, whose
@@ -579,6 +700,12 @@ pub struct RadioStatus {
     /// span MID-SENTENCE (policy-aware soft barge) instead of waiting for the
     /// sentence boundary.
     pub mid_span_yields: AtomicU64,
+    /// Speculative reply generation (guide phase 5): starts from a STABLE
+    /// live-STT hypothesis while the caller is still speaking; kept when the
+    /// final turn matched, cancelled (wasted) when it diverged.
+    pub spec_llm_started: AtomicU64,
+    pub spec_llm_kept: AtomicU64,
+    pub spec_llm_wasted: AtomicU64,
     pub gap_yields: AtomicU64,
     pub semantic_cuts: AtomicU64,
     pub barge_cuts: AtomicU64,
@@ -700,6 +827,9 @@ impl RadioHandle {
             "probeCommands": s.probe_commands.load(Ordering::Relaxed),
             "boundaryYields": s.boundary_yields.load(Ordering::Relaxed),
             "midSpanYields": s.mid_span_yields.load(Ordering::Relaxed),
+            "specLlmStarted": s.spec_llm_started.load(Ordering::Relaxed),
+            "specLlmKept": s.spec_llm_kept.load(Ordering::Relaxed),
+            "specLlmWasted": s.spec_llm_wasted.load(Ordering::Relaxed),
             "gapYields": s.gap_yields.load(Ordering::Relaxed),
             "semanticCuts": s.semantic_cuts.load(Ordering::Relaxed),
             "bargeCuts": s.barge_cuts.load(Ordering::Relaxed),
@@ -3041,6 +3171,23 @@ fn run_loop(
     // personalization overlay (bounds the hold; reset per call).
     #[cfg(feature = "voice")]
     let mut greet_hold_started: Option<Instant> = None;
+    // Guide phase 2/5 — LIVE HYPOTHESIS LANE: while the caller speaks (bot
+    // idle), the in-progress utterance is re-transcribed every ~600 ms on the
+    // probe channel, giving streaming partial text; a STABLE partial starts a
+    // SPECULATIVE reply generation so the answer is largely ready at the
+    // endpoint instead of starting there.
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    let mut live_hyp: Option<String> = None;
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    let mut live_hyp_prev: Option<String> = None;
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    let mut live_hyp_shipped: usize = 0;
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    let mut live_hyp_at: Option<Instant> = None;
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    let mut live_probe_in_flight = false;
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    let mut spec_reply: Option<ReplyStream> = None;
     // Conversation history for the agent (OpenAI chat messages), reset per call.
     #[cfg(feature = "voice")]
     let mut history: Vec<serde_json::Value> = Vec::new();
@@ -3293,6 +3440,15 @@ fn run_loop(
             // next caller can never inherit the previous caller's persona.
             call_agent_overlay = None;
             greet_hold_started = None;
+            live_hyp = None;
+            live_hyp_prev = None;
+            live_hyp_shipped = 0;
+            live_hyp_at = None;
+            live_probe_in_flight = false;
+            if let Some(sp) = spec_reply.take() {
+                sp.cancel.store(true, Ordering::Relaxed);
+                status.spec_llm_wasted.fetch_add(1, Ordering::Relaxed);
+            }
             // Drop the echo canceller entirely rather than just resetting its
             // FIFOs (review sweep): it was built at the FIRST call's SCO rate
             // and reset() keeps that rate + filter length. Back-to-back calls
@@ -3696,6 +3852,91 @@ fn run_loop(
                 stt_had_speech = false;
                 stt_silence = Duration::ZERO;
             }
+            // ── LIVE HYPOTHESIS LANE (guide phase 2/5) ──────────────────────
+            // While the caller is mid-utterance and the bot is silent, ship
+            // the ACCUMULATING buffer for partial transcription (~600 ms
+            // cadence, ≤1 in flight, local probe channel — no HTTP egress).
+            if agent_enabled && stt_had_speech {
+                let due = live_hyp_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(600));
+                let grown =
+                    stt_buf.len() >= live_hyp_shipped + 16_000 / 2 && stt_buf.len() >= 16_000 / 2;
+                if !live_probe_in_flight && due && grown {
+                    if let Some(sess) = tracker.current() {
+                        let from = stt_buf.len().saturating_sub(16_000 * 8);
+                        if stt_tx
+                            .send(SttWork::Probe {
+                                generation: sess.generation,
+                                samples: stt_buf[from..].to_vec(),
+                            })
+                            .is_ok()
+                        {
+                            live_probe_in_flight = true;
+                            live_hyp_shipped = stt_buf.len();
+                            live_hyp_at = Some(Instant::now());
+                            status.probes_sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                while let Ok(res) = probe_result_rx.try_recv() {
+                    live_probe_in_flight = false;
+                    if res.generation != voice_call_gen || res.text.trim().is_empty() {
+                        continue;
+                    }
+                    live_hyp_prev = live_hyp.take();
+                    live_hyp = Some(res.text);
+                }
+                // A stable, intent-sized hypothesis starts the reply EARLY —
+                // the generation streams while the caller finishes; the turn
+                // flush below adopts it when the final text matches.
+                if spec_reply.is_none() && !dialogue.is_paused() {
+                    if let (Some(prev), Some(cur)) = (live_hyp_prev.as_deref(), live_hyp.as_deref())
+                    {
+                        if hypothesis_stable(prev, cur) {
+                            if let Some(client) = agent_client.as_ref() {
+                                let persona_now: &str = call_agent_overlay
+                                    .as_ref()
+                                    .and_then(|o| o.persona.as_deref())
+                                    .unwrap_or(&agent_persona);
+                                // PEEK the nudge tail (never consume — a
+                                // discarded speculation must leave it for the
+                                // real reply).
+                                let sys = compose_agent_system_prompt(
+                                    persona_now,
+                                    agent_hangup,
+                                    last_cut_context.as_deref(),
+                                );
+                                let mut messages =
+                                    vec![serde_json::json!({ "role": "system", "content": sys })];
+                                messages.extend(history.iter().cloned());
+                                messages
+                                    .push(serde_json::json!({ "role": "user", "content": cur }));
+                                eprintln!(
+                                    "[aokie-plugin] speculative reply START on stable hypothesis: {}",
+                                    content_for_log(cur)
+                                );
+                                status.spec_llm_started.fetch_add(1, Ordering::Relaxed);
+                                spec_reply = Some(spawn_reply_stream(
+                                    client,
+                                    serde_json::json!(messages),
+                                    cur.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else if !stt_had_speech {
+                // Utterance over (or none): partials for it are dead. A late
+                // probe result must not seed the NEXT utterance's hypothesis.
+                if live_hyp.is_some() || live_hyp_prev.is_some() {
+                    live_hyp = None;
+                    live_hyp_prev = None;
+                }
+                live_hyp_shipped = 0;
+                while probe_result_rx.try_recv().is_ok() {
+                    live_probe_in_flight = false;
+                }
+            }
+
             // Finished transcripts: accumulate into the OPEN caller turn
             // (audit AK-008). A transcript whose tail looks unfinished — a
             // digit group mid-phone-number, "my number is…" — keeps the turn
@@ -4074,6 +4315,15 @@ fn run_loop(
                         }
                     }
 
+                    if !respond_with_llm {
+                        // The turn resolved WITHOUT a reply (hesitation, floor
+                        // command, paused dialogue): a pending speculation has
+                        // nothing to be adopted by — kill the worker.
+                        if let Some(sp) = spec_reply.take() {
+                            sp.cancel.store(true, Ordering::Relaxed);
+                            status.spec_llm_wasted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     if agent_enabled && respond_with_llm {
                         // Lazily connect to the local LLM on the first caller turn.
                         if agent_client.is_none() {
@@ -4115,19 +4365,13 @@ fn run_loop(
                                 .as_ref()
                                 .and_then(|o| o.persona.as_deref())
                                 .unwrap_or(&agent_persona);
-                            let mut system_prompt = if agent_hangup {
-                                format!("{persona_now}{SPEECH_STYLE_INSTRUCTION}{END_CALL_INSTRUCTION}")
-                            } else {
-                                format!("{persona_now}{SPEECH_STYLE_INSTRUCTION}")
-                            };
-                            // The nudge: the caller interrupted the previous
-                            // reply — hand the model its unspoken tail so the
-                            // join sounds like one flowing thought.
-                            if let Some(tail) = last_cut_context.take() {
-                                system_prompt.push_str(&format!(
-                                    "\n\nThe caller interrupted your previous reply. You were about to say: \"{tail}\". Respond to what they just said, weaving that pending point in ONLY if it is still relevant. Never repeat what you already said and never restart the reply."
-                                ));
-                            }
+                            // The nudge tail is CONSUMED here (or below on
+                            // adoption — the speculation already baked it in).
+                            let system_prompt = compose_agent_system_prompt(
+                                persona_now,
+                                agent_hangup,
+                                last_cut_context.take().as_deref(),
+                            );
                             let mut messages = vec![
                                 serde_json::json!({ "role": "system", "content": system_prompt }),
                             ];
@@ -4214,41 +4458,41 @@ fn run_loop(
                             // abandoned worker aborts at its next stream line
                             // (cancel flag) or, if stuck mid-read, at the
                             // client's whole-request timeout.
-                            let (reply_tx, reply_rx) =
-                                std::sync::mpsc::sync_channel::<ReplyMsg>(REPLY_CHANNEL_BOUND);
-                            let reply_cancel = Arc::new(AtomicBool::new(false));
-                            let reply_activity: Arc<Mutex<Option<Instant>>> =
-                                Arc::new(Mutex::new(None));
-                            {
-                                let client = client.clone();
-                                let cancel = reply_cancel.clone();
-                                let activity = reply_activity.clone();
-                                let messages = serde_json::json!(messages);
-                                // A failed spawn drops reply_tx → the pump sees
-                                // Disconnected and reports a reply failure.
-                                let _ = std::thread::Builder::new()
-                                    .name("aokie-agent-reply".to_string())
-                                    .spawn(move || {
-                                        let res = client.stream_reply(
-                                            messages,
-                                            &cancel,
-                                            || {
-                                                *activity.lock().unwrap() = Some(Instant::now());
-                                            },
-                                            |sentence| {
-                                                reply_tx
-                                                    .send(ReplyMsg::Sentence(sentence.to_string()))
-                                                    .is_ok()
-                                            },
-                                        );
-                                        let _ = reply_tx.send(ReplyMsg::Done(res));
-                                    })
-                                    .map_err(|e| {
+                            // Guide phase 5: ADOPT a compatible speculative
+                            // generation (started mid-utterance from a stable
+                            // hypothesis) — its first sentence is often already
+                            // waiting in the channel. A diverged speculation is
+                            // cancelled: answering what the caller REVISED away
+                            // is worse than the regeneration cost. Either way
+                            // the nudge tail was consumed above (the adopted
+                            // stream baked it in at speculation time).
+                            let stream = match spec_reply.take() {
+                                Some(sp) if hypothesis_covers(&sp.answering, &text) => {
+                                    status.spec_llm_kept.fetch_add(1, Ordering::Relaxed);
+                                    eprintln!(
+                                        "[aokie-plugin] speculative reply ADOPTED ({}ms head start)",
+                                        sp.started.elapsed().as_millis()
+                                    );
+                                    sp
+                                }
+                                other => {
+                                    if let Some(sp) = other {
+                                        sp.cancel.store(true, Ordering::Relaxed);
+                                        status.spec_llm_wasted.fetch_add(1, Ordering::Relaxed);
                                         eprintln!(
-                                            "[aokie-plugin] reply worker failed to start: {e}"
-                                        )
-                                    });
-                            }
+                                            "[aokie-plugin] speculative reply discarded (final turn diverged)"
+                                        );
+                                    }
+                                    spawn_reply_stream(
+                                        client,
+                                        serde_json::json!(messages),
+                                        text.clone(),
+                                    )
+                                }
+                            };
+                            let reply_rx = stream.rx;
+                            let reply_cancel = stream.cancel;
+                            let reply_activity = stream.activity;
                             let started = Instant::now();
                             let mut stream_outcome: Option<Result<String, String>> = None;
                             'pump: loop {
@@ -6163,6 +6407,52 @@ mod tests {
         assert!(!p.stop_playback_now(now), "ordinary overlap rides the budget");
         p.semantic = Some(crate::duplex::CallerIntent::StopSpeaking);
         assert!(p.stop_playback_now(now), "spoken command beats protection");
+    }
+
+    /// Guide phase 5: hypothesis stability + adoption rules for speculative
+    /// reply generation — stable = the previous partial stayed a (near-)prefix
+    /// and carries intent; covers = the final turn matched what the model was
+    /// answering, with at most a short unseen tail.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn speculative_hypothesis_rules() {
+        // Stability: prefix held across two partials, >=4 words.
+        assert!(hypothesis_stable(
+            "do you have any tables",
+            "do you have any tables free on Friday"
+        ));
+        assert!(!hypothesis_stable("do you", "do you have any tables"), "too short to speculate");
+        assert!(
+            !hypothesis_stable("can I change my booking", "can I cancel the whole thing and"),
+            "a rewritten head is NOT stable"
+        );
+        // One mid-prefix STT wobble is tolerated.
+        assert!(hypothesis_stable(
+            "do you have any tables",
+            "do you have eny tables free"
+        ));
+
+        // Adoption: the final said what the hypothesis said (+ short tail).
+        assert!(hypothesis_covers(
+            "do you have any tables free on Friday",
+            "Do you have any tables free on Friday night?"
+        ));
+        assert!(
+            !hypothesis_covers(
+                "do you have any tables free on Friday",
+                "do you have any tables free on Friday actually make that Saturday around six"
+            ),
+            "a long unseen tail is a material revision"
+        );
+        assert!(
+            !hypothesis_covers("book me for Friday", "cancel my booking for Friday"),
+            "a diverged head must regenerate"
+        );
+        // Case/punctuation never break the match.
+        assert!(hypothesis_covers(
+            "what time do you open tomorrow",
+            "What time do you open tomorrow?"
+        ));
     }
 
     /// §9.3: the greeting hold waits for the overlay only while the caller
