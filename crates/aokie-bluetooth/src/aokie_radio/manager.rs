@@ -1136,6 +1136,10 @@ fn hfp_event_record(event: hfp::HfpEvent) -> HfpEventRecord {
             name: "Ringing".to_string(),
             summary: "ring notification".to_string(),
         },
+        hfp::HfpEvent::OutgoingDialing => HfpEventRecord {
+            name: "OutgoingDialing".to_string(),
+            summary: "outbound call setup started".to_string(),
+        },
         hfp::HfpEvent::CallAnswered => HfpEventRecord {
             name: "CallAnswered".to_string(),
             summary: "call indicator active".to_string(),
