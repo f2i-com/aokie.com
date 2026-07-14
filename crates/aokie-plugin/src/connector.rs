@@ -548,6 +548,7 @@ impl Plugin {
             reenumerate_hwid,
             greeting,
             self.ack_mode,
+            self.host_rpc.clone(),
         ) {
             Ok(handle) => {
                 eprintln!(
