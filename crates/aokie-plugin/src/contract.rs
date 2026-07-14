@@ -58,6 +58,13 @@ pub mod events {
     pub const SMS_RECEIVED: &str = "aokie.sms.received";
     pub const SMS_SENT: &str = "aokie.sms.sent";
     pub const SMS_FAILED: &str = "aokie.sms.failed";
+    // ── Manager line (Phase 3) ──────────────────────────────────────
+    /// A PIN-VERIFIED manager change, validated and composed by the
+    /// manager-action-plan flow — {callId, summary, hasUpdate, updateId,
+    /// update, at}. The manager-action-apply binding performs the record
+    /// write; the plugin only emits this AFTER the spoken PIN verified
+    /// (deterministic digit comparison — never the model).
+    pub const MANAGER_ACTION: &str = "aokie.manager.action";
     // ── Hardware ────────────────────────────────────────────────────
     pub const HARDWARE_ERROR: &str = "aokie.hardware.error";
 
@@ -87,6 +94,7 @@ pub mod events {
         SMS_RECEIVED,
         SMS_SENT,
         SMS_FAILED,
+        MANAGER_ACTION,
         HARDWARE_ERROR,
     ];
 
