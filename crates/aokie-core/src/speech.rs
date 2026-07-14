@@ -18,7 +18,12 @@
 /// This runs ONLY on the text handed to the synthesizer — transcripts, history
 /// and records keep the original wording.
 pub fn normalize_speech_text(input: &str) -> String {
-    // Date abbreviations first (live report 2026-07-14: "Tue Jul 14 2026" —
+    // Currency first (live report 2026-07-14: "$9" in a menu read-back was
+    // voiced wrong): "$18" -> "18 dollars", "$1" -> "1 dollar",
+    // "$18.50" -> "18 dollars and 50 cents" — the sign becomes a spoken word
+    // AFTER the amount, the way a person says a price.
+    let input = &normalize_currency(input);
+    // Date abbreviations next (live report 2026-07-14: "Tue Jul 14 2026" —
     // a toDateString-style label echoed by the model — was voiced as garbled
     // numbers): "Tue" -> "Tuesday", "Jul" -> "July" when they sit in date
     // context, so the synthesizer reads dates like a person would.
@@ -192,6 +197,72 @@ fn expand_date_abbreviations(input: &str) -> String {
 /// Strictly shaped: 1-2 digit hour (0-23), exactly 2-digit minutes (00-59),
 /// no digit on either side — "3:1" (a ratio), "10:154" and "100:30" are
 /// untouched. Runs only on synthesizer text, never on transcripts/records.
+/// `$<amount>` → spoken price: "$18" -> "18 dollars", "$1" -> "1 dollar",
+/// "$1,200" -> "1200 dollars", "$18.50" -> "18 dollars and 50 cents",
+/// "$0.50" -> "50 cents", "$9.5" -> "9 dollars and 50 cents". A `$` not
+/// directly followed by a digit is left alone. Synthesizer-input only.
+fn normalize_currency(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+            let mut j = i + 1;
+            let mut whole = String::new();
+            while j < chars.len() {
+                if chars[j].is_ascii_digit() {
+                    whole.push(chars[j]);
+                    j += 1;
+                } else if chars[j] == ','
+                    && chars.get(j + 1).is_some_and(|c| c.is_ascii_digit())
+                {
+                    // A thousands separator ONLY when digits follow — the
+                    // comma in "$18, steak" is prose punctuation and stays.
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            // Optional cents: '.' + 1-2 digits (3+ digits after the dot is
+            // not money — "$3.14159" keeps its dot untouched).
+            let mut cents: Option<u32> = None;
+            if chars.get(j) == Some(&'.') && chars.get(j + 1).is_some_and(|c| c.is_ascii_digit()) {
+                let mut k = j + 1;
+                let mut frac = String::new();
+                while k < chars.len() && chars[k].is_ascii_digit() {
+                    frac.push(chars[k]);
+                    k += 1;
+                }
+                if frac.len() <= 2 {
+                    let padded = if frac.len() == 1 { format!("{frac}0") } else { frac };
+                    cents = padded.parse::<u32>().ok();
+                    j = k;
+                }
+            }
+            let dollars: u64 = whole.parse().unwrap_or(0);
+            let mut spoken = String::new();
+            if dollars > 0 || cents.unwrap_or(0) == 0 {
+                spoken.push_str(&format!(
+                    "{dollars} dollar{}",
+                    if dollars == 1 { "" } else { "s" }
+                ));
+            }
+            if let Some(c) = cents.filter(|c| *c > 0) {
+                if !spoken.is_empty() {
+                    spoken.push_str(" and ");
+                }
+                spoken.push_str(&format!("{c} cent{}", if c == 1 { "" } else { "s" }));
+            }
+            out.push_str(&spoken);
+            i = j;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn normalize_clock_times(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -272,6 +343,31 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn currency_spoken_as_dollars_after_the_number() {
+        use super::normalize_currency as c;
+        // The live failure: a menu read-back — "$9" voiced wrong.
+        assert_eq!(
+            c("fish & chips for $18, steak for $32, and rum pudding for $9."),
+            "fish & chips for 18 dollars, steak for 32 dollars, and rum pudding for 9 dollars."
+        );
+        assert_eq!(c("$1 coin"), "1 dollar coin");
+        assert_eq!(c("$1,200 deposit"), "1200 dollars deposit");
+        assert_eq!(c("that's $18.50 all up"), "that's 18 dollars and 50 cents all up");
+        assert_eq!(c("$9.5 special"), "9 dollars and 50 cents special");
+        assert_eq!(c("just $0.50"), "just 50 cents");
+        assert_eq!(c("$18.00 even"), "18 dollars even");
+        assert_eq!(c("$1.01 exactly"), "1 dollar and 1 cent exactly");
+        // 3+ decimals is not money; a bare $ is left alone.
+        assert_eq!(c("pi costs $3.14159"), "pi costs 3 dollars.14159");
+        assert_eq!(c("the $ sign"), "the $ sign");
+        // Through the full pipeline too.
+        assert_eq!(
+            normalize_speech_text("Steak is $32 at 6 PM"),
+            "Steak is 32 dollars at 6 pee em"
+        );
+    }
 
     #[test]
     fn meridiems_become_user_tuned_phonetics() {
