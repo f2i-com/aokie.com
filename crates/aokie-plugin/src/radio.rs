@@ -1344,6 +1344,28 @@ fn content_for_log(text: &str) -> String {
     }
 }
 
+/// audioTranscript: tidy the audio model's corrected transcription before it
+/// replaces a transcript line. Markers the model may have imitated from its
+/// reply training are stripped, whitespace collapsed, surrounding quotes
+/// dropped; an empty, oversized, or unchanged result means "no correction"
+/// (None) — the STT text stays, and no corrected event is emitted.
+#[cfg(feature = "voice")]
+fn sanitize_heard(raw: &str, stt: &str) -> Option<String> {
+    let mut s = raw.trim().to_string();
+    while let (Some(a), Some(rel)) = (s.find("[["), s.find("[[").and_then(|a| s[a..].find("]]"))) {
+        s.replace_range(a..a + rel + 2, " ");
+    }
+    let s = s.trim().trim_matches('"').trim_matches('\'').trim();
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() || collapsed.chars().count() > 800 {
+        return None;
+    }
+    if collapsed == stt.trim() {
+        return None;
+    }
+    Some(collapsed)
+}
+
 /// Heuristic self-echo guard for the in-plugin agent: true when `caller` (a fresh
 /// transcript) is mostly the same words as Aokie's last spoken reply `bot` â€” i.e.
 /// Aokie's own TTS leaked back into the mic and STT transcribed it. Keeps Aokie
@@ -2650,6 +2672,41 @@ fn mentions_a_date(text: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod sanitize_heard_tests {
+    use super::sanitize_heard;
+
+    #[test]
+    fn plain_correction_passes_collapsed() {
+        assert_eq!(
+            sanitize_heard("  I'd like to book a  table\nfor two ", "I'd like to look a table for two"),
+            Some("I'd like to book a table for two".to_string())
+        );
+    }
+
+    #[test]
+    fn unchanged_or_empty_means_no_correction() {
+        assert_eq!(sanitize_heard("hello there", "hello there"), None);
+        assert_eq!(sanitize_heard("   ", "anything"), None);
+        assert_eq!(sanitize_heard("\"hello there\"", "hello there"), None); // quotes stripped, then unchanged
+    }
+
+    #[test]
+    fn imitated_markers_and_quotes_are_stripped() {
+        assert_eq!(
+            sanitize_heard("[[WAIT]] \"Can I move my booking?\"", "can I moo my booking"),
+            Some("Can I move my booking?".to_string())
+        );
+        // An unclosed marker never loops forever.
+        assert_eq!(sanitize_heard("[[HEARD hello", "x"), Some("[[HEARD hello".to_string()));
+    }
+
+    #[test]
+    fn oversized_output_is_rejected() {
+        assert_eq!(sanitize_heard(&"word ".repeat(300), "short"), None);
+    }
 }
 
 #[cfg(test)]
@@ -4155,6 +4212,15 @@ fn run_loop(
     // to STT; capped at ~30 s so a rambling turn can't balloon the request.
     #[cfg(feature = "voice")]
     let send_audio = agent_enabled && std::env::var_os("AOKIE_SEND_AUDIO").is_some();
+    // audioTranscript: after each caller turn a small DETACHED request asks
+    // the audio model to correct the STT from the turn's audio; results ride
+    // this channel back (tagged with their call id + turn, so a correction
+    // for an ENDED call still lands on its transcript row). Gated on
+    // send_audio - without the audio capture there is nothing to hear.
+    #[cfg(feature = "voice")]
+    let audio_transcript = send_audio && std::env::var_os("AOKIE_AUDIO_TRANSCRIPT").is_some();
+    #[cfg(feature = "voice")]
+    let (heard_tx, heard_rx) = std::sync::mpsc::channel::<(String, u32, String, String)>();
     // Call screening policy (spec Phase 0): parsed once per radio start.
     #[cfg(feature = "voice")]
     let mut screen_policy = crate::screen::ScreenPolicy::from_env();
@@ -5345,6 +5411,44 @@ fn run_loop(
                     p.flush_at = Instant::now();
                 }
             }
+            // audioTranscript corrections (detached lane): each result
+            // updates an ALREADY-EMITTED turn — a corrected event for the
+            // durable transcript row plus an in-place history patch so
+            // follow-up replies read the better text. Corrections for an
+            // ended call still emit; only the history patch is current-call.
+            while let Ok((cid, tidx, raw, stt)) = heard_rx.try_recv() {
+                if let Some(heard) = sanitize_heard(&raw, &stt) {
+                    eprintln!(
+                        "[aokie-plugin] audio transcript correction [turn {tidx}]: {}",
+                        content_for_log(&heard)
+                    );
+                    emit(
+                        outbox,
+                        sink,
+                        aokie_core::events::aokie_event_with_step(
+                            crate::contract::events::CALL_TURN_CORRECTED,
+                            &cid,
+                            &format!("turn.{tidx}.corrected"),
+                            serde_json::json!({
+                                "callId": cid,
+                                "turn": tidx,
+                                "text": heard,
+                                "sttText": stt,
+                                "at": aokie_core::events::now_iso8601(),
+                            }),
+                        ),
+                    );
+                    if tracker.call_id() == Some(cid.as_str()) {
+                        if let Some(entry) = history.iter_mut().rev().find(|m| {
+                            m.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                                && m.get("content").and_then(serde_json::Value::as_str)
+                                    == Some(stt.as_str())
+                        }) {
+                            entry["content"] = serde_json::json!(heard);
+                        }
+                    }
+                }
+            }
             // Flush the open turn once its hold expired AND the caller isn't
             // mid-utterance (fresh speech extends the merge window naturally).
             status.loop_phase.store(loop_phase::TURN, Ordering::Relaxed);
@@ -5471,6 +5575,35 @@ fn run_loop(
                         lane.turn_final();
                         if let Some(line) = lane.phase("thinking", Instant::now()) {
                             let _ = sink.send_line(&line);
+                        }
+                    }
+                    // audioTranscript: ask the audio model (DETACHED - the
+                    // reply never waits on this) to correct this turn's STT
+                    // from its audio. The manager PIN gate broke out of
+                    // 'turn_done above, so a PIN utterance structurally
+                    // cannot reach this request. Best-effort: no connected
+                    // client / no captured audio = silent no-op.
+                    if audio_transcript && !last_turn_audio.is_empty() {
+                        let heard_client = agent_client
+                            .clone()
+                            .or_else(|| pending_agent_client.lock().unwrap().clone());
+                        if let Some(hc) = heard_client {
+                            let pcm = last_turn_audio.clone();
+                            let cid = corr.clone();
+                            let stt = text.clone();
+                            let tidx = turn_index;
+                            let tx = heard_tx.clone();
+                            std::thread::spawn(move || {
+                                let b64 = crate::agent::LlmClient::wav_base64(&pcm, 16_000);
+                                match hc.transcribe_turn(&b64, &stt) {
+                                    Ok(raw) => {
+                                        let _ = tx.send((cid, tidx, raw, stt));
+                                    }
+                                    Err(e) => eprintln!(
+                                        "[aokie-plugin] transcript correction failed: {e}"
+                                    ),
+                                }
+                            });
                         }
                     }
                     turn_overlapped = false;

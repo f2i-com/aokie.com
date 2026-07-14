@@ -46,6 +46,14 @@ pub mod events {
     pub const CALL_AUDIO_DISCONNECTED: &str = "aokie.call.audio.disconnected";
     pub const CALL_TURN_PARTIAL: &str = "aokie.call.turn.partial";
     pub const CALL_TURN_FINAL: &str = "aokie.call.turn.final";
+    /// Optional audio-model transcript correction for an ALREADY-EMITTED
+    /// caller turn — {callId, turn, text, sttText, at}. Emitted only when
+    /// BOTH `sendAudio` and `audioTranscript` are on: a small detached
+    /// request asks the audio-capable model to correct the on-device STT
+    /// from the turn's actual audio. `turn` names the turn.final it
+    /// corrects; consumers UPDATE that record (never mint a new turn), and
+    /// it must never be treated as a fresh caller turn (no replies).
+    pub const CALL_TURN_CORRECTED: &str = "aokie.call.turn.corrected";
     pub const CALL_ENDED: &str = "aokie.call.ended";
     /// Phase 2 (outbound calling): an OUTBOUND call attempt started —
     /// {callId, to, purpose?, at}. The rest of the outbound lifecycle rides
@@ -89,6 +97,7 @@ pub mod events {
         CALL_AUDIO_DISCONNECTED,
         CALL_TURN_PARTIAL,
         CALL_TURN_FINAL,
+        CALL_TURN_CORRECTED,
         CALL_ENDED,
         CALL_OUTBOUND_DIALING,
         SMS_RECEIVED,

@@ -107,6 +107,56 @@ impl LlmClient {
         Ok(())
     }
 
+    /// audioTranscript: ask the audio-capable model to CORRECT the
+    /// on-device STT from the turn's actual audio. Non-streaming, one small
+    /// generation, called from a DETACHED worker only — never the radio
+    /// loop (the reply path must not wait on this). The prompt frames it as
+    /// a correction (the STT draft rides along as a hint) so the output
+    /// stays close to the recognizer when it was already right instead of
+    /// re-imagining the sentence.
+    pub fn transcribe_turn(&self, wav_b64: &str, stt_text: &str) -> Result<String, String> {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "You transcribe one short phone-call utterance from its audio. A speech recognizer's draft is provided; correct any words it got wrong using the audio. Reply with ONLY the corrected transcription - the caller's exact words, no quotes, no commentary." },
+                { "role": "user", "content": [
+                    { "type": "input_audio", "input_audio": { "data": wav_b64, "format": "wav" } },
+                    { "type": "text", "text": format!("Recognizer draft: {stt_text}") },
+                ] },
+            ],
+            "stream": false,
+            "max_tokens": 200,
+            "temperature": 0.0,
+            "chat_template_kwargs": { "enable_thinking": false },
+        });
+        if let Some(m) = &self.model {
+            body["model"] = serde_json::json!(m);
+        }
+        let client = self
+            .client
+            .as_ref()
+            .map_err(|reason| format!("llm endpoint rejected: {reason}"))?;
+        let resp = client
+            .post(&self.endpoint)
+            .json(&body)
+            .send()
+            .map_err(|e| format!("transcript correction failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("transcript correction responded {}", resp.status()));
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .map_err(|e| format!("transcript correction body unreadable: {e}"))?;
+        let content = v
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Ok(content)
+    }
+
     /// Encode 16-bit mono PCM as a base64 WAV — the `input_audio` content
     /// part for audio-capable models (Gemma 3n / Qwen2-Audio class) served
     /// by llama-server's OpenAI-compatible endpoint. Used only when the
