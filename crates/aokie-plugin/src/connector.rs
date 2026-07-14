@@ -1627,6 +1627,119 @@ impl Plugin {
                 )?;
                 Ok(json!({"accepted": true, "mock": true, "callId": call_id}))
             }
+            "call.dial" => {
+                // Phase 2 (call-policy spec): place an OUTBOUND call. The
+                // agent speaks `openingLine` VERBATIM when the remote party
+                // answers (records-compose pattern — never model prose for
+                // the first words), and `purpose` grounds its conversation.
+                // Guardrails, all typed refusals BEFORE anything reaches the
+                // radio: consent recorded (bluetooth scope — placing calls IS
+                // phone-line use), the outboundEnabled kill switch (DEFAULT
+                // OFF), local quiet hours, and the persisted daily dial cap.
+                // A dedicated `outbound` consent scope + wizard checkbox is
+                // the documented follow-up before GA; until then the
+                // default-off kill switch is the explicit operator opt-in.
+                let obj = expect_fields(payload, &["number", "openingLine", "purpose"])?;
+                let number = require_str(&obj, "number")?;
+                let opening_line = require_str(&obj, "openingLine")?;
+                let purpose = optional_str(&obj, "purpose")?;
+                let number = validate_sms_recipient(&number)
+                    .map_err(|e| CmdError::failed(format!("number: {e}")))?;
+                let opening_line = opening_line.trim().to_string();
+                if opening_line.is_empty() || opening_line.chars().count() > 500 {
+                    return Err(CmdError::failed(
+                        "openingLine is required (1-500 chars): the exact first words spoken when they answer",
+                    ));
+                }
+                if purpose.as_deref().is_some_and(|p| p.chars().count() > 1000) {
+                    return Err(CmdError::failed("purpose: too long (max 1000 chars)"));
+                }
+                self.check_consent("call.dial", crate::consent::Scope::Bluetooth)?;
+                let s = &self.store.config.settings;
+                let enabled = s
+                    .get("outboundEnabled")
+                    .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+                    .unwrap_or(false);
+                if !enabled {
+                    return Err(CmdError::failed(
+                        "outbound calling is OFF — the operator must set outboundEnabled: true (the kill switch defaults off)",
+                    ));
+                }
+                let int_setting = |key: &str, default: i64| -> i64 {
+                    s.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
+                };
+                let qh_start = int_setting("quietHoursStart", 21);
+                let qh_end = int_setting("quietHoursEnd", 8);
+                let hour = aokie_core::events::local_hour();
+                if quiet_hours_block(qh_start, qh_end, hour) {
+                    return Err(CmdError::failed(format!(
+                        "quiet hours: automated calls are not placed between {qh_start}:00 and {qh_end}:00 local time (now {hour}:xx) — adjust quietHoursStart/quietHoursEnd if this is wrong"
+                    )));
+                }
+                let max_daily = int_setting("maxDailyDials", 20).max(1) as u32;
+                let today = aokie_core::events::today_local_ymd();
+                let used = match self.store.config.dial_ledger.as_ref() {
+                    Some(l) if l.date == today => l.count,
+                    _ => 0,
+                };
+                if used >= max_daily {
+                    return Err(CmdError::failed(format!(
+                        "daily dial cap reached ({used}/{max_daily} today) — raise maxDailyDials or try tomorrow"
+                    )));
+                }
+                let Some(radio) = self.radio.as_ref() else {
+                    // No radio, no call — dev mode gets a simulated
+                    // acceptance (no events; the browser mock owns demo
+                    // parity), real mode a typed refusal.
+                    self.require_radio_or_dev("call.dial")?;
+                    let call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                    return Ok(json!({
+                        "accepted": true,
+                        "queued": true,
+                        "simulated": true,
+                        "callId": call_id,
+                        "to": number,
+                    }));
+                };
+                if radio.current_call_id().is_some() {
+                    return Err(CmdError::failed(
+                        "a call is already in progress — outbound dialing needs an idle line",
+                    ));
+                }
+                if !radio.status.connected.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(CmdError::failed(
+                        "no phone is connected — reconnect the phone before dialing",
+                    ));
+                }
+                // Count the ATTEMPT before it reaches the radio: a crash
+                // between dial and persist must never under-count the cap.
+                self.store.config.dial_ledger = Some(crate::config::DialLedger {
+                    date: today,
+                    count: used + 1,
+                });
+                self.save_config()?;
+                let call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                let op = operation_id();
+                radio
+                    .send(crate::radio::RadioControl::Dial {
+                        call_id: call_id.clone(),
+                        number: number.clone(),
+                        purpose,
+                        opening_line,
+                        op: Some(op.clone()),
+                    })
+                    .map_err(CmdError::failed)?;
+                Ok(json!({
+                    "accepted": true,
+                    "queued": true,
+                    "operationId": op,
+                    "via": "radio",
+                    "callId": call_id,
+                    "to": number,
+                    "dialsToday": used + 1,
+                    "maxDailyDials": max_daily,
+                }))
+            }
             "sms.threads" => {
                 expect_fields(payload, &[])?;
                 // FL-CONN-001: this reads the dev simulator's in-memory threads —
@@ -2537,6 +2650,16 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     // only an explicit false turns the auto-block off (the notice + hangup
     // always happen regardless).
     SettingSpec { key: "autoBlockAbuse", kind: SettingKind::Bool, applies_live: true },
+    // Phase 2 outbound guardrails — read at DISPATCH time (call.dial), so
+    // they apply immediately with no reconnect. outboundEnabled is the kill
+    // switch and DEFAULTS OFF: the receptionist can never place a call until
+    // the operator explicitly turns outbound on.
+    SettingSpec { key: "outboundEnabled", kind: SettingKind::Bool, applies_live: true },
+    SettingSpec { key: "maxDailyDials", kind: SettingKind::Int { min: 1, max: 200 }, applies_live: true },
+    // Local-time do-not-dial window [start, end): 21/8 = no automated calls
+    // 9pm–8am. start == end disables the window.
+    SettingSpec { key: "quietHoursStart", kind: SettingKind::Int { min: 0, max: 23 }, applies_live: true },
+    SettingSpec { key: "quietHoursEnd", kind: SettingKind::Int { min: 0, max: 23 }, applies_live: true },
     SettingSpec { key: "agentHangup", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "reenumerateHwid", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "legacyPairingPin", kind: SettingKind::Bool, applies_live: false },
@@ -2588,6 +2711,24 @@ fn is_loopback_endpoint(url: &str) -> bool {
         authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
     };
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+/// Phase 2 outbound guardrail, pure for tests: is `hour` (local, 0-23)
+/// inside the do-not-dial window [start, end)? A wrapping window (21 → 8)
+/// blocks the evening AND the early morning; start == end disables the
+/// window entirely (there is no "block all day" — that's the kill switch's
+/// job, and a mis-set pair of equal hours must not silently disable
+/// outbound forever).
+fn quiet_hours_block(start: i64, end: i64, hour: u32) -> bool {
+    let (start, end, hour) = (start.clamp(0, 23), end.clamp(0, 23), i64::from(hour));
+    if start == end {
+        return false;
+    }
+    if start < end {
+        hour >= start && hour < end
+    } else {
+        hour >= start || hour < end
+    }
 }
 
 /// Screening settings → process env (spec Phase 0). Called at radio start
@@ -4079,6 +4220,164 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(list, list2, "suffix-equal number must not append again");
+    }
+
+    /// Phase 2 quiet hours: wrapping + plain windows, and the equal-hours
+    /// escape hatch (no silent "block all day" — that's the kill switch).
+    #[test]
+    fn quiet_hours_windows() {
+        // 21 → 8 wraps: evening AND early morning blocked.
+        assert!(quiet_hours_block(21, 8, 21));
+        assert!(quiet_hours_block(21, 8, 23));
+        assert!(quiet_hours_block(21, 8, 0));
+        assert!(quiet_hours_block(21, 8, 7));
+        assert!(!quiet_hours_block(21, 8, 8));
+        assert!(!quiet_hours_block(21, 8, 12));
+        assert!(!quiet_hours_block(21, 8, 20));
+        // Plain window 0 → 6.
+        assert!(quiet_hours_block(0, 6, 3));
+        assert!(!quiet_hours_block(0, 6, 6));
+        // start == end disables the window.
+        assert!(!quiet_hours_block(9, 9, 9));
+        assert!(!quiet_hours_block(0, 0, 12));
+    }
+
+    /// Phase 2 call.dial: the kill switch defaults OFF, guardrails refuse
+    /// typed BEFORE the radio, an accepted dial queues RadioControl::Dial
+    /// with the returned callId, and the persisted daily ledger enforces
+    /// the cap across dispatches.
+    #[test]
+    fn call_dial_guardrails_and_accept_path() {
+        let mut plugin = Plugin::ephemeral(true);
+        let (handle, control_rx) = crate::radio::RadioHandle::test_handle();
+        handle
+            .status
+            .connected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        plugin.radio = Some(handle);
+        let mut sink = VecSink::default();
+        let dial = json!({"number": "+61 400 111 222", "openingLine": "Hi, this is the clinic confirming your booking.", "purpose": "confirm the Tuesday booking"});
+
+        // Kill switch OFF by default: typed refusal, nothing reaches the radio.
+        let err = plugin
+            .dispatch_command("call.dial", &dial, &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("outboundEnabled"), "{}", err.message);
+        assert!(control_rx.try_recv().is_err(), "nothing queued while off");
+
+        // Enable + disable quiet hours (equal start/end): accepted.
+        plugin
+            .store
+            .config
+            .settings
+            .insert("outboundEnabled".into(), json!(true));
+        plugin
+            .store
+            .config
+            .settings
+            .insert("quietHoursStart".into(), json!(0));
+        plugin
+            .store
+            .config
+            .settings
+            .insert("quietHoursEnd".into(), json!(0));
+        plugin
+            .store
+            .config
+            .settings
+            .insert("maxDailyDials".into(), json!(2));
+        let data = plugin
+            .dispatch_command("call.dial", &dial, &mut sink)
+            .unwrap();
+        assert_eq!(data["accepted"], json!(true));
+        assert_eq!(data["queued"], json!(true));
+        assert_eq!(data["dialsToday"], json!(1));
+        let call_id = data["callId"].as_str().unwrap().to_string();
+        assert!(call_id.starts_with("call_"));
+        match control_rx.try_recv().unwrap() {
+            crate::radio::RadioControl::Dial { call_id: sent, number, opening_line, purpose, op } => {
+                assert_eq!(sent, call_id);
+                assert_eq!(number, "+61 400 111 222");
+                assert!(opening_line.contains("confirming your booking"));
+                assert_eq!(purpose.as_deref(), Some("confirm the Tuesday booking"));
+                assert!(op.is_some());
+            }
+            _ => panic!("expected the Dial control"),
+        }
+        // The attempt is counted + persisted (a restart can't reset the cap).
+        assert_eq!(
+            plugin.store.config.dial_ledger.as_ref().unwrap().count,
+            1
+        );
+
+        // A live call refuses further dials.
+        *plugin.radio.as_ref().unwrap().status.current_call_id.lock().unwrap() =
+            Some("call_busy".into());
+        let err = plugin
+            .dispatch_command("call.dial", &dial, &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("already in progress"), "{}", err.message);
+        *plugin.radio.as_ref().unwrap().status.current_call_id.lock().unwrap() = None;
+
+        // Daily cap: second dial fits (cap 2), third refuses typed.
+        plugin
+            .dispatch_command("call.dial", &dial, &mut sink)
+            .unwrap();
+        let _ = control_rx.try_recv();
+        let err = plugin
+            .dispatch_command("call.dial", &dial, &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("daily dial cap"), "{}", err.message);
+
+        // Quiet hours: a window covering the current local hour refuses.
+        let hour = aokie_core::events::local_hour() as i64;
+        plugin
+            .store
+            .config
+            .settings
+            .insert("quietHoursStart".into(), json!(hour));
+        plugin
+            .store
+            .config
+            .settings
+            .insert("quietHoursEnd".into(), json!((hour + 1) % 24));
+        plugin
+            .store
+            .config
+            .settings
+            .insert("maxDailyDials".into(), json!(200));
+        let err = plugin
+            .dispatch_command("call.dial", &dial, &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("quiet hours"), "{}", err.message);
+
+        // Validation: junk number / empty opening line never dial.
+        plugin
+            .store
+            .config
+            .settings
+            .insert("quietHoursStart".into(), json!(0));
+        plugin
+            .store
+            .config
+            .settings
+            .insert("quietHoursEnd".into(), json!(0));
+        let err = plugin
+            .dispatch_command(
+                "call.dial",
+                &json!({"number": "not-a-number!", "openingLine": "x"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("number"), "{}", err.message);
+        let err = plugin
+            .dispatch_command(
+                "call.dial",
+                &json!({"number": "+61400111222", "openingLine": "   "}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("openingLine"), "{}", err.message);
     }
 
     // ---- CONSENT-001: enforce-by-default + signed grants + destinations ----

@@ -57,6 +57,32 @@
       "appliesLive": true
     },
     {
+      "key": "outboundEnabled",
+      "type": "bool",
+      "appliesLive": true
+    },
+    {
+      "key": "maxDailyDials",
+      "type": "int",
+      "min": 1,
+      "max": 200,
+      "appliesLive": true
+    },
+    {
+      "key": "quietHoursStart",
+      "type": "int",
+      "min": 0,
+      "max": 23,
+      "appliesLive": true
+    },
+    {
+      "key": "quietHoursEnd",
+      "type": "int",
+      "min": 0,
+      "max": 23,
+      "appliesLive": true
+    },
+    {
       "key": "agentHangup",
       "type": "bool",
       "appliesLive": false
