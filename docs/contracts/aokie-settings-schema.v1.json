@@ -26,24 +26,24 @@
       "key": "blockedNumbers",
       "type": "string",
       "maxChars": 4000,
-      "appliesLive": false
+      "appliesLive": true
     },
     {
       "key": "acceptPattern",
       "type": "string",
       "maxChars": 200,
-      "appliesLive": false
+      "appliesLive": true
     },
     {
       "key": "rejectPrivate",
       "type": "bool",
-      "appliesLive": false
+      "appliesLive": true
     },
     {
       "key": "screenMessage",
       "type": "string",
       "maxChars": 500,
-      "appliesLive": false
+      "appliesLive": true
     },
     {
       "key": "agentHangup",
