@@ -54,6 +54,12 @@ pub enum HfpAtCommand {
     DisableNoiseReduction,
     Answer,
     RejectOrHangup,
+    /// `ATD<number>;` — place an OUTBOUND voice call (Phase 2, call-policy
+    /// spec). The trailing `;` marks a voice (not data) call per 3GPP 27.007.
+    /// The number must be pre-sanitized (digits and a leading `+` only) —
+    /// the builder strips anything else defensively so a malformed number
+    /// can never smuggle extra AT syntax onto the wire.
+    Dial(String),
     ConfirmCodec(u8),
     /// `AT+CLCC` — list current calls. Sent right after a call is answered:
     /// instant auto-answer races the ringing-phase `+CLIP` (several live
@@ -85,7 +91,16 @@ pub enum HfpEvent {
     /// no "retry the queue" path that's safe to take.
     ServiceLevelConnectionFailed(String),
     IncomingCall,
+    /// `callsetup,3` — an OUTBOUND (mobile-originated) call is alerting at
+    /// the remote end. MT calls never produce callsetup 3, so this has
+    /// always been the MO-alerting signal.
     Ringing,
+    /// `callsetup,2` — an OUTBOUND call setup started (Phase 2): either the
+    /// plugin dialed (ATD) or the phone's OWNER dialed from the handset.
+    /// Consumers must treat the pending call as outbound — the eventual
+    /// `CallAnswered` is the REMOTE party picking up, never a caller to
+    /// greet.
+    OutgoingDialing,
     CallAnswered,
     CallTerminated,
     CallerId(String),
@@ -105,6 +120,11 @@ pub struct HfpHandsFreeState {
     callsetup_indicator_index: u8,
     call_active: bool,
     incoming_call: bool,
+    /// An OUTBOUND call setup is in progress (`callsetup` 2 or 3 with no
+    /// active call). Mirrors `incoming_call` for the MO direction (Phase 2):
+    /// a `callsetup,0` while set is the same ambiguous edge — abandon vs
+    /// answered-with-late-`call,1` — so it feeds the SAME held verdict.
+    outgoing_setup: bool,
     /// `callsetup: 0` arrived while ringing with the `call` indicator still 0.
     /// That transition is AMBIGUOUS — the ring phase ends for BOTH an
     /// abandoned ring AND an answered call, and some AGs send `callsetup,0`
@@ -132,6 +152,7 @@ impl Default for HfpHandsFreeState {
             callsetup_indicator_index: 3,
             call_active: false,
             incoming_call: false,
+            outgoing_setup: false,
             terminate_pending: false,
             selected_codec: None,
         }
@@ -275,9 +296,12 @@ impl HfpHandsFreeState {
         }
         if let Some(callsetup) = indicator_status_value(values, self.callsetup_indicator_index) {
             // Only callsetup=1 (incoming) needs to be reflected so we
-            // don't auto-answer phantom rings. Outgoing (2) and alerting
-            // (3) aren't relevant for the HF's snapshot view.
+            // don't auto-answer phantom rings. Outgoing setup (2/3) is
+            // synced SILENTLY too (Phase 2): a snapshot is state alignment,
+            // not a notification — but the held-verdict logic needs to know
+            // an MO attempt is pending so its callsetup,0 resolves honestly.
             self.incoming_call = *callsetup == 1 && !self.call_active;
+            self.outgoing_setup = (*callsetup == 2 || *callsetup == 3) && !self.call_active;
         }
         events
     }
@@ -295,13 +319,16 @@ impl HfpHandsFreeState {
     fn update_callsetup(&mut self, value: i32) -> Vec<HfpEvent> {
         match value {
             0 => {
-                if self.incoming_call && !self.call_active {
-                    // AMBIGUOUS: the ring phase ends on BOTH abandon and
+                if (self.incoming_call || self.outgoing_setup) && !self.call_active {
+                    // AMBIGUOUS: the setup phase ends on BOTH abandon and
                     // answer, and `call,1` may arrive AFTER this (observed
-                    // live — see `terminate_pending`). Never guess
-                    // "terminated" here: hold the verdict for the `call`
-                    // indicator (CIEV edge or CIND? snapshot) to decide.
+                    // live — see `terminate_pending`). The SAME edge exists
+                    // for an outbound attempt: remote answered (call,1 next)
+                    // vs no-answer/busy/cancel. Never guess "terminated"
+                    // here: hold the verdict for the `call` indicator (CIEV
+                    // edge or CIND? snapshot) to decide.
                     self.incoming_call = false;
+                    self.outgoing_setup = false;
                     self.terminate_pending = true;
                 }
                 Vec::new()
@@ -334,10 +361,37 @@ impl HfpHandsFreeState {
                     events.push(HfpEvent::CallTerminated);
                 }
                 self.incoming_call = true;
+                self.outgoing_setup = false;
                 events.push(HfpEvent::IncomingCall);
                 events
             }
-            3 => vec![HfpEvent::Ringing],
+            2 => {
+                // OUTBOUND setup started (we sent ATD, or the owner dialed on
+                // the handset). Mirror the fresh-incoming logic: a still-held
+                // verdict or a stuck-active call means the PREVIOUS call's
+                // boundary was lost — resolve it first so the consumer's
+                // per-call reset runs before the new outbound session.
+                let mut events = Vec::new();
+                if self.terminate_pending {
+                    self.terminate_pending = false;
+                    events.push(HfpEvent::CallTerminated);
+                } else if self.call_active {
+                    self.call_active = false;
+                    events.push(HfpEvent::CallTerminated);
+                }
+                self.incoming_call = false;
+                self.outgoing_setup = true;
+                events.push(HfpEvent::OutgoingDialing);
+                events
+            }
+            3 => {
+                // MO alerting. Some AGs jump straight to 3 without a 2 —
+                // make sure the outbound setup is tracked either way.
+                if !self.call_active {
+                    self.outgoing_setup = true;
+                }
+                vec![HfpEvent::Ringing]
+            }
             _ => Vec::new(),
         }
     }
@@ -360,6 +414,7 @@ impl HfpHandsFreeState {
 
         self.call_active = active;
         self.incoming_call = false;
+        self.outgoing_setup = false;
         if active {
             vec![HfpEvent::CallAnswered]
         } else {
@@ -404,6 +459,15 @@ pub fn build_at_command(command: HfpAtCommand) -> Vec<u8> {
         HfpAtCommand::DisableNoiseReduction => "AT+NREC=0\r".to_string(),
         HfpAtCommand::Answer => "ATA\r".to_string(),
         HfpAtCommand::RejectOrHangup => "AT+CHUP\r".to_string(),
+        HfpAtCommand::Dial(number) => {
+            let sanitized: String = number
+                .chars()
+                .enumerate()
+                .filter(|(i, c)| c.is_ascii_digit() || (*i == 0 && *c == '+'))
+                .map(|(_, c)| c)
+                .collect();
+            format!("ATD{sanitized};\r")
+        }
         HfpAtCommand::ConfirmCodec(codec) => format!("AT+BCS={}\r", codec),
         HfpAtCommand::ListCurrentCalls => "AT+CLCC\r".to_string(),
     };
@@ -769,6 +833,114 @@ mod tests {
         assert_eq!(
             state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 0, 0])),
             Vec::<HfpEvent>::new()
+        );
+    }
+
+    // ── Phase 2: OUTBOUND (mobile-originated) call lifecycle ───────────────
+
+    #[test]
+    fn outbound_dial_command_is_sanitized_atd() {
+        assert_eq!(
+            build_at_command(HfpAtCommand::Dial("+61 491 570-156".to_string())),
+            b"ATD+61491570156;\r"
+        );
+        // A `+` anywhere but the front (or any other junk) is stripped — no
+        // way to smuggle AT syntax through the number.
+        assert_eq!(
+            build_at_command(HfpAtCommand::Dial("04;DT99\r+21".to_string())),
+            b"ATD049921;\r"
+        );
+    }
+
+    #[test]
+    fn outbound_setup_alert_answer_hangup_lifecycle() {
+        let mut state = HfpHandsFreeState::new();
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 2 }),
+            vec![HfpEvent::OutgoingDialing]
+        );
+        assert!(!state.incoming_call(), "MO setup is never an incoming call");
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 3 }),
+            vec![HfpEvent::Ringing]
+        );
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 }),
+            vec![HfpEvent::CallAnswered]
+        );
+        // Setup phase over; a later callsetup,0 echo must stay silent.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
+            Vec::<HfpEvent>::new()
+        );
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 }),
+            vec![HfpEvent::CallTerminated]
+        );
+    }
+
+    #[test]
+    fn outbound_no_answer_resolves_terminated_via_the_held_verdict() {
+        // Remote never picked up: callsetup 2 → 3 → 0 with `call` never
+        // rising. The drop is the SAME ambiguous edge as the MT ring — the
+        // verdict holds until the call indicator (snapshot here) decides.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 2 });
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 3 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
+            Vec::<HfpEvent>::new()
+        );
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 0, 0])),
+            vec![HfpEvent::CallTerminated]
+        );
+        assert!(!state.call_active());
+    }
+
+    #[test]
+    fn outbound_answer_race_callsetup_drop_before_call_up() {
+        // Same AG quirk as the MT answer (observed live 2026-07-13):
+        // callsetup,0 lands BEFORE call,1 on the remote pickup. The held
+        // verdict must resolve as the ANSWER, never a failed attempt.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 2 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
+            Vec::<HfpEvent>::new()
+        );
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 }),
+            vec![HfpEvent::CallAnswered]
+        );
+    }
+
+    #[test]
+    fn outbound_straight_to_alerting_is_still_tracked() {
+        // Some AGs skip callsetup=2 and report 3 directly — the attempt must
+        // still be tracked so its callsetup,0 resolves honestly.
+        let mut state = HfpHandsFreeState::new();
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 3 }),
+            vec![HfpEvent::Ringing]
+        );
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 }),
+            vec![HfpEvent::CallTerminated]
+        );
+    }
+
+    #[test]
+    fn fresh_outbound_setup_resolves_a_stranded_prior_call_first() {
+        // Mirror of the fresh-incoming boundary rule: a lost call,0 must not
+        // let the previous call's session leak into the new outbound one.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 2 }),
+            vec![HfpEvent::CallTerminated, HfpEvent::OutgoingDialing]
         );
     }
 
