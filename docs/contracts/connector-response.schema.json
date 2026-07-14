@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://formlogic.com/schemas/connector-response.schema.json",
   "title": "Connector command response",
-  "description": "Response of POST /api/connectors/{connectorId}/request and of the JSON-RPC \"connector.request\" result. Error codes are the SAME typed set FormLogic's ConnectorError already parses (form-builder/ui/src/client-runtime/connectors/connectorTypes.ts), so browser fallback semantics apply unchanged: only ipc_unavailable and connector_missing are fallbackable. Canonical copy: formlogic-app/docs/contracts/.",
+  "description": "Response of POST /api/connectors/{connectorId}/request and of the JSON-RPC \"connector.request\" result. Error codes are the SAME typed set FormLogic's ConnectorError already parses (formlogic/ui/src/client-runtime/connectors/connectorTypes.ts), so browser fallback semantics apply unchanged: only ipc_unavailable and connector_missing are fallbackable. Canonical copy: formlogic-app/docs/contracts/.",
   "type": "object",
   "oneOf": [
     {
