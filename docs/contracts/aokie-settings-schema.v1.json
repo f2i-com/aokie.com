@@ -52,6 +52,11 @@
       "appliesLive": true
     },
     {
+      "key": "autoBlockAbuse",
+      "type": "bool",
+      "appliesLive": true
+    },
+    {
       "key": "agentHangup",
       "type": "bool",
       "appliesLive": false
