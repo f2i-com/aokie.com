@@ -4666,6 +4666,21 @@ fn run_loop(
                         mute_stt_until =
                             Some(Instant::now() + out.dur + Duration::from_millis(400));
                     }
+                    // Phase 2 (live report 2026-07-14, call 5ba0ab2f): on an
+                    // agent-owned OUTBOUND call there is no ringtone phase —
+                    // anything captured between the remote pickup and the
+                    // opening line is the CALLEE's own words ("Hello?").
+                    // Keep it; the inbound clear below exists to drop
+                    // pre-answer ringtone garbage, which outbound never has.
+                    let pre_line: Vec<f32> = if stt_had_speech
+                        && tracker
+                            .current()
+                            .is_some_and(|s| s.outbound && s.agent_owned)
+                    {
+                        std::mem::take(&mut stt_buf)
+                    } else {
+                        Vec::new()
+                    };
                     stt_buf.clear();
                     stt_had_speech = false;
                     stt_silence = Duration::ZERO;
@@ -4679,6 +4694,20 @@ fn run_loop(
                         turn_overlapped = true;
                         turn_overlap_at = Some(aokie_core::events::iso8601_ago_ms(
                             (out.captured_speech.len() * 1000 / (sr as usize).max(1)) as u64,
+                        ));
+                    }
+                    if !pre_line.is_empty() {
+                        // The hello came BEFORE anything captured during the
+                        // line — prepend, and back-date to its actual start
+                        // (pre-line length + the opening line's duration ago).
+                        let pre_ms = (pre_line.len() as u64 * 1000) / 16_000;
+                        let mut seeded = pre_line;
+                        seeded.extend_from_slice(&stt_buf);
+                        stt_buf = seeded;
+                        stt_had_speech = true;
+                        turn_overlapped = true;
+                        turn_overlap_at = Some(aokie_core::events::iso8601_ago_ms(
+                            pre_ms + out.dur.as_millis() as u64,
                         ));
                     }
                     // Truthful transcript (audit AOK-VOICE-001/002): record the
