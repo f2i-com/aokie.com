@@ -28,6 +28,11 @@ pub enum BluetoothEvent {
     DeviceDisconnected(String),
     CallIncoming,
     CallRinging,
+    /// Phase 2: an OUTBOUND call setup started (`callsetup,2`) — either the
+    /// plugin dialed (ATD) or the phone's owner dialed on the handset. The
+    /// eventual `CallAnswered` is the REMOTE side picking up, never a
+    /// caller to greet.
+    OutgoingDialing,
     CallAnswered,
     CallTerminated,
     AudioConnected {
@@ -207,6 +212,14 @@ impl BluetoothManager {
         self.runtime.reject_or_hangup()
     }
 
+    /// Phase 2: place an OUTBOUND voice call via HFP `ATD<number>;`.
+    /// Progress arrives on the normal event stream (OutgoingDialing →
+    /// CallRinging → CallAnswered/CallTerminated) — the AG's indicator
+    /// stream stays the single source of call-state truth.
+    pub fn dial(&self, number: String) -> Result<(), String> {
+        self.runtime.dial(number)
+    }
+
     /// AOK-BT-001: open a bounded, discoverable pairing window for `seconds`.
     /// At rest the radio is connectable-only, so an unknown phone can only
     /// pair while this window is open.
@@ -356,6 +369,7 @@ fn bluetooth_event_from_runtime(
         RuntimeEvent::DeviceDisconnected(addr) => BluetoothEvent::DeviceDisconnected(addr),
         RuntimeEvent::CallIncoming => BluetoothEvent::CallIncoming,
         RuntimeEvent::CallRinging => BluetoothEvent::CallRinging,
+        RuntimeEvent::OutgoingDialing => BluetoothEvent::OutgoingDialing,
         RuntimeEvent::CallAnswered => BluetoothEvent::CallAnswered,
         RuntimeEvent::CallTerminated => BluetoothEvent::CallTerminated,
         RuntimeEvent::AudioConnected { codec, sample_rate, armed } => {
@@ -416,6 +430,9 @@ pub fn bluetooth_event_from_aokie_hfp(
         ),
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::IncomingCall => Some(BluetoothEvent::CallIncoming),
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::Ringing => Some(BluetoothEvent::CallRinging),
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::OutgoingDialing => {
+            Some(BluetoothEvent::OutgoingDialing)
+        }
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallAnswered => Some(BluetoothEvent::CallAnswered),
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallTerminated => Some(BluetoothEvent::CallTerminated),
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallerId(number) => {

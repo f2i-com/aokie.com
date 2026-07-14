@@ -66,6 +66,10 @@ pub enum RuntimeEvent {
     DeviceDisconnected(String),
     CallIncoming,
     CallRinging,
+    /// Phase 2: an OUTBOUND call setup started (`callsetup,2`) — the plugin
+    /// dialed via ATD, or the phone's owner dialed on the handset. The
+    /// eventual `CallAnswered` is the REMOTE party picking up.
+    OutgoingDialing,
     CallAnswered,
     CallTerminated,
     AudioConnected {
@@ -193,6 +197,11 @@ pub struct AudioFrame {
 enum ControlCommand {
     Answer,
     RejectOrHangup,
+    /// Phase 2: place an outbound voice call (`ATD<number>;`). Call-state
+    /// truth stays with the AG's +CIEV stream — the runtime only puts the
+    /// command on the wire; dialing/alerting/answer events follow from the
+    /// indicator updates exactly like an incoming call's do.
+    Dial(String),
     SendAudio(Vec<i16>),
     /// Drain `sco_tx_queue` immediately, dropping any TTS bytes that were
     /// already queued for transmission. Used by "Take Over Call" so the
@@ -545,6 +554,16 @@ impl AokieRuntime {
     pub fn reject_or_hangup(&self) -> Result<(), String> {
         self.control_tx
             .send(ControlCommand::RejectOrHangup)
+            .map_err(|_| "aokie-radio runtime is no longer running".to_string())
+    }
+
+    /// Phase 2: place an OUTBOUND voice call. The number is sanitized to
+    /// digits (+ optional leading `+`) at the AT layer. Progress arrives as
+    /// the normal event stream: `OutgoingDialing` → `CallRinging` (remote
+    /// alerting) → `CallAnswered` / `CallTerminated`.
+    pub fn dial(&self, number: String) -> Result<(), String> {
+        self.control_tx
+            .send(ControlCommand::Dial(number))
             .map_err(|_| "aokie-radio runtime is no longer running".to_string())
     }
 
@@ -2198,6 +2217,27 @@ fn run_runtime(
                     for packet in &packets {
                         if let Err(e) = transport.write_acl(packet) {
                             let _ = event_tx.send(RuntimeEvent::Error(format!("hangup: {}", e)));
+                        }
+                    }
+                }
+                Ok(ControlCommand::Dial(number)) => {
+                    let packets = l2cap_state
+                        .build_hfp_call_control_packets(HfpAtCommand::Dial(number.clone()))?;
+                    eprintln!(
+                        "[AokieRadio] Dial requested — built {} ACL packet(s) for ATD",
+                        packets.len()
+                    );
+                    if packets.is_empty() {
+                        // No open HFP SLC = no way to place the call. Surface
+                        // it — a silently-swallowed dial reads as "no answer"
+                        // to the caller-side watchdog for no reason it can see.
+                        let _ = event_tx.send(RuntimeEvent::Error(
+                            "dial: no open HFP service-level connection".to_string(),
+                        ));
+                    }
+                    for packet in &packets {
+                        if let Err(e) = transport.write_acl(packet) {
+                            let _ = event_tx.send(RuntimeEvent::Error(format!("dial: {}", e)));
                         }
                     }
                 }
@@ -4856,6 +4896,10 @@ fn forward_hfp_event(
         HfpEvent::Ringing => {
             eprintln!("[AokieRadio] HFP Ringing");
             let _ = event_tx.send(RuntimeEvent::CallRinging);
+        }
+        HfpEvent::OutgoingDialing => {
+            eprintln!("[AokieRadio] HFP OutgoingDialing (MO call setup)");
+            let _ = event_tx.send(RuntimeEvent::OutgoingDialing);
         }
         HfpEvent::CallAnswered => {
             eprintln!("[AokieRadio] HFP CallAnswered");

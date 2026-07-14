@@ -1194,6 +1194,9 @@ fn emit_call_ended(
                 "durationSeconds": ended.duration_seconds,
                 "durationMs": ended.duration_ms as u64,
                 "outcome": ended.outcome,
+                // Phase 2 (additive): which way the call went. Outbound
+                // callers' `from` is the DIALED number.
+                "direction": if ended.outbound { "outbound" } else { "inbound" },
                 "configVersion": config_version,
             }),
         ),
@@ -4272,9 +4275,12 @@ fn run_loop(
         // Auto-answer ASAP: the instant a call is present and not yet answered,
         // send the answer â€” before the audio channel comes up and freezes the
         // loop. Answer exactly once per call (the session's auto_answered flag).
+        // Never for OUTBOUND sessions (Phase 2): "not yet active" there means
+        // the REMOTE side hasn't picked up — an ATA into our own dialing
+        // attempt is nonsense.
         if auto_answer {
             if let Some(s) = tracker.current_mut() {
-                if !s.auto_answered && !s.is_active() {
+                if !s.auto_answered && !s.is_active() && !s.outbound {
                     // AOK-VOICE-001: never answer into silence. A KNOWN voice
                     // failure (asset preflight or a live engine/synthesis
                     // failure) means the receptionist can't hear or speak —
@@ -4408,8 +4414,11 @@ fn run_loop(
                 // `is_active()` (answered) is REQUIRED, not just `sr > 0`:
                 // some phones open the SCO channel during RINGING (in-band
                 // ringtone) — the greeting must never speak into a line the
-                // caller isn't connected to yet.
-                Some(s) if !s.greeted && s.is_active() && sr > 0 => {
+                // caller isn't connected to yet. OUTBOUND sessions (Phase 2)
+                // never greet: the remote party picking up is not a caller —
+                // greeting into the owner's own handset-dialed call was a
+                // latent bug this gate also closes.
+                Some(s) if !s.greeted && s.is_active() && sr > 0 && !s.outbound => {
                     // §9.3 personalization race: the caller-id flow's
                     // call-scoped overlay ("Hi <name>!") usually lands 1–3 s
                     // after answer — briefly hold the greeting for it instead
@@ -4657,8 +4666,14 @@ fn run_loop(
                 // ACTIVE calls only: some phones open the SCO during RINGING
                 // (in-band ringtone) — transcribing that seeds the first
                 // caller turn with garbage, and no caller can speak before
-                // the call is answered anyway.
-                if !tracker.current().is_some_and(|s| s.is_active()) {
+                // the call is answered anyway. OUTBOUND sessions (Phase 2
+                // slice 1) are observer-only: the owner's own handset-dialed
+                // call must not be transcribed or answered by the agent —
+                // the receptionist has no business on that line.
+                if !tracker
+                    .current()
+                    .is_some_and(|s| s.is_active() && !s.outbound)
+                {
                     continue;
                 }
                 // Full-duplex: echo-cancel the mic (so Aokie's own voice, even
@@ -7383,6 +7398,26 @@ fn handle_event(
                 *status.call_started_at.lock().unwrap() = Some(s.started_at_iso.clone());
             }
         }
+        E::OutgoingDialing => {
+            // Phase 2: an OUTBOUND call setup (callsetup,2). Slice 1 only
+            // OBSERVES: the session exists so call-state truth (status,
+            // call.ended records, no phantom "recovery" greeting when
+            // call,1 lands) is kept — but the receptionist stays silent and
+            // deaf on it: greeting/agent/STT are all outbound-gated. The
+            // number is unknown here (a handset-originated dial carries no
+            // +CLIP for the HF); plugin-initiated dials (call.dial) will
+            // seed it when the command lands in slice 2.
+            let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+            if let Some(s) = tracker.dial(id, None, now_iso8601()) {
+                eprintln!(
+                    "[aokie-plugin] OUTBOUND call setup observed ({}) — receptionist stays out of it",
+                    s.id
+                );
+                *status.current_caller.lock().unwrap() = None;
+                *status.current_call_id.lock().unwrap() = Some(s.id.clone());
+                *status.call_started_at.lock().unwrap() = Some(s.started_at_iso.clone());
+            }
+        }
         E::CallerId(num) => {
             // The FIRST time this call learns a (non-empty) number, announce
             // it: with instant auto-answer the ringing-phase +CLIP usually
@@ -7417,6 +7452,9 @@ fn handle_event(
         }
         E::CallRinging => {
             flush_incoming_if_pending(tracker, outbox, sink);
+            // Phase 2: callsetup,3 is MO alerting — classifies a
+            // never-answered outbound attempt as no_answer (vs failed).
+            tracker.note_alerted();
             if let Some(corr) = tracker.call_id() {
                 emit(
                     outbox,

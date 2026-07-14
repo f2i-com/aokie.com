@@ -67,6 +67,15 @@ pub struct CallSession {
     pub greeted: bool,
     pub auto_answered: bool,
     pub toned: bool,
+    /// Phase 2: this call is OUTBOUND (mobile-originated) — the plugin
+    /// dialed, or the phone's owner dialed on the handset. `caller_id` then
+    /// holds the REMOTE (dialed) number, `answered` means the remote party
+    /// picked up, and the receptionist must never greet into it.
+    pub outbound: bool,
+    /// Phase 2: the outbound attempt reached ALERTING (remote ringing,
+    /// callsetup 3). Classifies a never-answered attempt: alerted =
+    /// `no_answer`, never-alerted = `failed` (bad number / no service).
+    pub alerted: bool,
     /// Per-call utterance counter (STT job ids — observability + ordering).
     next_utterance: u32,
 }
@@ -117,12 +126,18 @@ pub struct EndedCall {
     /// signal, so a 100 ms answered call reads durationSeconds 0 AND
     /// outcome "completed".
     pub duration_seconds: u64,
-    /// "completed" | "rejected" | "missed" — from the answered flag and the
-    /// recorded termination intent, NOT from duration truncation.
+    /// "completed" | "rejected" | "missed" (inbound) — plus, for OUTBOUND
+    /// calls, "no_answer" (alerted, never picked up) and "failed" (never
+    /// even alerted) — from the answered flag and the recorded termination
+    /// intent, NOT from duration truncation.
     pub outcome: &'static str,
     /// "operator_reject" | "operator_hangup" | "remote_or_operator" (the
     /// legacy value when no operator intent was recorded).
     pub reason: &'static str,
+    /// Phase 2: the ended call was outbound (`caller_id` = the dialed
+    /// number). Rides into `aokie.call.ended` so records tell directions
+    /// apart.
+    pub outbound: bool,
 }
 
 /// Owns the current session (at most one call at a time — HFP) and the
@@ -178,9 +193,56 @@ impl SessionTracker {
             greeted: false,
             auto_answered: false,
             toned: false,
+            outbound: false,
+            alerted: false,
             next_utterance: 0,
         });
         self.session.as_ref()
+    }
+
+    /// Phase 2: an OUTBOUND call setup started (we dialed, or the owner
+    /// dialed on the handset). Same only-when-idle semantics as [`ring`];
+    /// `number` is the dialed remote number when known (None for a
+    /// handset-originated call we merely observed). No `aokie.call.incoming`
+    /// is ever held or emitted for these — outbound calls announce
+    /// themselves with their own event at dial time.
+    pub fn dial(
+        &mut self,
+        id: String,
+        number: Option<String>,
+        started_at_iso: String,
+    ) -> Option<&CallSession> {
+        if self.session.is_some() {
+            return None;
+        }
+        self.last_generation += 1;
+        self.session = Some(CallSession {
+            id,
+            generation: self.last_generation,
+            phase: Phase::Ringing,
+            started_at_iso,
+            started: Instant::now(),
+            answered: None,
+            caller_id: number,
+            intent: None,
+            pending_incoming_since: None,
+            greeted: false,
+            auto_answered: false,
+            toned: false,
+            outbound: true,
+            alerted: false,
+            next_utterance: 0,
+        });
+        self.session.as_ref()
+    }
+
+    /// Phase 2: the outbound attempt reached remote ALERTING (callsetup 3).
+    pub fn note_alerted(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            if s.outbound {
+                s.alerted = true;
+            }
+        }
     }
 
     /// CLIP caller id arrived (any time before or after answer).
@@ -215,10 +277,38 @@ impl SessionTracker {
 
     /// The call terminated. Consumes the session and computes the outcome:
     /// answered → completed (regardless of duration); never answered →
-    /// rejected when the operator rejected it, else missed.
+    /// rejected when the operator rejected it, else missed. OUTBOUND
+    /// (Phase 2) never-answered attempts get their own truths: `no_answer`
+    /// when the remote alerted but never picked up, `failed` when the
+    /// attempt never even alerted (bad number / no service).
     pub fn terminate(&mut self) -> Option<EndedCall> {
         let s = self.session.take()?;
         let duration_ms = s.answered.map(|t| t.elapsed().as_millis()).unwrap_or(0);
+        if s.outbound && s.answered.is_none() {
+            let cancelled = matches!(
+                s.intent,
+                Some(TerminationIntent::OperatorHangup)
+                    | Some(TerminationIntent::OperatorReject)
+                    | Some(TerminationIntent::AgentHangup)
+            );
+            let (outcome, reason) = match (s.alerted, s.intent) {
+                (_, Some(TerminationIntent::DeviceLost)) => ("failed", "device_lost"),
+                (true, _) if cancelled => ("no_answer", "cancelled"),
+                (true, _) => ("no_answer", "remote_or_network"),
+                (false, _) if cancelled => ("failed", "cancelled"),
+                (false, _) => ("failed", "setup_failed"),
+            };
+            return Some(EndedCall {
+                id: s.id,
+                generation: s.generation,
+                caller_id: s.caller_id,
+                duration_ms: 0,
+                duration_seconds: 0,
+                outcome,
+                reason,
+                outbound: true,
+            });
+        }
         let (outcome, reason) = match (s.answered.is_some(), s.intent) {
             // Device loss is its own truth (audit AOK-LIF-003): the call did
             // not complete or get rejected — the hardware went away.
@@ -251,6 +341,7 @@ impl SessionTracker {
             duration_seconds: (duration_ms / 1000) as u64,
             outcome,
             reason,
+            outbound: s.outbound,
         })
     }
 }
@@ -346,6 +437,63 @@ mod tests {
         t.note_intent(TerminationIntent::AgentTerminateAbuse);
         t.note_intent(TerminationIntent::AgentHangup);
         assert_eq!(t.terminate().unwrap().outcome, "terminated_abuse");
+    }
+
+    // ── Phase 2: outbound sessions ──────────────────────────────────────────
+
+    #[test]
+    fn outbound_answered_call_is_a_completion_with_the_dialed_number() {
+        let mut t = SessionTracker::new();
+        t.dial("call_o".into(), Some("+61400111222".into()), "x".into());
+        assert!(t.current().unwrap().outbound);
+        assert!(
+            !t.current().unwrap().incoming_pending(),
+            "outbound calls never hold an incoming event"
+        );
+        t.note_alerted();
+        t.answered();
+        let ended = t.terminate().unwrap();
+        assert_eq!(ended.outcome, "completed");
+        assert_eq!(ended.caller_id.as_deref(), Some("+61400111222"));
+        assert!(ended.outbound);
+    }
+
+    #[test]
+    fn outbound_alerted_but_unanswered_is_no_answer_never_missed() {
+        let mut t = SessionTracker::new();
+        t.dial("call_o".into(), Some("+61400111222".into()), "x".into());
+        t.note_alerted();
+        let ended = t.terminate().unwrap();
+        assert_eq!(ended.outcome, "no_answer");
+        assert_eq!(ended.reason, "remote_or_network");
+        // We gave up mid-ring: still no_answer, but the reason says who.
+        t.dial("call_p".into(), None, "x".into());
+        t.note_alerted();
+        t.note_intent(TerminationIntent::AgentHangup);
+        let ended = t.terminate().unwrap();
+        assert_eq!(ended.outcome, "no_answer");
+        assert_eq!(ended.reason, "cancelled");
+    }
+
+    #[test]
+    fn outbound_that_never_alerted_is_failed() {
+        let mut t = SessionTracker::new();
+        t.dial("call_o".into(), Some("+61400111222".into()), "x".into());
+        let ended = t.terminate().unwrap();
+        assert_eq!(ended.outcome, "failed");
+        assert_eq!(ended.reason, "setup_failed");
+    }
+
+    #[test]
+    fn note_alerted_never_marks_an_inbound_session() {
+        let mut t = SessionTracker::new();
+        ring(&mut t, "call_a");
+        t.note_alerted();
+        assert!(!t.current().unwrap().alerted);
+        assert!(!t.current().unwrap().outbound);
+        let ended = t.terminate().unwrap();
+        assert!(!ended.outbound);
+        assert_eq!(ended.outcome, "missed");
     }
 
     #[test]
