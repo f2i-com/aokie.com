@@ -43,6 +43,7 @@ pub mod event_bridge;
 pub mod host_rpc;
 pub mod outbox;
 pub mod radio;
+pub mod realtime;
 pub mod rpc;
 pub mod speech_plan;
 pub mod speech_wire;
