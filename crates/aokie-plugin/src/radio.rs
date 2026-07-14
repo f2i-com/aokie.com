@@ -1476,7 +1476,49 @@ fn turn_looks_unfinished(text: &str) -> bool {
 struct PendingTurn {
     corr: String,
     text: String,
+    /// sendAudio: the utterance PCM(s) whose STT produced `text`, paired by
+    /// utterance id and merged across continuation holds (tail-capped 30 s).
+    /// A single shared "last audio" slot raced the turn flush (live call
+    /// 94b9c792: corrections carried the NEIGHBOURING utterance's words) —
+    /// the audio now travels WITH its turn.
+    audio: Vec<i16>,
     flush_at: Instant,
+}
+
+/// sendAudio: stash a just-sent utterance's PCM keyed by its STT utterance
+/// id — the result drain pairs it back into the pending turn. Bounded: a
+/// result that never returns (worker death) just ages out.
+#[cfg(feature = "voice")]
+fn stash_utt_audio(map: &mut std::collections::VecDeque<(u32, Vec<i16>)>, utt: u32, buf: &[f32]) {
+    let start = buf.len().saturating_sub(16_000 * 30);
+    let pcm: Vec<i16> = buf[start..]
+        .iter()
+        .map(|&x| (x.clamp(-1.0, 1.0) * 32767.0) as i16)
+        .collect();
+    map.push_back((utt, pcm));
+    while map.len() > 6 {
+        map.pop_front();
+    }
+}
+
+/// Take the stashed PCM for `utt` out of the map (None when aged out /
+/// never stashed — e.g. sendAudio off).
+#[cfg(feature = "voice")]
+fn take_utt_audio(map: &mut std::collections::VecDeque<(u32, Vec<i16>)>, utt: u32) -> Option<Vec<i16>> {
+    let pos = map.iter().position(|(u, _)| *u == utt)?;
+    map.remove(pos).map(|(_, pcm)| pcm)
+}
+
+/// Merge one utterance's PCM into its turn's accumulated audio, keeping the
+/// most recent 30 s (the WAV cap the LLM request also uses).
+#[cfg(feature = "voice")]
+fn append_turn_audio(dst: &mut Vec<i16>, src: Vec<i16>) {
+    dst.extend(src);
+    let cap = 16_000 * 30;
+    if dst.len() > cap {
+        let drop = dst.len() - cap;
+        dst.drain(..drop);
+    }
 }
 
 // â”€â”€ Windows: the real radio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -4230,6 +4272,11 @@ fn run_loop(
     }
     #[cfg(feature = "voice")]
     let mut last_turn_audio: Vec<i16> = Vec::new();
+    // sendAudio: utterance-id → PCM, written at every STT send and consumed
+    // by the result drains into the pending turn (exact pairing — see
+    // PendingTurn::audio).
+    #[cfg(feature = "voice")]
+    let mut utt_audio: std::collections::VecDeque<(u32, Vec<i16>)> = Default::default();
     // When AOKIE_AGENT_HANGUP is set (the `agentHangup` setting) the agent ends
     // the call itself once the caller's request is fully handled: it says a brief
     // goodbye, then hangs up (AT+CHUP) so the caller doesn't have to. The LLM
@@ -4421,12 +4468,7 @@ fn run_loop(
                     } else if let Some(s) = tracker.current_mut() {
                         let utterance = s.next_utterance_id();
                         if send_audio {
-                            let start = stt_buf.len().saturating_sub(16_000 * 30);
-                            // stt_buf holds f32 samples — convert to i16 PCM for the WAV.
-                            last_turn_audio = stt_buf[start..]
-                                .iter()
-                                .map(|&x| (x.clamp(-1.0, 1.0) * 32767.0) as i16)
-                                .collect();
+                            stash_utt_audio(&mut utt_audio, utterance, &stt_buf);
                         }
                         if stt_tx
                             .send(SttWork::Utterance {
@@ -4457,6 +4499,9 @@ fn run_loop(
                     match stt_result_rx.recv_timeout(left) {
                         Ok(SttResult { generation, utterance, text }) => {
                             stt_outstanding = stt_outstanding.saturating_sub(1);
+                            // The stash pops on EVERY arm — a discarded
+                            // result's audio must never pair with a later one.
+                            let utt_pcm = take_utt_audio(&mut utt_audio, utterance);
                             if let Some(pos) =
                                 stale_specs.iter().position(|&u| u == utterance)
                             {
@@ -4474,11 +4519,15 @@ fn run_loop(
                                 Some(p) => {
                                     p.text.push(' ');
                                     p.text.push_str(text.trim());
+                                    if let Some(pcm) = utt_pcm {
+                                        append_turn_audio(&mut p.audio, pcm);
+                                    }
                                 }
                                 None => {
                                     pending_turn = Some(PendingTurn {
                                         corr: tracker.call_id().unwrap_or_default().to_string(),
                                         text: text.trim().to_string(),
+                                        audio: utt_pcm.unwrap_or_default(),
                                         flush_at: Instant::now(),
                                     })
                                 }
@@ -4540,6 +4589,8 @@ fn run_loop(
             agent_hung_up = false;
             prev_caller_text.clear();
             manager_gate = ManagerGate::default();
+            utt_audio.clear();
+            last_turn_audio.clear();
             rt_lane = tracker.call_id().map(|id| {
                 crate::realtime::RealtimeLane::new(id.to_string(), voice_call_gen, Instant::now())
             });
@@ -5165,6 +5216,9 @@ fn run_loop(
             {
                 if let Some(s) = tracker.current_mut() {
                     let utterance = s.next_utterance_id();
+                    if send_audio {
+                        stash_utt_audio(&mut utt_audio, utterance, &stt_buf);
+                    }
                     if stt_tx
                         .send(SttWork::Utterance {
                             generation: s.generation,
@@ -5181,29 +5235,17 @@ fn run_loop(
             if stt_had_speech && stt_silence >= endpoint {
                 if spec_utterance.take().is_some() {
                     // The speculation IS this utterance (nothing new was said
-                    // since it was sent) — never transcribe it twice.
+                    // since it was sent) — never transcribe it twice. Its
+                    // audio was stashed at the SPEC SEND, so the result drain
+                    // already paired it into the pending turn.
                     status.early_stt_hits.fetch_add(1, Ordering::Relaxed);
-                    if send_audio {
-                        // sendAudio: this is the DOMINANT turn path (early-stt
-                        // hit) — snapshot here too or the LLM never gets audio.
-                        let start = stt_buf.len().saturating_sub(16_000 * 30);
-                        last_turn_audio = stt_buf[start..]
-                            .iter()
-                            .map(|&x| (x.clamp(-1.0, 1.0) * 32767.0) as i16)
-                            .collect();
-                    }
                     stt_buf.clear();
                 } else if stt_buf.len() >= 16_000 / 5 {
                     // Stamp the job with the call it belongs to (audit C-05).
                     if let Some(s) = tracker.current_mut() {
                         let utterance = s.next_utterance_id();
                         if send_audio {
-                            let start = stt_buf.len().saturating_sub(16_000 * 30);
-                            // stt_buf holds f32 samples — convert to i16 PCM for the WAV.
-                            last_turn_audio = stt_buf[start..]
-                                .iter()
-                                .map(|&x| (x.clamp(-1.0, 1.0) * 32767.0) as i16)
-                                .collect();
+                            stash_utt_audio(&mut utt_audio, utterance, &stt_buf);
                         }
                         if stt_tx
                             .send(SttWork::Utterance {
@@ -5358,6 +5400,9 @@ fn run_loop(
             {
                 idle = false;
                 stt_outstanding = stt_outstanding.saturating_sub(1);
+                // The stash pops on EVERY arm — a discarded result's audio
+                // must never pair with a later turn.
+                let utt_pcm = take_utt_audio(&mut utt_audio, utterance);
                 // A superseded speculative transcription (its utterance grew
                 // after it was sent): the whole utterance re-transcribed —
                 // drop this partial result, never merge it.
@@ -5391,11 +5436,15 @@ fn run_loop(
                         p.text.push(' ');
                         p.text.push_str(text.trim());
                         p.corr = corr;
+                        if let Some(pcm) = utt_pcm {
+                            append_turn_audio(&mut p.audio, pcm);
+                        }
                     }
                     None => {
                         pending_turn = Some(PendingTurn {
                             corr,
                             text: text.trim().to_string(),
+                            audio: utt_pcm.unwrap_or_default(),
                             flush_at: Instant::now(),
                         })
                     }
@@ -5454,12 +5503,15 @@ fn run_loop(
             status.loop_phase.store(loop_phase::TURN, Ordering::Relaxed);
             let flushed_turn = match pending_turn.as_ref() {
                 Some(p) if Instant::now() >= p.flush_at && !stt_had_speech => {
-                    pending_turn.take().map(|p| (p.corr, p.text))
+                    pending_turn.take().map(|p| (p.corr, p.text, p.audio))
                 }
                 _ => None,
             };
-            if let Some((corr, text)) = flushed_turn {
+            if let Some((corr, text, turn_audio)) = flushed_turn {
                 idle = false;
+                // The flushed turn's PAIRED audio is what both the reply
+                // attach and the transcript correction must use.
+                last_turn_audio = turn_audio;
                 'turn_done: {
                     // ── Phase 3 PIN gate ─────────────────────────────────
                     // The utterance IS the PIN attempt: it must never reach
