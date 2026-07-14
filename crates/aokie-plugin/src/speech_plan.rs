@@ -271,6 +271,87 @@ pub fn parse_lookup_marker(text: &str) -> Option<String> {
     }
 }
 
+/// Phase 3: extract the manager-action request from a `[[MANAGER: ...]]`
+/// marker (same shape as the lookup marker). The request is the manager's
+/// change in the model's words — a downstream flow structures and validates
+/// it; the PIN gate stands between this marker and any write.
+pub fn parse_manager_marker(text: &str) -> Option<String> {
+    let start = text.find("[[MANAGER:")?;
+    let rest = &text[start + "[[MANAGER:".len()..];
+    let end = rest.find("]]")?;
+    let q = rest[..end].trim();
+    if q.is_empty() {
+        None
+    } else {
+        Some(q.to_string())
+    }
+}
+
+/// Phase 3 PIN capture: the digits in a spoken utterance, tolerant to STT
+/// writing them as words ("one two three four"), digits ("1234"), or a mix.
+/// Everything that is not a digit is ignored, so "uh, it's 1 2 3 4 thanks"
+/// verifies cleanly. "oh"/"o" count as zero (phone-speak).
+pub fn spoken_digits(s: &str) -> String {
+    let mut out = String::new();
+    for token in s.split(|c: char| !c.is_alphanumeric()) {
+        if token.is_empty() {
+            continue;
+        }
+        if token.chars().all(|c| c.is_ascii_digit()) {
+            out.push_str(token);
+            continue;
+        }
+        let word = token.to_ascii_lowercase();
+        let d = match word.as_str() {
+            "zero" | "oh" | "o" => Some('0'),
+            "one" => Some('1'),
+            "two" => Some('2'),
+            "three" => Some('3'),
+            "four" => Some('4'),
+            "five" => Some('5'),
+            "six" => Some('6'),
+            "seven" => Some('7'),
+            "eight" => Some('8'),
+            "nine" => Some('9'),
+            _ => None,
+        };
+        if let Some(d) = d {
+            out.push(d);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod manager_marker_tests {
+    use super::{parse_manager_marker, spoken_digits};
+
+    #[test]
+    fn parse_manager_marker_shapes() {
+        assert_eq!(
+            parse_manager_marker("[[MANAGER: cancel the 2pm booking on the 22nd]]"),
+            Some("cancel the 2pm booking on the 22nd".into())
+        );
+        assert_eq!(
+            parse_manager_marker("Sure. [[MANAGER: block 0400 111 222]]"),
+            Some("block 0400 111 222".into())
+        );
+        assert_eq!(parse_manager_marker("[[MANAGER:]]"), None);
+        assert_eq!(parse_manager_marker("[[MANAGER: unclosed"), None);
+        assert_eq!(parse_manager_marker("no marker here"), None);
+    }
+
+    #[test]
+    fn spoken_digits_reads_words_digits_and_mixes() {
+        assert_eq!(spoken_digits("one two three four"), "1234");
+        assert_eq!(spoken_digits("1234"), "1234");
+        assert_eq!(spoken_digits("uh, it's 12 three 4 thanks"), "1234");
+        assert_eq!(spoken_digits("Oh seven oh nine"), "0709");
+        assert_eq!(spoken_digits("nothing here"), "");
+        assert_eq!(spoken_digits("One, Two... THREE? four!"), "1234");
+    }
+}
+
 #[cfg(test)]
 mod lookup_marker_tests {
     #[test]
