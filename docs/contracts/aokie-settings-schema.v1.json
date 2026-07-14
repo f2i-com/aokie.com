@@ -23,6 +23,11 @@
       "appliesLive": false
     },
     {
+      "key": "audioTranscript",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
       "key": "blockedNumbers",
       "type": "string",
       "maxChars": 4000,
