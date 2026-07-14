@@ -1546,6 +1546,9 @@ enum SttWork {
         endpoint: Option<String>,
     },
     ResetCall,
+    /// Ring-time pre-warm (2026-07-14): load the local STT engine while the
+    /// phone is still ringing, so the caller's first words transcribe hot.
+    Warm,
 }
 
 /// A finished transcription, still carrying the identity of the call whose
@@ -2115,6 +2118,65 @@ fn note_tts_outcome(status: &RadioStatus, out: &SpeakOutcome) {
             "the last speech attempt produced no audio (TTS engine/endpoint failure) — check the voice models and the plugin log"
                 .to_string(),
         );
+    }
+}
+
+/// Ring-time personalization window (user idea 2026-07-14): +CLIP rides the
+/// RING, so waiting a beat before auto-answering lets the caller id land and
+/// the personalize flow deliver its call-scoped overlay BEFORE the call is
+/// even picked up — "Hi <name>!" from the very first word, and ~one ring of
+/// pickup latency reads as natural telephony, not lag. No caller id yet:
+/// wait only ANSWER_ID_WAIT (a withheld number never gets one). Id known:
+/// wait up to ANSWER_OVERLAY_WAIT for the flow. Overlay ready: answer NOW.
+#[cfg(feature = "voice")]
+const ANSWER_ID_WAIT: std::time::Duration = std::time::Duration::from_millis(1200);
+#[cfg(feature = "voice")]
+const ANSWER_OVERLAY_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+#[cfg(feature = "voice")]
+fn hold_auto_answer(
+    caller_id_known: bool,
+    overlay_ready: bool,
+    elapsed: std::time::Duration,
+) -> bool {
+    if overlay_ready {
+        return false;
+    }
+    if !caller_id_known {
+        return elapsed < ANSWER_ID_WAIT;
+    }
+    elapsed < ANSWER_OVERLAY_WAIT
+}
+
+/// Connect the in-plugin agent's LLM client (llama.cpp :8080 / ollama :11434
+/// / the configured aiEndpoint) and keep the health slot truthful. Shared by
+/// the lazy first-reply path and the ring-time pre-warm.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn connect_agent_client(
+    agent_endpoint: &Arc<Mutex<Option<String>>>,
+    agent_model: Option<String>,
+    status: &Arc<RadioStatus>,
+) -> Option<crate::agent::LlmClient> {
+    let configured = agent_endpoint.lock().unwrap().clone();
+    match crate::agent::discover_endpoint(configured.as_deref()) {
+        Some(ep) => {
+            let c = crate::agent::LlmClient::new(ep, agent_model);
+            eprintln!(
+                "[aokie-plugin] voice agent LLM: {} (model {:?})",
+                c.endpoint(),
+                c.model()
+            );
+            *status.llm_error.lock().unwrap() = None;
+            Some(c)
+        }
+        None => {
+            eprintln!("[aokie-plugin] voice agent: no local LLM reachable (:8080/:11434)");
+            *status.llm_error.lock().unwrap() = Some(
+                "no reachable LLM at reply time (tried llama.cpp :8080 and ollama :11434)"
+                    .to_string(),
+            );
+            None
+        }
     }
 }
 
@@ -2954,6 +3016,23 @@ fn run_loop(
                             samples,
                         } => (generation, utterance, samples),
                         SttWork::Probe { .. } => continue, // handled above
+                        SttWork::Warm => {
+                            if !stt_disabled && engine.is_none() {
+                                match crate::voice::SttEngine::load() {
+                                    Ok(e) => {
+                                        eprintln!("[aokie-plugin] STT engine pre-warmed (ring)");
+                                        *worker_status.stt_error.lock().unwrap() = None;
+                                        engine = Some(e);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[aokie-plugin] STT pre-warm failed: {e}");
+                                        *worker_status.stt_error.lock().unwrap() =
+                                            Some(format!("the STT engine failed to load: {e}"));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         SttWork::Configure { endpoint } => {
                             http_stt.configure(endpoint);
                             continue;
@@ -3171,6 +3250,10 @@ fn run_loop(
     // personalization overlay (bounds the hold; reset per call).
     #[cfg(feature = "voice")]
     let mut greet_hold_started: Option<Instant> = None;
+    // Ring-time personalization window: when auto-answer first saw the
+    // ringing call (bounds the hold; reset per call).
+    #[cfg(feature = "voice")]
+    let mut answer_hold_started: Option<Instant> = None;
     // Guide phase 2/5 — LIVE HYPOTHESIS LANE: while the caller speaks (bot
     // idle), the in-progress utterance is re-transcribed every ~600 ms on the
     // probe channel, giving streaming partial text; a STABLE partial starts a
@@ -3304,6 +3387,20 @@ fn run_loop(
             // in-flight STT, and flush the held turn — THEN let handle_event
             // publish the terminal event. The call is already over, so the
             // short stall cannot delay answering it.
+            // Ring-time pre-warm (user idea 2026-07-14): the phone is still
+            // RINGING — load both speech engines and connect the LLM now, so
+            // the greeting synthesizes hot and the first reply starts fast (a
+            // cold TTS engine after a plugin restart cost seconds live, and
+            // the STT engine used to load lazily mid-call).
+            #[cfg(all(target_os = "windows", feature = "voice"))]
+            if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallIncoming) {
+                let _ = stt_tx.send(SttWork::Warm);
+                synth.warm();
+                if agent_enabled && agent_client.is_none() {
+                    agent_client =
+                        connect_agent_client(&agent_endpoint, agent_model.clone(), &status);
+                }
+            }
             #[cfg(feature = "voice")]
             if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallTerminated)
                 && tracker.current().is_some()
@@ -3440,6 +3537,7 @@ fn run_loop(
             // next caller can never inherit the previous caller's persona.
             call_agent_overlay = None;
             greet_hold_started = None;
+            answer_hold_started = None;
             live_hyp = None;
             live_hyp_prev = None;
             live_hyp_shipped = 0;
@@ -3520,14 +3618,57 @@ fn run_loop(
                             voice_block_logged_call = Some(s.id.clone());
                         }
                     } else {
-                        match bt.answer_call() {
-                            Ok(()) => {
-                                eprintln!("[aokie-plugin] auto-answered incoming call (immediate)")
+                        // Ring-time personalization window: let +CLIP land and
+                        // the personalize flow push its call-scoped overlay
+                        // BEFORE picking up — bounded (one ring, not lag), and
+                        // the overlay's arrival short-circuits it.
+                        #[cfg(feature = "voice")]
+                        let (hold, overlay_ready) = {
+                            let overlay_ready = call_agent_overlay
+                                .as_ref()
+                                .is_some_and(|o| o.call_id == s.id);
+                            let started = *answer_hold_started.get_or_insert_with(Instant::now);
+                            (
+                                hold_auto_answer(
+                                    s.caller_id.as_deref().is_some_and(|c| !c.is_empty()),
+                                    overlay_ready,
+                                    started.elapsed(),
+                                ),
+                                overlay_ready,
+                            )
+                        };
+                        #[cfg(not(feature = "voice"))]
+                        let (hold, overlay_ready) = (false, false);
+                        if hold {
+                            idle = false;
+                        } else {
+                            match bt.answer_call() {
+                                Ok(()) => {
+                                    #[cfg(feature = "voice")]
+                                    eprintln!(
+                                        "[aokie-plugin] auto-answered incoming call ({}ms ring window{})",
+                                        answer_hold_started
+                                            .map(|t| t.elapsed().as_millis())
+                                            .unwrap_or(0),
+                                        if overlay_ready {
+                                            ", personalization READY"
+                                        } else {
+                                            ""
+                                        }
+                                    );
+                                    #[cfg(not(feature = "voice"))]
+                                    {
+                                        let _ = overlay_ready;
+                                        eprintln!(
+                                            "[aokie-plugin] auto-answered incoming call (immediate)"
+                                        );
+                                    }
+                                }
+                                Err(e) => eprintln!("[aokie-plugin] auto-answer failed: {e}"),
                             }
-                            Err(e) => eprintln!("[aokie-plugin] auto-answer failed: {e}"),
+                            s.auto_answered = true;
+                            idle = false;
                         }
-                        s.auto_answered = true;
-                        idle = false;
                     }
                 }
             }
@@ -4327,29 +4468,9 @@ fn run_loop(
                     if agent_enabled && respond_with_llm {
                         // Lazily connect to the local LLM on the first caller turn.
                         if agent_client.is_none() {
-                            let configured = agent_endpoint.lock().unwrap().clone();
-                            match crate::agent::discover_endpoint(configured.as_deref()) {
-                                Some(ep) => {
-                                    let c = crate::agent::LlmClient::new(ep, agent_model.clone());
-                                    eprintln!(
-                                        "[aokie-plugin] voice agent LLM: {} (model {:?})",
-                                        c.endpoint(),
-                                        c.model()
-                                    );
-                                    agent_client = Some(c);
-                                    // PROC-001: a live connect is fresher than the probe.
-                                    *status.llm_error.lock().unwrap() = None;
-                                }
-                                None => {
-                                    eprintln!(
-                                        "[aokie-plugin] voice agent: no local LLM reachable (:8080/:11434)"
-                                    );
-                                    *status.llm_error.lock().unwrap() = Some(
-                                        "no reachable LLM at reply time (tried llama.cpp :8080 and ollama :11434)"
-                                            .to_string(),
-                                    );
-                                }
-                            }
+                            // PROC-001: a live connect is fresher than the probe.
+                            agent_client =
+                                connect_agent_client(&agent_endpoint, agent_model.clone(), &status);
                         }
                         if let Some(client) = agent_client.as_ref() {
                             let sr = bt.get_sample_rate();
@@ -6453,6 +6574,22 @@ mod tests {
             "what time do you open tomorrow",
             "What time do you open tomorrow?"
         ));
+    }
+
+    /// Ring-time personalization window: auto-answer waits for +CLIP (short)
+    /// and then the overlay (bounded), and the overlay's arrival always wins.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn auto_answer_waits_one_ring_for_personalization() {
+        use std::time::Duration as D3;
+        // No caller id yet: wait, but only inside the short id window.
+        assert!(hold_auto_answer(false, false, D3::from_millis(300)));
+        assert!(!hold_auto_answer(false, false, D3::from_millis(1300)), "withheld numbers answer after ~one ring");
+        // Id known, flow still running: wait up to the overlay budget.
+        assert!(hold_auto_answer(true, false, D3::from_millis(1800)));
+        assert!(!hold_auto_answer(true, false, D3::from_millis(2600)), "the budget is hard");
+        // Overlay ready: answer NOW.
+        assert!(!hold_auto_answer(true, true, D3::from_millis(100)));
     }
 
     /// §9.3: the greeting hold waits for the overlay only while the caller
