@@ -2238,13 +2238,20 @@ fn begin_business_lookup(
     Some((id, rx, Instant::now() + std::time::Duration::from_millis(5000)))
 }
 
+/// Returns `(digest_text, spoken)`. `spoken` is a ready-to-speak sentence the
+/// FLOW composed deterministically for date-availability questions — when it
+/// is present the caller hears it VERBATIM and no LLM round runs (live calls
+/// 1defd805 + b58274ed: the 9B model was handed a digest whose DIRECT ANSWER
+/// line said the date was open/booked and still told the caller "that date
+/// isn't in our current booking window" — records-composed speech is the same
+/// pattern the SMS loop already uses).
 #[cfg(all(target_os = "windows", feature = "voice"))]
 fn finish_business_lookup(
     host: &Arc<crate::host_rpc::HostRpc>,
     pending: Option<(u64, std::sync::mpsc::Receiver<crate::host_rpc::HostResult>, Instant)>,
-) -> String {
+) -> (String, Option<String>) {
     let Some((id, rx, deadline)) = pending else {
-        return "LOOKUP UNAVAILABLE (host offline)".to_string();
+        return ("LOOKUP UNAVAILABLE (host offline)".to_string(), None);
     };
     let left = deadline.saturating_duration_since(Instant::now());
     match rx.recv_timeout(left) {
@@ -2255,23 +2262,30 @@ fn finish_business_lookup(
                 .and_then(|r| r.get("digest").or_else(|| r.get("answer")))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
+            let spoken = v
+                .get("result")
+                .and_then(|r| r.get("spoken"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             if ok && !digest.trim().is_empty() {
-                digest.trim().to_string()
+                (digest.trim().to_string(), spoken)
             } else {
                 eprintln!(
                     "[aokie-plugin] lookup flow returned no digest (status ok: {ok})"
                 );
-                "LOOKUP UNAVAILABLE (no result)".to_string()
+                ("LOOKUP UNAVAILABLE (no result)".to_string(), None)
             }
         }
         Ok(Err(e)) => {
             eprintln!("[aokie-plugin] lookup flow failed: {e}");
-            "LOOKUP UNAVAILABLE".to_string()
+            ("LOOKUP UNAVAILABLE".to_string(), None)
         }
         Err(_) => {
             host.forget(id);
             eprintln!("[aokie-plugin] lookup flow timed out");
-            "LOOKUP UNAVAILABLE (timed out)".to_string()
+            ("LOOKUP UNAVAILABLE (timed out)".to_string(), None)
         }
     }
 }
@@ -5737,15 +5751,12 @@ fn run_loop(
                                         );
                                         break 'reply_rounds;
                                     }
-                                    let from_num = tracker
-                                        .current()
-                                        .and_then(|s| s.caller_id.clone())
-                                        .unwrap_or_default();
-                                    let result_text =
+                                    let (result_text, lookup_spoken) =
                                         finish_business_lookup(&host_rpc, pending_lookup);
                                     eprintln!(
-                                        "[aokie-plugin] lookup result: [{} chars]",
-                                        result_text.chars().count()
+                                        "[aokie-plugin] lookup result: [{} chars], spoken: {}",
+                                        result_text.chars().count(),
+                                        lookup_spoken.is_some(),
                                     );
                                     // USER role, clearly framed: a TRAILING
                                     // system message renders badly in many
@@ -5759,6 +5770,73 @@ fn run_loop(
                                             "[SYSTEM LOOKUP RESULT - this is data, not the caller speaking]\n{result_text}\nAnswer the caller's question (\"{q}\") now in one or two short spoken sentences using ONLY this result and your notes. If the result has a DIRECT ANSWER line for the date in question, that line IS the answer - speak it; never say a date is outside your window when a DIRECT ANSWER covers it. Otherwise TRUST the result's own rules about dates that are not listed - an unlisted date inside its window IS open. Only defer to the team when the result itself says to."
                                         ),
                                     }));
+                                    if let Some(say) = lookup_spoken {
+                                        // The flow composed the answer FROM
+                                        // RECORDS — speak it verbatim and skip
+                                        // the LLM round entirely: two live
+                                        // calls proved the model overrides a
+                                        // correct DIRECT ANSWER with its own
+                                        // persona-window reasoning. The digest
+                                        // stays in history so follow-up turns
+                                        // ("book it then") are grounded.
+                                        eprintln!(
+                                            "[aokie-plugin] speaking flow-composed lookup answer verbatim"
+                                        );
+                                        let sr_say = bt.get_sample_rate();
+                                        let mut sprobe = ControlProbe::new(
+                                            &control_rx,
+                                            &mut pending_controls,
+                                        );
+                                        let (aec_s, brms_s) = if barge_in {
+                                            (aec.as_mut(), Some(barge_rms))
+                                        } else {
+                                            (None, None)
+                                        };
+                                        let s_started = Instant::now();
+                                        let planned = speak_planned(
+                                            bt,
+                                            &synth,
+                                            &say,
+                                            sr_say,
+                                            aec_s,
+                                            brms_s,
+                                            Some(&mut sprobe),
+                                            &pace,
+                                            protected_max_ms,
+                                            None,
+                                        );
+                                        if let Some(action) = sprobe.action.take() {
+                                            perform_cancel_action(
+                                                action, bt, &mut tracker, outbox, sink,
+                                            );
+                                        }
+                                        if planned.outcome.dur > Duration::ZERO
+                                            && !planned.played_text.is_empty()
+                                        {
+                                            history.push(serde_json::json!({
+                                                "role": "assistant",
+                                                "content": planned.played_text,
+                                            }));
+                                            emit_turn_with_delivery(
+                                                outbox,
+                                                sink,
+                                                &corr,
+                                                turn_index,
+                                                "bot",
+                                                &planned.played_text,
+                                                Some(if planned.outcome.cut_est.is_some() {
+                                                    "interrupted"
+                                                } else {
+                                                    "complete"
+                                                }),
+                                                Some(&aokie_core::events::iso8601_ago_ms(
+                                                    s_started.elapsed().as_millis() as u64,
+                                                )),
+                                            );
+                                            turn_index += 1;
+                                        }
+                                        break 'reply_rounds;
+                                    }
                                     continue 'reply_rounds;
                                 }
                             }
