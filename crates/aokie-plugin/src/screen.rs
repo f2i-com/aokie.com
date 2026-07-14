@@ -14,8 +14,25 @@ pub struct ScreenPolicy {
     blocked: Vec<String>,
     accept: Option<regex::Regex>,
     pub reject_private: bool,
-    /// Spoken to a screened caller before hangup ("" = hang up silently).
+    /// Spoken to a FILTERED / PRIVATE caller before hangup ("" = silent).
+    /// The polite "call back with caller ID" line.
     pub message: String,
+    /// Spoken to a BLOCKED-list caller before hangup ("" = silent reject).
+    /// Separate from `message`: a blocked (often abusive) number should not
+    /// get the polite private-caller line.
+    pub blocked_message: String,
+}
+
+impl ScreenPolicy {
+    /// The line to speak for a given verdict reason before hangup ("" =
+    /// hang up silently). Blocked numbers get their own message.
+    pub fn message_for(&self, reason: &str) -> &str {
+        if reason == "blocked" {
+            self.blocked_message.trim()
+        } else {
+            self.message.trim()
+        }
+    }
 }
 
 fn digit_suffix(raw: &str) -> String {
@@ -51,11 +68,13 @@ impl ScreenPolicy {
             });
         let reject_private = std::env::var_os("AOKIE_REJECT_PRIVATE").is_some();
         let message = std::env::var("AOKIE_SCREEN_MESSAGE").unwrap_or_default();
+        let blocked_message = std::env::var("AOKIE_BLOCKED_MESSAGE").unwrap_or_default();
         Self {
             blocked,
             accept,
             reject_private,
             message,
+            blocked_message,
         }
     }
 
@@ -102,7 +121,21 @@ mod tests {
             accept: accept.map(|p| regex::Regex::new(p).unwrap()),
             reject_private: private,
             message: String::new(),
+            blocked_message: String::new(),
         }
+    }
+
+    #[test]
+    fn message_for_picks_the_right_line() {
+        let mut p = policy("0491570156", None, true);
+        p.message = "polite".into();
+        p.blocked_message = "no abuse".into();
+        assert_eq!(p.message_for("blocked"), "no abuse");
+        assert_eq!(p.message_for("private"), "polite");
+        assert_eq!(p.message_for("filtered"), "polite");
+        // Blank blocked message = silent reject even when the polite one is set.
+        p.blocked_message = String::new();
+        assert_eq!(p.message_for("blocked"), "");
     }
 
     #[test]
