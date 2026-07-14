@@ -68,6 +68,19 @@ pub enum RadioControl {
         to: String,
         body: String,
     },
+    /// Phase 2: place an OUTBOUND call (`call.dial`). The connector minted
+    /// `call_id` (returned to the caller) and enforced every guardrail;
+    /// the radio owns the wire: ATD, the outbound session, the
+    /// `aokie.call.outbound.dialing` event, and the agent context — the
+    /// `opening_line` is spoken VERBATIM when the remote party answers
+    /// (via the greeting slot) and `purpose` grounds the conversation.
+    Dial {
+        call_id: String,
+        number: String,
+        purpose: Option<String>,
+        opening_line: String,
+        op: Option<String>,
+    },
     /// Speak text to the caller. The connector result is `accepted/queued`;
     /// the bot `call.turn.final` event is the authoritative confirmation the
     /// text actually played (a silent synthesis emits `speak_failed` instead).
@@ -228,6 +241,20 @@ const ABUSE_INSTRUCTION: &str = "\n\nAbusive callers: if the caller is directly 
 /// hangup — never model prose. ASCII only (straight to TTS).
 #[cfg(feature = "voice")]
 const ABUSE_LINE: &str = "We do not tolerate abusive calls, so this call will now end. Goodbye.";
+
+/// Phase 2: composes the OUTBOUND CALL persona block for a plugin-dialed
+/// call. The opening line was already spoken via the greeting slot; this
+/// grounds every subsequent reply in the fact that WE rang THEM.
+#[cfg(feature = "voice")]
+fn outbound_call_block(number: &str, purpose: Option<&str>) -> String {
+    let purpose_line = match purpose {
+        Some(p) if !p.trim().is_empty() => format!("\nPurpose of this call: {}", p.trim()),
+        _ => String::new(),
+    };
+    format!(
+        "\n\nOUTBOUND CALL: YOU placed this call to {number} - the person answering is NOT a caller, you rang THEM. Your opening line was already spoken when they picked up; never re-introduce the call from scratch.{purpose_line}\nBe brief and polite: accomplish the purpose, answer their questions honestly from your notes, then say a short goodbye ending with [[END_CALL]]. If they are busy, annoyed, or say it is a bad time, apologise briefly and end the call politely with [[END_CALL]]. If you reach VOICEMAIL or an answering machine (a recorded greeting, a beep, no live person), leave ONE short message covering the purpose and end with [[END_CALL]] - never hold a conversation with a recording."
+    )
+}
 
 /// VOICE-001, pure for tests: after a reply attempt, is the caller sitting in
 /// DEAD AIR? True only when nothing audibly played AND nothing else explains
@@ -3836,6 +3863,10 @@ fn run_loop(
     // personalization overlay (bounds the hold; reset per call).
     #[cfg(feature = "voice")]
     let mut greet_hold_started: Option<Instant> = None;
+    // Phase 2 dial watchdog: the call id whose stuck outbound attempt we
+    // already cancelled — the CHUP is sent exactly once per attempt (ids are
+    // never reused, so no reset is needed).
+    let mut dial_cancel_sent: Option<String> = None;
     // Ring-time personalization window: when auto-answer first saw the
     // ringing call (bounds the hold; reset per call).
     #[cfg(feature = "voice")]
@@ -4272,6 +4303,31 @@ fn run_loop(
             flush_incoming_if_pending(&mut tracker, outbox, sink);
         }
 
+        // Phase 2 dial watchdog: an agent-placed outbound attempt that is
+        // still not answered after 60s is abandoned — the carrier/phone
+        // usually times MO attempts out themselves, but a stuck attempt must
+        // never hold the line (and the receptionist's availability) forever.
+        // CHUP once; the CIEV stream then terminates the session with the
+        // honest outcome (no_answer/failed, reason "cancelled").
+        if let Some(s) = tracker.current() {
+            if s.outbound
+                && s.agent_owned
+                && !s.is_active()
+                && s.ringing_for_ms() > 60_000
+                && dial_cancel_sent.as_deref() != Some(s.id.as_str())
+            {
+                eprintln!(
+                    "[aokie-plugin] outbound attempt {} unanswered after 60s — cancelling (AT+CHUP)",
+                    s.id
+                );
+                dial_cancel_sent = Some(s.id.clone());
+                tracker.note_intent(crate::call_session::TerminationIntent::AgentHangup);
+                if let Err(e) = bt.hangup() {
+                    eprintln!("[aokie-plugin] outbound cancel failed: {e}");
+                }
+            }
+        }
+
         // Auto-answer ASAP: the instant a call is present and not yet answered,
         // send the answer â€” before the audio channel comes up and freezes the
         // loop. Answer exactly once per call (the session's auto_answered flag).
@@ -4414,11 +4470,17 @@ fn run_loop(
                 // `is_active()` (answered) is REQUIRED, not just `sr > 0`:
                 // some phones open the SCO channel during RINGING (in-band
                 // ringtone) — the greeting must never speak into a line the
-                // caller isn't connected to yet. OUTBOUND sessions (Phase 2)
-                // never greet: the remote party picking up is not a caller —
-                // greeting into the owner's own handset-dialed call was a
-                // latent bug this gate also closes.
-                Some(s) if !s.greeted && s.is_active() && sr > 0 && !s.outbound => {
+                // caller isn't connected to yet. OUTBOUND sessions greet only
+                // when the AGENT placed the call (the opening line rides the
+                // greeting slot via the call overlay); a handset-dialed call
+                // we merely observe is never greeted — greeting into the
+                // owner's own outgoing call was a latent bug this gate closes.
+                Some(s)
+                    if !s.greeted
+                        && s.is_active()
+                        && sr > 0
+                        && (!s.outbound || s.agent_owned) =>
+                {
                     // §9.3 personalization race: the caller-id flow's
                     // call-scoped overlay ("Hi <name>!") usually lands 1–3 s
                     // after answer — briefly hold the greeting for it instead
@@ -4456,8 +4518,16 @@ fn run_loop(
                         None
                     } else {
                         s.greeted = true;
+                        // Screening is an INBOUND policy: never screen the
+                        // number WE dialed (a blocked-list hit or accept-
+                        // pattern miss on our own outbound target would
+                        // hang up our own call).
                         #[cfg(feature = "voice")]
-                        let screened = screen_policy.verdict(s.caller_id.as_deref());
+                        let screened = if s.outbound {
+                            None
+                        } else {
+                            screen_policy.verdict(s.caller_id.as_deref())
+                        };
                         #[cfg(not(feature = "voice"))]
                         let screened: Option<&'static str> = None;
                         Some((s.id.clone(), sr, screened))
@@ -4666,13 +4736,13 @@ fn run_loop(
                 // ACTIVE calls only: some phones open the SCO during RINGING
                 // (in-band ringtone) — transcribing that seeds the first
                 // caller turn with garbage, and no caller can speak before
-                // the call is answered anyway. OUTBOUND sessions (Phase 2
-                // slice 1) are observer-only: the owner's own handset-dialed
-                // call must not be transcribed or answered by the agent —
-                // the receptionist has no business on that line.
+                // the call is answered anyway. OUTBOUND: only an
+                // AGENT-PLACED call (call.dial) is transcribed/answered —
+                // the owner's own handset-dialed call stays private; the
+                // receptionist has no business on that line.
                 if !tracker
                     .current()
-                    .is_some_and(|s| s.is_active() && !s.outbound)
+                    .is_some_and(|s| s.is_active() && (!s.outbound || s.agent_owned))
                 {
                     continue;
                 }
@@ -6969,6 +7039,71 @@ fn run_loop(
                         emit_control_failed(outbox, sink, &tracker, "call.hangup", op.as_deref(), &e);
                     }
                 }
+                Ok(RadioControl::Dial { call_id, number, purpose, opening_line, op }) => {
+                    // Phase 2: the connector enforced every guardrail; the
+                    // radio is authoritative for line state (a call may have
+                    // arrived between accept and here).
+                    if tracker.current().is_some() {
+                        emit_control_failed(
+                            outbox, sink, &tracker, "call.dial", op.as_deref(),
+                            "a call arrived before the dial could start — outbound attempt dropped",
+                        );
+                    } else if let Err(e) = bt.dial(number.clone()) {
+                        eprintln!("[aokie-plugin] radio dial failed: {e}");
+                        emit_control_failed(outbox, sink, &tracker, "call.dial", op.as_deref(), &e);
+                    } else {
+                        eprintln!(
+                            "[aokie-plugin] dialing OUT ({call_id}) — opening line ready, agent owns the call"
+                        );
+                        if let Some(s) = tracker.dial(
+                            call_id.clone(),
+                            Some(number.clone()),
+                            aokie_core::events::now_iso8601(),
+                            true,
+                        ) {
+                            *status.current_caller.lock().unwrap() = Some(number.clone());
+                            *status.current_call_id.lock().unwrap() = Some(s.id.clone());
+                            *status.call_started_at.lock().unwrap() =
+                                Some(s.started_at_iso.clone());
+                        }
+                        // Agent context rides the CALL-SCOPED overlay (§9.3
+                        // machinery, wiped at the call boundary): the opening
+                        // line IS this call's greeting, the persona gains the
+                        // outbound block. A later personalize push for this
+                        // call would replace it — acceptable; outbound calls
+                        // never mint caller_id events, so none arrives.
+                        #[cfg(feature = "voice")]
+                        {
+                            call_agent_overlay = Some(CallAgentOverlay {
+                                call_id: call_id.clone(),
+                                persona: Some(format!(
+                                    "{agent_persona}{}",
+                                    outbound_call_block(&number, purpose.as_deref())
+                                )),
+                                greeting: Some(opening_line.clone()),
+                            });
+                        }
+                        #[cfg(not(feature = "voice"))]
+                        let _ = (&purpose, &opening_line);
+                        // The outbound lifecycle announcement — the rest
+                        // (ringing/answered/ended) rides the existing family
+                        // with this callId.
+                        emit(
+                            outbox,
+                            sink,
+                            aokie_core::events::aokie_event(
+                                crate::contract::events::CALL_OUTBOUND_DIALING,
+                                &call_id,
+                                json!({
+                                    "callId": call_id,
+                                    "to": number,
+                                    "purpose": purpose,
+                                    "at": aokie_core::events::now_iso8601(),
+                                }),
+                            ),
+                        );
+                    }
+                }
                 Ok(RadioControl::SendSms { to, body }) => {
                     if let Err(e) = bt.send_sms(to, body, None) {
                         emit(
@@ -7408,7 +7543,7 @@ fn handle_event(
             // +CLIP for the HF); plugin-initiated dials (call.dial) will
             // seed it when the command lands in slice 2.
             let id = format!("call_{}", uuid::Uuid::new_v4().simple());
-            if let Some(s) = tracker.dial(id, None, now_iso8601()) {
+            if let Some(s) = tracker.dial(id, None, now_iso8601(), false) {
                 eprintln!(
                     "[aokie-plugin] OUTBOUND call setup observed ({}) — receptionist stays out of it",
                     s.id
@@ -7427,10 +7562,14 @@ fn handle_event(
             // customer by name). Emitted at most once per call: +CLIP repeats
             // per ring and +CLCC answers too, and the idempotency key
             // (corr + `caller_id` step) must be minted exactly once.
+            // OUTBOUND sessions never mint caller_id events (Phase 2): the
+            // number is the DIALED remote, and announcing it would run the
+            // personalize/screening flows against our own call — whitelist
+            // mode would REJECT the call we just placed.
             let newly_known = !num.trim().is_empty()
                 && tracker
                     .current()
-                    .is_some_and(|s| s.caller_id.as_deref().unwrap_or("").is_empty());
+                    .is_some_and(|s| !s.outbound && s.caller_id.as_deref().unwrap_or("").is_empty());
             tracker.caller_id(num.clone());
             if newly_known {
                 // Lifecycle order (AOK-LIF-001): the number is known now, so

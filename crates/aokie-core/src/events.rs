@@ -96,6 +96,20 @@ pub fn today_spoken_local() -> String {
     now.format("%A %-d %B %Y").to_string()
 }
 
+/// The LOCAL wall-clock hour (0–23). Phase 2 outbound guardrails: quiet
+/// hours are the OPERATOR's local evening/morning, never UTC.
+pub fn local_hour() -> u32 {
+    use chrono::Timelike;
+    chrono::Local::now().hour()
+}
+
+/// Today's LOCAL date as `YYYY-MM-DD` — the outbound dial ledger's day key
+/// (a per-day cap that reset at UTC midnight would reset mid-afternoon in
+/// UTC+10; the operator's day is the local one).
+pub fn today_local_ymd() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
 /// Build the Aokie idempotency key: `aokie:<correlationId>:<step>:v1`.
 ///
 /// `step` is the event name minus the `aokie.` prefix, with the

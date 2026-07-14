@@ -47,6 +47,13 @@ pub mod events {
     pub const CALL_TURN_PARTIAL: &str = "aokie.call.turn.partial";
     pub const CALL_TURN_FINAL: &str = "aokie.call.turn.final";
     pub const CALL_ENDED: &str = "aokie.call.ended";
+    /// Phase 2 (outbound calling): an OUTBOUND call attempt started —
+    /// {callId, to, purpose?, at}. The rest of the outbound lifecycle rides
+    /// the EXISTING family with the same callId (`call.ringing` = remote
+    /// alerting, `call.answered` = remote pickup, `call.ended` with outcome
+    /// completed / no_answer / failed + `direction: "outbound"`), so per-call
+    /// serial queues, transcripts, captions and summary flows all just work.
+    pub const CALL_OUTBOUND_DIALING: &str = "aokie.call.outbound.dialing";
     // ── SMS ─────────────────────────────────────────────────────────
     pub const SMS_RECEIVED: &str = "aokie.sms.received";
     pub const SMS_SENT: &str = "aokie.sms.sent";
@@ -76,6 +83,7 @@ pub mod events {
         CALL_TURN_PARTIAL,
         CALL_TURN_FINAL,
         CALL_ENDED,
+        CALL_OUTBOUND_DIALING,
         SMS_RECEIVED,
         SMS_SENT,
         SMS_FAILED,
@@ -123,6 +131,7 @@ pub mod commands {
         "call.hangup",
         "call.operatorSpeak",
         "call.configureAgent",
+        "call.dial",
         "sms.threads",
         "sms.thread",
         "sms.send",
