@@ -706,6 +706,16 @@ pub struct RadioStatus {
     pub spec_llm_started: AtomicU64,
     pub spec_llm_kept: AtomicU64,
     pub spec_llm_wasted: AtomicU64,
+    /// Phase-0 observability: run_loop liveness breadcrumbs — the iteration
+    /// counter and the coarse phase the loop last entered (see
+    /// [`loop_phase`]). The watchdog thread reports a stalled loop WITH its
+    /// phase, so a live hang names its own location instead of needing a
+    /// debugger on a production box.
+    pub loop_beat: AtomicU64,
+    pub loop_phase: std::sync::atomic::AtomicU8,
+    /// When the STT worker started its CURRENT transcription (None = idle) +
+    /// the job's sample count — a wedged engine reports itself the same way.
+    pub stt_busy: Mutex<Option<(std::time::Instant, usize)>>,
     pub gap_yields: AtomicU64,
     pub semantic_cuts: AtomicU64,
     pub barge_cuts: AtomicU64,
@@ -2121,6 +2131,79 @@ fn note_tts_outcome(status: &RadioStatus, out: &SpeakOutcome) {
     }
 }
 
+/// run_loop phase breadcrumbs (Phase-0 observability): which section the
+/// loop last ENTERED. Coarse on purpose — the watchdog only needs to NAME the
+/// stalled neighbourhood (the 2026-07-14 "silent call" forensics cost an hour
+/// for lack of exactly this).
+mod loop_phase {
+    pub const EVENTS: u8 = 1;
+    pub const CALL_SETUP: u8 = 2;
+    pub const MIC: u8 = 3;
+    pub const RESULTS: u8 = 4;
+    pub const TURN: u8 = 5;
+    pub const WATCHDOGS: u8 = 6;
+    pub const CONTROLS: u8 = 7;
+    pub const TAIL: u8 = 8;
+}
+
+/// Marks the STT worker busy for the lifetime of one transcription job — the
+/// loop watchdog reads it, so a wedged engine names itself in the log.
+#[cfg(feature = "voice")]
+struct SttBusyGuard(Arc<RadioStatus>);
+
+#[cfg(feature = "voice")]
+impl SttBusyGuard {
+    fn set(status: &Arc<RadioStatus>, samples: usize) -> Self {
+        *status.stt_busy.lock().unwrap() = Some((std::time::Instant::now(), samples));
+        Self(status.clone())
+    }
+}
+
+#[cfg(feature = "voice")]
+impl Drop for SttBusyGuard {
+    fn drop(&mut self) {
+        *self.0.stt_busy.lock().unwrap() = None;
+    }
+}
+
+/// Fire-and-forget llama KV prefix warm (2026-07-14, ring pre-warm follow-up):
+/// discover + 1-token-process the reply prefix on a WORKER thread. Called at
+/// ring (base persona) and again when the call-scoped overlay lands (its
+/// persona replaces the prefix, so the first warm no longer matches).
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn spawn_llm_prefix_warm(
+    agent_endpoint: &Arc<Mutex<Option<String>>>,
+    agent_model: Option<String>,
+    status: &Arc<RadioStatus>,
+    system_prompt: String,
+    history: Vec<serde_json::Value>,
+    label: &'static str,
+) {
+    let ep = agent_endpoint.clone();
+    let st = status.clone();
+    let _ = std::thread::Builder::new()
+        .name("aokie-llm-warm".into())
+        .spawn(move || {
+            let configured = ep.lock().unwrap().clone();
+            let Some(endpoint) = crate::agent::discover_endpoint(configured.as_deref()) else {
+                return;
+            };
+            *st.llm_error.lock().unwrap() = None;
+            let client = crate::agent::LlmClient::new(endpoint, agent_model);
+            let mut messages =
+                vec![serde_json::json!({ "role": "system", "content": system_prompt })];
+            messages.extend(history);
+            let t = std::time::Instant::now();
+            match client.warm_prefix(serde_json::json!(messages)) {
+                Ok(()) => eprintln!(
+                    "[aokie-plugin] llm prefix warmed ({label}) in {:?}",
+                    t.elapsed()
+                ),
+                Err(e) => eprintln!("[aokie-plugin] llm prefix warm ({label}) failed: {e}"),
+            }
+        });
+}
+
 /// Ring-time personalization window (user idea 2026-07-14): +CLIP rides the
 /// RING, so waiting a beat before auto-answering lets the caller id land and
 /// the personalize flow deliver its call-scoped overlay BEFORE the call is
@@ -2992,6 +3075,7 @@ fn run_loop(
                             }
                         }
                         if let Some(eng) = engine.as_mut() {
+                            let _busy = SttBusyGuard::set(&worker_status, samples.len());
                             match eng.transcribe(samples) {
                                 Ok(text) if !text.is_empty() => {
                                     let _ = probe_tx.send(SttResult {
@@ -3058,6 +3142,9 @@ fn run_loop(
                             text,
                         });
                     };
+                    // Busy for the rest of this job (HTTP or local): the loop
+                    // watchdog reports a wedged transcription with its size.
+                    let _busy = SttBusyGuard::set(&worker_status, buf.len());
                     if let Some(endpoint) = http_stt.endpoint_for_call().map(str::to_string) {
                         // Hardened per-endpoint client (AOK-ENDPOINT-001); a rejected
                         // endpoint takes the same sticky fallback path as a failed request.
@@ -3374,8 +3461,53 @@ fn run_loop(
     #[cfg(feature = "voice")]
     let mut silence_timer: Option<SilenceTimer> = None;
 
+    // Phase-0 observability: a stalled run_loop reports ITSELF — the watchdog
+    // compares the iteration beat every 5 s and, on a freeze, logs the phase
+    // breadcrumb plus the STT worker's busy state.
+    let loop_alive = Arc::new(AtomicBool::new(true));
+    {
+        let status = status.clone();
+        let alive = loop_alive.clone();
+        let _ = std::thread::Builder::new()
+            .name("aokie-loop-watchdog".into())
+            .spawn(move || {
+                let mut last = u64::MAX;
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    if !alive.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let beat = status.loop_beat.load(Ordering::Relaxed);
+                    if beat == last && beat != 0 {
+                        let stt = match *status.stt_busy.lock().unwrap() {
+                            Some((at, n)) => {
+                                format!("BUSY {}ms on {n} samples", at.elapsed().as_millis())
+                            }
+                            None => "idle".to_string(),
+                        };
+                        eprintln!(
+                            "[aokie-plugin] WATCHDOG: run_loop stalled >5s in phase {} (beat {beat}); stt worker {stt}",
+                            status.loop_phase.load(Ordering::Relaxed)
+                        );
+                    }
+                    last = beat;
+                }
+            });
+    }
+    struct LoopAlive(Arc<AtomicBool>);
+    impl Drop for LoopAlive {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
+    let _loop_alive = LoopAlive(loop_alive);
+
     loop {
         let mut idle = true;
+        status.loop_beat.fetch_add(1, Ordering::Relaxed);
+        status
+            .loop_phase
+            .store(loop_phase::EVENTS, Ordering::Relaxed);
 
         while let Some(ev) = bt.try_recv_event() {
             idle = false;
@@ -3396,22 +3528,20 @@ fn run_loop(
             if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallIncoming) {
                 let _ = stt_tx.send(SttWork::Warm);
                 synth.warm();
-                // LLM warm-up runs OFF-THREAD: endpoint discovery is HTTP and
-                // can block for seconds — doing it here delayed the ANSWER
-                // itself (live report 2026-07-14). The probe warms DNS/TCP and
-                // the health slot; the reply path still owns the connect (its
-                // discovery is instant once llama has been probed).
-                if agent_enabled && agent_client.is_none() {
-                    let ep = agent_endpoint.clone();
-                    let st = status.clone();
-                    let _ = std::thread::Builder::new()
-                        .name("aokie-llm-ring-warm".into())
-                        .spawn(move || {
-                            let configured = ep.lock().unwrap().clone();
-                            if crate::agent::discover_endpoint(configured.as_deref()).is_some() {
-                                *st.llm_error.lock().unwrap() = None;
-                            }
-                        });
+                // LLM warm-up runs OFF-THREAD (an on-loop HTTP call delayed
+                // the ANSWER once): discover + prime llama's prompt cache with
+                // the BASE reply prefix, so the first token of the first reply
+                // only pays for the caller's words. A new call's history is
+                // empty by definition.
+                if agent_enabled {
+                    spawn_llm_prefix_warm(
+                        &agent_endpoint,
+                        agent_model.clone(),
+                        &status,
+                        compose_agent_system_prompt(&agent_persona, agent_hangup, None),
+                        Vec::new(),
+                        "ring",
+                    );
                 }
             }
             #[cfg(feature = "voice")]
@@ -3570,6 +3700,9 @@ fn run_loop(
             aec = None;
         }
 
+        status
+            .loop_phase
+            .store(loop_phase::CALL_SETUP, Ordering::Relaxed);
         // Flush a buffered incoming call once the caller id is known or the
         // grace window elapses.
         let flush_incoming = tracker.current().is_some_and(|s| {
@@ -3897,6 +4030,7 @@ fn run_loop(
             idle = false;
         }
 
+        status.loop_phase.store(loop_phase::MIC, Ordering::Relaxed);
         // Inbound caller audio.
         #[cfg(not(feature = "voice"))]
         while bt.try_recv_audio().is_some() {
@@ -4022,6 +4156,9 @@ fn run_loop(
                 stt_had_speech = false;
                 stt_silence = Duration::ZERO;
             }
+            status
+                .loop_phase
+                .store(loop_phase::RESULTS, Ordering::Relaxed);
             // ── LIVE HYPOTHESIS LANE (guide phase 2/5) ──────────────────────
             // While the caller is mid-utterance and the bot is silent, ship
             // the ACCUMULATING buffer for partial transcription (~600 ms
@@ -4176,6 +4313,7 @@ fn run_loop(
             }
             // Flush the open turn once its hold expired AND the caller isn't
             // mid-utterance (fresh speech extends the merge window naturally).
+            status.loop_phase.store(loop_phase::TURN, Ordering::Relaxed);
             let flushed_turn = match pending_turn.as_ref() {
                 Some(p) if Instant::now() >= p.flush_at && !stt_had_speech => {
                     pending_turn.take().map(|p| (p.corr, p.text))
@@ -5331,6 +5469,9 @@ fn run_loop(
                 }
             }
 
+            status
+                .loop_phase
+                .store(loop_phase::WATCHDOGS, Ordering::Relaxed);
             // AOK-CTRL-001: call-level max-silence watchdog (agent mode). A
             // live, answered call where NEITHER side has produced audio for a
             // whole window gets a check-in prompt; a second silent window gets
@@ -5506,6 +5647,9 @@ fn run_loop(
             }
         }
 
+        status
+            .loop_phase
+            .store(loop_phase::CONTROLS, Ordering::Relaxed);
         loop {
             // Controls deferred by the mid-reply poll (audit AK-003) run first,
             // in arrival order, before anything newly queued.
@@ -5694,6 +5838,21 @@ fn run_loop(
                                 persona.is_some(),
                                 greeting.is_some()
                             );
+                            // The overlay persona REPLACES the prefix the
+                            // ring warm primed — re-warm so the first reply
+                            // still hits the prompt cache.
+                            if agent_enabled {
+                                if let Some(p) = persona.as_deref() {
+                                    spawn_llm_prefix_warm(
+                                        &agent_endpoint,
+                                        agent_model.clone(),
+                                        &status,
+                                        compose_agent_system_prompt(p, agent_hangup, None),
+                                        history.clone(),
+                                        "overlay",
+                                    );
+                                }
+                            }
                             call_agent_overlay = Some(CallAgentOverlay {
                                 call_id,
                                 persona,
@@ -5819,6 +5978,7 @@ fn run_loop(
             idle = false;
         }
 
+        status.loop_phase.store(loop_phase::TAIL, Ordering::Relaxed);
         if idle {
             std::thread::sleep(Duration::from_millis(15));
         }
