@@ -1514,6 +1514,12 @@ fn turn_looks_unfinished(text: &str) -> bool {
 struct PendingTurn {
     corr: String,
     text: String,
+    /// This turn was SEEDED from barge/overlap capture — the caller cut in
+    /// while Aokie was speaking, so they are almost certainly mid-sentence.
+    /// Gets ONE continuation-hold grace so the rest of the interruption
+    /// merges into it instead of splitting (live call e150a269: "Yeah, do
+    /// you have any" and "appointments next week?" landed as two turns).
+    from_overlap: bool,
     /// sendAudio: the utterance PCM(s) whose STT produced `text`, paired by
     /// utterance id and merged across continuation holds (tail-capped 30 s).
     /// A single shared "last audio" slot raced the turn flush (live call
@@ -2347,7 +2353,12 @@ impl TtsChunkPlayback {
         // complete — detection no longer eats the leading words.
         let captured_speech = match self.speech_start {
             Some(start) => {
-                let pre_roll = self.frame * 30; // ~300 ms
+                // ~450 ms pre-roll: the capture gate (CAPTURE_RMS) already
+                // opens below the barge threshold, but a soft leading
+                // consonant ("do you have…") can sit under even that for a
+                // beat — keep a generous run-up so a barge never loses its
+                // first word.
+                let pre_roll = self.frame * 45;
                 self.captured.split_off(start.saturating_sub(pre_roll))
             }
             None => Vec::new(),
@@ -4628,6 +4639,9 @@ fn run_loop(
                                     pending_turn = Some(PendingTurn {
                                         corr: tracker.call_id().unwrap_or_default().to_string(),
                                         text: text.trim().to_string(),
+                                        // Call-end drain: this flushes right
+                                        // below, so the grace flag is moot.
+                                        from_overlap: false,
                                         audio: utt_pcm.unwrap_or_default(),
                                         flush_at: Instant::now(),
                                     })
@@ -5545,16 +5559,30 @@ fn run_loop(
                         pending_turn = Some(PendingTurn {
                             corr,
                             text: text.trim().to_string(),
+                            // A barge just seeded stt_buf — the interruption
+                            // is still in progress, so grant the merge grace.
+                            from_overlap: turn_overlapped,
                             audio: utt_pcm.unwrap_or_default(),
                             flush_at: Instant::now(),
                         })
                     }
                 }
                 let p = pending_turn.as_mut().expect("just set");
-                if p.text.len() < CONTINUATION_MAX_CHARS && turn_looks_unfinished(&p.text) {
+                // An overlap turn gets ONE grace window (consumed here) so the
+                // caller's mid-barge sentence completes into a single turn;
+                // the normal unfinished-tail heuristic handles the rest.
+                let overlap_grace = std::mem::take(&mut p.from_overlap);
+                if p.text.len() < CONTINUATION_MAX_CHARS
+                    && (turn_looks_unfinished(&p.text) || overlap_grace)
+                {
                     p.flush_at = Instant::now() + CONTINUATION_HOLD;
                     eprintln!(
-                        "[aokie-plugin] holding turn open (looks unfinished): {}",
+                        "[aokie-plugin] holding turn open ({}): {}",
+                        if overlap_grace && !turn_looks_unfinished(&p.text) {
+                            "barge continuation"
+                        } else {
+                            "looks unfinished"
+                        },
                         content_for_log(&p.text)
                     );
                 } else {
