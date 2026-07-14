@@ -72,6 +72,11 @@ pub struct CallSession {
     /// holds the REMOTE (dialed) number, `answered` means the remote party
     /// picked up, and the receptionist must never greet into it.
     pub outbound: bool,
+    /// Phase 2: the PLUGIN placed this outbound call (`call.dial`) — the
+    /// agent OWNS the conversation (opening line + replies + STT). False for
+    /// a handset-originated call we merely observe (the owner's own call:
+    /// the receptionist stays silent and deaf on it).
+    pub agent_owned: bool,
     /// Phase 2: the outbound attempt reached ALERTING (remote ringing,
     /// callsetup 3). Classifies a never-answered attempt: alerted =
     /// `no_answer`, never-alerted = `failed` (bad number / no service).
@@ -194,6 +199,7 @@ impl SessionTracker {
             auto_answered: false,
             toned: false,
             outbound: false,
+            agent_owned: false,
             alerted: false,
             next_utterance: 0,
         });
@@ -203,14 +209,17 @@ impl SessionTracker {
     /// Phase 2: an OUTBOUND call setup started (we dialed, or the owner
     /// dialed on the handset). Same only-when-idle semantics as [`ring`];
     /// `number` is the dialed remote number when known (None for a
-    /// handset-originated call we merely observed). No `aokie.call.incoming`
-    /// is ever held or emitted for these — outbound calls announce
-    /// themselves with their own event at dial time.
+    /// handset-originated call we merely observed); `agent_owned` = the
+    /// plugin placed this call (`call.dial`) and the agent runs the
+    /// conversation. No `aokie.call.incoming` is ever held or emitted for
+    /// these — outbound calls announce themselves with their own event at
+    /// dial time.
     pub fn dial(
         &mut self,
         id: String,
         number: Option<String>,
         started_at_iso: String,
+        agent_owned: bool,
     ) -> Option<&CallSession> {
         if self.session.is_some() {
             return None;
@@ -230,6 +239,7 @@ impl SessionTracker {
             auto_answered: false,
             toned: false,
             outbound: true,
+            agent_owned,
             alerted: false,
             next_utterance: 0,
         });
@@ -444,7 +454,7 @@ mod tests {
     #[test]
     fn outbound_answered_call_is_a_completion_with_the_dialed_number() {
         let mut t = SessionTracker::new();
-        t.dial("call_o".into(), Some("+61400111222".into()), "x".into());
+        t.dial("call_o".into(), Some("+61400111222".into()), "x".into(), true);
         assert!(t.current().unwrap().outbound);
         assert!(
             !t.current().unwrap().incoming_pending(),
@@ -461,13 +471,13 @@ mod tests {
     #[test]
     fn outbound_alerted_but_unanswered_is_no_answer_never_missed() {
         let mut t = SessionTracker::new();
-        t.dial("call_o".into(), Some("+61400111222".into()), "x".into());
+        t.dial("call_o".into(), Some("+61400111222".into()), "x".into(), true);
         t.note_alerted();
         let ended = t.terminate().unwrap();
         assert_eq!(ended.outcome, "no_answer");
         assert_eq!(ended.reason, "remote_or_network");
         // We gave up mid-ring: still no_answer, but the reason says who.
-        t.dial("call_p".into(), None, "x".into());
+        t.dial("call_p".into(), None, "x".into(), false);
         t.note_alerted();
         t.note_intent(TerminationIntent::AgentHangup);
         let ended = t.terminate().unwrap();
@@ -478,7 +488,7 @@ mod tests {
     #[test]
     fn outbound_that_never_alerted_is_failed() {
         let mut t = SessionTracker::new();
-        t.dial("call_o".into(), Some("+61400111222".into()), "x".into());
+        t.dial("call_o".into(), Some("+61400111222".into()), "x".into(), true);
         let ended = t.terminate().unwrap();
         assert_eq!(ended.outcome, "failed");
         assert_eq!(ended.reason, "setup_failed");

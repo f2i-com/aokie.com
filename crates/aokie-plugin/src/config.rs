@@ -33,6 +33,16 @@ pub struct PairedDevice {
     pub name: String,
 }
 
+/// Phase 2 outbound guardrail: how many automated dials were placed on
+/// `date` (operator-LOCAL `YYYY-MM-DD`). Persisted so a plugin restart
+/// can't reset the daily cap.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DialLedger {
+    pub date: String,
+    pub count: u32,
+}
+
 /// The persisted document. `settings` is the free-form key/value bag
 /// behind `settings.get` / `settings.set` (e.g. `mockCalls: true`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -45,6 +55,8 @@ pub struct PluginConfig {
     /// `settings.set` save, so operators and tests can tell exactly which
     /// configuration a call ran under.
     pub config_version: u64,
+    /// Phase 2: the outbound daily-dial ledger (None = never dialed).
+    pub dial_ledger: Option<DialLedger>,
 }
 
 /// Load/save wrapper bound to one data dir.
