@@ -183,6 +183,9 @@ pub struct RfcommState {
     hfp_dlci: u8,
     max_frame_size: u16,
     hfp_state: hfp::HfpHandsFreeState,
+    /// Incomplete trailing AT line carried across UIH frames (a response
+    /// line can fragment at the mux MTU — see parse_ag_results_buffered).
+    hfp_line_carry: String,
     hfp_pending_commands: VecDeque<hfp::HfpAtCommand>,
     /// Tracks the command that's currently waiting on the AG's OK/ERROR
     /// reply. `None` means there's no SLC command in flight (either we've
@@ -242,6 +245,7 @@ impl Default for RfcommState {
             hfp_dlci: aokie_hfp_dlci(),
             max_frame_size: RFCOMM_DEFAULT_MAX_FRAME_SIZE,
             hfp_state: hfp::HfpHandsFreeState::new(),
+            hfp_line_carry: String::new(),
             hfp_pending_commands: VecDeque::new(),
             hfp_in_flight_command: None,
             hfp_in_flight_command_sent_at: None,
@@ -847,7 +851,7 @@ impl RfcommState {
         }
 
         let mut responses = Vec::new();
-        for result in hfp::parse_ag_results(payload)? {
+        for result in hfp::parse_ag_results_buffered(&mut self.hfp_line_carry, payload)? {
             self.hfp_events.extend(self.hfp_state.apply_result(&result));
             match result {
                 hfp::HfpAgResult::Ok => {
