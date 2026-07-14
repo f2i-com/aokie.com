@@ -3715,7 +3715,11 @@ fn run_loop(
         let greet_now = {
             let sr = bt.get_sample_rate();
             match tracker.current_mut() {
-                Some(s) if !s.greeted && sr > 0 => {
+                // `is_active()` (answered) is REQUIRED, not just `sr > 0`:
+                // some phones open the SCO channel during RINGING (in-band
+                // ringtone) — the greeting must never speak into a line the
+                // caller isn't connected to yet.
+                Some(s) if !s.greeted && s.is_active() && sr > 0 => {
                     // §9.3 personalization race: the caller-id flow's
                     // call-scoped overlay ("Hi <name>!") usually lands 1–3 s
                     // after answer — briefly hold the greeting for it instead
@@ -3908,7 +3912,11 @@ fn run_loop(
             let muted = mute_stt_until.is_some_and(|t| Instant::now() < t);
             while let Some(frame) = bt.try_recv_audio() {
                 idle = false;
-                if tracker.current().is_none() {
+                // ACTIVE calls only: some phones open the SCO during RINGING
+                // (in-band ringtone) — transcribing that seeds the first
+                // caller turn with garbage, and no caller can speak before
+                // the call is answered anyway.
+                if !tracker.current().is_some_and(|s| s.is_active()) {
                     continue;
                 }
                 // Full-duplex: echo-cancel the mic (so Aokie's own voice, even
