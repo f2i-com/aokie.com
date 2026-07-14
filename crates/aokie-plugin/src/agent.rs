@@ -113,14 +113,28 @@ impl LlmClient {
     /// loop (the reply path must not wait on this). The prompt frames it as
     /// a correction (the STT draft rides along as a hint) so the output
     /// stays close to the recognizer when it was already right instead of
-    /// re-imagining the sentence.
-    pub fn transcribe_turn(&self, wav_b64: &str, stt_text: &str) -> Result<String, String> {
+    /// re-imagining the sentence. `context` carries the last few
+    /// conversation turns (text only) so ambiguous audio resolves toward
+    /// the dialogue's domain — live call e150a269: the caller asked about
+    /// "ointments" at a DENTAL receptionist and the context-free model kept
+    /// it verbatim instead of hearing "appointments".
+    pub fn transcribe_turn(
+        &self,
+        wav_b64: &str,
+        stt_text: &str,
+        context: &str,
+    ) -> Result<String, String> {
+        let hint = if context.is_empty() {
+            format!("Recognizer draft: {stt_text}")
+        } else {
+            format!("Conversation so far:\n{context}\n\nRecognizer draft: {stt_text}")
+        };
         let mut body = serde_json::json!({
             "messages": [
-                { "role": "system", "content": "You transcribe one short phone-call utterance from its audio. A speech recognizer's draft is provided; correct any words it got wrong using the audio. Reply with ONLY the corrected transcription - the caller's exact words, no quotes, no commentary." },
+                { "role": "system", "content": "You transcribe one short phone-call utterance from its audio. A speech recognizer's draft and the recent conversation are provided; correct any words the recognizer got wrong using the audio, and use the conversation only to resolve unclear or ambiguous words toward what the caller plainly meant to say. Never import words from the conversation that the audio does not support. Reply with ONLY the corrected transcription - the caller's exact words, no quotes, no commentary." },
                 { "role": "user", "content": [
                     { "type": "input_audio", "input_audio": { "data": wav_b64, "format": "wav" } },
-                    { "type": "text", "text": format!("Recognizer draft: {stt_text}") },
+                    { "type": "text", "text": hint },
                 ] },
             ],
             "stream": false,
