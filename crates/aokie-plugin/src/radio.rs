@@ -2256,7 +2256,13 @@ fn finish_business_lookup(
     let left = deadline.saturating_duration_since(Instant::now());
     match rx.recv_timeout(left) {
         Ok(Ok(v)) => {
-            let ok = v.get("status").and_then(serde_json::Value::as_str) == Some("succeeded");
+            // The desktop runner's success status is "done" (the same
+            // vocabulary flow_run_logs persists); "succeeded" kept for other
+            // hosts. Checking ONLY "succeeded" + the host dropping `result`
+            // from the RPC response meant every live lookup injected
+            // LOOKUP UNAVAILABLE while a perfect digest sat in the run log.
+            let status = v.get("status").and_then(serde_json::Value::as_str);
+            let ok = matches!(status, Some("done") | Some("succeeded"));
             let digest = v
                 .get("result")
                 .and_then(|r| r.get("digest").or_else(|| r.get("answer")))
