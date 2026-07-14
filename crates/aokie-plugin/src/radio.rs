@@ -218,6 +218,17 @@ const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read
 const FALLBACK_LINE: &str = "I'm sorry, I'm having technical trouble taking your call right now. \
 Please call back shortly. Goodbye.";
 
+/// Phase 1 abuse handling (call-policy spec): the standing prompt rule. The
+/// model only FLAGS ([[ABUSE]]); deterministic code speaks the notice, ends
+/// the call and writes the block — the LLM is never in the block/unblock
+/// path. Worded to keep a small model from overfiring on ordinary frustration.
+const ABUSE_INSTRUCTION: &str = "\n\nAbusive callers: if the caller is directly abusive - slurs, threats, sexual harassment, or sustained personal insults aimed at you or the staff - reply with EXACTLY [[ABUSE]] and nothing else. The system then speaks a standard notice and ends the call for you. This is ONLY for genuine abuse: frustration, venting, complaining, or swearing about their own situation is NOT abuse - stay warm and helpful through those. Never argue with or lecture an abusive caller yourself, and never threaten them with the marker.";
+
+/// Phase 1: the deterministic notice spoken to a flagged caller before the
+/// hangup — never model prose. ASCII only (straight to TTS).
+#[cfg(feature = "voice")]
+const ABUSE_LINE: &str = "We do not tolerate abusive calls, so this call will now end. Goodbye.";
+
 /// VOICE-001, pure for tests: after a reply attempt, is the caller sitting in
 /// DEAD AIR? True only when nothing audibly played AND nothing else explains
 /// the silence — a barge-in means the caller is talking (their turn is already
@@ -410,9 +421,9 @@ fn compose_agent_system_prompt(
     // to resolve them against but conversational vibes.
     let today = aokie_core::events::today_spoken_local();
     let mut p = if agent_hangup {
-        format!("{persona}\n\nToday is {today}.{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}{END_CALL_INSTRUCTION}")
+        format!("{persona}\n\nToday is {today}.{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}{ABUSE_INSTRUCTION}{END_CALL_INSTRUCTION}")
     } else {
-        format!("{persona}\n\nToday is {today}.{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}")
+        format!("{persona}\n\nToday is {today}.{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}{ABUSE_INSTRUCTION}")
     };
     if let Some(tail) = cut_context {
         p.push_str(&format!(
@@ -786,6 +797,12 @@ pub struct RadioStatus {
     /// against this — the radio would silently drop it anyway (double-responder
     /// guard), and an accepted-then-dropped command is a lie.
     pub agent_enabled: AtomicBool,
+    /// Phase 1 abuse auto-block hand-off: numbers the radio thread already
+    /// blocked LIVE (policy + env) that still need persisting into the
+    /// `blockedNumbers` setting. The connector drains this on every command
+    /// dispatch (the desktop's health poll bounds the lag) — the radio never
+    /// touches the settings store itself.
+    pub pending_blocked_numbers: Mutex<Vec<String>>,
 }
 
 /// VOICE-001: one loopback self-test outcome (always compiled — non-voice
@@ -5422,6 +5439,11 @@ fn run_loop(
                             let mut wait_requested = false;
                             let mut wait_regen_done = false;
                             let mut empty_retry_done = false;
+                            // Set when the reply carried the [[ABUSE]] marker
+                            // (Phase 1): the model flagged an abusive caller.
+                            // DETERMINISTIC code takes over below — notice,
+                            // hangup, auto-block; no model prose is spoken.
+                            let mut abuse_flagged = false;
                             // Set when the generation was a [[LOOKUP:]] verdict
                             // (round 0 only): run the flow + regenerate.
                             let mut lookup_requested: Option<String> = None;
@@ -5670,6 +5692,20 @@ fn run_loop(
                                             );
                                             continue;
                                         }
+                                        if spoken_text.contains("[[ABUSE") {
+                                            // Phase 1: the abuse flag is a
+                                            // VERDICT, not speech — never
+                                            // spoken (even unclosed), and the
+                                            // rest of the generation is moot:
+                                            // the deterministic notice below
+                                            // replaces all model prose.
+                                            eprintln!(
+                                                "[aokie-plugin] agent flagged abuse — abandoning the reply for the deterministic handler"
+                                            );
+                                            abuse_flagged = true;
+                                            reply_cancel.store(true, Ordering::Relaxed);
+                                            break 'pump;
+                                        }
                                         // The mid-span check compares overlap
                                         // against everything SENT so far plus
                                         // the sentence about to play.
@@ -5860,6 +5896,12 @@ fn run_loop(
                                     if crate::speech_plan::has_wait_marker(&full) {
                                         wait_requested = true;
                                     }
+                                    // Phase 1: whole-generation abuse-flag
+                                    // fallback (a stream split can hide the
+                                    // marker from the per-sentence check).
+                                    if full.contains("[[ABUSE") {
+                                        abuse_flagged = true;
+                                    }
                                     if let Some(q) =
                                         crate::speech_plan::parse_lookup_marker(&full)
                                     {
@@ -5975,6 +6017,7 @@ fn run_loop(
                                     // to leave the caller their thinking room.
                                     if !line_dead
                                         && !wait_requested
+                                        && !abuse_flagged
                                         && lookup_requested.is_none()
                                         && lookup_rounds == 0
                                         && reply_left_dead_air(
@@ -6159,6 +6202,116 @@ fn run_loop(
                                 turn_overlap_at = Some(aokie_core::events::iso8601_ago_ms(
                                     (overlap_capture.len() * 1000 / (sr as usize).max(1)) as u64,
                                 ));
+                            }
+                            // ── Phase 1: ABUSE TERMINATION (deterministic) ──
+                            // The model only FLAGGED ([[ABUSE]]); everything
+                            // from here is fixed code: speak the notice, block
+                            // the number (policy live + env now, persisted via
+                            // the connector drain), hang up with the ghost-turn
+                            // latch. Never the LLM's job — and never spoken
+                            // prose from it either.
+                            if abuse_flagged && !line_dead && !operator_ended {
+                                eprintln!(
+                                    "[aokie-plugin] abusive caller flagged — speaking the notice and ending the call (Phase 1 policy)"
+                                );
+                                // Cut anything still queued so the notice is
+                                // the only thing the caller hears.
+                                bt.flush_tx_audio();
+                                let ab_t0 = Instant::now();
+                                let out = tts_speak(
+                                    bt, &synth, ABUSE_LINE, sr, None, None, None, 1.0, None,
+                                    None,
+                                );
+                                note_tts_outcome(&status, &out);
+                                if out.dur > Duration::ZERO {
+                                    // Truthful transcript: the notice WAS heard.
+                                    emit_turn_with_delivery(
+                                        outbox,
+                                        sink,
+                                        &corr,
+                                        turn_index,
+                                        "bot",
+                                        ABUSE_LINE,
+                                        Some("complete"),
+                                        Some(&aokie_core::events::iso8601_ago_ms(
+                                            ab_t0.elapsed().as_millis() as u64,
+                                        )),
+                                    );
+                                    turn_index += 1;
+                                    let wait =
+                                        playout_drain_wait(ab_t0, out.dur, Instant::now());
+                                    if !wait.is_zero() {
+                                        std::thread::sleep(wait);
+                                    }
+                                } else {
+                                    // TTS broken: the hangup still happens —
+                                    // ending the call IS the policy outcome.
+                                    eprintln!(
+                                        "[aokie-plugin] abuse notice produced no audio — ending the call without it"
+                                    );
+                                }
+                                // Auto-block (default ON): live policy + env
+                                // first — the number's NEXT attempt is already
+                                // screened even before persistence lands.
+                                if screen_policy.auto_block_abuse {
+                                    let num = tracker
+                                        .current()
+                                        .and_then(|s| s.caller_id.clone())
+                                        .unwrap_or_default();
+                                    if screen_policy.block_number(&num) {
+                                        let mut env_list =
+                                            std::env::var("AOKIE_BLOCKED_NUMBERS")
+                                                .unwrap_or_default();
+                                        if !env_list.trim().is_empty() {
+                                            env_list.push(',');
+                                        }
+                                        env_list.push_str(num.trim());
+                                        std::env::set_var(
+                                            "AOKIE_BLOCKED_NUMBERS",
+                                            env_list,
+                                        );
+                                        status
+                                            .pending_blocked_numbers
+                                            .lock()
+                                            .unwrap()
+                                            .push(num);
+                                        eprintln!(
+                                            "[aokie-plugin] abusive caller auto-blocked (live now; persisted at the next host poll) — unblock via the console's Call screening card"
+                                        );
+                                    } else if num.trim().is_empty() {
+                                        eprintln!(
+                                            "[aokie-plugin] abuse auto-block skipped — caller id withheld/unknown"
+                                        );
+                                    }
+                                }
+                                tracker.note_intent(
+                                    crate::call_session::TerminationIntent::AgentTerminateAbuse,
+                                );
+                                match bt.hangup() {
+                                    Ok(()) => {
+                                        // Ghost-turn latch: words captured
+                                        // during the notice must never mint an
+                                        // answered post-hangup turn.
+                                        agent_hung_up = true;
+                                        eprintln!(
+                                            "[aokie-plugin] abuse termination complete (AT+CHUP)"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[aokie-plugin] abuse-termination hangup failed: {e}"
+                                        );
+                                        emit_control_failed(
+                                            outbox,
+                                            sink,
+                                            &tracker,
+                                            "agent.abuse_hangup",
+                                            None,
+                                            &e,
+                                        );
+                                    }
+                                }
+                                break 'reply_rounds;
                             }
                             // VOICE-001 fail-safe: the caller asked something and heard
                             // NOTHING — the responder is broken mid-call. Never leave
@@ -7732,6 +7885,23 @@ mod tests {
         assert!(!reply_left_dead_air(true, true, true));
         // The canned apology must be non-trivial speech, not a stub.
         assert!(FALLBACK_LINE.len() > 40 && FALLBACK_LINE.contains("sorry"));
+    }
+
+    /// Phase 1 abuse handling: the notice is fixed ASCII speech (straight to
+    /// TTS), the standing instruction teaches EXACTLY the marker the pump
+    /// detects, and it explicitly protects ordinary frustration from being
+    /// flagged. The prompt composer must always carry the rule.
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[test]
+    fn abuse_notice_and_instruction_are_wired() {
+        assert!(ABUSE_LINE.len() > 30 && ABUSE_LINE.contains("abusive"));
+        assert!(ABUSE_LINE.is_ascii(), "the notice goes straight to TTS");
+        assert!(ABUSE_INSTRUCTION.contains("[[ABUSE]]"));
+        assert!(ABUSE_INSTRUCTION.contains("NOT abuse"));
+        let p = compose_agent_system_prompt("persona", false, None);
+        assert!(p.contains("[[ABUSE]]"), "prompt must teach the marker");
+        let p2 = compose_agent_system_prompt("persona", true, None);
+        assert!(p2.contains("[[ABUSE]]"));
     }
 
     /// The agent-hangup end-call marker must be stripped from spoken/recorded

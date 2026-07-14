@@ -972,6 +972,82 @@ impl Plugin {
         }
     }
 
+    /// Phase 1 abuse auto-block persistence: the RADIO thread pushed numbers
+    /// it already blocked live (policy + env) onto the shared status queue —
+    /// merge them into the persisted `blockedNumbers` setting here, on the
+    /// main RPC thread that owns the store. Called on every dispatch, so the
+    /// desktop's periodic health poll bounds the persistence lag; the block
+    /// itself was live the moment the radio applied it. Deduped by the same
+    /// digits-only last-9 suffix the policy matches with.
+    fn drain_pending_blocks(&mut self) {
+        let pending: Vec<String> = match self.radio.as_ref() {
+            Some(radio) => {
+                let mut q = radio.status.pending_blocked_numbers.lock().unwrap();
+                if q.is_empty() {
+                    return;
+                }
+                q.drain(..).collect()
+            }
+            None => return,
+        };
+        let mut list = self
+            .store
+            .config
+            .settings
+            .get("blockedNumbers")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let existing: Vec<String> = list
+            .split([',', '\n', ';'])
+            .map(crate::screen::digit_suffix)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut added = 0usize;
+        for num in pending {
+            let suffix = crate::screen::digit_suffix(&num);
+            if suffix.len() < 6 || existing.iter().any(|e| *e == suffix) {
+                continue;
+            }
+            if !list.is_empty() {
+                list.push('\n');
+            }
+            list.push_str(num.trim());
+            added += 1;
+        }
+        if added == 0 {
+            return;
+        }
+        self.store
+            .config
+            .settings
+            .insert("blockedNumbers".to_string(), json!(list));
+        self.store.config.config_version += 1;
+        match self.save_config() {
+            Ok(()) => {
+                if let Some(radio) = self.radio.as_ref() {
+                    radio
+                        .status
+                        .config_version
+                        .store(self.store.config.config_version, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Env follows the store so any later policy rebuild keeps the
+                // block; the running radio already applied it in-thread.
+                apply_screening_env(&self.store.config.settings);
+                eprintln!(
+                    "[aokie-plugin] abuse auto-block persisted ({added} number(s) appended to blockedNumbers, configVersion {})",
+                    self.store.config.config_version
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[aokie-plugin] abuse auto-block persist FAILED ({e:?}) — the live policy still holds the block until restart"
+                );
+            }
+        }
+    }
+
     /// The MVP command surface. Every handler validates its payload
     /// (unknown fields rejected) before acting.
     pub fn dispatch_command(
@@ -980,6 +1056,9 @@ impl Plugin {
         payload: &Value,
         sink: &mut dyn Sink,
     ) -> Result<Value, CmdError> {
+        // Any host interaction is a persistence opportunity for radio-side
+        // abuse auto-blocks (the desktop health poll guarantees a bounded lag).
+        self.drain_pending_blocks();
         match command {
             "dongle.list" => {
                 expect_fields(payload, &[])?;
@@ -1745,6 +1824,7 @@ impl Plugin {
                             | "rejectPrivate"
                             | "screenMessage"
                             | "blockedMessage"
+                            | "autoBlockAbuse"
                     )
                 });
                 if screening_key {
@@ -2452,6 +2532,11 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     SettingSpec { key: "rejectPrivate", kind: SettingKind::Bool, applies_live: true },
     SettingSpec { key: "screenMessage", kind: SettingKind::Str { max_chars: 500 }, applies_live: true },
     SettingSpec { key: "blockedMessage", kind: SettingKind::Str { max_chars: 500 }, applies_live: true },
+    // Phase 1 abuse handling: when the agent flags an abusive caller
+    // ([[ABUSE]]), also append their number to blockedNumbers. Default ON —
+    // only an explicit false turns the auto-block off (the notice + hangup
+    // always happen regardless).
+    SettingSpec { key: "autoBlockAbuse", kind: SettingKind::Bool, applies_live: true },
     SettingSpec { key: "agentHangup", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "reenumerateHwid", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "legacyPairingPin", kind: SettingKind::Bool, applies_live: false },
@@ -2535,6 +2620,16 @@ fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
         std::env::set_var("AOKIE_REJECT_PRIVATE", "1");
     } else {
         std::env::remove_var("AOKIE_REJECT_PRIVATE");
+    }
+    // Default ON (Phase 1): only an explicit false writes the opt-out var.
+    let auto_block = settings
+        .get("autoBlockAbuse")
+        .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() != Some("false")))
+        .unwrap_or(true);
+    if auto_block {
+        std::env::remove_var("AOKIE_AUTO_BLOCK_ABUSE");
+    } else {
+        std::env::set_var("AOKIE_AUTO_BLOCK_ABUSE", "0");
     }
 }
 
@@ -3911,6 +4006,79 @@ mod tests {
             .dispatch_command("call.answer", &json!({"callId": "call_stale"}), &mut sink)
             .unwrap_err();
         assert_eq!(err.code, "stale_call");
+    }
+
+    /// Phase 1 abuse auto-block: numbers the RADIO queued on the shared
+    /// status are merged into the persisted `blockedNumbers` setting on the
+    /// next command dispatch (production: the desktop health poll) — deduped
+    /// by digit suffix, config version bumped, existing entries untouched.
+    #[test]
+    fn abuse_auto_blocks_persist_via_dispatch_drain() {
+        let mut plugin = Plugin::ephemeral(true);
+        let (handle, _control_rx) = crate::radio::RadioHandle::test_handle();
+        handle
+            .status
+            .pending_blocked_numbers
+            .lock()
+            .unwrap()
+            .push("+61 400 111 222".to_string());
+        plugin.radio = Some(handle);
+        plugin
+            .store
+            .config
+            .settings
+            .insert("blockedNumbers".into(), json!("0491570156"));
+        let v0 = plugin.store.config.config_version;
+        let mut sink = VecSink::default();
+        // ANY dispatch drains the queue.
+        plugin
+            .dispatch_command("settings.get", &json!({}), &mut sink)
+            .unwrap();
+        let list = plugin
+            .store
+            .config
+            .settings
+            .get("blockedNumbers")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        assert!(list.contains("0491570156"), "existing entries kept: {list}");
+        assert!(list.contains("+61 400 111 222"), "new block appended: {list}");
+        assert_eq!(plugin.store.config.config_version, v0 + 1);
+        assert!(
+            plugin
+                .radio
+                .as_ref()
+                .unwrap()
+                .status
+                .pending_blocked_numbers
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "queue consumed"
+        );
+        // Dedupe: the same number in ANOTHER format never lands twice.
+        plugin
+            .radio
+            .as_ref()
+            .unwrap()
+            .status
+            .pending_blocked_numbers
+            .lock()
+            .unwrap()
+            .push("0400111222".to_string());
+        plugin
+            .dispatch_command("settings.get", &json!({}), &mut sink)
+            .unwrap();
+        let list2 = plugin
+            .store
+            .config
+            .settings
+            .get("blockedNumbers")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        assert_eq!(list, list2, "suffix-equal number must not append again");
     }
 
     // ---- CONSENT-001: enforce-by-default + signed grants + destinations ----

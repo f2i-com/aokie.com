@@ -21,6 +21,11 @@ pub struct ScreenPolicy {
     /// Separate from `message`: a blocked (often abusive) number should not
     /// get the polite private-caller line.
     pub blocked_message: String,
+    /// Phase 1 (abuse handling): when the agent flags a caller as abusive
+    /// ([[ABUSE]]), automatically append their number to the block list.
+    /// Default ON; `autoBlockAbuse: false` (env AOKIE_AUTO_BLOCK_ABUSE=0)
+    /// turns only the auto-block off — the notice + hangup always happen.
+    pub auto_block_abuse: bool,
 }
 
 impl ScreenPolicy {
@@ -35,7 +40,7 @@ impl ScreenPolicy {
     }
 }
 
-fn digit_suffix(raw: &str) -> String {
+pub(crate) fn digit_suffix(raw: &str) -> String {
     let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
     let n = digits.chars().count();
     if n > 9 {
@@ -69,13 +74,31 @@ impl ScreenPolicy {
         let reject_private = std::env::var_os("AOKIE_REJECT_PRIVATE").is_some();
         let message = std::env::var("AOKIE_SCREEN_MESSAGE").unwrap_or_default();
         let blocked_message = std::env::var("AOKIE_BLOCKED_MESSAGE").unwrap_or_default();
+        // Default ON: absence of the var (or any value but "0") auto-blocks.
+        let auto_block_abuse = std::env::var("AOKIE_AUTO_BLOCK_ABUSE")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
         Self {
             blocked,
             accept,
             reject_private,
             message,
             blocked_message,
+            auto_block_abuse,
         }
+    }
+
+    /// Phase 1 auto-block: add a number to the RUNNING policy (the caller's
+    /// next attempt is screened immediately, before any persistence lands).
+    /// Returns false for an unusable id (withheld / too few digits) or a
+    /// number already on the list.
+    pub fn block_number(&mut self, raw: &str) -> bool {
+        let suffix = digit_suffix(raw);
+        if suffix.len() < 6 || self.blocked.iter().any(|b| *b == suffix) {
+            return false;
+        }
+        self.blocked.push(suffix);
+        true
     }
 
     pub fn is_active(&self) -> bool {
@@ -122,6 +145,7 @@ mod tests {
             reject_private: private,
             message: String::new(),
             blocked_message: String::new(),
+            auto_block_abuse: true,
         }
     }
 
@@ -176,5 +200,21 @@ mod tests {
     fn blocked_wins_over_accept() {
         let p = policy("0491570156", Some(r"^0"), false);
         assert_eq!(p.verdict(Some("0491570156")), Some("blocked"));
+    }
+
+    /// Phase 1 auto-block: a flagged number screens IMMEDIATELY on the
+    /// running policy — format-agnostic, deduped, and unusable ids refused.
+    #[test]
+    fn block_number_applies_live_and_dedupes() {
+        let mut p = policy("", None, false);
+        assert!(!p.is_active());
+        assert!(p.block_number("+61 400 111 222"));
+        assert!(p.is_active());
+        assert_eq!(p.verdict(Some("0400111222")), Some("blocked"));
+        // Same number in another format = already blocked, not a new entry.
+        assert!(!p.block_number("0400111222"));
+        // Withheld / fragment ids can never be blocked.
+        assert!(!p.block_number(""));
+        assert!(!p.block_number("243"));
     }
 }
