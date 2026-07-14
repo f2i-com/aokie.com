@@ -860,6 +860,19 @@ impl RfcommState {
                     if !self.hfp_slc_failed {
                         if let Some(command) = self.next_hfp_command_frame() {
                             responses.push(command);
+                        } else if self.hfp_pending_commands.is_empty()
+                            && self.hfp_state.needs_indicator_definitions_retry()
+                        {
+                            // Lost/garbled +CIND=? definitions (phantom-answer
+                            // incidents): re-request ONCE before readiness —
+                            // ringing on default indices misreads as answered.
+                            self.hfp_pending_commands
+                                .push_back(hfp::HfpAtCommand::RetrieveIndicators);
+                            self.hfp_pending_commands
+                                .push_back(hfp::HfpAtCommand::RetrieveIndicatorStatus);
+                            if let Some(command) = self.next_hfp_command_frame() {
+                                responses.push(command);
+                            }
                         } else {
                             self.mark_hfp_service_ready();
                         }
@@ -2230,8 +2243,27 @@ mod tests {
             assert_eq!(parse_frame(&responses[0]).unwrap().payload, command);
         }
 
+        // The bare-OK run above never carried a +CIND DEFINITIONS line, so
+        // the state re-requests it ONCE before readiness (phantom-answer
+        // hardening: ringing on default indices misreads as answered).
         let responses = state
             .handle_packet(&build_uih(aokie_hfp_dlci(), false, None, b"\r\nOK\r\n"))
+            .unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(parse_frame(&responses[0]).unwrap().payload, b"AT+CIND=?\r");
+        let responses = state
+            .handle_packet(&build_uih(
+                aokie_hfp_dlci(),
+                false,
+                None,
+                b"\r\n+CIND: (\"call\",(0,1)),(\"callsetup\",(0-3))\r\nOK\r\n",
+            ))
+            .unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(parse_frame(&responses[0]).unwrap().payload, b"AT+CIND?\r");
+
+        let responses = state
+            .handle_packet(&build_uih(aokie_hfp_dlci(), false, None, b"\r\n+CIND: 0,0\r\nOK\r\n"))
             .unwrap();
         assert!(responses.is_empty());
         assert!(state.hfp_state().service_level_ready());
@@ -2239,6 +2271,8 @@ mod tests {
             state.take_hfp_events(),
             vec![hfp::HfpEvent::ServiceLevelConnectionReady]
         );
+        // The definitions parsed on the retry own the mapping now.
+        assert_eq!(state.hfp_state().call_indicator_index(), 1);
     }
 
     #[test]

@@ -125,6 +125,15 @@ pub struct HfpHandsFreeState {
     /// a `callsetup,0` while set is the same ambiguous edge — abandon vs
     /// answered-with-late-`call,1` — so it feeds the SAME held verdict.
     outgoing_setup: bool,
+    /// The +CIND=? DEFINITIONS response was parsed and named BOTH the call
+    /// and callsetup indicators. Without it the index fields above are the
+    /// built-in defaults, which do NOT match every phone (Android puts
+    /// `call` FIRST) — a ringing callsetup CIEV then misreads as
+    /// CallAnswered (live phantom-answer incidents 2026-07-14/15). The SLC
+    /// pump re-requests the definitions ONCE when readiness is reached
+    /// without them.
+    indicator_definitions_seen: bool,
+    indicator_definitions_retry_used: bool,
     /// `callsetup: 0` arrived while ringing with the `call` indicator still 0.
     /// That transition is AMBIGUOUS — the ring phase ends for BOTH an
     /// abandoned ring AND an answered call, and some AGs send `callsetup,0`
@@ -150,6 +159,8 @@ impl Default for HfpHandsFreeState {
             indicator_updates_enabled: false,
             call_indicator_index: 2,
             callsetup_indicator_index: 3,
+            indicator_definitions_seen: false,
+            indicator_definitions_retry_used: false,
             call_active: false,
             incoming_call: false,
             outgoing_setup: false,
@@ -263,14 +274,49 @@ impl HfpHandsFreeState {
     }
 
     fn apply_indicator_definitions(&mut self, indicators: &[String]) {
+        let mut saw_call = false;
+        let mut saw_callsetup = false;
         for (index, name) in indicators.iter().enumerate() {
             let hfp_index = (index + 1) as u8;
             if name.eq_ignore_ascii_case("call") {
                 self.call_indicator_index = hfp_index;
+                saw_call = true;
             } else if name.eq_ignore_ascii_case("callsetup") {
                 self.callsetup_indicator_index = hfp_index;
+                saw_callsetup = true;
             }
         }
+        if saw_call && saw_callsetup {
+            self.indicator_definitions_seen = true;
+        }
+        // The one log line that would have named every phantom-answer
+        // incident instantly: the mapping THIS connection will use.
+        eprintln!(
+            "[AokieRadio] CIND definitions parsed: call={} callsetup={} ({} indicators{})",
+            self.call_indicator_index,
+            self.callsetup_indicator_index,
+            indicators.len(),
+            if saw_call && saw_callsetup {
+                ""
+            } else {
+                " — INCOMPLETE, call/callsetup not both named"
+            },
+        );
+    }
+
+    /// True exactly once: SLC readiness was reached WITHOUT a usable
+    /// definitions line (lost/fragmented/corrupted on the wire) — the pump
+    /// should re-queue AT+CIND=? + AT+CIND? instead of going ready on
+    /// default indices that may not match this phone.
+    pub fn needs_indicator_definitions_retry(&mut self) -> bool {
+        if self.indicator_definitions_seen || self.indicator_definitions_retry_used {
+            return false;
+        }
+        self.indicator_definitions_retry_used = true;
+        eprintln!(
+            "[AokieRadio] SLC finished without indicator DEFINITIONS — re-requesting AT+CIND=? once (default call/callsetup indices may not match this phone)"
+        );
+        true
     }
 
     /// Sync internal call-state from a `+CIND?` status read.
@@ -678,6 +724,25 @@ mod tests {
             })
             .unwrap();
         assert_eq!(indicators, &vec!["service", "call", "callsetup"]);
+    }
+
+    #[test]
+    fn missing_cind_definitions_get_exactly_one_retry() {
+        // Definitions lost on the wire: the pump asks once, then never loops.
+        let mut state = HfpHandsFreeState::new();
+        assert!(state.needs_indicator_definitions_retry());
+        assert!(!state.needs_indicator_definitions_retry());
+        // Definitions parsed (Android order — call FIRST): no retry, and the
+        // mapping reflects the phone's real order, not the defaults.
+        let mut ok = HfpHandsFreeState::new();
+        ok.apply_result(&HfpAgResult::Indicators(vec![
+            "call".to_string(),
+            "callsetup".to_string(),
+            "service".to_string(),
+        ]));
+        assert!(!ok.needs_indicator_definitions_retry());
+        assert_eq!(ok.call_indicator_index, 1);
+        assert_eq!(ok.callsetup_indicator_index, 2);
     }
 
     #[test]

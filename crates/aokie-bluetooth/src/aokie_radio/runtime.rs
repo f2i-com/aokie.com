@@ -1105,11 +1105,13 @@ fn pop_acl_frame(
 /// space-separated hex string for diagnostic logging. Caps at 32 so a
 /// stray full-buffer caller can't dump kilobytes into the log.
 /// Persistent ACL-stream corruption detector (see the tracker locals in the
-/// radio loop): ≥4 resync/flush recoveries inside 5 minutes means the dongle
+/// radio loop): ≥3 garbage-PREFIX resyncs inside 10 minutes means the dongle
 /// controller is mangling its USB transfers — every connect will fail until
 /// the operator power-cycles it — so raise ONE actionable hardware error.
-/// The window emptying (a quiet 5 minutes) re-arms the report, so a relapse
-/// after a recovery is announced again.
+/// ONLY Resynced (prefix-garbage) outcomes count: deterministic parser
+/// stalls on one traffic shape (the MAP-poll flush loop) must never trip
+/// the replug instruction (false alarm, live 2026-07-15). The window
+/// emptying re-arms the report, so a relapse after a recovery is announced.
 fn note_acl_corruption(
     times: &mut std::collections::VecDeque<Instant>,
     reported: &mut bool,
@@ -1118,7 +1120,7 @@ fn note_acl_corruption(
     let now = Instant::now();
     while times
         .front()
-        .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(300))
+        .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(600))
     {
         times.pop_front();
     }
@@ -1126,7 +1128,7 @@ fn note_acl_corruption(
         *reported = false;
     }
     times.push_back(now);
-    if times.len() >= 4 && !*reported {
+    if times.len() >= 3 && !*reported {
         *reported = true;
         let _ = event_tx.send(RuntimeEvent::Error(
             "Bluetooth dongle USB stream corrupted (repeated garbage in reads) - connections \
@@ -3425,11 +3427,13 @@ fn run_runtime(
                             );
                         }
                     }
-                    note_acl_corruption(
-                        &mut acl_corruption_times,
-                        &mut acl_corruption_reported,
-                        &event_tx,
-                    );
+                    // Deliberately NOT counted toward the corruption report:
+                    // a deterministic parser stall on one traffic shape (the
+                    // MAP-poll loop produces an identical flush every cycle,
+                    // live 2026-07-15) is a parsing bug to fix, not a wedged
+                    // controller — telling the operator to replug for it was
+                    // a false alarm. Only garbage-PREFIX resyncs (the real
+                    // wedge signature) count.
                     break;
                 }
                 AclPopOutcome::Frame(pkt) => pkt,
@@ -5414,7 +5418,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut times = std::collections::VecDeque::new();
         let mut reported = false;
-        for _ in 0..3 {
+        for _ in 0..2 {
             note_acl_corruption(&mut times, &mut reported, &tx);
         }
         assert!(rx.try_recv().is_err(), "below threshold must stay a log line");
