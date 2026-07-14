@@ -25,6 +25,11 @@ pub enum TerminationIntent {
     /// itself (user feature): after a completed conversation it says goodbye and
     /// terminates so the caller does not have to. Outcome is a normal completion.
     AgentHangup,
+    /// Phase 1 abuse handling (call-policy spec): the agent flagged the caller
+    /// as abusive ([[ABUSE]]); deterministic code spoke the notice and ended
+    /// the call. Its own outcome — `terminated_abuse` — so the Calls row is an
+    /// honest audit trail, never a look-alike "completed".
+    AgentTerminateAbuse,
     /// The dongle/phone link vanished under a live call (audit AOK-LIF-003):
     /// the radio synthesizes termination rather than leaving the session —
     /// and the operator UI — stuck "live" on hardware that is gone.
@@ -222,12 +227,20 @@ impl SessionTracker {
             (true, Some(TerminationIntent::OperatorHangup)) => ("completed", "operator_hangup"),
             // The agent hung up after handling the call: a normal completion.
             (true, Some(TerminationIntent::AgentHangup)) => ("completed", "agent_hangup"),
+            // Abuse termination is its own truth (Phase 1): the notice was
+            // spoken and the call ended by policy — not a completion.
+            (true, Some(TerminationIntent::AgentTerminateAbuse)) => {
+                ("terminated_abuse", "agent_abuse")
+            }
             (true, _) => ("completed", "remote_or_operator"),
             (false, Some(TerminationIntent::OperatorReject)) => ("rejected", "operator_reject"),
             (false, Some(TerminationIntent::OperatorHangup)) => ("rejected", "operator_hangup"),
             // Defensive: the agent only hangs up after answering, so this cannot
             // normally occur — classify as missed rather than leave it unmatched.
             (false, Some(TerminationIntent::AgentHangup)) => ("missed", "agent_hangup"),
+            (false, Some(TerminationIntent::AgentTerminateAbuse)) => {
+                ("rejected", "agent_abuse")
+            }
             (false, None) => ("missed", "remote_or_operator"),
         };
         Some(EndedCall {
@@ -314,6 +327,25 @@ mod tests {
         let ended = t.terminate().unwrap();
         assert_eq!(ended.outcome, "completed");
         assert_eq!(ended.reason, "operator_hangup");
+    }
+
+    /// Phase 1: an abuse termination is its own outcome — the Calls row must
+    /// read `terminated_abuse`, never a look-alike "completed".
+    #[test]
+    fn abuse_termination_has_its_own_outcome() {
+        let mut t = SessionTracker::new();
+        ring(&mut t, "call_a");
+        t.answered();
+        t.note_intent(TerminationIntent::AgentTerminateAbuse);
+        let ended = t.terminate().unwrap();
+        assert_eq!(ended.outcome, "terminated_abuse");
+        assert_eq!(ended.reason, "agent_abuse");
+        // First intent still wins: a later redundant hangup can't relabel it.
+        ring(&mut t, "call_b");
+        t.answered();
+        t.note_intent(TerminationIntent::AgentTerminateAbuse);
+        t.note_intent(TerminationIntent::AgentHangup);
+        assert_eq!(t.terminate().unwrap().outcome, "terminated_abuse");
     }
 
     #[test]
