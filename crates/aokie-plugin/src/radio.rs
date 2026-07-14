@@ -2251,6 +2251,15 @@ fn begin_business_lookup(
     Some((id, rx, Instant::now() + std::time::Duration::from_millis(5000)))
 }
 
+/// FloorManager ownership (guide P1-8, PROMOTED 2026-07-14 after a day of
+/// shadow telemetry): the fused decision drives the substantive yield + duck
+/// actions. `AOKIE_FLOOR_SHADOW_ONLY=1` reverts to observe-only with the
+/// legacy threshold chain — the escape hatch for live tuning.
+fn floor_manager_owns() -> bool {
+    static OWNS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OWNS.get_or_init(|| std::env::var_os("AOKIE_FLOOR_SHADOW_ONLY").is_none())
+}
+
 /// True when a reply ANNOUNCES a data check to the caller ("let me check the
 /// calendar for...") — used as a marker-forgotten fallback: the model's
 /// spoken history strips markers, so it imitated its own announce-only turns
@@ -2742,6 +2751,21 @@ impl<'a> SttProbeLane<'a> {
         self.audio_played = true;
     }
 
+    /// PROMOTED floor path: perform the once-per-reply yield bookkeeping the
+    /// legacy substantive_overlap() did (latch + midSpanYields + log).
+    fn floor_yield_once(&mut self) -> bool {
+        if self.mid_span_fired {
+            return false;
+        }
+        self.mid_span_fired = true;
+        self.status.mid_span_yields.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[aokie-plugin] floor yield — substantive overlap takes the clause: {}",
+            content_for_log(self.content.trim())
+        );
+        true
+    }
+
     /// The bot text spoken so far (+ the sentence about to play): the echo
     /// comparator for [`Self::substantive_overlap`].
     fn set_bot_context(&mut self, ctx: String) {
@@ -3007,26 +3031,11 @@ fn tts_speak(
             lane.maybe_probe(&playback);
             if let Some(intent) = lane.check() {
                 playback.semantic = Some(intent);
-            } else if !playback.barged
-                && (playback.speech_during_playback
-                    || (lane.audio_played && playback.speech_start.is_some()))
-                && lane.substantive_overlap()
-            {
-                // speech_during_playback gate (live call 20563f53): the
-                // capture can hold the TAIL of the caller's own just-finished
-                // turn — the reply answering an interruption got cut 723 ms in
-                // by the residue of that same interruption. Only speech that
-                // BEGAN while this span was audibly playing may yield it.
-                // A substantive comment takes the floor NOW — as a POLICY-AWARE
-                // soft barge (a protected/digit span still finishes its bounded
-                // extension), unlike the hard cut of a spoken "wait"/"stop".
-                // The cut tail rides the nudge into the next reply.
-                playback.barged = true;
-                playback.barged_at = Some(now);
             }
-            // SHADOW floor decision from the same evidence the live paths
-            // see. Log only on transitions (content-free reason codes);
-            // count per severity; the span-end block scores divergence.
+            // Fused floor decision (guide §7.1). PROMOTED: it owns the
+            // substantive-yield and duck actions; the spoken-command lane
+            // above and the energy hard-barge in poll_mic stay authoritative
+            // for their cases. Shadow-only mode keeps the legacy chain.
             let (txt, substantive) = lane.shadow_snapshot();
             let ev = crate::duplex::FloorEvidence {
                 bot_audible: !playback.first,
@@ -3045,6 +3054,8 @@ fn tts_speak(
                 substantive,
                 protected_span: finish_extra.is_some(),
                 barge_energy: playback.barged,
+                speech_began_in_reply: playback.speech_during_playback
+                    || (lane.audio_played && playback.speech_start.is_some()),
             };
             let (dec, reason) = crate::duplex::shadow_floor_decision(&ev);
             shadow_worst = shadow_worst.max(crate::duplex::floor_decision_rank(dec));
@@ -3064,8 +3075,48 @@ fn tts_speak(
                     _ => {}
                 }
                 if dec != crate::duplex::FloorDecision::Continue {
-                    eprintln!("[aokie-plugin] floor shadow: {dec:?} ({reason})");
+                    if floor_manager_owns() {
+                        eprintln!("[aokie-plugin] floor: {dec:?} ({reason})");
+                    } else {
+                        eprintln!("[aokie-plugin] floor shadow: {dec:?} ({reason})");
+                    }
                 }
+            }
+            if floor_manager_owns() {
+                match dec {
+                    crate::duplex::FloorDecision::CutNow
+                    | crate::duplex::FloorDecision::YieldAtBoundary
+                        if matches!(
+                            reason,
+                            "substantive_overlap" | "substantive_over_protected"
+                        ) =>
+                    {
+                        // Policy-aware soft barge: a protected/digit span
+                        // still finishes its bounded extension; the cut tail
+                        // rides the nudge into the next reply.
+                        if !playback.barged && lane.floor_yield_once() {
+                            playback.barged = true;
+                            playback.barged_at = Some(now);
+                        }
+                    }
+                    crate::duplex::FloorDecision::Duck => {
+                        if playback.ducked_at.is_none() {
+                            playback.ducked_at = Some(now);
+                        }
+                    }
+                    // explicit_stop/explicit_wait belong to the spoken-command
+                    // lane (lane.check() above); energy_barge already acted in
+                    // poll_mic; Continue/StaySilent need nothing.
+                    _ => {}
+                }
+            } else if !playback.barged
+                && (playback.speech_during_playback
+                    || (lane.audio_played && playback.speech_start.is_some()))
+                && lane.substantive_overlap()
+            {
+                // Legacy threshold chain (shadow-only mode).
+                playback.barged = true;
+                playback.barged_at = Some(now);
             }
         }
         if playback.stop_playback_now(now) {
@@ -3083,7 +3134,9 @@ fn tts_speak(
     // signal — an echo-driven energy barge shows up as "actual cut, shadow
     // saw nothing"; an ignored comment as "shadow cut/yield, span played
     // out". One line per divergent span, content-free.
-    if let Some(lane) = probe.as_deref() {
+    if let Some(lane) = probe.as_deref().filter(|_| !floor_manager_owns()) {
+        // Divergence is only meaningful in shadow-only mode — once promoted,
+        // the decision IS the action.
         let actual_cut = playback.barged || playback.semantic.is_some();
         let shadow_cut = shadow_worst >= 2; // YieldAtBoundary or stronger
         if shadow_cut != actual_cut && !playback.cancelled {
