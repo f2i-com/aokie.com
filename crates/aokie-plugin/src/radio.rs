@@ -189,7 +189,7 @@ Booking rule: a booking or message is INCOMPLETE without the caller's name. If y
 /// real generations stay identically primed. A missing/failed lookup flow
 /// degrades gracefully — the injected result says UNAVAILABLE and the model
 /// answers from its notes.
-const TOOL_INSTRUCTION: &str = "\n\nLive lookups: when the caller asks for business DATA you genuinely do NOT have in your notes (availability beyond the listed days, records), reply with EXACTLY [[LOOKUP: one clear data question]] and nothing else - the SYSTEM runs the lookup and hands you the result to answer from. The lookup question is addressed to a DATABASE, never to the caller: if you need to ask the CALLER something (to clarify a date, for example), just ask them normally WITHOUT the marker. At most one lookup per caller turn; never for things already in your notes. Dates beyond your calendar window are EXACTLY what lookups are for - run one instead of deferring to the team.";
+const TOOL_INSTRUCTION: &str = "\n\nLive lookups: when the caller asks for business DATA you genuinely do NOT have in your notes (availability beyond the listed days, records), reply with EXACTLY [[LOOKUP: one clear data question]] and nothing else - the SYSTEM runs the lookup and hands you the result to answer from. The lookup question is addressed to a DATABASE, never to the caller: if you need to ask the CALLER something (to clarify a date, for example), just ask them normally WITHOUT the marker. At most one lookup per caller turn; never for things already in your notes. Dates beyond your calendar window are EXACTLY what lookups are for - run one instead of deferring to the team. When the question involves specific dates, work each one out from today's date and write it in plain YYYY-MM-DD form inside the lookup question (for example [[LOOKUP: availability 2026-08-01]]) - the system answers exact dates directly.";
 
 /// Spoken while the lookup flow runs (1-4 s): silence there reads as a dead
 /// line. Persona-neutral on purpose.
@@ -399,10 +399,15 @@ fn compose_agent_system_prompt(
     agent_hangup: bool,
     cut_context: Option<&str>,
 ) -> String {
+    // An explicit "today" anchor: the model has to resolve relative dates
+    // ("first Saturday of August", "next Tuesday") both when speaking and
+    // when composing lookup questions, and without this line it had nothing
+    // to resolve them against but conversational vibes.
+    let today = aokie_core::events::today_spoken_local();
     let mut p = if agent_hangup {
-        format!("{persona}{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}{END_CALL_INSTRUCTION}")
+        format!("{persona}\n\nToday is {today}.{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}{END_CALL_INSTRUCTION}")
     } else {
-        format!("{persona}{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}")
+        format!("{persona}\n\nToday is {today}.{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}")
     };
     if let Some(tail) = cut_context {
         p.push_str(&format!(
@@ -2233,6 +2238,7 @@ fn begin_business_lookup(
     Some((id, rx, Instant::now() + std::time::Duration::from_millis(5000)))
 }
 
+#[cfg(all(target_os = "windows", feature = "voice"))]
 fn finish_business_lookup(
     host: &Arc<crate::host_rpc::HostRpc>,
     pending: Option<(u64, std::sync::mpsc::Receiver<crate::host_rpc::HostResult>, Instant)>,
@@ -5750,7 +5756,7 @@ fn run_loop(
                                     history.push(serde_json::json!({
                                         "role": "user",
                                         "content": format!(
-                                            "[SYSTEM LOOKUP RESULT - this is data, not the caller speaking]\n{result_text}\nAnswer the caller's question (\"{q}\") now in one or two short spoken sentences using ONLY this result and your notes. TRUST the result's own rules about dates that are not listed - an unlisted date inside its window IS open. Only defer to the team when the question falls outside the result's stated window or genuinely cannot be answered from it."
+                                            "[SYSTEM LOOKUP RESULT - this is data, not the caller speaking]\n{result_text}\nAnswer the caller's question (\"{q}\") now in one or two short spoken sentences using ONLY this result and your notes. If the result has a DIRECT ANSWER line for the date in question, that line IS the answer - speak it; never say a date is outside your window when a DIRECT ANSWER covers it. Otherwise TRUST the result's own rules about dates that are not listed - an unlisted date inside its window IS open. Only defer to the team when the result itself says to."
                                         ),
                                     }));
                                     continue 'reply_rounds;
