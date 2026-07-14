@@ -3822,6 +3822,10 @@ fn run_loop(
     // call OR idle) resets per-call voice state and re-stamps the STT gate.
     #[cfg(feature = "voice")]
     let mut voice_call_gen: u64 = 0;
+    // Volatile realtime lane (guide §9.2 v1): live caller partials + session
+    // phase as droppable realtime.emit notifications. One lane per call
+    // epoch; recreated in the per-call reset block below.
+    let mut rt_lane: Option<crate::realtime::RealtimeLane> = None;
     // AOK-CTRL-001: call-level max-silence watchdog (agent mode). Created when
     // the greeting arms the conversation, dropped at every call boundary.
     #[cfg(feature = "voice")]
@@ -4017,6 +4021,14 @@ fn run_loop(
             }
             voice_call_gen = tracker.generation();
             stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
+            rt_lane = tracker.call_id().map(|id| {
+                crate::realtime::RealtimeLane::new(id.to_string(), voice_call_gen, Instant::now())
+            });
+            if let Some(lane) = rt_lane.as_mut() {
+                if let Some(line) = lane.phase("listening", Instant::now()) {
+                    let _ = sink.send_line(&line);
+                }
+            }
             // §9.2: no caller turns exist yet in the new call — any reply
             // still naming the previous call's turn number must read stale.
             status.last_caller_turn.store(0, Ordering::Relaxed);
@@ -4560,6 +4572,11 @@ fn run_loop(
                     }
                     live_hyp_prev = live_hyp.take();
                     live_hyp = Some(res.text);
+                    if let (Some(lane), Some(cur)) = (rt_lane.as_mut(), live_hyp.as_deref()) {
+                        if let Some(line) = lane.user_partial(cur, Instant::now()) {
+                            let _ = sink.send_line(&line);
+                        }
+                    }
                     // Content-free tuning telemetry: how often consecutive
                     // partials look stable on REAL calls (specLlmStarted was
                     // 0 for a whole evening before this existed).
@@ -4745,6 +4762,12 @@ fn run_loop(
                     // §9.2: this is now the newest caller turn — a flow reply
                     // naming an older one is stale (typed refusal upstream).
                     status.last_caller_turn.store(turn_index, Ordering::Relaxed);
+                    if let Some(lane) = rt_lane.as_mut() {
+                        lane.turn_final();
+                        if let Some(line) = lane.phase("thinking", Instant::now()) {
+                            let _ = sink.send_line(&line);
+                        }
+                    }
                     turn_overlapped = false;
                     turn_overlap_at = None;
                     turn_index += 1;
@@ -5286,6 +5309,13 @@ fn run_loop(
                                 }
                                 match reply_rx.recv_timeout(Duration::from_millis(25)) {
                                     Ok(ReplyMsg::Sentence(sentence)) => {
+                                        if let Some(lane) = rt_lane.as_mut() {
+                                            if let Some(line) =
+                                                lane.phase("speaking", Instant::now())
+                                            {
+                                                let _ = sink.send_line(&line);
+                                            }
+                                        }
                                         // Strip any [[END_CALL]] marker BEFORE synthesis so the
                                         // caller never hears it and it never lands in the
                                         // transcript; its presence arms the post-reply hangup
@@ -5915,6 +5945,14 @@ fn run_loop(
                             // window measures from here.
                             if let Some(t) = silence_timer.as_mut() {
                                 t.note_activity(Instant::now());
+                            }
+                            // Realtime phase: the reply is done — the floor is
+                            // the caller's again (or the held pause).
+                            if let Some(lane) = rt_lane.as_mut() {
+                                let ph = if dialogue.is_paused() { "paused" } else { "listening" };
+                                if let Some(line) = lane.phase(ph, Instant::now()) {
+                                    let _ = sink.send_line(&line);
+                                }
                             }
                             // The model chose intentional silence ([[WAIT]]): the
                             // floor stays with the caller — hold the pause state
