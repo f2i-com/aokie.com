@@ -1264,6 +1264,14 @@ fn emit_call_ended(
 ) {
     use aokie_core::events::{aokie_event, now_iso8601};
     let from = ended.caller_id.clone().unwrap_or_default();
+    // Phase 3 (additive): a manager-number caller. The after-call booking
+    // extractor must never run on the manager's own line — live call
+    // a5c3f900: a manager-line move was ALSO read as a new booking, minting
+    // a duplicate appointment + an active SMS loop + a kickoff text AT THE
+    // MANAGER. Env is the same truth the running ScreenPolicy is built from
+    // (managerNumbers applies live through apply_screening_env).
+    let manager = !ended.outbound
+        && crate::screen::ScreenPolicy::from_env().is_manager(ended.caller_id.as_deref());
     emit(
         outbox,
         sink,
@@ -1282,6 +1290,7 @@ fn emit_call_ended(
                 // Phase 2 (additive): which way the call went. Outbound
                 // callers' `from` is the DIALED number.
                 "direction": if ended.outbound { "outbound" } else { "inbound" },
+                "manager": manager,
                 "configVersion": config_version,
             }),
         ),
