@@ -3848,6 +3848,12 @@ fn run_loop(
     // consecutive accepted WAIT: a second is rejected and the reply
     // regenerates once with an explicit speak-now note.
     let mut consecutive_waits: u32 = 0;
+    // Post-hangup ghost-turn latch (live call 2f668ad4): the caller's words
+    // captured DURING the goodbye came back from STT ~600ms AFTER the agent's
+    // AT+CHUP, minted a new turn, and the agent spoke a fresh reply into the
+    // dying line — unheard but in the transcript. Once the agent finalizes
+    // the call, late turns are recorded but never answered.
+    let mut agent_hung_up = false;
     // AOK-CTRL-001: call-level max-silence watchdog (agent mode). Created when
     // the greeting arms the conversation, dropped at every call boundary.
     #[cfg(feature = "voice")]
@@ -4052,6 +4058,7 @@ fn run_loop(
             voice_call_gen = tracker.generation();
             stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
             consecutive_waits = 0;
+            agent_hung_up = false;
             rt_lane = tracker.call_id().map(|id| {
                 crate::realtime::RealtimeLane::new(id.to_string(), voice_call_gen, Instant::now())
             });
@@ -4843,7 +4850,16 @@ fn run_loop(
 
                     // Whether to fall through to the normal LLM reply path.
                     let mut respond_with_llm = false;
-                    if agent_enabled && !hesitation {
+                    if agent_hung_up {
+                        // The agent already said goodbye and hung up: a late
+                        // STT result from goodbye-overlap capture is part of
+                        // the record, never a prompt for one more reply into
+                        // a dying line.
+                        eprintln!(
+                            "[aokie-plugin] turn arrived after the agent hung up — recorded, not answered"
+                        );
+                    }
+                    if agent_enabled && !hesitation && !agent_hung_up {
                         history.push(serde_json::json!({ "role": "user", "content": text }));
                         if history.len() > 24 {
                             let drop = history.len() - 24;
@@ -6019,9 +6035,12 @@ fn run_loop(
                                         crate::call_session::TerminationIntent::AgentHangup,
                                     );
                                     match bt.hangup() {
-                                        Ok(()) => eprintln!(
-                                            "[aokie-plugin] agent finalized the call — hung up (AT+CHUP)"
-                                        ),
+                                        Ok(()) => {
+                                            agent_hung_up = true;
+                                            eprintln!(
+                                                "[aokie-plugin] agent finalized the call — hung up (AT+CHUP)"
+                                            );
+                                        }
                                         Err(e) => {
                                             eprintln!("[aokie-plugin] agent hangup failed: {e}");
                                             emit_control_failed(
