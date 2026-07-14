@@ -403,6 +403,11 @@ pub struct FloorEvidence {
     pub protected_span: bool,
     /// The live energy/soft barge has tripped for this span.
     pub barge_energy: bool,
+    /// The overlap speech began during THIS reply's audible playback (not
+    /// pre-reply residue — the 20563f53 self-echo class). A substantive cut
+    /// requires it; promoted ownership keeps the protection inside the
+    /// tested decision instead of scattered call-site gates.
+    pub speech_began_in_reply: bool,
 }
 
 /// §7.1 floor actions. Shadow-only today; the variants map onto the live
@@ -460,6 +465,12 @@ pub fn shadow_floor_decision(ev: &FloorEvidence) -> (FloorDecision, &'static str
             return (FloorDecision::Duck, "short_backchannel");
         }
         if ev.substantive {
+            if !ev.speech_began_in_reply {
+                // The transcript is substantive but the AUDIO predates this
+                // reply's playback: the tail of the caller's own previous
+                // turn, not an interruption (live call 20563f53).
+                return (FloorDecision::Continue, "stale_or_pre_reply");
+            }
             return if ev.protected_span {
                 (FloorDecision::YieldAtBoundary, "substantive_over_protected")
             } else {
@@ -501,6 +512,7 @@ mod floor_shadow_tests {
             substantive: false,
             protected_span: false,
             barge_energy: false,
+            speech_began_in_reply: true,
         }
     }
 
@@ -541,6 +553,18 @@ mod floor_shadow_tests {
         // Short echo-suspect fragment → the live paths ignore it; so do we.
         let echo = FloorEvidence { stable_text: "booked at".into(), ..ev() };
         assert_eq!(shadow_floor_decision(&echo), (FloorDecision::Continue, "short_or_echo"));
+        // Substantive text whose AUDIO predates the reply: pre-reply residue,
+        // never a cut (the 20563f53 self-echo class, now inside the decision).
+        let stale = FloorEvidence {
+            stable_text: "no wait not thursday".into(),
+            substantive: true,
+            speech_began_in_reply: false,
+            ..ev()
+        };
+        assert_eq!(
+            shadow_floor_decision(&stale),
+            (FloorDecision::Continue, "stale_or_pre_reply")
+        );
     }
 
     #[test]
