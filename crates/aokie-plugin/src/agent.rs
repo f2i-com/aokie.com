@@ -74,6 +74,39 @@ impl LlmClient {
     /// deadline (reqwest 0.11 has no per-read timeout — only the whole-request
     /// deadline set in [`LlmClient::new`], which remains the hard backstop for
     /// a worker abandoned mid-read).
+    /// Ring-time KV pre-warm (2026-07-14): process the reply request's
+    /// PREFIX (system prompt + history) with a 1-token generation so
+    /// llama.cpp's prompt cache is hot when the real reply arrives — its
+    /// first token then only pays for the caller's new words. Cheap on the
+    /// serving GPU; fire-and-forget from a worker thread, NEVER the radio
+    /// loop (an on-loop HTTP call delayed the ANSWER once already).
+    pub fn warm_prefix(&self, messages: serde_json::Value) -> Result<(), String> {
+        let mut body = serde_json::json!({
+            "messages": messages,
+            "stream": false,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "cache_prompt": true,
+            "chat_template_kwargs": { "enable_thinking": false },
+        });
+        if let Some(m) = &self.model {
+            body["model"] = serde_json::json!(m);
+        }
+        let client = self
+            .client
+            .as_ref()
+            .map_err(|reason| format!("llm endpoint rejected: {reason}"))?;
+        let resp = client
+            .post(&self.endpoint)
+            .json(&body)
+            .send()
+            .map_err(|e| format!("llm warm failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("llm warm responded {}", resp.status()));
+        }
+        Ok(())
+    }
+
     pub fn stream_reply(
         &self,
         messages: serde_json::Value,
@@ -90,6 +123,10 @@ impl LlmClient {
             // Sunday-July-19-6PM record) — factual precision beats sparkle
             // on a phone line.
             "temperature": 0.35,
+            // llama.cpp prompt/KV caching: with the ring-time prefix warm the
+            // real reply's first token only pays for the caller's NEW words.
+            // Providers without the extension ignore the field.
+            "cache_prompt": true,
             // Qwen3-class reasoning models otherwise burn the budget on a hidden
             // <think> block; ignored by models without a thinking mode.
             "chat_template_kwargs": { "enable_thinking": false },
