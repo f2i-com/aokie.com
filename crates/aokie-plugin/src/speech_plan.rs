@@ -271,6 +271,22 @@ pub fn parse_lookup_marker(text: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+mod lookup_marker_tests {
+    #[test]
+    fn parse_lookup_marker_shapes() {
+        use super::parse_lookup_marker as p;
+        assert_eq!(p("[[LOOKUP: any tables Friday?]]"), Some("any tables Friday?".into()));
+        assert_eq!(
+            p("Sure. [[LOOKUP: bookings on the 28th]] thanks"),
+            Some("bookings on the 28th".into())
+        );
+        assert_eq!(p("[[LOOKUP:]]"), None, "empty question is not a lookup");
+        assert_eq!(p("[[LOOKUP: unclosed marker"), None, "unclosed never parses");
+        assert_eq!(p("no marker here"), None);
+    }
+}
+
 /// True when the text carries a `[[WAIT]]` / `[WAIT]` marker — the model's
 /// way of choosing INTENTIONAL SILENCE ("the caller is thinking; say
 /// nothing"). The marker itself is always stripped by [`plan_spans`].
