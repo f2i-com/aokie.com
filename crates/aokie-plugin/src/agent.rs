@@ -107,6 +107,32 @@ impl LlmClient {
         Ok(())
     }
 
+    /// Encode 16-bit mono PCM as a base64 WAV — the `input_audio` content
+    /// part for audio-capable models (Gemma 3n / Qwen2-Audio class) served
+    /// by llama-server's OpenAI-compatible endpoint. Used only when the
+    /// `sendAudio` setting is on.
+    pub fn wav_base64(pcm: &[i16], sample_rate: u32) -> String {
+        use base64::Engine as _;
+        let data_len = (pcm.len() * 2) as u32;
+        let mut wav = Vec::with_capacity(44 + pcm.len() * 2);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for s in pcm {
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+        base64::engine::general_purpose::STANDARD.encode(&wav)
+    }
+
     pub fn stream_reply(
         &self,
         messages: serde_json::Value,
