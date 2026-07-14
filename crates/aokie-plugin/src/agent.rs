@@ -123,12 +123,21 @@ impl LlmClient {
         wav_b64: &str,
         stt_text: &str,
         context: &str,
+        prev_draft: Option<&str>,
     ) -> Result<String, String> {
-        let hint = if context.is_empty() {
-            format!("Recognizer draft: {stt_text}")
-        } else {
-            format!("Conversation so far:\n{context}\n\nRecognizer draft: {stt_text}")
-        };
+        let mut hint = String::new();
+        if !context.is_empty() {
+            hint.push_str(&format!("Conversation so far:\n{context}\n\n"));
+        }
+        if let Some(p) = prev_draft {
+            // Split-utterance continuity: the WAV starts with the caller's
+            // previous utterance so the model hears the sentence flow — it
+            // must still output only the FINAL utterance.
+            hint.push_str(&format!(
+                "The audio STARTS with the caller's previous utterance (draft: {p}) for continuity - transcribe ONLY the final utterance after it.\n\n"
+            ));
+        }
+        hint.push_str(&format!("Recognizer draft: {stt_text}"));
         let mut body = serde_json::json!({
             "messages": [
                 { "role": "system", "content": "You transcribe one short phone-call utterance from its audio. A speech recognizer's draft and the recent conversation are provided; correct any words the recognizer got wrong using the audio, and use the conversation only to resolve unclear or ambiguous words toward what the caller plainly meant to say. Never import words from the conversation that the audio does not support. When the draft already reads as fluent natural speech, prefer it - change only words the audio clearly contradicts. If the audio is silence or a filler sound, output the draft unchanged. Reply with ONLY the corrected transcription - the caller's exact words, no quotes, no commentary." },
