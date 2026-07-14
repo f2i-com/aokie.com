@@ -5338,6 +5338,7 @@ fn run_loop(
                                     if !line_dead
                                         && !wait_requested
                                         && lookup_requested.is_none()
+                                        && lookup_rounds == 0
                                         && reply_left_dead_air(
                                             reply_dur > Duration::ZERO,
                                             barged,
@@ -5646,6 +5647,24 @@ fn run_loop(
                             // flow takes 1-4 s); every failure injects an
                             // explicit UNAVAILABLE so the model answers from
                             // its notes instead of guessing.
+                            let mut speak_handoff = false;
+                            if lookup_rounds > 0
+                                && reply_dur == Duration::ZERO
+                                && !line_dead
+                                && !operator_ended
+                                && !wait_requested
+                                && !barged
+                            {
+                                // The post-lookup round produced NOTHING
+                                // audible: an empty regeneration must never
+                                // end in the tech-difficulties apology (live
+                                // call fefa0e8d — the lookup itself had
+                                // SUCCEEDED).
+                                eprintln!(
+                                    "[aokie-plugin] post-lookup round was silent — speaking the handoff line"
+                                );
+                                speak_handoff = true;
+                            }
                             if let Some(q) = lookup_requested.take() {
                                 if lookup_rounds > 0
                                     && !line_dead
@@ -5659,56 +5678,7 @@ fn run_loop(
                                     eprintln!(
                                         "[aokie-plugin] repeat lookup request — speaking the handoff line"
                                     );
-                                    let sr_now = bt.get_sample_rate();
-                                    let mut hprobe = ControlProbe::new(
-                                        &control_rx,
-                                        &mut pending_controls,
-                                    );
-                                    let (aec_ref, brms) = if barge_in {
-                                        (aec.as_mut(), Some(barge_rms))
-                                    } else {
-                                        (None, None)
-                                    };
-                                    let h_started = Instant::now();
-                                    let planned = speak_planned(
-                                        bt,
-                                        &synth,
-                                        LOOKUP_HANDOFF_LINE,
-                                        sr_now,
-                                        aec_ref,
-                                        brms,
-                                        Some(&mut hprobe),
-                                        &pace,
-                                        protected_max_ms,
-                                        None,
-                                    );
-                                    if let Some(action) = hprobe.action.take() {
-                                        perform_cancel_action(
-                                            action, bt, &mut tracker, outbox, sink,
-                                        );
-                                    }
-                                    if planned.outcome.dur > Duration::ZERO
-                                        && !planned.played_text.is_empty()
-                                    {
-                                        history.push(serde_json::json!({
-                                            "role": "assistant",
-                                            "content": planned.played_text,
-                                        }));
-                                        emit_turn_with_delivery(
-                                            outbox,
-                                            sink,
-                                            &corr,
-                                            turn_index,
-                                            "bot",
-                                            &planned.played_text,
-                                            Some("complete"),
-                                            Some(&aokie_core::events::iso8601_ago_ms(
-                                                h_started.elapsed().as_millis() as u64,
-                                            )),
-                                        );
-                                        turn_index += 1;
-                                    }
-                                    break 'reply_rounds;
+                                    speak_handoff = true;
                                 }
                                 if lookup_rounds == 0
                                     && !line_dead
@@ -5771,13 +5741,70 @@ fn run_loop(
                                         "[aokie-plugin] lookup result: [{} chars]",
                                         result_text.chars().count()
                                     );
+                                    // USER role, clearly framed: a TRAILING
+                                    // system message renders badly in many
+                                    // chat templates — the first successful
+                                    // live lookup regenerated to EMPTY and the
+                                    // caller got the tech-difficulties apology
+                                    // (call fefa0e8d).
                                     history.push(serde_json::json!({
-                                        "role": "system",
+                                        "role": "user",
                                         "content": format!(
-                                            "LOOKUP RESULT for \"{q}\":\n{result_text}\nAnswer the caller now in one or two short spoken sentences using ONLY this result and your notes. If it does not answer the question, say you will have the team check and offer to take their details."
+                                            "[SYSTEM LOOKUP RESULT - this is data, not the caller speaking]\n{result_text}\nAnswer the caller's question (\"{q}\") now in one or two short spoken sentences using ONLY this result and your notes. If it does not answer the question, say you will have the team check and offer to take their details."
                                         ),
                                     }));
                                     continue 'reply_rounds;
+                                }
+                            }
+                            if speak_handoff
+                                && !line_dead
+                                && !operator_ended
+                                && bt.get_sample_rate() > 0
+                            {
+                                let sr_now = bt.get_sample_rate();
+                                let mut hprobe =
+                                    ControlProbe::new(&control_rx, &mut pending_controls);
+                                let (aec_ref, brms) = if barge_in {
+                                    (aec.as_mut(), Some(barge_rms))
+                                } else {
+                                    (None, None)
+                                };
+                                let h_started = Instant::now();
+                                let planned = speak_planned(
+                                    bt,
+                                    &synth,
+                                    LOOKUP_HANDOFF_LINE,
+                                    sr_now,
+                                    aec_ref,
+                                    brms,
+                                    Some(&mut hprobe),
+                                    &pace,
+                                    protected_max_ms,
+                                    None,
+                                );
+                                if let Some(action) = hprobe.action.take() {
+                                    perform_cancel_action(action, bt, &mut tracker, outbox, sink);
+                                }
+                                if planned.outcome.dur > Duration::ZERO
+                                    && !planned.played_text.is_empty()
+                                {
+                                    history.push(serde_json::json!({
+                                        "role": "assistant",
+                                        "content": planned.played_text,
+                                    }));
+                                    emit_turn_with_delivery(
+                                        outbox,
+                                        sink,
+                                        &corr,
+                                        turn_index,
+                                        "bot",
+                                        &planned.played_text,
+                                        Some("complete"),
+                                        Some(&aokie_core::events::iso8601_ago_ms(
+                                            h_started.elapsed().as_millis() as u64,
+                                        )),
+                                    );
+                                    turn_index += 1;
                                 }
                             }
                             break 'reply_rounds;
