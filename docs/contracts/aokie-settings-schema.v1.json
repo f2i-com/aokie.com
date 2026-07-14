@@ -18,6 +18,11 @@
       "appliesLive": false
     },
     {
+      "key": "sendAudio",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
       "key": "agentHangup",
       "type": "bool",
       "appliesLive": false
