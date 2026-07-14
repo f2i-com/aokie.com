@@ -189,7 +189,7 @@ Booking rule: a booking or message is INCOMPLETE without the caller's name. If y
 /// real generations stay identically primed. A missing/failed lookup flow
 /// degrades gracefully — the injected result says UNAVAILABLE and the model
 /// answers from its notes.
-const TOOL_INSTRUCTION: &str = "\n\nLive lookups: when the caller asks for business DATA you genuinely do NOT have in your notes (availability beyond the listed days, records), reply with EXACTLY [[LOOKUP: one clear data question]] and nothing else - the SYSTEM runs the lookup and hands you the result to answer from. The lookup question is addressed to a DATABASE, never to the caller: if you need to ask the CALLER something (to clarify a date, for example), just ask them normally WITHOUT the marker. At most one lookup per caller turn; never for things already in your notes.";
+const TOOL_INSTRUCTION: &str = "\n\nLive lookups: when the caller asks for business DATA you genuinely do NOT have in your notes (availability beyond the listed days, records), reply with EXACTLY [[LOOKUP: one clear data question]] and nothing else - the SYSTEM runs the lookup and hands you the result to answer from. The lookup question is addressed to a DATABASE, never to the caller: if you need to ask the CALLER something (to clarify a date, for example), just ask them normally WITHOUT the marker. At most one lookup per caller turn; never for things already in your notes. Dates beyond your calendar window are EXACTLY what lookups are for - run one instead of deferring to the team.";
 
 /// Spoken while the lookup flow runs (1-4 s): silence there reads as a dead
 /// line. Persona-neutral on purpose.
