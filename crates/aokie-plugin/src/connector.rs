@@ -1938,6 +1938,7 @@ impl Plugin {
                             | "screenMessage"
                             | "blockedMessage"
                             | "autoBlockAbuse"
+                            | "managerNumbers"
                     )
                 });
                 if screening_key {
@@ -2650,6 +2651,11 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     // only an explicit false turns the auto-block off (the notice + hangup
     // always happen regardless).
     SettingSpec { key: "autoBlockAbuse", kind: SettingKind::Bool, applies_live: true },
+    // Phase 3 manager line: numbers whose callers get the MANAGER persona +
+    // name-inclusive lookups (READ-ONLY — caller ID is spoofable; writes will
+    // additionally require the spoken PIN). Applies live via the screening
+    // reload machinery.
+    SettingSpec { key: "managerNumbers", kind: SettingKind::Str { max_chars: 2000 }, applies_live: true },
     // Phase 2 outbound guardrails — read at DISPATCH time (call.dial), so
     // they apply immediately with no reconnect. outboundEnabled is the kill
     // switch and DEFAULTS OFF: the receptionist can never place a call until
@@ -2740,6 +2746,7 @@ fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
         ("acceptPattern", "AOKIE_ACCEPT_PATTERN"),
         ("screenMessage", "AOKIE_SCREEN_MESSAGE"),
         ("blockedMessage", "AOKIE_BLOCKED_MESSAGE"),
+        ("managerNumbers", "AOKIE_MANAGER_NUMBERS"),
     ] {
         let v = settings
             .get(key)
