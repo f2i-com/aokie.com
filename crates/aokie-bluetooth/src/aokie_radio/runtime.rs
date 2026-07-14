@@ -1104,6 +1104,39 @@ fn pop_acl_frame(
 /// Format the leading 32 bytes of an ACL accumulator buffer as a
 /// space-separated hex string for diagnostic logging. Caps at 32 so a
 /// stray full-buffer caller can't dump kilobytes into the log.
+/// Persistent ACL-stream corruption detector (see the tracker locals in the
+/// radio loop): ≥4 resync/flush recoveries inside 5 minutes means the dongle
+/// controller is mangling its USB transfers — every connect will fail until
+/// the operator power-cycles it — so raise ONE actionable hardware error.
+/// The window emptying (a quiet 5 minutes) re-arms the report, so a relapse
+/// after a recovery is announced again.
+fn note_acl_corruption(
+    times: &mut std::collections::VecDeque<Instant>,
+    reported: &mut bool,
+    event_tx: &UnboundedSender<RuntimeEvent>,
+) {
+    let now = Instant::now();
+    while times
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(300))
+    {
+        times.pop_front();
+    }
+    if times.is_empty() {
+        *reported = false;
+    }
+    times.push_back(now);
+    if times.len() >= 4 && !*reported {
+        *reported = true;
+        let _ = event_tx.send(RuntimeEvent::Error(
+            "Bluetooth dongle USB stream corrupted (repeated garbage in reads) - connections \
+             cannot succeed until the dongle is power-cycled: unplug it, wait 5 seconds, plug \
+             it back in"
+                .to_string(),
+        ));
+    }
+}
+
 fn first32_hex(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -1528,6 +1561,17 @@ fn run_runtime(
     // the entire ACL stream forever (incoming-call RING bytes get
     // queued behind the bogus header and HFP never sees them).
     let mut acl_partial_since: Option<Instant> = None;
+    // Persistent-corruption detector (live incident 2026-07-15): a wedged
+    // dongle controller (BCM20702 firmware) prefixed EVERY inbound transfer
+    // with garbage bytes until a PHYSICAL replug — software resets, HCI
+    // reset and USB disable/enable all survived it, and connections just
+    // failed silently for hours. Repeated resync/flush recoveries in a
+    // short window are that signature; surface ONE actionable hardware
+    // error (degraded health + operator toast) instead of a mute death.
+    // A transient one-off resync (seen once during a 2026-07-13 listing
+    // burst) stays a log line — it never reaches the threshold.
+    let mut acl_corruption_times: std::collections::VecDeque<Instant> = Default::default();
+    let mut acl_corruption_reported = false;
     let mut loop_iter: u64 = 0;
     let mut last_heartbeat = Instant::now();
     // ACL keepalive: during a call the SCO link monopolises the air and the AG
@@ -3349,6 +3393,11 @@ fn run_runtime(
                         buffer_len_before,
                         first32_hex(&first32),
                     );
+                    note_acl_corruption(
+                        &mut acl_corruption_times,
+                        &mut acl_corruption_reported,
+                        &event_tx,
+                    );
                     continue;
                 }
                 AclPopOutcome::Flushed {
@@ -3376,6 +3425,11 @@ fn run_runtime(
                             );
                         }
                     }
+                    note_acl_corruption(
+                        &mut acl_corruption_times,
+                        &mut acl_corruption_reported,
+                        &event_tx,
+                    );
                     break;
                 }
                 AclPopOutcome::Frame(pkt) => pkt,
@@ -5354,6 +5408,25 @@ fn build_msbc_sco_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acl_corruption_reports_once_at_threshold() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut times = std::collections::VecDeque::new();
+        let mut reported = false;
+        for _ in 0..3 {
+            note_acl_corruption(&mut times, &mut reported, &tx);
+        }
+        assert!(rx.try_recv().is_err(), "below threshold must stay a log line");
+        note_acl_corruption(&mut times, &mut reported, &tx);
+        match rx.try_recv() {
+            Ok(RuntimeEvent::Error(msg)) => assert!(msg.contains("power-cycled")),
+            other => panic!("expected the actionable error, got {other:?}"),
+        }
+        // One report per episode — continued corruption must not spam.
+        note_acl_corruption(&mut times, &mut reported, &tx);
+        assert!(rx.try_recv().is_err(), "no duplicate reports mid-episode");
+    }
 
     fn listing_with(handles: &[&str]) -> Vec<u8> {
         let mut s = String::from("<MAP-msg-listing version=\"1.0\">");
