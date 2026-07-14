@@ -3760,6 +3760,14 @@ fn run_loop(
     // meaningful with the agent on (it drives the interruptible reply loop).
     #[cfg(feature = "voice")]
     let barge_in = agent_enabled && std::env::var_os("AOKIE_BARGE_IN").is_some();
+    // sendAudio: attach the caller turn's PCM (base64 WAV) to the LLM request
+    // alongside the transcript — for audio-capable models (Gemma 3n /
+    // Qwen2-Audio class). The snapshot is taken where the utterance is sent
+    // to STT; capped at ~30 s so a rambling turn can't balloon the request.
+    #[cfg(feature = "voice")]
+    let send_audio = agent_enabled && std::env::var_os("AOKIE_SEND_AUDIO").is_some();
+    #[cfg(feature = "voice")]
+    let mut last_turn_audio: Vec<i16> = Vec::new();
     // When AOKIE_AGENT_HANGUP is set (the `agentHangup` setting) the agent ends
     // the call itself once the caller's request is fully handled: it says a brief
     // goodbye, then hangs up (AT+CHUP) so the caller doesn't have to. The LLM
@@ -3935,6 +3943,14 @@ fn run_loop(
                         // waits for that result; never send it twice.
                     } else if let Some(s) = tracker.current_mut() {
                         let utterance = s.next_utterance_id();
+                        if send_audio {
+                            let start = stt_buf.len().saturating_sub(16_000 * 30);
+                            // stt_buf holds f32 samples — convert to i16 PCM for the WAV.
+                            last_turn_audio = stt_buf[start..]
+                                .iter()
+                                .map(|&x| (x.clamp(-1.0, 1.0) * 32767.0) as i16)
+                                .collect();
+                        }
                         if stt_tx
                             .send(SttWork::Utterance {
                                 generation: s.generation,
@@ -4526,6 +4542,14 @@ fn run_loop(
                     // Stamp the job with the call it belongs to (audit C-05).
                     if let Some(s) = tracker.current_mut() {
                         let utterance = s.next_utterance_id();
+                        if send_audio {
+                            let start = stt_buf.len().saturating_sub(16_000 * 30);
+                            // stt_buf holds f32 samples — convert to i16 PCM for the WAV.
+                            last_turn_audio = stt_buf[start..]
+                                .iter()
+                                .map(|&x| (x.clamp(-1.0, 1.0) * 32767.0) as i16)
+                                .collect();
+                        }
                         if stt_tx
                             .send(SttWork::Utterance {
                                 generation: s.generation,
@@ -5100,6 +5124,40 @@ fn run_loop(
                                 serde_json::json!({ "role": "system", "content": system_prompt }),
                             ];
                             messages.extend(history.iter().cloned());
+                            // sendAudio: the LAST user message becomes content
+                            // PARTS — the turn's audio + its transcript. Only
+                            // the WIRE copy: history stays text, so replayed
+                            // context never re-sends old audio. (Speculative
+                            // replies stay text-only — they start mid-
+                            // utterance before the PCM is final.)
+                            if send_audio && !last_turn_audio.is_empty() {
+                                if let Some(last) = messages.last_mut() {
+                                    if last.get("role").and_then(serde_json::Value::as_str)
+                                        == Some("user")
+                                    {
+                                        let txt = last
+                                            .get("content")
+                                            .and_then(serde_json::Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let b64 = crate::agent::LlmClient::wav_base64(
+                                            &last_turn_audio,
+                                            16_000,
+                                        );
+                                        eprintln!(
+                                            "[aokie-plugin] attaching caller-turn audio to the LLM request ({} samples)",
+                                            last_turn_audio.len()
+                                        );
+                                        *last = serde_json::json!({
+                                            "role": "user",
+                                            "content": [
+                                                { "type": "input_audio", "input_audio": { "data": b64, "format": "wav" } },
+                                                { "type": "text", "text": txt },
+                                            ],
+                                        });
+                                    }
+                                }
+                            }
                             // Half-duplex: mute STT for the WHOLE reply as it streams.
                             // Sentences synthesize faster than they play, so the audio
                             // keeps playing (queued) after synthesis finishes; muting

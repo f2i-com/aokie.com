@@ -452,6 +452,21 @@ impl Plugin {
             std::env::set_var("AOKIE_BARGE_IN", "1");
             eprintln!("[aokie-plugin] bargeIn ON → full-duplex (caller can talk over Aokie)");
         }
+        // sendAudio: attach the caller turn's AUDIO (base64 WAV content part)
+        // to the LLM request alongside the transcript — for audio-capable
+        // models (Gemma 3n / Qwen2-Audio class) served by llama-server.
+        // Text-only models ignore or reject the part, so it defaults OFF.
+        let send_audio = self
+            .store
+            .config
+            .settings
+            .get("sendAudio")
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false);
+        if send_audio {
+            std::env::set_var("AOKIE_SEND_AUDIO", "1");
+            eprintln!("[aokie-plugin] sendAudio ON → caller-turn audio rides the LLM request");
+        }
         // Agent-initiated hangup: when `agentHangup` is truthy AND the agent is on,
         // the receptionist ends the call itself after a completed conversation
         // (says goodbye, then AT+CHUP) so the caller doesn't have to hang up first.
@@ -2409,6 +2424,7 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     SettingSpec { key: "autoAnswer", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "aiReceptionist", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "bargeIn", kind: SettingKind::Bool, applies_live: false },
+    SettingSpec { key: "sendAudio", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "agentHangup", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "reenumerateHwid", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "legacyPairingPin", kind: SettingKind::Bool, applies_live: false },
