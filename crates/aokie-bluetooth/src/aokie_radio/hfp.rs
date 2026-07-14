@@ -214,6 +214,22 @@ impl HfpHandsFreeState {
             HfpAtCommand::EnableIndicatorUpdates(active) => {
                 self.indicator_updates_enabled = *active;
             }
+            HfpAtCommand::Dial(_) => {
+                // Phase 2 (live incident 2026-07-14, silent callback call):
+                // dialing means the consumer considers any previous call
+                // OVER — it only dials on an idle line. A verdict still HELD
+                // for a just-abandoned inbound ring (its session was closed
+                // via the parallel SCO-teardown path, bypassing this state
+                // machine) must never discharge against the NEW attempt: the
+                // stale CallTerminated fired 100ms after ATD, killed the
+                // fresh dial session, and the callee answered a silent line.
+                // Align this machine with the dialer's reality and pre-arm
+                // the outbound setup.
+                self.terminate_pending = false;
+                self.incoming_call = false;
+                self.call_active = false;
+                self.outgoing_setup = true;
+            }
             _ => {}
         }
     }
@@ -928,6 +944,33 @@ mod tests {
         assert_eq!(
             state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 }),
             vec![HfpEvent::CallTerminated]
+        );
+    }
+
+    #[test]
+    fn dialing_clears_a_stale_held_verdict_from_the_previous_ring() {
+        // Live incident 2026-07-14 (silent callback): a missed inbound ring
+        // left its callsetup-drop verdict HELD (the session was closed via
+        // the SCO-teardown path instead); the callback's ATD echo
+        // (callsetup,2) then discharged the stale verdict as CallTerminated
+        // and killed the fresh dial session. Sending Dial must clear the
+        // held state — the dialer only dials when it considers the line idle.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
+            Vec::<HfpEvent>::new(),
+            "verdict held"
+        );
+        state.mark_command_sent(&HfpAtCommand::Dial("0491570156".to_string()));
+        // The ATD echo now announces the outbound setup — NO stale terminate.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 2 }),
+            vec![HfpEvent::OutgoingDialing]
+        );
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 }),
+            vec![HfpEvent::CallAnswered]
         );
     }
 
