@@ -184,6 +184,17 @@ const BOOKING_INSTRUCTION: &str = "
 
 Booking rule: a booking or message is INCOMPLETE without the caller's name. If you do not already know their name (from caller ID or because they told you), ask for it BEFORE wrapping up - e.g. 'And what name should I put that under?'. Then confirm name, day and time back in one short sentence. Never end a booking without a name attached.";
 
+/// Live business lookups (guide P1-16): tells the model about the
+/// [[LOOKUP:]] tool. Appended by the shared composer, so speculative and
+/// real generations stay identically primed. A missing/failed lookup flow
+/// degrades gracefully — the injected result says UNAVAILABLE and the model
+/// answers from its notes.
+const TOOL_INSTRUCTION: &str = "\n\nLive lookups: when the caller asks for business information you genuinely do NOT have in your notes (availability beyond the listed days, order or record lookups), reply with EXACTLY [[LOOKUP: one clear question]] and nothing else - the system runs the lookup and hands you the result to answer from. Use it at most once per caller turn, and never for things already in your notes.";
+
+/// Spoken while the lookup flow runs (1-4 s): silence there reads as a dead
+/// line. Persona-neutral on purpose.
+const LOOKUP_FILLER_LINE: &str = "One moment - let me check that for you.";
+
 const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read aloud to the caller by a voice synthesizer.\n- This is a LIVE phone conversation: keep every reply to ONE or TWO short sentences, then let the caller speak. Long replies get talked over and feel rude. Ask at most one question per reply. Only go longer when reading back details the caller asked for.\n- When reading back dates, times or booking details from your notes, copy them EXACTLY as written - never approximate, merge or reorder them. If a detail is not in your notes, say you will have the team confirm it rather than guessing.\n- Phone numbers and codes are automatically read slowly, digit by digit; you do not need to do anything special for them.\n- You may wrap a short critical detail in [[slow]]...[[/slow]] to have it spoken more slowly.\n- Rarely, you may wrap ONE short vital sentence in [[important]]...[[/important]] so a brief overlap does not cut it off. The caller can always stop you by saying stop or wait.\n- If the caller asks you to wait, says they are thinking, or clearly needs a moment, reply with exactly [[WAIT]] and nothing else - staying silent is the right response. Never fill their pause with chatter; when they speak again, continue naturally.\n- If the caller's words were only a brief acknowledgement (yeah, okay, mm-hm) while you were talking, continue where you left off instead of starting over - or reply with [[WAIT]] if nothing needs saying.\nThe double-bracket markers are never spoken and never shown to anyone.";
 
 /// VOICE-001 fail-safe: what the caller hears when the responder breaks
@@ -382,9 +393,9 @@ fn compose_agent_system_prompt(
     cut_context: Option<&str>,
 ) -> String {
     let mut p = if agent_hangup {
-        format!("{persona}{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{END_CALL_INSTRUCTION}")
+        format!("{persona}{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}{END_CALL_INSTRUCTION}")
     } else {
-        format!("{persona}{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}")
+        format!("{persona}{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}")
     };
     if let Some(tail) = cut_context {
         p.push_str(&format!(
@@ -1309,6 +1320,7 @@ pub fn spawn(
     reenumerate_hwid: Option<String>,
     greeting: Option<String>,
     ack_mode: bool,
+    host_rpc: Arc<crate::host_rpc::HostRpc>,
 ) -> Result<RadioHandle, String> {
     use aokie_dongle::bluetooth::BluetoothManager;
     use std::sync::mpsc;
@@ -1395,6 +1407,7 @@ pub fn spawn(
                     auto_answer,
                     answer_tone,
                     greeting,
+                    host_rpc,
                 );
             }));
             if ran.is_err() {
@@ -2175,6 +2188,61 @@ impl Drop for SttBusyGuard {
     }
 }
 
+/// Run the read-only `business-lookup` flow on the HOST mid-call (guide
+/// P1-16) and return the text the model answers from. BLOCKING on the radio
+/// thread (bounded ~4.5 s; the audible filler plays first so the caller
+/// never sits in dead air) — an async lookup lane is the follow-up. Every
+/// failure path returns an explicit UNAVAILABLE string: the model is told to
+/// answer from its notes and offer the team, never to guess.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn run_business_lookup(
+    host: &Arc<crate::host_rpc::HostRpc>,
+    sink: &mut dyn Sink,
+    question: &str,
+    call_id: &str,
+    from: &str,
+) -> String {
+    let params = serde_json::json!({
+        "flowSlug": "business-lookup",
+        "input": { "question": question, "callId": call_id, "from": from },
+        "correlationId": call_id,
+        "idempotencyKey": format!("aokie:{call_id}:lookup:{}", uuid::Uuid::new_v4().simple()),
+        "timeoutMs": 6000,
+    });
+    let (id, line, rx) = host.begin("flow.run", params);
+    if sink.send_line(&line).is_err() {
+        host.forget(id);
+        return "LOOKUP UNAVAILABLE (host offline)".to_string();
+    }
+    match rx.recv_timeout(std::time::Duration::from_millis(4500)) {
+        Ok(Ok(v)) => {
+            let ok = v.get("status").and_then(serde_json::Value::as_str) == Some("succeeded");
+            let digest = v
+                .get("result")
+                .and_then(|r| r.get("digest").or_else(|| r.get("answer")))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if ok && !digest.trim().is_empty() {
+                digest.trim().to_string()
+            } else {
+                eprintln!(
+                    "[aokie-plugin] lookup flow returned no digest (status ok: {ok})"
+                );
+                "LOOKUP UNAVAILABLE (no result)".to_string()
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!("[aokie-plugin] lookup flow failed: {e}");
+            "LOOKUP UNAVAILABLE".to_string()
+        }
+        Err(_) => {
+            host.forget(id);
+            eprintln!("[aokie-plugin] lookup flow timed out");
+            "LOOKUP UNAVAILABLE (timed out)".to_string()
+        }
+    }
+}
+
 /// Fire-and-forget llama KV prefix warm (2026-07-14, ring pre-warm follow-up):
 /// discover + 1-token-process the reply prefix on a WORKER thread. Called at
 /// ring (base persona) and again when the call-scoped overlay lands (its
@@ -2187,6 +2255,7 @@ fn spawn_llm_prefix_warm(
     system_prompt: String,
     history: Vec<serde_json::Value>,
     label: &'static str,
+    handoff: Option<Arc<Mutex<Option<crate::agent::LlmClient>>>>,
 ) {
     let ep = agent_endpoint.clone();
     let st = status.clone();
@@ -2199,6 +2268,11 @@ fn spawn_llm_prefix_warm(
             };
             *st.llm_error.lock().unwrap() = None;
             let client = crate::agent::LlmClient::new(endpoint, agent_model);
+            // Park a connected client for the loop to adopt (first-turn
+            // speculation + replies skip the lazy connect entirely).
+            if let Some(slot) = handoff {
+                *slot.lock().unwrap() = Some(client.clone());
+            }
             let mut messages =
                 vec![serde_json::json!({ "role": "system", "content": system_prompt })];
             messages.extend(history);
@@ -2887,7 +2961,10 @@ fn run_loop(
     auto_answer: bool,
     answer_tone: bool,
     mut greeting: Option<String>,
+    host_rpc: Arc<crate::host_rpc::HostRpc>,
 ) {
+    #[cfg(not(all(target_os = "windows", feature = "voice")))]
+    let _ = &host_rpc;
     use std::sync::mpsc::TryRecvError;
     use std::time::Duration;
     #[cfg(feature = "voice")]
@@ -3367,6 +3444,13 @@ fn run_loop(
     let mut live_probe_in_flight = false;
     #[cfg(all(target_os = "windows", feature = "voice"))]
     let mut spec_reply: Option<ReplyStream> = None;
+    // Ring-warm handoff: the off-thread LLM warm CONNECTS a client and parks
+    // it here; the loop adopts it so the FIRST caller turn can speculate and
+    // reply without the lazy connect (which previously only happened at the
+    // first reply — first-turn speculation never fired).
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    let pending_agent_client: Arc<Mutex<Option<crate::agent::LlmClient>>> =
+        Arc::new(Mutex::new(None));
     // Conversation history for the agent (OpenAI chat messages), reset per call.
     #[cfg(feature = "voice")]
     let mut history: Vec<serde_json::Value> = Vec::new();
@@ -3550,6 +3634,7 @@ fn run_loop(
                         compose_agent_system_prompt(&agent_persona, agent_hangup, None),
                         Vec::new(),
                         "ring",
+                        Some(pending_agent_client.clone()),
                     );
                 }
             }
@@ -4205,6 +4290,10 @@ fn run_loop(
                 // the generation streams while the caller finishes; the turn
                 // flush below adopts it when the final text matches.
                 if spec_reply.is_none() && !dialogue.is_paused() {
+                    // Adopt a ring-warmed client so the FIRST turn speculates.
+                    if agent_client.is_none() {
+                        agent_client = pending_agent_client.lock().unwrap().take();
+                    }
                     if let (Some(prev), Some(cur)) = (live_hyp_prev.as_deref(), live_hyp.as_deref())
                     {
                         if hypothesis_stable(prev, cur) {
@@ -4644,11 +4733,22 @@ fn run_loop(
                     if agent_enabled && respond_with_llm {
                         // Lazily connect to the local LLM on the first caller turn.
                         if agent_client.is_none() {
+                            // Prefer the ring-warmed client (already connected).
+                            agent_client = pending_agent_client.lock().unwrap().take();
+                        }
+                        if agent_client.is_none() {
                             // PROC-001: a live connect is fresher than the probe.
                             agent_client =
                                 connect_agent_client(&agent_endpoint, agent_model.clone(), &status);
                         }
                         if let Some(client) = agent_client.as_ref() {
+                            // ── REPLY ROUNDS (guide P1-16) ──────────────────
+                            // Round 0 is the normal reply. A [[LOOKUP:]]
+                            // verdict runs the read-only host flow, injects
+                            // the result, and regenerates ONCE — bounded to
+                            // one lookup per caller turn.
+                            let mut lookup_rounds: u8 = 0;
+                            'reply_rounds: loop {
                             let sr = bt.get_sample_rate();
                             // Add the standing instructions at reply time (not by
                             // mutating agent_persona, which a live Configure could
@@ -4730,6 +4830,9 @@ fn run_loop(
                             // a moment / is thinking). An empty waited reply is NOT
                             // dead air, and the floor stays with the caller.
                             let mut wait_requested = false;
+                            // Set when the generation was a [[LOOKUP:]] verdict
+                            // (round 0 only): run the flow + regenerate.
+                            let mut lookup_requested: Option<String> = None;
                             // What the caller actually HEARD: sentences that
                             // reached the speaker (audit AK-008 + sweep). The
                             // history/turn record uses this, never the full
@@ -5130,6 +5233,13 @@ fn run_loop(
                                     if crate::speech_plan::has_wait_marker(&full) {
                                         wait_requested = true;
                                     }
+                                    if lookup_rounds == 0 {
+                                        if let Some(q) =
+                                            crate::speech_plan::parse_lookup_marker(&full)
+                                        {
+                                            lookup_requested = Some(q);
+                                        }
+                                    }
                                     // The transcript records what audibly PLAYED
                                     // (span-planned, marker-free) — never the raw
                                     // generation, which may carry control markup
@@ -5172,6 +5282,7 @@ fn run_loop(
                                     // to leave the caller their thinking room.
                                     if !line_dead
                                         && !wait_requested
+                                        && lookup_requested.is_none()
                                         && reply_left_dead_air(
                                             reply_dur > Duration::ZERO,
                                             barged,
@@ -5472,6 +5583,75 @@ fn run_loop(
                                     silence_timer =
                                         Some(SilenceTimer::new(silence_window * 3, Instant::now()));
                                 }
+                            }
+
+                            // ── LIVE LOOKUP ROUND (guide P1-16) ─────────────
+                            // Run the read-only host flow and regenerate with
+                            // its result. The audible filler plays FIRST (the
+                            // flow takes 1-4 s); every failure injects an
+                            // explicit UNAVAILABLE so the model answers from
+                            // its notes instead of guessing.
+                            if let Some(q) = lookup_requested.take() {
+                                if lookup_rounds == 0
+                                    && !line_dead
+                                    && !operator_ended
+                                    && !barged
+                                    && bt.get_sample_rate() > 0
+                                {
+                                    lookup_rounds += 1;
+                                    eprintln!(
+                                        "[aokie-plugin] agent lookup: {}",
+                                        content_for_log(&q)
+                                    );
+                                    let sr_now = bt.get_sample_rate();
+                                    let mut fprobe = ControlProbe::new(
+                                        &control_rx,
+                                        &mut pending_controls,
+                                    );
+                                    let (aec_ref, brms) = if barge_in {
+                                        (aec.as_mut(), Some(barge_rms))
+                                    } else {
+                                        (None, None)
+                                    };
+                                    let _ = speak_planned(
+                                        bt,
+                                        &synth,
+                                        LOOKUP_FILLER_LINE,
+                                        sr_now,
+                                        aec_ref,
+                                        brms,
+                                        Some(&mut fprobe),
+                                        &pace,
+                                        protected_max_ms,
+                                        None,
+                                    );
+                                    if let Some(action) = fprobe.action.take() {
+                                        perform_cancel_action(
+                                            action, bt, &mut tracker, outbox, sink,
+                                        );
+                                        break 'reply_rounds;
+                                    }
+                                    let from_num = tracker
+                                        .current()
+                                        .and_then(|s| s.caller_id.clone())
+                                        .unwrap_or_default();
+                                    let result_text = run_business_lookup(
+                                        &host_rpc, sink, &q, &corr, &from_num,
+                                    );
+                                    eprintln!(
+                                        "[aokie-plugin] lookup result: [{} chars]",
+                                        result_text.chars().count()
+                                    );
+                                    history.push(serde_json::json!({
+                                        "role": "system",
+                                        "content": format!(
+                                            "LOOKUP RESULT for \"{q}\":\n{result_text}\nAnswer the caller now in one or two short spoken sentences using ONLY this result and your notes. If it does not answer the question, say you will have the team check and offer to take their details."
+                                        ),
+                                    }));
+                                    continue 'reply_rounds;
+                                }
+                            }
+                            break 'reply_rounds;
                             }
                         }
                     }
@@ -5859,6 +6039,7 @@ fn run_loop(
                                         compose_agent_system_prompt(p, agent_hangup, None),
                                         history.clone(),
                                         "overlay",
+                                        None,
                                     );
                                 }
                             }
