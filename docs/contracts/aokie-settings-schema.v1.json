@@ -23,6 +23,29 @@
       "appliesLive": false
     },
     {
+      "key": "blockedNumbers",
+      "type": "string",
+      "maxChars": 4000,
+      "appliesLive": false
+    },
+    {
+      "key": "acceptPattern",
+      "type": "string",
+      "maxChars": 200,
+      "appliesLive": false
+    },
+    {
+      "key": "rejectPrivate",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "screenMessage",
+      "type": "string",
+      "maxChars": 500,
+      "appliesLive": false
+    },
+    {
       "key": "agentHangup",
       "type": "bool",
       "appliesLive": false

@@ -45,6 +45,7 @@ pub mod outbox;
 pub mod radio;
 pub mod realtime;
 pub mod rpc;
+pub mod screen;
 pub mod speech_plan;
 pub mod speech_wire;
 #[cfg(feature = "voice")]

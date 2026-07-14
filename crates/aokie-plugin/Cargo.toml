@@ -35,6 +35,7 @@ serde_json = { workspace = true }
 # never satisfy the consent gate).
 ed25519-dalek = { version = "2", features = ["signature"] }
 base64 = "0.22"
+regex = "1"
 # Same major as the legacy app (aokie-desktop pins 0.31) so the two
 # don't fight over bundled-SQLite versions when built side by side.
 rusqlite = { version = "0.31", features = ["bundled"] }

@@ -3871,6 +3871,13 @@ fn run_loop(
     // to STT; capped at ~30 s so a rambling turn can't balloon the request.
     #[cfg(feature = "voice")]
     let send_audio = agent_enabled && std::env::var_os("AOKIE_SEND_AUDIO").is_some();
+    // Call screening policy (spec Phase 0): parsed once per radio start.
+    #[cfg(feature = "voice")]
+    let screen_policy = crate::screen::ScreenPolicy::from_env();
+    #[cfg(feature = "voice")]
+    if screen_policy.is_active() {
+        eprintln!("[aokie-plugin] call screening ACTIVE (block list / accept pattern / private-number policy)");
+    }
     #[cfg(feature = "voice")]
     let mut last_turn_audio: Vec<i16> = Vec::new();
     // When AOKIE_AGENT_HANGUP is set (the `agentHangup` setting) the agent ends
@@ -4396,12 +4403,20 @@ fn run_loop(
                             .as_ref()
                             .is_some_and(|o| o.call_id == s.id);
                         let started = *greet_hold_started.get_or_insert_with(Instant::now);
-                        hold_greeting_for_overlay(
-                            overlay_matches,
-                            s.caller_id.is_some(),
-                            started.elapsed(),
-                            GREETING_PERSONALIZE_HOLD,
-                        )
+                        // rejectPrivate needs to KNOW the id is absent, not
+                        // merely late: this phone's CLCC id lands ~100ms
+                        // post-answer, so give it a bounded window before
+                        // declaring the number withheld.
+                        let private_id_wait = screen_policy.reject_private
+                            && s.caller_id.is_none()
+                            && started.elapsed() < std::time::Duration::from_millis(1200);
+                        private_id_wait
+                            || hold_greeting_for_overlay(
+                                overlay_matches,
+                                s.caller_id.is_some(),
+                                started.elapsed(),
+                                GREETING_PERSONALIZE_HOLD,
+                            )
                     };
                     #[cfg(not(feature = "voice"))]
                     let hold = false;
@@ -4410,17 +4425,49 @@ fn run_loop(
                         None
                     } else {
                         s.greeted = true;
-                        Some((s.id.clone(), sr))
+                        #[cfg(feature = "voice")]
+                        let screened = screen_policy.verdict(s.caller_id.as_deref());
+                        #[cfg(not(feature = "voice"))]
+                        let screened: Option<&'static str> = None;
+                        Some((s.id.clone(), sr, screened))
                     }
                 }
                 _ => None,
             }
         };
-        if let Some((corr, sr)) = greet_now {
+        if let Some((corr, sr, screened)) = greet_now {
             #[cfg(not(feature = "voice"))]
-            let _ = (&corr, sr);
+            let _ = (&corr, sr, screened);
             #[cfg(feature = "voice")]
-            {
+            if let Some(reason) = screened {
+                // Screened call (spec Phase 0): no greeting, no agent — the
+                // optional screen message, then hangup. Enforced HERE because
+                // it is universally correct: phones that only deliver the id
+                // post-answer (this Pixel) still get screened within ~1.5s.
+                eprintln!("[aokie-plugin] call screened ({reason}) — {}",
+                    if screen_policy.message.trim().is_empty() { "hanging up" } else { "message + hangup" });
+                if !screen_policy.message.trim().is_empty() {
+                    let mut probe = ControlProbe::new(&control_rx, &mut pending_controls);
+                    let _ = speak_planned(
+                        bt,
+                        &synth,
+                        screen_policy.message.trim(),
+                        sr,
+                        None,
+                        None,
+                        Some(&mut probe),
+                        &pace,
+                        protected_max_ms,
+                        None,
+                    );
+                }
+                tracker.note_intent(crate::call_session::TerminationIntent::AgentHangup);
+                if let Err(e) = bt.hangup() {
+                    eprintln!("[aokie-plugin] screened-call hangup failed: {e}");
+                }
+                agent_hung_up = true;
+                let _ = &corr;
+            } else {
                 // Build the echo canceller once we know the negotiated SCO
                 // rate (full-duplex only). Reused for every phrase this call.
                 if barge_in && aec.is_none() {
