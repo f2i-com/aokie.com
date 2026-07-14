@@ -40,6 +40,7 @@ pub mod duplex;
 #[cfg(feature = "voice")]
 pub mod endpoint_http;
 pub mod event_bridge;
+pub mod host_rpc;
 pub mod outbox;
 pub mod radio;
 pub mod rpc;
