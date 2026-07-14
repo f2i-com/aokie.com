@@ -2956,7 +2956,15 @@ fn tts_speak(
             lane.maybe_probe(&playback);
             if let Some(intent) = lane.check() {
                 playback.semantic = Some(intent);
-            } else if !playback.barged && lane.substantive_overlap() {
+            } else if !playback.barged
+                && playback.speech_during_playback
+                && lane.substantive_overlap()
+            {
+                // speech_during_playback gate (live call 20563f53): the
+                // capture can hold the TAIL of the caller's own just-finished
+                // turn — the reply answering an interruption got cut 723 ms in
+                // by the residue of that same interruption. Only speech that
+                // BEGAN while this span was audibly playing may yield it.
                 // A substantive comment takes the floor NOW — as a POLICY-AWARE
                 // soft barge (a protected/digit span still finishes its bounded
                 // extension), unlike the hard cut of a spoken "wait"/"stop".
@@ -4781,6 +4789,16 @@ fn run_loop(
                         eprintln!(
                             "[aokie-plugin] caller hesitation — staying quiet while they finish thinking"
                         );
+                        // The turn-flush already stamped 'thinking'; a
+                        // hesitation never runs the reply block, so restore
+                        // 'listening' HERE or the caption strip lies (live
+                        // call 20563f53: stuck on 'Live - thinking' while the
+                        // bot was correctly staying quiet).
+                        if let Some(lane) = rt_lane.as_mut() {
+                            if let Some(line) = lane.phase("listening", Instant::now()) {
+                                let _ = sink.send_line(&line);
+                            }
+                        }
                     }
 
                     // Whether to fall through to the normal LLM reply path.
