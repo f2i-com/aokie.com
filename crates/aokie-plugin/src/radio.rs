@@ -189,7 +189,7 @@ Booking rule: a booking or message is INCOMPLETE without the caller's name. If y
 /// real generations stay identically primed. A missing/failed lookup flow
 /// degrades gracefully — the injected result says UNAVAILABLE and the model
 /// answers from its notes.
-const TOOL_INSTRUCTION: &str = "\n\nLive lookups: when the caller asks for business DATA you genuinely do NOT have in your notes (availability beyond the listed days, records), reply with EXACTLY [[LOOKUP: one clear data question]] and nothing else - the SYSTEM runs the lookup and hands you the result to answer from. The lookup question is addressed to a DATABASE, never to the caller: if you need to ask the CALLER something (to clarify a date, for example), just ask them normally WITHOUT the marker. At most one lookup per caller turn; never for things already in your notes. Dates beyond your calendar window are EXACTLY what lookups are for - run one instead of deferring to the team. When the question involves specific dates, work each one out from today's date and write it in plain YYYY-MM-DD form inside the lookup question (for example [[LOOKUP: availability 2026-08-01]]) - the system answers exact dates directly. NEVER tell the caller you will check or look something up without putting the [[LOOKUP: ...]] marker in that SAME reply - announcing a check without the marker strands the caller in silence waiting for an answer that never comes. NEVER defer a date or availability question to the team without running the lookup FIRST - the calendar is right there; if the caller has not named a date yet, ask them for the date instead of deferring.";
+const TOOL_INSTRUCTION: &str = "\n\nLive lookups: when the caller asks for business DATA you genuinely do NOT have in your notes (availability beyond the listed days, records), reply with EXACTLY [[LOOKUP: one clear data question]] and nothing else - the SYSTEM runs the lookup and hands you the result to answer from. The lookup question is addressed to a DATABASE, never to the caller: if you need to ask the CALLER something (to clarify a date, for example), just ask them normally WITHOUT the marker. At most one lookup per caller turn; never for things already in your notes. Dates beyond your calendar window are EXACTLY what lookups are for - run one instead of deferring to the team. When the question involves specific dates, work each one out from today's date and write it in plain YYYY-MM-DD form inside the lookup question (for example [[LOOKUP: availability 2026-08-01]]) - the system answers exact dates directly. If the caller names a WEEKDAY within some week ('the Wednesday in the second week of August'), resolve THAT weekday to its exact date and ask for it. For a whole week or span, write a range: [[LOOKUP: availability 2026-08-11 to 2026-08-17]]. NEVER tell the caller you will check or look something up without putting the [[LOOKUP: ...]] marker in that SAME reply - announcing a check without the marker strands the caller in silence waiting for an answer that never comes. NEVER defer a date or availability question to the team without running the lookup FIRST - the calendar is right there; if the caller has not named a date yet, ask them for the date instead of deferring.";
 
 /// Spoken while the lookup flow runs (1-4 s): silence there reads as a dead
 /// line. Persona-neutral on purpose.
@@ -2271,6 +2271,16 @@ fn looks_like_lookup_announcement(reply: &str) -> bool {
     .any(|p| r.contains(p))
 }
 
+/// True when the CALLER explicitly asks for a live check ("can you look it
+/// up?", "check the calendar") - a reply without a lookup marker then runs
+/// one on their words instead of deferring (call 372836dc).
+fn caller_asked_for_lookup(text: &str) -> bool {
+    let t = text.to_lowercase();
+    ["look it up", "look that up", "look up the", "check the calendar", "check the availability", "check availability", "can you check", "could you check"]
+        .iter()
+        .any(|p| t.contains(p))
+}
+
 /// True when a reply CLAIMS availability ("...looks open", "we have
 /// availability") — combined with a dated caller question and NO lookup this
 /// is a hallucinated calendar claim (call 2c00cac0: 'Monday 10 August looks
@@ -2374,6 +2384,15 @@ mod lookup_announcement_tests {
         assert!(!ann("Saturday 8 August looks open. Would you like me to put a booking request in?"));
         assert!(!ann("We're open Monday to Friday, nine to five."));
         assert!(!ann("I'll have the team confirm that for you."));
+    }
+
+    #[test]
+    fn caller_lookup_requests_detected() {
+        use super::caller_asked_for_lookup as ask;
+        assert!(ask("Can you look it up, please? Yeah."));
+        assert!(ask("check the calendar for me"));
+        assert!(!ask("I'll look for parking"));
+        assert!(!ask("what's on the menu?"));
     }
 
     #[test]
@@ -2682,6 +2701,12 @@ struct SttProbeLane<'a> {
     /// The mid-span yield fires at most once per lane: after it, the span
     /// is already yielding and the reply path owns the floor decision.
     mid_span_fired: bool,
+    /// Some span of THIS reply has audibly played: ongoing overlap speech in
+    /// later spans/gaps may yield even though it did not START inside the
+    /// current span (sentences are separate spans - the per-span
+    /// speech_during_playback flag alone went deaf across boundaries; user
+    /// report 2026-07-14: 'it doesn't seem to be hearing me while talking').
+    audio_played: bool,
 }
 
 #[cfg(all(target_os = "windows", feature = "voice"))]
@@ -2708,7 +2733,13 @@ impl<'a> SttProbeLane<'a> {
             pending_command: None,
             bot_context: String::new(),
             mid_span_fired: false,
+            audio_played: false,
         }
+    }
+
+    /// The pump marks the reply audible after each span that produced audio.
+    fn note_audio_played(&mut self) {
+        self.audio_played = true;
     }
 
     /// The bot text spoken so far (+ the sentence about to play): the echo
@@ -2977,7 +3008,8 @@ fn tts_speak(
             if let Some(intent) = lane.check() {
                 playback.semantic = Some(intent);
             } else if !playback.barged
-                && playback.speech_during_playback
+                && (playback.speech_during_playback
+                    || (lane.audio_played && playback.speech_start.is_some()))
                 && lane.substantive_overlap()
             {
                 // speech_during_playback gate (live call 20563f53): the
@@ -3874,6 +3906,9 @@ fn run_loop(
     // dying line — unheard but in the transcript. Once the agent finalizes
     // the call, late turns are recorded but never answered.
     let mut agent_hung_up = false;
+    // The previous caller turn's text: an explicit 'look it up' usually names
+    // its subject one turn earlier.
+    let mut prev_caller_text = String::new();
     // AOK-CTRL-001: call-level max-silence watchdog (agent mode). Created when
     // the greeting arms the conversation, dropped at every call boundary.
     #[cfg(feature = "voice")]
@@ -4079,6 +4114,7 @@ fn run_loop(
             stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
             consecutive_waits = 0;
             agent_hung_up = false;
+            prev_caller_text.clear();
             rt_lane = tracker.call_id().map(|id| {
                 crate::realtime::RealtimeLane::new(id.to_string(), voice_call_gen, Instant::now())
             });
@@ -4880,6 +4916,7 @@ fn run_loop(
                         );
                     }
                     if agent_enabled && !hesitation && !agent_hung_up {
+                        prev_caller_text = text.clone();
                         history.push(serde_json::json!({ "role": "user", "content": text }));
                         if history.len() > 24 {
                             let drop = history.len() - 24;
@@ -5557,6 +5594,12 @@ fn run_loop(
                                             note_tts_outcome(&status, &out);
                                         }
                                         reply_dur += out.dur;
+                                        if out.dur > Duration::ZERO {
+                                            // The reply is audible: later spans may
+                                            // yield to ONGOING overlap speech, not
+                                            // just speech starting inside them.
+                                            reply_lane.note_audio_played();
+                                        }
                                         // Truthful transcript (AOK-VOICE-001): record
                                         // only the spans that audibly PLAYED.
                                         if out.dur > Duration::ZERO {
@@ -5723,6 +5766,24 @@ fn run_loop(
                                             "[aokie-plugin] lookup announcement without a marker — looking up the caller's words"
                                         );
                                         lookup_requested = Some(text.clone());
+                                    } else if lookup_rounds == 0
+                                        && caller_asked_for_lookup(&text)
+                                    {
+                                        // The caller EXPLICITLY asked for a
+                                        // check ('can you look it up?') and
+                                        // the reply carried no marker (call
+                                        // 372836dc: it got a team-deferral).
+                                        // The subject usually lives in their
+                                        // PREVIOUS turn - send both.
+                                        eprintln!(
+                                            "[aokie-plugin] caller asked for a lookup - running it on their words"
+                                        );
+                                        let subject = if prev_caller_text.is_empty() {
+                                            text.clone()
+                                        } else {
+                                            format!("{prev_caller_text} {text}")
+                                        };
+                                        lookup_requested = Some(subject);
                                     } else if lookup_rounds == 0
                                         && looks_like_availability_claim(&full)
                                         && mentions_a_date(&text)
