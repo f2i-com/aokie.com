@@ -18,7 +18,12 @@
 /// This runs ONLY on the text handed to the synthesizer — transcripts, history
 /// and records keep the original wording.
 pub fn normalize_speech_text(input: &str) -> String {
-    // Clock times first, so the meridiem pass sees the cleaned form:
+    // Date abbreviations first (live report 2026-07-14: "Tue Jul 14 2026" —
+    // a toDateString-style label echoed by the model — was voiced as garbled
+    // numbers): "Tue" -> "Tuesday", "Jul" -> "July" when they sit in date
+    // context, so the synthesizer reads dates like a person would.
+    let input = &expand_date_abbreviations(input);
+    // Clock times next, so the meridiem pass sees the cleaned form:
     // "10:00 AM" -> "10 AM" -> "10 a em".
     let input = &normalize_clock_times(input);
     let chars: Vec<char> = input.chars().collect();
@@ -83,6 +88,99 @@ pub fn normalize_speech_text(input: &str) -> String {
         cleaned = next;
     }
     cleaned
+}
+
+/// Expand abbreviated weekday/month names when they sit in DATE CONTEXT, so
+/// "Tue Jul 14 2026 at 6 PM" is voiced "Tuesday July 14 2026…". Conservative
+/// by design: only exactly-capitalized abbreviations ("Tue", "Sept") expand,
+/// and only next to a date neighbour — a day abbreviation needs a following
+/// month name or day-of-month number; a month abbreviation needs a
+/// day-of-month number on either side. "he sat 14 exams", the word "sun" and
+/// the name "Jan" (no digit neighbour) are never rewritten.
+fn expand_date_abbreviations(input: &str) -> String {
+    const DAYS: [(&str, &str); 10] = [
+        ("Mon", "Monday"),
+        ("Tue", "Tuesday"),
+        ("Tues", "Tuesday"),
+        ("Wed", "Wednesday"),
+        ("Thu", "Thursday"),
+        ("Thur", "Thursday"),
+        ("Thurs", "Thursday"),
+        ("Fri", "Friday"),
+        ("Sat", "Saturday"),
+        ("Sun", "Sunday"),
+    ];
+    const MONTHS: [(&str, &str); 12] = [
+        ("Jan", "January"),
+        ("Feb", "February"),
+        ("Mar", "March"),
+        ("Apr", "April"),
+        ("Jun", "June"),
+        ("Jul", "July"),
+        ("Aug", "August"),
+        ("Sep", "September"),
+        ("Sept", "September"),
+        ("Oct", "October"),
+        ("Nov", "November"),
+        ("Dec", "December"),
+    ];
+    const MONTH_FULL: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August", "September",
+        "October", "November", "December",
+    ];
+    fn is_day_number(w: &str) -> bool {
+        let w = w.trim_end_matches(|c: char| !c.is_ascii_digit());
+        !w.is_empty() && w.len() <= 2 && w.chars().all(|c| c.is_ascii_digit())
+    }
+    fn is_month_word(w: &str) -> bool {
+        let w = w.trim_end_matches('.');
+        MONTHS.iter().any(|(a, f)| *a == w || *f == w) || MONTH_FULL.contains(&w)
+    }
+
+    // Word-wise pass: split on whitespace, keep the original separators by
+    // rebuilding with single spaces only when the input used them — simpler:
+    // operate on whitespace-delimited words and rejoin with the ORIGINAL
+    // separator slices.
+    let mut words: Vec<&str> = Vec::new();
+    let mut seps: Vec<&str> = Vec::new();
+    let mut rest = input;
+    while !rest.is_empty() {
+        let word_end = rest
+            .find(char::is_whitespace)
+            .unwrap_or(rest.len());
+        let (w, r) = rest.split_at(word_end);
+        words.push(w);
+        let sep_end = r
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(r.len());
+        let (s, r2) = r.split_at(sep_end);
+        seps.push(s);
+        rest = r2;
+    }
+    let mut out = String::with_capacity(input.len() + 16);
+    for i in 0..words.len() {
+        let w = words[i];
+        let bare = w.trim_end_matches(['.', ',']);
+        let next = words.get(i + 1).copied().unwrap_or("");
+        let prev = if i > 0 { words[i - 1] } else { "" };
+        let day_hit = DAYS
+            .iter()
+            .find(|(a, _)| *a == bare)
+            .filter(|_| is_month_word(next) || is_day_number(next));
+        let month_hit = MONTHS
+            .iter()
+            .find(|(a, _)| *a == bare)
+            .filter(|_| is_day_number(next) || is_day_number(prev));
+        if let Some((_, full)) = day_hit.or(month_hit) {
+            out.push_str(full);
+            // Keep any trailing punctuation the abbreviation carried ("Tue,").
+            out.push_str(&w[bare.len()..]);
+        } else {
+            out.push_str(w);
+        }
+        out.push_str(seps[i]);
+    }
+    out
 }
 
 /// Rewrite `H:MM` clock times into forms the TTS reads naturally — the colon
@@ -154,6 +252,25 @@ fn push_phonetic(out: &mut String, phonetic: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn date_abbreviations_expand_in_date_context_only() {
+        use super::expand_date_abbreviations as x;
+        // The live failure: a toDateString-style label.
+        assert_eq!(x("Tue Jul 14 2026 at 6 PM"), "Tuesday July 14 2026 at 6 PM");
+        assert_eq!(x("booked for Sun Sept 6"), "booked for Sunday September 6");
+        // Month next to a day number, either side.
+        assert_eq!(x("on 14 Jul"), "on 14 July");
+        assert_eq!(x("Jul 14."), "July 14.");
+        // Trailing punctuation on the abbreviation is kept.
+        assert_eq!(x("Tue, Jul 14"), "Tuesday, July 14");
+        assert_eq!(x("Tue. Jul 14"), "Tuesday. July 14");
+        // NEVER in ordinary prose: verbs, names, the actual sun.
+        assert_eq!(x("he sat 14 exams"), "he sat 14 exams");
+        assert_eq!(x("the Sun is bright"), "the Sun is bright");
+        assert_eq!(x("ask Jan about it"), "ask Jan about it");
+        assert_eq!(x("Mar was here"), "Mar was here");
+    }
+
     use super::*;
 
     #[test]
