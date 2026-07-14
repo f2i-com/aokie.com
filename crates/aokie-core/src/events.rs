@@ -87,6 +87,15 @@ pub fn iso8601_ago_ms(ms: u64) -> String {
         .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// Today's LOCAL date in spoken-friendly form, e.g. "Tuesday 14 July 2026".
+/// Used to anchor the voice agent's date reasoning: without an explicit
+/// "today" the model guessed at relative dates ("first Saturday of August")
+/// from context alone.
+pub fn today_spoken_local() -> String {
+    let now = chrono::Local::now();
+    now.format("%A %-d %B %Y").to_string()
+}
+
 /// Build the Aokie idempotency key: `aokie:<correlationId>:<step>:v1`.
 ///
 /// `step` is the event name minus the `aokie.` prefix, with the
