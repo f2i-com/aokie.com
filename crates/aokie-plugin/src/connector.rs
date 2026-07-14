@@ -467,6 +467,24 @@ impl Plugin {
             std::env::set_var("AOKIE_SEND_AUDIO", "1");
             eprintln!("[aokie-plugin] sendAudio ON → caller-turn audio rides the LLM request");
         }
+        // audioTranscript: after each caller turn, a small DETACHED request
+        // asks the audio-capable model to correct the on-device STT from the
+        // turn's actual audio; the corrected text rides
+        // aokie.call.turn.corrected and updates the transcript record.
+        // Meaningless without sendAudio's audio capture, so gated on it.
+        let audio_transcript = self
+            .store
+            .config
+            .settings
+            .get("audioTranscript")
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false);
+        if send_audio && audio_transcript {
+            std::env::set_var("AOKIE_AUDIO_TRANSCRIPT", "1");
+            eprintln!(
+                "[aokie-plugin] audioTranscript ON → the audio model corrects each caller turn's transcript"
+            );
+        }
         // Call screening (spec Phase 0): number rules → env, read into a
         // ScreenPolicy at radio start and on live settings.set (see below).
         apply_screening_env(&self.store.config.settings);
@@ -2642,6 +2660,7 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     SettingSpec { key: "aiReceptionist", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "bargeIn", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "sendAudio", kind: SettingKind::Bool, applies_live: false },
+    SettingSpec { key: "audioTranscript", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "blockedNumbers", kind: SettingKind::Str { max_chars: 4000 }, applies_live: true },
     SettingSpec { key: "acceptPattern", kind: SettingKind::Str { max_chars: 200 }, applies_live: true },
     SettingSpec { key: "rejectPrivate", kind: SettingKind::Bool, applies_live: true },
