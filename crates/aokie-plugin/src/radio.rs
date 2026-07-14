@@ -175,6 +175,15 @@ const END_CALL_INSTRUCTION: &str = "\n\nEnding the call: ordinary replies just a
 /// bracketed token before anything is spoken or recorded. Plain ASCII (the
 /// text is model-facing but lives next to caller-spoken constants).
 #[cfg(feature = "voice")]
+/// Standing booking rule (live report 2026-07-14, call be80cacb: an unknown
+/// caller booked a table for two and was never asked their NAME - they even
+/// pointed it out on the call). Appended at reply time like the other
+/// standing instructions; the KNOWN-CALLER overlay's "don't re-ask" rule
+/// composes cleanly with the "unless you already know it" clause.
+const BOOKING_INSTRUCTION: &str = "
+
+Booking rule: a booking or message is INCOMPLETE without the caller's name. If you do not already know their name (from caller ID or because they told you), ask for it BEFORE wrapping up - e.g. 'And what name should I put that under?'. Then confirm name, day and time back in one short sentence. Never end a booking without a name attached.";
+
 const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read aloud to the caller by a voice synthesizer.\n- This is a LIVE phone conversation: keep every reply to ONE or TWO short sentences, then let the caller speak. Long replies get talked over and feel rude. Ask at most one question per reply. Only go longer when reading back details the caller asked for.\n- When reading back dates, times or booking details from your notes, copy them EXACTLY as written - never approximate, merge or reorder them. If a detail is not in your notes, say you will have the team confirm it rather than guessing.\n- Phone numbers and codes are automatically read slowly, digit by digit; you do not need to do anything special for them.\n- You may wrap a short critical detail in [[slow]]...[[/slow]] to have it spoken more slowly.\n- Rarely, you may wrap ONE short vital sentence in [[important]]...[[/important]] so a brief overlap does not cut it off. The caller can always stop you by saying stop or wait.\n- If the caller asks you to wait, says they are thinking, or clearly needs a moment, reply with exactly [[WAIT]] and nothing else - staying silent is the right response. Never fill their pause with chatter; when they speak again, continue naturally.\n- If the caller's words were only a brief acknowledgement (yeah, okay, mm-hm) while you were talking, continue where you left off instead of starting over - or reply with [[WAIT]] if nothing needs saying.\nThe double-bracket markers are never spoken and never shown to anyone.";
 
 /// VOICE-001 fail-safe: what the caller hears when the responder breaks
@@ -373,9 +382,9 @@ fn compose_agent_system_prompt(
     cut_context: Option<&str>,
 ) -> String {
     let mut p = if agent_hangup {
-        format!("{persona}{SPEECH_STYLE_INSTRUCTION}{END_CALL_INSTRUCTION}")
+        format!("{persona}{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{END_CALL_INSTRUCTION}")
     } else {
-        format!("{persona}{SPEECH_STYLE_INSTRUCTION}")
+        format!("{persona}{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}")
     };
     if let Some(tail) = cut_context {
         p.push_str(&format!(
