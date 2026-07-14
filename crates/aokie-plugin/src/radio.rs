@@ -4466,8 +4466,18 @@ fn run_loop(
                         protected_max_ms,
                         None,
                     );
+                } else {
+                    // A blank message hangs up SILENTLY — but an AT+CHUP fired
+                    // the instant we answer is ignored by the phone (the call
+                    // hasn't stabilized), so a blank block used to leave the
+                    // caller connected to dead air (live report 2026-07-14).
+                    // The speak path above settles the call for ~1.5s; the
+                    // silent path needs the same brief settle before CHUP —
+                    // the agent-hangup drain uses the same bounded sleep.
+                    std::thread::sleep(Duration::from_millis(900));
                 }
                 tracker.note_intent(crate::call_session::TerminationIntent::AgentHangup);
+                bt.flush_tx_audio();
                 if let Err(e) = bt.hangup() {
                     eprintln!("[aokie-plugin] screened-call hangup failed: {e}");
                 }
