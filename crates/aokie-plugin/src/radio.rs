@@ -202,7 +202,7 @@ const LOOKUP_FILLER_LINE: &str = "One moment - let me check that for you.";
 const LOOKUP_HANDOFF_LINE: &str =
     "I couldn't find that just now - I'll have the team check and get back to you. Is there anything else I can help with?";
 
-const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read aloud to the caller by a voice synthesizer.\n- This is a LIVE phone conversation: keep every reply to ONE or TWO short sentences, then let the caller speak. Long replies get talked over and feel rude. Ask at most one question per reply. Only go longer when reading back details the caller asked for.\n- When reading back dates, times or booking details from your notes, copy them EXACTLY as written - never approximate, merge or reorder them. If a detail is not in your notes, say you will have the team confirm it rather than guessing.\n- Phone numbers and codes are automatically read slowly, digit by digit; you do not need to do anything special for them.\n- You may wrap a short critical detail in [[slow]]...[[/slow]] to have it spoken more slowly.\n- Rarely, you may wrap ONE short vital sentence in [[important]]...[[/important]] so a brief overlap does not cut it off. The caller can always stop you by saying stop or wait.\n- If the caller asks you to wait, says they are thinking, or clearly needs a moment, reply with exactly [[WAIT]] and nothing else - staying silent is the right response. Never fill their pause with chatter; when they speak again, continue naturally.\n- If the caller's words were only a brief acknowledgement (yeah, okay, mm-hm) while you were talking, continue where you left off instead of starting over - or reply with [[WAIT]] if nothing needs saying.\nThe double-bracket markers are never spoken and never shown to anyone.";
+const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read aloud to the caller by a voice synthesizer.\n- This is a LIVE phone conversation: keep every reply to ONE or TWO short sentences, then let the caller speak. Long replies get talked over and feel rude. Ask at most one question per reply. Only go longer when reading back details the caller asked for.\n- When reading back dates, times or booking details from your notes, copy them EXACTLY as written - never approximate, merge or reorder them. If a detail is not in your notes, say you will have the team confirm it rather than guessing.\n- Phone numbers and codes are automatically read slowly, digit by digit; you do not need to do anything special for them.\n- You may wrap a short critical detail in [[slow]]...[[/slow]] to have it spoken more slowly.\n- Rarely, you may wrap ONE short vital sentence in [[important]]...[[/important]] so a brief overlap does not cut it off. The caller can always stop you by saying stop or wait.\n- If the caller asks you to wait, says they are thinking, or clearly needs a moment, reply with exactly [[WAIT]] and nothing else - staying silent is the right response. Never fill their pause with chatter; when they speak again, continue naturally.\n- If the caller's words were only a brief acknowledgement (yeah, okay, mm-hm) while you were talking, continue where you left off instead of starting over - or reply with [[WAIT]] if nothing needs saying.\n- NEVER reply [[WAIT]] twice in a row: if you already waited once and the caller speaks again, greets you, or checks you are there, ANSWER them.\nThe double-bracket markers are never spoken and never shown to anyone.";
 
 /// VOICE-001 fail-safe: what the caller hears when the responder breaks
 /// MID-call (LLM died / synthesis went silent) — a plain apology, then a
@@ -3842,6 +3842,12 @@ fn run_loop(
     // phase as droppable realtime.emit notifications. One lane per call
     // epoch; recreated in the per-call reset block below.
     let mut rt_lane: Option<crate::realtime::RealtimeLane> = None;
+    // [[WAIT]] streak breaker (live call 5824f759: Gemma 4 latched onto
+    // [[WAIT]] after one caller 'hold on' and answered EVERY later turn with
+    // it, including 'hello?' — the bot went permanently silent). At most ONE
+    // consecutive accepted WAIT: a second is rejected and the reply
+    // regenerates once with an explicit speak-now note.
+    let mut consecutive_waits: u32 = 0;
     // AOK-CTRL-001: call-level max-silence watchdog (agent mode). Created when
     // the greeting arms the conversation, dropped at every call boundary.
     #[cfg(feature = "voice")]
@@ -4045,6 +4051,7 @@ fn run_loop(
             }
             voice_call_gen = tracker.generation();
             stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
+            consecutive_waits = 0;
             rt_lane = tracker.call_id().map(|id| {
                 crate::realtime::RealtimeLane::new(id.to_string(), voice_call_gen, Instant::now())
             });
@@ -4537,6 +4544,15 @@ fn run_loop(
                     // The speculation IS this utterance (nothing new was said
                     // since it was sent) — never transcribe it twice.
                     status.early_stt_hits.fetch_add(1, Ordering::Relaxed);
+                    if send_audio {
+                        // sendAudio: this is the DOMINANT turn path (early-stt
+                        // hit) — snapshot here too or the LLM never gets audio.
+                        let start = stt_buf.len().saturating_sub(16_000 * 30);
+                        last_turn_audio = stt_buf[start..]
+                            .iter()
+                            .map(|&x| (x.clamp(-1.0, 1.0) * 32767.0) as i16)
+                            .collect();
+                    }
                     stt_buf.clear();
                 } else if stt_buf.len() >= 16_000 / 5 {
                     // Stamp the job with the call it belongs to (audit C-05).
@@ -4577,7 +4593,7 @@ fn run_loop(
             // the ACCUMULATING buffer for partial transcription (~600 ms
             // cadence, ≤1 in flight, local probe channel — no HTTP egress).
             if agent_enabled && stt_had_speech {
-                let due = live_hyp_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(600));
+                let due = live_hyp_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(400));
                 let grown =
                     stt_buf.len() >= live_hyp_shipped + 16_000 / 2 && stt_buf.len() >= 16_000 / 2;
                 if !live_probe_in_flight && due && grown {
@@ -5215,6 +5231,7 @@ fn run_loop(
                             // a moment / is thinking). An empty waited reply is NOT
                             // dead air, and the floor stays with the caller.
                             let mut wait_requested = false;
+                            let mut wait_regen_done = false;
                             // Set when the generation was a [[LOOKUP:]] verdict
                             // (round 0 only): run the flow + regenerate.
                             let mut lookup_requested: Option<String> = None;
@@ -5768,6 +5785,7 @@ fn run_loop(
                                         // later "checks" were announced with
                                         // no marker at all (call acadcecc).
                                         // The transcript stays marker-free.
+                                        consecutive_waits = 0;
                                         let hist_content = match &lookup_requested {
                                             Some(lq) => format!("{heard} [[LOOKUP: {lq}]]"),
                                             None => heard.clone(),
@@ -6043,9 +6061,33 @@ fn run_loop(
                             // floor stays with the caller — hold the pause state
                             // and stretch the silence watchdog so a deliberately
                             // quiet caller isn't nagged mid-thought.
-                            if wait_requested && !barged && !operator_ended && !line_dead {
+                            if wait_requested
+                                && !barged
+                                && !operator_ended
+                                && !line_dead
+                                && consecutive_waits >= 1
+                                && !wait_regen_done
+                                && lookup_rounds == 0
+                            {
+                                // Streak breaker: one silent wait is respect,
+                                // two is a dead line. Regenerate ONCE with the
+                                // instruction spelled out; if it still waits,
+                                // accept it (never loop).
                                 eprintln!(
-                                    "[aokie-plugin] agent chose to wait silently ([[WAIT]]) — the caller has the floor"
+                                    "[aokie-plugin] second consecutive [[WAIT]] rejected — regenerating with a speak-now note"
+                                );
+                                history.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": "[SYSTEM NOTE - not the caller speaking] You already waited silently once. The caller has spoken again - [[WAIT]] is not available for this reply. Answer them now in one short sentence.",
+                                }));
+                                wait_requested = false;
+                                wait_regen_done = true;
+                                continue 'reply_rounds;
+                            }
+                            if wait_requested && !barged && !operator_ended && !line_dead {
+                                consecutive_waits += 1;
+                                eprintln!(
+                                    "[aokie-plugin] agent chose to wait silently ([[WAIT]]) — the caller has the floor (streak {consecutive_waits})"
                                 );
                                 dialogue.apply(crate::duplex::CallerIntent::Pause);
                                 if !silence_window.is_zero() {
