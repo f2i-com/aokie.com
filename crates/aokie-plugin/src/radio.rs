@@ -830,6 +830,22 @@ pub struct RadioStatus {
     /// dispatch (the desktop's health poll bounds the lag) — the radio never
     /// touches the settings store itself.
     pub pending_blocked_numbers: Mutex<Vec<String>>,
+    /// Phase 2: the outbound dial in flight (set at ATD, cleared when its
+    /// call goes ACTIVE). Lets the event mapper attach a late
+    /// OutgoingDialing to the REAL dial (agent-owned, original call id) and
+    /// refuse a stale CallTerminated that would otherwise kill the fresh
+    /// attempt (live incident 2026-07-14: a held verdict from the
+    /// just-missed inbound ring discharged 100ms after ATD — the callee
+    /// answered a silent observed session while a spurious failed
+    /// call.ended fired the apology-SMS flow).
+    pub pending_dial: Mutex<Option<PendingDial>>,
+}
+
+/// See [`RadioStatus::pending_dial`].
+pub struct PendingDial {
+    pub call_id: String,
+    pub number: String,
+    pub at: std::time::Instant,
 }
 
 /// VOICE-001: one loopback self-test outcome (always compiled — non-voice
@@ -7104,6 +7120,14 @@ fn run_loop(
                             *status.call_started_at.lock().unwrap() =
                                 Some(s.started_at_iso.clone());
                         }
+                        // The in-flight dial context: lets the event mapper
+                        // survive a stale terminate / late OutgoingDialing
+                        // (see RadioStatus::pending_dial).
+                        *status.pending_dial.lock().unwrap() = Some(PendingDial {
+                            call_id: call_id.clone(),
+                            number: number.clone(),
+                            at: std::time::Instant::now(),
+                        });
                         // Agent context rides the CALL-SCOPED overlay (§9.3
                         // machinery, wiped at the call boundary): the opening
                         // line IS this call's greeting, the persona gains the
@@ -7572,14 +7596,42 @@ fn handle_event(
             }
         }
         E::OutgoingDialing => {
-            // Phase 2: an OUTBOUND call setup (callsetup,2). Slice 1 only
-            // OBSERVES: the session exists so call-state truth (status,
-            // call.ended records, no phantom "recovery" greeting when
-            // call,1 lands) is kept — but the receptionist stays silent and
-            // deaf on it: greeting/agent/STT are all outbound-gated. The
-            // number is unknown here (a handset-originated dial carries no
-            // +CLIP for the HF); plugin-initiated dials (call.dial) will
-            // seed it when the command lands in slice 2.
+            // Phase 2: an OUTBOUND call setup (callsetup,2). If WE just
+            // dialed and the tracker is idle — our dial session was killed
+            // by a stale terminate from the previous call (live incident
+            // 2026-07-14) or the setup indicator simply beat the control
+            // path — attach this setup to the REAL dial: agent-owned, the
+            // ORIGINAL call id, so the opening-line overlay and the
+            // outbound.dialing event correlation stay intact. Otherwise
+            // it's a handset-originated dial we merely OBSERVE: session
+            // tracked for call-state truth, but the receptionist stays
+            // silent and deaf on the owner's own call.
+            let pending: Option<(String, String)> = status
+                .pending_dial
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|p| p.at.elapsed() < std::time::Duration::from_secs(10))
+                .map(|p| (p.call_id.clone(), p.number.clone()));
+            if let Some((call_id, number)) = pending {
+                if tracker.current().is_none() {
+                    if let Some(s) =
+                        tracker.dial(call_id, Some(number.clone()), now_iso8601(), true)
+                    {
+                        eprintln!(
+                            "[aokie-plugin] outbound setup attached to our pending dial ({}) — agent owns the call",
+                            s.id
+                        );
+                        *status.current_caller.lock().unwrap() = Some(number);
+                        *status.current_call_id.lock().unwrap() = Some(s.id.clone());
+                        *status.call_started_at.lock().unwrap() =
+                            Some(s.started_at_iso.clone());
+                    }
+                }
+                // Tracker busy = our dial session is already live — the
+                // indicator echo is expected; nothing to do.
+                return;
+            }
             let id = format!("call_{}", uuid::Uuid::new_v4().simple());
             if let Some(s) = tracker.dial(id, None, now_iso8601(), false) {
                 eprintln!(
@@ -7671,6 +7723,11 @@ fn handle_event(
             // answered — even when the caller-ID hold hasn't elapsed yet.
             flush_incoming_if_pending(tracker, outbox, sink);
             tracker.answered();
+            // Phase 2: the dial reached its call — the in-flight context has
+            // done its job (a terminate from here on is REAL).
+            if tracker.current().is_some_and(|s| s.outbound && s.agent_owned) {
+                *status.pending_dial.lock().unwrap() = None;
+            }
             if let Some(corr) = tracker.call_id() {
                 // Only a TRACKED call may read as active — an orphaned
                 // answer that wasn't recovered (dead link) must not leave
@@ -7688,6 +7745,35 @@ fn handle_event(
             }
         }
         E::CallTerminated => {
+            // Phase 2 stale-verdict guard (live incident 2026-07-14): a
+            // terminate landing within moments of OUR OWN dial — before the
+            // attempt even ALERTED — belongs to the PREVIOUS call (a held
+            // ring verdict or a late SCO-teardown synthesis), never to the
+            // fresh outbound session. Consuming it killed the dial session,
+            // emitted a spurious failed call.ended (which sent the apology
+            // text while the callee's phone was still ringing) and left a
+            // silent observed session for them to answer.
+            let stale_for_dial = tracker.current().is_some_and(|s| {
+                s.outbound
+                    && s.agent_owned
+                    && !s.is_active()
+                    && !s.alerted
+                    && status
+                        .pending_dial
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|p| {
+                            p.call_id == s.id
+                                && p.at.elapsed() < std::time::Duration::from_secs(3)
+                        })
+            });
+            if stale_for_dial {
+                eprintln!(
+                    "[aokie-plugin] CallTerminated moments after our dial, before alerting — it belongs to the previous call; the outbound attempt continues"
+                );
+                return;
+            }
             // Even an instantly-abandoned ring gets its incoming record
             // before the terminal event (audit AOK-LIF-001).
             flush_incoming_if_pending(tracker, outbox, sink);
@@ -8483,6 +8569,57 @@ mod tests {
         for s in ["Um no", "well yes", "no", "that's all", ""] {
             assert!(!crate::duplex::is_hesitation(s), "{s:?}");
         }
+    }
+
+    /// Phase 2, the 2026-07-14 silent-callback incident replayed: the
+    /// previous ring's STALE CallTerminated (held verdict discharging after
+    /// our ATD) must not kill the fresh dial session, the setup indicator
+    /// attaches to the REAL dial (agent-owned, ORIGINAL call id) when the
+    /// session was lost anyway, and a terminate after ANSWER is real again.
+    #[test]
+    fn stale_terminate_never_kills_a_fresh_dial_and_setup_reattaches() {
+        use crate::event_bridge::VecSink;
+        use aokie_dongle::bluetooth::BluetoothEvent as E;
+
+        let status = Arc::new(RadioStatus::default());
+        let mut sink = VecSink::default();
+        let mut tracker = crate::call_session::SessionTracker::new();
+
+        // The Dial arm's work: agent-owned session + in-flight context.
+        tracker.dial("call_dial1".into(), Some("0491570156".into()), "x".into(), true);
+        *status.pending_dial.lock().unwrap() = Some(PendingDial {
+            call_id: "call_dial1".into(),
+            number: "0491570156".into(),
+            at: std::time::Instant::now(),
+        });
+
+        // The stale terminate (100ms after ATD in the incident): IGNORED —
+        // the session survives and no call.ended is emitted.
+        handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
+        assert_eq!(tracker.call_id(), Some("call_dial1"), "dial session survives");
+        assert!(
+            !sink
+                .lines
+                .iter()
+                .any(|l| l.contains(crate::contract::events::CALL_ENDED)),
+            "no spurious call.ended: {:?}",
+            sink.lines
+        );
+
+        // Even if the session HAD been lost, the setup indicator re-attaches
+        // to the pending dial instead of minting an observed session.
+        let mut lost = crate::call_session::SessionTracker::new();
+        handle_event(E::OutgoingDialing, &mut lost, None, &mut sink, &status);
+        let s = lost.current().expect("session re-created");
+        assert_eq!(s.id, "call_dial1", "ORIGINAL call id (overlay + event correlation)");
+        assert!(s.agent_owned, "agent owns the re-attached call");
+        assert_eq!(s.caller_id.as_deref(), Some("0491570156"));
+
+        // Answer clears the in-flight context — a terminate is REAL now.
+        handle_event(E::CallAnswered, &mut lost, None, &mut sink, &status);
+        assert!(status.pending_dial.lock().unwrap().is_none(), "context consumed");
+        handle_event(E::CallTerminated, &mut lost, None, &mut sink, &status);
+        assert!(lost.current().is_none(), "post-answer terminate ends the call");
     }
 
     /// Audit C-01/C-02/AK-001: the radio publishes the current call's identity
