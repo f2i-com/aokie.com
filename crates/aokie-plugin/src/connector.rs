@@ -467,40 +467,9 @@ impl Plugin {
             std::env::set_var("AOKIE_SEND_AUDIO", "1");
             eprintln!("[aokie-plugin] sendAudio ON → caller-turn audio rides the LLM request");
         }
-        // Call screening (spec Phase 0): number rules enforced at the
-        // greeting site. String settings ride env verbatim; empty = unset.
-        for (key, env) in [
-            ("blockedNumbers", "AOKIE_BLOCKED_NUMBERS"),
-            ("acceptPattern", "AOKIE_ACCEPT_PATTERN"),
-            ("screenMessage", "AOKIE_SCREEN_MESSAGE"),
-        ] {
-            let v = self
-                .store
-                .config
-                .settings
-                .get(key)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if v.is_empty() {
-                std::env::remove_var(env);
-            } else {
-                std::env::set_var(env, v);
-            }
-        }
-        let reject_private = self
-            .store
-            .config
-            .settings
-            .get("rejectPrivate")
-            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
-            .unwrap_or(false);
-        if reject_private {
-            std::env::set_var("AOKIE_REJECT_PRIVATE", "1");
-        } else {
-            std::env::remove_var("AOKIE_REJECT_PRIVATE");
-        }
+        // Call screening (spec Phase 0): number rules → env, read into a
+        // ScreenPolicy at radio start and on live settings.set (see below).
+        apply_screening_env(&self.store.config.settings);
         // Agent-initiated hangup: when `agentHangup` is truthy AND the agent is on,
         // the receptionist ends the call itself after a completed conversation
         // (says goodbye, then AT+CHUP) so the caller doesn't have to hang up first.
@@ -1765,6 +1734,21 @@ impl Plugin {
                 // can push the Receptionist Settings — persona/greeting/voice/model —
                 // and have them take effect on the current call, no reconnect. Only
                 // the agent-shaping keys trip this; other settings just persist.
+                // Call screening (spec Phase 0) applies LIVE: set env from the
+                // merged config, then tell the running radio to reload — a
+                // block/unblock takes effect on the NEXT call, no reconnect.
+                let screening_key = obj.keys().any(|k| {
+                    matches!(
+                        k.as_str(),
+                        "blockedNumbers" | "acceptPattern" | "rejectPrivate" | "screenMessage"
+                    )
+                });
+                if screening_key {
+                    apply_screening_env(&self.store.config.settings);
+                    if let Some(radio) = self.radio.as_ref() {
+                        let _ = radio.send(crate::radio::RadioControl::ReloadScreening);
+                    }
+                }
                 let agent_key = has_receptionist_config_key(obj);
                 let radio_running = self.radio.is_some();
                 if agent_key {
@@ -2459,10 +2443,10 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     SettingSpec { key: "aiReceptionist", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "bargeIn", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "sendAudio", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "blockedNumbers", kind: SettingKind::Str { max_chars: 4000 }, applies_live: false },
-    SettingSpec { key: "acceptPattern", kind: SettingKind::Str { max_chars: 200 }, applies_live: false },
-    SettingSpec { key: "rejectPrivate", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "screenMessage", kind: SettingKind::Str { max_chars: 500 }, applies_live: false },
+    SettingSpec { key: "blockedNumbers", kind: SettingKind::Str { max_chars: 4000 }, applies_live: true },
+    SettingSpec { key: "acceptPattern", kind: SettingKind::Str { max_chars: 200 }, applies_live: true },
+    SettingSpec { key: "rejectPrivate", kind: SettingKind::Bool, applies_live: true },
+    SettingSpec { key: "screenMessage", kind: SettingKind::Str { max_chars: 500 }, applies_live: true },
     SettingSpec { key: "agentHangup", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "reenumerateHwid", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "legacyPairingPin", kind: SettingKind::Bool, applies_live: false },
@@ -2514,6 +2498,38 @@ fn is_loopback_endpoint(url: &str) -> bool {
         authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
     };
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+/// Screening settings → process env (spec Phase 0). Called at radio start
+/// and from settings.set (followed by a RadioControl::ReloadScreening so the
+/// running radio rebuilds its policy). Empty string clears the var.
+fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
+    for (key, env) in [
+        ("blockedNumbers", "AOKIE_BLOCKED_NUMBERS"),
+        ("acceptPattern", "AOKIE_ACCEPT_PATTERN"),
+        ("screenMessage", "AOKIE_SCREEN_MESSAGE"),
+    ] {
+        let v = settings
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if v.is_empty() {
+            std::env::remove_var(env);
+        } else {
+            std::env::set_var(env, v);
+        }
+    }
+    let reject_private = settings
+        .get("rejectPrivate")
+        .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+        .unwrap_or(false);
+    if reject_private {
+        std::env::set_var("AOKIE_REJECT_PRIVATE", "1");
+    } else {
+        std::env::remove_var("AOKIE_REJECT_PRIVATE");
+    }
 }
 
 fn validate_setting(key: &str, value: &Value) -> Result<(), CmdError> {

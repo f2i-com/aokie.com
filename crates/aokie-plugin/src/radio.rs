@@ -108,6 +108,11 @@ pub enum RadioControl {
     },
     /// AOK-BT-001: close the pairing window now (operator cancel / done).
     StopPairing,
+    /// Live-reload the call-screening policy (spec Phase 0) from the current
+    /// environment — sent by settings.set when a screening key changes so a
+    /// block/unblock takes effect on the NEXT call without a reconnect. The
+    /// env vars are set by the connector before this is sent.
+    ReloadScreening,
     /// AOK-BT-001: forget a bonded device; replies whether a link key was removed.
     RemovePaired {
         address: String,
@@ -3873,7 +3878,7 @@ fn run_loop(
     let send_audio = agent_enabled && std::env::var_os("AOKIE_SEND_AUDIO").is_some();
     // Call screening policy (spec Phase 0): parsed once per radio start.
     #[cfg(feature = "voice")]
-    let screen_policy = crate::screen::ScreenPolicy::from_env();
+    let mut screen_policy = crate::screen::ScreenPolicy::from_env();
     #[cfg(feature = "voice")]
     if screen_policy.is_active() {
         eprintln!("[aokie-plugin] call screening ACTIVE (block list / accept pattern / private-number policy)");
@@ -6969,6 +6974,18 @@ fn run_loop(
                     }
                     #[cfg(not(feature = "voice"))]
                     let _ = (call_id, persona, greeting);
+                }
+                Ok(RadioControl::ReloadScreening) => {
+                    // Rebuild from env (the connector set the vars first): a
+                    // block/unblock applies to the NEXT call, no reconnect.
+                    #[cfg(feature = "voice")]
+                    {
+                        screen_policy = crate::screen::ScreenPolicy::from_env();
+                        eprintln!(
+                            "[aokie-plugin] call-screening policy reloaded (active: {})",
+                            screen_policy.is_active()
+                        );
+                    }
                 }
                 Ok(RadioControl::Configure {
                     persona,
