@@ -741,6 +741,15 @@ pub struct RadioStatus {
     /// span MID-SENTENCE (policy-aware soft barge) instead of waiting for the
     /// sentence boundary.
     pub mid_span_yields: AtomicU64,
+    /// FloorManager SHADOW (guide §7.1/P1-8): what the fused evidence-driven
+    /// decision-maker WOULD have done, logged only — the live threshold paths
+    /// keep the floor. Transition counts per severity + span-end divergences
+    /// (shadow said cut/yield but the span played out, or vice versa) are the
+    /// promote-or-tune signal.
+    pub floor_shadow_cuts: AtomicU64,
+    pub floor_shadow_yields: AtomicU64,
+    pub floor_shadow_ducks: AtomicU64,
+    pub floor_shadow_divergences: AtomicU64,
     /// Speculative reply generation (guide phase 5): starts from a STABLE
     /// live-STT hypothesis while the caller is still speaking; kept when the
     /// final turn matched, cancelled (wasted) when it diverged.
@@ -884,6 +893,10 @@ impl RadioHandle {
             "gapYields": s.gap_yields.load(Ordering::Relaxed),
             "semanticCuts": s.semantic_cuts.load(Ordering::Relaxed),
             "bargeCuts": s.barge_cuts.load(Ordering::Relaxed),
+            "floorShadowCuts": s.floor_shadow_cuts.load(Ordering::Relaxed),
+            "floorShadowYields": s.floor_shadow_yields.load(Ordering::Relaxed),
+            "floorShadowDucks": s.floor_shadow_ducks.load(Ordering::Relaxed),
+            "floorShadowDivergences": s.floor_shadow_divergences.load(Ordering::Relaxed),
         })
     }
 
@@ -2708,6 +2721,16 @@ impl<'a> SttProbeLane<'a> {
         hit
     }
 
+    /// Non-consuming snapshot for the FloorManager SHADOW (guide §7.1/P1-8):
+    /// the latest overlap transcript + whether it passes the substantive gate.
+    /// Never fires the yield, never takes the command — pure evidence.
+    fn shadow_snapshot(&mut self) -> (String, bool) {
+        let ctx = std::mem::take(&mut self.bot_context);
+        let substantive = self.substantive_content(&ctx).is_some();
+        self.bot_context = ctx;
+        (self.content.clone(), substantive)
+    }
+
     /// Ship a probe when speech has been running long enough and enough NEW
     /// audio arrived since the last one.
     fn maybe_probe(&mut self, playback: &TtsChunkPlayback) {
@@ -2868,6 +2891,11 @@ fn tts_speak(
     // §6.3 delivery truth: did playback run to completion, or was it cut?
     // Only the CUT case needs an audible-prefix estimate.
     let mut natural_end = false;
+    // FloorManager SHADOW (guide §7.1/P1-8): the fused decision the shadow
+    // would make, tracked across the span. Logged on transitions; compared
+    // with the actual outcome at span end. Behavior-neutral by construction.
+    let mut shadow_prev: Option<crate::duplex::FloorDecision> = None;
+    let mut shadow_worst: u8 = 0;
     loop {
         let now = std::time::Instant::now();
         // Urgent controls cut even while we're idling between frames.
@@ -2936,6 +2964,49 @@ fn tts_speak(
                 playback.barged = true;
                 playback.barged_at = Some(now);
             }
+            // SHADOW floor decision from the same evidence the live paths
+            // see. Log only on transitions (content-free reason codes);
+            // count per severity; the span-end block scores divergence.
+            let (txt, substantive) = lane.shadow_snapshot();
+            let ev = crate::duplex::FloorEvidence {
+                bot_audible: !playback.first,
+                speech_frames: playback.speech_frames,
+                // speech_start is a sample OFFSET into the capture buffer —
+                // overlap duration = captured samples since it, at the mic
+                // rate.
+                overlap_ms: playback
+                    .speech_start
+                    .map(|s| {
+                        (playback.captured.len().saturating_sub(s) as u64 * 1000
+                            / playback.sample_rate.max(1) as u64) as u32
+                    })
+                    .unwrap_or(0),
+                stable_text: txt,
+                substantive,
+                protected_span: finish_extra.is_some(),
+                barge_energy: playback.barged,
+            };
+            let (dec, reason) = crate::duplex::shadow_floor_decision(&ev);
+            shadow_worst = shadow_worst.max(crate::duplex::floor_decision_rank(dec));
+            if shadow_prev != Some(dec) {
+                shadow_prev = Some(dec);
+                match dec {
+                    crate::duplex::FloorDecision::CutNow
+                    | crate::duplex::FloorDecision::PauseAndRetain => {
+                        lane.status.floor_shadow_cuts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::duplex::FloorDecision::YieldAtBoundary => {
+                        lane.status.floor_shadow_yields.fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::duplex::FloorDecision::Duck => {
+                        lane.status.floor_shadow_ducks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+                if dec != crate::duplex::FloorDecision::Continue {
+                    eprintln!("[aokie-plugin] floor shadow: {dec:?} ({reason})");
+                }
+            }
         }
         if playback.stop_playback_now(now) {
             break;
@@ -2946,6 +3017,25 @@ fn tts_speak(
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+    // SHADOW divergence: did the fused decision-maker agree with what the
+    // live paths actually did to this span? Disagreements are the tuning
+    // signal — an echo-driven energy barge shows up as "actual cut, shadow
+    // saw nothing"; an ignored comment as "shadow cut/yield, span played
+    // out". One line per divergent span, content-free.
+    if let Some(lane) = probe.as_deref() {
+        let actual_cut = playback.barged || playback.semantic.is_some();
+        let shadow_cut = shadow_worst >= 2; // YieldAtBoundary or stronger
+        if shadow_cut != actual_cut && !playback.cancelled {
+            lane.status
+                .floor_shadow_divergences
+                .fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[aokie-plugin] floor shadow divergence: shadow {} vs actual {}",
+                if shadow_cut { "cut/yield" } else { "continue" },
+                if actual_cut { "cut" } else { "played out" },
+            );
+        }
     }
     // A cut span leaves the worker mid-stream: invalidate its epoch so it
     // aborts at the next chunk instead of synthesizing into the void.
