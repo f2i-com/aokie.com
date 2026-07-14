@@ -1988,6 +1988,29 @@ fn note_tts_outcome(status: &RadioStatus, out: &SpeakOutcome) {
     }
 }
 
+/// §9.3 greeting-personalization race: how long the greeting may WAIT for
+/// the caller-id flow's call-scoped overlay before speaking the configured
+/// default. The overlay typically lands 1–3 s after answer (caller-id event →
+/// sync flow → call.configureAgent); greeting synthesis becomes ready in a
+/// similar window, so the real added delay is usually well under the cap.
+/// Bounded hard: a slow or absent flow costs at most this much extra silence.
+#[cfg(feature = "voice")]
+const GREETING_PERSONALIZE_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// §9.3: should the greeting WAIT for the personalization overlay? Only when
+/// the caller id is KNOWN (the flow that pushes the overlay triggers on the
+/// caller-id event — no id, no push coming) and the overlay hasn't arrived,
+/// and never past the bounded hold. Pure for tests.
+#[cfg(feature = "voice")]
+fn hold_greeting_for_overlay(
+    overlay_matches_call: bool,
+    caller_id_known: bool,
+    hold_elapsed: std::time::Duration,
+    cap: std::time::Duration,
+) -> bool {
+    !overlay_matches_call && caller_id_known && hold_elapsed < cap
+}
+
 /// §6.3 delivery-truth v1 (alignment fallback #4 — conservative duration-
 /// weighted estimation): which PREFIX of a cut span's display text did the
 /// caller plausibly hear? The local engines expose no word/phoneme alignment,
@@ -3014,6 +3037,10 @@ fn run_loop(
     // §9.3 call-scoped agent overlay — see [`CallAgentOverlay`].
     #[cfg(feature = "voice")]
     let mut call_agent_overlay: Option<CallAgentOverlay> = None;
+    // §9.3: when the greeting first became READY but was held for the
+    // personalization overlay (bounds the hold; reset per call).
+    #[cfg(feature = "voice")]
+    let mut greet_hold_started: Option<Instant> = None;
     // Conversation history for the agent (OpenAI chat messages), reset per call.
     #[cfg(feature = "voice")]
     let mut history: Vec<serde_json::Value> = Vec::new();
@@ -3265,6 +3292,7 @@ fn run_loop(
             // §9.3: the call-scoped agent overlay dies WITH its call — the
             // next caller can never inherit the previous caller's persona.
             call_agent_overlay = None;
+            greet_hold_started = None;
             // Drop the echo canceller entirely rather than just resetting its
             // FIFOs (review sweep): it was built at the FIRST call's SCO rate
             // and reset() keeps that rate + filter length. Back-to-back calls
@@ -3378,8 +3406,37 @@ fn run_loop(
             let sr = bt.get_sample_rate();
             match tracker.current_mut() {
                 Some(s) if !s.greeted && sr > 0 => {
-                    s.greeted = true;
-                    Some((s.id.clone(), sr))
+                    // §9.3 personalization race: the caller-id flow's
+                    // call-scoped overlay ("Hi <name>!") usually lands 1–3 s
+                    // after answer — briefly hold the greeting for it instead
+                    // of speaking the generic one a beat too early. Under the
+                    // old GLOBAL settings.set design a lost race left the
+                    // personalized greeting stuck in settings, so the NEXT
+                    // call (or caller!) inherited it — the exact leak
+                    // call-scoping removed; this hold is the leak-free way to
+                    // win the race within the call it belongs to.
+                    #[cfg(feature = "voice")]
+                    let hold = {
+                        let overlay_matches = call_agent_overlay
+                            .as_ref()
+                            .is_some_and(|o| o.call_id == s.id);
+                        let started = *greet_hold_started.get_or_insert_with(Instant::now);
+                        hold_greeting_for_overlay(
+                            overlay_matches,
+                            s.caller_id.is_some(),
+                            started.elapsed(),
+                            GREETING_PERSONALIZE_HOLD,
+                        )
+                    };
+                    #[cfg(not(feature = "voice"))]
+                    let hold = false;
+                    if hold {
+                        idle = false;
+                        None
+                    } else {
+                        s.greeted = true;
+                        Some((s.id.clone(), sr))
+                    }
                 }
                 _ => None,
             }
@@ -6106,6 +6163,23 @@ mod tests {
         assert!(!p.stop_playback_now(now), "ordinary overlap rides the budget");
         p.semantic = Some(crate::duplex::CallerIntent::StopSpeaking);
         assert!(p.stop_playback_now(now), "spoken command beats protection");
+    }
+
+    /// §9.3: the greeting hold waits for the overlay only while the caller
+    /// id is known, the overlay is missing, and the bounded cap has time left.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn greeting_holds_briefly_for_the_personalization_overlay() {
+        use std::time::Duration as D2;
+        let cap = D2::from_millis(1500);
+        // Known caller, no overlay yet, inside the cap: hold.
+        assert!(hold_greeting_for_overlay(false, true, D2::from_millis(200), cap));
+        // Overlay arrived: speak NOW (personalized).
+        assert!(!hold_greeting_for_overlay(true, true, D2::from_millis(200), cap));
+        // Cap spent: speak the default — a slow flow never buys dead air.
+        assert!(!hold_greeting_for_overlay(false, true, D2::from_millis(1600), cap));
+        // Caller id withheld: no push is coming — never hold.
+        assert!(!hold_greeting_for_overlay(false, false, D2::from_millis(200), cap));
     }
 
     /// §6.3 delivery-truth v1: the audible-prefix estimator UNDERCLAIMS —
