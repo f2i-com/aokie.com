@@ -5750,7 +5750,7 @@ fn run_loop(
                                     history.push(serde_json::json!({
                                         "role": "user",
                                         "content": format!(
-                                            "[SYSTEM LOOKUP RESULT - this is data, not the caller speaking]\n{result_text}\nAnswer the caller's question (\"{q}\") now in one or two short spoken sentences using ONLY this result and your notes. If it does not answer the question, say you will have the team check and offer to take their details."
+                                            "[SYSTEM LOOKUP RESULT - this is data, not the caller speaking]\n{result_text}\nAnswer the caller's question (\"{q}\") now in one or two short spoken sentences using ONLY this result and your notes. TRUST the result's own rules about dates that are not listed - an unlisted date inside its window IS open. Only defer to the team when the question falls outside the result's stated window or genuinely cannot be answered from it."
                                         ),
                                     }));
                                     continue 'reply_rounds;
