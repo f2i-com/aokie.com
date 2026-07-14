@@ -1408,7 +1408,7 @@ fn heard_context(history: &[serde_json::Value]) -> String {
             let clipped: String = c.chars().take(160).collect();
             Some(format!("{who}: {clipped}"))
         })
-        .take(4)
+        .take(6)
         .collect();
     turns.reverse();
     turns.join("\n")
@@ -2782,7 +2782,10 @@ mod heard_context_tests {
     #[test]
     fn recent_turns_compact_with_markers_stripped() {
         let history = vec![
-            serde_json::json!({"role": "user", "content": "old turn that falls off"}),
+            serde_json::json!({"role": "user", "content": "oldest turn that falls off"}),
+            serde_json::json!({"role": "assistant", "content": "second oldest, also dropped"}),
+            serde_json::json!({"role": "user", "content": "kept one"}),
+            serde_json::json!({"role": "assistant", "content": "kept two"}),
             serde_json::json!({"role": "user", "content": "Do I have any appointments?"}),
             serde_json::json!({"role": "assistant", "content": "You have a checkup Wednesday. [[LOOKUP: availability 2026-07-22]]"}),
             serde_json::json!({"role": "user", "content": "What\ntime is\nit at?"}),
@@ -2791,9 +2794,9 @@ mod heard_context_tests {
         let ctx = heard_context(&history);
         assert_eq!(
             ctx,
-            "Caller: Do I have any appointments?\nReceptionist: You have a checkup Wednesday.\nCaller: What time is it at?\nReceptionist: It's at 3 PM."
+            "Caller: kept one\nReceptionist: kept two\nCaller: Do I have any appointments?\nReceptionist: You have a checkup Wednesday.\nCaller: What time is it at?\nReceptionist: It's at 3 PM."
         );
-        assert!(!ctx.contains("old turn"), "capped at the last 4 turns");
+        assert!(!ctx.contains("oldest turn"), "capped at the last 6 turns");
         assert!(!ctx.contains("[["), "markers never reach another prompt");
     }
 
@@ -4378,6 +4381,11 @@ fn run_loop(
     let audio_transcript = send_audio && std::env::var_os("AOKIE_AUDIO_TRANSCRIPT").is_some();
     #[cfg(feature = "voice")]
     let (heard_tx, heard_rx) = std::sync::mpsc::channel::<(String, u32, String, String)>();
+    // Split-utterance continuity: the previous caller turn's audio + draft +
+    // when it flushed — prepended to the next correction request when the
+    // turns are moments apart (one sentence split by a pause). Reset per call.
+    #[cfg(feature = "voice")]
+    let mut prev_heard: Option<(Vec<i16>, String, Instant)> = None;
     // Call screening policy (spec Phase 0): parsed once per radio start.
     #[cfg(feature = "voice")]
     let mut screen_policy = crate::screen::ScreenPolicy::from_env();
@@ -4740,6 +4748,7 @@ fn run_loop(
             manager_gate = ManagerGate::default();
             utt_audio.clear();
             last_turn_audio.clear();
+            prev_heard = None;
             rt_lane = tracker.call_id().map(|id| {
                 crate::realtime::RealtimeLane::new(id.to_string(), voice_call_gen, Instant::now())
             });
@@ -5836,22 +5845,60 @@ fn run_loop(
                             );
                         }
                         if let (Some(hc), false) = (heard_client, last_turn_audio.is_empty()) {
-                            let pcm = last_turn_audio.clone();
+                            // Split-utterance continuity (user idea; live
+                            // turns 16/17: a mid-thought pause split one
+                            // sentence into two turns and each fragment
+                            // corrected blind): when the caller's PREVIOUS
+                            // turn ended moments ago, prepend its audio so
+                            // the model hears the sentence continuously —
+                            // the prompt + length guard hold the output to
+                            // the final utterance only.
+                            let (pcm, prev_draft) = match prev_heard.as_ref() {
+                                Some((ppcm, ptext, at))
+                                    if at.elapsed() < Duration::from_secs(8) =>
+                                {
+                                    let mut combined = ppcm.clone();
+                                    append_turn_audio(&mut combined, last_turn_audio.clone());
+                                    (combined, Some(ptext.clone()))
+                                }
+                                _ => (last_turn_audio.clone(), None),
+                            };
                             let cid = corr.clone();
                             let stt = text.clone();
                             // Dialogue context disambiguates unclear audio
                             // ("ointments" → "appointments"); this turn is
-                            // not yet in history, so this is the PRIOR turns.
-                            let ctx = heard_context(&history);
+                            // not yet in history, so this is the PRIOR
+                            // turns. The Setting line names the domain even
+                            // on turn 1, when no dialogue exists yet.
+                            let ctx = {
+                                let setting: String = call_agent_overlay
+                                    .as_ref()
+                                    .and_then(|o| o.persona.as_deref())
+                                    .unwrap_or(&agent_persona)
+                                    .split('.')
+                                    .next()
+                                    .unwrap_or("")
+                                    .chars()
+                                    .take(160)
+                                    .collect();
+                                let mut c = format!("Setting: {}", setting.trim());
+                                let h = heard_context(&history);
+                                if !h.is_empty() {
+                                    c.push('\n');
+                                    c.push_str(&h);
+                                }
+                                c
+                            };
                             let tidx = turn_index;
                             let tx = heard_tx.clone();
                             eprintln!(
-                                "[aokie-plugin] audio transcript check spawned [turn {tidx}] ({} samples)",
-                                pcm.len()
+                                "[aokie-plugin] audio transcript check spawned [turn {tidx}] ({} samples{})",
+                                pcm.len(),
+                                if prev_draft.is_some() { ", incl. previous-turn audio" } else { "" }
                             );
                             std::thread::spawn(move || {
                                 let b64 = crate::agent::LlmClient::wav_base64(&pcm, 16_000);
-                                match hc.transcribe_turn(&b64, &stt, &ctx) {
+                                match hc.transcribe_turn(&b64, &stt, &ctx, prev_draft.as_deref()) {
                                     Ok(raw) => {
                                         let _ = tx.send((cid, tidx, raw, stt));
                                     }
@@ -5861,6 +5908,13 @@ fn run_loop(
                                 }
                             });
                         }
+                    }
+                    // Every caller turn with audio becomes the next turn's
+                    // continuity context (hesitations included — their audio
+                    // is real), tracked AFTER the spawn read the previous one.
+                    if send_audio && !last_turn_audio.is_empty() {
+                        prev_heard =
+                            Some((last_turn_audio.clone(), text.clone(), Instant::now()));
                     }
                     turn_overlapped = false;
                     turn_overlap_at = None;
