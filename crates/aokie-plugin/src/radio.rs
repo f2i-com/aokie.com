@@ -5365,6 +5365,15 @@ fn run_loop(
                                         // applies per-span interrupt policy. The probe
                                         // lane rides along: a spoken "wait"/"stop" cuts
                                         // the sentence mid-playback.
+                                        if let Some(lane) = rt_lane.as_mut() {
+                                            if let Some(line) = lane.delivery(
+                                                &spoken_text,
+                                                "sent_to_sco",
+                                                Instant::now(),
+                                            ) {
+                                                let _ = sink.send_line(&line);
+                                            }
+                                        }
                                         if spoken_text.contains("[[LOOKUP") {
                                             // A lookup marker leaking through
                                             // the stream (often UNCLOSED — the
