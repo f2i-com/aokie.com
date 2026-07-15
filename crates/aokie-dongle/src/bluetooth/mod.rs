@@ -80,12 +80,14 @@ pub enum BluetoothEvent {
     /// Phase 4e: a SendSms call we sent to the runtime was acked by
     /// the AG.
     SmsSent {
+        message_id: String,
         recipient_phone: String,
     },
     /// An outbound SMS was abandoned (MAS PUT failed / aged out across
     /// recovery cycles) — surfaced so the host can record the truth
     /// instead of a silent loss.
     SmsSendFailed {
+        message_id: String,
         recipient_phone: String,
         reason: String,
     },
@@ -214,11 +216,12 @@ impl BluetoothManager {
     /// runtime falls back to plain SMS_GSM.
     pub fn send_sms(
         &self,
+        message_id: String,
         recipient_phone: String,
         body: String,
         msg_type: Option<String>,
     ) -> Result<(), String> {
-        self.runtime.send_sms(recipient_phone, body, msg_type)
+        self.runtime.send_sms(message_id, recipient_phone, body, msg_type)
     }
 
     pub fn answer_call(&self) -> Result<(), String> {
@@ -452,11 +455,13 @@ fn bluetooth_event_from_runtime(
             handle,
             msg_type,
         }),
-        RuntimeEvent::SmsSent { recipient_phone } => BluetoothEvent::SmsSent { recipient_phone },
+        RuntimeEvent::SmsSent { message_id, recipient_phone } => BluetoothEvent::SmsSent { message_id, recipient_phone },
         RuntimeEvent::SmsSendFailed {
+            message_id,
             recipient_phone,
             reason,
         } => BluetoothEvent::SmsSendFailed {
+            message_id,
             recipient_phone,
             reason,
         },

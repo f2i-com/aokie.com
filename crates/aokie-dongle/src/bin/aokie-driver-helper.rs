@@ -1,9 +1,20 @@
 #![cfg(target_os = "windows")]
 
-use std::io::Write;
+use std::ffi::OsString;
+use std::io::{Read, Write};
+use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use sha2::{Digest, Sha256};
+
+use windows_sys::Win32::Foundation::{GetLastError, LocalFree, S_OK};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows_sys::Win32::UI::Shell::{SHGetFolderPathW, CSIDL_COMMON_APPDATA};
 
 #[derive(Debug, serde::Deserialize)]
 struct DriverJob {
@@ -34,6 +45,10 @@ struct DriverJob {
     /// recomputes the INF on disk and refuses on mismatch.
     #[serde(default)]
     inf_sha256: String,
+    /// AK-DRV-02: digest of the adjacent signed catalog. Production compares
+    /// this against a digest compiled into this signed helper.
+    #[serde(default)]
+    cat_sha256: String,
     /// DRIVER-001: the expected hardware id (`USB\VID_xxxx&PID_xxxx`).
     /// Mandatory on install jobs and must equal the id the helper derives
     /// from vid/pid itself — a job whose fields disagree is refused.
@@ -55,11 +70,30 @@ fn default_job_mode() -> String {
     "install".to_string()
 }
 
+/// v5 (AK-DRV-02): `cat_sha256` binds the signed catalog, and install
+/// package bytes move through locked handles into an admin-only directory.
+///
 /// v4 (DRIVER-001): `instance_id`/`inf_sha256` became mandatory for
 /// install, `hardware_id` + `allow_dev_self_sign` were added, restore
-/// jobs pin the instance id, and the owner check fails CLOSED. Exact
+/// jobs pin the instance id, and exact package checks fail CLOSED. Exact
 /// version match — a stale helper or stale dispatcher refuses to run.
-const SUPPORTED_JOB_VERSION: u32 = 4;
+const SUPPORTED_JOB_VERSION: u32 = 5;
+
+#[cfg(not(debug_assertions))]
+const EXPECTED_INF_SHA256: Option<&str> = Some(env!(
+    "AOKIE_EXPECTED_DRIVER_INF_SHA256",
+    "Release helpers require the exact Microsoft-signed package INF digest"
+));
+#[cfg(debug_assertions)]
+const EXPECTED_INF_SHA256: Option<&str> = option_env!("AOKIE_EXPECTED_DRIVER_INF_SHA256");
+
+#[cfg(not(debug_assertions))]
+const EXPECTED_CAT_SHA256: Option<&str> = Some(env!(
+    "AOKIE_EXPECTED_DRIVER_CAT_SHA256",
+    "Release helpers require the exact Microsoft-signed package CAT digest"
+));
+#[cfg(debug_assertions)]
+const EXPECTED_CAT_SHA256: Option<&str> = option_env!("AOKIE_EXPECTED_DRIVER_CAT_SHA256");
 
 /// %TEMP%\aokie-driver-helper.log. Lazily initialised the first time
 /// `log_line!` fires so a helper that bails early during arg parsing
@@ -128,8 +162,10 @@ fn main() {
 fn run() -> Result<(), String> {
     let job_path = parse_job_path()?;
     validate_job_path(&job_path)?;
-    let job_json = std::fs::read_to_string(&job_path)
-        .map_err(|e| format!("could not read job file {:?}: {}", job_path, e))?;
+    // AK-DRV-02: read the untrusted request once through a handle that denies
+    // sharing. After parsing, no later operation reopens or trusts the job.
+    let job_json = String::from_utf8(read_locked(&job_path, 64 * 1024)?)
+        .map_err(|e| format!("job file {:?} is not UTF-8: {}", job_path, e))?;
     let job: DriverJob = serde_json::from_str(&job_json)
         .map_err(|e| format!("could not parse job file {:?}: {}", job_path, e))?;
 
@@ -141,14 +177,15 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    // DRIVER-001: the job file itself must be owned by a trusted principal
-    // on EVERY mode — restore and remove-certs mutate machine state too.
-    guard_trusted_owner(&job_path)?;
-
-    transaction_log(&job.mode, &format!(
-        "job accepted: vid=0x{:04x} pid=0x{:04x} instance={:?}",
-        job.vid, job.pid, job.instance_id
-    ));
+    // The request remains untrusted even though it was read through a locked handle.
+    // Every privileged mode therefore re-authorizes its exact target below.
+    transaction_log(
+        &job.mode,
+        &format!(
+            "job accepted: vid=0x{:04x} pid=0x{:04x} instance={:?}",
+            job.vid, job.pid, job.instance_id
+        ),
+    );
 
     let result = match job.mode.as_str() {
         "install" => run_install(&job, &job_path),
@@ -174,10 +211,16 @@ fn run() -> Result<(), String> {
 /// (or be blocked from) an otherwise-valid job, so failures degrade to the
 /// per-run log only.
 fn transaction_log(mode: &str, detail: &str) {
-    let dir = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Aokie");
+    let dir = match program_data_dir() {
+        Ok(path) => path.join("Aokie"),
+        Err(error) => {
+            log_err!(
+                "[aokie-driver-helper] transaction journal unavailable: {}",
+                error
+            );
+            return;
+        }
+    };
     let entry = format!(
         "{{\"at\":{:?},\"pid\":{},\"mode\":{:?},\"detail\":{:?}}}",
         chrono::Local::now().to_rfc3339(),
@@ -222,6 +265,31 @@ fn validate_install_job_fields(job: &DriverJob) -> Result<(), String> {
             job.inf_sha256
         ));
     }
+    let cat_hash = job.cat_sha256.trim();
+    if !job.allow_dev_self_sign
+        && (cat_hash.len() != 64 || !cat_hash.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(
+            "production install job has no valid cat_sha256; refusing an unbound driver package"
+                .to_string(),
+        );
+    }
+    if let Some(expected) = EXPECTED_INF_SHA256 {
+        if !expected.eq_ignore_ascii_case(hash) {
+            return Err(format!(
+                "INF digest is not the package pinned into this helper: expected {}, got {}",
+                expected, hash
+            ));
+        }
+    }
+    if let Some(expected) = EXPECTED_CAT_SHA256 {
+        if !expected.eq_ignore_ascii_case(cat_hash) {
+            return Err(format!(
+                "catalog digest is not the package pinned into this helper: expected {}, got {}",
+                expected, cat_hash
+            ));
+        }
+    }
     let expected_hwid = aokie_dongle::winusb::hardware_id(job.vid, job.pid);
     if !job.hardware_id.eq_ignore_ascii_case(&expected_hwid) {
         return Err(format!(
@@ -233,6 +301,234 @@ fn validate_install_job_fields(job: &DriverJob) -> Result<(), String> {
     Ok(())
 }
 
+/// Read an attacker-writable input through a handle that denies read, write,
+/// and delete sharing. A replacement race therefore either loses before the
+/// open (and is caught by the pinned digest) or fails while this read runs.
+fn read_locked(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .map_err(|e| format!("could not open {:?} without sharing: {}", path, e))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("could not stat {:?}: {}", path, e))?
+        .len();
+    if len > max_bytes {
+        return Err(format!(
+            "refusing oversized input {:?}: {} bytes exceeds {}",
+            path, len, max_bytes
+        ));
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("could not read {:?}: {}", path, e))?;
+    Ok(bytes)
+}
+
+struct PrivilegedPackage {
+    root: PathBuf,
+    inf_path: PathBuf,
+    cat_path: Option<PathBuf>,
+}
+
+impl PrivilegedPackage {
+    fn copy_from(job: &DriverJob) -> Result<Self, String> {
+        let root = create_admin_only_staging_dir()?;
+        let inf_path = root.join(aokie_dongle::winusb::INF_NAME);
+        let mut package = Self {
+            root,
+            inf_path,
+            cat_path: None,
+        };
+
+        copy_locked_verified(
+            &job.inf_path,
+            &package.inf_path,
+            &job.inf_sha256,
+            4 * 1024 * 1024,
+        )?;
+
+        let source_cat = job.inf_path.with_file_name(aokie_dongle::winusb::CAT_NAME);
+        if source_cat.is_file() {
+            let cat_path = package.root.join(aokie_dongle::winusb::CAT_NAME);
+            copy_locked_verified(&source_cat, &cat_path, &job.cat_sha256, 16 * 1024 * 1024)?;
+            package.cat_path = Some(cat_path);
+        } else if !job.allow_dev_self_sign {
+            return Err(
+                "the Microsoft-signed catalog is missing; refusing production install".into(),
+            );
+        }
+        Ok(package)
+    }
+}
+
+impl Drop for PrivilegedPackage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn copy_locked_verified(
+    source: &Path,
+    destination: &Path,
+    expected_sha256: &str,
+    max_bytes: u64,
+) -> Result<(), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!("no valid pinned digest for {:?}", source));
+    }
+    let mut input = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(source)
+        .map_err(|e| format!("open package file {:?} without sharing: {}", source, e))?;
+    let len = input
+        .metadata()
+        .map_err(|e| format!("stat package file {:?}: {}", source, e))?
+        .len();
+    if len == 0 || len > max_bytes {
+        return Err(format!(
+            "package file {:?} has invalid size {}",
+            source, len
+        ));
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .open(destination)
+        .map_err(|e| format!("create privileged copy {:?}: {}", destination, e))?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|e| format!("read package file {:?}: {}", source, e))?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|e| format!("write privileged copy {:?}: {}", destination, e))?;
+        hasher.update(&buffer[..read]);
+        copied += read as u64;
+    }
+    output
+        .sync_all()
+        .map_err(|e| format!("sync privileged copy {:?}: {}", destination, e))?;
+    if copied != len {
+        return Err(format!("short package copy for {:?}", source));
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !expected_sha256.eq_ignore_ascii_case(&actual) {
+        return Err(format!(
+            "package digest mismatch for {:?}: expected {}, got {}",
+            source, expected_sha256, actual
+        ));
+    }
+    Ok(())
+}
+
+/// Create a unique leaf directly under ProgramData with a protected DACL:
+/// full control for SYSTEM and Administrators only, no inherited user ACEs.
+fn create_admin_only_staging_dir() -> Result<PathBuf, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // Never trust an inherited ProgramData environment variable at an
+    // elevation boundary. Resolve the machine folder through Shell32.
+    let program_data = program_data_dir()?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("system clock: {}", e))?
+        .as_nanos();
+    let sddl: Vec<u16> = "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(format!(
+            "create protected staging security descriptor: Win32 error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    let mut security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let mut result = None;
+    for sequence in 0..32_u32 {
+        let path = program_data.join(format!(
+            "AokieDriverStaging-{}-{nonce:x}-{sequence}",
+            std::process::id()
+        ));
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if unsafe { CreateDirectoryW(wide.as_ptr(), &mut security) } != 0 {
+            result = Some(Ok(path));
+            break;
+        }
+        let error = unsafe { GetLastError() };
+        if error != 183 {
+            result = Some(Err(format!(
+                "create protected staging directory: Win32 error {}",
+                error
+            )));
+            break;
+        }
+    }
+    unsafe {
+        LocalFree(descriptor as _);
+    }
+    result.unwrap_or_else(|| Err("could not allocate a unique protected staging directory".into()))
+}
+
+fn program_data_dir() -> Result<PathBuf, String> {
+    let mut buffer = [0_u16; 260];
+    let result = unsafe {
+        SHGetFolderPathW(
+            std::ptr::null_mut(),
+            CSIDL_COMMON_APPDATA as i32,
+            std::ptr::null_mut(),
+            0,
+            buffer.as_mut_ptr(),
+        )
+    };
+    if result != S_OK {
+        return Err(format!(
+            "resolve the machine ProgramData folder: HRESULT 0x{:08x}",
+            result as u32
+        ));
+    }
+    let len = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    if len == 0 {
+        return Err("the machine ProgramData folder is empty".to_string());
+    }
+    Ok(PathBuf::from(OsString::from_wide(&buffer[..len])))
+}
+
 fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
     validate_inf_path(&job.inf_path, job_path)?;
 
@@ -240,13 +536,10 @@ fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
     // there is no legacy "empty field skips the check" path anymore.
     validate_install_job_fields(job)?;
 
-    // AOK-DRIVER-001 — verify the INF was written by a trusted principal
-    // (the elevated user, Administrators, or SYSTEM); the job file was
-    // guarded in run(). Closes the "a lower-privilege local process
-    // planted files in the work dir and we're about to act on them
-    // elevated" race. DRIVER-001: a security-API failure fails CLOSED.
-    guard_trusted_owner(&job.inf_path)?;
-
+    // AK-DRV-02: the source directory remains attacker-controlled. The INF
+    // and CAT are copied through no-sharing handles into a fresh admin-only
+    // staging directory and checked against their release-pinned digests
+    // before any SetupAPI call below.
     log_line!(
         "[aokie-driver-helper] install job: vid=0x{:04x} pid=0x{:04x} inf={:?}",
         job.vid,
@@ -288,25 +581,37 @@ fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
     // different driver payload can't ride in on a tampered job. The hash
     // is re-verified HERE, immediately before mutation — the field itself
     // was already format-validated above.
-    let actual = aokie_dongle::sha256_file(&job.inf_path)
-        .map_err(|e| format!("could not hash INF for verification: {}", e))?;
+    let package = PrivilegedPackage::copy_from(job)?;
+    let actual = aokie_dongle::sha256_file(&package.inf_path)
+        .map_err(|e| format!("could not re-hash privileged INF: {}", e))?;
     if !inf_hash_matches(&job.inf_sha256, &actual) {
         return Err(format!(
             "INF SHA-256 mismatch: job approved {} but {:?} hashes to {} — refusing",
             job.inf_sha256, job.inf_path, actual
         ));
     }
-    log_line!("[aokie-driver-helper] INF hash verified ({}…)", &actual[..actual.len().min(16)]);
+    log_line!(
+        "[aokie-driver-helper] INF hash verified ({}…)",
+        &actual[..actual.len().min(16)]
+    );
+
+    if let (Some(cat_path), Some(expected)) = (&package.cat_path, EXPECTED_CAT_SHA256) {
+        let cat_actual = aokie_dongle::sha256_file(cat_path)
+            .map_err(|e| format!("could not re-hash privileged catalog: {}", e))?;
+        if !expected.eq_ignore_ascii_case(&cat_actual) {
+            return Err("privileged catalog changed after verified copy; refusing".to_string());
+        }
+    }
 
     transaction_log(
         "install",
         &format!(
             "staging driver: instance={} inf={:?} inf_sha256={} dev_self_sign={}",
-            device.instance_id, job.inf_path, actual, job.allow_dev_self_sign
+            device.instance_id, package.inf_path, actual, job.allow_dev_self_sign
         ),
     );
     let result = aokie_dongle::winusb::install_package(
-        &job.inf_path,
+        &package.inf_path,
         job.vid,
         job.pid,
         job.allow_dev_self_sign,
@@ -404,26 +709,6 @@ fn run_restore(job: &DriverJob) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse the job if `path`'s owner is a principal we don't trust
-/// (i.e. not the elevated user, Administrators, or SYSTEM). DRIVER-001:
-/// a security-API failure now fails CLOSED too — an owner we cannot
-/// verify is an owner we do not trust; the old "inconclusive → soft
-/// pass" carve-out was an elevation-time fail-open.
-fn guard_trusted_owner(path: &Path) -> Result<(), String> {
-    match aokie_dongle::winusb::file_owner_is_trusted(path) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(format!(
-            "refusing: {:?} is owned by an untrusted principal (possible planted file)",
-            path
-        )),
-        Err(e) => Err(format!(
-            "refusing: could not verify the owner of {:?} ({}) — an unverifiable job \
-             file is not acted on elevated",
-            path, e
-        )),
-    }
-}
-
 /// AOK-DRIVER-001/DRIVER-001: the live device instance must match the one
 /// the dispatcher approved — exact, case-insensitive, never skipped (an
 /// empty approved id is refused earlier by the mandatory-field checks).
@@ -514,6 +799,14 @@ fn validate_inf_path(inf_path: &Path, job_path: &Path) -> Result<(), String> {
         return Err(format!(
             "inf_path must end in .inf, got extension {:?}",
             ext
+        ));
+    }
+    let name = inf_path.file_name().and_then(|name| name.to_str());
+    if !name.is_some_and(|name| name.eq_ignore_ascii_case(aokie_dongle::winusb::INF_NAME)) {
+        return Err(format!(
+            "inf_path must name the pinned package file {}, got {:?}",
+            aokie_dongle::winusb::INF_NAME,
+            name
         ));
     }
     if !inf_path.is_file() {
@@ -626,7 +919,7 @@ mod tests {
         std::fs::create_dir_all(&dir_job).unwrap();
         std::fs::create_dir_all(&dir_inf).unwrap();
         let job = dir_job.join("aokie_driver_job.json");
-        let inf = dir_inf.join("aokie_winusb.inf");
+        let inf = dir_inf.join(aokie_dongle::winusb::INF_NAME);
         touch(&job);
         touch(&inf);
         let err = validate_inf_path(&inf, &job).unwrap_err();
@@ -644,7 +937,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let job = dir.join("aokie_driver_job.json");
-        let inf = dir.join("aokie_winusb.inf");
+        let inf = dir.join(aokie_dongle::winusb::INF_NAME);
         touch(&job);
         touch(&inf);
         validate_inf_path(&inf, &job).unwrap();
@@ -681,12 +974,12 @@ mod tests {
         assert!(!inf_hash_matches("", "anything"));
     }
 
-    fn v4_job(instance_id: &str, inf_sha256: &str, hardware_id: &str) -> DriverJob {
+    fn v5_job(instance_id: &str, inf_sha256: &str, hardware_id: &str) -> DriverJob {
         serde_json::from_str(&format!(
-            r#"{{"version":4,"mode":"install","vid":2652,"pid":8684,
+            r#"{{"version":5,"mode":"install","vid":2652,"pid":8684,
                 "inf_path":"C:\\x\\aokie_winusb_bluetooth.inf",
-                "instance_id":{:?},"inf_sha256":{:?},"hardware_id":{:?}}}"#,
-            instance_id, inf_sha256, hardware_id
+                "instance_id":{:?},"inf_sha256":{:?},"cat_sha256":{:?},"hardware_id":{:?}}}"#,
+            instance_id, inf_sha256, GOOD_SHA, hardware_id
         ))
         .unwrap()
     }
@@ -694,29 +987,34 @@ mod tests {
     const GOOD_SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
-    fn v4_install_job_requires_every_exact_target_field() {
+    fn v5_install_job_requires_every_exact_target_field() {
         // DRIVER-001 acceptance: missing fields abort before mutation.
         let hwid = aokie_dongle::winusb::hardware_id(2652, 8684);
-        let good = v4_job("USB\\VID_0A5C&PID_21EC\\00198600226C", GOOD_SHA, &hwid);
+        let good = v5_job("USB\\VID_0A5C&PID_21EC\\00198600226C", GOOD_SHA, &hwid);
         validate_install_job_fields(&good).unwrap();
         assert!(!good.allow_dev_self_sign, "self-signing defaults OFF");
 
-        let err = validate_install_job_fields(&v4_job("", GOOD_SHA, &hwid)).unwrap_err();
+        let err = validate_install_job_fields(&v5_job("", GOOD_SHA, &hwid)).unwrap_err();
         assert!(err.contains("no device instance id"), "got: {}", err);
 
-        let err = validate_install_job_fields(&v4_job("USB\\X\\1", "deadbeef", &hwid)).unwrap_err();
+        let err = validate_install_job_fields(&v5_job("USB\\X\\1", "deadbeef", &hwid)).unwrap_err();
         assert!(err.contains("not a 64-hex SHA-256"), "got: {}", err);
 
-        let err = validate_install_job_fields(&v4_job("USB\\X\\1", GOOD_SHA, "")).unwrap_err();
-        assert!(err.contains("does not match the id derived"), "got: {}", err);
+        let err = validate_install_job_fields(&v5_job("USB\\X\\1", GOOD_SHA, "")).unwrap_err();
+        assert!(
+            err.contains("does not match the id derived"),
+            "got: {}",
+            err
+        );
 
-        let err = validate_install_job_fields(&v4_job(
-            "USB\\X\\1",
-            GOOD_SHA,
-            "USB\\VID_1234&PID_5678",
-        ))
-        .unwrap_err();
-        assert!(err.contains("does not match the id derived"), "got: {}", err);
+        let err =
+            validate_install_job_fields(&v5_job("USB\\X\\1", GOOD_SHA, "USB\\VID_1234&PID_5678"))
+                .unwrap_err();
+        assert!(
+            err.contains("does not match the id derived"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -733,15 +1031,17 @@ mod tests {
     }
 
     #[test]
-    fn v4_job_round_trips_the_new_fields() {
-        let json = r#"{"version":4,"mode":"install","vid":2652,"pid":8684,
+    fn v5_job_round_trips_the_new_fields() {
+        let json = r#"{"version":5,"mode":"install","vid":2652,"pid":8684,
                        "inf_path":"C:\\x\\aokie_winusb_bluetooth.inf",
                        "instance_id":"USB\\VID_0A5C&PID_21EC\\00198600226C",
                        "inf_sha256":"deadbeef",
+                       "cat_sha256":"feedface",
                        "hardware_id":"USB\\VID_0A5C&PID_21EC",
                        "allow_dev_self_sign":true}"#;
         let job: DriverJob = serde_json::from_str(json).unwrap();
-        assert_eq!(job.version, 4);
+        assert_eq!(job.version, 5);
+        assert_eq!(job.cat_sha256, "feedface");
         assert_eq!(job.hardware_id, "USB\\VID_0A5C&PID_21EC");
         assert!(job.allow_dev_self_sign);
     }

@@ -12,8 +12,8 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW, SetupDiSetDeviceRegistryPropertyW,
     SetupOpenInfFileW, UpdateDriverForPlugAndPlayDevicesW, CM_REENUMERATE_RETRY_INSTALLATION,
     CM_REMOVE_NO_RESTART, CONFIGFLAG_REINSTALL, CR_NO_SUCH_DEVNODE, CR_SUCCESS, DIGCF_ALLCLASSES,
-    DIGCF_PRESENT, HDEVINFO, INF_STYLE_WIN4, INSTALLFLAG_FORCE, SPDRP_CONFIGFLAGS, SPDRP_HARDWAREID,
-    SPOST_PATH, SP_COPY_NEWER_OR_SAME, SP_DEVINFO_DATA,
+    DIGCF_PRESENT, HDEVINFO, INF_STYLE_WIN4, INSTALLFLAG_FORCE, SPDRP_CONFIGFLAGS,
+    SPDRP_HARDWAREID, SPOST_PATH, SP_COPY_NEWER_OR_SAME, SP_DEVINFO_DATA,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, HANDLE, WAIT_FAILED,
@@ -536,7 +536,13 @@ pub fn restart_device(hardware_id: &str) -> Result<(), String> {
         // Surprise-remove the device (null veto out-params: we don't inspect the
         // veto, a non-success return is enough to skip).
         let cr = unsafe {
-            CM_Query_And_Remove_SubTreeW(info.DevInst, null_mut(), null_mut(), 0, CM_REMOVE_NO_RESTART)
+            CM_Query_And_Remove_SubTreeW(
+                info.DevInst,
+                null_mut(),
+                null_mut(),
+                0,
+                CM_REMOVE_NO_RESTART,
+            )
         };
         if cr != CR_SUCCESS {
             eprintln!(
@@ -924,7 +930,9 @@ pub fn file_owner_is_trusted(path: &std::path::Path) -> Result<bool, String> {
 /// True when `owner` equals the current process token's user SID.
 fn current_process_user_owns(owner: windows_sys::Win32::Security::PSID) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{EqualSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {

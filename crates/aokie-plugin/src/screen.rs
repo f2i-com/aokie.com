@@ -21,16 +21,12 @@ pub struct ScreenPolicy {
     /// Separate from `message`: a blocked (often abusive) number should not
     /// get the polite private-caller line.
     pub blocked_message: String,
-    /// Phase 1 (abuse handling): when the agent flags a caller as abusive
-    /// ([[ABUSE]]), automatically append their number to the block list.
-    /// Default ON; `autoBlockAbuse: false` (env AOKIE_AUTO_BLOCK_ABUSE=0)
-    /// turns only the auto-block off — the notice + hangup always happen.
+    /// Reserved for a future operator-approved incident workflow. Model
+    /// output cannot enable persistent blocking; the shipped value is false.
     pub auto_block_abuse: bool,
-    /// Phase 3 (manager line): digits-only last-9 suffixes of the
-    /// business's MANAGER numbers. A matching caller gets the MANAGER
-    /// persona + name-inclusive lookups (READ-ONLY — caller ID is trivially
-    /// spoofable, so writes will additionally require the spoken PIN) and
-    /// is never screened out by the number rules.
+    /// Phase 3 (manager line): digits-only last-9 suffixes of the business's
+    /// manager numbers. A match is only a PIN-challenge candidate and never
+    /// changes screening, persona, lookup privacy or event authorization.
     manager: Vec<String>,
 }
 
@@ -80,10 +76,8 @@ impl ScreenPolicy {
         let reject_private = std::env::var_os("AOKIE_REJECT_PRIVATE").is_some();
         let message = std::env::var("AOKIE_SCREEN_MESSAGE").unwrap_or_default();
         let blocked_message = std::env::var("AOKIE_BLOCKED_MESSAGE").unwrap_or_default();
-        // Default ON: absence of the var (or any value but "0") auto-blocks.
-        let auto_block_abuse = std::env::var("AOKIE_AUTO_BLOCK_ABUSE")
-            .map(|v| v.trim() != "0")
-            .unwrap_or(true);
+        // Model output can end the current call but cannot persist a block.
+        let auto_block_abuse = false;
         let manager = std::env::var("AOKIE_MANAGER_NUMBERS")
             .unwrap_or_default()
             .split(|c: char| c == ',' || c == '\n' || c == ';')
@@ -101,7 +95,7 @@ impl ScreenPolicy {
         }
     }
 
-    /// Phase 3: is this caller id one of the business's manager numbers?
+    /// Phase 3: is this caller id eligible to attempt manager authentication?
     /// Same digits-only last-9-suffix rule as everything else. A withheld
     /// id is never a manager.
     pub fn is_manager(&self, caller_id: Option<&str>) -> bool {
@@ -130,11 +124,6 @@ impl ScreenPolicy {
     /// `Some(reason)` means the call is screened out. Reasons are the
     /// privacy-safe codes "blocked" / "filtered" / "private".
     pub fn verdict(&self, caller_id: Option<&str>) -> Option<&'static str> {
-        // Phase 3: the manager's own numbers are never screened — an accept
-        // filter tuned for customer mobiles must not hang up on the boss.
-        if self.is_manager(caller_id) {
-            return None;
-        }
         let id = caller_id.unwrap_or("").trim();
         if id.is_empty() {
             return if self.reject_private {
@@ -171,7 +160,7 @@ mod tests {
             reject_private: private,
             message: String::new(),
             blocked_message: String::new(),
-            auto_block_abuse: true,
+            auto_block_abuse: false,
             manager: Vec::new(),
         }
     }
@@ -185,11 +174,10 @@ mod tests {
         p
     }
 
-    /// Phase 3: manager numbers match on the same suffix rule, a withheld id
-    /// is never a manager, and the manager's own number is never screened —
-    /// even by an accept filter or the block list.
+    /// Phase 3: manager candidates match on the same suffix rule, a withheld
+    /// id is ineligible, and ANI never bypasses ordinary screening.
     #[test]
-    fn manager_numbers_match_and_bypass_screening() {
+    fn manager_numbers_are_candidates_but_do_not_bypass_screening() {
         let p = with_manager(policy("", Some(r"^\+1"), true), "+61 400 999 888");
         assert!(p.is_manager(Some("0400999888")));
         assert!(p.is_manager(Some("+61400999888")));
@@ -198,11 +186,11 @@ mod tests {
         assert!(!p.is_manager(Some("")));
         // The accept filter (US-only here) screens ordinary AU callers…
         assert_eq!(p.verdict(Some("0400111222")), Some("filtered"));
-        // …but never the manager.
-        assert_eq!(p.verdict(Some("0400999888")), None);
-        // Even a block-list hit on the manager's own number loses.
+        // …and the same result applies to a spoofable manager candidate.
+        assert_eq!(p.verdict(Some("0400999888")), Some("filtered"));
+        // A block-list hit is also authoritative.
         let pb = with_manager(policy("0400999888", None, false), "0400999888");
-        assert_eq!(pb.verdict(Some("0400999888")), None);
+        assert_eq!(pb.verdict(Some("0400999888")), Some("blocked"));
         // is_active unaffected: manager numbers alone don't turn screening on.
         let quiet = with_manager(policy("", None, false), "0400999888");
         assert!(!quiet.is_active());

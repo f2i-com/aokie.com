@@ -127,6 +127,7 @@ pub enum RuntimeEvent {
     /// acknowledged by the AG. The phone has accepted the bMessage —
     /// it'll forward to the carrier on its own schedule.
     SmsSent {
+        message_id: String,
         recipient_phone: String,
     },
     /// An outbound SMS was ABANDONED — the MAS session failed the PUT,
@@ -134,6 +135,7 @@ pub enum RuntimeEvent {
     /// cycles. Emitted so the message is never lost silently (audit
     /// C-16: a caller was once promised an SMS that never existed).
     SmsSendFailed {
+        message_id: String,
         recipient_phone: String,
         reason: String,
     },
@@ -253,6 +255,7 @@ enum ControlCommand {
     /// (including None for manual sends) falls back to plain
     /// SMS_GSM.
     SendSms {
+        message_id: String,
         recipient_phone: String,
         body: String,
         msg_type: Option<String>,
@@ -364,6 +367,7 @@ enum PendingMapOp {
     /// ago is stale and should be dropped to avoid surprise late
     /// replies when the user reconnects.
     SendReply {
+        message_id: String,
         bmessage: Vec<u8>,
         recipient_phone: String,
         queued_at: Instant,
@@ -651,12 +655,14 @@ impl AokieRuntime {
     /// plain SMS_GSM bMessage as before.
     pub fn send_sms(
         &self,
+        message_id: String,
         recipient_phone: String,
         body: String,
         msg_type: Option<String>,
     ) -> Result<(), String> {
         self.control_tx
             .send(ControlCommand::SendSms {
+                message_id,
                 recipient_phone,
                 body,
                 msg_type,
@@ -2265,6 +2271,7 @@ fn run_runtime(
                     if let Some(op) = active_map_op.take() {
                         match &op {
                             PendingMapOp::SendReply {
+                                message_id,
                                 queued_at,
                                 recipient_phone,
                                 ..
@@ -2277,6 +2284,7 @@ fn run_runtime(
                                     pending_map_ops.push_back(op);
                                 } else {
                                     let _ = event_tx.send(RuntimeEvent::SmsSendFailed {
+                                        message_id: message_id.clone(),
                                         recipient_phone: recipient_phone.clone(),
                                         reason: format!(
                                             "abandoned after {:.0}s of MAS-stall recovery cycles",
@@ -2471,6 +2479,7 @@ fn run_runtime(
                     );
                 }
                 Ok(ControlCommand::SendSms {
+                    message_id,
                     recipient_phone,
                     body,
                     msg_type,
@@ -2491,6 +2500,7 @@ fn run_runtime(
                         bmessage::build_sms_push(&recipient_phone, &body)
                     };
                     pending_map_ops.push_back(PendingMapOp::SendReply {
+                        message_id,
                         bmessage,
                         recipient_phone,
                         queued_at: Instant::now(),
@@ -3303,6 +3313,7 @@ fn run_runtime(
                             }
                             pending_map_ops.retain(|op| match op {
                                 PendingMapOp::SendReply {
+                                    message_id,
                                     queued_at,
                                     recipient_phone,
                                     ..
@@ -3313,6 +3324,7 @@ fn run_runtime(
                                         // Aged out: surface it — a customer
                                         // was told a text was coming.
                                         let _ = event_tx.send(RuntimeEvent::SmsSendFailed {
+                                            message_id: message_id.clone(),
                                             recipient_phone: recipient_phone.clone(),
                                             reason: format!(
                                                 "abandoned {:.0}s after queueing (ACL lost before the phone acked the send)",
@@ -4800,12 +4812,13 @@ fn handle_map_runtime_event(
             }
             (
                 Some(PendingMapOp::SendReply {
-                    recipient_phone, ..
+                    message_id, recipient_phone, ..
                 }),
                 _,
             ) => {
                 *last_send_reply_at = Some(Instant::now());
                 let _ = event_tx.send(RuntimeEvent::SmsSent {
+                    message_id: message_id.clone(),
                     recipient_phone: recipient_phone.clone(),
                 });
             }
@@ -4842,12 +4855,13 @@ fn handle_map_runtime_event(
             // refusal can't loop forever); aged ones surface as
             // SmsSendFailed so nothing dies silently.
             if let Some(op @ PendingMapOp::SendReply { .. }) = active_map_op.as_ref() {
-                let (queued_at, recipient_phone) = match op {
+                let (queued_at, message_id, recipient_phone) = match op {
                     PendingMapOp::SendReply {
+                        message_id,
                         queued_at,
                         recipient_phone,
                         ..
-                    } => (*queued_at, recipient_phone.clone()),
+                    } => (*queued_at, message_id.clone(), recipient_phone.clone()),
                     _ => unreachable!(),
                 };
                 if queued_at.elapsed() < SEND_REPLY_RETAIN_TTL {
@@ -4858,6 +4872,7 @@ fn handle_map_runtime_event(
                     pending_map_ops.push_back(op.clone());
                 } else {
                     let _ = event_tx.send(RuntimeEvent::SmsSendFailed {
+                        message_id,
                         recipient_phone,
                         reason: format!("MAS session failed the send: {}", reason),
                     });
