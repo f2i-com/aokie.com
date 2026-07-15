@@ -51,6 +51,8 @@ enum Phase {
 pub struct HfpConnectRuntime {
     connection_handle: u16,
     wbs_supported: bool,
+    /// Phase 4: advertise call waiting / 3-way on the outbound SLC.
+    call_waiting_enabled: bool,
     phase: Phase,
     pending_events: Vec<HfpConnectEvent>,
     /// Inbound bytes captured by the SDP channel's upper handler,
@@ -61,10 +63,11 @@ pub struct HfpConnectRuntime {
 }
 
 impl HfpConnectRuntime {
-    pub fn new(connection_handle: u16, wbs_supported: bool) -> Self {
+    pub fn new(connection_handle: u16, wbs_supported: bool, call_waiting_enabled: bool) -> Self {
         Self {
             connection_handle,
             wbs_supported,
+            call_waiting_enabled,
             phase: Phase::Idle,
             pending_events: Vec::new(),
             inbound_buffer: Arc::new(StdMutex::new(Vec::new())),
@@ -291,8 +294,12 @@ impl HfpConnectRuntime {
                 let channel_num = *server_channel;
                 if let Some(channel) = l2cap_state.channel(cid) {
                     if channel.state == ChannelState::Open {
-                        let sabm =
-                            l2cap_state.start_hfp_client(cid, channel_num, self.wbs_supported)?;
+                        let sabm = l2cap_state.start_hfp_client(
+                            cid,
+                            channel_num,
+                            self.wbs_supported,
+                            self.call_waiting_enabled,
+                        )?;
                         out.push(sabm);
                         eprintln!(
                             "[AokieRadio] HFP connect: RFCOMM cid 0x{:04x} open — SLC kickoff (AG channel {})",
@@ -468,7 +475,7 @@ mod tests {
     #[test]
     fn full_flow_reaches_slc_kickoff() {
         let mut l2cap = L2capState::new();
-        let mut runtime = HfpConnectRuntime::new(HANDLE, false);
+        let mut runtime = HfpConnectRuntime::new(HANDLE, false, false);
         let packets = runtime.start(&mut l2cap).expect("start");
         assert_eq!(packets.len(), 1, "SDP ConnectionRequest expected");
         assert!(runtime.start(&mut l2cap).is_err(), "double start refused");
@@ -500,7 +507,7 @@ mod tests {
     #[test]
     fn missing_ag_record_fails_cleanly() {
         let mut l2cap = L2capState::new();
-        let mut runtime = HfpConnectRuntime::new(HANDLE, false);
+        let mut runtime = HfpConnectRuntime::new(HANDLE, false, false);
         runtime.start(&mut l2cap).expect("start");
         let sdp_cid = 0x0040;
         walk_outbound_l2cap_to_open(&mut l2cap, sdp_cid, 0x0070, 0x80, 0x81);
@@ -530,7 +537,7 @@ mod tests {
     #[test]
     fn inactivity_watchdog_fails_a_silent_setup() {
         let mut l2cap = L2capState::new();
-        let mut runtime = HfpConnectRuntime::new(HANDLE, false);
+        let mut runtime = HfpConnectRuntime::new(HANDLE, false, false);
         runtime.start(&mut l2cap).expect("start");
         // No peer answer at all. Backdate progress past the timeout.
         runtime.last_progress_at =

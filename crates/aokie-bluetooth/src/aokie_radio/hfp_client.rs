@@ -45,10 +45,12 @@ pub struct HfpClientState {
 }
 
 impl HfpClientState {
-    pub fn new(server_channel: u8, wbs_supported: bool) -> Self {
+    pub fn new(server_channel: u8, wbs_supported: bool, call_waiting_enabled: bool) -> Self {
+        let mut hfp_state = hfp::HfpHandsFreeState::new();
+        hfp_state.set_call_waiting_enabled(call_waiting_enabled);
         Self {
             client: RfcommClientState::new(server_channel),
-            hfp_state: hfp::HfpHandsFreeState::new(),
+            hfp_state,
             line_carry: String::new(),
             pending_commands: VecDeque::new(),
             in_flight_command: None,
@@ -144,6 +146,7 @@ impl HfpClientState {
                     );
                     self.pending_commands = hfp::HfpHandsFreeState::initial_service_level_commands(
                         self.wbs_supported,
+                        self.hfp_state.call_waiting_enabled(),
                     )
                     .into();
                     if let Some(frame) = self.next_command_frame()? {
@@ -239,49 +242,45 @@ impl HfpClientState {
             self.events.extend(self.hfp_state.apply_result(&result));
             match result {
                 hfp::HfpAgResult::Ok => {
+                    if matches!(
+                        self.in_flight_command,
+                        Some(hfp::HfpAtCommand::EnableCallWaitingNotifications)
+                    ) {
+                        self.hfp_state.note_ccwa_accepted();
+                    }
                     self.in_flight_command = None;
                     self.in_flight_sent_at = None;
                     if !self.slc_failed {
-                        if let Some(frame) = self.next_command_frame()? {
-                            responses.push(frame);
-                        } else if self.pending_commands.is_empty() {
-                            // Lost/garbled +CIND=? definitions (phantom-answer
-                            // incidents): re-request ONCE before readiness —
-                            // ringing on default indices misreads as answered.
-                            if self.hfp_state.needs_indicator_definitions_retry() {
-                                self.pending_commands
-                                    .push_back(hfp::HfpAtCommand::RetrieveIndicators);
-                                self.pending_commands
-                                    .push_back(hfp::HfpAtCommand::RetrieveIndicatorStatus);
-                                if let Some(frame) = self.next_command_frame()? {
-                                    responses.push(frame);
-                                }
-                            } else {
-                                // Only an EMPTY queue means the SLC sequence
-                                // finished — a command held back by credit
-                                // flow control must not fake readiness.
-                                if let Some(event) = self.hfp_state.mark_service_level_ready() {
-                                    self.events.push(event);
-                                }
-                            }
-                        }
+                        self.advance_slc_queue(&mut responses)?;
                     }
                 }
                 hfp::HfpAgResult::Error => {
                     // Same policy as the inbound path: an ERROR during
                     // SLC is fatal (no safe blind retry); post-SLC
                     // ERRORs surface but don't unready the connection.
+                    // Phase 4 exception: the call-waiting probes (AT+CHLD=?
+                    // / AT+CCWA=1) are non-fatal — capability off, queue
+                    // continues (see the server-path Error arm).
                     let failed = self.in_flight_command.take();
                     self.in_flight_sent_at = None;
-                    if !self.hfp_state.service_level_ready() {
-                        self.pending_commands.clear();
-                        self.slc_failed = true;
+                    let capability_probe = failed
+                        .as_ref()
+                        .is_some_and(|c| self.hfp_state.note_slc_probe_error(c));
+                    if capability_probe {
+                        if !self.slc_failed {
+                            self.advance_slc_queue(&mut responses)?;
+                        }
+                    } else {
+                        if !self.hfp_state.service_level_ready() {
+                            self.pending_commands.clear();
+                            self.slc_failed = true;
+                        }
+                        let label = failed
+                            .map(|c| format!("{:?}", c))
+                            .unwrap_or_else(|| "unsolicited".to_string());
+                        self.events
+                            .push(hfp::HfpEvent::ServiceLevelConnectionFailed(label));
                     }
-                    let label = failed
-                        .map(|c| format!("{:?}", c))
-                        .unwrap_or_else(|| "unsolicited".to_string());
-                    self.events
-                        .push(hfp::HfpEvent::ServiceLevelConnectionFailed(label));
                 }
                 hfp::HfpAgResult::SelectedCodec(codec) => {
                     responses.push(self.build_at_frame(hfp::HfpAtCommand::ConfirmCodec(codec))?);
@@ -290,6 +289,35 @@ impl HfpClientState {
             }
         }
         Ok(responses)
+    }
+
+    /// Shared SLC-queue advance (send next / definitions retry / readiness)
+    /// for the OK arm and the non-fatal capability-probe ERROR arm.
+    fn advance_slc_queue(&mut self, responses: &mut Vec<Vec<u8>>) -> Result<(), String> {
+        if let Some(frame) = self.next_command_frame()? {
+            responses.push(frame);
+        } else if self.pending_commands.is_empty() {
+            // Lost/garbled +CIND=? definitions (phantom-answer
+            // incidents): re-request ONCE before readiness —
+            // ringing on default indices misreads as answered.
+            if self.hfp_state.needs_indicator_definitions_retry() {
+                self.pending_commands
+                    .push_back(hfp::HfpAtCommand::RetrieveIndicators);
+                self.pending_commands
+                    .push_back(hfp::HfpAtCommand::RetrieveIndicatorStatus);
+                if let Some(frame) = self.next_command_frame()? {
+                    responses.push(frame);
+                }
+            } else {
+                // Only an EMPTY queue means the SLC sequence
+                // finished — a command held back by credit
+                // flow control must not fake readiness.
+                if let Some(event) = self.hfp_state.mark_service_level_ready() {
+                    self.events.push(event);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn next_command_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
@@ -302,13 +330,20 @@ impl HfpClientState {
         if !self.client.can_send_data() {
             return Ok(None);
         }
-        let Some(command) = self.pending_commands.pop_front() else {
-            return Ok(None);
-        };
-        let frame = self.build_at_frame(command.clone())?;
-        self.in_flight_command = Some(command);
-        self.in_flight_sent_at = Some(Instant::now());
-        Ok(Some(frame))
+        loop {
+            let Some(command) = self.pending_commands.pop_front() else {
+                return Ok(None);
+            };
+            // Phase 4: probes skip unless both sides support three-way —
+            // same rule as the server path's next_hfp_command_frame.
+            if self.hfp_state.should_skip_slc_command(&command) {
+                continue;
+            }
+            let frame = self.build_at_frame(command.clone())?;
+            self.in_flight_command = Some(command);
+            self.in_flight_sent_at = Some(Instant::now());
+            return Ok(Some(frame));
+        }
     }
 
     fn build_at_frame(&mut self, command: hfp::HfpAtCommand) -> Result<Vec<u8>, String> {
@@ -403,7 +438,7 @@ mod tests {
 
     #[test]
     fn opened_channel_kicks_slc_with_at_brsf() {
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         let out = open_channel(&mut state);
         // MSC RSP to the peer's CMD + the first SLC command.
         assert!(state.is_open());
@@ -422,7 +457,7 @@ mod tests {
     /// DISCs the channel 5s later.
     #[test]
     fn cfc_holds_at_brsf_until_the_credit_grant_arrives() {
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         let pn_rsp = build_parameter_negotiation_response_cfc(target_dlci(), 7, 127, 0);
         let out = open_channel_with_pn(&mut state, &pn_rsp);
         assert!(state.is_open());
@@ -450,7 +485,7 @@ mod tests {
     /// among our outputs once the peer's budget runs low.
     #[test]
     fn cfc_tops_up_the_peers_credits_as_data_arrives() {
-        let mut state = HfpClientState::new(AG_CHANNEL, true);
+        let mut state = HfpClientState::new(AG_CHANNEL, true, false);
         let pn_rsp = build_parameter_negotiation_response_cfc(target_dlci(), 7, 127, 0);
         open_channel_with_pn(&mut state, &pn_rsp);
         state
@@ -475,7 +510,7 @@ mod tests {
 
     #[test]
     fn slc_queue_drains_to_service_ready() {
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         open_channel(&mut state);
 
         // Reply to each queued command the way a healthy AG would.
@@ -503,9 +538,72 @@ mod tests {
         assert!(state.service_level_ready());
     }
 
+    /// Phase 4, initiator direction: probes negotiate / refuse non-fatally
+    /// on the OUTBOUND (phone.connect) SLC too — this pump is a separate
+    /// implementation from the server path.
+    #[test]
+    fn call_waiting_negotiates_and_probe_errors_are_non_fatal_outbound() {
+        let mut state = HfpClientState::new(AG_CHANNEL, false, true);
+        let out = open_channel(&mut state);
+        let brsf = out
+            .iter()
+            .map(|f| frame_payload_string(f))
+            .find(|p| p.contains("AT+BRSF"))
+            .expect("BRSF fires at channel open");
+        assert!(brsf.contains("AT+BRSF=695"), "HF bit 1 advertised: {brsf}");
+        let mut sent = Vec::new();
+        for reply in [
+            "\r\n+BRSF: 4095\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\n+CIND: (\"call\",(0,1)),(\"callsetup\",(0-3)),(\"callheld\",(0-2))\r\nOK\r\n",
+            "\r\n+CIND: 0,0,0\r\nOK\r\n",
+            "\r\n+CHLD: (0,1,2,3)\r\nOK\r\n",
+            "\r\nOK\r\n", // AT+CCWA=1
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+        ] {
+            for frame in ag_payload(&mut state, reply) {
+                sent.push(frame_payload_string(&frame));
+            }
+        }
+        assert!(sent.iter().any(|p| p.contains("AT+CHLD=?")));
+        assert!(sent.iter().any(|p| p.contains("AT+CCWA=1")));
+        assert!(state.service_level_ready());
+        assert!(state.hfp_state().three_way_negotiated());
+
+        // Refused probes: capability off, SLC alive.
+        let mut state = HfpClientState::new(AG_CHANNEL, false, true);
+        open_channel(&mut state);
+        for reply in [
+            "\r\n+BRSF: 4095\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\n+CIND: (\"call\",(0,1)),(\"callsetup\",(0-3))\r\nOK\r\n",
+            "\r\n+CIND: 0,0\r\nOK\r\n",
+            "\r\nERROR\r\n", // AT+CHLD=?
+            "\r\nERROR\r\n", // AT+CCWA=1
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+        ] {
+            ag_payload(&mut state, reply);
+        }
+        assert!(state.service_level_ready(), "SLC survived refused probes");
+        assert!(!state.hfp_state().three_way_negotiated());
+        let events = state.take_hfp_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, hfp::HfpEvent::ServiceLevelConnectionFailed(_))),
+            "no fatal event for refused probes: {events:?}"
+        );
+    }
+
     #[test]
     fn error_during_slc_fails_the_connection() {
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         open_channel(&mut state);
         ag_payload(&mut state, "\r\nERROR\r\n");
         let events = state.take_hfp_events();
@@ -520,7 +618,7 @@ mod tests {
 
     #[test]
     fn unsolicited_ring_after_ready_surfaces_call_events() {
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         open_channel(&mut state);
         for reply in [
             "\r\n+BRSF: 871\r\n\r\nOK\r\n",
@@ -552,7 +650,7 @@ mod tests {
 
     #[test]
     fn stall_watchdog_fails_a_silent_ag() {
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         open_channel(&mut state);
         // AT+BRSF is in flight; the AG never replies.
         let fired = state.tick_hfp_stall(
@@ -568,7 +666,7 @@ mod tests {
 
     #[test]
     fn selected_codec_is_confirmed_immediately() {
-        let mut state = HfpClientState::new(AG_CHANNEL, true);
+        let mut state = HfpClientState::new(AG_CHANNEL, true, false);
         open_channel(&mut state);
         let out = ag_payload(&mut state, "\r\n+BCS: 2\r\n");
         assert!(
@@ -637,7 +735,7 @@ mod tests {
 
     #[test]
     fn mas_dlci_opens_on_the_shared_initiator_mux_and_carries_obex() {
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         open_channel(&mut state);
         assert!(state.mux_is_open());
         let dlci = open_mas_dlci(&mut state);
@@ -669,7 +767,7 @@ mod tests {
 
     #[test]
     fn mas_refusal_fails_only_the_mas_dlci_never_the_hfp_session() {
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         open_channel(&mut state);
         let (dlci, _) = state.attach_client_dlci(MAS_CHANNEL).expect("attach");
         // Peer refuses with DM on the MAS DLCI.
@@ -697,7 +795,7 @@ mod tests {
 
     #[test]
     fn hfp_at_traffic_still_flows_while_a_mas_dlci_is_mid_handshake() {
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         open_channel(&mut state);
         let _ = state.attach_client_dlci(MAS_CHANNEL).expect("attach");
         // An unsolicited RING on the HFP DLCI mid-MAS-handshake must
@@ -716,7 +814,7 @@ mod tests {
 
     #[test]
     fn force_disc_frees_the_dlci_for_a_fresh_attach() {
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         open_channel(&mut state);
         let dlci = open_mas_dlci(&mut state);
         let disc = state.build_force_disc_secondary_dlci(dlci);
@@ -733,7 +831,7 @@ mod tests {
         // Live 2026-07-13: stall recovery DISC'd the (never-open) MNS
         // dlci 4; the phone's DM answer hit the session-wide catch-all
         // and tore down a healthy HFP link mid-conversation.
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         open_channel(&mut state);
         state
             .handle_packet(&build_dm(4, false))
@@ -757,7 +855,7 @@ mod tests {
 
     #[test]
     fn attach_refuses_when_the_mux_is_not_open_or_the_dlci_is_taken() {
-        let mut state = HfpClientState::new(AG_CHANNEL, false);
+        let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         assert!(state.attach_client_dlci(MAS_CHANNEL).is_err(), "no mux yet");
         open_channel(&mut state);
         let _ = state.attach_client_dlci(MAS_CHANNEL).expect("attach");

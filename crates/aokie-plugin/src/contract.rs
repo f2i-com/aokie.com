@@ -55,6 +55,17 @@ pub mod events {
     /// it must never be treated as a fresh caller turn (no replies).
     pub const CALL_TURN_CORRECTED: &str = "aokie.call.turn.corrected";
     pub const CALL_ENDED: &str = "aokie.call.ended";
+    /// Phase 4 (call waiting, observe-only slice): a SECOND caller rang
+    /// while `callId` was active — {callId, from, at}. `callId` is the
+    /// ACTIVE call the knock happened during (the waiting caller has no
+    /// session of their own yet); `from` is the waiting caller's number,
+    /// "" when the network withheld it. Emitted once per waiting episode,
+    /// only on connections where call waiting negotiated (holdAndCallWaiting
+    /// setting + phone capability). Aokie does NOT yet answer or hold —
+    /// the waiting caller hears the network's tone until they give up (a
+    /// flow may e.g. text them); if the active call ends while they are
+    /// still waiting, their ring is promoted to a normal incoming call.
+    pub const CALL_WAITING: &str = "aokie.call.waiting";
     /// Phase 2 (outbound calling): an OUTBOUND call attempt started —
     /// {callId, to, purpose?, at}. The rest of the outbound lifecycle rides
     /// the EXISTING family with the same callId (`call.ringing` = remote
@@ -99,6 +110,7 @@ pub mod events {
         CALL_TURN_FINAL,
         CALL_TURN_CORRECTED,
         CALL_ENDED,
+        CALL_WAITING,
         CALL_OUTBOUND_DIALING,
         SMS_RECEIVED,
         SMS_SENT,
