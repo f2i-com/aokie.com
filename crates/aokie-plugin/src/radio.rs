@@ -4109,6 +4109,14 @@ enum SwapBackVerdict {
     ActiveDied,
     /// Everything tore down (the z49 signature: callheld 2→0).
     AllGone,
+    /// The CLCC evidence CONTRADICTS the callheld indicator — the phone was
+    /// mid-transition when the list was captured (VoLTE swaps take 1-2s on
+    /// the Pixel; live incident 2026-07-15 round 2: a 1.2s-early CLCC showed
+    /// no active leg while callheld read 1, the judge concluded ActiveDied,
+    /// closed the WRONG session and the follow-up "retrieve" CHLD=2 swapped
+    /// the wrong caller off hold). Never act on this — re-query and judge
+    /// again; persistently inconclusive resolves by the indicator alone.
+    Inconclusive,
 }
 
 #[cfg(all(target_os = "windows", feature = "voice"))]
@@ -4134,11 +4142,28 @@ fn judge_swap_back(
                 _ => None,
             }
         };
+        // ── Consistency rules: a "someone died" conclusion is only ever
+        // drawn when the CLCC and the callheld indicator AGREE. A list
+        // that is missing legs the indicator says exist was captured
+        // mid-transition — judging it killed the wrong session live.
         if active.is_empty() && held.is_empty() {
-            return SwapBackVerdict::AllGone;
+            return if snap.callheld == 0 {
+                SwapBackVerdict::AllGone
+            } else {
+                SwapBackVerdict::Inconclusive
+            };
         }
         if active.is_empty() {
-            return SwapBackVerdict::ActiveDied;
+            return if snap.callheld == 2 {
+                SwapBackVerdict::ActiveDied
+            } else {
+                SwapBackVerdict::Inconclusive
+            };
+        }
+        // Someone is active. A lone active leg while the indicator says a
+        // held call exists is the same transitional shape.
+        if held.is_empty() && snap.callheld == 1 {
+            return SwapBackVerdict::Inconclusive;
         }
         let a = active[0];
         if leg_is(a, &primary) == Some(true) {
@@ -4165,12 +4190,66 @@ fn judge_swap_back(
         // 1 active + 1 held with dark numbers: indistinguishable from a
         // no-op — fall through to the indicator and trust the toggle.
     }
+    resolve_swap_back_by_indicator(snap)
+}
+
+/// The indicator-only resolver (never Inconclusive) — the FINAL word when
+/// CLCC evidence stays transitional/absent after a re-query.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn resolve_swap_back_by_indicator(snap: &SwapSnapshot) -> SwapBackVerdict {
     match (snap.callheld, snap.current_alive) {
         (2, _) => SwapBackVerdict::ActiveDied,
         (0, true) => SwapBackVerdict::NewcomerAlone,
         (0, false) => SwapBackVerdict::AllGone,
         _ => SwapBackVerdict::Swapped,
     }
+}
+
+/// Settle after a swap-back CHLD=2 and produce a FINAL verdict: wait for a
+/// fresh CLCC (fired at 2s — VoLTE swaps take 1-2s on the live Pixel, and a
+/// 1.2s query caught a mid-transition list on the first live test), judge
+/// with the consistency rules, and on Inconclusive re-query ONCE before
+/// falling back to the indicator. Only ever returns actionable verdicts.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
+fn settle_and_judge_swap_back(
+    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    tracker: &mut crate::call_session::SessionTracker,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+    status: &Arc<RadioStatus>,
+    primary: Option<&str>,
+    newcomer: Option<&str>,
+) -> SwapBackVerdict {
+    let snap = settle_swap(
+        bt, tracker, outbox, sink, status,
+        std::time::Duration::from_millis(5000),
+        Some(std::time::Duration::from_millis(2000)),
+        |s, _| s.clcc.is_some() || (s.callheld == 0 && !s.current_alive),
+    );
+    let verdict = judge_swap_back(&snap, primary, newcomer);
+    if verdict != SwapBackVerdict::Inconclusive {
+        return verdict;
+    }
+    eprintln!(
+        "[aokie-plugin] SWITCHBOARD: swap outcome inconclusive (transitional CLCC, callheld={}) — re-querying",
+        snap.callheld
+    );
+    let snap2 = settle_swap(
+        bt, tracker, outbox, sink, status,
+        std::time::Duration::from_millis(3000),
+        Some(std::time::Duration::from_millis(400)),
+        |s, _| s.clcc.is_some() || (s.callheld == 0 && !s.current_alive),
+    );
+    let verdict2 = judge_swap_back(&snap2, primary, newcomer);
+    if verdict2 != SwapBackVerdict::Inconclusive {
+        return verdict2;
+    }
+    let resolved = resolve_swap_back_by_indicator(&snap2);
+    eprintln!(
+        "[aokie-plugin] SWITCHBOARD: still inconclusive after re-query — resolved by indicator: {resolved:?}"
+    );
+    resolved
 }
 
 #[cfg(all(target_os = "windows", feature = "voice"))]
@@ -5463,14 +5542,8 @@ fn run_loop(
                                 let mut verdict = if swap_sent.is_err() {
                                     SwapBackVerdict::StayedOnNewcomer
                                 } else {
-                                    let snap2 = settle_swap(
+                                    settle_and_judge_swap_back(
                                         bt, &mut tracker, outbox, sink, &status,
-                                        std::time::Duration::from_millis(4000),
-                                        Some(std::time::Duration::from_millis(1200)),
-                                        |s, _| s.clcc.is_some() || (s.callheld == 0 && !s.current_alive),
-                                    );
-                                    judge_swap_back(
-                                        &snap2,
                                         b_number.as_deref(),
                                         if c_from.is_empty() { None } else { Some(c_from.as_str()) },
                                     )
@@ -5488,14 +5561,8 @@ fn run_loop(
                                             "cascade_return_retry".to_string(),
                                             std::time::Instant::now(),
                                         ));
-                                        let snap3 = settle_swap(
+                                        verdict = settle_and_judge_swap_back(
                                             bt, &mut tracker, outbox, sink, &status,
-                                            std::time::Duration::from_millis(4000),
-                                            Some(std::time::Duration::from_millis(1200)),
-                                            |s, _| s.clcc.is_some() || (s.callheld == 0 && !s.current_alive),
-                                        );
-                                        verdict = judge_swap_back(
-                                            &snap3,
                                             b_number.as_deref(),
                                             if c_from.is_empty() { None } else { Some(c_from.as_str()) },
                                         );
@@ -5674,6 +5741,18 @@ fn run_loop(
                                         status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
                                         eprintln!("[aokie-plugin] SWITCHBOARD: cascade lost every leg — line is idle");
                                     }
+                                    SwapBackVerdict::Inconclusive => {
+                                        // Structurally unreachable — same
+                                        // defensive road as the juggle: the
+                                        // newcomer keeps the line, the parked
+                                        // caller waits for auto-retrieve.
+                                        promote_greet_for = Some(c_id.clone());
+                                        pending_ctx_restore = Some(std::mem::replace(
+                                            &mut ctx,
+                                            CallVoiceContext::fresh(None),
+                                        ));
+                                        eprintln!("[aokie-plugin] SWITCHBOARD: unresolved cascade verdict — newcomer keeps the line");
+                                    }
                                 }
                             }
                         }
@@ -5681,7 +5760,75 @@ fn run_loop(
                     #[cfg(not(feature = "voice"))]
                     let _ = &w;
                 } else if !switch_recent {
-                    // No knock in the way: retrieve the parked caller with
+                    let held_state = status.call_held_state.load(Ordering::Relaxed);
+                    if held_state == 1 {
+                        // Someone is ALREADY active on the phone with someone
+                        // held — the "retrieve" premise is wrong, and a
+                        // CHLD=2 here would SWAP, activating the WRONG leg
+                        // (live incident 2026-07-15 round 2: a transitional
+                        // CLCC misjudged the newcomer dead; the phone had
+                        // actually finished the swap, so the blind retrieve
+                        // re-held the primary and gave the line to a
+                        // sessionless leg). The parked caller's leg is the
+                        // active one — restore the session DIRECTLY, no wire
+                        // command.
+                        let (sess, ctx_saved) = parked.take().expect("checked above");
+                        eprintln!(
+                            "[aokie-plugin] SWITCHBOARD: foreground ended but a leg is already ACTIVE (callheld=1) — restoring {} without CHLD",
+                            sess.id
+                        );
+                        let resumed_id = sess.id.clone();
+                        let resumed_from = sess.caller_id.clone();
+                        let was_greeted = sess.greeted;
+                        match tracker.restore(sess) {
+                            Ok(_generation) => {
+                                pending_ctx_restore = Some(ctx_saved);
+                                if !was_greeted {
+                                    promote_greet_for = Some(resumed_id.clone());
+                                } else {
+                                    resume_line_for = Some((
+                                        resumed_id.clone(),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                status.call_active.store(true, Ordering::Relaxed);
+                                *status.current_call_id.lock().unwrap() = Some(resumed_id);
+                                *status.current_caller.lock().unwrap() = resumed_from;
+                                *status.call_started_at.lock().unwrap() =
+                                    tracker.current().map(|s| s.started_at_iso.clone());
+                                *status.parked_call.lock().unwrap() = None;
+                                status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(sess_back) => {
+                                eprintln!(
+                                    "[aokie-plugin] SWITCHBOARD: a new call raced the direct restore — {} stays parked",
+                                    sess_back.id
+                                );
+                                parked = Some((sess_back, ctx_saved));
+                            }
+                        }
+                    } else if held_state == 0 {
+                        // Nothing held on the phone — the parked caller's leg
+                        // is already gone. Close them honestly instead of
+                        // firing a CHLD into an empty line and resurrecting a
+                        // dead session.
+                        let (sess, _ctx_gone) = parked.take().expect("checked above");
+                        eprintln!(
+                            "[aokie-plugin] SWITCHBOARD: foreground ended but nothing is held (callheld=0) — parked caller {} is gone",
+                            sess.id
+                        );
+                        let ended =
+                            crate::call_session::SessionTracker::terminate_detached(sess, None);
+                        emit_call_ended(
+                            &ended,
+                            status.config_version.load(Ordering::Relaxed),
+                            outbox,
+                            sink,
+                        );
+                        *status.parked_call.lock().unwrap() = None;
+                        status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                    // Held-only (callheld=2): retrieve the parked caller with
                     // one CHLD=2 (only a held call remains, so the toggle
                     // retrieves), session + context restored.
                     let (sess, ctx_saved) = parked.take().expect("checked above");
@@ -5729,6 +5876,7 @@ fn run_loop(
                             );
                             parked = Some((sess_back, ctx_saved));
                         }
+                    }
                     }
                 }
             } else if held_now == 2 && prev_call_held != 2 && !switch_recent {
@@ -5965,14 +6113,8 @@ fn run_loop(
                                         eprintln!("[aokie-plugin] AUTO-HOLD: swap-back CHLD=2 failed to send — staying with the newcomer");
                                         SwapBackVerdict::StayedOnNewcomer
                                     } else {
-                                        let snap2 = settle_swap(
+                                        settle_and_judge_swap_back(
                                             bt, &mut tracker, outbox, sink, &status,
-                                            std::time::Duration::from_millis(4000),
-                                            Some(std::time::Duration::from_millis(1200)),
-                                            |s, _| s.clcc.is_some() || (s.callheld == 0 && !s.current_alive),
-                                        );
-                                        judge_swap_back(
-                                            &snap2,
                                             a_number.as_deref(),
                                             if b_from.is_empty() { None } else { Some(b_from.as_str()) },
                                         )
@@ -5995,14 +6137,8 @@ fn run_loop(
                                                 "auto_hold_return_retry".to_string(),
                                                 Instant::now(),
                                             ));
-                                            let snap3 = settle_swap(
+                                            verdict = settle_and_judge_swap_back(
                                                 bt, &mut tracker, outbox, sink, &status,
-                                                std::time::Duration::from_millis(4000),
-                                                Some(std::time::Duration::from_millis(1200)),
-                                                |s, _| s.clcc.is_some() || (s.callheld == 0 && !s.current_alive),
-                                            );
-                                            verdict = judge_swap_back(
-                                                &snap3,
                                                 a_number.as_deref(),
                                                 if b_from.is_empty() { None } else { Some(b_from.as_str()) },
                                             );
@@ -6206,6 +6342,22 @@ fn run_loop(
                                             *status.call_started_at.lock().unwrap() = None;
                                             status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
                                             eprintln!("[aokie-plugin] AUTO-HOLD: both calls tore down during the swap-back — line is idle");
+                                        }
+                                        SwapBackVerdict::Inconclusive => {
+                                            // Structurally unreachable (the
+                                            // settle helper always resolves) —
+                                            // defensively take the least
+                                            // destructive road: nobody's
+                                            // session is closed, the newcomer
+                                            // keeps the line, the primary
+                                            // stays parked for auto-retrieve.
+                                            parked = Some((sess_a, ctx_a));
+                                            promote_greet_for = Some(b_id.clone());
+                                            pending_ctx_restore = Some(std::mem::replace(
+                                                &mut ctx,
+                                                CallVoiceContext::fresh(None),
+                                            ));
+                                            eprintln!("[aokie-plugin] AUTO-HOLD: unresolved swap verdict — degrading to single-swap");
                                         }
                                     }
                                 }
@@ -11801,15 +11953,33 @@ mod tests {
             judge_swap_back(&snap(0, true, Some(vec![leg(0, b)])), a, b),
             SwapBackVerdict::NewcomerAlone
         );
-        // CLCC: nobody active but someone held = retrieve.
+        // CLCC: nobody active but someone held = retrieve — ONLY when the
+        // callheld indicator agrees (2 = held-only).
         assert_eq!(
             judge_swap_back(&snap(2, true, Some(vec![leg(1, a)])), a, b),
             SwapBackVerdict::ActiveDied
         );
-        // CLCC: empty list = the z49 signature, everything gone.
+        // The same list with callheld=1 is a MID-TRANSITION capture (the
+        // live round-2 incident: judging it killed the wrong session).
+        assert_eq!(
+            judge_swap_back(&snap(1, true, Some(vec![leg(1, a)])), a, b),
+            SwapBackVerdict::Inconclusive
+        );
+        // CLCC: empty list = the z49 signature, everything gone — only when
+        // the indicator agrees nothing is held.
         assert_eq!(
             judge_swap_back(&snap(0, false, Some(vec![])), a, b),
             SwapBackVerdict::AllGone
+        );
+        assert_eq!(
+            judge_swap_back(&snap(1, true, Some(vec![])), a, b),
+            SwapBackVerdict::Inconclusive
+        );
+        // A lone active leg while the indicator still reports a held call is
+        // transitional too — even with a matching number.
+        assert_eq!(
+            judge_swap_back(&snap(1, true, Some(vec![leg(0, a)])), a, b),
+            SwapBackVerdict::Inconclusive
         );
         // Withheld numbers + one lone active leg: keep the tracker's
         // session (no further CHLD needed) — NewcomerAlone.
