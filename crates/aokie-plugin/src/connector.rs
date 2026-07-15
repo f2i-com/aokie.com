@@ -16,6 +16,7 @@ use aokie_core::redact::{validate_sms_body, validate_sms_recipient};
 use serde_json::{json, Map, Value};
 
 use crate::config::{ConfigStore, PreferredDongle};
+use crate::command_journal::{CommandJournal, Prepare as JournalPrepare};
 use crate::event_bridge::{emit_event, Sink};
 use crate::outbox::Outbox;
 use crate::rpc::{self, RpcMessage};
@@ -25,6 +26,7 @@ pub const CONNECTOR_ID: &str = "aokie";
 
 /// Outbox DB file name inside the plugin data dir.
 pub const OUTBOX_FILE: &str = "outbox.sqlite";
+pub const COMMAND_JOURNAL_FILE: &str = "command-journal.sqlite3";
 
 const RECEPTIONIST_CONFIG_KEYS: [&str; 7] = [
     "persona",
@@ -39,8 +41,6 @@ const RECEPTIONIST_CONFIG_KEYS: [&str; 7] = [
 /// Settings whose values are URLs that will receive caller audio/transcripts —
 /// classified via `aokie_core::url_classification` before persisting
 /// (audit PRIV-001/C-16).
-const ENDPOINT_SETTING_KEYS: &[&str] = &["aiEndpoint", "sttEndpoint", "ttsEndpoint"];
-
 /// Typed connector-level error, surfaced as a JSON-RPC error with
 /// `error.data = {code, message}` (connector-response.schema.json
 /// codes; the plugin produces `command_failed`, `stale_call` and — for
@@ -159,6 +159,9 @@ pub struct Plugin {
     pub data_dir: PathBuf,
     pub store: ConfigStore,
     pub outbox: Outbox,
+    /// Durable acceptance/result ledger for commands that can touch the
+    /// phone. A Desktop retry must not produce another physical effect.
+    pub command_journal: CommandJournal,
     pub mock: MockState,
     /// The live Bluetooth radio, present in real (non-dev) mode once a
     /// dongle is available. `None` = dev/mock mode or no radio (e.g. a
@@ -200,11 +203,14 @@ impl Plugin {
         let store = ConfigStore::load(&data_dir);
         let outbox = Outbox::open(&data_dir.join(OUTBOX_FILE))
             .map_err(|e| format!("cannot open outbox: {e}"))?;
+        let command_journal = CommandJournal::open(&data_dir.join(COMMAND_JOURNAL_FILE))
+            .map_err(|e| format!("cannot open command journal: {e}"))?;
         Ok(Plugin {
             dev_mode,
             data_dir,
             store,
             outbox,
+            command_journal,
             mock: MockState::default(),
             radio: None,
             radio_start_error: None,
@@ -231,6 +237,7 @@ impl Plugin {
             data_dir: dir.clone(),
             store: ConfigStore::load(&dir),
             outbox: Outbox::open_in_memory().expect("in-memory outbox"),
+            command_journal: CommandJournal::open_in_memory().expect("in-memory command journal"),
             mock: MockState::default(),
             radio: None,
             radio_start_error: None,
@@ -930,6 +937,7 @@ impl Plugin {
                             self.data_dir = rerooted.data_dir;
                             self.store = rerooted.store;
                             self.outbox = rerooted.outbox;
+                            self.command_journal = rerooted.command_journal;
                         }
                         Err(e) => {
                             return rpc::error_line(
@@ -1019,6 +1027,21 @@ impl Plugin {
             );
         }
         let request_id = obj.get("requestId").and_then(Value::as_str);
+        if let Some(rid) = request_id {
+            if rid.is_empty()
+                || rid.len() > 128
+                || !rid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+            {
+                return connector_error_line(
+                    id,
+                    &CmdError::failed(
+                        "requestId must be 1..=128 safe identifier characters",
+                    ),
+                );
+            }
+        }
         if connector_id != CONNECTOR_ID {
             let err = CmdError {
                 code: "connector_missing",
@@ -1029,7 +1052,47 @@ impl Plugin {
             return connector_error_line(id, &err);
         }
         let payload = obj.get("payload").cloned().unwrap_or(Value::Null);
-        match self.dispatch_command(command, &payload, sink) {
+        let outcome = if is_journalled_command(command) {
+            let Some(rid) = request_id else {
+                return connector_error_line(
+                    id,
+                    &CmdError::failed(format!(
+                        "{command} requires requestId for durable idempotency"
+                    )),
+                );
+            };
+            match self.command_journal.prepare(rid, command, &payload) {
+                Ok(JournalPrepare::Replay(result)) => Ok(result),
+                Ok(JournalPrepare::Collision) => Err(CmdError::failed(format!(
+                    "requestId {rid:?} was already used for a different command or payload"
+                ))),
+                Ok(JournalPrepare::Pending) => Err(CmdError::failed(format!(
+                    "requestId {rid:?} was accepted previously but completion is unknown; refusing to repeat a physical action"
+                ))),
+                Ok(JournalPrepare::New) => match self.dispatch_command(command, &payload, sink) {
+                    Ok(result) => match self.command_journal.complete(rid, &result) {
+                        Ok(()) => Ok(result),
+                        Err(e) => Err(CmdError::failed(format!(
+                            "{command} was accepted but its durable result could not be recorded: {e}"
+                        ))),
+                    },
+                    Err(err) => {
+                        if let Err(e) = self.command_journal.abandon(rid) {
+                            eprintln!(
+                                "[aokie-plugin] command journal cleanup failed for {rid:?}: {e}"
+                            );
+                        }
+                        Err(err)
+                    }
+                },
+                Err(e) => Err(CmdError::failed(format!(
+                    "command idempotency journal unavailable; phone was not touched: {e}"
+                ))),
+            }
+        } else {
+            self.dispatch_command(command, &payload, sink)
+        };
+        match outcome {
             Ok(data) => {
                 let mut body = json!({"ok": true, "data": data});
                 if let Some(rid) = request_id {
@@ -1943,11 +2006,27 @@ impl Plugin {
                 Ok(json!({"id": thread.id, "phone": thread.phone, "messages": messages}))
             }
             "sms.send" => {
-                let obj = expect_fields(payload, &["to", "body"])?;
+                let obj = expect_fields(payload, &["to", "body", "messageId"])?;
                 let to = require_str(&obj, "to")?;
                 let body = require_str(&obj, "body")?;
                 let to = validate_sms_recipient(&to).map_err(CmdError::failed)?;
                 let body = validate_sms_body(&body).map_err(CmdError::failed)?;
+                let message_id = payload
+                    .get("messageId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("sms_{}", uuid::Uuid::new_v4().simple()));
+                if message_id.len() > 128
+                    || !message_id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+                {
+                    return Err(CmdError::failed(
+                        "sms.send messageId must be 1..=128 safe identifier characters",
+                    ));
+                }
                 // AOK-CONSENT-001: sending SMS (MAP) needs the `sms` scope.
                 self.check_consent("sms.send", crate::consent::Scope::Sms)?;
                 if let Some(radio) = self.radio.as_ref() {
@@ -1956,17 +2035,17 @@ impl Plugin {
                     // radio thread when the AG acks the PUT.
                     radio
                         .send(crate::radio::RadioControl::SendSms {
+                            message_id: message_id.clone(),
                             to: to.clone(),
                             body,
                         })
                         .map_err(CmdError::failed)?;
-                    return Ok(json!({"to": to, "status": "queued", "via": "radio"}));
+                    return Ok(json!({"messageId": message_id, "to": to, "status": "queued", "via": "radio"}));
                 }
                 // Real mode with no radio: the message can NOT be sent — a
                 // fabricated "queued" here is the audit's canonical fake
                 // success (a caller was promised an SMS that never existed).
                 self.require_radio_or_dev("sms.send")?;
-                let message_id = format!("sms_{}", uuid::Uuid::new_v4().simple());
                 let at = now_iso8601();
                 // Essential event: outboxed before emission. The
                 // correlation id is the SMS handle (contract §3).
@@ -2048,7 +2127,10 @@ impl Plugin {
                             if url.is_empty() || is_loopback_endpoint(url) {
                                 continue; // clearing / local processing needs no destination grant
                             }
-                            if !grant.scopes.destinations.iter().any(|d| d.trim() == url) {
+                            let canonical = canonical_destination(url).map_err(CmdError::failed)?;
+                            if !grant.scopes.destinations.iter().any(|d| {
+                                canonical_destination(d).ok().as_deref() == Some(canonical.as_str())
+                            }) {
                                 return Err(CmdError::failed(format!(
                                     "{key}: {url} is not a consented destination — re-run the \
                                      FormLogic consent wizard to add it before use"
@@ -2065,6 +2147,15 @@ impl Plugin {
                 }
                 self.store.config.config_version += 1;
                 self.save_config()?;
+                for (setting, env) in [
+                    ("aiEndpoint", "AOKIE_AI_ENDPOINT"),
+                    ("sttEndpoint", "AOKIE_STT_ENDPOINT"),
+                    ("ttsEndpoint", "AOKIE_TTS_ENDPOINT"),
+                ] {
+                    if obj.contains_key(setting) {
+                        apply_endpoint_env_from_settings(&self.store.config.settings, setting, env);
+                    }
+                }
                 // Stamp the live revision into the radio status so the NEXT
                 // call.ended records which configuration it ran under
                 // (audit AOK-CONFIG-002).
@@ -2109,9 +2200,9 @@ impl Plugin {
                             greeting: string_setting(obj, "greeting"),
                             voice: string_setting(obj, "ttsVoice"),
                             model: string_setting(obj, "aiModel"),
-                            endpoint: string_setting(obj, "aiEndpoint"),
-                            stt_endpoint: string_setting(obj, "sttEndpoint"),
-                            tts_endpoint: string_setting(obj, "ttsEndpoint"),
+                            endpoint: endpoint_update(obj, "aiEndpoint"),
+                            stt_endpoint: endpoint_update(obj, "sttEndpoint"),
+                            tts_endpoint: endpoint_update(obj, "ttsEndpoint"),
                         });
                     }
                 }
@@ -2737,6 +2828,28 @@ fn operation_id() -> String {
     format!("op_{}", uuid::Uuid::new_v4().simple())
 }
 
+/// Commands that can cause an observable phone/radio effect. These require a
+/// Desktop-supplied request id and pass through the persistent ledger above.
+fn is_journalled_command(command: &str) -> bool {
+    matches!(
+        command,
+        "phone.startPairing"
+            | "phone.stopPairing"
+            | "phone.removePaired"
+            | "phone.disconnect"
+            | "phone.connect"
+            | "phone.confirmPairing"
+            | "call.activate"
+            | "call.answer"
+            | "call.reject"
+            | "call.hangup"
+            | "call.operatorSpeak"
+            | "call.configureAgent"
+            | "call.dial"
+            | "sms.send"
+    )
+}
+
 /// Payload validation: `null`/missing means "no payload"; objects may
 /// only carry the allowed keys. Anything else (arrays, scalars,
 /// unknown fields) is rejected — commands must validate defensively.
@@ -2873,17 +2986,15 @@ fn setting_spec(key: &str) -> Option<&'static SettingSpec> {
 /// CONSENT-001: true when a speech/AI endpoint URL points at THIS machine
 /// (loopback host) — local processing needs no remote-destination consent.
 fn is_loopback_endpoint(url: &str) -> bool {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
-    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
-    let host = if let Some(inner) = authority.strip_prefix('[') {
-        inner.split(']').next().unwrap_or(inner)
-    } else {
-        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
-    };
-    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+    matches!(
+        aokie_core::url_classification::classify_base_url(url),
+        aokie_core::url_classification::BaseUrlClassification::Loopback
+    )
+}
+
+fn canonical_destination(url: &str) -> Result<String, String> {
+    aokie_core::url_classification::parse_base_url(url)
+        .map(|parsed| parsed.canonical_origin().to_string())
 }
 
 /// Phase 2 outbound guardrail, pure for tests: is `hour` (local, 0-23)
@@ -2941,7 +3052,7 @@ fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
     let auto_block = settings
         .get("autoBlockAbuse")
         .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() != Some("false")))
-        .unwrap_or(true);
+        .unwrap_or(false);
     if auto_block {
         std::env::remove_var("AOKIE_AUTO_BLOCK_ABUSE");
     } else {
@@ -2952,6 +3063,9 @@ fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
 fn validate_setting(key: &str, value: &Value) -> Result<(), CmdError> {
     if matches!(value, Value::Null) {
         return Ok(());
+    }
+    if key == "managerPin" {
+        return validate_manager_pin(value);
     }
     let Some(spec) = setting_spec(key) else {
         return match value {
@@ -3007,6 +3121,31 @@ fn validate_setting(key: &str, value: &Value) -> Result<(), CmdError> {
     }
 }
 
+fn validate_manager_pin(value: &Value) -> Result<(), CmdError> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| CmdError::failed("managerPin must be a string"))?
+        .trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    let repeated = digits.chars().all(|c| Some(c) == digits.chars().next());
+    let sequential = "01234567890123456789".contains(&digits)
+        || "98765432109876543210".contains(&digits);
+    if digits.len() < 6 || digits.len() > 12 || repeated || sequential {
+        return Err(CmdError::failed(
+            "managerPin must be a non-repeating, non-sequential 6-12 digit PIN",
+        ));
+    }
+    if raw.chars().any(|c| !c.is_ascii_digit() && !c.is_ascii_whitespace() && c != '-') {
+        return Err(CmdError::failed(
+            "managerPin may contain digits, spaces, and hyphens only",
+        ));
+    }
+    Ok(())
+}
+
 /// Default-OFF auto-answer (audit INT-006/C-15): only an explicit
 /// `autoAnswer: true` (bool or the string "true") arms the receptionist.
 fn auto_answer_from_settings(settings: &Map<String, Value>) -> bool {
@@ -3022,7 +3161,7 @@ fn auto_answer_from_settings(settings: &Map<String, Value>) -> bool {
 /// a PUBLIC endpoint must be HTTPS — caller audio/transcripts never leave
 /// the machine in cleartext.
 fn validate_endpoint_setting(key: &str, value: &Value) -> Result<(), CmdError> {
-    use aokie_core::url_classification::{classify_base_url, BaseUrlClassification as C};
+    use aokie_core::url_classification::{classify_base_url, parse_base_url, BaseUrlClassification as C};
     let raw = match value {
         Value::Null => return Ok(()),
         Value::String(s) => s.trim(),
@@ -3036,14 +3175,13 @@ fn validate_endpoint_setting(key: &str, value: &Value) -> Result<(), CmdError> {
     if raw.is_empty() {
         return Ok(()); // clearing the endpoint is always fine
     }
+    let parsed = parse_base_url(raw)
+        .map_err(|e| CmdError::failed(format!("{key} rejected: {e}")))?;
     match classify_base_url(raw) {
         C::Empty | C::Loopback => Ok(()),
-        C::Private => {
-            eprintln!(
-                "[aokie-plugin] {key} points at a private-network host — caller audio/transcripts will leave this machine over the LAN"
-            );
-            Ok(())
-        }
+        C::Private => Err(CmdError::failed(format!(
+            "{key} rejected: private-network destinations cannot receive caller data"
+        ))),
         C::Metadata => Err(CmdError::failed(format!(
             "{key} rejected: cloud-metadata endpoints must never receive caller data"
         ))),
@@ -3052,7 +3190,7 @@ fn validate_endpoint_setting(key: &str, value: &Value) -> Result<(), CmdError> {
         ))),
         C::Invalid => Err(CmdError::failed(format!("{key} rejected: not a valid URL"))),
         C::Public => {
-            if raw.starts_with("https://") {
+            if parsed.url().scheme() == "https" {
                 eprintln!(
                     "[aokie-plugin] {key} points at a public host — caller audio/transcripts will be sent to it"
                 );
@@ -3097,10 +3235,9 @@ fn apply_endpoint_env_from_settings(
     setting_key: &str,
     env_key: &str,
 ) {
-    if let Some(ep) = settings.get(setting_key).and_then(Value::as_str) {
-        if !ep.trim().is_empty() {
-            std::env::set_var(env_key, ep.trim());
-        }
+    match settings.get(setting_key).and_then(Value::as_str).map(str::trim) {
+        Some(ep) if !ep.is_empty() => std::env::set_var(env_key, ep),
+        _ => std::env::remove_var(env_key),
     }
 }
 
@@ -3125,6 +3262,16 @@ fn greeting_from_settings(settings: &Map<String, Value>) -> Option<String> {
 
 fn string_setting(obj: &Map<String, Value>, key: &str) -> Option<String> {
     obj.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn endpoint_update(obj: &Map<String, Value>, key: &str) -> crate::radio::EndpointUpdate {
+    match obj.get(key) {
+        None => crate::radio::EndpointUpdate::Unchanged,
+        Some(Value::Null) => crate::radio::EndpointUpdate::Clear,
+        Some(Value::String(value)) if value.trim().is_empty() => crate::radio::EndpointUpdate::Clear,
+        Some(Value::String(value)) => crate::radio::EndpointUpdate::Set(value.trim().to_string()),
+        Some(_) => crate::radio::EndpointUpdate::Unchanged,
+    }
 }
 
 fn json_type_name(v: &Value) -> &'static str {
@@ -4837,7 +4984,7 @@ mod tests {
     fn endpoint_settings_map_to_radio_env_vars() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         std::env::remove_var("AOKIE_STT_ENDPOINT");
-        std::env::remove_var("AOKIE_TTS_ENDPOINT");
+        std::env::set_var("AOKIE_TTS_ENDPOINT", "http://stale.invalid");
 
         let mut settings = Map::new();
         settings.insert(
@@ -4878,6 +5025,20 @@ mod tests {
             string_setting(&obj, "ttsEndpoint").as_deref(),
             Some("http://127.0.0.1:17920/v1/audio/speech")
         );
+        assert_eq!(
+            endpoint_update(&obj, "sttEndpoint"),
+            crate::radio::EndpointUpdate::Set(
+                "http://127.0.0.1:17920/v1/audio/transcriptions".to_string()
+            )
+        );
+
+        let cleared = json!({"sttEndpoint": null, "ttsEndpoint": "  "})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(endpoint_update(&cleared, "sttEndpoint"), crate::radio::EndpointUpdate::Clear);
+        assert_eq!(endpoint_update(&cleared, "ttsEndpoint"), crate::radio::EndpointUpdate::Clear);
+        assert_eq!(endpoint_update(&cleared, "aiEndpoint"), crate::radio::EndpointUpdate::Unchanged);
 
         let obj = json!({"mockCalls": true}).as_object().unwrap().clone();
         assert!(!has_receptionist_config_key(&obj));

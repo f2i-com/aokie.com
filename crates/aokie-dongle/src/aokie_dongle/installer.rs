@@ -28,7 +28,11 @@ use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForS
 /// `allow_dev_self_sign` (production default false: an install with no
 /// shipped signed catalog is refused rather than minting a machine-trusted
 /// self-signed certificate), and pinned the instance id on restore jobs.
-const JOB_FORMAT_VERSION: u32 = 4;
+///
+/// v5 (AK-DRV-02) adds the adjacent catalog digest. The elevated helper
+/// checks both package hashes against values compiled into the signed helper,
+/// then copies them through non-shareable handles into an admin-only directory.
+const JOB_FORMAT_VERSION: u32 = 5;
 
 /// Pin for the helper exe's SHA-256, baked at build time.
 ///
@@ -55,8 +59,9 @@ const JOB_FORMAT_VERSION: u32 = 4;
 const EXPECTED_HELPER_SHA256: Option<&str> = Some(env!(
     "AOKIE_EXPECTED_HELPER_SHA256",
     "Release builds require AOKIE_EXPECTED_HELPER_SHA256 to be set at build time. \
-     Compute the post-sign helper SHA-256 and re-run cargo build with it exported. \
-     See docs/RELEASE_SIGNING.md."
+     Build the helper with the documented bootstrap placeholder, sign it, then \
+     compute its SHA-256 and build the plugin with that final hash exported. \
+     See README.md under Release build."
 ));
 
 #[cfg(debug_assertions)]
@@ -86,6 +91,9 @@ struct DriverJob<'a> {
     /// mismatch, so a job pointing at a swapped INF can't stage a
     /// different driver. Empty for `remove-certs` / `restore-driver`.
     inf_sha256: &'a str,
+    /// AK-DRV-02: SHA-256 of the adjacent Microsoft-signed catalog. Empty only
+    /// for the explicit development self-signing path and non-install modes.
+    cat_sha256: &'a str,
     /// DRIVER-001: the expected hardware id (`USB\VID_xxxx&PID_xxxx`);
     /// the helper refuses a job whose vid/pid derive to something else.
     /// Empty for `remove-certs`.
@@ -176,6 +184,12 @@ pub fn install_winusb(vid: u16, pid: u16, work_dir: &Path) -> Result<InstallOutc
     let inf_path = super::write_winusb_package(vid, pid, work_dir)?;
     // Fingerprint the exact INF bytes the helper is authorised to stage.
     let inf_sha256 = super::sha256_file(&inf_path)?;
+    let cat_path = inf_path.with_file_name(super::winusb::CAT_NAME);
+    let cat_sha256 = if cat_path.is_file() {
+        super::sha256_file(&cat_path)?
+    } else {
+        String::new()
+    };
 
     let helper_path = helper_path().ok_or_else(|| {
         "could not locate aokie-driver-helper.exe — set AOKIE_WINUSB_HELPER \
@@ -188,6 +202,7 @@ pub fn install_winusb(vid: u16, pid: u16, work_dir: &Path) -> Result<InstallOutc
         pid,
         &device.instance_id,
         &inf_sha256,
+        &cat_sha256,
         work_dir,
         &inf_path,
         &helper_path,
@@ -282,6 +297,7 @@ fn run_helper_install(
     pid: u16,
     instance_id: &str,
     inf_sha256: &str,
+    cat_sha256: &str,
     work_dir: &Path,
     inf_path: &Path,
     helper_path: &Path,
@@ -296,6 +312,7 @@ fn run_helper_install(
         inf_path,
         instance_id,
         inf_sha256,
+        cat_sha256,
         hardware_id: &hardware_id,
         allow_dev_self_sign: dev_self_sign_allowed(),
     };
@@ -358,6 +375,7 @@ fn run_helper_remove_certs(work_dir: &Path, helper_path: &Path) -> Result<(), St
         inf_path: &placeholder_inf,
         instance_id: "",
         inf_sha256: "",
+        cat_sha256: "",
         hardware_id: "",
         allow_dev_self_sign: false,
     };
@@ -411,6 +429,7 @@ fn run_helper_restore(
         inf_path: &placeholder_inf,
         instance_id,
         inf_sha256: "",
+        cat_sha256: "",
         hardware_id: &hardware_id,
         allow_dev_self_sign: false,
     };

@@ -77,13 +77,9 @@ pub fn client_for(
     timeout: Duration,
     connect_timeout: Option<Duration>,
 ) -> Result<reqwest::blocking::Client, String> {
-    let url = reqwest::Url::parse(endpoint.trim()).map_err(|e| format!("invalid endpoint URL: {e}"))?;
-    let origin = format!(
-        "{}://{}:{}",
-        url.scheme(),
-        url.host_str().unwrap_or_default(),
-        url.port_or_known_default().unwrap_or(0)
-    );
+    let parsed = aokie_core::url_classification::parse_base_url(endpoint)?;
+    let url = parsed.url();
+    let origin = parsed.canonical_origin().to_string();
     let key = (
         origin,
         timeout.as_millis() as u64,
@@ -101,6 +97,15 @@ pub fn client_for(
         .timeout(timeout);
     if let Some(connect) = connect_timeout {
         builder = builder.connect_timeout(connect);
+    }
+
+    let host = url.host_str().ok_or_else(|| "endpoint URL has no host".to_string())?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !ip.is_loopback() && !ip_is_public_unicast(ip) {
+            return Err(format!(
+                "endpoint IP {ip} is private, link-local, metadata, or otherwise non-public"
+            ));
+        }
     }
 
     // Hostname endpoints: resolve, validate every address, pin the first valid one.

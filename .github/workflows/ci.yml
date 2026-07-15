@@ -142,6 +142,20 @@ jobs:
             throw "TRUST-001: tag releases require WINDOWS_CERT_PFX_B64/WINDOWS_CERT_PASSWORD — refusing to produce an unsigned public release"
           }
 
+          # DIST-01 / DRV-02: compile the exact Microsoft-signed driver pair
+          # into the helper's trust decision. This applies to smoke bundles as
+          # well as tags: no assembled release is allowed to omit the driver.
+          $driverInf = 'drivers/winusb/aokie_winusb_bluetooth.inf'
+          $driverCat = 'drivers/winusb/aokie_winusb_bluetooth.cat'
+          if (-not (Test-Path -LiteralPath $driverInf -PathType Leaf) -or -not (Test-Path -LiteralPath $driverCat -PathType Leaf)) {
+            throw "AK-DIST-01: release requires the static INF and Microsoft attestation/WHQL-signed CAT under drivers/winusb"
+          }
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
+          & $signtool verify /kp /c $driverCat $driverInf
+          if ($LASTEXITCODE -ne 0) { throw "AK-DIST-01: catalog is not kernel-policy trusted or does not bind the exact INF" }
+          $env:AOKIE_EXPECTED_DRIVER_INF_SHA256 = (Get-FileHash $driverInf -Algorithm SHA256).Hash.ToLower()
+          $env:AOKIE_EXPECTED_DRIVER_CAT_SHA256 = (Get-FileHash $driverCat -Algorithm SHA256).Hash.ToLower()
+
           # The release-build compile gate (installer.rs env!) applies to the
           # aokie-dongle LIB, which the helper bin itself links. The pin is
           # meaningless inside the helper (it never dispatches elevation), so
@@ -152,7 +166,6 @@ jobs:
           cargo build -p aokie-dongle --bin aokie-driver-helper --release
           if ($LASTEXITCODE -ne 0) { throw "helper build failed" }
 
-          $signtool = $null
           $pfx = $null
           if ($env:CERT_B64) {
             $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
@@ -209,6 +222,10 @@ jobs:
           # pinned digests) rides in every release so installers can verify
           # staged model files byte-for-byte.
           Copy-Item docs/models-manifest.json bundle/
+          Copy-Item docs/MODEL_LICENSES.md bundle/
+          New-Item -ItemType Directory -Force bundle/driver-package | Out-Null
+          Copy-Item drivers/winusb/aokie_winusb_bluetooth.inf bundle/driver-package/
+          Copy-Item drivers/winusb/aokie_winusb_bluetooth.cat bundle/driver-package/
           $dll = Get-ChildItem target/release -Filter 'onnxruntime*.dll' -ErrorAction SilentlyContinue
           if (-not $dll) { throw "AOK-REL-002: voice release requires onnxruntime*.dll beside the plugin exe — none found; the packaged receptionist could not transcribe or speak" }
           $dll | Copy-Item -Destination bundle/
@@ -228,7 +245,12 @@ jobs:
             flavour = 'voice'
             signed = [bool]$env:CERT_B64
             helperSha256 = $packaged
-            files = @(Get-ChildItem bundle -File | ForEach-Object { [ordered]@{ name = $_.Name; sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() } })
+            driverInfSha256 = (Get-FileHash bundle/driver-package/aokie_winusb_bluetooth.inf -Algorithm SHA256).Hash.ToLower()
+            driverCatSha256 = (Get-FileHash bundle/driver-package/aokie_winusb_bluetooth.cat -Algorithm SHA256).Hash.ToLower()
+            files = @(Get-ChildItem bundle -File -Recurse | ForEach-Object {
+              $name = [IO.Path]::GetRelativePath((Resolve-Path bundle).Path, $_.FullName).Replace('\', '/')
+              [ordered]@{ name = $name; sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() }
+            })
           }
           $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding ascii bundle/release-manifest.json
         env:
@@ -259,9 +281,9 @@ jobs:
         shell: pwsh
         working-directory: bundle
         run: |
-          Get-ChildItem -File | Where-Object Name -ne 'SHA256SUMS.txt' |
+          Get-ChildItem -File -Recurse | Where-Object Name -ne 'SHA256SUMS.txt' |
             Get-FileHash -Algorithm SHA256 |
-            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), [IO.Path]::GetRelativePath((Get-Location).Path, $_.Path).Replace('\', '/') } |
             Set-Content -Encoding ascii SHA256SUMS.txt
           Get-Content SHA256SUMS.txt
 

@@ -371,7 +371,11 @@ pub fn allow_unknown_dongle() -> bool {
 /// failure returns the policy's actionable message. A device that isn't
 /// enumerated at all is `NotPresent` — Aokie never stages a driver
 /// against an absent device.
-pub fn evaluate_present_target(vid: u16, pid: u16, allow_unknown: bool) -> Result<UsbDevice, String> {
+pub fn evaluate_present_target(
+    vid: u16,
+    pid: u16,
+    allow_unknown: bool,
+) -> Result<UsbDevice, String> {
     use aokie_core::dongle_catalog::{evaluate_install_target, DeviceFacts, InstallRejection};
 
     let device = find_device(vid, pid)?;
@@ -455,6 +459,51 @@ pub fn write_winusb_package(vid: u16, pid: u16, work_dir: &Path) -> Result<PathB
     std::fs::create_dir_all(work_dir)
         .map_err(|e| format!("could not create WinUSB package dir {:?}: {}", work_dir, e))?;
 
+    // DIST-01: production uses the unchanged static INF/CAT pair returned by
+    // Microsoft signing. It lives beside the release in `driver-package/`;
+    // an explicit directory override is useful only for packaging tests. The
+    // elevated helper independently pins both digests, so this unelevated copy
+    // is transport rather than a trust boundary.
+    let package_dir = std::env::var_os("AOKIE_WINUSB_PACKAGE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|parent| parent.join("driver-package")))
+        });
+    if let Some(package_dir) = package_dir {
+        let source_inf = package_dir.join(winusb::INF_NAME);
+        let source_cat = package_dir.join(winusb::CAT_NAME);
+        if source_inf.is_file() && source_cat.is_file() {
+            let inf_text = std::fs::read_to_string(&source_inf)
+                .map_err(|e| format!("could not read static WinUSB INF {:?}: {}", source_inf, e))?;
+            let hardware_id = winusb::hardware_id(vid, pid);
+            if !inf_text.to_ascii_uppercase().contains(&hardware_id) {
+                return Err(format!(
+                    "the signed WinUSB INF does not cover {}; obtain a new Microsoft-signed package",
+                    hardware_id
+                ));
+            }
+            let inf_path = work_dir.join(winusb::INF_NAME);
+            let cat_path = work_dir.join(winusb::CAT_NAME);
+            std::fs::copy(&source_inf, &inf_path)
+                .map_err(|e| format!("could not stage static INF {:?}: {}", source_inf, e))?;
+            std::fs::copy(&source_cat, &cat_path)
+                .map_err(|e| format!("could not stage static catalog {:?}: {}", source_cat, e))?;
+            return Ok(inf_path);
+        }
+    }
+
+    if !cfg!(debug_assertions) {
+        return Err(format!(
+            "the signed WinUSB package is missing; {} and {} must be present in driver-package/ beside the plugin",
+            winusb::INF_NAME,
+            winusb::CAT_NAME
+        ));
+    }
+
+    // Development fallback only. The elevated install path will generate a
+    // local test catalog when its explicit self-signing policy permits it.
     let device = find_device(vid, pid)?;
     let description = device
         .as_ref()
@@ -473,6 +522,19 @@ pub fn write_winusb_package(vid: u16, pid: u16, work_dir: &Path) -> Result<PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_release_inf_covers_every_supported_hardware_id() {
+        let inf = include_str!("../../../../drivers/winusb/aokie_winusb_bluetooth.inf")
+            .to_ascii_uppercase();
+        for dongle in aokie_core::dongle_catalog::DEFAULT_CATALOG {
+            let hardware_id = winusb::hardware_id(dongle.vid, dongle.pid);
+            assert!(
+                inf.contains(&hardware_id),
+                "static release INF omits {hardware_id}"
+            );
+        }
+    }
 
     #[test]
     fn parses_vid_pid_from_usb_ids() {

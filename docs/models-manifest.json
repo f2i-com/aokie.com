@@ -1,13 +1,20 @@
 {
-  "format": 1,
-  "generatedAt": "2026-07-12",
-  "note": "Required voice model bundles for the Aokie receptionist (DIST-001). Digests pin the exact tested files; a public download source is part of the distribution-channel decision and is filled in when DIST-001's release source ships. Until then installers must stage these files and verify the digests below.",
+  "format": 2,
+  "generatedAt": "2026-07-15",
+  "note": "Required voice model bundles for the Aokie receptionist. Sources are immutable revisions; every download is size- and SHA-256-verified before the bundle is promoted into app data.",
   "bundles": [
     {
       "name": "parakeet",
       "description": "STT (streaming ASR) - the receptionist's ears",
       "installDir": "<app_data>/models/parakeet",
-      "source": null,
+      "license": "NVIDIA Open Model License",
+      "licenseUrl": "https://huggingface.co/eschmidbauer/parakeet-unified-en-0.6b-onnx",
+      "source": {
+        "repository": "eschmidbauer/parakeet-unified-en-0.6b-onnx",
+        "revision": "7a16ff98b72e5b0beba6f182a5357c704d977b15",
+        "baseUrl": "https://huggingface.co/eschmidbauer/parakeet-unified-en-0.6b-onnx/resolve/7a16ff98b72e5b0beba6f182a5357c704d977b15/",
+        "pathPrefix": "onnx_int8"
+      },
       "files": [
         {
           "path": "decoder_joint.int8.onnx",
@@ -30,7 +37,14 @@
       "name": "pocket_tts_onnx",
       "description": "TTS - the receptionist's voice",
       "installDir": "<app_data>/models/pocket_tts_onnx",
-      "source": null,
+      "license": "CC BY 4.0",
+      "licenseUrl": "https://huggingface.co/KevinAHM/pocket-tts-onnx",
+      "source": {
+        "repository": "KevinAHM/pocket-tts-onnx",
+        "revision": "58a6d00cf13d239b6748cb0769f35c580a8f606c",
+        "baseUrl": "https://huggingface.co/KevinAHM/pocket-tts-onnx/resolve/58a6d00cf13d239b6748cb0769f35c580a8f606c/",
+        "pathPrefix": "onnx/english_2026-04"
+      },
       "files": [
         {
           "path": "bos_before_voice.npy",
@@ -64,6 +78,7 @@
         },
         {
           "path": "reference_sample.wav",
+          "sourcePath": "reference_sample.wav",
           "sha256": "88fbb0d31ec26674e97e531a71758cabe4e0e4e5b5a18dafa783021a7f5c9366",
           "size": 286060
         },
@@ -76,146 +91,6 @@
           "path": "tokenizer.model",
           "sha256": "d461765ae179566678c93091c5fa6f2984c31bbe990bf1aa62d92c64d91bc3f6",
           "size": 59339
-        },
-        {
-          "path": "voices/alba.safetensors",
-          "sha256": "e4a323e8e771f14fd669428d83e7af6d83b4d6d0f0e282c30122f04824f17b1c",
-          "size": 6194424
-        },
-        {
-          "path": "voices/alba.wav",
-          "sha256": "46264e83cb99115c3d210260e029117566d9c64f20266d10daa78107759ede3e",
-          "size": 958542
-        },
-        {
-          "path": "voices/anna.safetensors",
-          "sha256": "87e1922e9d1bfb27728ae4f1ea89bc3174e17a9f819ce0a728cfbea19517d9c7",
-          "size": 7816440
-        },
-        {
-          "path": "voices/azelma.safetensors",
-          "sha256": "3d4ede5a1dbfd3632d2b9a5738dc3cc60ce799646f5c110ede9c8162e4eb289f",
-          "size": 7963896
-        },
-        {
-          "path": "voices/azelma.wav",
-          "sha256": "beef9034c42a40a5696657cfd39f01d56243e3ca215d0b1c0269e88b6ac08b33",
-          "size": 960044
-        },
-        {
-          "path": "voices/bill_boerst.safetensors",
-          "sha256": "a2eb24310d563b4600573f3afdffb2c871bc6c1392beffcddbcb3c92e605483a",
-          "size": 6735096
-        },
-        {
-          "path": "voices/caro_davy.safetensors",
-          "sha256": "e5217ce9629f3473b27519dc280e80c79eb304853f5e4104ea7cd65f77d3dc5f",
-          "size": 5260536
-        },
-        {
-          "path": "voices/charles.safetensors",
-          "sha256": "0681cdd3decb917df78f7ebeb42f01f2784d7490911591d8f93af906ab3770e5",
-          "size": 6194424
-        },
-        {
-          "path": "voices/cosette.safetensors",
-          "sha256": "014818ee1fe5ef13e11f238b17822d27021b7cfd7e264402e49087d24250fe7f",
-          "size": 6194424
-        },
-        {
-          "path": "voices/cosette.wav",
-          "sha256": "6ab1000d755c151865f24ba18f83e049f829c54def2ce78fae8349b3991c119a",
-          "size": 960044
-        },
-        {
-          "path": "voices/eponine.safetensors",
-          "sha256": "e4ae23d204cfc26f47a132d70051bb99331905e3d45fc2a71f5eb356bd7d1e27",
-          "size": 6931704
-        },
-        {
-          "path": "voices/eponine.wav",
-          "sha256": "b6a2fb658b2aa8cd5c075a1ad2ebbed119952f0b77182fceecf3a0b39a932094",
-          "size": 960044
-        },
-        {
-          "path": "voices/eve.safetensors",
-          "sha256": "a9509d0951b2ed9ac9b1d08a75199aba88c974e3e74cf6168d251bb7ccdc01e7",
-          "size": 6538488
-        },
-        {
-          "path": "voices/fantine.safetensors",
-          "sha256": "b7581a77c09d39b43a0b619b1962042e6469e21cf13cdcce67b880bec4ff46fd",
-          "size": 6538488
-        },
-        {
-          "path": "voices/fantine.wav",
-          "sha256": "d5892cb5bbb7aeef05973adbf6608c0f97477ec1c41fb386358919b18135bf01",
-          "size": 960044
-        },
-        {
-          "path": "voices/george.safetensors",
-          "sha256": "9a78363b01ee91dcfd431b500e84350ef6f8e6e0639d5a34f1441cd6129d4dc7",
-          "size": 6243576
-        },
-        {
-          "path": "voices/jane.safetensors",
-          "sha256": "d4354fc55d32045f7ca45e616ddd63c64e27487f743c098765345cb50cfbd78b",
-          "size": 7374072
-        },
-        {
-          "path": "voices/javert.safetensors",
-          "sha256": "d476bdc0b43b42192f4934ea080553851d1e5897d9eefe965e7a30b69b7d10a3",
-          "size": 6194424
-        },
-        {
-          "path": "voices/javert.wav",
-          "sha256": "999c08297c5638e965cd431eec385ad1d21f55a0a949ad017d6efc288af44894",
-          "size": 960044
-        },
-        {
-          "path": "voices/jean.safetensors",
-          "sha256": "82a9d8ee6d371da90c9b6400629aba7d77003c3ee01e12a8635caee32aff964c",
-          "size": 6194424
-        },
-        {
-          "path": "voices/jean.wav",
-          "sha256": "ae21ed2cfa7f5568b7fea98058d15f1044803c8d4de3dad6d9b751391fc2a496",
-          "size": 960044
-        },
-        {
-          "path": "voices/marius.safetensors",
-          "sha256": "6e561ad98e5c36b4fae278e9a8540d4b86069c46446028efd04e9d58fa25d3c9",
-          "size": 6194424
-        },
-        {
-          "path": "voices/marius.wav",
-          "sha256": "6fff87b99496bd278b6c43e7f91e025e0343c6a231645775e6b87c8f80ee1d5b",
-          "size": 960044
-        },
-        {
-          "path": "voices/michael.safetensors",
-          "sha256": "e23d5ae79a6c0e96f13bf60267d88a99c893bda9e6d559de4e78135060935bd7",
-          "size": 7275768
-        },
-        {
-          "path": "voices/paul.safetensors",
-          "sha256": "8c227d54297a5be31ecae4fe9067c4f7fba49606c241cfe70279eb9cb67b9e46",
-          "size": 6980856
-        },
-        {
-          "path": "voices/peter_yearsley.safetensors",
-          "sha256": "837af0682b00e268bf034ccbf0400125369bbd0d4e2d0c3a3ddea1487acbc543",
-          "size": 3736816
-        },
-        {
-          "path": "voices/stuart_bell.safetensors",
-          "sha256": "7c6f0f5bc4806cc5e852e6af96ac386a9679362e35bbf8c3dc9b8fefa04ed055",
-          "size": 5260536
-        },
-        {
-          "path": "voices/vera.safetensors",
-          "sha256": "c1409379aa12ab8a88b97b83270896d721efc1b4dbad8df7a2094b2b69cbfab6",
-          "size": 6735096
         }
       ]
     }
