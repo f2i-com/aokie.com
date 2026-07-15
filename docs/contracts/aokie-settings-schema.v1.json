@@ -33,6 +33,11 @@
       "appliesLive": false
     },
     {
+      "key": "autoHoldQueue",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
       "key": "blockedNumbers",
       "type": "string",
       "maxChars": 4000,
