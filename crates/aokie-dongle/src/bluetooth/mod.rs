@@ -55,6 +55,15 @@ pub enum BluetoothEvent {
     CallHeld {
         state: i32,
     },
+    /// One parsed `+CLCC:` line (Phase 4 observe topology): `status` 0
+    /// active / 1 held / 2 dialing / 3 alerting / 4 incoming / 5 waiting.
+    CallListEntry {
+        index: u8,
+        direction: u8,
+        status: u8,
+        multiparty: bool,
+        number: Option<String>,
+    },
     /// Phase 3e: PBAP fetch finished. Payload is a flattened list of
     /// (phone_number, display_name) pairs — one row per number, so a
     /// vCard with multiple TEL fields produces multiple entries.
@@ -392,6 +401,19 @@ fn bluetooth_event_from_runtime(
         RuntimeEvent::CallWaiting { number } => BluetoothEvent::CallWaiting { number },
         RuntimeEvent::CallWaitingEnded => BluetoothEvent::CallWaitingEnded,
         RuntimeEvent::CallHeld { state } => BluetoothEvent::CallHeld { state },
+        RuntimeEvent::CallListEntry {
+            index,
+            direction,
+            status,
+            multiparty,
+            number,
+        } => BluetoothEvent::CallListEntry {
+            index,
+            direction,
+            status,
+            multiparty,
+            number,
+        },
         RuntimeEvent::PbapContactsFetched(contacts) => BluetoothEvent::ContactsFetched(
             contacts
                 .into_iter()
@@ -462,9 +484,15 @@ pub fn bluetooth_event_from_aokie_hfp(
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallHeld(state) => {
             Some(BluetoothEvent::CallHeld { state })
         }
-        // Observe-only topology entries stay a radio-log concern for now
-        // (the switchboard slice will consume them).
-        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallListEntry(_) => None,
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallListEntry(entry) => {
+            Some(BluetoothEvent::CallListEntry {
+                index: entry.index,
+                direction: entry.direction,
+                status: entry.status,
+                multiparty: entry.multiparty,
+                number: entry.number,
+            })
+        }
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CodecSelected { codec, sample_rate } => {
             // Codec selection precedes iso arming; this legacy path never
             // observed an arming failure, so it reports armed.

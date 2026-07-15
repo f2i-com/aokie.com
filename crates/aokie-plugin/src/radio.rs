@@ -892,6 +892,13 @@ pub struct RadioStatus {
     /// Last `callheld` indicator state (0 none / 1 held+active / 2 held
     /// only) — diagnostics only, nothing consumes it yet.
     pub call_held_state: AtomicU64,
+    /// Phase 4 observe topology: the most recent AT+CLCC snapshot (one
+    /// rendered line per current call) + when its burst started. Entries
+    /// arriving within a short window belong to one response burst; a
+    /// later entry starts a fresh snapshot. Bounded (a phone has at most a
+    /// handful of concurrent legs). Exposed via dongle.diagnostics so a
+    /// knock's topology is verifiable AFTER the log ring wraps.
+    pub clcc_snapshot: Mutex<Option<(std::time::Instant, Vec<String>)>>,
 }
 
 /// See [`RadioStatus::pending_dial`].
@@ -1018,12 +1025,27 @@ impl RadioHandle {
         })
     }
 
-    /// Phase 4 observe lane: waiting episodes seen this radio session +
-    /// the last callheld indicator state — dongle.diagnostics visibility.
+    /// Phase 4 observe lane: waiting episodes seen this radio session, the
+    /// last callheld indicator state and the most recent AT+CLCC snapshot
+    /// — dongle.diagnostics visibility (the log ring wraps in ~1 min under
+    /// call load; this survives).
     pub fn call_waiting_diagnostics(&self) -> serde_json::Value {
+        let last_clcc = self
+            .status
+            .clcc_snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(started, lines)| {
+                json!({
+                    "ageSecs": started.elapsed().as_secs(),
+                    "entries": lines,
+                })
+            });
         json!({
             "episodes": self.status.call_waiting_episodes.load(Ordering::Relaxed),
             "callHeldState": self.status.call_held_state.load(Ordering::Relaxed),
+            "lastClcc": last_clcc,
         })
     }
 
@@ -8689,6 +8711,48 @@ fn handle_event(
                 .call_held_state
                 .store(state.max(0) as u64, Ordering::Relaxed);
         }
+        E::CallListEntry {
+            index,
+            direction,
+            status: leg_status,
+            multiparty,
+            number,
+        } => {
+            // Phase 4 observe topology: fold the entry into the rolling
+            // CLCC snapshot (dongle.diagnostics.callWaiting.lastClcc) —
+            // entries within one response burst accumulate; a later entry
+            // starts a fresh snapshot. The switchboard slice reconciles
+            // hold/activate against exactly these.
+            let rendered = format!(
+                "idx={} dir={} status={}{}{}",
+                index,
+                direction,
+                match leg_status {
+                    0 => "active".to_string(),
+                    1 => "held".to_string(),
+                    2 => "dialing".to_string(),
+                    3 => "alerting".to_string(),
+                    4 => "incoming".to_string(),
+                    5 => "waiting".to_string(),
+                    other => format!("{other}"),
+                },
+                if multiparty { " mpty" } else { "" },
+                number
+                    .as_deref()
+                    .map(|n| format!(" number={n}"))
+                    .unwrap_or_default(),
+            );
+            let mut snapshot = status.clcc_snapshot.lock().unwrap();
+            match snapshot.as_mut() {
+                Some((started, lines))
+                    if started.elapsed() < std::time::Duration::from_millis(1500)
+                        && lines.len() < 8 =>
+                {
+                    lines.push(rendered);
+                }
+                _ => *snapshot = Some((std::time::Instant::now(), vec![rendered])),
+            }
+        }
         E::CallRinging => {
             flush_incoming_if_pending(tracker, outbox, sink);
             // Phase 2: callsetup,3 is MO alerting — classifies a
@@ -9795,6 +9859,44 @@ mod tests {
             &status,
         );
         assert!(sink.lines.is_empty(), "no event without a tracked call");
+
+        // CLCC entries fold into ONE snapshot burst (diagnostics-visible),
+        // and the waiting leg renders with its status name + number.
+        handle_event(
+            E::CallListEntry {
+                index: 1,
+                direction: 1,
+                status: 0,
+                multiparty: false,
+                number: Some("0491570156".to_string()),
+            },
+            &mut tracker,
+            None,
+            &mut sink,
+            &status,
+        );
+        handle_event(
+            E::CallListEntry {
+                index: 2,
+                direction: 1,
+                status: 5,
+                multiparty: false,
+                number: Some("0491570157".to_string()),
+            },
+            &mut tracker,
+            None,
+            &mut sink,
+            &status,
+        );
+        let snapshot = status.clcc_snapshot.lock().unwrap().clone();
+        let (_, lines) = snapshot.expect("snapshot recorded");
+        assert_eq!(
+            lines,
+            vec![
+                "idx=1 dir=1 status=active number=0491570156".to_string(),
+                "idx=2 dir=1 status=waiting number=0491570157".to_string(),
+            ]
+        );
     }
 
     /// Audit AK-001/AK-01: an operator-rejected ring ends "rejected", a
