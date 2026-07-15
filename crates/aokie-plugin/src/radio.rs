@@ -5559,7 +5559,19 @@ fn run_loop(
                                     ),
                                 );
                                 stt_current_gen.store(tracker.generation(), Ordering::Relaxed);
-                                *status.waiting_call.lock().unwrap() = None;
+                                {
+                                    // Clear ONLY the knock we just served: a NEW
+                                    // caller can knock mid-settle, and wiping
+                                    // their freshly-minted leg makes the plugin
+                                    // forget them entirely (live 2026-07-15
+                                    // 15:19: the third caller vanished from
+                                    // tracking, so their give-up never became a
+                                    // missed call and no one rang them back).
+                                    let mut wl = status.waiting_call.lock().unwrap();
+                                    if wl.as_ref().is_some_and(|l| l.call_id == c_id) {
+                                        *wl = None;
+                                    }
+                                }
                                 *status.current_call_id.lock().unwrap() = Some(c_id.clone());
                                 *status.current_caller.lock().unwrap() =
                                     if c_from.is_empty() { None } else { Some(c_from.clone()) };
@@ -6430,7 +6442,19 @@ fn run_loop(
                                                 from: b_from.clone(),
                                                 since_iso: aokie_core::events::now_iso8601(),
                                             });
-                                            *status.waiting_call.lock().unwrap() = None;
+                                            {
+                                                // Clear ONLY the knock we just
+                                                // served — a NEW caller knocking
+                                                // mid-settle must stay tracked
+                                                // (live 2026-07-15 15:19: this
+                                                // blind clear erased the third
+                                                // caller; their give-up never
+                                                // became a missed call).
+                                                let mut wl = status.waiting_call.lock().unwrap();
+                                                if wl.as_ref().is_some_and(|l| l.call_id == b_id) {
+                                                    *wl = None;
+                                                }
+                                            }
                                             *status.current_call_id.lock().unwrap() =
                                                 tracker.call_id().map(|s| s.to_string());
                                             *status.current_caller.lock().unwrap() =
@@ -6791,7 +6815,14 @@ fn run_loop(
                                         *status.call_started_at.lock().unwrap() =
                                             tracker.current().map(|s| s.started_at_iso.clone());
                                         status.call_active.store(true, Ordering::Relaxed);
-                                        *status.waiting_call.lock().unwrap() = None;
+                                        {
+                                            // Same id-guarded clear as the other
+                                            // accept paths (never wipe a newer knock).
+                                            let mut wl = status.waiting_call.lock().unwrap();
+                                            if wl.as_ref().is_some_and(|l| l.call_id == b_id) {
+                                                *wl = None;
+                                            }
+                                        }
                                         status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
                                         // A fresh call: the per-call reset fences
                                         // STT/context; the greeting block then
@@ -10272,7 +10303,14 @@ fn run_loop(
                             parked = Some((sess_a, ctx_a));
                             *status.switch_in_flight.lock().unwrap() =
                                 Some(("accept_waiting".to_string(), std::time::Instant::now()));
-                            *status.waiting_call.lock().unwrap() = None;
+                            {
+                                // Id-guarded: only the accepted knock clears —
+                                // a newer knock stays tracked.
+                                let mut wl = status.waiting_call.lock().unwrap();
+                                if wl.as_ref().is_some_and(|l| l.call_id == w.call_id) {
+                                    *wl = None;
+                                }
+                            }
                             // The minted waiting identity becomes a REAL call:
                             // lifecycle order incoming → caller_id → answered
                             // (AOK-LIF-001), then the normal machinery greets
