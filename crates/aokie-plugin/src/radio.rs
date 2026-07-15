@@ -5015,6 +5015,9 @@ fn run_loop(
     // already cancelled — the CHUP is sent exactly once per attempt (ids are
     // never reused, so no reset is needed).
     let mut dial_cancel_sent: Option<String> = None;
+    // Dead-air watchdog: the call id whose no-SCO hangup was already sent
+    // (one CHUP per call — the CIEV stream finishes the termination).
+    let mut no_sco_hangup_for: Option<String> = None;
     // Consecutive CallIncoming events observed while the tracker held an
     // ACTIVE inbound session — the phantom-answer self-heal counter (see the
     // guard in the event loop).
@@ -6976,6 +6979,42 @@ fn run_loop(
                 tracker.note_intent(crate::call_session::TerminationIntent::AgentHangup);
                 if let Err(e) = bt.hangup() {
                     eprintln!("[aokie-plugin] outbound cancel failed: {e}");
+                }
+            }
+        }
+
+        // Dead-air watchdog: a call ANSWERED whose audio channel never
+        // arrives is silence the caller can do nothing about — every speaker
+        // gates on sample_rate > 0, so not even the greeting can play. Live
+        // 2026-07-15 15:07 (corrupted-USB window): call 82fc29bb sat
+        // answered with NO SCO for 13s until the caller gave up; the very
+        // next attempt worked. Hang up after a bounded wait instead — the
+        // line drops honestly and the caller simply calls again. Suppressed
+        // around our own CHLD switches (the SCO legitimately bounces during
+        // a juggle and its settles are bounded well under this).
+        {
+            let switch_recent = status
+                .switch_in_flight
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() < std::time::Duration::from_secs(10));
+            if !switch_recent && bt.get_sample_rate() == 0 {
+                if let Some(s) = tracker.current() {
+                    if s.is_active()
+                        && s.active_for_ms() > 8_000
+                        && no_sco_hangup_for.as_deref() != Some(s.id.as_str())
+                    {
+                        eprintln!(
+                            "[aokie-plugin] call {} answered but NO audio channel after 8s — hanging up (dead air beats silence)",
+                            s.id
+                        );
+                        no_sco_hangup_for = Some(s.id.clone());
+                        tracker.note_intent(crate::call_session::TerminationIntent::DeviceLost);
+                        if let Err(e) = bt.hangup() {
+                            eprintln!("[aokie-plugin] dead-air hangup failed: {e}");
+                        }
+                    }
                 }
             }
         }

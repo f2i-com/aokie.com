@@ -104,6 +104,11 @@ impl CallSession {
         self.started.elapsed().as_millis()
     }
 
+    /// Milliseconds since the call was ANSWERED (0 while still ringing).
+    pub fn active_for_ms(&self) -> u128 {
+        self.answered.map(|t| t.elapsed().as_millis()).unwrap_or(0)
+    }
+
     /// True while `aokie.call.incoming` has not been emitted yet.
     pub fn incoming_pending(&self) -> bool {
         self.pending_incoming_since.is_some()
