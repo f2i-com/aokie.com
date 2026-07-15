@@ -22,6 +22,72 @@
 //! Mirrors `src/lib/urlClassification.ts` — keep them in sync.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use url::{Host, Url};
+
+#[derive(Debug, Clone)]
+pub struct ParsedBaseUrl {
+    url: Url,
+    canonical_origin: String,
+}
+
+impl ParsedBaseUrl {
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    pub fn canonical_origin(&self) -> &str {
+        &self.canonical_origin
+    }
+}
+
+/// Parse the exact HTTP(S) authority that downstream clients will use.
+/// User-info is forbidden so `localhost@169.254.169.254` cannot be consented
+/// or classified as localhost while the request connects elsewhere.
+pub fn parse_base_url(raw: &str) -> Result<ParsedBaseUrl, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("endpoint is empty".to_string());
+    }
+    let url = Url::parse(raw).map_err(|e| format!("invalid endpoint URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("endpoint scheme must be http or https".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("endpoint URL must not contain a username or password".to_string());
+    }
+    let host = url.host().ok_or_else(|| "endpoint URL has no host".to_string())?;
+    // The URL standard accepts legacy octal, hexadecimal, and integer IPv4
+    // spellings, then normalises them. Require the literal to already match
+    // the dotted-decimal address the HTTP client will use.
+    if let Host::Ipv4(ip) = host {
+        let authority = raw
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(raw)
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("");
+        let raw_host = authority
+            .rsplit_once(':')
+            .map(|(candidate, port)| {
+                if port.chars().all(|c| c.is_ascii_digit()) { candidate } else { authority }
+            })
+            .unwrap_or(authority);
+        if raw_host != ip.to_string() {
+            return Err("endpoint uses a non-canonical IPv4 literal".to_string());
+        }
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "endpoint URL has no valid port".to_string())?;
+    let host_token = match host {
+        Host::Domain(domain) => domain.to_ascii_lowercase(),
+        Host::Ipv4(ip) => ip.to_string(),
+        Host::Ipv6(ip) => format!("[{ip}]"),
+    };
+    let canonical_origin = format!("{}://{}:{}", url.scheme(), host_token, port);
+    Ok(ParsedBaseUrl { url, canonical_origin })
+}
 
 /// Output of [`classify_base_url`]. The variants are deliberately the
 /// same shape as the TypeScript `BaseUrlClassification` union so a
@@ -72,51 +138,16 @@ pub fn classify_base_url(raw: &str) -> BaseUrlClassification {
         return BaseUrlClassification::Empty;
     }
 
-    // Hand-parse the host portion: skip past `://` if present, then
-    // take everything up to the first `/`, `?`, or `#`. We don't pull
-    // the `url` crate as a direct dep — it's a transitive of Tauri
-    // but coupling our gate to a transitive version is fragile.
-    let after_scheme = match trimmed.find("://") {
-        Some(idx) => &trimmed[idx + 3..],
-        None => trimmed,
+    let parsed = match parse_base_url(trimmed) {
+        Ok(parsed) => parsed,
+        Err(_) => return BaseUrlClassification::Invalid,
     };
-    let host_end = after_scheme
-        .find(|c: char| c == '/' || c == '?' || c == '#')
-        .unwrap_or(after_scheme.len());
-    let host_with_port = &after_scheme[..host_end];
-
-    if host_with_port.is_empty() {
-        return BaseUrlClassification::Invalid;
+    match parsed.url().host() {
+        Some(Host::Domain(host)) => classify_host(host),
+        Some(Host::Ipv4(ip)) => classify_host(&ip.to_string()),
+        Some(Host::Ipv6(ip)) => classify_host(&ip.to_string()),
+        None => BaseUrlClassification::Invalid,
     }
-
-    // Strip optional `:<port>` while preserving an IPv6 bracket pair
-    // (`[::1]:8080` → `::1`).
-    let host = if host_with_port.starts_with('[') {
-        // `[ipv6]:port`. Slice between the brackets — anything after
-        // the `]` is port noise.
-        match host_with_port.find(']') {
-            Some(close) => &host_with_port[1..close],
-            None => return BaseUrlClassification::Invalid,
-        }
-    } else if host_with_port.contains(':') && !host_with_port.starts_with(':') {
-        // Could be `host:port` or a bracketless IPv6 literal. Bracketless
-        // IPv6 inside a URL is malformed (RFC 3986 requires the brackets);
-        // treat any colon-bearing unbracketed string as `host:port` and
-        // strip after the LAST colon. This is what URL.hostname does.
-        host_with_port
-            .rsplit_once(':')
-            .map(|(h, _port)| h)
-            .unwrap_or(host_with_port)
-    } else {
-        host_with_port
-    };
-
-    let host = host.to_ascii_lowercase();
-    if host.is_empty() {
-        return BaseUrlClassification::Invalid;
-    }
-
-    classify_host(&host)
 }
 
 fn classify_host(host: &str) -> BaseUrlClassification {
@@ -342,30 +373,19 @@ mod tests {
         // public.
         assert_eq!(
             classify_base_url("http://010.0.0.1/"),
-            BaseUrlClassification::Public,
+            BaseUrlClassification::Invalid,
         );
         assert_eq!(
             classify_base_url("http://0177.0.0.1/"),
-            BaseUrlClassification::Public,
+            BaseUrlClassification::Invalid,
         );
     }
 
-    /// Pre-URL fallback: operator typed `localhost:1234` without a
-    /// scheme. Classifier should still recognise the host.
     #[test]
-    fn pre_scheme_inputs_still_classify() {
-        assert_eq!(
-            classify_base_url("localhost:1234"),
-            BaseUrlClassification::Loopback,
-        );
-        assert_eq!(
-            classify_base_url("127.0.0.1:8080"),
-            BaseUrlClassification::Loopback,
-        );
-        assert_eq!(
-            classify_base_url("169.254.169.254"),
-            BaseUrlClassification::Metadata,
-        );
+    fn missing_or_non_http_scheme_is_invalid() {
+        for raw in ["localhost:1234", "127.0.0.1:8080", "ftp://example.com"] {
+            assert_eq!(classify_base_url(raw), BaseUrlClassification::Invalid, "{raw}");
+        }
     }
 
     #[test]
@@ -375,5 +395,26 @@ mod tests {
             classify_base_url("http://[::1"),
             BaseUrlClassification::Invalid,
         );
+    }
+
+    #[test]
+    fn user_info_and_encoded_authority_tricks_are_invalid() {
+        for raw in [
+            "http://localhost@169.254.169.254/latest/meta-data",
+            "http://user:pass@example.com/v1",
+            "http://localhost%40169.254.169.254/v1",
+            "https://%6c%6f%63%61%6c%68%6f%73%74@10.0.0.1/v1",
+        ] {
+            assert_eq!(classify_base_url(raw), BaseUrlClassification::Invalid, "{raw}");
+            assert!(parse_base_url(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn canonical_origin_normalises_default_ports_and_host_case() {
+        let a = parse_base_url("HTTPS://Example.COM/v1").unwrap();
+        let b = parse_base_url("https://example.com:443/other").unwrap();
+        assert_eq!(a.canonical_origin(), "https://example.com:443");
+        assert_eq!(a.canonical_origin(), b.canonical_origin());
     }
 }

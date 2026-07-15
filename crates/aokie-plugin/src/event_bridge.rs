@@ -27,6 +27,8 @@ pub const ESSENTIAL_EVENTS: &[&str] = &[
     crate::contract::events::CALL_ENDED,
     crate::contract::events::SMS_RECEIVED,
     crate::contract::events::SMS_SENT,
+    crate::contract::events::SMS_FAILED,
+    crate::contract::events::MANAGER_ACTION,
     crate::contract::events::HARDWARE_ERROR,
 ];
 

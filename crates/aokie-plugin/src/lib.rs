@@ -32,6 +32,7 @@ pub mod aec;
 #[cfg(feature = "voice")]
 pub mod agent;
 pub mod call_session;
+pub mod command_journal;
 pub mod config;
 pub mod connector;
 pub mod consent;
@@ -41,6 +42,9 @@ pub mod duplex;
 pub mod endpoint_http;
 pub mod event_bridge;
 pub mod host_rpc;
+pub mod manager_auth;
+#[cfg(feature = "voice")]
+pub mod model_distribution;
 pub mod outbox;
 pub mod radio;
 pub mod realtime;

@@ -15,6 +15,7 @@ uuid = { workspace = true }
 dirs = "5.0"
 # consent.rs adds a small random jitter to grace-window timestamps.
 rand = "0.8"
+url = "2"
 # OS-native secret store for provider API keys (secrets.rs). Windows
 # path stays on Win32 APIs (Credential Manager / DPAPI) only.
 keyring = { version = "3", default-features = false, features = [

@@ -229,12 +229,13 @@ Always test both the default plugin surface and the `voice` feature. Deny-level 
 Build the elevated driver helper first, pin its final SHA-256 into the plugin, then build the voice-enabled plugin:
 
 ```powershell
+$env:AOKIE_EXPECTED_HELPER_SHA256 = 'helper-build-placeholder'
 cargo build -p aokie-dongle --bin aokie-driver-helper --release
 $env:AOKIE_EXPECTED_HELPER_SHA256 = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
 cargo build -p aokie-plugin --features voice --release
 ```
 
-The release voice bundle also needs ONNX Runtime, the Parakeet assets and the pocket-tts assets in the expected model directories.
+The placeholder is used only while compiling the helper itself; the helper never dispatches an elevation request. A production helper also requires `AOKIE_EXPECTED_DRIVER_INF_SHA256` and `AOKIE_EXPECTED_DRIVER_CAT_SHA256` for the exact Microsoft-signed driver pair. Sign the helper before calculating its final hash, then build the plugin with that post-sign hash. The release voice bundle also needs ONNX Runtime, the Parakeet assets and the pocket-tts assets in the expected model directories.
 
 ## Workspace map
 

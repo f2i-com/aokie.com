@@ -39,6 +39,7 @@ regex = "1"
 # Same major as the legacy app (aokie-desktop pins 0.31) so the two
 # don't fight over bundled-SQLite versions when built side by side.
 rusqlite = { version = "0.31", features = ["bundled"] }
+sha2 = "0.10"
 uuid = { version = "1.0", features = ["v4"] }
 
 # Windows multimedia-timer API (winmm) — raise this process's timer resolution

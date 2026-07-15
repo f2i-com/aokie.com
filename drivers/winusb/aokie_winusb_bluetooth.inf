@@ -1,0 +1,75 @@
+; Static Aokie WinUSB package submitted for Microsoft attestation/WHQL signing.
+; Do not modify this file without obtaining a new signed catalog.
+
+[Version]
+Signature="$Windows NT$"
+Class=USBDevice
+ClassGuid={88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider=%ProviderName%
+DriverVer=07/15/2026,2.2.0.20260715
+CatalogFile=aokie_winusb_bluetooth.cat
+
+[ClassInstall32]
+AddReg=AokieClassReg
+
+[AokieClassReg]
+HKR,,,0,"Universal Serial Bus devices"
+HKR,,Icon,,-20
+
+[Manufacturer]
+%ProviderName%=AokieDevices,NTx86,NTamd64,NTarm64
+
+[AokieDevices.NTx86]
+%BCM21E8%=WinUSB_Install,USB\VID_0A5C&PID_21E8
+%BCM21EC%=WinUSB_Install,USB\VID_0A5C&PID_21EC
+%RTL8771%=WinUSB_Install,USB\VID_0BDA&PID_8771
+%RTLC822%=WinUSB_Install,USB\VID_0BDA&PID_C822
+%CSR0001%=WinUSB_Install,USB\VID_0A12&PID_0001
+
+[AokieDevices.NTamd64]
+%BCM21E8%=WinUSB_Install,USB\VID_0A5C&PID_21E8
+%BCM21EC%=WinUSB_Install,USB\VID_0A5C&PID_21EC
+%RTL8771%=WinUSB_Install,USB\VID_0BDA&PID_8771
+%RTLC822%=WinUSB_Install,USB\VID_0BDA&PID_C822
+%CSR0001%=WinUSB_Install,USB\VID_0A12&PID_0001
+
+[AokieDevices.NTarm64]
+%BCM21E8%=WinUSB_Install,USB\VID_0A5C&PID_21E8
+%BCM21EC%=WinUSB_Install,USB\VID_0A5C&PID_21EC
+%RTL8771%=WinUSB_Install,USB\VID_0BDA&PID_8771
+%RTLC822%=WinUSB_Install,USB\VID_0BDA&PID_C822
+%CSR0001%=WinUSB_Install,USB\VID_0A12&PID_0001
+
+[WinUSB_Install]
+Include=winusb.inf
+Needs=WINUSB.NT
+
+[WinUSB_Install.Services]
+AddService=WinUSB,0x00000002,WinUSB_ServiceInstall
+
+[WinUSB_ServiceInstall]
+DisplayName="WinUSB - Aokie Bluetooth"
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WinUSB.sys
+
+[WinUSB_Install.Wdf]
+KmdfService=WINUSB, WinUsb_Install
+
+[WinUsb_Install]
+KmdfLibraryVersion=1.11
+
+[WinUSB_Install.HW]
+AddReg=DeviceInterfaceGUIDs
+
+[DeviceInterfaceGUIDs]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{B6F5F3A8-6E2C-41D8-9B7A-6E35F60480D6}"
+
+[Strings]
+ProviderName="Aokie"
+BCM21E8="Aokie Broadcom BCM20702 Bluetooth Dongle"
+BCM21EC="Aokie Broadcom BCM20702 Bluetooth Dongle"
+RTL8771="Aokie Realtek RTL8761 Bluetooth Dongle"
+RTLC822="Aokie Realtek RTL8821CE Bluetooth Adapter"
+CSR0001="Aokie CSR8510 Bluetooth Dongle"
