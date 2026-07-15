@@ -88,6 +88,16 @@ pub enum RadioControl {
         text: String,
         op: Option<String>,
     },
+    /// Phase 4 (switchboard): make `call_id` the FOREGROUND call. The
+    /// connector validated the target against the switchboard mirrors
+    /// (waiting or parked) and revision; the radio owns the wire: it parks
+    /// the current foreground context+session, sends exactly one AT+CHLD=2
+    /// (toggle — never blind-retried), and installs/restores the target.
+    /// Outcome confirmation is the indicator stream + the follow-up CLCC.
+    Activate {
+        call_id: String,
+        op: Option<String>,
+    },
     /// Live-reconfigure the in-plugin voice agent without a reconnect. Each
     /// field is `Some` only when it changed; `None` leaves the current value
     /// alone. A flow (or `settings.set`) pushes this so the receptionist's
@@ -899,6 +909,30 @@ pub struct RadioStatus {
     /// handful of concurrent legs). Exposed via dongle.diagnostics so a
     /// knock's topology is verifiable AFTER the log ring wraps.
     pub clcc_snapshot: Mutex<Option<(std::time::Instant, Vec<String>)>>,
+    /// Phase 4 switchboard mirrors (connector-readable): the WAITING caller
+    /// (identity minted at the knock — `call.activate`'s target before any
+    /// session exists) and the PARKED caller (their real session + voice
+    /// context live as radio-loop locals; this is the reporting/validation
+    /// view). Max one of each in v1 — plain CHLD=2 is ambiguous with more.
+    pub waiting_call: Mutex<Option<SwitchboardLeg>>,
+    pub parked_call: Mutex<Option<SwitchboardLeg>>,
+    /// Bumped on every topology change (knock start/end, park, restore,
+    /// promotion) — `call.activate`'s optimistic-concurrency token.
+    pub switchboard_revision: AtomicU64,
+    /// A CHLD switch we sent that hasn't settled (label + when sent). One
+    /// at a time; doubles as the suppression window for callheld-edge
+    /// attribution (our own swap produces expected transitions).
+    pub switch_in_flight: Mutex<Option<(String, std::time::Instant)>>,
+}
+
+/// One non-foreground switchboard leg (waiting or parked) — see
+/// [`RadioStatus::waiting_call`].
+#[derive(Debug, Clone)]
+pub struct SwitchboardLeg {
+    pub call_id: String,
+    /// "" when the network withheld the number.
+    pub from: String,
+    pub since_iso: String,
 }
 
 /// See [`RadioStatus::pending_dial`].
@@ -1046,6 +1080,62 @@ impl RadioHandle {
             "episodes": self.status.call_waiting_episodes.load(Ordering::Relaxed),
             "callHeldState": self.status.call_held_state.load(Ordering::Relaxed),
             "lastClcc": last_clcc,
+        })
+    }
+
+    /// Phase 4 switchboard mirrors — the connector's validation view.
+    pub fn waiting_call(&self) -> Option<SwitchboardLeg> {
+        self.status.waiting_call.lock().unwrap().clone()
+    }
+
+    pub fn parked_call_leg(&self) -> Option<SwitchboardLeg> {
+        self.status.parked_call.lock().unwrap().clone()
+    }
+
+    pub fn switchboard_revision(&self) -> u64 {
+        self.status.switchboard_revision.load(Ordering::Relaxed)
+    }
+
+    /// A CHLD switch we sent within the last ~4s that hasn't settled.
+    pub fn switch_in_flight(&self) -> bool {
+        self.status
+            .switch_in_flight
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < std::time::Duration::from_secs(4))
+    }
+
+    /// The authoritative `call.switchboard` snapshot: foreground (the
+    /// `call.current` shape), waiting + parked legs, revision, transition
+    /// state and the callheld indicator.
+    pub fn switchboard_view(&self) -> serde_json::Value {
+        let leg_json = |leg: &SwitchboardLeg| {
+            json!({
+                "callId": leg.call_id,
+                "from": leg.from,
+                "since": leg.since_iso,
+            })
+        };
+        let foreground = self.current_call_id().map(|call_id| {
+            json!({
+                "callId": call_id,
+                "from": self.current_caller(),
+                "state": if self.is_call_active() {
+                    crate::contract::call_state::ACTIVE
+                } else {
+                    crate::contract::call_state::RINGING
+                },
+                "startedAt": self.call_started_at(),
+            })
+        });
+        json!({
+            "foreground": foreground,
+            "waiting": self.waiting_call().as_ref().map(leg_json),
+            "parked": self.parked_call_leg().as_ref().map(leg_json),
+            "revision": self.switchboard_revision(),
+            "switchInProgress": self.switch_in_flight(),
+            "callHeldState": self.status.call_held_state.load(Ordering::Relaxed),
         })
     }
 
@@ -4584,9 +4674,22 @@ fn run_loop(
     // Phase 4 isolation: THE current caller's conversational state — see
     // [`CallVoiceContext`]. Swapped for a fresh instance in the per-call
     // reset block (reset-by-construction: a new per-caller field cannot
-    // be forgotten there); the switchboard slice will PARK it per caller
-    // across hold/resume instead of dropping it.
+    // be forgotten there); the switchboard PARKS it per caller across
+    // hold/resume instead of dropping it.
     let mut ctx = CallVoiceContext::fresh(None);
+    // Phase 4 switchboard: the PARKED caller — their session (out of the
+    // tracker, no terminal bookkeeping) + their whole conversational
+    // context. Max ONE in v1: plain CHLD=2 (this phone's only mode) is
+    // ambiguous with more legs. The status mirrors (RadioStatus::
+    // parked_call/waiting_call) are the connector's validation view.
+    let mut parked: Option<(crate::call_session::CallSession, CallVoiceContext)> = None;
+    // A resume in progress: the per-call reset block installs THIS context
+    // (the parked caller's, conversation intact) instead of a fresh one.
+    let mut pending_ctx_restore: Option<CallVoiceContext> = None;
+    // Last observed callheld indicator value — the attribution edge
+    // detector for "foreground vanished" (→2) / "parked vanished" (→0)
+    // while a caller is parked.
+    let mut prev_call_held: u64 = 0;
     // AOK-CTRL-001: call-level max-silence watchdog (agent mode). Created when
     // the greeting arms the conversation, dropped at every call boundary.
     #[cfg(feature = "voice")]
@@ -4806,6 +4909,133 @@ fn run_loop(
             handle_event(ev, &mut tracker, outbox, sink, &status);
         }
 
+        // ── Phase 4 switchboard reconciliation (only while a caller is
+        // parked — normal calls never enter this block). The phone's
+        // indicator stream cannot say WHICH leg an edge belongs to once two
+        // exist; these are the conservative attribution rules, suppressed
+        // inside the ~4s window after our OWN CHLD (whose transitions are
+        // expected, not news).
+        if parked.is_some() {
+            let held_now = status.call_held_state.load(Ordering::Relaxed);
+            let switch_recent = status
+                .switch_in_flight
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() < std::time::Duration::from_secs(4));
+            if !status.connected.load(Ordering::Relaxed) {
+                // The phone link died with a caller parked: their session
+                // terminates truthfully (the foreground's own device-loss
+                // termination was already synthesized by handle_event).
+                if let Some((sess, _ctx_lost)) = parked.take() {
+                    eprintln!(
+                        "[aokie-plugin] SWITCHBOARD: phone link lost with {} parked — synthesized termination",
+                        sess.id
+                    );
+                    let ended = crate::call_session::SessionTracker::terminate_detached(
+                        sess,
+                        Some(crate::call_session::TerminationIntent::DeviceLost),
+                    );
+                    emit_call_ended(
+                        &ended,
+                        status.config_version.load(Ordering::Relaxed),
+                        outbox,
+                        sink,
+                    );
+                    *status.parked_call.lock().unwrap() = None;
+                    status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if tracker.current().is_none() {
+                // The foreground ended (its call.ended already went out) —
+                // the parked caller is still on the phone's hold, waiting.
+                // Retrieve them: one CHLD=2 (only a held call remains, so
+                // the toggle retrieves), session + context restored.
+                let (sess, ctx_saved) = parked.take().expect("checked above");
+                eprintln!(
+                    "[aokie-plugin] SWITCHBOARD: foreground ended with {} parked — retrieving them (AT+CHLD=2)",
+                    sess.id
+                );
+                bt.flush_tx_audio();
+                let _ = bt.hold_swap();
+                *status.switch_in_flight.lock().unwrap() =
+                    Some(("auto_retrieve".to_string(), std::time::Instant::now()));
+                let resumed_id = sess.id.clone();
+                let resumed_from = sess.caller_id.clone();
+                match tracker.restore(sess) {
+                    Ok(_generation) => {
+                        pending_ctx_restore = Some(ctx_saved);
+                        status.call_active.store(true, Ordering::Relaxed);
+                        *status.current_call_id.lock().unwrap() = Some(resumed_id);
+                        *status.current_caller.lock().unwrap() = resumed_from;
+                        *status.call_started_at.lock().unwrap() =
+                            tracker.current().map(|s| s.started_at_iso.clone());
+                        *status.parked_call.lock().unwrap() = None;
+                        status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(sess_back) => {
+                        // A fresh ring raced the retrieve — keep them parked.
+                        eprintln!(
+                            "[aokie-plugin] SWITCHBOARD: a new call raced the retrieve — {} stays parked",
+                            sess_back.id
+                        );
+                        parked = Some((sess_back, ctx_saved));
+                    }
+                }
+            } else if held_now == 2 && prev_call_held != 2 && !switch_recent {
+                // callheld=2 = "held, NO active": the FOREGROUND leg ended on
+                // the phone side WITHOUT a CallTerminated edge (the call
+                // indicator stays 1 while the held leg lives). Close the
+                // foreground truthfully; the next pass retrieves the parked
+                // caller via the branch above.
+                eprintln!(
+                    "[aokie-plugin] SWITCHBOARD: callheld=2 — the foreground call ended on the phone side; closing it"
+                );
+                flush_incoming_if_pending(&mut tracker, outbox, sink);
+                status.call_active.store(false, Ordering::Relaxed);
+                if let Some(ended) = tracker.terminate() {
+                    emit_call_ended(
+                        &ended,
+                        status.config_version.load(Ordering::Relaxed),
+                        outbox,
+                        sink,
+                    );
+                }
+                *status.current_caller.lock().unwrap() = None;
+                *status.current_call_id.lock().unwrap() = None;
+                *status.call_started_at.lock().unwrap() = None;
+            } else if held_now == 0 && prev_call_held != 0 && !switch_recent {
+                // callheld=0 with a caller parked and no CHLD from us: the
+                // PARKED leg vanished — they hung up while on hold.
+                if let Some((sess, _ctx_gone)) = parked.take() {
+                    eprintln!(
+                        "[aokie-plugin] SWITCHBOARD: parked caller {} hung up while on hold",
+                        sess.id
+                    );
+                    let ended =
+                        crate::call_session::SessionTracker::terminate_detached(sess, None);
+                    emit_call_ended(
+                        &ended,
+                        status.config_version.load(Ordering::Relaxed),
+                        outbox,
+                        sink,
+                    );
+                    *status.parked_call.lock().unwrap() = None;
+                    status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        prev_call_held = status.call_held_state.load(Ordering::Relaxed);
+        {
+            // Settle the in-flight switch marker once its window passed.
+            let mut in_flight = status.switch_in_flight.lock().unwrap();
+            if in_flight
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() >= std::time::Duration::from_secs(4))
+            {
+                *in_flight = None;
+            }
+        }
+
         // Per-call voice isolation (audit AK-002/C-05): the moment the session
         // generation changes — a call ended, or a new one replaced it — stamp
         // the STT gate (queued jobs for the old generation are skipped, their
@@ -4847,7 +5077,15 @@ fn run_loop(
             let fresh_lane = tracker.call_id().map(|id| {
                 crate::realtime::RealtimeLane::new(id.to_string(), voice_call_gen, Instant::now())
             });
-            let prev_ctx = std::mem::replace(&mut ctx, CallVoiceContext::fresh(fresh_lane));
+            // Phase 4: a RESUME installs the parked caller's context whole
+            // (conversation, PIN gate, pace — everything travels with them);
+            // otherwise a fresh one. Either way the captions lane belongs to
+            // the new call EPOCH, never a parked one.
+            let incoming_ctx = pending_ctx_restore
+                .take()
+                .unwrap_or_else(|| CallVoiceContext::fresh(None));
+            let prev_ctx = std::mem::replace(&mut ctx, incoming_ctx);
+            ctx.rt_lane = fresh_lane;
             // §9.3: the call-scoped agent overlay dies WITH its call — the
             // next caller can never inherit the previous caller's persona.
             // EXCEPT an overlay already bound to THIS (new) call: a
@@ -8132,6 +8370,195 @@ fn run_loop(
                         );
                     }
                 }
+                Ok(RadioControl::Activate { call_id, op }) => {
+                    // Phase 4 switchboard: make `call_id` the foreground.
+                    // The connector already validated against the mirrors;
+                    // the radio re-validates against its OWN state (events
+                    // drained this iteration may have changed the topology)
+                    // and owns the wire. Exactly ONE AT+CHLD=2 per accepted
+                    // request — a toggle, never blind-retried.
+                    use aokie_core::events::{aokie_event, now_iso8601};
+                    let waiting_leg = status.waiting_call.lock().unwrap().clone();
+                    let parked_leg = status.parked_call.lock().unwrap().clone();
+                    let switch_recent = status
+                        .switch_in_flight
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|(_, at)| {
+                            at.elapsed() < std::time::Duration::from_secs(4)
+                        });
+                    if switch_recent {
+                        emit_control_failed(
+                            outbox, sink, &tracker, "call.activate", op.as_deref(),
+                            "a switch is already in progress — reconcile before retrying (CHLD=2 is a toggle)",
+                        );
+                    } else if waiting_leg.as_ref().is_some_and(|w| w.call_id == call_id) {
+                        // ── accept the WAITING caller: park the foreground ──
+                        let w = waiting_leg.expect("checked above");
+                        if parked.is_some() {
+                            emit_control_failed(
+                                outbox, sink, &tracker, "call.activate", op.as_deref(),
+                                "a caller is already parked — one parked caller max in this release",
+                            );
+                        } else if !tracker.current().is_some_and(|s| s.is_active()) {
+                            emit_control_failed(
+                                outbox, sink, &tracker, "call.activate", op.as_deref(),
+                                "no ACTIVE foreground call to put on hold",
+                            );
+                        } else if let Err(e) = {
+                            bt.flush_tx_audio();
+                            bt.hold_swap()
+                        } {
+                            emit_control_failed(
+                                outbox, sink, &tracker, "call.activate", op.as_deref(), &e,
+                            );
+                        } else {
+                            let sess_a = tracker.park().expect("checked active above");
+                            let ctx_a =
+                                std::mem::replace(&mut ctx, CallVoiceContext::fresh(None));
+                            eprintln!(
+                                "[aokie-plugin] SWITCHBOARD: parked {} — accepting waiting caller {} (AT+CHLD=2 sent)",
+                                sess_a.id, w.call_id
+                            );
+                            *status.parked_call.lock().unwrap() = Some(SwitchboardLeg {
+                                call_id: sess_a.id.clone(),
+                                from: sess_a.caller_id.clone().unwrap_or_default(),
+                                since_iso: now_iso8601(),
+                            });
+                            parked = Some((sess_a, ctx_a));
+                            *status.switch_in_flight.lock().unwrap() =
+                                Some(("accept_waiting".to_string(), std::time::Instant::now()));
+                            *status.waiting_call.lock().unwrap() = None;
+                            // The minted waiting identity becomes a REAL call:
+                            // lifecycle order incoming → caller_id → answered
+                            // (AOK-LIF-001), then the normal machinery greets
+                            // them and the caller_id event personalizes them.
+                            tracker.ring(w.call_id.clone(), now_iso8601());
+                            if !w.from.is_empty() {
+                                tracker.caller_id(w.from.clone());
+                            }
+                            flush_incoming_if_pending(&mut tracker, outbox, sink);
+                            if !w.from.is_empty() {
+                                emit(
+                                    outbox,
+                                    sink,
+                                    aokie_event(
+                                        crate::contract::events::CALL_CALLER_ID,
+                                        &w.call_id,
+                                        json!({"callId": w.call_id, "from": w.from, "at": now_iso8601()}),
+                                    ),
+                                );
+                            }
+                            tracker.answered();
+                            status.call_active.store(true, Ordering::Relaxed);
+                            *status.current_call_id.lock().unwrap() = Some(w.call_id.clone());
+                            *status.current_caller.lock().unwrap() = if w.from.is_empty() {
+                                None
+                            } else {
+                                Some(w.from.clone())
+                            };
+                            *status.call_started_at.lock().unwrap() =
+                                tracker.current().map(|s| s.started_at_iso.clone());
+                            emit(
+                                outbox,
+                                sink,
+                                aokie_event(
+                                    crate::contract::events::CALL_ANSWERED,
+                                    &w.call_id,
+                                    json!({"at": now_iso8601()}),
+                                ),
+                            );
+                            status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else if parked_leg.as_ref().is_some_and(|p| p.call_id == call_id) {
+                        // ── swap back to / retrieve the PARKED caller ──
+                        if waiting_leg.is_some() {
+                            emit_control_failed(
+                                outbox, sink, &tracker, "call.activate", op.as_deref(),
+                                "a waiting caller is knocking — CHLD=2 would accept THEM; handle the knock first",
+                            );
+                        } else if let Some((sess_a, ctx_a)) = parked.take() {
+                            bt.flush_tx_audio();
+                            if let Err(e) = bt.hold_swap() {
+                                parked = Some((sess_a, ctx_a));
+                                emit_control_failed(
+                                    outbox, sink, &tracker, "call.activate", op.as_deref(), &e,
+                                );
+                            } else {
+                                if tracker.current().is_some() {
+                                    let sess_b = tracker.park().expect("checked current");
+                                    let ctx_b = std::mem::replace(
+                                        &mut ctx,
+                                        CallVoiceContext::fresh(None),
+                                    );
+                                    eprintln!(
+                                        "[aokie-plugin] SWITCHBOARD: swap — {} parked, resuming {}",
+                                        sess_b.id, sess_a.id
+                                    );
+                                    *status.parked_call.lock().unwrap() =
+                                        Some(SwitchboardLeg {
+                                            call_id: sess_b.id.clone(),
+                                            from: sess_b
+                                                .caller_id
+                                                .clone()
+                                                .unwrap_or_default(),
+                                            since_iso: now_iso8601(),
+                                        });
+                                    parked = Some((sess_b, ctx_b));
+                                } else {
+                                    eprintln!(
+                                        "[aokie-plugin] SWITCHBOARD: retrieving parked caller {}",
+                                        sess_a.id
+                                    );
+                                    *status.parked_call.lock().unwrap() = None;
+                                }
+                                *status.switch_in_flight.lock().unwrap() = Some((
+                                    "activate_parked".to_string(),
+                                    std::time::Instant::now(),
+                                ));
+                                let resumed_id = sess_a.id.clone();
+                                let resumed_from = sess_a.caller_id.clone();
+                                match tracker.restore(sess_a) {
+                                    Ok(_generation) => {
+                                        pending_ctx_restore = Some(ctx_a);
+                                        status.call_active.store(true, Ordering::Relaxed);
+                                        *status.current_call_id.lock().unwrap() =
+                                            Some(resumed_id.clone());
+                                        *status.current_caller.lock().unwrap() = resumed_from;
+                                        *status.call_started_at.lock().unwrap() = tracker
+                                            .current()
+                                            .map(|s| s.started_at_iso.clone());
+                                        status
+                                            .switchboard_revision
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        eprintln!(
+                                            "[aokie-plugin] SWITCHBOARD: {} resumed — their conversation context is restored",
+                                            resumed_id
+                                        );
+                                    }
+                                    Err(sess_back) => {
+                                        // Cannot happen (we just parked/checked
+                                        // idle) — keep the caller parked rather
+                                        // than lose them.
+                                        eprintln!(
+                                            "[aokie-plugin] SWITCHBOARD: restore refused unexpectedly — {} stays parked",
+                                            sess_back.id
+                                        );
+                                        parked = Some((sess_back, ctx_a));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        emit_control_failed(
+                            outbox, sink, &tracker, "call.activate", op.as_deref(),
+                            &format!(
+                                "{call_id} is not the waiting or parked caller — stale switchboard view"
+                            ),
+                        );
+                    }
+                }
                 Ok(RadioControl::SendSms { to, body }) => {
                     if let Err(e) = bt.send_sms(to, body, None) {
                         emit(
@@ -8668,20 +9095,40 @@ fn handle_event(
                             "[aokie-plugin] waiting caller identified: {}",
                             aokie_core::redact::Phone(&num)
                         );
+                        // Late number for an anonymously-started episode:
+                        // the switchboard leg keeps its minted id.
+                        if let Some(leg) = status.waiting_call.lock().unwrap().as_mut() {
+                            if leg.from.is_empty() {
+                                leg.from = num;
+                            }
+                        }
                     }
                     return;
                 }
                 *announced = Some(corr.clone());
             }
+            // Phase 4 switchboard: the waiting caller gets a STABLE identity
+            // at the knock — `call.activate` targets it, and if they are
+            // accepted this becomes their session's call id.
+            let waiting_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+            *status.waiting_call.lock().unwrap() = Some(SwitchboardLeg {
+                call_id: waiting_id.clone(),
+                from: num.clone(),
+                since_iso: now_iso8601(),
+            });
+            status
+                .switchboard_revision
+                .fetch_add(1, Ordering::Relaxed);
             status.call_waiting_episodes.fetch_add(1, Ordering::Relaxed);
             eprintln!(
-                "[aokie-plugin] SECOND CALLER waiting during call {} ({}) — observe-only: the active call continues",
+                "[aokie-plugin] SECOND CALLER waiting during call {} ({}) as {} — the active call continues; call.activate can accept them",
                 corr,
                 if num.is_empty() {
                     "number withheld/unknown".to_string()
                 } else {
                     aokie_core::redact::Phone(&num).to_string()
                 },
+                waiting_id,
             );
             emit(
                 outbox,
@@ -8690,7 +9137,12 @@ fn handle_event(
                     crate::contract::events::CALL_WAITING,
                     &corr,
                     &occurrence_id(),
-                    json!({"callId": corr, "from": num, "at": now_iso8601()}),
+                    json!({
+                        "callId": corr,
+                        "from": num,
+                        "waitingCallId": waiting_id,
+                        "at": now_iso8601(),
+                    }),
                 ),
             );
         }
@@ -8699,6 +9151,11 @@ fn handle_event(
                 "[aokie-plugin] waiting caller gone — active call untouched"
             );
             *status.call_waiting_announced.lock().unwrap() = None;
+            if status.waiting_call.lock().unwrap().take().is_some() {
+                status
+                    .switchboard_revision
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         E::CallHeld { state } => {
             // Diagnostics only in the observe slice: a transition here with

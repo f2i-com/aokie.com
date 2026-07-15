@@ -155,6 +155,8 @@ pub mod commands {
         "phone.disconnect",
         "phone.connect",
         "call.current",
+        "call.switchboard",
+        "call.activate",
         "call.answer",
         "call.reject",
         "call.hangup",
