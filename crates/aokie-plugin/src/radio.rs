@@ -270,15 +270,17 @@ const HOLD_PROMOTED_GREET_LINE: &str =
 #[cfg(feature = "voice")]
 const HOLD_JUGGLE_ABORT_LINE: &str = "Sorry about that - I'm back with you. Where were we?";
 
-/// The hold ask spoken to the second caller, with their queue position when
-/// it's meaningful (position 2 = "you're next"; higher = "Nth in the
-/// queue"). Kept pure for testing.
+/// The hold ask spoken to a just-accepted caller, with their queue position.
+/// `ahead_in_queue` counts the callers WAITING ahead of them (excluding
+/// whoever is being actively served): 0 = they are next; 1 = number 2; and
+/// so on. The numbers stay honest as the queue moves — someone hanging up
+/// ahead simply means the next accept speaks a smaller number. Kept pure
+/// for testing.
 #[cfg(feature = "voice")]
-fn second_caller_hold_line(queue_position: u32) -> String {
-    let tail = match queue_position {
-        0 | 1 => String::new(), // shouldn't happen for a second caller
-        2 => " You're next in the queue.".to_string(),
-        n => format!(" You're number {n} in the queue."),
+fn second_caller_hold_line(ahead_in_queue: u32) -> String {
+    let tail = match ahead_in_queue {
+        0 => " You're next in the queue.".to_string(),
+        n => format!(" You're number {} in the queue.", n + 1),
     };
     format!("{HOLD_SECOND_ASK_LINE}{tail}")
 }
@@ -287,7 +289,7 @@ fn second_caller_hold_line(queue_position: u32) -> String {
 /// model only FLAGS ([[ABUSE]]); deterministic code speaks the notice, ends
 /// the call and writes the block — the LLM is never in the block/unblock
 /// path. Worded to keep a small model from overfiring on ordinary frustration.
-const ABUSE_INSTRUCTION: &str = "\n\nAbusive callers: if the caller is directly abusive - slurs, threats, sexual harassment, or sustained personal insults aimed at you or the staff - reply with EXACTLY [[ABUSE]] and nothing else. The system then speaks a standard notice and ends the call for you. This is ONLY for genuine abuse: frustration, venting, complaining, or swearing about their own situation is NOT abuse - stay warm and helpful through those. Never argue with or lecture an abusive caller yourself, and never threaten them with the marker.";
+const ABUSE_INSTRUCTION: &str = "\n\nAbusive callers: reply with EXACTLY [[ABUSE]] and nothing else ONLY when the caller is SWEARING AT you or the staff (profanity aimed at a person), or YELLING abuse at you (sustained angry shouting), or both. The system then speaks a standard notice and ends the call for you. This is a LAST RESORT with a very high bar: rudeness, sarcasm, insults without swearing, threats to leave a bad review, frustration, venting, complaining, or swearing about their own situation (not at a person) are NOT abuse - stay warm, patient and helpful through ALL of those, every time. One heated word is not abuse either; it must be unmistakable, directed and sustained. Never argue with or lecture an abusive caller yourself, and never threaten them with the marker.";
 
 /// Phase 1: the deterministic notice spoken to a flagged caller before the
 /// hangup — never model prose. ASCII only (straight to TTS).
@@ -1444,6 +1446,22 @@ fn flush_incoming_if_pending(
 /// session state machine (audit AK-001): answered → "completed" (even a
 /// sub-second call), operator-rejected → "rejected", never answered →
 /// "missed", radio link gone → reason "device_lost".
+/// Phase 4 (hold queue): how a PARKED caller's disappearance reads. A caller
+/// who had a real conversation before being held gave up ON HOLD (follow-up
+/// flows apologise by SMS — never a callback that would ring someone who
+/// chose to leave); one who only ever heard the "please hold" line gave up
+/// IN THE QUEUE (follow-ups call back like a missed call, with a hold
+/// apology in the opening line).
+fn parked_end_intent(
+    sess: &crate::call_session::CallSession,
+) -> crate::call_session::TerminationIntent {
+    if sess.greeted {
+        crate::call_session::TerminationIntent::AbandonedOnHold
+    } else {
+        crate::call_session::TerminationIntent::AbandonedInQueue
+    }
+}
+
 fn emit_call_ended(
     ended: &crate::call_session::EndedCall,
     config_version: u64,
@@ -5464,7 +5482,8 @@ fn run_loop(
                                             "[aokie-plugin] SWITCHBOARD: parked caller {} is gone too",
                                             sess_gone.id
                                         );
-                                        let ended = crate::call_session::SessionTracker::terminate_detached(sess_gone, None);
+                                        let gone_intent = parked_end_intent(&sess_gone);
+                                        let ended = crate::call_session::SessionTracker::terminate_detached(sess_gone, Some(gone_intent));
                                         emit_call_ended(
                                             &ended,
                                             status.config_version.load(Ordering::Relaxed),
@@ -5530,7 +5549,7 @@ fn run_loop(
                                     |_, sr_now| sr_now > 0,
                                 );
                                 let sr_c = bt.get_sample_rate();
-                                let hold_line = second_caller_hold_line(2);
+                                let hold_line = second_caller_hold_line(1);
                                 if sr_c > 0 {
                                     let _ = speak_announcement(
                                         bt, &synth, &hold_line, sr_c, &ctx.pace,
@@ -5639,7 +5658,8 @@ fn run_loop(
                                         // are retrieved when this call ends.
                                         if verdict == SwapBackVerdict::NewcomerAlone {
                                             if let Some((sess_b, _ctx_b)) = parked.take() {
-                                                let ended = crate::call_session::SessionTracker::terminate_detached(sess_b, None);
+                                                let b_intent = parked_end_intent(&sess_b);
+                                                let ended = crate::call_session::SessionTracker::terminate_detached(sess_b, Some(b_intent));
                                                 emit_call_ended(
                                                     &ended,
                                                     status.config_version.load(Ordering::Relaxed),
@@ -5736,7 +5756,8 @@ fn run_loop(
                                             );
                                         }
                                         if let Some((sess_b, _ctx_b)) = parked.take() {
-                                            let ended = crate::call_session::SessionTracker::terminate_detached(sess_b, None);
+                                            let b_intent = parked_end_intent(&sess_b);
+                                            let ended = crate::call_session::SessionTracker::terminate_detached(sess_b, Some(b_intent));
                                             emit_call_ended(
                                                 &ended,
                                                 status.config_version.load(Ordering::Relaxed),
@@ -5828,8 +5849,11 @@ fn run_loop(
                             "[aokie-plugin] SWITCHBOARD: foreground ended but nothing is held (callheld=0) — parked caller {} is gone",
                             sess.id
                         );
-                        let ended =
-                            crate::call_session::SessionTracker::terminate_detached(sess, None);
+                        let sess_intent = parked_end_intent(&sess);
+                        let ended = crate::call_session::SessionTracker::terminate_detached(
+                            sess,
+                            Some(sess_intent),
+                        );
                         emit_call_ended(
                             &ended,
                             status.config_version.load(Ordering::Relaxed),
@@ -5920,8 +5944,11 @@ fn run_loop(
                         "[aokie-plugin] SWITCHBOARD: parked caller {} hung up while on hold",
                         sess.id
                     );
-                    let ended =
-                        crate::call_session::SessionTracker::terminate_detached(sess, None);
+                    let sess_intent = parked_end_intent(&sess);
+                    let ended = crate::call_session::SessionTracker::terminate_detached(
+                        sess,
+                        Some(sess_intent),
+                    );
                     emit_call_ended(
                         &ended,
                         status.config_version.load(Ordering::Relaxed),
@@ -6097,7 +6124,7 @@ fn run_loop(
                                         |_, sr_now| sr_now > 0,
                                     );
                                     let sr_b = bt.get_sample_rate();
-                                    let hold_line = second_caller_hold_line(2);
+                                    let hold_line = second_caller_hold_line(0);
                                     if sr_b > 0 {
                                         let _ = speak_announcement(
                                             bt, &synth, &hold_line, sr_b, &ctx.pace,
@@ -6281,7 +6308,8 @@ fn run_loop(
                                             // newcomer keeps the line alone. Close
                                             // the primary honestly; release the
                                             // newcomer from "please hold".
-                                            let ended_a = crate::call_session::SessionTracker::terminate_detached(sess_a, None);
+                                            let a_intent = parked_end_intent(&sess_a);
+                                            let ended_a = crate::call_session::SessionTracker::terminate_detached(sess_a, Some(a_intent));
                                             emit_call_ended(
                                                 &ended_a,
                                                 status.config_version.load(Ordering::Relaxed),
@@ -6338,7 +6366,8 @@ fn run_loop(
                                                     sink,
                                                 );
                                             }
-                                            let ended_a = crate::call_session::SessionTracker::terminate_detached(sess_a, None);
+                                            let a_intent = parked_end_intent(&sess_a);
+                                            let ended_a = crate::call_session::SessionTracker::terminate_detached(sess_a, Some(a_intent));
                                             emit_call_ended(
                                                 &ended_a,
                                                 status.config_version.load(Ordering::Relaxed),
@@ -11741,12 +11770,13 @@ mod tests {
     #[cfg(feature = "voice")]
     #[test]
     fn second_caller_hold_line_names_the_queue_position() {
-        // Position 2 = the very next caller.
-        assert!(super::second_caller_hold_line(2).ends_with("You're next in the queue."));
-        // Deeper positions name the number.
-        assert!(super::second_caller_hold_line(3).ends_with("You're number 3 in the queue."));
+        // Nobody waiting ahead = the very next caller.
+        assert!(super::second_caller_hold_line(0).ends_with("You're next in the queue."));
+        // One ahead (a parked caller) = number 2, and so on.
+        assert!(super::second_caller_hold_line(1).ends_with("You're number 2 in the queue."));
+        assert!(super::second_caller_hold_line(2).ends_with("You're number 3 in the queue."));
         // Every line starts with the ask and is ASCII (TTS-safe).
-        let line = super::second_caller_hold_line(2);
+        let line = super::second_caller_hold_line(0);
         assert!(line.starts_with("Thank you for calling!"));
         assert!(line.is_ascii(), "hold line must be ASCII for the synthesizer");
     }

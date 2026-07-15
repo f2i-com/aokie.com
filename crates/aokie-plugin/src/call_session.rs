@@ -34,6 +34,15 @@ pub enum TerminationIntent {
     /// the radio synthesizes termination rather than leaving the session —
     /// and the operator UI — stuck "live" on hardware that is gone.
     DeviceLost,
+    /// Phase 4 (hold queue): a caller who was PARKED mid-conversation hung
+    /// up (or their leg died) before the receptionist got back to them.
+    /// Its own outcome so the follow-up flows can apologise by SMS instead
+    /// of treating a lost hold like a missed call.
+    AbandonedOnHold,
+    /// Phase 4 (hold queue): a caller who never got past the "please hold —
+    /// you're next in the queue" line gave up waiting. Follow-up flows treat
+    /// this like a missed call (call them back) with a hold apology.
+    AbandonedInQueue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,6 +383,13 @@ impl SessionTracker {
             (true, Some(TerminationIntent::AgentTerminateAbuse)) => {
                 ("terminated_abuse", "agent_abuse")
             }
+            // Phase 4: parked callers who never made it back to the line.
+            (true, Some(TerminationIntent::AbandonedOnHold)) => {
+                ("abandoned_on_hold", "hung_up_on_hold")
+            }
+            (true, Some(TerminationIntent::AbandonedInQueue)) => {
+                ("abandoned_in_queue", "hung_up_in_queue")
+            }
             (true, _) => ("completed", "remote_or_operator"),
             (false, Some(TerminationIntent::OperatorReject)) => ("rejected", "operator_reject"),
             (false, Some(TerminationIntent::OperatorHangup)) => ("rejected", "operator_hangup"),
@@ -382,6 +398,12 @@ impl SessionTracker {
             (false, Some(TerminationIntent::AgentHangup)) => ("missed", "agent_hangup"),
             (false, Some(TerminationIntent::AgentTerminateAbuse)) => {
                 ("rejected", "agent_abuse")
+            }
+            // Defensive: a parked session is always answered — a never-answered
+            // one still reads honestly as missed.
+            (false, Some(TerminationIntent::AbandonedOnHold))
+            | (false, Some(TerminationIntent::AbandonedInQueue)) => {
+                ("missed", "hung_up_in_queue")
             }
             (false, None) => ("missed", "remote_or_operator"),
         };
@@ -530,6 +552,35 @@ mod tests {
         t.note_intent(TerminationIntent::AgentTerminateAbuse);
         t.note_intent(TerminationIntent::AgentHangup);
         assert_eq!(t.terminate().unwrap().outcome, "terminated_abuse");
+    }
+
+    /// Phase 4 (hold queue): parked callers who hang up get their own
+    /// outcomes so follow-up flows can tell "gave up mid-conversation on
+    /// hold" (apology SMS) from "gave up waiting in the queue" (callback
+    /// with a hold apology).
+    #[test]
+    fn parked_hangups_have_their_own_outcomes() {
+        let mut t = SessionTracker::new();
+        ring(&mut t, "call_hold");
+        t.answered();
+        let sess = t.park().unwrap();
+        let ended = SessionTracker::terminate_detached(
+            sess,
+            Some(TerminationIntent::AbandonedOnHold),
+        );
+        assert_eq!(ended.outcome, "abandoned_on_hold");
+        assert_eq!(ended.reason, "hung_up_on_hold");
+
+        let mut t = SessionTracker::new();
+        ring(&mut t, "call_queue");
+        t.answered();
+        let sess = t.park().unwrap();
+        let ended = SessionTracker::terminate_detached(
+            sess,
+            Some(TerminationIntent::AbandonedInQueue),
+        );
+        assert_eq!(ended.outcome, "abandoned_in_queue");
+        assert_eq!(ended.reason, "hung_up_in_queue");
     }
 
     // ── Phase 2: outbound sessions ──────────────────────────────────────────
