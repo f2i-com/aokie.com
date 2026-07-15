@@ -92,6 +92,16 @@ pub enum RuntimeEvent {
     CallWaitingEnded,
     /// `callheld` indicator transition (0 none / 1 held+active / 2 held only).
     CallHeld { state: i32 },
+    /// One parsed `+CLCC:` line (Phase 4 observe topology): `status` 0
+    /// active / 1 held / 2 dialing / 3 alerting / 4 incoming / 5 waiting.
+    /// A CLCC response bursts one of these per current call.
+    CallListEntry {
+        index: u8,
+        direction: u8,
+        status: u8,
+        multiparty: bool,
+        number: Option<String>,
+    },
     /// Phase 3e: phonebook fetch finished. The runtime IO loop
     /// produces this once per ACL connection after PBAP completes.
     /// One entry per (phone, display name) pair — vCards with
@@ -5041,8 +5051,12 @@ fn forward_hfp_event(
         }
         HfpEvent::CallListEntry(entry) => {
             // Observe-only topology (Phase 4 step 2): every CLCC line is
-            // logged so real waiting-call timelines can be verified on live
-            // phones before any CHLD command ever goes out.
+            // logged AND forwarded — the plugin keeps the last snapshot in
+            // dongle.diagnostics so a knock's topology is verifiable after
+            // the fact (the 500-line log ring wraps in ~1 min under call
+            // load; the first two live soak tests both lost the race), and
+            // the switchboard slice reconciles switches against exactly
+            // these entries.
             eprintln!(
                 "[AokieRadio] HFP CLCC entry: idx={} dir={} status={} mode={} mpty={} number={}",
                 entry.index,
@@ -5056,6 +5070,13 @@ fn forward_hfp_event(
                     .map(|n| aokie_core::redact::Phone(n).to_string())
                     .unwrap_or_else(|| "-".to_string()),
             );
+            let _ = event_tx.send(RuntimeEvent::CallListEntry {
+                index: entry.index,
+                direction: entry.direction,
+                status: entry.status,
+                multiparty: entry.multiparty,
+                number: entry.number,
+            });
         }
         HfpEvent::CodecSelected { codec, sample_rate } => {
             // Surface AG-initiated codec connection so a "no audio after
