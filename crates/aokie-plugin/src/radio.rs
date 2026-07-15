@@ -5462,6 +5462,23 @@ fn run_loop(
                     // later pass retrieves the parked caller.
                     #[cfg(feature = "voice")]
                     if auto_hold
+                        && auto_hold_done_for.as_deref() != Some(w.call_id.as_str())
+                        && screen_policy
+                            .verdict(if w.from.is_empty() { None } else { Some(w.from.as_str()) })
+                            .is_some()
+                    {
+                        // A SCREENED caller knocking while someone is parked:
+                        // never serve them FIFO — wait for their ring to
+                        // clear, then the plain retrieve brings the parked
+                        // caller back (accepting them just to hang up on them
+                        // would also delay the caller who matters).
+                        auto_hold_done_for = Some(w.call_id.clone());
+                        eprintln!(
+                            "[aokie-plugin] SWITCHBOARD: knocking caller is screened — waiting for their ring to clear before retrieving the parked caller"
+                        );
+                    }
+                    #[cfg(feature = "voice")]
+                    if auto_hold
                         && !switch_recent
                         && auto_hold_done_for.as_deref() != Some(w.call_id.as_str())
                     {
@@ -6113,7 +6130,24 @@ fn run_loop(
                     num.map(crate::screen::digit_suffix).filter(|s| s.len() >= 6)
                 };
                 let mut keep: Vec<(SwitchboardLeg, std::time::Instant, u64)> = Vec::new();
+                // Same env-derived truth the screening itself runs on (the
+                // classifier is not voice-gated, so the live-reloaded local
+                // is out of reach here — from_env matches emit_call_ended).
+                let screen = crate::screen::ScreenPolicy::from_env();
                 for (leg, ended_at, gen_at_end) in pending {
+                    // Screened callers leave NO missed-call record: they were
+                    // never going to be served, and ringing them back would
+                    // undo the block (user policy 2026-07-15).
+                    if screen
+                        .verdict(if leg.from.is_empty() { None } else { Some(leg.from.as_str()) })
+                        .is_some()
+                    {
+                        eprintln!(
+                            "[aokie-plugin] screened caller {} gave up — no missed-call record by policy",
+                            leg.call_id
+                        );
+                        continue;
+                    }
                     let claimed_by_id = tracker.current().is_some_and(|s| s.id == leg.call_id)
                         || parked.as_ref().is_some_and(|(s, _)| s.id == leg.call_id);
                     let knock_suffix = crate::screen::digit_suffix(&leg.from);
@@ -6218,8 +6252,23 @@ fn run_loop(
             if let Some(w) = waiting_snapshot {
                 if primary_active && !busy {
                     auto_hold_done_for = Some(w.call_id.clone());
+                    // Screened callers (blocked list / accept-filter miss /
+                    // withheld id with rejectPrivate) NEVER interrupt a live
+                    // conversation: no juggle, no queue spot — they ring out
+                    // at the network and their give-up leaves no missed-call
+                    // record (user policy 2026-07-15). A call from them on an
+                    // IDLE line still gets the normal answer-then-screen flow.
+                    let knock_screen = screen_policy.verdict(if w.from.is_empty() {
+                        None
+                    } else {
+                        Some(w.from.as_str())
+                    });
                     let sr = bt.get_sample_rate();
-                    if sr == 0 {
+                    if let Some(reason) = knock_screen {
+                        eprintln!(
+                            "[aokie-plugin] AUTO-HOLD: knocking caller is screened ({reason}) — no juggle, no queue spot; they ring out and leave no missed-call record"
+                        );
+                    } else if sr == 0 {
                         eprintln!(
                             "[aokie-plugin] AUTO-HOLD: no audio path (sr=0) — leaving {} in observe state",
                             w.call_id
