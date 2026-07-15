@@ -100,34 +100,46 @@ struct DriverJob<'a> {
     hardware_id: &'a str,
     /// DRIVER-001: whether DEVELOPER self-signing (minting a local
     /// catalog-signing cert trusted machine-wide) is authorised for this
-    /// install. Debug builds default on; release builds refuse unless the
-    /// operator explicitly set `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`.
+    /// install. Debug builds default on. Release builds require BOTH the
+    /// `managed-beta-driver` compile-time feature and the operator's explicit
+    /// `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1` runtime opt-in.
     allow_dev_self_sign: bool,
 }
 
-/// DRIVER-001: is developer self-signing allowed for this dispatch?
+fn self_sign_policy(debug_build: bool, managed_beta_build: bool, operator_opt_in: bool) -> bool {
+    debug_build || (managed_beta_build && operator_opt_in)
+}
+
+/// DRIVER-001: is local catalog self-signing allowed for this dispatch?
 /// Debug builds: yes (a dev box installing its own WinUSB rebind).
-/// Release builds: only with the explicit `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`
-/// override, which is audited — the production default is a properly
-/// signed driver package, never a locally-minted root of trust.
+/// Release builds: only when compiled as the explicit managed-beta flavour
+/// AND the operator sets `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`. A standard
+/// production binary cannot be switched into self-signing mode at runtime.
 fn dev_self_sign_allowed() -> bool {
-    if cfg!(debug_assertions) {
-        return true;
-    }
-    let forced = std::env::var("AOKIE_ALLOW_SELF_SIGNED_DRIVER").as_deref() == Ok("1");
-    if forced {
+    let operator_opt_in = std::env::var("AOKIE_ALLOW_SELF_SIGNED_DRIVER").as_deref() == Ok("1");
+    let allowed = self_sign_policy(
+        cfg!(debug_assertions),
+        cfg!(feature = "managed-beta-driver"),
+        operator_opt_in,
+    );
+    if allowed && !cfg!(debug_assertions) {
         aokie_core::redact::audit(
-            "driver_self_sign_override",
-            "AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 on a release build — a locally-generated \
-             signing certificate will be trusted machine-wide for this install"
-                .to_string(),
+            "managed_beta_driver_self_sign",
+            "managed-beta-driver build + AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 — a \
+             locally-generated signing certificate will be trusted machine-wide for this install",
         );
         eprintln!(
-            "[installer] ⚠️ AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 — release build will self-sign \
-             the driver catalog and trust it via LocalMachine\\Root (dev override)"
+            "[installer] ⚠️ MANAGED BETA DRIVER — release build will self-sign the driver \
+             catalog and trust it via LocalMachine\\Root + TrustedPublisher"
+        );
+    } else if operator_opt_in && !allowed {
+        aokie_core::redact::audit(
+            "driver_self_sign_refused",
+            "AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 was ignored because this release was not \
+             compiled with the managed-beta-driver feature",
         );
     }
-    forced
+    allowed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,7 +326,10 @@ fn run_helper_install(
         inf_sha256,
         cat_sha256,
         hardware_id: &hardware_id,
-        allow_dev_self_sign: dev_self_sign_allowed(),
+        // Prefer a shipped catalog whenever one is present. The managed-beta
+        // trust-store path is considered only for a genuinely catalog-less,
+        // dynamically rendered package.
+        allow_dev_self_sign: cat_sha256.is_empty() && dev_self_sign_allowed(),
     };
     let job_json = serde_json::to_string_pretty(&job)
         .map_err(|e| format!("could not serialize driver helper job: {}", e))?;
@@ -639,6 +654,18 @@ mod tests {
     // pass `false` (debug build) by default — that's the historical
     // shape — and pass `true` to lock in the new R3-#1 fail-closed
     // behaviour for release builds.
+
+    #[test]
+    fn managed_beta_self_sign_policy_requires_build_and_operator_opt_in() {
+        assert!(
+            self_sign_policy(true, false, false),
+            "debug remains convenient"
+        );
+        assert!(!self_sign_policy(false, false, false));
+        assert!(!self_sign_policy(false, false, true));
+        assert!(!self_sign_policy(false, true, false));
+        assert!(self_sign_policy(false, true, true));
+    }
 
     #[test]
     fn check_helper_hash_passes_when_pin_unset_in_debug() {

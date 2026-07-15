@@ -6,6 +6,14 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# Explicit release flavour for managed/technical deployments that accept a
+# locally generated driver-catalog certificate. Standard release builds keep
+# requiring the Microsoft-signed INF/CAT pair; enabling this feature alone is
+# insufficient because the operator must also opt in at install time.
+managed-beta-driver = []
+
 [dependencies]
 aokie-core = { path = "../aokie-core" }
 aokie-bluetooth = { path = "../aokie-bluetooth" }
