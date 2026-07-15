@@ -972,15 +972,16 @@ pub struct RadioStatus {
     /// at a time; doubles as the suppression window for callheld-edge
     /// attribution (our own swap produces expected transitions).
     pub switch_in_flight: Mutex<Option<(String, std::time::Instant)>>,
-    /// A waiting episode that just ended, pending give-up classification
-    /// (leg, when it ended, tracker generation at that moment). If no
-    /// session claims the knock within a short window — accepted under its
-    /// minted id, or promoted under a fresh id with the same number — the
-    /// run_loop emits an honest MISSED `call.ended` for the waitingCallId
-    /// so the missed-call flows ring the caller back. Before this, a caller
-    /// who rang out while both slots were busy left NO record at all (live
-    /// gap, user report 2026-07-15).
-    pub gave_up_knock: Mutex<Option<(SwitchboardLeg, std::time::Instant, u64)>>,
+    /// Waiting episodes that just ended, pending give-up classification
+    /// (leg, when it ended, tracker generation at that moment). A QUEUE
+    /// (bounded 8): during one long call several different callers can
+    /// knock and give up in turn — EVERY unclaimed one becomes an honest
+    /// MISSED `call.ended` under its waitingCallId so the missed-call
+    /// flows queue a ring-back for each (user request 2026-07-15: multiple
+    /// missed calls must all be called back, one after the other). Claimed
+    /// entries (accepted under their minted id, or promoted under a fresh
+    /// id with the same number) are dropped silently.
+    pub gave_up_knock: Mutex<Vec<(SwitchboardLeg, std::time::Instant, u64)>>,
 }
 
 /// One non-foreground switchboard leg (waiting or parked) — see
@@ -5866,7 +5867,7 @@ fn run_loop(
                                                     .gave_up_knock
                                                     .lock()
                                                     .unwrap()
-                                                    .take()
+                                                    .pop()
                                                     .map(|(l, _, _)| l)
                                             });
                                         let (s_id, s_from) = match stranger {
@@ -6106,30 +6107,35 @@ fn run_loop(
         // caller who rang out while both slots were busy left NO record and
         // never got a callback (live gap, user report 2026-07-15).
         {
-            let stash = status.gave_up_knock.lock().unwrap().clone();
-            if let Some((leg, ended_at, gen_at_end)) = stash {
-                let claimed_by_id = tracker.current().is_some_and(|s| s.id == leg.call_id)
-                    || parked.as_ref().is_some_and(|(s, _)| s.id == leg.call_id);
-                let knock_suffix = crate::screen::digit_suffix(&leg.from);
+            let pending = status.gave_up_knock.lock().unwrap().clone();
+            if !pending.is_empty() {
                 let suffix_of = |num: Option<&str>| -> Option<String> {
                     num.map(crate::screen::digit_suffix).filter(|s| s.len() >= 6)
                 };
-                let claimed_by_number = knock_suffix.len() >= 6
-                    && (suffix_of(tracker.current().and_then(|s| s.caller_id.as_deref()))
-                        .as_deref()
-                        == Some(knock_suffix.as_str())
-                        || suffix_of(parked.as_ref().and_then(|(s, _)| s.caller_id.as_deref()))
+                let mut keep: Vec<(SwitchboardLeg, std::time::Instant, u64)> = Vec::new();
+                for (leg, ended_at, gen_at_end) in pending {
+                    let claimed_by_id = tracker.current().is_some_and(|s| s.id == leg.call_id)
+                        || parked.as_ref().is_some_and(|(s, _)| s.id == leg.call_id);
+                    let knock_suffix = crate::screen::digit_suffix(&leg.from);
+                    let claimed_by_number = knock_suffix.len() >= 6
+                        && (suffix_of(tracker.current().and_then(|s| s.caller_id.as_deref()))
                             .as_deref()
-                            == Some(knock_suffix.as_str()));
-                // Withheld number: any fresh session since the episode ended
-                // is almost certainly the promotion answering them — never
-                // record a miss we cannot verify.
-                let anonymous_claim =
-                    leg.from.is_empty() && tracker.generation() != gen_at_end;
-                if claimed_by_id || claimed_by_number || anonymous_claim {
-                    *status.gave_up_knock.lock().unwrap() = None;
-                } else if ended_at.elapsed() >= std::time::Duration::from_millis(2500) {
-                    *status.gave_up_knock.lock().unwrap() = None;
+                            == Some(knock_suffix.as_str())
+                            || suffix_of(parked.as_ref().and_then(|(s, _)| s.caller_id.as_deref()))
+                                .as_deref()
+                                == Some(knock_suffix.as_str()));
+                    // Withheld number: any fresh session since the episode
+                    // ended is almost certainly the promotion answering them —
+                    // never record a miss we cannot verify.
+                    let anonymous_claim =
+                        leg.from.is_empty() && tracker.generation() != gen_at_end;
+                    if claimed_by_id || claimed_by_number || anonymous_claim {
+                        continue; // served — no record
+                    }
+                    if ended_at.elapsed() < std::time::Duration::from_millis(2500) {
+                        keep.push((leg, ended_at, gen_at_end));
+                        continue;
+                    }
                     eprintln!(
                         "[aokie-plugin] waiting caller {} gave up unserved — recording an honest missed call",
                         leg.call_id
@@ -6159,6 +6165,10 @@ fn run_loop(
                         ),
                     );
                 }
+                // Entries pushed by a settle pump later in this pass are
+                // appended AFTER this store (same thread) — nothing is lost
+                // by the write-back.
+                *status.gave_up_knock.lock().unwrap() = keep;
             }
         }
         {
@@ -6664,7 +6674,7 @@ fn run_loop(
                                                         .gave_up_knock
                                                         .lock()
                                                         .unwrap()
-                                                        .take()
+                                                        .pop()
                                                         .map(|(l, _, _)| l)
                                                 });
                                             let (s_id, s_from) = match stranger {
@@ -11050,9 +11060,14 @@ fn handle_event(
                 // cascade, call.activate — all mint the session under this
                 // very id) or a promotion (fresh id, same number) claims the
                 // knock within moments; anything unclaimed becomes an honest
-                // MISSED call so follow-ups ring the caller back.
-                *status.gave_up_knock.lock().unwrap() =
-                    Some((leg, std::time::Instant::now(), tracker.generation()));
+                // MISSED call so follow-ups ring the caller back. A queue,
+                // so several give-ups during one long call ALL get records.
+                {
+                    let mut q = status.gave_up_knock.lock().unwrap();
+                    if q.len() < 8 {
+                        q.push((leg, std::time::Instant::now(), tracker.generation()));
+                    }
+                }
                 status
                     .switchboard_revision
                     .fetch_add(1, Ordering::Relaxed);
@@ -12224,10 +12239,11 @@ mod tests {
         // honest MISSED call so follow-ups ring the caller back.
         {
             let stash = status.gave_up_knock.lock().unwrap().clone();
-            let (leg, _at, gen_at_end) = stash.expect("ended episode stashed for give-up check");
+            assert_eq!(stash.len(), 1, "ended episode queued for give-up check");
+            let (leg, _at, gen_at_end) = &stash[0];
             assert!(leg.call_id.starts_with("call_"));
-            assert_eq!(gen_at_end, tracker.generation());
-            *status.gave_up_knock.lock().unwrap() = None;
+            assert_eq!(*gen_at_end, tracker.generation());
+            status.gave_up_knock.lock().unwrap().clear();
         }
         sink.lines.clear();
         handle_event(
