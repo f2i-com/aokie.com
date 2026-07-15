@@ -241,6 +241,43 @@ const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read
 const FALLBACK_LINE: &str = "I'm sorry, I'm having technical trouble taking your call right now. \
 Please call back shortly. Goodbye.";
 
+// ── Phase 4 call-waiting: the deterministic spoken switch flow ──────────
+// Only the ACTIVE call can hear Aokie (HFP exposes one audio path), so the
+// receptionist juggles: it tells the primary caller it will be a moment,
+// swaps to the new caller to ask them to hold, swaps back and resumes. All
+// lines are fixed/records-composed (never model prose) and ASCII (TTS-safe).
+/// Spoken to the PRIMARY caller, who is active, right before they are put on
+/// hold to deal with a second caller knocking.
+#[cfg(feature = "voice")]
+const HOLD_PRIMARY_ASK_LINE: &str =
+    "Sorry, I've just had another call come in. Let me put you on hold for one moment - I'll be right back with you.";
+/// Spoken to the PRIMARY caller when Aokie returns to them after the swap.
+#[cfg(feature = "voice")]
+const HOLD_PRIMARY_RESUME_LINE: &str = "Thanks so much for holding. Now, where were we?";
+/// Spoken to the SECOND caller during the brief window they are active, to
+/// ask them to hold. `heard_hold_line` appends their queue position.
+#[cfg(feature = "voice")]
+const HOLD_SECOND_ASK_LINE: &str =
+    "Thank you for calling! I'm just with another caller at the moment. Please hold and I'll be with you as soon as I can.";
+/// Spoken to a held caller when Aokie finally gives them its full attention
+/// (the previous call ended and they were promoted from hold).
+#[cfg(feature = "voice")]
+const HOLD_PROMOTED_GREET_LINE: &str =
+    "Thank you so much for holding. How can I help you today?";
+
+/// The hold ask spoken to the second caller, with their queue position when
+/// it's meaningful (position 2 = "you're next"; higher = "Nth in the
+/// queue"). Kept pure for testing.
+#[cfg(feature = "voice")]
+fn second_caller_hold_line(queue_position: u32) -> String {
+    let tail = match queue_position {
+        0 | 1 => String::new(), // shouldn't happen for a second caller
+        2 => " You're next in the queue.".to_string(),
+        n => format!(" You're number {n} in the queue."),
+    };
+    format!("{HOLD_SECOND_ASK_LINE}{tail}")
+}
+
 /// Phase 1 abuse handling (call-policy spec): the standing prompt rule. The
 /// model only FLAGS ([[ABUSE]]); deterministic code speaks the notice, ends
 /// the call and writes the block — the LLM is never in the block/unblock
@@ -3836,6 +3873,38 @@ struct PlannedSpeech {
 /// Stops early on a barge (after the barged span finishes its bounded
 /// extension, if any) or an urgent control; the remaining spans are never
 /// spoken (yield: the caller has the floor).
+/// Phase 4: speak a FIXED announcement (a hold/resume line) to whoever is
+/// currently active, plainly — no barge lane, no STT capture (these lines
+/// are not up for interruption and the caller's audio during them is
+/// discarded by the juggle). A hangup/reject arriving mid-line still cuts
+/// it and is returned so the caller can honour it.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn speak_announcement(
+    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    synth: &crate::synth::SynthHandle,
+    text: &str,
+    sample_rate: u16,
+    pace: &crate::speech_plan::PaceState,
+    protected_max_ms: u32,
+    control_rx: &std::sync::mpsc::Receiver<RadioControl>,
+    pending_controls: &mut std::collections::VecDeque<RadioControl>,
+) -> Option<CancelAction> {
+    let mut probe = ControlProbe::new(control_rx, pending_controls);
+    let _ = speak_planned(
+        bt,
+        synth,
+        text,
+        sample_rate,
+        None,
+        None,
+        Some(&mut probe),
+        pace,
+        protected_max_ms,
+        None,
+    );
+    probe.action.take()
+}
+
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 fn speak_planned(
@@ -4631,6 +4700,25 @@ fn run_loop(
     // farewell is spoken/recorded. Only meaningful with the agent on.
     #[cfg(feature = "voice")]
     let agent_hangup = agent_enabled && std::env::var_os("AOKIE_AGENT_HANGUP").is_some();
+    // Phase 4: when call waiting is negotiated (AOKIE_CALL_WAITING, the
+    // holdAndCallWaiting setting) AND the agent owns replies, a second caller
+    // is handled AUTOMATICALLY — the receptionist tells the current caller to
+    // hold, briefly answers the newcomer to ask THEM to hold with their queue
+    // position, then returns to the first caller. When the current call ends
+    // the held caller is promoted and greeted. Off ⇒ the observe-only lane
+    // (aokie.call.waiting event, no spoken flow).
+    #[cfg(feature = "voice")]
+    let auto_hold = agent_enabled && std::env::var_os("AOKIE_CALL_WAITING").is_some();
+    // The waiting callId whose auto-hold juggle already ran (so the pump does
+    // not re-trigger every loop pass while that caller sits on hold).
+    #[cfg(feature = "voice")]
+    let mut auto_hold_done_for: Option<String> = None;
+    // A held caller was just promoted (their call ended-neighbour retrieved
+    // them): the greeting block speaks the "thanks for holding" line to THIS
+    // callId instead of the normal greeting, exactly once. Written by the
+    // shared reconciliation block; read only in the voice greeting path.
+    #[cfg_attr(not(feature = "voice"), allow(unused_assignments, unused_variables))]
+    let mut promote_greet_for: Option<String> = None;
     // Cleaned-mic RMS above which the caller counts as speaking over Aokie. Set
     // above the AEC's residual echo floor; tune per handset via AOKIE_BARGE_RMS.
     #[cfg(feature = "voice")]
@@ -4961,9 +5049,17 @@ fn run_loop(
                     Some(("auto_retrieve".to_string(), std::time::Instant::now()));
                 let resumed_id = sess.id.clone();
                 let resumed_from = sess.caller_id.clone();
+                let was_greeted = sess.greeted;
                 match tracker.restore(sess) {
                     Ok(_generation) => {
                         pending_ctx_restore = Some(ctx_saved);
+                        // A held caller who never got past the "please hold"
+                        // line (auto-hold model — their session was answered
+                        // but never greeted) is now given full attention: the
+                        // greeting block speaks the "thanks for holding" line.
+                        if !was_greeted {
+                            promote_greet_for = Some(resumed_id.clone());
+                        }
                         status.call_active.store(true, Ordering::Relaxed);
                         *status.current_call_id.lock().unwrap() = Some(resumed_id);
                         *status.current_caller.lock().unwrap() = resumed_from;
@@ -5033,6 +5129,165 @@ fn run_loop(
                 .is_some_and(|(_, at)| at.elapsed() >= std::time::Duration::from_secs(4))
             {
                 *in_flight = None;
+            }
+        }
+
+        // ── Phase 4 AUTO-HOLD juggle: a second caller knocked mid-call.
+        // Only the ACTIVE call hears Aokie, so the receptionist juggles the
+        // audio path: tell the current caller it will be a moment → CHLD=2 →
+        // ask the newcomer to hold with their queue position → CHLD=2 →
+        // resume the current caller. The newcomer ends up PARKED and is
+        // greeted when the current call finishes (the reconciliation block
+        // above auto-retrieves them). Runs once per waiting caller; the two
+        // swaps are separated by the multi-second hold message, which gives
+        // the phone ample settle time between CHLD toggles.
+        #[cfg(feature = "voice")]
+        if auto_hold
+            && parked.is_none()
+            && voice_call_gen == tracker.generation()
+            && auto_hold_done_for.as_deref() != status.waiting_call.lock().unwrap().as_ref().map(|w| w.call_id.as_str())
+        {
+            let primary_active =
+                tracker.current().is_some_and(|s| s.is_active() && !s.outbound);
+            let busy = ctx.manager_gate.awaiting_pin || ctx.agent_hung_up;
+            if let Some(w) = status.waiting_call.lock().unwrap().clone() {
+                if primary_active && !busy {
+                    auto_hold_done_for = Some(w.call_id.clone());
+                    let sr = bt.get_sample_rate();
+                    if sr == 0 {
+                        eprintln!(
+                            "[aokie-plugin] AUTO-HOLD: no audio path (sr=0) — leaving {} in observe state",
+                            w.call_id
+                        );
+                    } else {
+                        eprintln!(
+                            "[aokie-plugin] AUTO-HOLD: second caller {} knocking — telling the primary to hold",
+                            w.call_id
+                        );
+                        // 1) Tell the PRIMARY (active) they'll be held briefly.
+                        let cancel = speak_announcement(
+                            bt, &synth, HOLD_PRIMARY_ASK_LINE, sr, &ctx.pace,
+                            protected_max_ms, &control_rx, &mut pending_controls,
+                        );
+                        if let Some(action) = cancel {
+                            // The primary hung up during the ask — honour it and
+                            // abandon the juggle (the phone promotes the waiting
+                            // caller to a fresh incoming, which auto-answers).
+                            perform_cancel_action(action, bt, &mut tracker, outbox, sink);
+                        } else if let Err(e) = {
+                            bt.flush_tx_audio();
+                            bt.hold_swap()
+                        } {
+                            eprintln!("[aokie-plugin] AUTO-HOLD: CHLD=2 to reach the newcomer failed: {e}");
+                        } else {
+                            // 2) Primary is now held; the newcomer is active.
+                            // Park the primary's whole session + context.
+                            let sess_a =
+                                tracker.park().expect("primary was active");
+                            let ctx_a = std::mem::replace(
+                                &mut ctx,
+                                CallVoiceContext::fresh(None),
+                            );
+                            // Reset the engines between speakers.
+                            synth.reset_call();
+                            stt_buf.clear();
+                            stt_had_speech = false;
+                            stt_silence = Duration::ZERO;
+                            while probe_result_rx.try_recv().is_ok() {}
+                            // Mint the newcomer as a real answered call so their
+                            // records + eventual promotion work.
+                            let b_id = w.call_id.clone();
+                            let b_from = w.from.clone();
+                            tracker.ring(b_id.clone(), aokie_core::events::now_iso8601());
+                            if !b_from.is_empty() {
+                                tracker.caller_id(b_from.clone());
+                            }
+                            flush_incoming_if_pending(&mut tracker, outbox, sink);
+                            if !b_from.is_empty() {
+                                emit(
+                                    outbox,
+                                    sink,
+                                    aokie_core::events::aokie_event(
+                                        crate::contract::events::CALL_CALLER_ID,
+                                        &b_id,
+                                        json!({"callId": b_id, "from": b_from, "at": aokie_core::events::now_iso8601()}),
+                                    ),
+                                );
+                            }
+                            tracker.answered();
+                            stt_current_gen.store(tracker.generation(), Ordering::Relaxed);
+                            // 3) Ask the newcomer to hold (queue position 2: the
+                            // primary + this caller; max one parked in v1).
+                            let hold_line = second_caller_hold_line(2);
+                            let _ = speak_announcement(
+                                bt, &synth, &hold_line, sr, &ctx.pace,
+                                protected_max_ms, &control_rx, &mut pending_controls,
+                            );
+                            emit_turn(outbox, sink, &b_id, ctx.turn_index, "bot", &hold_line);
+                            ctx.turn_index += 1;
+                            // 4) Swap back: newcomer held, primary active again.
+                            bt.flush_tx_audio();
+                            let _ = bt.hold_swap();
+                            let sess_b = tracker.park().expect("newcomer was active");
+                            let ctx_b = std::mem::replace(&mut ctx, ctx_a);
+                            match tracker.restore(sess_a) {
+                                Ok(_gen) => {}
+                                Err(back) => {
+                                    // Cannot normally happen (idle after park).
+                                    eprintln!("[aokie-plugin] AUTO-HOLD: primary restore refused — recovering");
+                                    let _ = tracker.restore(back);
+                                }
+                            }
+                            // The primary CONTINUES — this is NOT a call
+                            // boundary, so align voice_call_gen to the primary's
+                            // fresh generation and re-fence STT so the reset
+                            // block does not fire and wipe the primary's context.
+                            voice_call_gen = tracker.generation();
+                            stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
+                            ctx.rt_lane = tracker.call_id().map(|id| {
+                                crate::realtime::RealtimeLane::new(
+                                    id.to_string(),
+                                    voice_call_gen,
+                                    Instant::now(),
+                                )
+                            });
+                            synth.reset_call();
+                            stt_buf.clear();
+                            stt_had_speech = false;
+                            stt_silence = Duration::ZERO;
+                            while probe_result_rx.try_recv().is_ok() {}
+                            // Record the newcomer as the parked caller.
+                            parked = Some((sess_b, ctx_b));
+                            *status.parked_call.lock().unwrap() = Some(SwitchboardLeg {
+                                call_id: b_id.clone(),
+                                from: b_from,
+                                since_iso: aokie_core::events::now_iso8601(),
+                            });
+                            *status.waiting_call.lock().unwrap() = None;
+                            *status.current_call_id.lock().unwrap() =
+                                tracker.call_id().map(|s| s.to_string());
+                            *status.current_caller.lock().unwrap() =
+                                tracker.current().and_then(|s| s.caller_id.clone());
+                            *status.call_started_at.lock().unwrap() =
+                                tracker.current().map(|s| s.started_at_iso.clone());
+                            status.call_active.store(true, Ordering::Relaxed);
+                            status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                            *status.switch_in_flight.lock().unwrap() =
+                                Some(("auto_hold".to_string(), Instant::now()));
+                            prev_call_held =
+                                status.call_held_state.load(Ordering::Relaxed);
+                            // 5) Resume with the primary.
+                            let _ = speak_announcement(
+                                bt, &synth, HOLD_PRIMARY_RESUME_LINE, sr, &ctx.pace,
+                                protected_max_ms, &control_rx, &mut pending_controls,
+                            );
+                            eprintln!(
+                                "[aokie-plugin] AUTO-HOLD: {} parked, resumed with the primary caller",
+                                b_id
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -5456,7 +5711,15 @@ fn run_loop(
                 let manager_greet = tracker.current().is_some_and(|s| {
                     !s.outbound && screen_policy.is_manager(s.caller_id.as_deref())
                 });
-                let chosen_greeting: Option<&str> = if manager_greet {
+                // Phase 4: a caller promoted from hold hears "thanks for
+                // holding, how can I help" instead of the cold-open greeting.
+                let promoted = promote_greet_for.as_deref() == Some(corr.as_str());
+                if promoted {
+                    promote_greet_for = None;
+                }
+                let chosen_greeting: Option<&str> = if promoted {
+                    Some(HOLD_PROMOTED_GREET_LINE)
+                } else if manager_greet {
                     Some(MANAGER_GREETING)
                 } else {
                     overlay_greeting.or(greeting.as_deref())
@@ -10230,6 +10493,19 @@ mod tests {
         assert!(second.is_some());
         assert_ne!(second, call_id);
         assert_eq!(tracker.generation(), 2);
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn second_caller_hold_line_names_the_queue_position() {
+        // Position 2 = the very next caller.
+        assert!(super::second_caller_hold_line(2).ends_with("You're next in the queue."));
+        // Deeper positions name the number.
+        assert!(super::second_caller_hold_line(3).ends_with("You're number 3 in the queue."));
+        // Every line starts with the ask and is ASCII (TTS-safe).
+        let line = super::second_caller_hold_line(2);
+        assert!(line.starts_with("Thank you for calling!"));
+        assert!(line.is_ascii(), "hold line must be ASCII for the synthesizer");
     }
 
     /// Phase 4 observe lane: a waiting knock emits ONE aokie.call.waiting
