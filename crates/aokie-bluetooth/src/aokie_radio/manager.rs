@@ -1271,6 +1271,21 @@ pub(crate) fn hfp_call_control_packets_for_event(
             }
             Ok(packets)
         }
+        hfp::HfpEvent::CallWaiting(_) => {
+            // Phase 4 observe-only topology: every waiting knock triggers a
+            // fresh AT+CLCC so the AUTHORITATIVE call list (the active leg +
+            // the status-5 waiting leg, with indexes) lands in the logs —
+            // the soak data the switchboard slice's index handling needs.
+            // Read-only command, same mid-call safety as the caller-id
+            // rescue on CallAnswered above.
+            let packets =
+                l2cap_state.build_hfp_call_control_packets(hfp::HfpAtCommand::ListCurrentCalls)?;
+            if !packets.is_empty() {
+                report.last_action =
+                    Some("sent AT+CLCC topology query for a waiting call".to_string());
+            }
+            Ok(packets)
+        }
         hfp::HfpEvent::IncomingCall | hfp::HfpEvent::Ringing
             if report.auto_answer_enabled && !*answer_sent_for_call =>
         {
@@ -1743,6 +1758,31 @@ mod tests {
             report.last_action.as_deref(),
             Some("could not auto-answer: no open HFP channel")
         );
+    }
+
+    /// Phase 4: a waiting knock triggers the AT+CLCC topology query (like
+    /// the CallAnswered caller-id rescue) — and NEVER an answer attempt,
+    /// even with auto-answer armed: plain ATA cannot answer a waiting call.
+    #[test]
+    fn call_waiting_triggers_clcc_topology_query_never_an_answer() {
+        let mut state = l2cap::L2capState::new();
+        let mut report = HfpControlReport {
+            auto_answer_enabled: true,
+            ..Default::default()
+        };
+        let mut answer_sent = true; // the ACTIVE call was answered earlier
+        let packets = hfp_call_control_packets_for_event(
+            &mut state,
+            &hfp::HfpEvent::CallWaiting(Some("0491570157".to_string())),
+            &mut answer_sent,
+            &mut report,
+        )
+        .unwrap();
+        // No open channel in this rig, so no packets — but the arm ran (no
+        // answer attempt was made and the flag is untouched).
+        assert!(packets.is_empty());
+        assert!(answer_sent, "a knock must never reset the answered flag");
+        assert_eq!(report.answer_attempts, 0, "never ATA a waiting call");
     }
 
     #[test]
