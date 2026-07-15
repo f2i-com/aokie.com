@@ -1432,6 +1432,89 @@ impl Plugin {
                 self.require_radio_or_dev("call.current")?;
                 Ok(json!({"call": self.mock.current_call.as_ref().map(call_json)}))
             }
+            "call.switchboard" => {
+                // Phase 4: the authoritative multi-call snapshot — foreground
+                // (same shape call.current returns), the waiting knock, the
+                // parked caller, the optimistic-concurrency revision and the
+                // transition flag. `call.current` stays foreground-only for
+                // backward compatibility.
+                expect_fields(payload, &[])?;
+                if let Some(radio) = self.radio.as_ref() {
+                    return Ok(radio.switchboard_view());
+                }
+                self.require_radio_or_dev("call.switchboard")?;
+                // Dev/mock: one simulated call, never a waiting/parked leg.
+                Ok(json!({
+                    "foreground": self.mock.current_call.as_ref().map(call_json),
+                    "waiting": null,
+                    "parked": null,
+                    "revision": 0,
+                    "switchInProgress": false,
+                    "callHeldState": 0,
+                }))
+            }
+            "call.activate" => {
+                // Phase 4: make `callId` (the waiting knock or the parked
+                // caller) the FOREGROUND call. The plugin picks the safe
+                // wire action (plain AT+CHLD=2 — the only mode the live
+                // phone advertises); the result reports ACCEPTANCE only,
+                // and the radio re-validates against its own state before
+                // touching the wire (an async failure emits hardware.error
+                // `control_failed` with this operationId).
+                let obj = expect_fields(payload, &["callId", "expectedRevision"])?;
+                let call_id = require_str(&obj, "callId")?;
+                let expected_revision = obj.get("expectedRevision").and_then(|v| v.as_u64());
+                let Some(radio) = self.radio.as_ref() else {
+                    self.require_radio_or_dev("call.activate")?;
+                    return Err(CmdError::failed(
+                        "call.activate needs the radio — the dev mock has no switchboard",
+                    ));
+                };
+                let revision = radio.switchboard_revision();
+                if let Some(expected) = expected_revision {
+                    if expected != revision {
+                        return Err(CmdError::failed(format!(
+                            "stale switchboard view (expectedRevision {expected}, current {revision}) — re-read call.switchboard"
+                        )));
+                    }
+                }
+                if radio.switch_in_flight() {
+                    return Err(CmdError::failed(
+                        "a switch is already in progress — re-read call.switchboard once it settles",
+                    ));
+                }
+                let is_waiting = radio
+                    .waiting_call()
+                    .is_some_and(|w| w.call_id == call_id);
+                let is_parked = radio
+                    .parked_call_leg()
+                    .is_some_and(|p| p.call_id == call_id);
+                if !is_waiting && !is_parked {
+                    return Err(CmdError::stale_call(format!(
+                        "call.activate targeted {call_id}, which is not the waiting or parked caller"
+                    )));
+                }
+                if is_parked && radio.waiting_call().is_some() {
+                    return Err(CmdError::failed(
+                        "a waiting caller is knocking — CHLD=2 would accept THEM; handle the knock first",
+                    ));
+                }
+                let op = operation_id();
+                radio
+                    .send(crate::radio::RadioControl::Activate {
+                        call_id: call_id.clone(),
+                        op: Some(op.clone()),
+                    })
+                    .map_err(CmdError::failed)?;
+                Ok(json!({
+                    "accepted": true,
+                    "queued": true,
+                    "operationId": op,
+                    "via": "radio",
+                    "callId": call_id,
+                    "revision": revision,
+                }))
+            }
             "call.answer" => {
                 let obj = expect_fields(payload, &["callId"])?;
                 let call_id = optional_str(&obj, "callId")?;

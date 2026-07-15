@@ -285,6 +285,44 @@ impl SessionTracker {
         }
     }
 
+    /// Phase 4 (switchboard): take the live session out WITHOUT terminal
+    /// bookkeeping — the call is being PARKED (held on the phone), not
+    /// ended. The tracker reads idle afterwards (`generation() == 0`), so
+    /// per-call machinery treats the line as between-calls until the next
+    /// ring or [`restore`].
+    pub fn park(&mut self) -> Option<CallSession> {
+        self.session.take()
+    }
+
+    /// Phase 4 (switchboard): reinstall a previously-parked session with a
+    /// FRESH generation — the focus fence. Async voice work stamped before
+    /// the park reads stale by construction, so a result from before the
+    /// hold can never speak into the resumed conversation. Refuses (hands
+    /// the session back) when another session is already live.
+    pub fn restore(&mut self, mut session: CallSession) -> Result<u64, CallSession> {
+        if self.session.is_some() {
+            return Err(session);
+        }
+        self.last_generation += 1;
+        session.generation = self.last_generation;
+        self.session = Some(session);
+        Ok(self.last_generation)
+    }
+
+    /// Phase 4 (switchboard): compute the terminal summary for a session
+    /// that is NOT in the tracker (a parked caller who hung up while on
+    /// hold, or was stranded by device loss). Same outcome rules as
+    /// [`terminate`]; `intent` records why when the session has none.
+    pub fn terminate_detached(
+        mut session: CallSession,
+        intent: Option<TerminationIntent>,
+    ) -> EndedCall {
+        if session.intent.is_none() {
+            session.intent = intent;
+        }
+        Self::ended_from(session)
+    }
+
     /// The call terminated. Consumes the session and computes the outcome:
     /// answered → completed (regardless of duration); never answered →
     /// rejected when the operator rejected it, else missed. OUTBOUND
@@ -293,6 +331,10 @@ impl SessionTracker {
     /// attempt never even alerted (bad number / no service).
     pub fn terminate(&mut self) -> Option<EndedCall> {
         let s = self.session.take()?;
+        Some(Self::ended_from(s))
+    }
+
+    fn ended_from(s: CallSession) -> EndedCall {
         let duration_ms = s.answered.map(|t| t.elapsed().as_millis()).unwrap_or(0);
         if s.outbound && s.answered.is_none() {
             let cancelled = matches!(
@@ -308,7 +350,7 @@ impl SessionTracker {
                 (false, _) if cancelled => ("failed", "cancelled"),
                 (false, _) => ("failed", "setup_failed"),
             };
-            return Some(EndedCall {
+            return EndedCall {
                 id: s.id,
                 generation: s.generation,
                 caller_id: s.caller_id,
@@ -317,7 +359,7 @@ impl SessionTracker {
                 outcome,
                 reason,
                 outbound: true,
-            });
+            };
         }
         let (outcome, reason) = match (s.answered.is_some(), s.intent) {
             // Device loss is its own truth (audit AOK-LIF-003): the call did
@@ -343,7 +385,7 @@ impl SessionTracker {
             }
             (false, None) => ("missed", "remote_or_operator"),
         };
-        Some(EndedCall {
+        EndedCall {
             id: s.id,
             generation: s.generation,
             caller_id: s.caller_id,
@@ -352,7 +394,7 @@ impl SessionTracker {
             outcome,
             reason,
             outbound: s.outbound,
-        })
+        }
     }
 }
 
@@ -383,6 +425,47 @@ mod tests {
         let first = t.current().unwrap().answered;
         t.answered();
         assert_eq!(t.current().unwrap().answered, first);
+    }
+
+    /// Phase 4 (switchboard): parking takes the session with NO terminal
+    /// bookkeeping; restore re-fences with a fresh generation so pre-hold
+    /// async work reads stale; a parked caller who hangs up still gets an
+    /// honest terminal summary.
+    #[test]
+    fn park_and_restore_fence_generations_without_terminal_events() {
+        let mut t = SessionTracker::new();
+        ring(&mut t, "call_a");
+        t.caller_id("0491570156".into());
+        t.answered();
+        assert_eq!(t.generation(), 1);
+        let parked = t.park().expect("session parked");
+        assert_eq!(parked.id, "call_a");
+        assert!(parked.is_active());
+        assert_eq!(t.generation(), 0, "tracker idle while parked");
+        assert!(t.current().is_none());
+        // A second caller takes the foreground (fresh generation).
+        ring(&mut t, "call_b");
+        t.answered();
+        assert_eq!(t.generation(), 2);
+        // Swap: park B, restore A — A gets a FRESH generation (focus fence).
+        let parked_b = t.park().expect("B parked");
+        let generation = t.restore(parked).expect("A restored");
+        assert_eq!(generation, 3);
+        assert_eq!(t.call_id(), Some("call_a"));
+        assert!(t.current().unwrap().is_active(), "restored A still active");
+        // Restore refuses while another session is live.
+        let back = t
+            .restore(parked_b)
+            .expect_err("cannot restore over a live call");
+        assert_eq!(back.id, "call_b");
+        // A parked caller who hung up gets an honest terminal summary.
+        let ended = SessionTracker::terminate_detached(back, None);
+        assert_eq!(ended.outcome, "completed");
+        assert_eq!(ended.id, "call_b");
+        // The restored call ends normally through the tracker.
+        let ended = t.terminate().unwrap();
+        assert_eq!(ended.id, "call_a");
+        assert_eq!(ended.outcome, "completed");
     }
 
     #[test]

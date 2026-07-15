@@ -241,6 +241,14 @@ impl BluetoothManager {
         self.runtime.dial(number)
     }
 
+    /// Phase 4 (switchboard): `AT+CHLD=2` — hold the active call and accept
+    /// the waiting/held one. TOGGLE semantics; the caller reconciles the
+    /// outcome via the CallHeld/CallWaitingEnded events + a CLCC snapshot,
+    /// and must never blind-retry after a lost OK.
+    pub fn hold_swap(&self) -> Result<(), String> {
+        self.runtime.hold_swap()
+    }
+
     /// AOK-BT-001: open a bounded, discoverable pairing window for `seconds`.
     /// At rest the radio is connectable-only, so an unknown phone can only
     /// pair while this window is open.
