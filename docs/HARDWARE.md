@@ -7,9 +7,12 @@ supports. The authoritative list is `crates/aokie-core/src/dongle_catalog.rs`
 
 ## Dongle compatibility tiers
 
-Anything not in the catalog is treated as **Unsupported** (the driver won't be
-bound). Tiers reflect how much of the HFP/SCO/MAP path has been exercised on
-real silicon, not a promise.
+Anything not in the catalog is treated as **Unverified**. Standard production
+builds do not bind it. A managed-beta build can admit an unlisted external USB
+Bluetooth HCI controller with the deliberate
+`AOKIE_INSTALL_UNKNOWN_DONGLE=YES_I_REBIND_AT_MY_OWN_RISK` operator opt-in.
+That is a probe path, not a compatibility promise. Tiers reflect how much of
+the HFP/SCO/MAP path has been exercised on real silicon.
 
 | Chipset | VID:PID | Tier | Notes |
 |---|---|---|---|
@@ -36,9 +39,24 @@ Windows 10/11 x64. The plugin raises the process timer resolution to 1 ms for
 the radio's lifetime — the SCO isochronous path services USB frames every
 millisecond and the default ~15.6 ms tick starves it.
 
+WinUSB replaces the selected dongle's normal Windows Bluetooth binding while
+Aokie owns it. Aokie therefore targets explicit external USB dongles only and
+refuses composite/internal adapters. Discovery and HCI/ACL may work on many
+standards-compliant controllers, while bidirectional SCO audio is the most
+likely vendor-specific failure point.
+
+## Linux
+
+Linux uses libusb rather than WinUSB. The selected VID/PID needs an appropriate
+udev permission rule, and Aokie may need to detach the kernel `btusb` driver for
+the session. The shared radio stack is portable, but Linux packaging and the
+real-hardware call/SMS/audio matrix are not yet release-qualified.
+
 ## Adding a dongle
 
-Add a `DongleId` to `DEFAULT_CATALOG` with a conservative tier, rebuild, and
+First exercise an external controller through managed-beta unknown-device mode.
+If endpoint probing, pairing, HFP, bidirectional SCO, MAP and restoration pass,
+add a `DongleId` to `DEFAULT_CATALOG` with a conservative Beta tier, rebuild, and
 run the full lifecycle against it (ring → answer → hear → speak → SMS). Until
 the SCO path is confirmed to carry audio both ways on that chipset, keep it at
 Beta.

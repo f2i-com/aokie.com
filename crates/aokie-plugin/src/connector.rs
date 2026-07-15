@@ -2706,10 +2706,11 @@ impl Plugin {
         ))
     }
 
-    /// Enumerate actually-connected USB dongles: every plugged-in device that either matches the
-    /// compatibility catalog OR already has the WinUSB (aokie) driver bound, annotated so the UI can
-    /// tell the user which dongle to pick and whether its driver still needs installing. Windows-only
-    /// live enumeration; other targets return an empty list + a note.
+    /// Enumerate actually-connected USB dongles. Standard builds expose catalogued devices and
+    /// already-bound WinUSB radios. The managed-beta flavour additionally exposes plausible
+    /// external Bluetooth-class/BTHUSB devices as unverified candidates; the elevated install
+    /// policy still requires the explicit unknown-device opt-in and refuses composite/internal or
+    /// disallowed-class hardware. Windows-only live enumeration; other targets return an empty list.
     #[cfg(target_os = "windows")]
     fn list_connected_dongles(&self) -> (Vec<Value>, Option<String>) {
         match aokie_dongle::list_devices(true) {
@@ -2722,10 +2723,19 @@ impl Plugin {
                 let out = devices
                     .into_iter()
                     .filter(|d| {
+                        let driver = d.driver.to_ascii_lowercase();
+                        let managed_beta_candidate = cfg!(feature = "managed-beta-driver")
+                            && !d.is_composite
+                            && !aokie_core::dongle_catalog::class_is_denied(&d.class)
+                            && (d.class.eq_ignore_ascii_case("Bluetooth")
+                                || driver.contains("bthusb")
+                                || d.description.to_ascii_lowercase().contains("bluetooth"));
                         known.contains(&(d.vid, d.pid))
-                            || d.driver.to_lowercase().contains("winusb")
+                            || driver.contains("winusb")
+                            || managed_beta_candidate
                     })
                     .map(|d| {
+                        let matches_catalog = known.contains(&(d.vid, d.pid));
                         json!({
                             "vid": d.vid,
                             "pid": d.pid,
@@ -2734,7 +2744,8 @@ impl Plugin {
                             "description": d.description,
                             "driver": d.driver,
                             "hardwareId": d.hardware_id,
-                            "matchesCatalog": known.contains(&(d.vid, d.pid)),
+                            "matchesCatalog": matches_catalog,
+                            "compatibility": if matches_catalog { "catalogued" } else { "unverified" },
                             "driverBound": d.driver.to_lowercase().contains("winusb"),
                         })
                     })

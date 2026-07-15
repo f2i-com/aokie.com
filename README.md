@@ -196,7 +196,7 @@ DPAPI is the normal Windows protection path. If that protection fails, Aokie sur
 <details>
 <summary><strong>Current hardware-beta boundaries</strong></summary>
 
-- Aokie is pre-1.0, Windows-only and supports only catalogued external USB Bluetooth hardware.
+- Aokie is pre-1.0: Windows is the shipping target; Linux/libusb is experimental, and uncatalogued external USB Bluetooth hardware is managed-beta only.
 - Phone behaviour varies by OS and firmware; there is not yet a certified handset matrix.
 - Auto-answer and optional barge-in default off.
 - The plugin can receive/send SMS events, but it should not yet be marketed as a complete mirrored phone inbox.
@@ -211,7 +211,10 @@ DPAPI is the normal Windows protection path. If that protection fails, Aokie sur
 
 ## Build from source
 
-Aokie's radio runtime targets Windows 10/11 x64 and uses WinUSB directly.
+Aokie's radio runtime uses WinUSB on Windows and libusb on Linux. The managed
+beta can probe an uncatalogued, external USB Bluetooth HCI controller after an
+explicit operator opt-in; "any dongle" is a compatibility goal rather than a
+guarantee because controller firmware, endpoint layouts and SCO support vary.
 
 ### Test gates
 
@@ -236,6 +239,32 @@ cargo build -p aokie-plugin --features voice --release
 ```
 
 The placeholder is used only while compiling the helper itself; the helper never dispatches an elevation request. A production helper also requires `AOKIE_EXPECTED_DRIVER_INF_SHA256` and `AOKIE_EXPECTED_DRIVER_CAT_SHA256` for the exact Microsoft-signed driver pair. Sign the helper before calculating its final hash, then build the plugin with that post-sign hash. The release voice bundle also needs ONNX Runtime, the Parakeet assets and the pocket-tts assets in the expected model directories.
+
+### Managed-beta driver build
+
+For administrator-managed pilots without a Microsoft-signed catalog, build the
+distinct managed-beta flavour. It keeps the helper hash pin and privileged
+target checks, but permits the helper's trusted per-device INF renderer and a
+locally generated catalog certificate:
+
+```powershell
+$env:AOKIE_EXPECTED_HELPER_SHA256 = 'helper-build-placeholder'
+cargo build -p aokie-dongle --bin aokie-driver-helper --features managed-beta-driver --release
+$env:AOKIE_EXPECTED_HELPER_SHA256 = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
+cargo build -p aokie-plugin --features voice,managed-beta-driver --release
+```
+
+The installed app must also receive `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`; the
+compile-time feature alone never authorises trust-store changes. To try an
+uncatalogued external dongle, additionally set:
+
+```powershell
+$env:AOKIE_INSTALL_UNKNOWN_DONGLE = 'YES_I_REBIND_AT_MY_OWN_RISK'
+```
+
+Unknown-device mode still refuses absent devices, hubs, composite/internal
+radios and non-Bluetooth device classes. Use **Restore driver** before returning
+the dongle to the operating system's normal Bluetooth stack.
 
 ## Workspace map
 
