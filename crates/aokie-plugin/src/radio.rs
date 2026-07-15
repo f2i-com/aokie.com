@@ -972,6 +972,15 @@ pub struct RadioStatus {
     /// at a time; doubles as the suppression window for callheld-edge
     /// attribution (our own swap produces expected transitions).
     pub switch_in_flight: Mutex<Option<(String, std::time::Instant)>>,
+    /// A waiting episode that just ended, pending give-up classification
+    /// (leg, when it ended, tracker generation at that moment). If no
+    /// session claims the knock within a short window — accepted under its
+    /// minted id, or promoted under a fresh id with the same number — the
+    /// run_loop emits an honest MISSED `call.ended` for the waitingCallId
+    /// so the missed-call flows ring the caller back. Before this, a caller
+    /// who rang out while both slots were busy left NO record at all (live
+    /// gap, user report 2026-07-15).
+    pub gave_up_knock: Mutex<Option<(SwitchboardLeg, std::time::Instant, u64)>>,
 }
 
 /// One non-foreground switchboard leg (waiting or parked) — see
@@ -5961,6 +5970,68 @@ fn run_loop(
             }
         }
         prev_call_held = status.call_held_state.load(Ordering::Relaxed);
+
+        // Phase 4: a knocker who gave up UNSERVED becomes an honest MISSED
+        // call (deferred ~2.5s so an accept or promotion can claim the knock
+        // first) — the missed-call flow then rings them back. Before this, a
+        // caller who rang out while both slots were busy left NO record and
+        // never got a callback (live gap, user report 2026-07-15).
+        {
+            let stash = status.gave_up_knock.lock().unwrap().clone();
+            if let Some((leg, ended_at, gen_at_end)) = stash {
+                let claimed_by_id = tracker.current().is_some_and(|s| s.id == leg.call_id)
+                    || parked.as_ref().is_some_and(|(s, _)| s.id == leg.call_id);
+                let knock_suffix = crate::screen::digit_suffix(&leg.from);
+                let suffix_of = |num: Option<&str>| -> Option<String> {
+                    num.map(crate::screen::digit_suffix).filter(|s| s.len() >= 6)
+                };
+                let claimed_by_number = knock_suffix.len() >= 6
+                    && (suffix_of(tracker.current().and_then(|s| s.caller_id.as_deref()))
+                        .as_deref()
+                        == Some(knock_suffix.as_str())
+                        || suffix_of(parked.as_ref().and_then(|(s, _)| s.caller_id.as_deref()))
+                            .as_deref()
+                            == Some(knock_suffix.as_str()));
+                // Withheld number: any fresh session since the episode ended
+                // is almost certainly the promotion answering them — never
+                // record a miss we cannot verify.
+                let anonymous_claim =
+                    leg.from.is_empty() && tracker.generation() != gen_at_end;
+                if claimed_by_id || claimed_by_number || anonymous_claim {
+                    *status.gave_up_knock.lock().unwrap() = None;
+                } else if ended_at.elapsed() >= std::time::Duration::from_millis(2500) {
+                    *status.gave_up_knock.lock().unwrap() = None;
+                    eprintln!(
+                        "[aokie-plugin] waiting caller {} gave up unserved — recording an honest missed call",
+                        leg.call_id
+                    );
+                    let manager = crate::screen::ScreenPolicy::from_env().is_manager(
+                        if leg.from.is_empty() { None } else { Some(leg.from.as_str()) },
+                    );
+                    emit(
+                        outbox,
+                        sink,
+                        aokie_core::events::aokie_event(
+                            crate::contract::events::CALL_ENDED,
+                            &leg.call_id,
+                            json!({
+                                "at": aokie_core::events::now_iso8601(),
+                                "reason": "gave_up_waiting",
+                                "callId": leg.call_id,
+                                "from": leg.from,
+                                "callerPhone": leg.from,
+                                "durationSeconds": 0,
+                                "durationMs": 0,
+                                "outcome": "missed",
+                                "direction": "inbound",
+                                "manager": manager,
+                                "configVersion": status.config_version.load(Ordering::Relaxed),
+                            }),
+                        ),
+                    );
+                }
+            }
+        }
         {
             // Settle the in-flight switch marker once its window passed.
             let mut in_flight = status.switch_in_flight.lock().unwrap();
@@ -10667,7 +10738,14 @@ fn handle_event(
                 "[aokie-plugin] waiting caller gone — active call untouched"
             );
             *status.call_waiting_announced.lock().unwrap() = None;
-            if status.waiting_call.lock().unwrap().take().is_some() {
+            if let Some(leg) = status.waiting_call.lock().unwrap().take() {
+                // Deferred give-up classification: an accept (juggle,
+                // cascade, call.activate — all mint the session under this
+                // very id) or a promotion (fresh id, same number) claims the
+                // knock within moments; anything unclaimed becomes an honest
+                // MISSED call so follow-ups ring the caller back.
+                *status.gave_up_knock.lock().unwrap() =
+                    Some((leg, std::time::Instant::now(), tracker.generation()));
                 status
                     .switchboard_revision
                     .fetch_add(1, Ordering::Relaxed);
@@ -11833,6 +11911,17 @@ mod tests {
         // Episode ends; a SECOND knock later in the same call re-announces —
         // number known from the start this time, so it rides the event.
         handle_event(E::CallWaitingEnded, &mut tracker, None, &mut sink, &status);
+        // The ended episode is STASHED for give-up classification: if no
+        // session claims the knock (accept mints under its id; promotion
+        // under a fresh id with the same number), the run_loop records an
+        // honest MISSED call so follow-ups ring the caller back.
+        {
+            let stash = status.gave_up_knock.lock().unwrap().clone();
+            let (leg, _at, gen_at_end) = stash.expect("ended episode stashed for give-up check");
+            assert!(leg.call_id.starts_with("call_"));
+            assert_eq!(gen_at_end, tracker.generation());
+            *status.gave_up_knock.lock().unwrap() = None;
+        }
         sink.lines.clear();
         handle_event(
             E::CallWaiting { number: Some("0491570157".to_string()) },

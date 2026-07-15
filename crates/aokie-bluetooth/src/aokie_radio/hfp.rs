@@ -434,10 +434,19 @@ impl HfpHandsFreeState {
                 Vec::new()
             }
             HfpAgResult::Ring => {
-                self.incoming_call = true;
                 // A live RING while a terminate verdict was held means the
                 // ring never actually ended — drop the held verdict.
                 self.terminate_pending = false;
+                if self.call_waiting && self.call_held != 0 {
+                    // The knocker's ring re-presenting while another call is
+                    // HELD — the same queue-jump hazard as the suppressed
+                    // promotion in update_call_state: the episode is already
+                    // tracked and the FIFO cascade owns accepting it. Never
+                    // mint an IncomingCall that auto-answer would grab ahead
+                    // of the held caller.
+                    return Vec::new();
+                }
+                self.incoming_call = true;
                 vec![HfpEvent::IncomingCall, HfpEvent::Ringing]
             }
             HfpAgResult::Indicators(indicators) => {
@@ -818,11 +827,23 @@ impl HfpHandsFreeState {
         if active {
             vec![HfpEvent::CallAnswered]
         } else if self.call_waiting {
+            if self.call_held != 0 {
+                // A call is still HELD: the switchboard owns this topology.
+                // Promoting here would auto-answer the knocker AHEAD of the
+                // held caller (live 2026-07-15: the third caller queue-jumped
+                // past the parked one and heard the cold-open greeting while
+                // they kept waiting). Keep the waiting episode alive — the
+                // plugin's FIFO cascade accepts the knocker with their queue
+                // position (AT+CHLD=2 prefers the waiting leg), then swaps
+                // back to the held caller.
+                return vec![HfpEvent::CallTerminated];
+            }
             // The active call ended while a second caller was still
-            // knocking: the phone keeps ringing them, but callsetup is
-            // ALREADY 1 so no fresh edge will announce it. Promote the
-            // waiting episode to a normal incoming ring — auto-answer and
-            // the whole per-call reset treat it like any fresh call.
+            // knocking and NOTHING is held: the phone keeps ringing them,
+            // but callsetup is ALREADY 1 so no fresh edge will announce it.
+            // Promote the waiting episode to a normal incoming ring —
+            // auto-answer and the whole per-call reset treat it like any
+            // fresh call.
             self.call_waiting = false;
             self.waiting_number_known = false;
             self.incoming_call = true;
@@ -1893,6 +1914,41 @@ mod tests {
         assert_eq!(
             state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 }),
             vec![HfpEvent::CallAnswered]
+        );
+    }
+
+    /// Phase 4 hold queue (live 2026-07-15): with a caller HELD, the
+    /// promotion must NOT fire — auto-answering the knocker would queue-jump
+    /// them past the held caller. The episode stays alive for the plugin's
+    /// FIFO cascade (CHLD=2 prefers the waiting leg), and a re-presenting
+    /// RING is swallowed for the same reason.
+    #[test]
+    fn held_call_blocks_the_waiting_ring_promotion() {
+        let mut state = negotiated_state();
+        state.apply_result(&HfpAgResult::Indicators(vec![
+            "call".to_string(),
+            "callsetup".to_string(),
+            "callheld".to_string(),
+        ]));
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 1, value: 1 }); // A active
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 }); // B held + active
+        state.apply_result(&HfpAgResult::CallWaitingNotification("0491570157".to_string()));
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 2 }); // held only
+        // A ends (this Pixel reports call=0 even with B still held): the
+        // honest termination, NO promotion.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 1, value: 0 }),
+            vec![HfpEvent::CallTerminated]
+        );
+        assert!(!state.incoming_call());
+        // The knocker's re-presenting RING is swallowed too — an ATA here
+        // would answer them ahead of the held caller.
+        assert_eq!(state.apply_result(&HfpAgResult::Ring), Vec::<HfpEvent>::new());
+        // Once nothing is held any more, a ring mints normally again.
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::Ring),
+            vec![HfpEvent::IncomingCall, HfpEvent::Ringing]
         );
     }
 
