@@ -84,6 +84,14 @@ pub enum RuntimeEvent {
     },
     AudioDisconnected,
     CallerId(String),
+    /// Phase 4: a SECOND caller is knocking while a call is active (+CCWA /
+    /// callsetup-while-active on a call-waiting-negotiated SLC). One per
+    /// waiting episode, plus one upgrade when a number arrives late.
+    CallWaiting { number: Option<String> },
+    /// The waiting episode ended with the active call untouched.
+    CallWaitingEnded,
+    /// `callheld` indicator transition (0 none / 1 held+active / 2 held only).
+    CallHeld { state: i32 },
     /// Phase 3e: phonebook fetch finished. The runtime IO loop
     /// produces this once per ACL connection after PBAP completes.
     /// One entry per (phone, display name) pair — vCards with
@@ -1338,7 +1346,22 @@ fn run_runtime(
             probed
         }
     };
-    install_mns_server_channel(&mut l2cap_state, mns_server.clone(), wbs_supported);
+    // Phase 4: whether this process advertises HFP call waiting / 3-way
+    // (BRSF bit 1) and probes AT+CHLD=? / AT+CCWA=1 at SLC time. Derived
+    // from the plugin's holdAndCallWaiting setting exactly like the other
+    // radio-start env vars; default off keeps the legacy wire behaviour.
+    let call_waiting_enabled = std::env::var_os("AOKIE_CALL_WAITING").is_some();
+    if call_waiting_enabled {
+        eprintln!(
+            "[AokieRadio] AOKIE_CALL_WAITING set — advertising call waiting / 3-way in BRSF and probing AT+CHLD=? / AT+CCWA=1"
+        );
+    }
+    install_mns_server_channel(
+        &mut l2cap_state,
+        mns_server.clone(),
+        wbs_supported,
+        call_waiting_enabled,
+    );
     let mut sco_assembler = sco::ScoPacketAssembler::new();
     let mut sco_tx_queue = sco::LinearPcmTxQueue::new(AOKIE_SCO_TX_QUEUE_SAMPLES);
     // Track inbound SCO liveness so we can spot the case where the
@@ -3070,8 +3093,11 @@ fn run_runtime(
                                 "[AokieRadio] phone.connect: link to {} encrypted — driving HFP setup",
                                 auth.address
                             );
-                            let mut runtime =
-                                HfpConnectRuntime::new(*connection_handle, wbs_supported);
+                            let mut runtime = HfpConnectRuntime::new(
+                                *connection_handle,
+                                wbs_supported,
+                                call_waiting_enabled,
+                            );
                             match runtime.start(&mut l2cap_state) {
                                 Ok(packets) => {
                                     let mut started = true;
@@ -4229,6 +4255,7 @@ fn install_mns_server_channel(
     l2cap_state: &mut l2cap::L2capState,
     mns_server: Arc<StdMutex<MnsServer>>,
     wbs_supported: bool,
+    call_waiting_enabled: bool,
 ) {
     l2cap_state.register_psm(
         l2cap::PSM_RFCOMM,
@@ -4237,6 +4264,7 @@ fn install_mns_server_channel(
             let rfcomm_state = channel.rfcomm_state.get_or_insert_with(|| {
                 let mut state = RfcommState::new();
                 state.set_wbs_supported(wbs_supported);
+                state.set_call_waiting_enabled(call_waiting_enabled);
                 register_mns_server_channel_handlers(&mut state, mns_arc.clone());
                 state
             });
@@ -4992,6 +5020,42 @@ fn forward_hfp_event(
                 aokie_core::redact::Phone(&number)
             );
             let _ = event_tx.send(RuntimeEvent::CallerId(number));
+        }
+        HfpEvent::CallWaiting(number) => {
+            eprintln!(
+                "[AokieRadio] HFP CallWaiting — second caller knocking ({})",
+                number
+                    .as_deref()
+                    .map(|n| aokie_core::redact::Phone(n).to_string())
+                    .unwrap_or_else(|| "number not yet known".to_string()),
+            );
+            let _ = event_tx.send(RuntimeEvent::CallWaiting { number });
+        }
+        HfpEvent::CallWaitingEnded => {
+            eprintln!("[AokieRadio] HFP CallWaitingEnded — waiting caller gone, active call untouched");
+            let _ = event_tx.send(RuntimeEvent::CallWaitingEnded);
+        }
+        HfpEvent::CallHeld(state) => {
+            eprintln!("[AokieRadio] HFP CallHeld indicator -> {state} (0 none / 1 held+active / 2 held only)");
+            let _ = event_tx.send(RuntimeEvent::CallHeld { state });
+        }
+        HfpEvent::CallListEntry(entry) => {
+            // Observe-only topology (Phase 4 step 2): every CLCC line is
+            // logged so real waiting-call timelines can be verified on live
+            // phones before any CHLD command ever goes out.
+            eprintln!(
+                "[AokieRadio] HFP CLCC entry: idx={} dir={} status={} mode={} mpty={} number={}",
+                entry.index,
+                entry.direction,
+                entry.status,
+                entry.mode,
+                entry.multiparty,
+                entry
+                    .number
+                    .as_deref()
+                    .map(|n| aokie_core::redact::Phone(n).to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
         }
         HfpEvent::CodecSelected { codec, sample_rate } => {
             // Surface AG-initiated codec connection so a "no audio after

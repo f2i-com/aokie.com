@@ -1152,6 +1152,25 @@ fn hfp_event_record(event: hfp::HfpEvent) -> HfpEventRecord {
             name: "CallerId".to_string(),
             summary: number,
         },
+        hfp::HfpEvent::CallWaiting(number) => HfpEventRecord {
+            name: "CallWaiting".to_string(),
+            summary: number.unwrap_or_else(|| "number not yet known".to_string()),
+        },
+        hfp::HfpEvent::CallWaitingEnded => HfpEventRecord {
+            name: "CallWaitingEnded".to_string(),
+            summary: "waiting caller gone, active call untouched".to_string(),
+        },
+        hfp::HfpEvent::CallHeld(state) => HfpEventRecord {
+            name: "CallHeld".to_string(),
+            summary: format!("callheld indicator {}", state),
+        },
+        hfp::HfpEvent::CallListEntry(entry) => HfpEventRecord {
+            name: "CallListEntry".to_string(),
+            summary: format!(
+                "idx={} dir={} status={} mpty={}",
+                entry.index, entry.direction, entry.status, entry.multiparty
+            ),
+        },
         hfp::HfpEvent::CodecSelected { codec, sample_rate } => HfpEventRecord {
             name: "CodecSelected".to_string(),
             summary: format!("{}:{}", codec, sample_rate),

@@ -277,6 +277,13 @@ impl RfcommState {
         self.wbs_supported = wbs_supported;
     }
 
+    /// Phase 4: whether this SLC advertises call waiting / 3-way (BRSF bit 1)
+    /// and probes AT+CHLD=? / AT+CCWA=1. Same set-before-SABM contract as
+    /// `set_wbs_supported`; the runtime derives it from AOKIE_CALL_WAITING.
+    pub fn set_call_waiting_enabled(&mut self, enabled: bool) {
+        self.hfp_state.set_call_waiting_enabled(enabled);
+    }
+
     /// Attach a new outbound DLCI on this RFCOMM multiplexer. Returns
     /// the target DLCI and the PN command framed as a UIH-on-DLCI-0
     /// ready to be wrapped by the L2CAP layer. The runtime sends this
@@ -636,8 +643,11 @@ impl RfcommState {
             self.msc_at_kicked = false;
             // Queue the SLC AT commands — they fire only after the MSC
             // exchange completes in both directions (per HFP §4.2.1).
-            self.hfp_pending_commands =
-                hfp::HfpHandsFreeState::initial_service_level_commands(self.wbs_supported).into();
+            self.hfp_pending_commands = hfp::HfpHandsFreeState::initial_service_level_commands(
+                self.wbs_supported,
+                self.hfp_state.call_waiting_enabled(),
+            )
+            .into();
             // Reply with UA, then proactively send our MSC CMD on the
             // multiplexer DLCI so the AG knows we're ready to talk.
             // RFCOMM signal byte 0x8d = EA(1) | RTC(1) | RTR(1) | DV(1)
@@ -855,27 +865,16 @@ impl RfcommState {
             self.hfp_events.extend(self.hfp_state.apply_result(&result));
             match result {
                 hfp::HfpAgResult::Ok => {
+                    if matches!(
+                        self.hfp_in_flight_command,
+                        Some(hfp::HfpAtCommand::EnableCallWaitingNotifications)
+                    ) {
+                        self.hfp_state.note_ccwa_accepted();
+                    }
                     self.hfp_in_flight_command = None;
                     self.hfp_in_flight_command_sent_at = None;
                     if !self.hfp_slc_failed {
-                        if let Some(command) = self.next_hfp_command_frame() {
-                            responses.push(command);
-                        } else if self.hfp_pending_commands.is_empty()
-                            && self.hfp_state.needs_indicator_definitions_retry()
-                        {
-                            // Lost/garbled +CIND=? definitions (phantom-answer
-                            // incidents): re-request ONCE before readiness —
-                            // ringing on default indices misreads as answered.
-                            self.hfp_pending_commands
-                                .push_back(hfp::HfpAtCommand::RetrieveIndicators);
-                            self.hfp_pending_commands
-                                .push_back(hfp::HfpAtCommand::RetrieveIndicatorStatus);
-                            if let Some(command) = self.next_hfp_command_frame() {
-                                responses.push(command);
-                            }
-                        } else {
-                            self.mark_hfp_service_ready();
-                        }
+                        self.advance_hfp_slc_queue(&mut responses);
                     }
                 }
                 hfp::HfpAgResult::Error => {
@@ -887,19 +886,35 @@ impl RfcommState {
                     // manager tear the RFCOMM channel down. Post-SLC
                     // ERRORs (e.g. "ATA" while no call is incoming) are
                     // surfaced too but do not flip the SLC-ready bit.
+                    //
+                    // Phase 4 exception: the call-waiting capability probes
+                    // (AT+CHLD=? / AT+CCWA=1) are NON-fatal — a phone that
+                    // refuses them merely lacks call waiting, and losing the
+                    // whole HFP connection over an optional capability was
+                    // the first bug of the Phase-4 review. The queue
+                    // continues exactly as if the probe had succeeded.
                     let failed_command = self.hfp_in_flight_command.take();
                     self.hfp_in_flight_command_sent_at = None;
-                    if !self.hfp_state.service_level_ready() {
-                        self.hfp_pending_commands.clear();
-                        self.hfp_slc_failed = true;
-                    }
-                    let label = failed_command
+                    let capability_probe = failed_command
                         .as_ref()
-                        .map(describe_at_command)
-                        .unwrap_or("unsolicited")
-                        .to_string();
-                    self.hfp_events
-                        .push(hfp::HfpEvent::ServiceLevelConnectionFailed(label));
+                        .is_some_and(|c| self.hfp_state.note_slc_probe_error(c));
+                    if capability_probe {
+                        if !self.hfp_slc_failed {
+                            self.advance_hfp_slc_queue(&mut responses);
+                        }
+                    } else {
+                        if !self.hfp_state.service_level_ready() {
+                            self.hfp_pending_commands.clear();
+                            self.hfp_slc_failed = true;
+                        }
+                        let label = failed_command
+                            .as_ref()
+                            .map(describe_at_command)
+                            .unwrap_or("unsolicited")
+                            .to_string();
+                        self.hfp_events
+                            .push(hfp::HfpEvent::ServiceLevelConnectionFailed(label));
+                    }
                 }
                 hfp::HfpAgResult::SelectedCodec(codec) => {
                     responses
@@ -912,11 +927,45 @@ impl RfcommState {
     }
 
     fn next_hfp_command_frame(&mut self) -> Option<Vec<u8>> {
-        let command = self.hfp_pending_commands.pop_front()?;
-        let frame = self.build_hfp_command_frame(command.clone());
-        self.hfp_in_flight_command = Some(command);
-        self.hfp_in_flight_command_sent_at = Some(Instant::now());
-        Some(frame)
+        loop {
+            let command = self.hfp_pending_commands.pop_front()?;
+            // Phase 4: the call-waiting probes only go out when both sides
+            // advertise three-way calling (the AG's +BRSF lands before
+            // either would be popped) — skipping keeps unsupported phones
+            // byte-for-byte on the legacy SLC.
+            if self.hfp_state.should_skip_slc_command(&command) {
+                continue;
+            }
+            let frame = self.build_hfp_command_frame(command.clone());
+            self.hfp_in_flight_command = Some(command);
+            self.hfp_in_flight_command_sent_at = Some(Instant::now());
+            return Some(frame);
+        }
+    }
+
+    /// Shared SLC-queue advance: send the next command, or run the one-shot
+    /// indicator-definitions retry, or declare readiness. Used by the OK arm
+    /// and by the non-fatal capability-probe ERROR arm (which must continue
+    /// the queue exactly as if the probe had succeeded).
+    fn advance_hfp_slc_queue(&mut self, responses: &mut Vec<Vec<u8>>) {
+        if let Some(command) = self.next_hfp_command_frame() {
+            responses.push(command);
+        } else if self.hfp_pending_commands.is_empty()
+            && self.hfp_state.needs_indicator_definitions_retry()
+        {
+            // Lost/garbled +CIND=? definitions (phantom-answer
+            // incidents): re-request ONCE before readiness —
+            // ringing on default indices misreads as answered.
+            self.hfp_pending_commands
+                .push_back(hfp::HfpAtCommand::RetrieveIndicators);
+            self.hfp_pending_commands
+                .push_back(hfp::HfpAtCommand::RetrieveIndicatorStatus);
+            if let Some(command) = self.next_hfp_command_frame() {
+                responses.push(command);
+            }
+        } else {
+            self.mark_hfp_service_ready();
+        }
     }
 
     /// Check whether the in-flight SLC command has been outstanding for
@@ -1654,11 +1703,13 @@ impl RfcommClientState {
 
 fn describe_at_command(command: &hfp::HfpAtCommand) -> &'static str {
     match command {
-        hfp::HfpAtCommand::SupportedFeatures => "AT+BRSF",
+        hfp::HfpAtCommand::SupportedFeatures { .. } => "AT+BRSF",
         hfp::HfpAtCommand::AvailableCodecs { .. } => "AT+BAC",
         hfp::HfpAtCommand::RetrieveIndicators => "AT+CIND=?",
         hfp::HfpAtCommand::RetrieveIndicatorStatus => "AT+CIND?",
         hfp::HfpAtCommand::RetrieveCallHoldSupport => "AT+CHLD=?",
+        hfp::HfpAtCommand::EnableCallWaitingNotifications => "AT+CCWA",
+        hfp::HfpAtCommand::CallHold(_) => "AT+CHLD",
         hfp::HfpAtCommand::ActivateClip(_) => "AT+CLIP",
         hfp::HfpAtCommand::EnableIndicatorUpdates(_) => "AT+CMER",
         hfp::HfpAtCommand::EnableAllIndicatorStatusUpdates(_) => "AT+BIA",
@@ -2223,12 +2274,14 @@ mod tests {
 
     #[test]
     fn state_sequences_hfp_service_level_commands_on_ok() {
+        // Default (holdAndCallWaiting off): AT+CHLD=? and AT+CCWA=1 are
+        // SKIPPED — we don't advertise three-way in BRSF, so probing the
+        // AG's hold support would be out of spec (Phase 4 review, bug #1).
         let mut state = open_hfp_state();
         let expected = [
             b"AT+BAC=1,2\r".as_slice(),
             b"AT+CIND=?\r".as_slice(),
             b"AT+CIND?\r".as_slice(),
-            b"AT+CHLD=?\r".as_slice(),
             b"AT+CLIP=1\r".as_slice(),
             b"AT+CMER=3,0,0,1\r".as_slice(),
             b"AT+BIA=1,1,1,1,1,1,1\r".as_slice(),
@@ -2273,6 +2326,126 @@ mod tests {
         );
         // The definitions parsed on the retry own the mapping now.
         assert_eq!(state.hfp_state().call_indicator_index(), 1);
+    }
+
+    /// Phase 4: with holdAndCallWaiting on and an AG that advertises
+    /// three-way calling, the SLC includes AT+CHLD=? + AT+CCWA=1, BRSF
+    /// carries HF bit 1, and the capability gate negotiates.
+    #[test]
+    fn call_waiting_slc_probes_negotiate_when_both_sides_support_it() {
+        let mut state = RfcommState::new();
+        state.set_wbs_supported(true);
+        state.set_call_waiting_enabled(true);
+        let _ = state
+            .handle_packet(&build_sabm(RFCOMM_DLCI_MULTIPLEXER, true))
+            .unwrap();
+        let _ = state
+            .handle_packet(&build_sabm(aokie_hfp_dlci(), true))
+            .unwrap();
+        let msc_rsp = build_uih(
+            RFCOMM_DLCI_MULTIPLEXER,
+            true,
+            None,
+            &build_modem_status_response(aokie_hfp_dlci(), RFCOMM_LOCAL_MODEM_STATUS),
+        );
+        let _ = state.handle_packet(&msc_rsp).unwrap();
+        let msc_cmd = build_uih(
+            RFCOMM_DLCI_MULTIPLEXER,
+            true,
+            None,
+            &build_modem_status_command(aokie_hfp_dlci(), RFCOMM_LOCAL_MODEM_STATUS),
+        );
+        let out = state.handle_packet(&msc_cmd).unwrap();
+        let brsf = out
+            .iter()
+            .filter_map(|f| parse_frame(f).ok())
+            .find(|f| f.payload.starts_with(b"AT+BRSF"))
+            .expect("BRSF fires at MSC completion");
+        assert_eq!(brsf.payload, b"AT+BRSF=695\r", "HF bit 1 advertised");
+
+        let mut sent = Vec::new();
+        for reply in [
+            "\r\n+BRSF: 4095\r\nOK\r\n", // AG advertises three-way (bit 0)
+            "\r\nOK\r\n",                // AT+BAC
+            "\r\n+CIND: (\"call\",(0,1)),(\"callsetup\",(0-3)),(\"callheld\",(0-2))\r\nOK\r\n",
+            "\r\n+CIND: 0,0,0\r\nOK\r\n",
+            "\r\n+CHLD: (0,1,1x,2,2x,3)\r\nOK\r\n",
+            "\r\nOK\r\n", // AT+CCWA=1
+            "\r\nOK\r\n", // AT+CLIP
+            "\r\nOK\r\n", // AT+CMER
+            "\r\nOK\r\n", // AT+BIA
+            "\r\nOK\r\n", // AT+NREC
+        ] {
+            for frame in state
+                .handle_packet(&build_uih(aokie_hfp_dlci(), false, None, reply.as_bytes()))
+                .unwrap()
+            {
+                sent.push(parse_frame(&frame).unwrap().payload.to_vec());
+            }
+        }
+        assert!(sent.iter().any(|p| p == b"AT+CHLD=?\r"), "CHLD probe sent");
+        assert!(sent.iter().any(|p| p == b"AT+CCWA=1\r"), "CCWA armed");
+        assert!(state.hfp_state().service_level_ready());
+        assert!(state.hfp_state().three_way_negotiated());
+    }
+
+    /// Phase 4 review bug #1: an AG that answers a capability probe with
+    /// ERROR must lose only the capability, never the HFP connection.
+    #[test]
+    fn call_waiting_probe_error_is_non_fatal_and_slc_still_readies() {
+        let mut state = RfcommState::new();
+        state.set_call_waiting_enabled(true);
+        let _ = state
+            .handle_packet(&build_sabm(RFCOMM_DLCI_MULTIPLEXER, true))
+            .unwrap();
+        let _ = state
+            .handle_packet(&build_sabm(aokie_hfp_dlci(), true))
+            .unwrap();
+        let msc_rsp = build_uih(
+            RFCOMM_DLCI_MULTIPLEXER,
+            true,
+            None,
+            &build_modem_status_response(aokie_hfp_dlci(), RFCOMM_LOCAL_MODEM_STATUS),
+        );
+        let _ = state.handle_packet(&msc_rsp).unwrap();
+        let msc_cmd = build_uih(
+            RFCOMM_DLCI_MULTIPLEXER,
+            true,
+            None,
+            &build_modem_status_command(aokie_hfp_dlci(), RFCOMM_LOCAL_MODEM_STATUS),
+        );
+        let _ = state.handle_packet(&msc_cmd).unwrap();
+
+        let mut sent = Vec::new();
+        for reply in [
+            "\r\n+BRSF: 4095\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\n+CIND: (\"call\",(0,1)),(\"callsetup\",(0-3))\r\nOK\r\n",
+            "\r\n+CIND: 0,0\r\nOK\r\n",
+            "\r\nERROR\r\n", // AT+CHLD=? refused
+            "\r\nERROR\r\n", // AT+CCWA=1 refused too
+            "\r\nOK\r\n",    // AT+CLIP
+            "\r\nOK\r\n",    // AT+CMER
+            "\r\nOK\r\n",    // AT+BIA
+            "\r\nOK\r\n",    // AT+NREC
+        ] {
+            for frame in state
+                .handle_packet(&build_uih(aokie_hfp_dlci(), false, None, reply.as_bytes()))
+                .unwrap()
+            {
+                sent.push(parse_frame(&frame).unwrap().payload.to_vec());
+            }
+        }
+        assert!(sent.iter().any(|p| p == b"AT+CLIP=1\r"), "queue continued");
+        assert!(state.hfp_state().service_level_ready(), "SLC survived");
+        assert!(!state.hfp_state().three_way_negotiated(), "capability off");
+        let events = state.take_hfp_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, hfp::HfpEvent::ServiceLevelConnectionFailed(_))),
+            "no fatal SLC event for a refused capability probe: {events:?}"
+        );
     }
 
     #[test]

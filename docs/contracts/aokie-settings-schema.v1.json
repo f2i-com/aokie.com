@@ -28,6 +28,11 @@
       "appliesLive": false
     },
     {
+      "key": "holdAndCallWaiting",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
       "key": "blockedNumbers",
       "type": "string",
       "maxChars": 4000,

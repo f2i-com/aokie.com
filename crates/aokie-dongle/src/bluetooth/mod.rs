@@ -43,6 +43,18 @@ pub enum BluetoothEvent {
     },
     AudioDisconnected,
     CallerId(String),
+    /// Phase 4: a SECOND caller is knocking while a call is active
+    /// (call-waiting-negotiated connections only). One per waiting episode
+    /// plus one upgrade when the number arrives after an anonymous start.
+    CallWaiting {
+        number: Option<String>,
+    },
+    /// The waiting episode ended with the active call untouched.
+    CallWaitingEnded,
+    /// `callheld` indicator transition (0 none / 1 held+active / 2 held only).
+    CallHeld {
+        state: i32,
+    },
     /// Phase 3e: PBAP fetch finished. Payload is a flattened list of
     /// (phone_number, display_name) pairs — one row per number, so a
     /// vCard with multiple TEL fields produces multiple entries.
@@ -377,6 +389,9 @@ fn bluetooth_event_from_runtime(
         }
         RuntimeEvent::AudioDisconnected => BluetoothEvent::AudioDisconnected,
         RuntimeEvent::CallerId(num) => BluetoothEvent::CallerId(num),
+        RuntimeEvent::CallWaiting { number } => BluetoothEvent::CallWaiting { number },
+        RuntimeEvent::CallWaitingEnded => BluetoothEvent::CallWaitingEnded,
+        RuntimeEvent::CallHeld { state } => BluetoothEvent::CallHeld { state },
         RuntimeEvent::PbapContactsFetched(contacts) => BluetoothEvent::ContactsFetched(
             contacts
                 .into_iter()
@@ -438,6 +453,18 @@ pub fn bluetooth_event_from_aokie_hfp(
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallerId(number) => {
             Some(BluetoothEvent::CallerId(number))
         }
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallWaiting(number) => {
+            Some(BluetoothEvent::CallWaiting { number })
+        }
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallWaitingEnded => {
+            Some(BluetoothEvent::CallWaitingEnded)
+        }
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallHeld(state) => {
+            Some(BluetoothEvent::CallHeld { state })
+        }
+        // Observe-only topology entries stay a radio-log concern for now
+        // (the switchboard slice will consume them).
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallListEntry(_) => None,
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CodecSelected { codec, sample_rate } => {
             // Codec selection precedes iso arming; this legacy path never
             // observed an arming failure, so it reports armed.

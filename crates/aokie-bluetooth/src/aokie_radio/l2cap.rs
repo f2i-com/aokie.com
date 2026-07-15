@@ -1122,6 +1122,7 @@ impl L2capState {
         local_cid: u16,
         server_channel: u8,
         wbs_supported: bool,
+        call_waiting_enabled: bool,
     ) -> Result<Vec<u8>, String> {
         let channel = self
             .channels
@@ -1139,7 +1140,8 @@ impl L2capState {
                 local_cid
             ));
         }
-        let mut client = hfp_client::HfpClientState::new(server_channel, wbs_supported);
+        let mut client =
+            hfp_client::HfpClientState::new(server_channel, wbs_supported, call_waiting_enabled);
         let sabm = client.kickoff()?;
         channel.hfp_client = Some(client);
         let basic = build_basic_frame(channel.remote_cid, &sabm);
