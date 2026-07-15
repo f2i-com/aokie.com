@@ -264,6 +264,11 @@ const HOLD_SECOND_ASK_LINE: &str =
 #[cfg(feature = "voice")]
 const HOLD_PROMOTED_GREET_LINE: &str =
     "Thank you so much for holding. How can I help you today?";
+/// Spoken to the PRIMARY caller when a juggle is ABANDONED before they were
+/// ever really held (the knock vanished, or the phone ignored the swap) —
+/// they heard "let me put you on hold" and then nothing happened.
+#[cfg(feature = "voice")]
+const HOLD_JUGGLE_ABORT_LINE: &str = "Sorry about that - I'm back with you. Where were we?";
 
 /// The hold ask spoken to the second caller, with their queue position when
 /// it's meaningful (position 2 = "you're next"; higher = "Nth in the
@@ -946,6 +951,11 @@ pub struct RadioStatus {
     /// handful of concurrent legs). Exposed via dongle.diagnostics so a
     /// knock's topology is verifiable AFTER the log ring wraps.
     pub clcc_snapshot: Mutex<Option<(std::time::Instant, Vec<String>)>>,
+    /// Structured twin of `clcc_snapshot` (same burst rules): the
+    /// verified-swap machinery matches leg status/numbers programmatically
+    /// against exactly the burst a post-CHLD `AT+CLCC` produced, instead of
+    /// assuming a toggle took.
+    pub clcc_calls: Mutex<Option<(std::time::Instant, Vec<ClccLeg>)>>,
     /// Phase 4 switchboard mirrors (connector-readable): the WAITING caller
     /// (identity minted at the knock — `call.activate`'s target before any
     /// session exists) and the PARKED caller (their real session + voice
@@ -970,6 +980,15 @@ pub struct SwitchboardLeg {
     /// "" when the network withheld the number.
     pub from: String,
     pub since_iso: String,
+}
+
+/// One structured `+CLCC:` leg — see [`RadioStatus::clcc_calls`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClccLeg {
+    pub index: u8,
+    /// 0 active / 1 held / 2 dialing / 3 alerting / 4 incoming / 5 waiting.
+    pub status: u8,
+    pub number: Option<String>,
 }
 
 /// See [`RadioStatus::pending_dial`].
@@ -3941,6 +3960,219 @@ fn speak_announcement(
     probe.action.take()
 }
 
+// ── Phase 4 VERIFIED SWAPS ──────────────────────────────────────────────
+// AT+CHLD=2 is a TOGGLE the phone may execute, half-execute or ignore — the
+// z49 live incident (2026-07-15) tore both calls down while the juggle
+// assumed its second swap had worked. Nothing here assumes any more: after
+// every CHLD the juggle PUMPS the radio's own event stream (through the
+// same handler the main loop uses, so the tracker/status stay truthful),
+// fires one on-demand AT+CLCC, and only moves session state once the phone
+// itself has reported the topology. Every failure shape has an explicit
+// convergence path — the line always ends in a state where someone can be
+// spoken to and everyone else's session is closed honestly.
+
+/// One point-in-time view of the phone-side call topology, assembled from
+/// the indicator stream + the freshest post-swap CLCC burst.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[derive(Debug, Clone)]
+struct SwapSnapshot {
+    /// callheld indicator (0 none / 1 held+active / 2 held only).
+    callheld: u64,
+    /// The waiting-knock leg still up (None = knock resolved / no knock).
+    waiting_id: Option<String>,
+    /// The tracker still has a current session (no terminal edge arrived).
+    current_alive: bool,
+    /// Structured CLCC legs from a burst that STARTED after the settle
+    /// began (None = no fresh response yet).
+    clcc: Option<Vec<ClccLeg>>,
+}
+
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn swap_snapshot(
+    status: &Arc<RadioStatus>,
+    tracker: &crate::call_session::SessionTracker,
+    since: std::time::Instant,
+) -> SwapSnapshot {
+    let clcc = status
+        .clcc_calls
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(started, _)| *started >= since)
+        .map(|(_, legs)| legs.clone());
+    SwapSnapshot {
+        callheld: status.call_held_state.load(Ordering::Relaxed),
+        waiting_id: status
+            .waiting_call
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|w| w.call_id.clone()),
+        current_alive: tracker.current().is_some(),
+        clcc,
+    }
+}
+
+/// Pump radio events + discard mic audio until `done` says the topology
+/// settled or `deadline` passes. Audio captured while the phone shuffles
+/// legs is transition garbage from an ambiguous speaker — never STT input.
+/// Fires one AT+CLCC after `clcc_after` so the snapshot gains authoritative
+/// leg status/numbers. Returns the LAST snapshot — a timeout returns the
+/// unsatisfied state and the pure judge functions own the interpretation.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
+fn settle_swap(
+    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    tracker: &mut crate::call_session::SessionTracker,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+    status: &Arc<RadioStatus>,
+    deadline: std::time::Duration,
+    clcc_after: Option<std::time::Duration>,
+    done: impl Fn(&SwapSnapshot, u16) -> bool,
+) -> SwapSnapshot {
+    let started = std::time::Instant::now();
+    let mut clcc_fired = false;
+    loop {
+        // Keep the stall watchdog honest — the loop is alive, just settling.
+        status.loop_beat.fetch_add(1, Ordering::Relaxed);
+        while let Some(ev) = bt.try_recv_event() {
+            handle_event(ev, tracker, outbox, sink, status);
+        }
+        while bt.try_recv_audio().is_some() {}
+        let snap = swap_snapshot(status, tracker, started);
+        let sr = bt.get_sample_rate();
+        if done(&snap, sr) || started.elapsed() >= deadline {
+            return snap;
+        }
+        if let Some(after) = clcc_after {
+            if !clcc_fired && started.elapsed() >= after {
+                clcc_fired = true;
+                let _ = bt.query_calls();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Verdict after the ACCEPT swap (CHLD=2 answering a knock while the
+/// primary talks). Pure — unit-tested against every observed failure shape.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptVerdict {
+    /// Knock resolved into a held+active pair — the newcomer has the line.
+    Accepted,
+    /// The primary's call died mid-accept (terminal edge consumed by the
+    /// settle pump) — the per-call machinery already closed it.
+    PrimaryGone,
+    /// The phone left ONE call held with NOBODY active — retrieve it.
+    HeldAlone,
+    /// The knock is still up and nothing went held: the phone ignored the
+    /// CHLD — abandon the juggle, the primary still has the line.
+    NothingChanged,
+    /// The knock vanished without a held pair forming (the waiting caller
+    /// gave up mid-swap) — the primary still has the line.
+    KnockGone,
+}
+
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn judge_accept(snap: &SwapSnapshot, knock_id: &str) -> AcceptVerdict {
+    if !snap.current_alive {
+        return AcceptVerdict::PrimaryGone;
+    }
+    let knock_up = snap.waiting_id.as_deref() == Some(knock_id);
+    match (knock_up, snap.callheld) {
+        (false, 1) => AcceptVerdict::Accepted,
+        (_, 2) => AcceptVerdict::HeldAlone,
+        (true, _) => AcceptVerdict::NothingChanged,
+        (false, _) => AcceptVerdict::KnockGone,
+    }
+}
+
+/// Verdict after a swap-back CHLD=2 (two calls, no knock: a pure toggle).
+/// The callheld indicator alone cannot name WHO is active afterwards (it
+/// reads 1 for success AND for a no-op) — fresh CLCC evidence wins when the
+/// legs' numbers allow it.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwapBackVerdict {
+    /// The primary is the active leg again; the newcomer is held.
+    Swapped,
+    /// The primary is active ALONE — the newcomer's leg vanished mid-swap.
+    SwappedNewcomerGone,
+    /// The newcomer kept the line (toggle refused/ignored); the primary is
+    /// still held — degrade to single-swap.
+    StayedOnNewcomer,
+    /// The newcomer is active ALONE — the primary's held leg vanished.
+    NewcomerAlone,
+    /// Nobody is active but a held leg remains — retrieve it.
+    ActiveDied,
+    /// Everything tore down (the z49 signature: callheld 2→0).
+    AllGone,
+}
+
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn judge_swap_back(
+    snap: &SwapSnapshot,
+    primary: Option<&str>,
+    newcomer: Option<&str>,
+) -> SwapBackVerdict {
+    let suffix = |n: Option<&str>| -> Option<String> {
+        n.map(crate::screen::digit_suffix).filter(|s| s.len() >= 6)
+    };
+    let primary = suffix(primary);
+    let newcomer = suffix(newcomer);
+    if let Some(clcc) = snap.clcc.as_ref() {
+        let active: Vec<&ClccLeg> = clcc.iter().filter(|l| l.status == 0).collect();
+        let held: Vec<&ClccLeg> = clcc.iter().filter(|l| l.status == 1).collect();
+        let leg_is = |leg: &ClccLeg, who: &Option<String>| -> Option<bool> {
+            match (
+                leg.number.as_deref().map(crate::screen::digit_suffix),
+                who.as_ref(),
+            ) {
+                (Some(n), Some(w)) if n.len() >= 6 => Some(n == *w),
+                _ => None,
+            }
+        };
+        if active.is_empty() && held.is_empty() {
+            return SwapBackVerdict::AllGone;
+        }
+        if active.is_empty() {
+            return SwapBackVerdict::ActiveDied;
+        }
+        let a = active[0];
+        if leg_is(a, &primary) == Some(true) {
+            return if held.is_empty() {
+                SwapBackVerdict::SwappedNewcomerGone
+            } else {
+                SwapBackVerdict::Swapped
+            };
+        }
+        if leg_is(a, &newcomer) == Some(true) {
+            return if held.is_empty() {
+                SwapBackVerdict::NewcomerAlone
+            } else {
+                SwapBackVerdict::StayedOnNewcomer
+            };
+        }
+        // Active leg's number unusable (withheld) — the leg COUNTS still
+        // say something: no held leg + numbers dark = someone is alone;
+        // keeping the tracker's session (the newcomer) needs no further
+        // CHLD, so it is the safe read.
+        if held.is_empty() {
+            return SwapBackVerdict::NewcomerAlone;
+        }
+        // 1 active + 1 held with dark numbers: indistinguishable from a
+        // no-op — fall through to the indicator and trust the toggle.
+    }
+    match (snap.callheld, snap.current_alive) {
+        (2, _) => SwapBackVerdict::ActiveDied,
+        (0, true) => SwapBackVerdict::NewcomerAlone,
+        (0, false) => SwapBackVerdict::AllGone,
+        _ => SwapBackVerdict::Swapped,
+    }
+}
+
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 fn speak_planned(
@@ -4738,15 +4970,15 @@ fn run_loop(
     let agent_hangup = agent_enabled && std::env::var_os("AOKIE_AGENT_HANGUP").is_some();
     // Phase 4: the AUTOMATIC spoken hold juggle — tell the current caller to
     // hold, swap to the newcomer to ask THEM to hold, swap BACK and resume.
-    // ⚠️ DISABLED BY DEFAULT (separate AOKIE_AUTO_HOLD flag, off) after a
-    // live test showed the DOUBLE CHLD=2 swap is unreliable on the Pixel: the
-    // swap-back tore the calls down (callheld 2→0) and left the resumed leg's
-    // SCO not draining. With `holdAndCallWaiting` on but this off, call
-    // waiting stays in the PROVEN modes — capability negotiation, the
-    // observe-only aokie.call.waiting event, and the operator-driven
-    // call.switchboard / call.activate (single swap, live-proven). The
-    // juggle needs a redesign that avoids two rapid swaps before it comes
-    // back on.
+    // OFF by default; armed by the `autoHoldQueue` setting (requires
+    // `holdAndCallWaiting`). v2: after the z49 live incident (a raw double
+    // CHLD=2 tore both calls down on the Pixel — callheld 2→0 — and the old
+    // code assumed success), every swap outcome is now VERIFIED against the
+    // callheld indicator + an on-demand AT+CLCC before session state moves;
+    // see the juggle block + judge_accept/judge_swap_back. With
+    // `holdAndCallWaiting` on but this off, call waiting stays in the proven
+    // observe/operator modes (aokie.call.waiting + call.switchboard /
+    // call.activate).
     #[cfg(feature = "voice")]
     let auto_hold = agent_enabled && std::env::var_os("AOKIE_AUTO_HOLD").is_some();
     // The waiting callId whose auto-hold juggle already ran (so the pump does
@@ -4759,6 +4991,13 @@ fn run_loop(
     // shared reconciliation block; read only in the voice greeting path.
     #[cfg_attr(not(feature = "voice"), allow(unused_assignments, unused_variables))]
     let mut promote_greet_for: Option<String> = None;
+    // Phase 4: a caller retrieved/restored from hold MID-CONVERSATION (they
+    // were already greeted, so the promoted greeting doesn't apply) hears
+    // HOLD_PRIMARY_RESUME_LINE once their audio path is back — see the hook
+    // after the per-call reset block. (call id, when set); expires after 10s
+    // so it can never leak into a later call.
+    #[cfg_attr(not(feature = "voice"), allow(unused_assignments, unused_variables))]
+    let mut resume_line_for: Option<(String, std::time::Instant)> = None;
     // Cleaned-mic RMS above which the caller counts as speaking over Aokie. Set
     // above the AEC's residual echo floor; tune per handset via AOKIE_BARGE_RMS.
     #[cfg(feature = "voice")]
@@ -5074,47 +5313,422 @@ fn run_loop(
                     status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
                 }
             } else if tracker.current().is_none() {
-                // The foreground ended (its call.ended already went out) —
-                // the parked caller is still on the phone's hold, waiting.
-                // Retrieve them: one CHLD=2 (only a held call remains, so
-                // the toggle retrieves), session + context restored.
-                let (sess, ctx_saved) = parked.take().expect("checked above");
-                eprintln!(
-                    "[aokie-plugin] SWITCHBOARD: foreground ended with {} parked — retrieving them (AT+CHLD=2)",
-                    sess.id
-                );
-                bt.flush_tx_audio();
-                let _ = bt.hold_swap();
-                *status.switch_in_flight.lock().unwrap() =
-                    Some(("auto_retrieve".to_string(), std::time::Instant::now()));
-                let resumed_id = sess.id.clone();
-                let resumed_from = sess.caller_id.clone();
-                let was_greeted = sess.greeted;
-                match tracker.restore(sess) {
-                    Ok(_generation) => {
-                        pending_ctx_restore = Some(ctx_saved);
-                        // A held caller who never got past the "please hold"
-                        // line (auto-hold model — their session was answered
-                        // but never greeted) is now given full attention: the
-                        // greeting block speaks the "thanks for holding" line.
-                        if !was_greeted {
-                            promote_greet_for = Some(resumed_id.clone());
-                        }
-                        status.call_active.store(true, Ordering::Relaxed);
-                        *status.current_call_id.lock().unwrap() = Some(resumed_id);
-                        *status.current_caller.lock().unwrap() = resumed_from;
-                        *status.call_started_at.lock().unwrap() =
-                            tracker.current().map(|s| s.started_at_iso.clone());
-                        *status.parked_call.lock().unwrap() = None;
-                        status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(sess_back) => {
-                        // A fresh ring raced the retrieve — keep them parked.
+                // The foreground ended — the parked caller is still on the
+                // phone's hold, waiting.
+                let knock = status.waiting_call.lock().unwrap().clone();
+                if let Some(w) = knock {
+                    // A second caller is KNOCKING at retrieve time: CHLD=2
+                    // would accept THEM (a waiting call beats a held one on
+                    // this phone), not retrieve the parked caller — acting
+                    // blindly here crossed sessions before v2. With the
+                    // auto-hold queue on, serve FIFO: accept the knock, ask
+                    // them to hold with their queue position, then swap to
+                    // the parked caller (who has waited longest). Without
+                    // it, WAIT — the knock resolves on its own (the caller
+                    // gives up, or the phone promotes their ring) and a
+                    // later pass retrieves the parked caller.
+                    #[cfg(feature = "voice")]
+                    if auto_hold
+                        && !switch_recent
+                        && auto_hold_done_for.as_deref() != Some(w.call_id.as_str())
+                    {
+                        auto_hold_done_for = Some(w.call_id.clone());
                         eprintln!(
-                            "[aokie-plugin] SWITCHBOARD: a new call raced the retrieve — {} stays parked",
-                            sess_back.id
+                            "[aokie-plugin] SWITCHBOARD: foreground ended with a caller parked AND {} knocking — serving FIFO (accept, ask to hold, return to the parked caller)",
+                            w.call_id
                         );
-                        parked = Some((sess_back, ctx_saved));
+                        bt.flush_tx_audio();
+                        if let Err(e) = bt.hold_swap() {
+                            eprintln!("[aokie-plugin] SWITCHBOARD: cascade CHLD=2 failed: {e}");
+                        } else {
+                            *status.switch_in_flight.lock().unwrap() =
+                                Some(("cascade_accept".to_string(), std::time::Instant::now()));
+                            let knock_id = w.call_id.clone();
+                            // Accepted here = the knock resolved into a
+                            // held+active pair (the parked caller stays held
+                            // underneath throughout).
+                            let snap = settle_swap(
+                                bt, &mut tracker, outbox, sink, &status,
+                                std::time::Duration::from_millis(5000),
+                                Some(std::time::Duration::from_millis(1500)),
+                                |s, _| {
+                                    s.waiting_id.as_deref() != Some(knock_id.as_str())
+                                        && s.callheld == 1
+                                },
+                            );
+                            let accepted = snap.waiting_id.as_deref() != Some(w.call_id.as_str())
+                                && snap.callheld == 1;
+                            if !accepted {
+                                // The knock never became a live leg. If the
+                                // parked caller is still held alone a later
+                                // pass retrieves them once the knock clears;
+                                // callheld==0 means their leg died too.
+                                eprintln!(
+                                    "[aokie-plugin] SWITCHBOARD: cascade accept unverified (callheld={}, knock_up={}) — reconciliation converges from here",
+                                    snap.callheld,
+                                    snap.waiting_id.is_some()
+                                );
+                                if snap.callheld == 0 && snap.waiting_id.is_none() {
+                                    if let Some((sess_gone, _ctx_gone)) = parked.take() {
+                                        eprintln!(
+                                            "[aokie-plugin] SWITCHBOARD: parked caller {} is gone too",
+                                            sess_gone.id
+                                        );
+                                        let ended = crate::call_session::SessionTracker::terminate_detached(sess_gone, None);
+                                        emit_call_ended(
+                                            &ended,
+                                            status.config_version.load(Ordering::Relaxed),
+                                            outbox,
+                                            sink,
+                                        );
+                                        *status.parked_call.lock().unwrap() = None;
+                                        status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            } else {
+                                // The newcomer has the line. Mint their call,
+                                // ask them to hold (the parked caller is
+                                // ahead of them), then swap to the parked
+                                // caller — every step verified like the
+                                // mid-call juggle above.
+                                let c_id = w.call_id.clone();
+                                let c_from = w.from.clone();
+                                ctx = CallVoiceContext::fresh(None);
+                                synth.reset_call();
+                                stt_buf.clear();
+                                stt_had_speech = false;
+                                stt_silence = Duration::ZERO;
+                                while probe_result_rx.try_recv().is_ok() {}
+                                tracker.ring(c_id.clone(), aokie_core::events::now_iso8601());
+                                if !c_from.is_empty() {
+                                    tracker.caller_id(c_from.clone());
+                                }
+                                flush_incoming_if_pending(&mut tracker, outbox, sink);
+                                if !c_from.is_empty() {
+                                    emit(
+                                        outbox,
+                                        sink,
+                                        aokie_core::events::aokie_event(
+                                            crate::contract::events::CALL_CALLER_ID,
+                                            &c_id,
+                                            json!({"callId": c_id, "from": c_from, "at": aokie_core::events::now_iso8601()}),
+                                        ),
+                                    );
+                                }
+                                tracker.answered();
+                                emit(
+                                    outbox,
+                                    sink,
+                                    aokie_core::events::aokie_event(
+                                        crate::contract::events::CALL_ANSWERED,
+                                        &c_id,
+                                        json!({"at": aokie_core::events::now_iso8601()}),
+                                    ),
+                                );
+                                stt_current_gen.store(tracker.generation(), Ordering::Relaxed);
+                                *status.waiting_call.lock().unwrap() = None;
+                                *status.current_call_id.lock().unwrap() = Some(c_id.clone());
+                                *status.current_caller.lock().unwrap() =
+                                    if c_from.is_empty() { None } else { Some(c_from.clone()) };
+                                *status.call_started_at.lock().unwrap() =
+                                    tracker.current().map(|s| s.started_at_iso.clone());
+                                status.call_active.store(true, Ordering::Relaxed);
+                                status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                let _ = settle_swap(
+                                    bt, &mut tracker, outbox, sink, &status,
+                                    std::time::Duration::from_millis(2500), None,
+                                    |_, sr_now| sr_now > 0,
+                                );
+                                let sr_c = bt.get_sample_rate();
+                                let hold_line = second_caller_hold_line(2);
+                                if sr_c > 0 {
+                                    let _ = speak_announcement(
+                                        bt, &synth, &hold_line, sr_c, &ctx.pace,
+                                        protected_max_ms, &control_rx, &mut pending_controls,
+                                    );
+                                    emit_turn(outbox, sink, &c_id, ctx.turn_index, "bot", &hold_line);
+                                    ctx.turn_index += 1;
+                                }
+                                // Dwell, then swap to the parked caller.
+                                let _ = settle_swap(
+                                    bt, &mut tracker, outbox, sink, &status,
+                                    std::time::Duration::from_millis(1200), None,
+                                    |_, _| false,
+                                );
+                                let b_number = parked.as_ref().and_then(|(p, _)| p.caller_id.clone());
+                                bt.flush_tx_audio();
+                                let swap_sent = bt.hold_swap();
+                                *status.switch_in_flight.lock().unwrap() =
+                                    Some(("cascade_return".to_string(), std::time::Instant::now()));
+                                let mut verdict = if swap_sent.is_err() {
+                                    SwapBackVerdict::StayedOnNewcomer
+                                } else {
+                                    let snap2 = settle_swap(
+                                        bt, &mut tracker, outbox, sink, &status,
+                                        std::time::Duration::from_millis(4000),
+                                        Some(std::time::Duration::from_millis(1200)),
+                                        |s, _| s.clcc.is_some() || (s.callheld == 0 && !s.current_alive),
+                                    );
+                                    judge_swap_back(
+                                        &snap2,
+                                        b_number.as_deref(),
+                                        if c_from.is_empty() { None } else { Some(c_from.as_str()) },
+                                    )
+                                };
+                                if verdict == SwapBackVerdict::StayedOnNewcomer && swap_sent.is_ok() {
+                                    eprintln!("[aokie-plugin] SWITCHBOARD: cascade swap did not take — one verified retry");
+                                    let _ = settle_swap(
+                                        bt, &mut tracker, outbox, sink, &status,
+                                        std::time::Duration::from_millis(1500), None,
+                                        |_, _| false,
+                                    );
+                                    bt.flush_tx_audio();
+                                    if bt.hold_swap().is_ok() {
+                                        *status.switch_in_flight.lock().unwrap() = Some((
+                                            "cascade_return_retry".to_string(),
+                                            std::time::Instant::now(),
+                                        ));
+                                        let snap3 = settle_swap(
+                                            bt, &mut tracker, outbox, sink, &status,
+                                            std::time::Duration::from_millis(4000),
+                                            Some(std::time::Duration::from_millis(1200)),
+                                            |s, _| s.clcc.is_some() || (s.callheld == 0 && !s.current_alive),
+                                        );
+                                        verdict = judge_swap_back(
+                                            &snap3,
+                                            b_number.as_deref(),
+                                            if c_from.is_empty() { None } else { Some(c_from.as_str()) },
+                                        );
+                                    }
+                                }
+                                eprintln!("[aokie-plugin] SWITCHBOARD: cascade verdict {verdict:?}");
+                                match verdict {
+                                    SwapBackVerdict::Swapped => {
+                                        // Newcomer parked; the longest-waiting
+                                        // caller finally gets the line.
+                                        let sess_c = tracker.park().expect("newcomer was active");
+                                        let ctx_c = std::mem::replace(&mut ctx, CallVoiceContext::fresh(None));
+                                        let (sess_b, ctx_b) = parked.take().expect("cascade runs with a parked caller");
+                                        let was_greeted = sess_b.greeted;
+                                        let b_id = sess_b.id.clone();
+                                        let b_from_leg = sess_b.caller_id.clone().unwrap_or_default();
+                                        match tracker.restore(sess_b) {
+                                            Ok(_gen) => {
+                                                pending_ctx_restore = Some(ctx_b);
+                                                if !was_greeted {
+                                                    promote_greet_for = Some(b_id.clone());
+                                                } else {
+                                                    resume_line_for = Some((
+                                                        b_id.clone(),
+                                                        std::time::Instant::now(),
+                                                    ));
+                                                }
+                                                parked = Some((sess_c, ctx_c));
+                                                *status.parked_call.lock().unwrap() = Some(SwitchboardLeg {
+                                                    call_id: c_id.clone(),
+                                                    from: c_from.clone(),
+                                                    since_iso: aokie_core::events::now_iso8601(),
+                                                });
+                                                status.call_active.store(true, Ordering::Relaxed);
+                                                *status.current_call_id.lock().unwrap() = Some(b_id);
+                                                *status.current_caller.lock().unwrap() = if b_from_leg.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(b_from_leg)
+                                                };
+                                                *status.call_started_at.lock().unwrap() =
+                                                    tracker.current().map(|s| s.started_at_iso.clone());
+                                                status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            Err(sess_back) => {
+                                                eprintln!("[aokie-plugin] SWITCHBOARD: cascade restore refused — the newcomer's session closes honestly");
+                                                parked = Some((sess_back, ctx_b));
+                                                let ended = crate::call_session::SessionTracker::terminate_detached(sess_c, None);
+                                                emit_call_ended(
+                                                    &ended,
+                                                    status.config_version.load(Ordering::Relaxed),
+                                                    outbox,
+                                                    sink,
+                                                );
+                                                drop(ctx_c);
+                                            }
+                                        }
+                                    }
+                                    SwapBackVerdict::StayedOnNewcomer | SwapBackVerdict::NewcomerAlone => {
+                                        // The newcomer keeps the line. If the
+                                        // parked caller's leg is gone, close
+                                        // them; otherwise they stay parked and
+                                        // are retrieved when this call ends.
+                                        if verdict == SwapBackVerdict::NewcomerAlone {
+                                            if let Some((sess_b, _ctx_b)) = parked.take() {
+                                                let ended = crate::call_session::SessionTracker::terminate_detached(sess_b, None);
+                                                emit_call_ended(
+                                                    &ended,
+                                                    status.config_version.load(Ordering::Relaxed),
+                                                    outbox,
+                                                    sink,
+                                                );
+                                                *status.parked_call.lock().unwrap() = None;
+                                            }
+                                        }
+                                        promote_greet_for = Some(c_id.clone());
+                                        pending_ctx_restore = Some(std::mem::replace(
+                                            &mut ctx,
+                                            CallVoiceContext::fresh(None),
+                                        ));
+                                        status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    SwapBackVerdict::SwappedNewcomerGone => {
+                                        // The swap took but the newcomer's leg
+                                        // vanished — the parked caller's leg is
+                                        // ACTIVE now. Close the newcomer's
+                                        // session and restore the parked caller
+                                        // directly (no further CHLD — their leg
+                                        // already has the line).
+                                        flush_incoming_if_pending(&mut tracker, outbox, sink);
+                                        if let Some(ended) = tracker.terminate() {
+                                            emit_call_ended(
+                                                &ended,
+                                                status.config_version.load(Ordering::Relaxed),
+                                                outbox,
+                                                sink,
+                                            );
+                                        }
+                                        let (sess_b, ctx_b) = parked.take().expect("cascade runs with a parked caller");
+                                        let was_greeted = sess_b.greeted;
+                                        let b_id = sess_b.id.clone();
+                                        let b_from_leg = sess_b.caller_id.clone().unwrap_or_default();
+                                        match tracker.restore(sess_b) {
+                                            Ok(_gen) => {
+                                                pending_ctx_restore = Some(ctx_b);
+                                                if !was_greeted {
+                                                    promote_greet_for = Some(b_id.clone());
+                                                } else {
+                                                    resume_line_for = Some((
+                                                        b_id.clone(),
+                                                        std::time::Instant::now(),
+                                                    ));
+                                                }
+                                                *status.parked_call.lock().unwrap() = None;
+                                                status.call_active.store(true, Ordering::Relaxed);
+                                                *status.current_call_id.lock().unwrap() = Some(b_id);
+                                                *status.current_caller.lock().unwrap() = if b_from_leg.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(b_from_leg)
+                                                };
+                                                *status.call_started_at.lock().unwrap() =
+                                                    tracker.current().map(|s| s.started_at_iso.clone());
+                                                status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            Err(sess_back) => {
+                                                eprintln!("[aokie-plugin] SWITCHBOARD: cascade restore refused after newcomer loss — caller stays parked");
+                                                parked = Some((sess_back, ctx_b));
+                                            }
+                                        }
+                                    }
+                                    SwapBackVerdict::ActiveDied => {
+                                        // The newcomer died mid-swap and the
+                                        // parked caller is still held. Close the
+                                        // newcomer; the normal retrieve path
+                                        // takes it from here on a later pass.
+                                        flush_incoming_if_pending(&mut tracker, outbox, sink);
+                                        if let Some(ended) = tracker.terminate() {
+                                            emit_call_ended(
+                                                &ended,
+                                                status.config_version.load(Ordering::Relaxed),
+                                                outbox,
+                                                sink,
+                                            );
+                                        }
+                                        status.call_active.store(false, Ordering::Relaxed);
+                                        *status.current_call_id.lock().unwrap() = None;
+                                        *status.current_caller.lock().unwrap() = None;
+                                        *status.call_started_at.lock().unwrap() = None;
+                                        status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    SwapBackVerdict::AllGone => {
+                                        flush_incoming_if_pending(&mut tracker, outbox, sink);
+                                        if let Some(ended) = tracker.terminate() {
+                                            emit_call_ended(
+                                                &ended,
+                                                status.config_version.load(Ordering::Relaxed),
+                                                outbox,
+                                                sink,
+                                            );
+                                        }
+                                        if let Some((sess_b, _ctx_b)) = parked.take() {
+                                            let ended = crate::call_session::SessionTracker::terminate_detached(sess_b, None);
+                                            emit_call_ended(
+                                                &ended,
+                                                status.config_version.load(Ordering::Relaxed),
+                                                outbox,
+                                                sink,
+                                            );
+                                        }
+                                        *status.parked_call.lock().unwrap() = None;
+                                        status.call_active.store(false, Ordering::Relaxed);
+                                        *status.current_call_id.lock().unwrap() = None;
+                                        *status.current_caller.lock().unwrap() = None;
+                                        *status.call_started_at.lock().unwrap() = None;
+                                        status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                        eprintln!("[aokie-plugin] SWITCHBOARD: cascade lost every leg — line is idle");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "voice"))]
+                    let _ = &w;
+                } else if !switch_recent {
+                    // No knock in the way: retrieve the parked caller with
+                    // one CHLD=2 (only a held call remains, so the toggle
+                    // retrieves), session + context restored.
+                    let (sess, ctx_saved) = parked.take().expect("checked above");
+                    eprintln!(
+                        "[aokie-plugin] SWITCHBOARD: foreground ended with {} parked — retrieving them (AT+CHLD=2)",
+                        sess.id
+                    );
+                    bt.flush_tx_audio();
+                    let _ = bt.hold_swap();
+                    *status.switch_in_flight.lock().unwrap() =
+                        Some(("auto_retrieve".to_string(), std::time::Instant::now()));
+                    let resumed_id = sess.id.clone();
+                    let resumed_from = sess.caller_id.clone();
+                    let was_greeted = sess.greeted;
+                    match tracker.restore(sess) {
+                        Ok(_generation) => {
+                            pending_ctx_restore = Some(ctx_saved);
+                            // A held caller who never got past the "please
+                            // hold" line is now given full attention: the
+                            // greeting block speaks the "thanks for holding"
+                            // line. A caller parked MID-conversation instead
+                            // hears the resume line (a silent return was the
+                            // live complaint).
+                            if !was_greeted {
+                                promote_greet_for = Some(resumed_id.clone());
+                            } else {
+                                resume_line_for = Some((
+                                    resumed_id.clone(),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                            status.call_active.store(true, Ordering::Relaxed);
+                            *status.current_call_id.lock().unwrap() = Some(resumed_id);
+                            *status.current_caller.lock().unwrap() = resumed_from;
+                            *status.call_started_at.lock().unwrap() =
+                                tracker.current().map(|s| s.started_at_iso.clone());
+                            *status.parked_call.lock().unwrap() = None;
+                            status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(sess_back) => {
+                            // A fresh ring raced the retrieve — keep them parked.
+                            eprintln!(
+                                "[aokie-plugin] SWITCHBOARD: a new call raced the retrieve — {} stays parked",
+                                sess_back.id
+                            );
+                            parked = Some((sess_back, ctx_saved));
+                        }
                     }
                 }
             } else if held_now == 2 && prev_call_held != 2 && !switch_recent {
@@ -5172,15 +5786,21 @@ fn run_loop(
             }
         }
 
-        // ── Phase 4 AUTO-HOLD juggle: a second caller knocked mid-call.
-        // Only the ACTIVE call hears Aokie, so the receptionist juggles the
-        // audio path: tell the current caller it will be a moment → CHLD=2 →
-        // ask the newcomer to hold with their queue position → CHLD=2 →
-        // resume the current caller. The newcomer ends up PARKED and is
-        // greeted when the current call finishes (the reconciliation block
-        // above auto-retrieves them). Runs once per waiting caller; the two
-        // swaps are separated by the multi-second hold message, which gives
-        // the phone ample settle time between CHLD toggles.
+        // ── Phase 4 AUTO-HOLD juggle (v2, VERIFIED): a second caller knocked
+        // mid-call. Only the ACTIVE call hears Aokie, so the receptionist
+        // juggles the audio path: tell the current caller it will be a
+        // moment → CHLD=2 → ask the newcomer to hold with their queue
+        // position → CHLD=2 → resume the current caller. The newcomer ends
+        // up PARKED and is greeted when the current call finishes (the
+        // reconciliation block above auto-retrieves them).
+        //
+        // v2 after the z49 live incident (the second of two rapid swaps tore
+        // both calls down while the code assumed success): every CHLD
+        // outcome is now VERIFIED against the phone's own reporting (the
+        // callheld indicator + an on-demand AT+CLCC) BEFORE session state
+        // moves, the toggles are separated by an enforced settle dwell, and
+        // every failure shape converges to a safe single-call state instead
+        // of speaking into the void. Runs once per waiting caller.
         #[cfg(feature = "voice")]
         if auto_hold
             && parked.is_none()
@@ -5220,111 +5840,464 @@ fn run_loop(
                         } {
                             eprintln!("[aokie-plugin] AUTO-HOLD: CHLD=2 to reach the newcomer failed: {e}");
                         } else {
-                            // 2) Primary is now held; the newcomer is active.
-                            // Park the primary's whole session + context.
-                            let sess_a =
-                                tracker.park().expect("primary was active");
-                            let ctx_a = std::mem::replace(
-                                &mut ctx,
-                                CallVoiceContext::fresh(None),
+                            *status.switch_in_flight.lock().unwrap() =
+                                Some(("auto_hold_accept".to_string(), Instant::now()));
+                            // 2) VERIFY the accept BEFORE any session state
+                            // moves: the knock must resolve into a held+active
+                            // pair. The settle pump keeps the tracker truthful
+                            // and fires one AT+CLCC for the judge/logs.
+                            let knock_id = w.call_id.clone();
+                            let snap = settle_swap(
+                                bt, &mut tracker, outbox, sink, &status,
+                                std::time::Duration::from_millis(5000),
+                                Some(std::time::Duration::from_millis(1500)),
+                                |s, _| matches!(
+                                    judge_accept(s, &knock_id),
+                                    AcceptVerdict::Accepted | AcceptVerdict::PrimaryGone
+                                ),
                             );
-                            // Reset the engines between speakers.
-                            synth.reset_call();
-                            stt_buf.clear();
-                            stt_had_speech = false;
-                            stt_silence = Duration::ZERO;
-                            while probe_result_rx.try_recv().is_ok() {}
-                            // Mint the newcomer as a real answered call so their
-                            // records + eventual promotion work.
-                            let b_id = w.call_id.clone();
-                            let b_from = w.from.clone();
-                            tracker.ring(b_id.clone(), aokie_core::events::now_iso8601());
-                            if !b_from.is_empty() {
-                                tracker.caller_id(b_from.clone());
-                            }
-                            flush_incoming_if_pending(&mut tracker, outbox, sink);
-                            if !b_from.is_empty() {
-                                emit(
-                                    outbox,
-                                    sink,
-                                    aokie_core::events::aokie_event(
-                                        crate::contract::events::CALL_CALLER_ID,
-                                        &b_id,
-                                        json!({"callId": b_id, "from": b_from, "at": aokie_core::events::now_iso8601()}),
-                                    ),
-                                );
-                            }
-                            tracker.answered();
-                            stt_current_gen.store(tracker.generation(), Ordering::Relaxed);
-                            // 3) Ask the newcomer to hold (queue position 2: the
-                            // primary + this caller; max one parked in v1).
-                            let hold_line = second_caller_hold_line(2);
-                            let _ = speak_announcement(
-                                bt, &synth, &hold_line, sr, &ctx.pace,
-                                protected_max_ms, &control_rx, &mut pending_controls,
+                            let accept = judge_accept(&snap, &w.call_id);
+                            eprintln!(
+                                "[aokie-plugin] AUTO-HOLD: accept verdict {:?} (callheld={}, clcc legs={})",
+                                accept,
+                                snap.callheld,
+                                snap.clcc.as_ref().map(|c| c.len()).unwrap_or(0)
                             );
-                            emit_turn(outbox, sink, &b_id, ctx.turn_index, "bot", &hold_line);
-                            ctx.turn_index += 1;
-                            // 4) Swap back: newcomer held, primary active again.
-                            bt.flush_tx_audio();
-                            let _ = bt.hold_swap();
-                            let sess_b = tracker.park().expect("newcomer was active");
-                            let ctx_b = std::mem::replace(&mut ctx, ctx_a);
-                            match tracker.restore(sess_a) {
-                                Ok(_gen) => {}
-                                Err(back) => {
-                                    // Cannot normally happen (idle after park).
-                                    eprintln!("[aokie-plugin] AUTO-HOLD: primary restore refused — recovering");
-                                    let _ = tracker.restore(back);
+                            match accept {
+                                AcceptVerdict::Accepted => {
+                                    // 3) The newcomer has the line — NOW park the
+                                    // primary's session + context and mint the
+                                    // newcomer as a real answered call.
+                                    let sess_a = tracker.park().expect("primary was active");
+                                    let a_id = sess_a.id.clone();
+                                    let a_number = sess_a.caller_id.clone();
+                                    let ctx_a = std::mem::replace(
+                                        &mut ctx,
+                                        CallVoiceContext::fresh(None),
+                                    );
+                                    synth.reset_call();
+                                    stt_buf.clear();
+                                    stt_had_speech = false;
+                                    stt_silence = Duration::ZERO;
+                                    while probe_result_rx.try_recv().is_ok() {}
+                                    let b_id = w.call_id.clone();
+                                    let b_from = w.from.clone();
+                                    tracker.ring(b_id.clone(), aokie_core::events::now_iso8601());
+                                    if !b_from.is_empty() {
+                                        tracker.caller_id(b_from.clone());
+                                    }
+                                    flush_incoming_if_pending(&mut tracker, outbox, sink);
+                                    if !b_from.is_empty() {
+                                        emit(
+                                            outbox,
+                                            sink,
+                                            aokie_core::events::aokie_event(
+                                                crate::contract::events::CALL_CALLER_ID,
+                                                &b_id,
+                                                json!({"callId": b_id, "from": b_from, "at": aokie_core::events::now_iso8601()}),
+                                            ),
+                                        );
+                                    }
+                                    tracker.answered();
+                                    emit(
+                                        outbox,
+                                        sink,
+                                        aokie_core::events::aokie_event(
+                                            crate::contract::events::CALL_ANSWERED,
+                                            &b_id,
+                                            json!({"at": aokie_core::events::now_iso8601()}),
+                                        ),
+                                    );
+                                    stt_current_gen.store(tracker.generation(), Ordering::Relaxed);
+                                    *status.parked_call.lock().unwrap() = Some(SwitchboardLeg {
+                                        call_id: a_id.clone(),
+                                        from: a_number.clone().unwrap_or_default(),
+                                        since_iso: aokie_core::events::now_iso8601(),
+                                    });
+                                    *status.current_call_id.lock().unwrap() = Some(b_id.clone());
+                                    *status.current_caller.lock().unwrap() =
+                                        if b_from.is_empty() { None } else { Some(b_from.clone()) };
+                                    *status.call_started_at.lock().unwrap() =
+                                        tracker.current().map(|s| s.started_at_iso.clone());
+                                    status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                    // 4) Wait for the (possibly re-established)
+                                    // SCO, then ask the newcomer to hold with
+                                    // their queue position.
+                                    let _ = settle_swap(
+                                        bt, &mut tracker, outbox, sink, &status,
+                                        std::time::Duration::from_millis(2500), None,
+                                        |_, sr_now| sr_now > 0,
+                                    );
+                                    let sr_b = bt.get_sample_rate();
+                                    let hold_line = second_caller_hold_line(2);
+                                    if sr_b > 0 {
+                                        let _ = speak_announcement(
+                                            bt, &synth, &hold_line, sr_b, &ctx.pace,
+                                            protected_max_ms, &control_rx, &mut pending_controls,
+                                        );
+                                        emit_turn(outbox, sink, &b_id, ctx.turn_index, "bot", &hold_line);
+                                        ctx.turn_index += 1;
+                                    } else {
+                                        eprintln!("[aokie-plugin] AUTO-HOLD: no SCO after the accept — hold line skipped");
+                                    }
+                                    // 5) Enforced quiet dwell between the two
+                                    // toggles (rapid CHLD pairs are what wedged
+                                    // the z49 test), then swap back.
+                                    let _ = settle_swap(
+                                        bt, &mut tracker, outbox, sink, &status,
+                                        std::time::Duration::from_millis(1200), None,
+                                        |_, _| false,
+                                    );
+                                    bt.flush_tx_audio();
+                                    let swap_back_sent = bt.hold_swap();
+                                    *status.switch_in_flight.lock().unwrap() =
+                                        Some(("auto_hold_return".to_string(), Instant::now()));
+                                    let mut verdict = if swap_back_sent.is_err() {
+                                        eprintln!("[aokie-plugin] AUTO-HOLD: swap-back CHLD=2 failed to send — staying with the newcomer");
+                                        SwapBackVerdict::StayedOnNewcomer
+                                    } else {
+                                        let snap2 = settle_swap(
+                                            bt, &mut tracker, outbox, sink, &status,
+                                            std::time::Duration::from_millis(4000),
+                                            Some(std::time::Duration::from_millis(1200)),
+                                            |s, _| s.clcc.is_some() || (s.callheld == 0 && !s.current_alive),
+                                        );
+                                        judge_swap_back(
+                                            &snap2,
+                                            a_number.as_deref(),
+                                            if b_from.is_empty() { None } else { Some(b_from.as_str()) },
+                                        )
+                                    };
+                                    if verdict == SwapBackVerdict::StayedOnNewcomer
+                                        && swap_back_sent.is_ok()
+                                    {
+                                        // The topology is KNOWN (one active + one
+                                        // held, no knock): a second CHLD=2 is a
+                                        // pure verified swap, not a blind retry.
+                                        eprintln!("[aokie-plugin] AUTO-HOLD: swap-back did not take — one verified retry");
+                                        let _ = settle_swap(
+                                            bt, &mut tracker, outbox, sink, &status,
+                                            std::time::Duration::from_millis(1500), None,
+                                            |_, _| false,
+                                        );
+                                        bt.flush_tx_audio();
+                                        if bt.hold_swap().is_ok() {
+                                            *status.switch_in_flight.lock().unwrap() = Some((
+                                                "auto_hold_return_retry".to_string(),
+                                                Instant::now(),
+                                            ));
+                                            let snap3 = settle_swap(
+                                                bt, &mut tracker, outbox, sink, &status,
+                                                std::time::Duration::from_millis(4000),
+                                                Some(std::time::Duration::from_millis(1200)),
+                                                |s, _| s.clcc.is_some() || (s.callheld == 0 && !s.current_alive),
+                                            );
+                                            verdict = judge_swap_back(
+                                                &snap3,
+                                                a_number.as_deref(),
+                                                if b_from.is_empty() { None } else { Some(b_from.as_str()) },
+                                            );
+                                        }
+                                    }
+                                    eprintln!("[aokie-plugin] AUTO-HOLD: swap-back verdict {verdict:?}");
+                                    match verdict {
+                                        SwapBackVerdict::Swapped => {
+                                            // Newcomer parked; the primary resumes
+                                            // with their whole conversation intact.
+                                            let sess_b = tracker.park().expect("newcomer was active");
+                                            let ctx_b = std::mem::replace(&mut ctx, ctx_a);
+                                            match tracker.restore(sess_a) {
+                                                Ok(_gen) => {}
+                                                Err(back) => {
+                                                    eprintln!("[aokie-plugin] AUTO-HOLD: primary restore refused — recovering");
+                                                    let _ = tracker.restore(back);
+                                                }
+                                            }
+                                            // The primary CONTINUES — not a call
+                                            // boundary: align the generation so the
+                                            // reset block does not wipe their
+                                            // conversation context.
+                                            voice_call_gen = tracker.generation();
+                                            stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
+                                            ctx.rt_lane = tracker.call_id().map(|id| {
+                                                crate::realtime::RealtimeLane::new(
+                                                    id.to_string(),
+                                                    voice_call_gen,
+                                                    Instant::now(),
+                                                )
+                                            });
+                                            synth.reset_call();
+                                            stt_buf.clear();
+                                            stt_had_speech = false;
+                                            stt_silence = Duration::ZERO;
+                                            while probe_result_rx.try_recv().is_ok() {}
+                                            parked = Some((sess_b, ctx_b));
+                                            *status.parked_call.lock().unwrap() = Some(SwitchboardLeg {
+                                                call_id: b_id.clone(),
+                                                from: b_from.clone(),
+                                                since_iso: aokie_core::events::now_iso8601(),
+                                            });
+                                            *status.waiting_call.lock().unwrap() = None;
+                                            *status.current_call_id.lock().unwrap() =
+                                                tracker.call_id().map(|s| s.to_string());
+                                            *status.current_caller.lock().unwrap() =
+                                                tracker.current().and_then(|s| s.caller_id.clone());
+                                            *status.call_started_at.lock().unwrap() =
+                                                tracker.current().map(|s| s.started_at_iso.clone());
+                                            status.call_active.store(true, Ordering::Relaxed);
+                                            status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                            // The resume line speaks via the hook
+                                            // below the reset block (it waits for
+                                            // the SCO to come back and retries).
+                                            resume_line_for = Some((a_id.clone(), Instant::now()));
+                                            eprintln!(
+                                                "[aokie-plugin] AUTO-HOLD: {} parked (next in queue), resumed with the primary caller",
+                                                b_id
+                                            );
+                                        }
+                                        SwapBackVerdict::SwappedNewcomerGone => {
+                                            // The swap took but the newcomer's leg
+                                            // vanished — close them honestly; the
+                                            // primary is active alone.
+                                            flush_incoming_if_pending(&mut tracker, outbox, sink);
+                                            if let Some(ended) = tracker.terminate() {
+                                                emit_call_ended(
+                                                    &ended,
+                                                    status.config_version.load(Ordering::Relaxed),
+                                                    outbox,
+                                                    sink,
+                                                );
+                                            }
+                                            ctx = ctx_a;
+                                            match tracker.restore(sess_a) {
+                                                Ok(_gen) => {}
+                                                Err(back) => {
+                                                    eprintln!("[aokie-plugin] AUTO-HOLD: primary restore refused — recovering");
+                                                    let _ = tracker.restore(back);
+                                                }
+                                            }
+                                            voice_call_gen = tracker.generation();
+                                            stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
+                                            ctx.rt_lane = tracker.call_id().map(|id| {
+                                                crate::realtime::RealtimeLane::new(
+                                                    id.to_string(),
+                                                    voice_call_gen,
+                                                    Instant::now(),
+                                                )
+                                            });
+                                            synth.reset_call();
+                                            stt_buf.clear();
+                                            stt_had_speech = false;
+                                            stt_silence = Duration::ZERO;
+                                            while probe_result_rx.try_recv().is_ok() {}
+                                            *status.parked_call.lock().unwrap() = None;
+                                            *status.current_call_id.lock().unwrap() =
+                                                tracker.call_id().map(|s| s.to_string());
+                                            *status.current_caller.lock().unwrap() =
+                                                tracker.current().and_then(|s| s.caller_id.clone());
+                                            *status.call_started_at.lock().unwrap() =
+                                                tracker.current().map(|s| s.started_at_iso.clone());
+                                            status.call_active.store(true, Ordering::Relaxed);
+                                            status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                            resume_line_for = Some((a_id.clone(), Instant::now()));
+                                            eprintln!("[aokie-plugin] AUTO-HOLD: newcomer's leg vanished during the swap-back — primary resumed alone");
+                                        }
+                                        SwapBackVerdict::StayedOnNewcomer => {
+                                            // DEGRADED single-swap: the phone will
+                                            // not give the primary back right now.
+                                            // The newcomer becomes the conversation
+                                            // (the promoted greeting releases them
+                                            // from "please hold"); the primary
+                                            // stays parked — the reconciliation
+                                            // block auto-retrieves them the moment
+                                            // this call ends.
+                                            parked = Some((sess_a, ctx_a));
+                                            promote_greet_for = Some(b_id.clone());
+                                            pending_ctx_restore = Some(std::mem::replace(
+                                                &mut ctx,
+                                                CallVoiceContext::fresh(None),
+                                            ));
+                                            status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                            eprintln!("[aokie-plugin] AUTO-HOLD: staying with the newcomer — the primary remains parked for auto-retrieve");
+                                        }
+                                        SwapBackVerdict::NewcomerAlone => {
+                                            // The primary's held leg vanished — the
+                                            // newcomer keeps the line alone. Close
+                                            // the primary honestly; release the
+                                            // newcomer from "please hold".
+                                            let ended_a = crate::call_session::SessionTracker::terminate_detached(sess_a, None);
+                                            emit_call_ended(
+                                                &ended_a,
+                                                status.config_version.load(Ordering::Relaxed),
+                                                outbox,
+                                                sink,
+                                            );
+                                            drop(ctx_a);
+                                            *status.parked_call.lock().unwrap() = None;
+                                            promote_greet_for = Some(b_id.clone());
+                                            pending_ctx_restore = Some(std::mem::replace(
+                                                &mut ctx,
+                                                CallVoiceContext::fresh(None),
+                                            ));
+                                            status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                            eprintln!("[aokie-plugin] AUTO-HOLD: the primary's leg dropped while held — continuing with the newcomer");
+                                        }
+                                        SwapBackVerdict::ActiveDied => {
+                                            // The newcomer died mid-swap: close
+                                            // them; park the primary — the proven
+                                            // reconciliation retrieve brings them
+                                            // back on a later pass.
+                                            flush_incoming_if_pending(&mut tracker, outbox, sink);
+                                            if let Some(ended) = tracker.terminate() {
+                                                emit_call_ended(
+                                                    &ended,
+                                                    status.config_version.load(Ordering::Relaxed),
+                                                    outbox,
+                                                    sink,
+                                                );
+                                            }
+                                            parked = Some((sess_a, ctx_a));
+                                            *status.parked_call.lock().unwrap() = Some(SwitchboardLeg {
+                                                call_id: a_id.clone(),
+                                                from: a_number.clone().unwrap_or_default(),
+                                                since_iso: aokie_core::events::now_iso8601(),
+                                            });
+                                            status.call_active.store(false, Ordering::Relaxed);
+                                            *status.current_call_id.lock().unwrap() = None;
+                                            *status.current_caller.lock().unwrap() = None;
+                                            *status.call_started_at.lock().unwrap() = None;
+                                            status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                            eprintln!("[aokie-plugin] AUTO-HOLD: the newcomer died mid-swap — the primary will be retrieved from hold");
+                                        }
+                                        SwapBackVerdict::AllGone => {
+                                            // The z49 signature — both legs tore
+                                            // down. Close everything honestly; the
+                                            // per-call reset re-arms a clean idle.
+                                            flush_incoming_if_pending(&mut tracker, outbox, sink);
+                                            if let Some(ended) = tracker.terminate() {
+                                                emit_call_ended(
+                                                    &ended,
+                                                    status.config_version.load(Ordering::Relaxed),
+                                                    outbox,
+                                                    sink,
+                                                );
+                                            }
+                                            let ended_a = crate::call_session::SessionTracker::terminate_detached(sess_a, None);
+                                            emit_call_ended(
+                                                &ended_a,
+                                                status.config_version.load(Ordering::Relaxed),
+                                                outbox,
+                                                sink,
+                                            );
+                                            drop(ctx_a);
+                                            *status.parked_call.lock().unwrap() = None;
+                                            status.call_active.store(false, Ordering::Relaxed);
+                                            *status.current_call_id.lock().unwrap() = None;
+                                            *status.current_caller.lock().unwrap() = None;
+                                            *status.call_started_at.lock().unwrap() = None;
+                                            status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                            eprintln!("[aokie-plugin] AUTO-HOLD: both calls tore down during the swap-back — line is idle");
+                                        }
+                                    }
+                                }
+                                AcceptVerdict::HeldAlone => {
+                                    // The phone held the primary but gave the line
+                                    // to nobody. Park them for real — the proven
+                                    // reconciliation block retrieves a parked
+                                    // caller the moment the foreground is empty,
+                                    // with all its raced-ring guards.
+                                    eprintln!("[aokie-plugin] AUTO-HOLD: primary held with nobody active — parking them for auto-retrieve");
+                                    let sess_a = tracker.park().expect("primary was tracked");
+                                    let a_id = sess_a.id.clone();
+                                    let a_from = sess_a.caller_id.clone().unwrap_or_default();
+                                    let ctx_a = std::mem::replace(
+                                        &mut ctx,
+                                        CallVoiceContext::fresh(None),
+                                    );
+                                    parked = Some((sess_a, ctx_a));
+                                    *status.parked_call.lock().unwrap() = Some(SwitchboardLeg {
+                                        call_id: a_id,
+                                        from: a_from,
+                                        since_iso: aokie_core::events::now_iso8601(),
+                                    });
+                                    status.call_active.store(false, Ordering::Relaxed);
+                                    *status.current_call_id.lock().unwrap() = None;
+                                    *status.current_caller.lock().unwrap() = None;
+                                    *status.call_started_at.lock().unwrap() = None;
+                                    status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                }
+                                AcceptVerdict::NothingChanged | AcceptVerdict::KnockGone => {
+                                    // The phone ignored the CHLD (or the waiting
+                                    // caller gave up mid-swap) — the primary still
+                                    // has the line; own the awkward beat out loud.
+                                    eprintln!("[aokie-plugin] AUTO-HOLD: juggle abandoned ({accept:?}) — resuming the primary");
+                                    let sr_now = bt.get_sample_rate();
+                                    if sr_now > 0 {
+                                        let _ = speak_announcement(
+                                            bt, &synth, HOLD_JUGGLE_ABORT_LINE, sr_now, &ctx.pace,
+                                            protected_max_ms, &control_rx, &mut pending_controls,
+                                        );
+                                    }
+                                }
+                                AcceptVerdict::PrimaryGone => {
+                                    // The primary's call died mid-accept — the
+                                    // settle pump already closed it truthfully. If
+                                    // the phone reports a live leg (the newcomer
+                                    // made it on), mint them as a real answered
+                                    // call; the promoted greeting releases them.
+                                    let newcomer_on = snap
+                                        .clcc
+                                        .as_ref()
+                                        .is_some_and(|c| c.iter().any(|l| l.status == 0))
+                                        || snap.callheld == 1;
+                                    if snap.waiting_id.is_none() && newcomer_on {
+                                        eprintln!("[aokie-plugin] AUTO-HOLD: primary ended mid-accept — the newcomer has the line; minting their call");
+                                        let b_id = w.call_id.clone();
+                                        let b_from = w.from.clone();
+                                        tracker.ring(b_id.clone(), aokie_core::events::now_iso8601());
+                                        if !b_from.is_empty() {
+                                            tracker.caller_id(b_from.clone());
+                                        }
+                                        flush_incoming_if_pending(&mut tracker, outbox, sink);
+                                        if !b_from.is_empty() {
+                                            emit(
+                                                outbox,
+                                                sink,
+                                                aokie_core::events::aokie_event(
+                                                    crate::contract::events::CALL_CALLER_ID,
+                                                    &b_id,
+                                                    json!({"callId": b_id, "from": b_from, "at": aokie_core::events::now_iso8601()}),
+                                                ),
+                                            );
+                                        }
+                                        tracker.answered();
+                                        emit(
+                                            outbox,
+                                            sink,
+                                            aokie_core::events::aokie_event(
+                                                crate::contract::events::CALL_ANSWERED,
+                                                &b_id,
+                                                json!({"at": aokie_core::events::now_iso8601()}),
+                                            ),
+                                        );
+                                        *status.current_call_id.lock().unwrap() = Some(b_id.clone());
+                                        *status.current_caller.lock().unwrap() =
+                                            if b_from.is_empty() { None } else { Some(b_from.clone()) };
+                                        *status.call_started_at.lock().unwrap() =
+                                            tracker.current().map(|s| s.started_at_iso.clone());
+                                        status.call_active.store(true, Ordering::Relaxed);
+                                        *status.waiting_call.lock().unwrap() = None;
+                                        status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                                        // A fresh call: the per-call reset fences
+                                        // STT/context; the greeting block then
+                                        // speaks the promoted greeting.
+                                        promote_greet_for = Some(b_id);
+                                    } else {
+                                        eprintln!("[aokie-plugin] AUTO-HOLD: primary ended mid-accept and no live leg is visible — going idle");
+                                    }
                                 }
                             }
-                            // The primary CONTINUES — this is NOT a call
-                            // boundary, so align voice_call_gen to the primary's
-                            // fresh generation and re-fence STT so the reset
-                            // block does not fire and wipe the primary's context.
-                            voice_call_gen = tracker.generation();
-                            stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
-                            ctx.rt_lane = tracker.call_id().map(|id| {
-                                crate::realtime::RealtimeLane::new(
-                                    id.to_string(),
-                                    voice_call_gen,
-                                    Instant::now(),
-                                )
-                            });
-                            synth.reset_call();
-                            stt_buf.clear();
-                            stt_had_speech = false;
-                            stt_silence = Duration::ZERO;
-                            while probe_result_rx.try_recv().is_ok() {}
-                            // Record the newcomer as the parked caller.
-                            parked = Some((sess_b, ctx_b));
-                            *status.parked_call.lock().unwrap() = Some(SwitchboardLeg {
-                                call_id: b_id.clone(),
-                                from: b_from,
-                                since_iso: aokie_core::events::now_iso8601(),
-                            });
-                            *status.waiting_call.lock().unwrap() = None;
-                            *status.current_call_id.lock().unwrap() =
-                                tracker.call_id().map(|s| s.to_string());
-                            *status.current_caller.lock().unwrap() =
-                                tracker.current().and_then(|s| s.caller_id.clone());
-                            *status.call_started_at.lock().unwrap() =
-                                tracker.current().map(|s| s.started_at_iso.clone());
-                            status.call_active.store(true, Ordering::Relaxed);
-                            status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
-                            *status.switch_in_flight.lock().unwrap() =
-                                Some(("auto_hold".to_string(), Instant::now()));
-                            prev_call_held =
-                                status.call_held_state.load(Ordering::Relaxed);
-                            // 5) Resume with the primary.
-                            let _ = speak_announcement(
-                                bt, &synth, HOLD_PRIMARY_RESUME_LINE, sr, &ctx.pace,
-                                protected_max_ms, &control_rx, &mut pending_controls,
-                            );
-                            eprintln!(
-                                "[aokie-plugin] AUTO-HOLD: {} parked, resumed with the primary caller",
-                                b_id
-                            );
+                            prev_call_held = status.call_held_state.load(Ordering::Relaxed);
                         }
                     }
                 }
@@ -5440,6 +6413,32 @@ fn run_loop(
             // makes it rebuild at THIS call's actual sample rate on the first
             // captured frame below.
             aec = None;
+        }
+
+        // Phase 4: a caller retrieved from hold mid-conversation hears the
+        // resume line the moment their audio path is back (the promoted
+        // greeting covers never-greeted callers; this covers everyone else —
+        // a SILENT return was the live complaint on the first supervised
+        // switchboard test). Retries across passes while the SCO
+        // re-establishes; expires quietly if the call moves on.
+        #[cfg(feature = "voice")]
+        if let Some((id, set_at)) = resume_line_for.clone() {
+            if tracker.call_id() != Some(id.as_str())
+                || set_at.elapsed() > std::time::Duration::from_secs(10)
+            {
+                resume_line_for = None;
+            } else if tracker.current().is_some_and(|s| s.is_active()) {
+                let sr = bt.get_sample_rate();
+                if sr > 0 {
+                    resume_line_for = None;
+                    let _ = speak_announcement(
+                        bt, &synth, HOLD_PRIMARY_RESUME_LINE, sr, &ctx.pace,
+                        protected_max_ms, &control_rx, &mut pending_controls,
+                    );
+                    emit_turn(outbox, sink, &id, ctx.turn_index, "bot", HOLD_PRIMARY_RESUME_LINE);
+                    ctx.turn_index += 1;
+                }
+            }
         }
 
         status
@@ -8822,9 +9821,22 @@ fn run_loop(
                                 ));
                                 let resumed_id = sess_a.id.clone();
                                 let resumed_from = sess_a.caller_id.clone();
+                                let was_greeted = sess_a.greeted;
                                 match tracker.restore(sess_a) {
                                     Ok(_generation) => {
                                         pending_ctx_restore = Some(ctx_a);
+                                        // User feedback (first supervised test):
+                                        // a swap must never be SILENT — greet a
+                                        // never-greeted caller, welcome everyone
+                                        // else back.
+                                        if !was_greeted {
+                                            promote_greet_for = Some(resumed_id.clone());
+                                        } else {
+                                            resume_line_for = Some((
+                                                resumed_id.clone(),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
                                         status.call_active.store(true, Ordering::Relaxed);
                                         *status.current_call_id.lock().unwrap() =
                                             Some(resumed_id.clone());
@@ -9511,6 +10523,25 @@ fn handle_event(
                     lines.push(rendered);
                 }
                 _ => *snapshot = Some((std::time::Instant::now(), vec![rendered])),
+            }
+            drop(snapshot);
+            // Structured twin — same burst window, consumed by the
+            // verified-swap machinery (numbers matter there, rendering
+            // doesn't).
+            let leg = ClccLeg {
+                index,
+                status: leg_status,
+                number,
+            };
+            let mut calls = status.clcc_calls.lock().unwrap();
+            match calls.as_mut() {
+                Some((started, legs))
+                    if started.elapsed() < std::time::Duration::from_millis(1500)
+                        && legs.len() < 8 =>
+                {
+                    legs.push(leg);
+                }
+                _ => *calls = Some((std::time::Instant::now(), vec![leg])),
             }
         }
         E::CallRinging => {
@@ -10670,6 +11701,123 @@ mod tests {
                 "idx=2 dir=1 status=waiting number=0491570157".to_string(),
             ]
         );
+        // The STRUCTURED twin folds the same burst — the verified-swap
+        // machinery judges numbers/status off exactly these.
+        let calls = status.clcc_calls.lock().unwrap().clone();
+        let (_, legs) = calls.expect("structured snapshot recorded");
+        assert_eq!(
+            legs,
+            vec![
+                ClccLeg { index: 1, status: 0, number: Some("0491570156".to_string()) },
+                ClccLeg { index: 2, status: 5, number: Some("0491570157".to_string()) },
+            ]
+        );
+    }
+
+    /// Phase 4 verified swaps: the pure accept judge — every observed shape
+    /// maps to exactly one convergence path.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn judge_accept_covers_every_topology() {
+        use super::{judge_accept, AcceptVerdict, SwapSnapshot};
+        let snap = |callheld: u64, waiting: Option<&str>, alive: bool| SwapSnapshot {
+            callheld,
+            waiting_id: waiting.map(str::to_string),
+            current_alive: alive,
+            clcc: None,
+        };
+        // Knock resolved + held/active pair = the newcomer has the line.
+        assert_eq!(judge_accept(&snap(1, None, true), "w1"), AcceptVerdict::Accepted);
+        // The primary died mid-accept beats everything else.
+        assert_eq!(judge_accept(&snap(1, None, false), "w1"), AcceptVerdict::PrimaryGone);
+        // Held with NOBODY active — retrieve territory (even if the knock
+        // is somehow still showing).
+        assert_eq!(judge_accept(&snap(2, Some("w1"), true), "w1"), AcceptVerdict::HeldAlone);
+        assert_eq!(judge_accept(&snap(2, None, true), "w1"), AcceptVerdict::HeldAlone);
+        // Knock still up, nothing held: the phone ignored the CHLD.
+        assert_eq!(
+            judge_accept(&snap(0, Some("w1"), true), "w1"),
+            AcceptVerdict::NothingChanged
+        );
+        // A DIFFERENT knock id is a new episode, not this accept resolving.
+        assert_eq!(judge_accept(&snap(0, Some("w2"), true), "w1"), AcceptVerdict::KnockGone);
+        // Knock vanished without a pair forming: the waiting caller gave up.
+        assert_eq!(judge_accept(&snap(0, None, true), "w1"), AcceptVerdict::KnockGone);
+    }
+
+    /// Phase 4 verified swaps: the pure swap-back judge. CLCC numbers name
+    /// WHO is active (the indicator cannot); the indicator is the fallback.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn judge_swap_back_names_the_active_leg() {
+        use super::{judge_swap_back, ClccLeg, SwapBackVerdict, SwapSnapshot};
+        let leg = |status: u8, number: Option<&str>| ClccLeg {
+            index: 1,
+            status,
+            number: number.map(str::to_string),
+        };
+        let snap = |callheld: u64, alive: bool, clcc: Option<Vec<ClccLeg>>| SwapSnapshot {
+            callheld,
+            waiting_id: None,
+            current_alive: alive,
+            clcc,
+        };
+        let a = Some("0491570156");
+        let b = Some("0491570157");
+        // CLCC: primary active + newcomer held = the swap took.
+        assert_eq!(
+            judge_swap_back(
+                &snap(1, true, Some(vec![leg(0, a), leg(1, b)])),
+                a,
+                b
+            ),
+            SwapBackVerdict::Swapped
+        );
+        // CLCC: newcomer still active = the toggle was ignored.
+        assert_eq!(
+            judge_swap_back(
+                &snap(1, true, Some(vec![leg(0, b), leg(1, a)])),
+                a,
+                b
+            ),
+            SwapBackVerdict::StayedOnNewcomer
+        );
+        // CLCC: primary active ALONE = swap took, newcomer's leg vanished.
+        assert_eq!(
+            judge_swap_back(&snap(0, true, Some(vec![leg(0, a)])), a, b),
+            SwapBackVerdict::SwappedNewcomerGone
+        );
+        // CLCC: newcomer active ALONE = the primary's held leg vanished.
+        assert_eq!(
+            judge_swap_back(&snap(0, true, Some(vec![leg(0, b)])), a, b),
+            SwapBackVerdict::NewcomerAlone
+        );
+        // CLCC: nobody active but someone held = retrieve.
+        assert_eq!(
+            judge_swap_back(&snap(2, true, Some(vec![leg(1, a)])), a, b),
+            SwapBackVerdict::ActiveDied
+        );
+        // CLCC: empty list = the z49 signature, everything gone.
+        assert_eq!(
+            judge_swap_back(&snap(0, false, Some(vec![])), a, b),
+            SwapBackVerdict::AllGone
+        );
+        // Withheld numbers + one lone active leg: keep the tracker's
+        // session (no further CHLD needed) — NewcomerAlone.
+        assert_eq!(
+            judge_swap_back(&snap(0, true, Some(vec![leg(0, None)])), a, None),
+            SwapBackVerdict::NewcomerAlone
+        );
+        // Dark numbers with a full pair fall through to the indicator.
+        assert_eq!(
+            judge_swap_back(&snap(1, true, Some(vec![leg(0, None), leg(1, None)])), None, None),
+            SwapBackVerdict::Swapped
+        );
+        // Indicator-only fallbacks (no fresh CLCC at all).
+        assert_eq!(judge_swap_back(&snap(1, true, None), a, b), SwapBackVerdict::Swapped);
+        assert_eq!(judge_swap_back(&snap(2, true, None), a, b), SwapBackVerdict::ActiveDied);
+        assert_eq!(judge_swap_back(&snap(0, true, None), a, b), SwapBackVerdict::NewcomerAlone);
+        assert_eq!(judge_swap_back(&snap(0, false, None), a, b), SwapBackVerdict::AllGone);
     }
 
     /// Audit AK-001/AK-01: an operator-rejected ring ends "rejected", a

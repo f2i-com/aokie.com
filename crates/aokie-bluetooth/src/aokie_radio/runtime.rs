@@ -228,6 +228,12 @@ enum ControlCommand {
     /// truth stays with the AG's indicator stream + CLCC, exactly like
     /// Answer/Dial.
     HoldSwap,
+    /// Phase 4 (switchboard): fire `AT+CLCC` on demand. The verified-swap
+    /// machinery sends this after a CHLD=2 so the authoritative call list
+    /// (who is active, who is held, who is waiting — with numbers) comes
+    /// back as CallListEntry events and the switchboard can CONFIRM a swap
+    /// took before speaking, instead of assuming.
+    QueryCalls,
     SendAudio(Vec<i16>),
     /// Drain `sco_tx_queue` immediately, dropping any TTS bytes that were
     /// already queued for transmission. Used by "Take Over Call" so the
@@ -600,6 +606,15 @@ impl AokieRuntime {
     pub fn hold_swap(&self) -> Result<(), String> {
         self.control_tx
             .send(ControlCommand::HoldSwap)
+            .map_err(|_| "aokie-radio runtime is no longer running".to_string())
+    }
+
+    /// Phase 4 (switchboard): fire an `AT+CLCC` topology query now. The
+    /// response arrives as CallListEntry events — best-effort verification,
+    /// so a missing SLC is a log line, never a health-degrading error.
+    pub fn query_calls(&self) -> Result<(), String> {
+        self.control_tx
+            .send(ControlCommand::QueryCalls)
             .map_err(|_| "aokie-radio runtime is no longer running".to_string())
     }
 
@@ -2358,6 +2373,23 @@ fn run_runtime(
                         if let Err(e) = transport.write_acl(packet) {
                             let _ =
                                 event_tx.send(RuntimeEvent::Error(format!("holdSwap: {}", e)));
+                        }
+                    }
+                }
+                Ok(ControlCommand::QueryCalls) => {
+                    // Verification query — best effort by design. A missing
+                    // SLC here means the link already died and the indicator
+                    // machinery is reporting that separately; degrade to a
+                    // log line rather than a health error.
+                    let packets = l2cap_state
+                        .build_hfp_call_control_packets(HfpAtCommand::ListCurrentCalls)?;
+                    eprintln!(
+                        "[AokieRadio] QueryCalls requested — built {} ACL packet(s) for AT+CLCC",
+                        packets.len()
+                    );
+                    for packet in &packets {
+                        if let Err(e) = transport.write_acl(packet) {
+                            eprintln!("[AokieRadio] queryCalls: {}", e);
                         }
                     }
                 }

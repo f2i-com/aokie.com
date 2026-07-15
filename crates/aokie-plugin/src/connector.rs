@@ -507,6 +507,35 @@ impl Plugin {
             // previously-armed flag once the setting is off.
             std::env::remove_var("AOKIE_CALL_WAITING");
         }
+        // autoHoldQueue (Phase 4 slice 6): the automatic spoken hold juggle —
+        // a second caller knocking mid-call is answered ("please hold, you're
+        // next in the queue"), parked, and the first caller resumed; parked
+        // callers are retrieved FIFO as calls end. Every AT+CHLD=2 outcome is
+        // verified against the phone's own reporting before session state
+        // moves (the raw double-swap wedged the live Pixel — z49 incident).
+        // Requires holdAndCallWaiting: without the negotiated capability no
+        // knock is ever seen, so the flag would be inert — refuse to arm it
+        // half-configured rather than look enabled while doing nothing.
+        let auto_hold_queue = self
+            .store
+            .config
+            .settings
+            .get("autoHoldQueue")
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false);
+        if auto_hold_queue && call_waiting {
+            std::env::set_var("AOKIE_AUTO_HOLD", "1");
+            eprintln!(
+                "[aokie-plugin] autoHoldQueue ON → automatic hold + queue juggle armed (verified swaps)"
+            );
+        } else {
+            if auto_hold_queue {
+                eprintln!(
+                    "[aokie-plugin] autoHoldQueue is set but holdAndCallWaiting is OFF — the queue stays disarmed (enable call waiting first)"
+                );
+            }
+            std::env::remove_var("AOKIE_AUTO_HOLD");
+        }
         // Call screening (spec Phase 0): number rules → env, read into a
         // ScreenPolicy at radio start and on live settings.set (see below).
         apply_screening_env(&self.store.config.settings);
@@ -2774,6 +2803,7 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     // (a second caller is detected + recorded, never answered/held) —
     // default OFF keeps the legacy wire behaviour byte-for-byte.
     SettingSpec { key: "holdAndCallWaiting", kind: SettingKind::Bool, applies_live: false },
+    SettingSpec { key: "autoHoldQueue", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "blockedNumbers", kind: SettingKind::Str { max_chars: 4000 }, applies_live: true },
     SettingSpec { key: "acceptPattern", kind: SettingKind::Str { max_chars: 200 }, applies_live: true },
     SettingSpec { key: "rejectPrivate", kind: SettingKind::Bool, applies_live: true },
