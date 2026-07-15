@@ -5810,7 +5810,16 @@ fn run_loop(
             let primary_active =
                 tracker.current().is_some_and(|s| s.is_active() && !s.outbound);
             let busy = ctx.manager_gate.awaiting_pin || ctx.agent_hung_up;
-            if let Some(w) = status.waiting_call.lock().unwrap().clone() {
+            // ⚠️ Bind the snapshot BEFORE the if-let. In edition 2021 an
+            // if-let scrutinee's temporaries — here the waiting_call mutex
+            // GUARD — live to the end of the whole if-let, and the juggle
+            // body re-locks waiting_call on every settle iteration
+            // (settle_swap → swap_snapshot + handle_event). A guard held
+            // across that is a same-thread deadlock: live incident
+            // 2026-07-15, the radio froze at the first settle of the first
+            // juggle (WATCHDOG "stalled in phase 1" forever, line dead).
+            let waiting_snapshot = status.waiting_call.lock().unwrap().clone();
+            if let Some(w) = waiting_snapshot {
                 if primary_active && !busy {
                     auto_hold_done_for = Some(w.call_id.clone());
                     let sr = bt.get_sample_rate();
