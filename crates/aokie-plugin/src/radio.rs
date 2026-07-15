@@ -3843,6 +3843,121 @@ fn perform_cancel_action(
     }
 }
 
+/// Phase 4 isolation: ONE caller's conversational state — everything that
+/// must travel WITH a caller across a future hold/resume, extracted from
+/// what used to be ~17 flat `run_loop` locals wiped one-by-one in the
+/// per-call reset block (the failure class that produced the §9.3 overlay
+/// leak and the pace leak: forgetting one field = the next caller inherits
+/// it). The reset block now swaps in `CallVoiceContext::fresh(...)`, so a
+/// new field is structurally reset-by-construction; the switchboard slice
+/// will PARK this struct per caller instead of dropping it.
+///
+/// Deliberately NOT here (hardware-transient, destroyed on every call
+/// boundary AND every future focus switch, never parked): STT capture
+/// buffers, the echo canceller, mute gates, speculative generation, the
+/// live hypothesis lane, greet/answer hold clocks and overlap-capture
+/// flags — those belong to the LINE, not the caller.
+#[cfg(target_os = "windows")]
+struct CallVoiceContext {
+    /// Volatile realtime captions lane (guide §9.2) — one per call epoch;
+    /// `None` until the call id is known.
+    rt_lane: Option<crate::realtime::RealtimeLane>,
+    /// [[WAIT]] streak breaker (live call 5824f759): at most ONE
+    /// consecutive accepted WAIT.
+    consecutive_waits: u32,
+    /// Post-hangup ghost-turn latch (live call 2f668ad4): once the agent
+    /// finalizes the call, late turns are recorded but never answered.
+    agent_hung_up: bool,
+    /// The previous caller turn's text: an explicit 'look it up' usually
+    /// names its subject one turn earlier.
+    prev_caller_text: String,
+    /// Conversation history for the agent (OpenAI chat messages).
+    #[cfg(feature = "voice")]
+    history: Vec<serde_json::Value>,
+    /// Monotonic transcript turn index (caller + bot share one sequence),
+    /// 1-based to match the simulated-call convention.
+    #[cfg(feature = "voice")]
+    turn_index: u32,
+    /// Caller turn held open across STT utterances (audit AK-008).
+    #[cfg(feature = "voice")]
+    pending_turn: Option<PendingTurn>,
+    /// Phase 3: the per-call manager PIN gate.
+    #[cfg(feature = "voice")]
+    manager_gate: ManagerGate,
+    /// §9.3 call-scoped agent overlay (persona/greeting bound to ONE call).
+    #[cfg(feature = "voice")]
+    call_agent_overlay: Option<CallAgentOverlay>,
+    /// Call-local speaking pace, mutated live by "slower"/"faster".
+    #[cfg(feature = "voice")]
+    pace: crate::speech_plan::PaceState,
+    /// Duplex floor state (PausedByCaller = intentional silence).
+    #[cfg(feature = "voice")]
+    dialogue: crate::duplex::DialogueState,
+    /// AOK-CTRL-001 max-silence watchdog (armed by the greeting).
+    #[cfg(feature = "voice")]
+    silence_timer: Option<SilenceTimer>,
+    /// Aokie's last spoken line — the self-echo guard's reference.
+    #[cfg(feature = "voice")]
+    last_bot_reply: String,
+    /// The last bot line as clean SPEAKABLE text ("repeat that" replays it).
+    #[cfg(feature = "voice")]
+    last_bot_speech: String,
+    /// The nudge: an interrupted reply's UNSPOKEN tail, consumed by exactly
+    /// one next generation.
+    #[cfg(feature = "voice")]
+    last_cut_context: Option<String>,
+    /// Split-utterance continuity: previous turn's audio + draft + flush
+    /// instant (audioTranscript correction requests prepend it).
+    #[cfg(feature = "voice")]
+    prev_heard: Option<(Vec<i16>, String, std::time::Instant)>,
+    /// The current turn's OWN paired audio (sendAudio reply attach +
+    /// audioTranscript correction source).
+    #[cfg(feature = "voice")]
+    last_turn_audio: Vec<i16>,
+}
+
+#[cfg(target_os = "windows")]
+impl CallVoiceContext {
+    /// A brand-new caller's context — the same values every field was
+    /// individually reset to at the old per-call boundary.
+    fn fresh(rt_lane: Option<crate::realtime::RealtimeLane>) -> Self {
+        Self {
+            rt_lane,
+            consecutive_waits: 0,
+            agent_hung_up: false,
+            prev_caller_text: String::new(),
+            #[cfg(feature = "voice")]
+            history: Vec::new(),
+            #[cfg(feature = "voice")]
+            turn_index: 1,
+            #[cfg(feature = "voice")]
+            pending_turn: None,
+            #[cfg(feature = "voice")]
+            manager_gate: ManagerGate::default(),
+            #[cfg(feature = "voice")]
+            call_agent_overlay: None,
+            // Pace + floor are strictly per-call: the next caller gets the
+            // configured defaults, never the last caller's "slower".
+            #[cfg(feature = "voice")]
+            pace: crate::speech_plan::PaceState::from_env(),
+            #[cfg(feature = "voice")]
+            dialogue: crate::duplex::DialogueState::new(),
+            #[cfg(feature = "voice")]
+            silence_timer: None,
+            #[cfg(feature = "voice")]
+            last_bot_reply: String::new(),
+            #[cfg(feature = "voice")]
+            last_bot_speech: String::new(),
+            #[cfg(feature = "voice")]
+            last_cut_context: None,
+            #[cfg(feature = "voice")]
+            prev_heard: None,
+            #[cfg(feature = "voice")]
+            last_turn_audio: Vec::new(),
+        }
+    }
+}
+
 /// The radio poll loop: drain events â†’ map+emit; buffer the incoming-call
 /// emission until the caller id lands (or a short timeout); drain audio
 /// (Stage 2 feeds the AI here); service control requests. Runs until the
@@ -4314,9 +4429,6 @@ fn run_loop(
         .filter(|s| !s.trim().is_empty());
     #[cfg(feature = "voice")]
     let mut agent_client: Option<crate::agent::LlmClient> = None;
-    // §9.3 call-scoped agent overlay — see [`CallAgentOverlay`].
-    #[cfg(feature = "voice")]
-    let mut call_agent_overlay: Option<CallAgentOverlay> = None;
     // §9.3: when the greeting first became READY but was held for the
     // personalization overlay (bounds the hold; reset per call).
     #[cfg(feature = "voice")]
@@ -4329,9 +4441,6 @@ fn run_loop(
     // ACTIVE inbound session — the phantom-answer self-heal counter (see the
     // guard in the event loop).
     let mut phantom_ring_count: u32 = 0;
-    // Phase 3: the per-call manager PIN gate (reset at every call boundary).
-    #[cfg(feature = "voice")]
-    let mut manager_gate = ManagerGate::default();
     // Ring-time personalization window: when auto-answer first saw the
     // ringing call (bounds the hold; reset per call).
     #[cfg(feature = "voice")]
@@ -4360,20 +4469,10 @@ fn run_loop(
     #[cfg(all(target_os = "windows", feature = "voice"))]
     let pending_agent_client: Arc<Mutex<Option<crate::agent::LlmClient>>> =
         Arc::new(Mutex::new(None));
-    // Conversation history for the agent (OpenAI chat messages), reset per call.
-    #[cfg(feature = "voice")]
-    let mut history: Vec<serde_json::Value> = Vec::new();
-    // Caller turn held open across STT utterances (audit AK-008 — see
-    // PendingTurn): replies wait until the turn stops looking unfinished.
-    #[cfg(feature = "voice")]
-    let mut pending_turn: Option<PendingTurn> = None;
     // Controls that arrived DURING an agent reply (audit AK-003): the
     // mid-reply poll acts on Hangup/Reject instantly and parks everything
     // else here; the main control loop drains this before its channel.
     let mut pending_controls: std::collections::VecDeque<RadioControl> = Default::default();
-    // Aokie's last spoken line (greeting or reply) â€” for the self-echo guard.
-    #[cfg(feature = "voice")]
-    let mut last_bot_reply = String::new();
     // Half-duplex gate: while Aokie is speaking (+ a short tail) inbound audio is
     // discarded so we never transcribe our own TTS echoing back over the line.
     #[cfg(feature = "voice")]
@@ -4401,11 +4500,6 @@ fn run_loop(
     let audio_transcript = send_audio && std::env::var_os("AOKIE_AUDIO_TRANSCRIPT").is_some();
     #[cfg(feature = "voice")]
     let (heard_tx, heard_rx) = std::sync::mpsc::channel::<(String, u32, String, String)>();
-    // Split-utterance continuity: the previous caller turn's audio + draft +
-    // when it flushed — prepended to the next correction request when the
-    // turns are moments apart (one sentence split by a pause). Reset per call.
-    #[cfg(feature = "voice")]
-    let mut prev_heard: Option<(Vec<i16>, String, Instant)> = None;
     // Call screening policy (spec Phase 0): parsed once per radio start.
     #[cfg(feature = "voice")]
     let mut screen_policy = crate::screen::ScreenPolicy::from_env();
@@ -4413,8 +4507,6 @@ fn run_loop(
     if screen_policy.is_active() {
         eprintln!("[aokie-plugin] call screening ACTIVE (block list / accept pattern / private-number policy)");
     }
-    #[cfg(feature = "voice")]
-    let mut last_turn_audio: Vec<i16> = Vec::new();
     // sendAudio: utterance-id → PCM, written at every STT send and consumed
     // by the result drains into the pending turn (exact pairing — see
     // PendingTurn::audio).
@@ -4438,22 +4530,9 @@ fn run_loop(
     // The echo canceller, built lazily once we know the negotiated SCO rate.
     #[cfg(feature = "voice")]
     let mut aec: Option<crate::aec::EchoCanceller> = None;
-    // Call-local speaking pace (base + detail rates, settings-seeded), mutated
-    // live by the caller's "slower"/"faster"/"normal speed" voice commands and
-    // reset at every call boundary.
-    #[cfg(feature = "voice")]
-    let mut pace = crate::speech_plan::PaceState::from_env();
     // Operator cap on how long an [[important]] span may resist an overlap.
     #[cfg(feature = "voice")]
     let protected_max_ms = crate::speech_plan::protected_max_ms_from_env();
-    // The duplex floor state: PausedByCaller means "say NOTHING until the
-    // caller speaks again or asks to continue" (intentional silence).
-    #[cfg(feature = "voice")]
-    let mut dialogue = crate::duplex::DialogueState::new();
-    // The last bot line as clean SPEAKABLE text (no truncation tags) — what
-    // "repeat that (slower)" replays. last_bot_reply keeps the echo-guard role.
-    #[cfg(feature = "voice")]
-    let mut last_bot_speech = String::new();
     // The NEXT caller turn began as OVERLAP capture (spoken while the bot was
     // talking): recorded on the turn so readers don't misread record order as
     // speech order. Set at every overlap-seed site, cleared when a turn flushes.
@@ -4463,16 +4542,6 @@ fn run_loop(
     // roughly its own duration before it was seeded).
     #[cfg(feature = "voice")]
     let mut turn_overlap_at: Option<String> = None;
-    // The nudge (round 3): an interrupted reply leaves its UNSPOKEN tail here
-    // so the next generation can weave the pending point in naturally instead
-    // of restarting the thought. Consumed by exactly one generation.
-    #[cfg(feature = "voice")]
-    let mut last_cut_context: Option<String> = None;
-    // Monotonic transcript turn index (caller + bot share one sequence), reset
-    // per call. 1-based to match the simulated-call convention (`turn.1.final`,
-    // `turn.2.final`, â€¦) so real + simulated calls dedup + display identically.
-    #[cfg(feature = "voice")]
-    let mut turn_index: u32 = 1;
 
     // Per-call state: ONE explicit session state machine (audit AK-001) owns
     // the call id, generation, phase, timing, caller id, termination intent
@@ -4490,31 +4559,16 @@ fn run_loop(
     // call OR idle) resets per-call voice state and re-stamps the STT gate.
     #[cfg(feature = "voice")]
     let mut voice_call_gen: u64 = 0;
-    // Volatile realtime lane (guide §9.2 v1): live caller partials + session
-    // phase as droppable realtime.emit notifications. One lane per call
-    // epoch; recreated in the per-call reset block below.
-    let mut rt_lane: Option<crate::realtime::RealtimeLane> = None;
-    // [[WAIT]] streak breaker (live call 5824f759: Gemma 4 latched onto
-    // [[WAIT]] after one caller 'hold on' and answered EVERY later turn with
-    // it, including 'hello?' — the bot went permanently silent). At most ONE
-    // consecutive accepted WAIT: a second is rejected and the reply
-    // regenerates once with an explicit speak-now note.
-    let mut consecutive_waits: u32 = 0;
-    // Post-hangup ghost-turn latch (live call 2f668ad4): the caller's words
-    // captured DURING the goodbye came back from STT ~600ms AFTER the agent's
-    // AT+CHUP, minted a new turn, and the agent spoke a fresh reply into the
-    // dying line — unheard but in the transcript. Once the agent finalizes
-    // the call, late turns are recorded but never answered.
-    let mut agent_hung_up = false;
-    // The previous caller turn's text: an explicit 'look it up' usually names
-    // its subject one turn earlier.
-    let mut prev_caller_text = String::new();
+    // Phase 4 isolation: THE current caller's conversational state — see
+    // [`CallVoiceContext`]. Swapped for a fresh instance in the per-call
+    // reset block (reset-by-construction: a new per-caller field cannot
+    // be forgotten there); the switchboard slice will PARK it per caller
+    // across hold/resume instead of dropping it.
+    let mut ctx = CallVoiceContext::fresh(None);
     // AOK-CTRL-001: call-level max-silence watchdog (agent mode). Created when
     // the greeting arms the conversation, dropped at every call boundary.
     #[cfg(feature = "voice")]
     let silence_window = max_silence_window();
-    #[cfg(feature = "voice")]
-    let mut silence_timer: Option<SilenceTimer> = None;
 
     // Phase-0 observability: a stalled run_loop reports ITSELF — the watchdog
     // compares the iteration beat every 5 s and, on a freeze, logs the phase
@@ -4686,10 +4740,10 @@ fn run_loop(
                                 status.stale_stt_results.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
-                            if agent_enabled && looks_like_echo(&text, &last_bot_reply) {
+                            if agent_enabled && looks_like_echo(&text, &ctx.last_bot_reply) {
                                 continue;
                             }
-                            match pending_turn.as_mut() {
+                            match ctx.pending_turn.as_mut() {
                                 Some(p) => {
                                     p.text.push(' ');
                                     p.text.push_str(text.trim());
@@ -4698,7 +4752,7 @@ fn run_loop(
                                     }
                                 }
                                 None => {
-                                    pending_turn = Some(PendingTurn {
+                                    ctx.pending_turn = Some(PendingTurn {
                                         corr: tracker.call_id().unwrap_or_default().to_string(),
                                         text: text.trim().to_string(),
                                         // Call-end drain: this flushes right
@@ -4713,17 +4767,17 @@ fn run_loop(
                         Err(_) => break,
                     }
                 }
-                if let Some(p) = pending_turn.take() {
+                if let Some(p) = ctx.pending_turn.take() {
                     if !p.corr.is_empty() && !p.text.is_empty() {
                         // A turn spoken while the PIN gate is armed IS the
                         // PIN — never let a boundary flush record it.
-                        let recorded = if manager_gate.awaiting_pin {
+                        let recorded = if ctx.manager_gate.awaiting_pin {
                             "[manager PIN redacted]"
                         } else {
                             p.text.as_str()
                         };
-                        emit_turn(outbox, sink, &p.corr, turn_index, "caller", recorded);
-                        turn_index += 1;
+                        emit_turn(outbox, sink, &p.corr, ctx.turn_index, "caller", recorded);
+                        ctx.turn_index += 1;
                     }
                 }
             }
@@ -4744,11 +4798,11 @@ fn run_loop(
             // continuation window) is RECORDED against that call — losing the
             // caller's last fragment (often the tail of a phone number) is
             // worse than a late turn event — but never answered.
-            if let Some(p) = pending_turn.take() {
+            if let Some(p) = ctx.pending_turn.take() {
                 if !p.corr.is_empty() && !p.text.is_empty() {
                     // A turn spoken while the PIN gate was armed IS the PIN —
                     // redact it even on the end-of-call flush.
-                    let recorded = if manager_gate.awaiting_pin {
+                    let recorded = if ctx.manager_gate.awaiting_pin {
                         "[manager PIN redacted]"
                     } else {
                         p.text.as_str()
@@ -4757,22 +4811,36 @@ fn run_loop(
                         "[aokie-plugin] flushing held caller turn from ended call: {}",
                         content_for_log(recorded)
                     );
-                    emit_turn(outbox, sink, &p.corr, turn_index, "caller", recorded);
+                    emit_turn(outbox, sink, &p.corr, ctx.turn_index, "caller", recorded);
                 }
             }
             voice_call_gen = tracker.generation();
             stt_current_gen.store(voice_call_gen, Ordering::Relaxed);
-            consecutive_waits = 0;
-            agent_hung_up = false;
-            prev_caller_text.clear();
-            manager_gate = ManagerGate::default();
-            utt_audio.clear();
-            last_turn_audio.clear();
-            prev_heard = None;
-            rt_lane = tracker.call_id().map(|id| {
+            // Phase 4 isolation: the ENTIRE per-caller conversational state
+            // swaps for a fresh CallVoiceContext in one move — reset-by-
+            // construction, no field can be forgotten here again (the class
+            // that produced the §9.3 overlay leak and the pace leak). The
+            // switchboard slice will PARK the outgoing context per caller
+            // instead of dropping it.
+            let fresh_lane = tracker.call_id().map(|id| {
                 crate::realtime::RealtimeLane::new(id.to_string(), voice_call_gen, Instant::now())
             });
-            if let Some(lane) = rt_lane.as_mut() {
+            let prev_ctx = std::mem::replace(&mut ctx, CallVoiceContext::fresh(fresh_lane));
+            // §9.3: the call-scoped agent overlay dies WITH its call — the
+            // next caller can never inherit the previous caller's persona.
+            // EXCEPT an overlay already bound to THIS (new) call: a
+            // plugin-dialed outbound call sets its opening-line/purpose
+            // overlay at DIAL time, one loop pass before this reset sees the
+            // generation change (live bug 2026-07-14, first outbound test
+            // call 2821e7e2: an unconditional wipe threw the overlay away
+            // and the agent greeted the callee with the INBOUND greeting,
+            // knowing nothing about the call it had just placed).
+            if prev_ctx.call_agent_overlay.as_ref().map(|o| o.call_id.as_str())
+                == tracker.call_id()
+            {
+                ctx.call_agent_overlay = prev_ctx.call_agent_overlay;
+            }
+            if let Some(lane) = ctx.rt_lane.as_mut() {
                 if let Some(line) = lane.phase("listening", Instant::now()) {
                     let _ = sink.send_line(&line);
                 }
@@ -4787,36 +4855,17 @@ fn run_loop(
             // result, so the in-flight counter resets at every call boundary
             // rather than accumulating drift across calls.
             stt_outstanding = 0;
-            turn_index = 1;
-            history.clear();
-            last_bot_reply.clear();
-            last_bot_speech.clear();
+            // Hardware-transient state (the LINE's, not the caller's) is
+            // destroyed at every boundary — never parked, never restored.
+            utt_audio.clear();
             stt_buf.clear();
             stt_had_speech = false;
             stt_silence = Duration::ZERO;
             mute_stt_until = None;
-            silence_timer = None;
-            // Pace + floor state are strictly per-call: the next caller gets
-            // the configured defaults, never the last caller's "slower".
-            pace = crate::speech_plan::PaceState::from_env();
-            dialogue.reset();
             turn_overlapped = false;
             turn_overlap_at = None;
             spec_utterance = None;
             stale_specs.clear();
-            last_cut_context = None;
-            // §9.3: the call-scoped agent overlay dies WITH its call — the
-            // next caller can never inherit the previous caller's persona.
-            // EXCEPT an overlay already bound to THIS (new) call: a
-            // plugin-dialed outbound call sets its opening-line/purpose
-            // overlay at DIAL time, one loop pass before this reset sees the
-            // generation change (live bug 2026-07-14, first outbound test
-            // call 2821e7e2: this unconditional wipe threw the overlay away
-            // and the agent greeted the callee with the INBOUND greeting,
-            // knowing nothing about the call it had just placed).
-            if call_agent_overlay.as_ref().map(|o| o.call_id.as_str()) != tracker.call_id() {
-                call_agent_overlay = None;
-            }
             greet_hold_started = None;
             answer_hold_started = None;
             live_hyp = None;
@@ -4936,7 +4985,7 @@ fn run_loop(
                         // the overlay's arrival short-circuits it.
                         #[cfg(feature = "voice")]
                         let (hold, overlay_ready) = {
-                            let overlay_ready = call_agent_overlay
+                            let overlay_ready = ctx.call_agent_overlay
                                 .as_ref()
                                 .is_some_and(|o| o.call_id == s.id);
                             let started = *answer_hold_started.get_or_insert_with(Instant::now);
@@ -5039,7 +5088,7 @@ fn run_loop(
                     // win the race within the call it belongs to.
                     #[cfg(feature = "voice")]
                     let hold = {
-                        let overlay_matches = call_agent_overlay
+                        let overlay_matches = ctx.call_agent_overlay
                             .as_ref()
                             .is_some_and(|o| o.call_id == s.id);
                         let started = *greet_hold_started.get_or_insert_with(Instant::now);
@@ -5105,7 +5154,7 @@ fn run_loop(
                         None,
                         None,
                         Some(&mut probe),
-                        &pace,
+                        &ctx.pace,
                         protected_max_ms,
                         None,
                     );
@@ -5124,7 +5173,7 @@ fn run_loop(
                 if let Err(e) = bt.hangup() {
                     eprintln!("[aokie-plugin] screened-call hangup failed: {e}");
                 }
-                agent_hung_up = true;
+                ctx.agent_hung_up = true;
                 let _ = &corr;
             } else {
                 // Build the echo canceller once we know the negotiated SCO
@@ -5137,7 +5186,7 @@ fn run_loop(
                 }
                 // §9.3: a call-scoped greeting (personalize-caller) wins for
                 // ITS call; the configured global greeting is the fallback.
-                let overlay_greeting = call_agent_overlay
+                let overlay_greeting = ctx.call_agent_overlay
                     .as_ref()
                     .filter(|o| o.call_id == corr)
                     .and_then(|o| o.greeting.as_deref());
@@ -5187,7 +5236,7 @@ fn run_loop(
                         aec_ref,
                         brms,
                         Some(&mut probe),
-                        &pace,
+                        &ctx.pace,
                         protected_max_ms,
                         lane_ref,
                     );
@@ -5201,7 +5250,7 @@ fn run_loop(
                     // A spoken floor command over the greeting = the caller
                     // holds the floor from the very first words.
                     if let Some(intent) = out.commanded {
-                        dialogue.apply(intent);
+                        ctx.dialogue.apply(intent);
                         eprintln!(
                             "[aokie-plugin] caller commanded {intent:?} over the greeting — holding the floor"
                         );
@@ -5274,20 +5323,20 @@ fn run_loop(
                             outbox,
                             sink,
                             &corr,
-                            turn_index,
+                            ctx.turn_index,
                             "bot",
                             &planned.played_text,
                             Some(delivery),
                             Some(&aokie_core::events::iso8601_ago_ms(speak_started.elapsed().as_millis() as u64)),
                         );
-                        turn_index += 1;
-                        history.push(
+                        ctx.turn_index += 1;
+                        ctx.history.push(
                             serde_json::json!({ "role": "assistant", "content": planned.played_text }),
                         );
                         // Echo guard + replay compare against what was SENT —
                         // the flushed-but-echoed tail must still match (§6.3).
-                        last_bot_reply = planned.sent_text.clone();
-                        last_bot_speech = planned.sent_text;
+                        ctx.last_bot_reply = planned.sent_text.clone();
+                        ctx.last_bot_speech = planned.sent_text;
                     } else {
                         eprintln!(
                             "[aokie-plugin] greeting produced NO audio (TTS failed) — not recorded as a spoken turn"
@@ -5298,7 +5347,7 @@ fn run_loop(
                 // call-level max-silence watchdog (agent mode only; in flow
                 // mode the host owns pacing).
                 if agent_enabled {
-                    silence_timer = Some(SilenceTimer::new(silence_window, Instant::now()));
+                    ctx.silence_timer = Some(SilenceTimer::new(silence_window, Instant::now()));
                 }
             }
             idle = false;
@@ -5368,7 +5417,7 @@ fn run_loop(
                     }
                     stt_buf.extend_from_slice(&f16);
                     // AOK-CTRL-001: live caller audio resets the max-silence window.
-                    if let Some(t) = silence_timer.as_mut() {
+                    if let Some(t) = ctx.silence_timer.as_mut() {
                         t.note_activity(Instant::now());
                     }
                 } else if stt_had_speech {
@@ -5453,7 +5502,7 @@ fn run_loop(
             // cadence, ≤1 in flight, local probe channel — no HTTP egress).
             // Phase 3: while the PIN gate is waiting, the utterance IS the
             // PIN — no partial captions, no probes, no speculation on it.
-            if agent_enabled && stt_had_speech && !manager_gate.awaiting_pin {
+            if agent_enabled && stt_had_speech && !ctx.manager_gate.awaiting_pin {
                 let due = live_hyp_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(400));
                 let grown =
                     stt_buf.len() >= live_hyp_shipped + 16_000 / 2 && stt_buf.len() >= 16_000 / 2;
@@ -5481,7 +5530,7 @@ fn run_loop(
                     }
                     live_hyp_prev = live_hyp.take();
                     live_hyp = Some(res.text);
-                    if let (Some(lane), Some(cur)) = (rt_lane.as_mut(), live_hyp.as_deref()) {
+                    if let (Some(lane), Some(cur)) = (ctx.rt_lane.as_mut(), live_hyp.as_deref()) {
                         if let Some(line) = lane.user_partial(cur, Instant::now()) {
                             let _ = sink.send_line(&line);
                         }
@@ -5501,7 +5550,7 @@ fn run_loop(
                 // A stable, intent-sized hypothesis starts the reply EARLY —
                 // the generation streams while the caller finishes; the turn
                 // flush below adopts it when the final text matches.
-                if spec_reply.is_none() && !dialogue.is_paused() {
+                if spec_reply.is_none() && !ctx.dialogue.is_paused() {
                     // Adopt a ring-warmed client so the FIRST turn speculates.
                     if agent_client.is_none() {
                         agent_client = pending_agent_client.lock().unwrap().take();
@@ -5510,7 +5559,7 @@ fn run_loop(
                     {
                         if hypothesis_stable(prev, cur) {
                             if let Some(client) = agent_client.as_ref() {
-                                let persona_base: &str = call_agent_overlay
+                                let persona_base: &str = ctx.call_agent_overlay
                                     .as_ref()
                                     .and_then(|o| o.persona.as_deref())
                                     .unwrap_or(&agent_persona);
@@ -5530,11 +5579,11 @@ fn run_loop(
                                 let sys = compose_agent_system_prompt(
                                     &persona_now,
                                     agent_hangup,
-                                    last_cut_context.as_deref(),
+                                    ctx.last_cut_context.as_deref(),
                                 );
                                 let mut messages =
                                     vec![serde_json::json!({ "role": "system", "content": sys })];
-                                messages.extend(history.iter().cloned());
+                                messages.extend(ctx.history.iter().cloned());
                                 messages
                                     .push(serde_json::json!({ "role": "user", "content": cur }));
                                 eprintln!(
@@ -5604,12 +5653,12 @@ fn run_loop(
                 // Drop a transcript that's really Aokie's own reply echoing back
                 // (belt-and-suspenders over the half-duplex mute) so it never
                 // records it as a caller turn or answers itself.
-                if agent_enabled && looks_like_echo(&text, &last_bot_reply) {
+                if agent_enabled && looks_like_echo(&text, &ctx.last_bot_reply) {
                     eprintln!("[aokie-plugin] ignored self-echo: {}", content_for_log(&text));
                     continue;
                 }
                 let corr = tracker.call_id().unwrap_or_default().to_string();
-                match pending_turn.as_mut() {
+                match ctx.pending_turn.as_mut() {
                     Some(p) => {
                         p.text.push(' ');
                         p.text.push_str(text.trim());
@@ -5619,7 +5668,7 @@ fn run_loop(
                         }
                     }
                     None => {
-                        pending_turn = Some(PendingTurn {
+                        ctx.pending_turn = Some(PendingTurn {
                             corr,
                             text: text.trim().to_string(),
                             // A barge just seeded stt_buf — the interruption
@@ -5630,7 +5679,7 @@ fn run_loop(
                         })
                     }
                 }
-                let p = pending_turn.as_mut().expect("just set");
+                let p = ctx.pending_turn.as_mut().expect("just set");
                 // An overlap turn gets ONE grace window (consumed here) so the
                 // caller's mid-barge sentence completes into a single turn;
                 // the normal unfinished-tail heuristic handles the rest.
@@ -5688,7 +5737,7 @@ fn run_loop(
                         ),
                     );
                     if tracker.call_id() == Some(cid.as_str()) {
-                        if let Some(entry) = history.iter_mut().rev().find(|m| {
+                        if let Some(entry) = ctx.history.iter_mut().rev().find(|m| {
                             m.get("role").and_then(serde_json::Value::as_str) == Some("user")
                                 && m.get("content").and_then(serde_json::Value::as_str)
                                     == Some(stt.as_str())
@@ -5701,9 +5750,9 @@ fn run_loop(
             // Flush the open turn once its hold expired AND the caller isn't
             // mid-utterance (fresh speech extends the merge window naturally).
             status.loop_phase.store(loop_phase::TURN, Ordering::Relaxed);
-            let flushed_turn = match pending_turn.as_ref() {
+            let flushed_turn = match ctx.pending_turn.as_ref() {
                 Some(p) if Instant::now() >= p.flush_at && !stt_had_speech => {
-                    pending_turn.take().map(|p| (p.corr, p.text, p.audio))
+                    ctx.pending_turn.take().map(|p| (p.corr, p.text, p.audio))
                 }
                 _ => None,
             };
@@ -5711,20 +5760,20 @@ fn run_loop(
                 idle = false;
                 // The flushed turn's PAIRED audio is what both the reply
                 // attach and the transcript correction must use.
-                last_turn_audio = turn_audio;
+                ctx.last_turn_audio = turn_audio;
                 'turn_done: {
                     // ── Phase 3 PIN gate ─────────────────────────────────
                     // The utterance IS the PIN attempt: it must never reach
                     // the transcript, the model's history, the captions or
                     // any reply generation. Verified by deterministic digit
                     // comparison — the model never judges a PIN.
-                    if manager_gate.awaiting_pin {
-                        manager_gate.awaiting_pin = false;
+                    if ctx.manager_gate.awaiting_pin {
+                        ctx.manager_gate.awaiting_pin = false;
                         emit_turn_full(
                             outbox,
                             sink,
                             &corr,
-                            turn_index,
+                            ctx.turn_index,
                             "caller",
                             "[manager PIN redacted]",
                             None,
@@ -5732,8 +5781,8 @@ fn run_loop(
                             false,
                             None,
                         );
-                        status.last_caller_turn.store(turn_index, Ordering::Relaxed);
-                        turn_index += 1;
+                        status.last_caller_turn.store(ctx.turn_index, Ordering::Relaxed);
+                        ctx.turn_index += 1;
                         turn_overlapped = false;
                         turn_overlap_at = None;
                         let given = crate::speech_plan::spoken_digits(&text);
@@ -5741,13 +5790,13 @@ fn run_loop(
                             &std::env::var("AOKIE_MANAGER_PIN").unwrap_or_default(),
                         );
                         if !expected.is_empty() && !given.is_empty() && given == expected {
-                            manager_gate.verified = true;
-                            manager_gate.attempts = 0;
+                            ctx.manager_gate.verified = true;
+                            ctx.manager_gate.attempts = 0;
                             eprintln!("[aokie-plugin] manager PIN verified");
-                            if let Some(req) = manager_gate.pending.take() {
+                            if let Some(req) = ctx.manager_gate.pending.take() {
                                 speak_manager_line(
                                     bt, &synth, outbox, sink, &status, &corr,
-                                    &mut turn_index, &mut history, MANAGER_ACTION_FILLER,
+                                    &mut ctx.turn_index, &mut ctx.history, MANAGER_ACTION_FILLER,
                                 );
                                 let mgr_from = tracker
                                     .current()
@@ -5759,27 +5808,27 @@ fn run_loop(
                                 );
                                 speak_manager_line(
                                     bt, &synth, outbox, sink, &status, &corr,
-                                    &mut turn_index, &mut history, &outcome,
+                                    &mut ctx.turn_index, &mut ctx.history, &outcome,
                                 );
                             } else {
                                 speak_manager_line(
                                     bt, &synth, outbox, sink, &status, &corr,
-                                    &mut turn_index, &mut history, PIN_OK_NOACTION_LINE,
+                                    &mut ctx.turn_index, &mut ctx.history, PIN_OK_NOACTION_LINE,
                                 );
                             }
                         } else {
-                            manager_gate.attempts += 1;
-                            if manager_gate.attempts < 2 && !expected.is_empty() {
-                                manager_gate.awaiting_pin = true;
+                            ctx.manager_gate.attempts += 1;
+                            if ctx.manager_gate.attempts < 2 && !expected.is_empty() {
+                                ctx.manager_gate.awaiting_pin = true;
                                 speak_manager_line(
                                     bt, &synth, outbox, sink, &status, &corr,
-                                    &mut turn_index, &mut history, PIN_RETRY_LINE,
+                                    &mut ctx.turn_index, &mut ctx.history, PIN_RETRY_LINE,
                                 );
                             } else {
-                                manager_gate.pending = None;
+                                ctx.manager_gate.pending = None;
                                 speak_manager_line(
                                     bt, &synth, outbox, sink, &status, &corr,
-                                    &mut turn_index, &mut history, PIN_FAIL_LINE,
+                                    &mut ctx.turn_index, &mut ctx.history, PIN_FAIL_LINE,
                                 );
                             }
                         }
@@ -5798,7 +5847,8 @@ fn run_loop(
                     };
                     let is_control = intent != crate::duplex::CallerIntent::Content;
                     eprintln!(
-                        "[aokie-plugin] heard [turn {turn_index}]{}: {}",
+                        "[aokie-plugin] heard [turn {}]{}: {}",
+                        ctx.turn_index,
                         if is_control {
                             format!(" (control: {intent:?})")
                         } else {
@@ -5812,7 +5862,7 @@ fn run_loop(
                         outbox,
                         sink,
                         &corr,
-                        turn_index,
+                        ctx.turn_index,
                         "caller",
                         &text,
                         None,
@@ -5822,8 +5872,8 @@ fn run_loop(
                     );
                     // §9.2: this is now the newest caller turn — a flow reply
                     // naming an older one is stale (typed refusal upstream).
-                    status.last_caller_turn.store(turn_index, Ordering::Relaxed);
-                    if let Some(lane) = rt_lane.as_mut() {
+                    status.last_caller_turn.store(ctx.turn_index, Ordering::Relaxed);
+                    if let Some(lane) = ctx.rt_lane.as_mut() {
                         lane.turn_final();
                         if let Some(line) = lane.phase("thinking", Instant::now()) {
                             let _ = sink.send_line(&line);
@@ -5845,7 +5895,8 @@ fn run_loop(
                         && text.split_whitespace().count() > 2;
                     if audio_transcript && !heard_worthwhile {
                         eprintln!(
-                            "[aokie-plugin] audio transcript check skipped [turn {turn_index}]: hesitation/too short"
+                            "[aokie-plugin] audio transcript check skipped [turn {}]: hesitation/too short",
+                                ctx.turn_index
                         );
                     }
                     if audio_transcript && heard_worthwhile {
@@ -5855,16 +5906,18 @@ fn run_loop(
                         // Every skip logs its reason — a silent lane is
                         // indistinguishable from a broken one (live call
                         // be56c70c: zero corrections and no way to tell why).
-                        if last_turn_audio.is_empty() {
+                        if ctx.last_turn_audio.is_empty() {
                             eprintln!(
-                                "[aokie-plugin] audio transcript check skipped [turn {turn_index}]: no paired audio for this turn"
+                                "[aokie-plugin] audio transcript check skipped [turn {}]: no paired audio for this turn",
+                                ctx.turn_index
                             );
                         } else if heard_client.is_none() {
                             eprintln!(
-                                "[aokie-plugin] audio transcript check skipped [turn {turn_index}]: no connected LLM client yet"
+                                "[aokie-plugin] audio transcript check skipped [turn {}]: no connected LLM client yet",
+                                ctx.turn_index
                             );
                         }
-                        if let (Some(hc), false) = (heard_client, last_turn_audio.is_empty()) {
+                        if let (Some(hc), false) = (heard_client, ctx.last_turn_audio.is_empty()) {
                             // Split-utterance continuity (user idea; live
                             // turns 16/17: a mid-thought pause split one
                             // sentence into two turns and each fragment
@@ -5873,15 +5926,15 @@ fn run_loop(
                             // the model hears the sentence continuously —
                             // the prompt + length guard hold the output to
                             // the final utterance only.
-                            let (pcm, prev_draft) = match prev_heard.as_ref() {
+                            let (pcm, prev_draft) = match ctx.prev_heard.as_ref() {
                                 Some((ppcm, ptext, at))
                                     if at.elapsed() < Duration::from_secs(8) =>
                                 {
                                     let mut combined = ppcm.clone();
-                                    append_turn_audio(&mut combined, last_turn_audio.clone());
+                                    append_turn_audio(&mut combined, ctx.last_turn_audio.clone());
                                     (combined, Some(ptext.clone()))
                                 }
-                                _ => (last_turn_audio.clone(), None),
+                                _ => (ctx.last_turn_audio.clone(), None),
                             };
                             let cid = corr.clone();
                             let stt = text.clone();
@@ -5890,8 +5943,8 @@ fn run_loop(
                             // not yet in history, so this is the PRIOR
                             // turns. The Setting line names the domain even
                             // on turn 1, when no dialogue exists yet.
-                            let ctx = {
-                                let setting: String = call_agent_overlay
+                            let heard_ctx = {
+                                let setting: String = ctx.call_agent_overlay
                                     .as_ref()
                                     .and_then(|o| o.persona.as_deref())
                                     .unwrap_or(&agent_persona)
@@ -5902,14 +5955,14 @@ fn run_loop(
                                     .take(160)
                                     .collect();
                                 let mut c = format!("Setting: {}", setting.trim());
-                                let h = heard_context(&history);
+                                let h = heard_context(&ctx.history);
                                 if !h.is_empty() {
                                     c.push('\n');
                                     c.push_str(&h);
                                 }
                                 c
                             };
-                            let tidx = turn_index;
+                            let tidx = ctx.turn_index;
                             let tx = heard_tx.clone();
                             eprintln!(
                                 "[aokie-plugin] audio transcript check spawned [turn {tidx}] ({} samples{})",
@@ -5918,7 +5971,7 @@ fn run_loop(
                             );
                             std::thread::spawn(move || {
                                 let b64 = crate::agent::LlmClient::wav_base64(&pcm, 16_000);
-                                match hc.transcribe_turn(&b64, &stt, &ctx, prev_draft.as_deref()) {
+                                match hc.transcribe_turn(&b64, &stt, &heard_ctx, prev_draft.as_deref()) {
                                     Ok(raw) => {
                                         let _ = tx.send((cid, tidx, raw, stt));
                                     }
@@ -5932,13 +5985,13 @@ fn run_loop(
                     // Every caller turn with audio becomes the next turn's
                     // continuity context (hesitations included — their audio
                     // is real), tracked AFTER the spawn read the previous one.
-                    if send_audio && !last_turn_audio.is_empty() {
-                        prev_heard =
-                            Some((last_turn_audio.clone(), text.clone(), Instant::now()));
+                    if send_audio && !ctx.last_turn_audio.is_empty() {
+                        ctx.prev_heard =
+                            Some((ctx.last_turn_audio.clone(), text.clone(), Instant::now()));
                     }
                     turn_overlapped = false;
                     turn_overlap_at = None;
-                    turn_index += 1;
+                    ctx.turn_index += 1;
 
                     // A bare hesitation ("Uh", "Well...") that outlived the
                     // continuation hold is the caller THINKING: record it,
@@ -5954,7 +6007,7 @@ fn run_loop(
                         // 'listening' HERE or the caption strip lies (live
                         // call 20563f53: stuck on 'Live - thinking' while the
                         // bot was correctly staying quiet).
-                        if let Some(lane) = rt_lane.as_mut() {
+                        if let Some(lane) = ctx.rt_lane.as_mut() {
                             if let Some(line) = lane.phase("listening", Instant::now()) {
                                 let _ = sink.send_line(&line);
                             }
@@ -5963,7 +6016,7 @@ fn run_loop(
 
                     // Whether to fall through to the normal LLM reply path.
                     let mut respond_with_llm = false;
-                    if agent_hung_up {
+                    if ctx.agent_hung_up {
                         // The agent already said goodbye and hung up: a late
                         // STT result from goodbye-overlap capture is part of
                         // the record, never a prompt for one more reply into
@@ -5972,14 +6025,14 @@ fn run_loop(
                             "[aokie-plugin] turn arrived after the agent hung up — recorded, not answered"
                         );
                     }
-                    if agent_enabled && !hesitation && !agent_hung_up {
-                        prev_caller_text = text.clone();
-                        history.push(serde_json::json!({ "role": "user", "content": text }));
-                        if history.len() > 24 {
-                            let drop = history.len() - 24;
-                            history.drain(..drop);
+                    if agent_enabled && !hesitation && !ctx.agent_hung_up {
+                        ctx.prev_caller_text = text.clone();
+                        ctx.history.push(serde_json::json!({ "role": "user", "content": text }));
+                        if ctx.history.len() > 24 {
+                            let drop = ctx.history.len() - 24;
+                            ctx.history.drain(..drop);
                         }
-                        match dialogue.apply(intent) {
+                        match ctx.dialogue.apply(intent) {
                             crate::duplex::DialogueAction::ReplyNormally => {
                                 respond_with_llm = true;
                             }
@@ -5994,21 +6047,21 @@ fn run_loop(
                             crate::duplex::DialogueAction::AdjustPace(cmd) => {
                                 let line = match cmd {
                                     crate::duplex::PaceCommand::Slower => {
-                                        pace.slower();
+                                        ctx.pace.slower();
                                         "Sure, I'll slow down."
                                     }
                                     crate::duplex::PaceCommand::Faster => {
-                                        pace.faster();
+                                        ctx.pace.faster();
                                         "Sure, I'll speed up."
                                     }
                                     crate::duplex::PaceCommand::Normal => {
-                                        pace.reset();
+                                        ctx.pace.reset();
                                         "Okay, back to normal speed."
                                     }
                                 };
                                 eprintln!(
                                     "[aokie-plugin] caller pace command {cmd:?} — base rate now {:.2}",
-                                    pace.base()
+                                    ctx.pace.base()
                                 );
                                 let sr = bt.get_sample_rate();
                                 if sr > 0 {
@@ -6030,7 +6083,7 @@ fn run_loop(
                                         aec_ref,
                                         brms,
                                         Some(&mut probe),
-                                        pace.base(),
+                                        ctx.pace.base(),
                                         None,
                                         None,
                                     );
@@ -6068,18 +6121,18 @@ fn run_loop(
                                             "complete"
                                         };
                                         emit_turn_with_delivery(
-                                            outbox, sink, &corr, turn_index, "bot", line,
+                                            outbox, sink, &corr, ctx.turn_index, "bot", line,
                                             Some(delivery),
                                             Some(&aokie_core::events::iso8601_ago_ms(
                                                 ack_started.elapsed().as_millis() as u64,
                                             )),
                                         );
-                                        turn_index += 1;
-                                        history.push(serde_json::json!({
+                                        ctx.turn_index += 1;
+                                        ctx.history.push(serde_json::json!({
                                             "role": "assistant",
                                             "content": line,
                                         }));
-                                        last_bot_reply = line.to_string();
+                                        ctx.last_bot_reply = line.to_string();
                                     }
                                     if let Some(action) = probe.action.take() {
                                         perform_cancel_action(
@@ -6089,15 +6142,15 @@ fn run_loop(
                                 }
                             }
                             crate::duplex::DialogueAction::Replay { slower } => {
-                                if last_bot_speech.is_empty() {
+                                if ctx.last_bot_speech.is_empty() {
                                     // Nothing to replay yet — let the model
                                     // answer the request instead.
                                     respond_with_llm = true;
                                 } else {
                                     let replay_pace = if slower {
-                                        pace.replay_slower()
+                                        ctx.pace.replay_slower()
                                     } else {
-                                        pace.clone()
+                                        ctx.pace.clone()
                                     };
                                     eprintln!(
                                         "[aokie-plugin] replaying the last reply{} (deterministic)",
@@ -6105,7 +6158,7 @@ fn run_loop(
                                     );
                                     let sr = bt.get_sample_rate();
                                     if sr > 0 {
-                                        let replay_text = last_bot_speech.clone();
+                                        let replay_text = ctx.last_bot_speech.clone();
                                         let mut probe =
                                             ControlProbe::new(&control_rx, &mut pending_controls);
                                         let (aec_ref, brms) = if barge_in {
@@ -6178,7 +6231,7 @@ fn run_loop(
                                                 outbox,
                                                 sink,
                                                 &corr,
-                                                turn_index,
+                                                ctx.turn_index,
                                                 "bot",
                                                 &planned.played_text,
                                                 Some(delivery),
@@ -6186,12 +6239,12 @@ fn run_loop(
                                                     replay_started.elapsed().as_millis() as u64,
                                                 )),
                                             );
-                                            turn_index += 1;
-                                            history.push(serde_json::json!({
+                                            ctx.turn_index += 1;
+                                            ctx.history.push(serde_json::json!({
                                                 "role": "assistant",
                                                 "content": planned.played_text,
                                             }));
-                                            last_bot_reply = planned.sent_text;
+                                            ctx.last_bot_reply = planned.sent_text;
                                         }
                                         if let Some(action) = probe.action.take() {
                                             perform_cancel_action(
@@ -6209,12 +6262,12 @@ fn run_loop(
                         if !silence_window.is_zero()
                             && tracker.current().is_some_and(|s| s.is_active())
                         {
-                            let w = if dialogue.is_paused() {
+                            let w = if ctx.dialogue.is_paused() {
                                 silence_window * 3
                             } else {
                                 silence_window
                             };
-                            silence_timer = Some(SilenceTimer::new(w, Instant::now()));
+                            ctx.silence_timer = Some(SilenceTimer::new(w, Instant::now()));
                         }
                     }
 
@@ -6255,7 +6308,7 @@ fn run_loop(
                             // persona (personalize-caller) applies to THIS
                             // call only — wiped at the call boundary, it can
                             // never leak into the next caller's conversation.
-                            let persona_base: &str = call_agent_overlay
+                            let persona_base: &str = ctx.call_agent_overlay
                                 .as_ref()
                                 .and_then(|o| o.persona.as_deref())
                                 .unwrap_or(&agent_persona);
@@ -6274,19 +6327,19 @@ fn run_loop(
                             let system_prompt = compose_agent_system_prompt(
                                 &persona_now,
                                 agent_hangup,
-                                last_cut_context.take().as_deref(),
+                                ctx.last_cut_context.take().as_deref(),
                             );
                             let mut messages = vec![
                                 serde_json::json!({ "role": "system", "content": system_prompt }),
                             ];
-                            messages.extend(history.iter().cloned());
+                            messages.extend(ctx.history.iter().cloned());
                             // sendAudio: the LAST user message becomes content
                             // PARTS — the turn's audio + its transcript. Only
                             // the WIRE copy: history stays text, so replayed
                             // context never re-sends old audio. (Speculative
                             // replies stay text-only — they start mid-
                             // utterance before the PCM is final.)
-                            if send_audio && !last_turn_audio.is_empty() {
+                            if send_audio && !ctx.last_turn_audio.is_empty() {
                                 if let Some(last) = messages.last_mut() {
                                     if last.get("role").and_then(serde_json::Value::as_str)
                                         == Some("user")
@@ -6297,12 +6350,12 @@ fn run_loop(
                                             .unwrap_or("")
                                             .to_string();
                                         let b64 = crate::agent::LlmClient::wav_base64(
-                                            &last_turn_audio,
+                                            &ctx.last_turn_audio,
                                             16_000,
                                         );
                                         eprintln!(
                                             "[aokie-plugin] attaching caller-turn audio to the LLM request ({} samples)",
-                                            last_turn_audio.len()
+                                            ctx.last_turn_audio.len()
                                         );
                                         *last = serde_json::json!({
                                             "role": "user",
@@ -6551,7 +6604,7 @@ fn run_loop(
                                 }
                                 match reply_rx.recv_timeout(Duration::from_millis(25)) {
                                     Ok(ReplyMsg::Sentence(sentence)) => {
-                                        if let Some(lane) = rt_lane.as_mut() {
+                                        if let Some(lane) = ctx.rt_lane.as_mut() {
                                             if let Some(line) =
                                                 lane.phase("speaking", Instant::now())
                                             {
@@ -6607,7 +6660,7 @@ fn run_loop(
                                         // applies per-span interrupt policy. The probe
                                         // lane rides along: a spoken "wait"/"stop" cuts
                                         // the sentence mid-playback.
-                                        if let Some(lane) = rt_lane.as_mut() {
+                                        if let Some(lane) = ctx.rt_lane.as_mut() {
                                             if let Some(line) = lane.delivery(
                                                 &spoken_text,
                                                 "sent_to_sco",
@@ -6672,7 +6725,7 @@ fn run_loop(
                                             aec_ref,
                                             brms,
                                             Some(&mut probe),
-                                            &pace,
+                                            &ctx.pace,
                                             protected_max_ms,
                                             lane_ref,
                                         );
@@ -6681,9 +6734,9 @@ fn run_loop(
                                         // dialogue IMMEDIATELY (the final transcript will
                                         // re-apply it — idempotent).
                                         if let Some(intent) = out.commanded {
-                                            dialogue.apply(intent);
+                                            ctx.dialogue.apply(intent);
                                             if !silence_window.is_zero() {
-                                                silence_timer = Some(SilenceTimer::new(
+                                                ctx.silence_timer = Some(SilenceTimer::new(
                                                     silence_window * 3,
                                                     Instant::now(),
                                                 ));
@@ -6894,10 +6947,10 @@ fn run_loop(
                                         eprintln!(
                                             "[aokie-plugin] caller asked for a lookup - running it on their words"
                                         );
-                                        let subject = if prev_caller_text.is_empty() {
+                                        let subject = if ctx.prev_caller_text.is_empty() {
                                             text.clone()
                                         } else {
-                                            format!("{prev_caller_text} {text}")
+                                            format!("{} {text}", ctx.prev_caller_text)
                                         };
                                         lookup_requested = Some(subject);
                                     } else if lookup_rounds == 0
@@ -6951,7 +7004,7 @@ fn run_loop(
                                         let clean_full = crate::speech_plan::clean_text(
                                             &crate::speech_plan::plan_spans(
                                                 &clean0,
-                                                &pace,
+                                                &ctx.pace,
                                                 protected_max_ms,
                                             ),
                                         );
@@ -6963,7 +7016,7 @@ fn run_loop(
                                         if !tail.is_empty() {
                                             let mut t = tail.join(" ");
                                             t.truncate(240);
-                                            last_cut_context = Some(t);
+                                            ctx.last_cut_context = Some(t);
                                         }
                                     }
                                     // VOICE-001: nothing audible + no barge/operator
@@ -6994,7 +7047,7 @@ fn run_loop(
                                             eprintln!(
                                                 "[aokie-plugin] empty generation — retrying once before the fail-safe"
                                             );
-                                            history.push(serde_json::json!({
+                                            ctx.history.push(serde_json::json!({
                                                 "role": "user",
                                                 "content": "[SYSTEM NOTE - not the caller speaking] Your previous reply was empty. Answer the caller now in one short sentence.",
                                             }));
@@ -7032,19 +7085,19 @@ fn run_loop(
                                         // later "checks" were announced with
                                         // no marker at all (call acadcecc).
                                         // The transcript stays marker-free.
-                                        consecutive_waits = 0;
+                                        ctx.consecutive_waits = 0;
                                         let hist_content = match &lookup_requested {
                                             Some(lq) => format!("{heard} [[LOOKUP: {lq}]]"),
                                             None => heard.clone(),
                                         };
-                                        history.push(
+                                        ctx.history.push(
                                             serde_json::json!({ "role": "assistant", "content": hist_content }),
                                         );
                                         emit_turn_with_delivery(
                                             outbox,
                                             sink,
                                             &corr,
-                                            turn_index,
+                                            ctx.turn_index,
                                             "bot",
                                             &heard,
                                             Some(delivery),
@@ -7052,14 +7105,14 @@ fn run_loop(
                                                 t0.elapsed().as_millis() as u64,
                                             )),
                                         );
-                                        turn_index += 1;
+                                        ctx.turn_index += 1;
                                         // Echo guard + replay compare/replay what
                                         // was SENT (§6.3) — the flushed-but-echoed
                                         // tail must still match; the transcript
                                         // above stays the conservative estimate.
                                         let sent_full =
                                             sent_spans.join(" ").trim().to_string();
-                                        last_bot_reply = if sent_full.is_empty() {
+                                        ctx.last_bot_reply = if sent_full.is_empty() {
                                             heard
                                         } else {
                                             match cut {
@@ -7067,7 +7120,7 @@ fn run_loop(
                                                 None => sent_full.clone(),
                                             }
                                         };
-                                        last_bot_speech = if sent_full.is_empty() {
+                                        ctx.last_bot_speech = if sent_full.is_empty() {
                                             played
                                         } else {
                                             sent_full
@@ -7100,14 +7153,14 @@ fn run_loop(
                                     let heard = spoken.join(" ").trim().to_string();
                                     if !heard.is_empty() {
                                         let heard = format!("{heard} [reply cut short by an error]");
-                                        history.push(
+                                        ctx.history.push(
                                             serde_json::json!({ "role": "assistant", "content": heard }),
                                         );
                                         emit_turn_with_delivery(
                                             outbox,
                                             sink,
                                             &corr,
-                                            turn_index,
+                                            ctx.turn_index,
                                             "bot",
                                             &heard,
                                             Some("error"),
@@ -7115,11 +7168,11 @@ fn run_loop(
                                                 t0.elapsed().as_millis() as u64,
                                             )),
                                         );
-                                        turn_index += 1;
-                                        last_bot_speech = heard
+                                        ctx.turn_index += 1;
+                                        ctx.last_bot_speech = heard
                                             .trim_end_matches(" [reply cut short by an error]")
                                             .to_string();
-                                        last_bot_reply = heard;
+                                        ctx.last_bot_reply = heard;
                                     } else if !line_dead
                                         && reply_left_dead_air(false, barged, operator_ended)
                                     {
@@ -7190,18 +7243,18 @@ fn run_loop(
                                         );
                                         speak_manager_line(
                                             bt, &synth, outbox, sink, &status, &corr,
-                                            &mut turn_index, &mut history,
+                                            &mut ctx.turn_index, &mut ctx.history,
                                             MANAGER_DENIED_LINE,
                                         );
                                     } else if !pin_set {
                                         speak_manager_line(
                                             bt, &synth, outbox, sink, &status, &corr,
-                                            &mut turn_index, &mut history, NO_PIN_LINE,
+                                            &mut ctx.turn_index, &mut ctx.history, NO_PIN_LINE,
                                         );
-                                    } else if manager_gate.verified {
+                                    } else if ctx.manager_gate.verified {
                                         speak_manager_line(
                                             bt, &synth, outbox, sink, &status, &corr,
-                                            &mut turn_index, &mut history,
+                                            &mut ctx.turn_index, &mut ctx.history,
                                             MANAGER_ACTION_FILLER,
                                         );
                                         let mgr_from = tracker
@@ -7215,15 +7268,15 @@ fn run_loop(
                                         );
                                         speak_manager_line(
                                             bt, &synth, outbox, sink, &status, &corr,
-                                            &mut turn_index, &mut history, &outcome,
+                                            &mut ctx.turn_index, &mut ctx.history, &outcome,
                                         );
                                     } else {
-                                        manager_gate.pending = Some(req);
-                                        manager_gate.awaiting_pin = true;
-                                        manager_gate.attempts = 0;
+                                        ctx.manager_gate.pending = Some(req);
+                                        ctx.manager_gate.awaiting_pin = true;
+                                        ctx.manager_gate.attempts = 0;
                                         speak_manager_line(
                                             bt, &synth, outbox, sink, &status, &corr,
-                                            &mut turn_index, &mut history,
+                                            &mut ctx.turn_index, &mut ctx.history,
                                             PIN_PROMPT_LINE,
                                         );
                                     }
@@ -7256,7 +7309,7 @@ fn run_loop(
                                         outbox,
                                         sink,
                                         &corr,
-                                        turn_index,
+                                        ctx.turn_index,
                                         "bot",
                                         ABUSE_LINE,
                                         Some("complete"),
@@ -7264,7 +7317,7 @@ fn run_loop(
                                             ab_t0.elapsed().as_millis() as u64,
                                         )),
                                     );
-                                    turn_index += 1;
+                                    ctx.turn_index += 1;
                                     let wait =
                                         playout_drain_wait(ab_t0, out.dur, Instant::now());
                                     if !wait.is_zero() {
@@ -7319,7 +7372,7 @@ fn run_loop(
                                         // Ghost-turn latch: words captured
                                         // during the notice must never mint an
                                         // answered post-hangup turn.
-                                        agent_hung_up = true;
+                                        ctx.agent_hung_up = true;
                                         eprintln!(
                                             "[aokie-plugin] abuse termination complete (AT+CHUP)"
                                         );
@@ -7373,7 +7426,7 @@ fn run_loop(
                                         outbox,
                                         sink,
                                         &corr,
-                                        turn_index,
+                                        ctx.turn_index,
                                         "bot",
                                         FALLBACK_LINE,
                                         Some("complete"),
@@ -7381,7 +7434,7 @@ fn run_loop(
                                             fb_t0.elapsed().as_millis() as u64,
                                         )),
                                     );
-                                    turn_index += 1;
+                                    ctx.turn_index += 1;
                                     // AOK-CTRL-001: drain the QUEUED apology before
                                     // CHUP — computed from what was actually queued
                                     // (the blind 900 ms cut a long apology short).
@@ -7400,7 +7453,7 @@ fn run_loop(
                                 );
                                 match bt.hangup() {
                                     Ok(()) => {
-                                        agent_hung_up = true;
+                                        ctx.agent_hung_up = true;
                                         eprintln!(
                                             "[aokie-plugin] fail-safe hangup complete (AT+CHUP)"
                                         );
@@ -7448,7 +7501,7 @@ fn run_loop(
                                     );
                                     match bt.hangup() {
                                         Ok(()) => {
-                                            agent_hung_up = true;
+                                            ctx.agent_hung_up = true;
                                             eprintln!(
                                                 "[aokie-plugin] agent finalized the call — hung up (AT+CHUP)"
                                             );
@@ -7477,13 +7530,13 @@ fn run_loop(
                             // AOK-CTRL-001: a finished reply attempt (audible or
                             // not) is conversational activity — the max-silence
                             // window measures from here.
-                            if let Some(t) = silence_timer.as_mut() {
+                            if let Some(t) = ctx.silence_timer.as_mut() {
                                 t.note_activity(Instant::now());
                             }
                             // Realtime phase: the reply is done — the floor is
                             // the caller's again (or the held pause).
-                            if let Some(lane) = rt_lane.as_mut() {
-                                let ph = if dialogue.is_paused() { "paused" } else { "listening" };
+                            if let Some(lane) = ctx.rt_lane.as_mut() {
+                                let ph = if ctx.dialogue.is_paused() { "paused" } else { "listening" };
                                 if let Some(line) = lane.phase(ph, Instant::now()) {
                                     let _ = sink.send_line(&line);
                                 }
@@ -7496,7 +7549,7 @@ fn run_loop(
                                 && !barged
                                 && !operator_ended
                                 && !line_dead
-                                && consecutive_waits >= 1
+                                && ctx.consecutive_waits >= 1
                                 && !wait_regen_done
                                 && lookup_rounds == 0
                             {
@@ -7507,7 +7560,7 @@ fn run_loop(
                                 eprintln!(
                                     "[aokie-plugin] second consecutive [[WAIT]] rejected — regenerating with a speak-now note"
                                 );
-                                history.push(serde_json::json!({
+                                ctx.history.push(serde_json::json!({
                                     "role": "user",
                                     "content": "[SYSTEM NOTE - not the caller speaking] You already waited silently once. The caller has spoken again - [[WAIT]] is not available for this reply. Answer them now in one short sentence.",
                                 }));
@@ -7516,13 +7569,14 @@ fn run_loop(
                                 continue 'reply_rounds;
                             }
                             if wait_requested && !barged && !operator_ended && !line_dead {
-                                consecutive_waits += 1;
+                                ctx.consecutive_waits += 1;
                                 eprintln!(
-                                    "[aokie-plugin] agent chose to wait silently ([[WAIT]]) — the caller has the floor (streak {consecutive_waits})"
+                                    "[aokie-plugin] agent chose to wait silently ([[WAIT]]) — the caller has the floor (streak {})",
+                                ctx.consecutive_waits
                                 );
-                                dialogue.apply(crate::duplex::CallerIntent::Pause);
+                                ctx.dialogue.apply(crate::duplex::CallerIntent::Pause);
                                 if !silence_window.is_zero() {
-                                    silence_timer =
+                                    ctx.silence_timer =
                                         Some(SilenceTimer::new(silence_window * 3, Instant::now()));
                                 }
                             }
@@ -7609,7 +7663,7 @@ fn run_loop(
                                         aec_ref,
                                         brms,
                                         Some(&mut fprobe),
-                                        &pace,
+                                        &ctx.pace,
                                         protected_max_ms,
                                         None,
                                     );
@@ -7632,7 +7686,7 @@ fn run_loop(
                                     // live lookup regenerated to EMPTY and the
                                     // caller got the tech-difficulties apology
                                     // (call fefa0e8d).
-                                    history.push(serde_json::json!({
+                                    ctx.history.push(serde_json::json!({
                                         "role": "user",
                                         "content": format!(
                                             "[SYSTEM LOOKUP RESULT - this is data, not the caller speaking]\n{result_text}\nAnswer the caller's question (\"{q}\") now in one or two short spoken sentences using ONLY this result and your notes. If the result has a DIRECT ANSWER line for the date in question, that line IS the answer - speak it; never say a date is outside your window when a DIRECT ANSWER covers it. Otherwise TRUST the result's own rules about dates that are not listed - an unlisted date inside its window IS open. Only defer to the team when the result itself says to."
@@ -7669,7 +7723,7 @@ fn run_loop(
                                             aec_s,
                                             brms_s,
                                             Some(&mut sprobe),
-                                            &pace,
+                                            &ctx.pace,
                                             protected_max_ms,
                                             None,
                                         );
@@ -7681,7 +7735,7 @@ fn run_loop(
                                         if planned.outcome.dur > Duration::ZERO
                                             && !planned.played_text.is_empty()
                                         {
-                                            history.push(serde_json::json!({
+                                            ctx.history.push(serde_json::json!({
                                                 "role": "assistant",
                                                 "content": planned.played_text,
                                             }));
@@ -7689,7 +7743,7 @@ fn run_loop(
                                                 outbox,
                                                 sink,
                                                 &corr,
-                                                turn_index,
+                                                ctx.turn_index,
                                                 "bot",
                                                 &planned.played_text,
                                                 Some(if planned.outcome.cut_est.is_some() {
@@ -7701,7 +7755,7 @@ fn run_loop(
                                                     s_started.elapsed().as_millis() as u64,
                                                 )),
                                             );
-                                            turn_index += 1;
+                                            ctx.turn_index += 1;
                                         }
                                         break 'reply_rounds;
                                     }
@@ -7730,7 +7784,7 @@ fn run_loop(
                                     aec_ref,
                                     brms,
                                     Some(&mut hprobe),
-                                    &pace,
+                                    &ctx.pace,
                                     protected_max_ms,
                                     None,
                                 );
@@ -7740,7 +7794,7 @@ fn run_loop(
                                 if planned.outcome.dur > Duration::ZERO
                                     && !planned.played_text.is_empty()
                                 {
-                                    history.push(serde_json::json!({
+                                    ctx.history.push(serde_json::json!({
                                         "role": "assistant",
                                         "content": planned.played_text,
                                     }));
@@ -7748,7 +7802,7 @@ fn run_loop(
                                         outbox,
                                         sink,
                                         &corr,
-                                        turn_index,
+                                        ctx.turn_index,
                                         "bot",
                                         &planned.played_text,
                                         Some("complete"),
@@ -7756,7 +7810,7 @@ fn run_loop(
                                             h_started.elapsed().as_millis() as u64,
                                         )),
                                     );
-                                    turn_index += 1;
+                                    ctx.turn_index += 1;
                                 }
                             }
                             break 'reply_rounds;
@@ -7777,7 +7831,7 @@ fn run_loop(
             if agent_enabled && tracker.current().is_some_and(|s| s.is_active()) {
                 let sr = bt.get_sample_rate();
                 let action = if sr > 0 {
-                    silence_timer.as_mut().and_then(|t| t.check(Instant::now()))
+                    ctx.silence_timer.as_mut().and_then(|t| t.check(Instant::now()))
                 } else {
                     None
                 };
@@ -7803,7 +7857,7 @@ fn run_loop(
                             aec_ref,
                             brms,
                             Some(&mut probe),
-                            pace.base(),
+                            ctx.pace.base(),
                             None,
                             None,
                         );
@@ -7812,7 +7866,7 @@ fn run_loop(
                             if out.barged {
                                 bt.flush_tx_audio();
                                 // The caller spoke over the prompt — that IS activity.
-                                if let Some(t) = silence_timer.as_mut() {
+                                if let Some(t) = ctx.silence_timer.as_mut() {
                                     t.note_activity(Instant::now());
                                 }
                             }
@@ -7846,7 +7900,7 @@ fn run_loop(
                                     outbox,
                                     sink,
                                     &corr,
-                                    turn_index,
+                                    ctx.turn_index,
                                     "bot",
                                     SILENCE_CHECK_LINE,
                                     Some(delivery),
@@ -7854,13 +7908,13 @@ fn run_loop(
                                         check_started.elapsed().as_millis() as u64,
                                     )),
                                 );
-                                turn_index += 1;
+                                ctx.turn_index += 1;
                             }
-                            history.push(serde_json::json!({
+                            ctx.history.push(serde_json::json!({
                                 "role": "assistant",
                                 "content": SILENCE_CHECK_LINE,
                             }));
-                            last_bot_reply = SILENCE_CHECK_LINE.to_string();
+                            ctx.last_bot_reply = SILENCE_CHECK_LINE.to_string();
                         }
                         if let Some(action) = probe.action.take() {
                             perform_cancel_action(action, bt, &mut tracker, outbox, sink);
@@ -7881,7 +7935,7 @@ fn run_loop(
                             None,
                             None,
                             Some(&mut probe),
-                            pace.base(),
+                            ctx.pace.base(),
                             None,
                             None,
                         );
@@ -7889,7 +7943,7 @@ fn run_loop(
                         if out.barged {
                             // The caller came back at the last moment — keep the call.
                             bt.flush_tx_audio();
-                            if let Some(t) = silence_timer.as_mut() {
+                            if let Some(t) = ctx.silence_timer.as_mut() {
                                 t.note_activity(Instant::now());
                             }
                         } else if let Some(action) = probe.action.take() {
@@ -7902,7 +7956,7 @@ fn run_loop(
                                         outbox,
                                         sink,
                                         &corr,
-                                        turn_index,
+                                        ctx.turn_index,
                                         "bot",
                                         SILENCE_GOODBYE_LINE,
                                         Some("complete"),
@@ -7910,7 +7964,7 @@ fn run_loop(
                                             gb_t0.elapsed().as_millis() as u64,
                                         )),
                                     );
-                                    turn_index += 1;
+                                    ctx.turn_index += 1;
                                 }
                                 let wait = playout_drain_wait(gb_t0, out.dur, Instant::now());
                                 if !wait.is_zero() {
@@ -7922,7 +7976,7 @@ fn run_loop(
                             );
                             match bt.hangup() {
                                 Ok(()) => {
-                                    agent_hung_up = true;
+                                    ctx.agent_hung_up = true;
                                     eprintln!(
                                         "[aokie-plugin] max-silence hangup complete (AT+CHUP)"
                                     );
@@ -7939,7 +7993,7 @@ fn run_loop(
                                     );
                                 }
                             }
-                            silence_timer = None;
+                            ctx.silence_timer = None;
                         }
                     }
                     None => {}
@@ -8026,7 +8080,7 @@ fn run_loop(
                         // never mint caller_id events, so none arrives.
                         #[cfg(feature = "voice")]
                         {
-                            call_agent_overlay = Some(CallAgentOverlay {
+                            ctx.call_agent_overlay = Some(CallAgentOverlay {
                                 call_id: call_id.clone(),
                                 persona: Some(format!(
                                     "{agent_persona}{}",
@@ -8119,7 +8173,7 @@ fn run_loop(
                             None,
                             None,
                             Some(&mut probe),
-                            &pace,
+                            &ctx.pace,
                             protected_max_ms,
                             None,
                         );
@@ -8146,7 +8200,7 @@ fn run_loop(
                                     outbox,
                                     sink,
                                     &corr,
-                                    turn_index,
+                                    ctx.turn_index,
                                     "bot",
                                     &planned.played_text,
                                     Some(delivery),
@@ -8154,10 +8208,10 @@ fn run_loop(
                                         op_started.elapsed().as_millis() as u64,
                                     )),
                                 );
-                                turn_index += 1;
+                                ctx.turn_index += 1;
                             }
                             // Spoken audio is conversational activity.
-                            if let Some(t) = silence_timer.as_mut() {
+                            if let Some(t) = ctx.silence_timer.as_mut() {
                                 t.note_activity(Instant::now());
                             }
                         } else if !out.cancelled && sr > 0 && !planned.text.trim().is_empty() {
@@ -8221,13 +8275,13 @@ fn run_loop(
                                         agent_model.clone(),
                                         &status,
                                         compose_agent_system_prompt(p, agent_hangup, None),
-                                        history.clone(),
+                                        ctx.history.clone(),
                                         "overlay",
                                         None,
                                     );
                                 }
                             }
-                            call_agent_overlay = Some(CallAgentOverlay {
+                            ctx.call_agent_overlay = Some(CallAgentOverlay {
                                 call_id,
                                 persona,
                                 greeting,
