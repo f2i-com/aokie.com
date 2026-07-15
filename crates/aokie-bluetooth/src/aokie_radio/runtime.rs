@@ -1156,19 +1156,26 @@ fn pop_acl_frame(
 /// space-separated hex string for diagnostic logging. Caps at 32 so a
 /// stray full-buffer caller can't dump kilobytes into the log.
 /// Persistent ACL-stream corruption detector (see the tracker locals in the
-/// radio loop): ≥3 garbage-PREFIX resyncs inside 10 minutes means the dongle
-/// controller is mangling its USB transfers — every connect will fail until
-/// the operator power-cycles it — so raise ONE actionable hardware error.
-/// ONLY Resynced (prefix-garbage) outcomes count: deterministic parser
-/// stalls on one traffic shape (the MAP-poll flush loop) must never trip
-/// the replug instruction (false alarm, live 2026-07-15). The window
-/// emptying re-arms the report, so a relapse after a recovery is announced.
+/// radio loop). ONLY Resynced (prefix-garbage) outcomes count: deterministic
+/// parser stalls on one traffic shape (the MAP-poll flush loop) must never
+/// trip the replug instruction (false alarm, live 2026-07-15).
+///
+/// TWO TIERS (live 2026-07-15 afternoon: sporadic hiccups under heavy
+/// call+MAP load self-recovered — though one cost a call its audio channel —
+/// while a true controller wedge (z38) produces CONTINUOUS garbage):
+/// - DENSE burst (the last 3 resyncs inside 2 minutes) → the actionable
+///   power-cycle error; a wedged controller trips this within seconds.
+/// - Slow accumulation (3 across the 10-minute window) → a softer
+///   "hiccuped but recovered" notice, so the operator knows the dongle is
+///   marginal without being told a working line is dead.
+/// A soft episode escalates to the hard report if a dense burst follows;
+/// the window emptying re-arms everything, so a relapse re-announces.
 fn note_acl_corruption(
     times: &mut std::collections::VecDeque<Instant>,
-    reported: &mut bool,
+    reported: &mut u8,
     event_tx: &UnboundedSender<RuntimeEvent>,
+    now: Instant,
 ) {
-    let now = Instant::now();
     while times
         .front()
         .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(600))
@@ -1176,15 +1183,29 @@ fn note_acl_corruption(
         times.pop_front();
     }
     if times.is_empty() {
-        *reported = false;
+        *reported = 0;
     }
     times.push_back(now);
-    if times.len() >= 3 && !*reported {
-        *reported = true;
+    let dense = times.len() >= 3
+        && times
+            .iter()
+            .rev()
+            .nth(2)
+            .is_some_and(|t| now.duration_since(*t) <= Duration::from_secs(120));
+    if dense && *reported < 2 {
+        *reported = 2;
         let _ = event_tx.send(RuntimeEvent::Error(
-            "Bluetooth dongle USB stream corrupted (repeated garbage in reads) - connections \
+            "Bluetooth dongle USB stream corrupted (continuous garbage in reads) - connections \
              cannot succeed until the dongle is power-cycled: unplug it, wait 5 seconds, plug \
              it back in"
+                .to_string(),
+        ));
+    } else if times.len() >= 3 && *reported == 0 {
+        *reported = 1;
+        let _ = event_tx.send(RuntimeEvent::Error(
+            "Bluetooth dongle USB stream hiccuped (garbage in reads) but recovered - a call's \
+             audio may have glitched. If calls go silent or drop, power-cycle the dongle: \
+             unplug it, wait 5 seconds, plug it back in"
                 .to_string(),
         ));
     }
@@ -1639,7 +1660,7 @@ fn run_runtime(
     // A transient one-off resync (seen once during a 2026-07-13 listing
     // burst) stays a log line — it never reaches the threshold.
     let mut acl_corruption_times: std::collections::VecDeque<Instant> = Default::default();
-    let mut acl_corruption_reported = false;
+    let mut acl_corruption_reported: u8 = 0;
     let mut loop_iter: u64 = 0;
     let mut last_heartbeat = Instant::now();
     // ACL keepalive: during a call the SCO link monopolises the air and the AG
@@ -3508,6 +3529,7 @@ fn run_runtime(
                         &mut acl_corruption_times,
                         &mut acl_corruption_reported,
                         &event_tx,
+                        Instant::now(),
                     );
                     continue;
                 }
@@ -5572,22 +5594,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn acl_corruption_reports_once_at_threshold() {
+    fn acl_corruption_dense_burst_demands_a_power_cycle() {
+        // Three resyncs in rapid succession = the wedge signature.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut times = std::collections::VecDeque::new();
-        let mut reported = false;
+        let mut reported: u8 = 0;
+        let t0 = Instant::now();
         for _ in 0..2 {
-            note_acl_corruption(&mut times, &mut reported, &tx);
+            note_acl_corruption(&mut times, &mut reported, &tx, t0);
         }
         assert!(rx.try_recv().is_err(), "below threshold must stay a log line");
-        note_acl_corruption(&mut times, &mut reported, &tx);
+        note_acl_corruption(&mut times, &mut reported, &tx, t0);
         match rx.try_recv() {
-            Ok(RuntimeEvent::Error(msg)) => assert!(msg.contains("power-cycled")),
+            Ok(RuntimeEvent::Error(msg)) => {
+                assert!(msg.contains("power-cycled"));
+                assert!(!msg.contains("recovered"));
+            }
             other => panic!("expected the actionable error, got {other:?}"),
         }
         // One report per episode — continued corruption must not spam.
-        note_acl_corruption(&mut times, &mut reported, &tx);
+        note_acl_corruption(&mut times, &mut reported, &tx, t0);
         assert!(rx.try_recv().is_err(), "no duplicate reports mid-episode");
+    }
+
+    #[test]
+    fn acl_corruption_slow_accumulation_is_a_recovered_hiccup_then_escalates() {
+        // Three resyncs SPREAD across minutes = marginal-under-load, not a
+        // wedge (live 2026-07-15: the line kept working) — soft notice only.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut times = std::collections::VecDeque::new();
+        let mut reported: u8 = 0;
+        let t0 = Instant::now();
+        note_acl_corruption(&mut times, &mut reported, &tx, t0);
+        note_acl_corruption(&mut times, &mut reported, &tx, t0 + Duration::from_secs(180));
+        note_acl_corruption(&mut times, &mut reported, &tx, t0 + Duration::from_secs(360));
+        match rx.try_recv() {
+            Ok(RuntimeEvent::Error(msg)) => {
+                assert!(msg.contains("recovered"), "sparse resyncs report the soft notice: {msg}");
+            }
+            other => panic!("expected the soft notice, got {other:?}"),
+        }
+        // A dense burst AFTER the soft notice escalates to the hard report.
+        let burst = t0 + Duration::from_secs(400);
+        note_acl_corruption(&mut times, &mut reported, &tx, burst);
+        note_acl_corruption(&mut times, &mut reported, &tx, burst + Duration::from_secs(1));
+        match rx.try_recv() {
+            Ok(RuntimeEvent::Error(msg)) => assert!(msg.contains("power-cycled") && !msg.contains("recovered")),
+            other => panic!("expected the escalation, got {other:?}"),
+        }
     }
 
     fn listing_with(handles: &[&str]) -> Vec<u8> {
