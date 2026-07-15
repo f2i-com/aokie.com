@@ -3630,8 +3630,44 @@ fn tts_speak(
     // with the actual outcome at span end. Behavior-neutral by construction.
     let mut shadow_prev: Option<crate::duplex::FloorDecision> = None;
     let mut shadow_worst: u8 = 0;
+    // Wall-clock safety floor: this loop runs ON the radio thread, so while
+    // it spins nothing else — event processing, control commands, a
+    // device-side hangup — is serviced. The natural-end test waits for the
+    // SCO TX queue to DRAIN at real time; if the audio path is wedged (a
+    // call-hold transition left this leg inactive, the dongle stalled) the
+    // queue never drains and the loop would spin forever, hanging the whole
+    // radio (observed live 2026-07-15: an auto-hold double-swap left the
+    // resumed leg's SCO not draining and the call could not be hung up).
+    // These two guards guarantee tts_speak ALWAYS returns, so the radio
+    // thread always gets back to servicing events + controls.
+    let loop_start = std::time::Instant::now();
     loop {
         let now = std::time::Instant::now();
+        // Absolute backstop: no single utterance legitimately pumps this
+        // long. If nothing was ever queued, synthesis is dead; either way,
+        // stop so the radio thread can service events (hangup) again.
+        let elapsed = now.duration_since(loop_start);
+        if playback.first {
+            if elapsed > Duration::from_secs(8) {
+                eprintln!(
+                    "[aokie-plugin] TTS produced no audio in 8s — abandoning playout to keep the radio responsive"
+                );
+                break;
+            }
+        } else {
+            // Something was queued: it must drain at ~real time. If far more
+            // wall-clock than the queued audio's own duration has elapsed and
+            // it still is not played out, the SCO sink is wedged.
+            let queued_ms =
+                playback.samples as u64 * 1000 / u64::from(sample_rate.max(1));
+            let played_ms = now.duration_since(playback.t_first).as_millis() as u64;
+            if played_ms > queued_ms + 4000 {
+                eprintln!(
+                    "[aokie-plugin] TTS playout wedged ({played_ms}ms elapsed vs {queued_ms}ms of audio queued) — SCO not draining, abandoning to keep the radio responsive"
+                );
+                break;
+            }
+        }
         // Urgent controls cut even while we're idling between frames.
         if let Some(p) = ctl.as_deref_mut() {
             if p.poll() {
@@ -4700,15 +4736,19 @@ fn run_loop(
     // farewell is spoken/recorded. Only meaningful with the agent on.
     #[cfg(feature = "voice")]
     let agent_hangup = agent_enabled && std::env::var_os("AOKIE_AGENT_HANGUP").is_some();
-    // Phase 4: when call waiting is negotiated (AOKIE_CALL_WAITING, the
-    // holdAndCallWaiting setting) AND the agent owns replies, a second caller
-    // is handled AUTOMATICALLY — the receptionist tells the current caller to
-    // hold, briefly answers the newcomer to ask THEM to hold with their queue
-    // position, then returns to the first caller. When the current call ends
-    // the held caller is promoted and greeted. Off ⇒ the observe-only lane
-    // (aokie.call.waiting event, no spoken flow).
+    // Phase 4: the AUTOMATIC spoken hold juggle — tell the current caller to
+    // hold, swap to the newcomer to ask THEM to hold, swap BACK and resume.
+    // ⚠️ DISABLED BY DEFAULT (separate AOKIE_AUTO_HOLD flag, off) after a
+    // live test showed the DOUBLE CHLD=2 swap is unreliable on the Pixel: the
+    // swap-back tore the calls down (callheld 2→0) and left the resumed leg's
+    // SCO not draining. With `holdAndCallWaiting` on but this off, call
+    // waiting stays in the PROVEN modes — capability negotiation, the
+    // observe-only aokie.call.waiting event, and the operator-driven
+    // call.switchboard / call.activate (single swap, live-proven). The
+    // juggle needs a redesign that avoids two rapid swaps before it comes
+    // back on.
     #[cfg(feature = "voice")]
-    let auto_hold = agent_enabled && std::env::var_os("AOKIE_CALL_WAITING").is_some();
+    let auto_hold = agent_enabled && std::env::var_os("AOKIE_AUTO_HOLD").is_some();
     // The waiting callId whose auto-hold juggle already ran (so the pump does
     // not re-trigger every loop pass while that caller sits on hold).
     #[cfg(feature = "voice")]
