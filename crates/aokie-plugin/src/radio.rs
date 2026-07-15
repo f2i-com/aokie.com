@@ -4037,6 +4037,17 @@ fn settle_swap(
         // Keep the stall watchdog honest — the loop is alive, just settling.
         status.loop_beat.fetch_add(1, Ordering::Relaxed);
         while let Some(ev) = bt.try_recv_event() {
+            // The CallerId RESCUE is topology-blind: a CLCC fired mid-shuffle
+            // reports whichever leg is momentarily ACTIVE, and stamping that
+            // number onto tracker.current() cross-labels sessions (live round
+            // 4: the parked newcomer's session took the PRIMARY's number
+            // during the swap-back settle — their Calls row ended up under
+            // the wrong phone). Every leg's identity is already minted and
+            // stable during a juggle — drop the rescue, keep everything else
+            // (the structured CallListEntry burst is what verification eats).
+            if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallerId(_)) {
+                continue;
+            }
             handle_event(ev, tracker, outbox, sink, status);
         }
         while bt.try_recv_audio().is_some() {}
