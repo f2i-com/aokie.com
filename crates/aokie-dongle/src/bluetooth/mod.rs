@@ -249,6 +249,13 @@ impl BluetoothManager {
         self.runtime.hold_swap()
     }
 
+    /// Phase 4 (switchboard): fire `AT+CLCC` now — the authoritative call
+    /// list comes back as CallListEntry events. The verified-swap machinery
+    /// uses this to CONFIRM a CHLD=2 outcome before acting on it.
+    pub fn query_calls(&self) -> Result<(), String> {
+        self.runtime.query_calls()
+    }
+
     /// AOK-BT-001: open a bounded, discoverable pairing window for `seconds`.
     /// At rest the radio is connectable-only, so an unknown phone can only
     /// pair while this window is open.
