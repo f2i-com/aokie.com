@@ -20,7 +20,7 @@
 //! 8 kHz with 48-byte HCI payloads paced at 3 ms each.
 
 use crate::aokie_radio::bmessage;
-use crate::aokie_radio::hfp::{HfpAtCommand, HfpEvent};
+use crate::aokie_radio::hfp::{ChldAction, HfpAtCommand, HfpEvent};
 use crate::aokie_radio::manager::{
     self, AOKIE_SCO_TX_QUEUE_SAMPLES, AOKIE_SCO_USB_PAYLOAD_BYTES, AOKIE_VOICE_SETTING,
     AOKIE_VOICE_SETTING_TRANSPARENT,
@@ -220,6 +220,14 @@ enum ControlCommand {
     /// command on the wire; dialing/alerting/answer events follow from the
     /// indicator updates exactly like an incoming call's do.
     Dial(String),
+    /// Phase 4 (switchboard): `AT+CHLD=2` — hold the active call and
+    /// accept the waiting/held one. The ONLY non-destructive switch on
+    /// phones without indexed CHLD modes (the live Pixel advertises
+    /// (0,1,2,3) only). TOGGLE semantics: never blind-retry after a lost
+    /// OK — the caller reconciles with a fresh AT+CLCC instead. State
+    /// truth stays with the AG's indicator stream + CLCC, exactly like
+    /// Answer/Dial.
+    HoldSwap,
     SendAudio(Vec<i16>),
     /// Drain `sco_tx_queue` immediately, dropping any TTS bytes that were
     /// already queued for transmission. Used by "Take Over Call" so the
@@ -582,6 +590,16 @@ impl AokieRuntime {
     pub fn dial(&self, number: String) -> Result<(), String> {
         self.control_tx
             .send(ControlCommand::Dial(number))
+            .map_err(|_| "aokie-radio runtime is no longer running".to_string())
+    }
+
+    /// Phase 4 (switchboard): `AT+CHLD=2` — hold the active call, accept
+    /// the waiting/held one (the plain toggle; see ControlCommand::HoldSwap
+    /// for the never-blind-retry rule). Outcome arrives via the indicator
+    /// stream (callheld/callsetup) + a follow-up AT+CLCC.
+    pub fn hold_swap(&self) -> Result<(), String> {
+        self.control_tx
+            .send(ControlCommand::HoldSwap)
             .map_err(|_| "aokie-radio runtime is no longer running".to_string())
     }
 
@@ -2317,6 +2335,29 @@ fn run_runtime(
                     for packet in &packets {
                         if let Err(e) = transport.write_acl(packet) {
                             let _ = event_tx.send(RuntimeEvent::Error(format!("dial: {}", e)));
+                        }
+                    }
+                }
+                Ok(ControlCommand::HoldSwap) => {
+                    let packets = l2cap_state.build_hfp_call_control_packets(
+                        HfpAtCommand::CallHold(ChldAction::HoldActiveAcceptOther),
+                    )?;
+                    eprintln!(
+                        "[AokieRadio] HoldSwap requested — built {} ACL packet(s) for AT+CHLD=2",
+                        packets.len()
+                    );
+                    if packets.is_empty() {
+                        // Same policy as Dial: a silently-swallowed switch
+                        // would leave the switchboard believing a transition
+                        // is in flight that never touched the wire.
+                        let _ = event_tx.send(RuntimeEvent::Error(
+                            "holdSwap: no open HFP service-level connection".to_string(),
+                        ));
+                    }
+                    for packet in &packets {
+                        if let Err(e) = transport.write_acl(packet) {
+                            let _ =
+                                event_tx.send(RuntimeEvent::Error(format!("holdSwap: {}", e)));
                         }
                     }
                 }
