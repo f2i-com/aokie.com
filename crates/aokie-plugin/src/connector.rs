@@ -485,6 +485,28 @@ impl Plugin {
                 "[aokie-plugin] audioTranscript ON → the audio model corrects each caller turn's transcript"
             );
         }
+        // holdAndCallWaiting (Phase 4): the radio advertises HFP three-way
+        // calling in BRSF and negotiates AT+CHLD=? / AT+CCWA=1 at SLC time,
+        // so a second caller during an active call surfaces as a waiting
+        // episode (aokie.call.waiting) instead of tearing the live session
+        // down. Observe-only: no hold/switch commands are ever sent yet.
+        let call_waiting = self
+            .store
+            .config
+            .settings
+            .get("holdAndCallWaiting")
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false);
+        if call_waiting {
+            std::env::set_var("AOKIE_CALL_WAITING", "1");
+            eprintln!(
+                "[aokie-plugin] holdAndCallWaiting ON → negotiating call waiting at the next connect (observe-only)"
+            );
+        } else {
+            // A radio restart inside the same process must not inherit a
+            // previously-armed flag once the setting is off.
+            std::env::remove_var("AOKIE_CALL_WAITING");
+        }
         // Call screening (spec Phase 0): number rules → env, read into a
         // ScreenPolicy at radio start and on live settings.set (see below).
         apply_screening_env(&self.store.config.settings);
@@ -2200,6 +2222,9 @@ impl Plugin {
                     "callActive": r.is_call_active(),
                     "staleSttResults": r.stale_stt_results(),
                     "duplex": r.duplex_counters(),
+                    // Phase 4 observe lane: waiting episodes + last callheld
+                    // indicator state (soak data for the switchboard slice).
+                    "callWaiting": r.call_waiting_diagnostics(),
                     "error": r.last_error(),
                     "voiceRuntime": {
                         "ready": stt_err.is_none() && tts_err.is_none()
@@ -2661,6 +2686,11 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     SettingSpec { key: "bargeIn", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "sendAudio", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "audioTranscript", kind: SettingKind::Bool, applies_live: false },
+    // Phase 4 (call waiting / hold): advertise HFP three-way calling and
+    // negotiate AT+CHLD / AT+CCWA at the next connect. OBSERVE-ONLY for now
+    // (a second caller is detected + recorded, never answered/held) —
+    // default OFF keeps the legacy wire behaviour byte-for-byte.
+    SettingSpec { key: "holdAndCallWaiting", kind: SettingKind::Bool, applies_live: false },
     SettingSpec { key: "blockedNumbers", kind: SettingKind::Str { max_chars: 4000 }, applies_live: true },
     SettingSpec { key: "acceptPattern", kind: SettingKind::Str { max_chars: 200 }, applies_live: true },
     SettingSpec { key: "rejectPrivate", kind: SettingKind::Bool, applies_live: true },

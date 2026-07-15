@@ -881,6 +881,17 @@ pub struct RadioStatus {
     /// answered a silent observed session while a spurious failed
     /// call.ended fired the apology-SMS flow).
     pub pending_dial: Mutex<Option<PendingDial>>,
+    /// Phase 4 (observe-only): waiting episodes seen this radio session —
+    /// dongle.diagnostics visibility for the live capability soak.
+    pub call_waiting_episodes: AtomicU64,
+    /// The call id whose CURRENT waiting episode already emitted
+    /// `aokie.call.waiting` (one durable event per episode; cleared when
+    /// the episode ends so a later second knock on the same call
+    /// re-announces).
+    pub call_waiting_announced: Mutex<Option<String>>,
+    /// Last `callheld` indicator state (0 none / 1 held+active / 2 held
+    /// only) — diagnostics only, nothing consumes it yet.
+    pub call_held_state: AtomicU64,
 }
 
 /// See [`RadioStatus::pending_dial`].
@@ -1004,6 +1015,15 @@ impl RadioHandle {
             "floorShadowYields": s.floor_shadow_yields.load(Ordering::Relaxed),
             "floorShadowDucks": s.floor_shadow_ducks.load(Ordering::Relaxed),
             "floorShadowDivergences": s.floor_shadow_divergences.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Phase 4 observe lane: waiting episodes seen this radio session +
+    /// the last callheld indicator state — dongle.diagnostics visibility.
+    pub fn call_waiting_diagnostics(&self) -> serde_json::Value {
+        json!({
+            "episodes": self.status.call_waiting_episodes.load(Ordering::Relaxed),
+            "callHeldState": self.status.call_held_state.load(Ordering::Relaxed),
         })
     }
 
@@ -2775,7 +2795,7 @@ fn mentions_a_date(text: &str) -> bool {
     false
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "voice"))]
 mod heard_context_tests {
     use super::heard_context;
 
@@ -2806,7 +2826,7 @@ mod heard_context_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "voice"))]
 mod sanitize_heard_tests {
     use super::sanitize_heard;
 
@@ -8549,6 +8569,72 @@ fn handle_event(
             }
             *status.current_caller.lock().unwrap() = Some(num);
         }
+        E::CallWaiting { number } => {
+            // Phase 4 observe-only lane: a SECOND caller is knocking while a
+            // call is active (call-waiting-negotiated connections only). No
+            // hold/switch happens yet — the waiting caller hears the
+            // network's tone — but the knock is recorded durably so flows
+            // can follow up (and so live soak data accumulates for the
+            // switchboard slice). One event per episode; a late number for
+            // an anonymously-started episode is log-only.
+            let num = number.unwrap_or_default();
+            let Some(corr) = tracker.call_id().map(str::to_string) else {
+                eprintln!(
+                    "[aokie-plugin] call-waiting signal with no tracked call — ignored"
+                );
+                return;
+            };
+            {
+                let mut announced = status.call_waiting_announced.lock().unwrap();
+                if announced.as_deref() == Some(corr.as_str()) {
+                    if !num.is_empty() {
+                        eprintln!(
+                            "[aokie-plugin] waiting caller identified: {}",
+                            aokie_core::redact::Phone(&num)
+                        );
+                    }
+                    return;
+                }
+                *announced = Some(corr.clone());
+            }
+            status.call_waiting_episodes.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[aokie-plugin] SECOND CALLER waiting during call {} ({}) — observe-only: the active call continues",
+                corr,
+                if num.is_empty() {
+                    "number withheld/unknown".to_string()
+                } else {
+                    aokie_core::redact::Phone(&num).to_string()
+                },
+            );
+            emit(
+                outbox,
+                sink,
+                aokie_event_occurrence(
+                    crate::contract::events::CALL_WAITING,
+                    &corr,
+                    &occurrence_id(),
+                    json!({"callId": corr, "from": num, "at": now_iso8601()}),
+                ),
+            );
+        }
+        E::CallWaitingEnded => {
+            eprintln!(
+                "[aokie-plugin] waiting caller gone — active call untouched"
+            );
+            *status.call_waiting_announced.lock().unwrap() = None;
+        }
+        E::CallHeld { state } => {
+            // Diagnostics only in the observe slice: a transition here with
+            // no CHLD command from us means the OWNER juggled calls on the
+            // handset while Aokie was on the line — worth seeing in logs.
+            eprintln!(
+                "[aokie-plugin] callheld indicator -> {state} (0 none / 1 held+active / 2 held only) — no switchboard yet, observe-only"
+            );
+            status
+                .call_held_state
+                .store(state.max(0) as u64, Ordering::Relaxed);
+        }
         E::CallRinging => {
             flush_incoming_if_pending(tracker, outbox, sink);
             // Phase 2: callsetup,3 is MO alerting — classifies a
@@ -9569,6 +9655,92 @@ mod tests {
         assert!(second.is_some());
         assert_ne!(second, call_id);
         assert_eq!(tracker.generation(), 2);
+    }
+
+    /// Phase 4 observe lane: a waiting knock emits ONE aokie.call.waiting
+    /// per episode (correlated to the ACTIVE call), never disturbs the
+    /// session, and a fresh episode later in the same call re-announces.
+    #[test]
+    fn handle_event_call_waiting_episode_emits_once_and_preserves_the_call() {
+        use crate::event_bridge::VecSink;
+        use aokie_dongle::bluetooth::BluetoothEvent as E;
+
+        let status = Arc::new(RadioStatus::default());
+        let mut sink = VecSink::default();
+        let mut tracker = crate::call_session::SessionTracker::new();
+
+        handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+        handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
+        let call_id = tracker.call_id().unwrap().to_string();
+        sink.lines.clear();
+
+        // Anonymous knock (callsetup-first ordering), then the +CCWA that
+        // names the caller: still exactly ONE durable event.
+        handle_event(E::CallWaiting { number: None }, &mut tracker, None, &mut sink, &status);
+        handle_event(
+            E::CallWaiting { number: Some("0491570157".to_string()) },
+            &mut tracker,
+            None,
+            &mut sink,
+            &status,
+        );
+        let events: Vec<serde_json::Value> = sink
+            .lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let waiting: Vec<_> = events
+            .iter()
+            .filter(|v| {
+                v["params"]["event"]["name"] == json!(crate::contract::events::CALL_WAITING)
+            })
+            .collect();
+        assert_eq!(waiting.len(), 1, "one durable event per episode: {events:?}");
+        assert_eq!(
+            waiting[0]["params"]["event"]["data"]["callId"],
+            json!(call_id)
+        );
+        assert_eq!(waiting[0]["params"]["event"]["data"]["from"], json!(""));
+        // The active session is untouched by the whole episode.
+        assert_eq!(tracker.call_id(), Some(call_id.as_str()));
+        assert!(status.call_active.load(Ordering::Relaxed));
+        assert_eq!(status.call_waiting_episodes.load(Ordering::Relaxed), 1);
+
+        // Episode ends; a SECOND knock later in the same call re-announces —
+        // number known from the start this time, so it rides the event.
+        handle_event(E::CallWaitingEnded, &mut tracker, None, &mut sink, &status);
+        sink.lines.clear();
+        handle_event(
+            E::CallWaiting { number: Some("0491570157".to_string()) },
+            &mut tracker,
+            None,
+            &mut sink,
+            &status,
+        );
+        let v: serde_json::Value = serde_json::from_str(&sink.lines[0]).unwrap();
+        assert_eq!(
+            v["params"]["event"]["name"],
+            json!(crate::contract::events::CALL_WAITING)
+        );
+        assert_eq!(v["params"]["event"]["data"]["from"], json!("0491570157"));
+        assert_eq!(status.call_waiting_episodes.load(Ordering::Relaxed), 2);
+
+        // callheld transitions are diagnostics-only.
+        handle_event(E::CallHeld { state: 1 }, &mut tracker, None, &mut sink, &status);
+        assert_eq!(status.call_held_state.load(Ordering::Relaxed), 1);
+        assert!(tracker.current().is_some(), "session survives callheld");
+
+        // A knock with NO tracked call is ignored (no panic, no event).
+        let mut idle = crate::call_session::SessionTracker::new();
+        sink.lines.clear();
+        handle_event(
+            E::CallWaiting { number: Some("0491570157".to_string()) },
+            &mut idle,
+            None,
+            &mut sink,
+            &status,
+        );
+        assert!(sink.lines.is_empty(), "no event without a tracked call");
     }
 
     /// Audit AK-001/AK-01: an operator-rejected ring ends "rejected", a
