@@ -79,21 +79,33 @@ fn default_job_mode() -> String {
 /// version match — a stale helper or stale dispatcher refuses to run.
 const SUPPORTED_JOB_VERSION: u32 = 5;
 
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), not(feature = "managed-beta-driver")))]
 const EXPECTED_INF_SHA256: Option<&str> = Some(env!(
     "AOKIE_EXPECTED_DRIVER_INF_SHA256",
     "Release helpers require the exact Microsoft-signed package INF digest"
 ));
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "managed-beta-driver"))]
 const EXPECTED_INF_SHA256: Option<&str> = option_env!("AOKIE_EXPECTED_DRIVER_INF_SHA256");
 
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), not(feature = "managed-beta-driver")))]
 const EXPECTED_CAT_SHA256: Option<&str> = Some(env!(
     "AOKIE_EXPECTED_DRIVER_CAT_SHA256",
     "Release helpers require the exact Microsoft-signed package CAT digest"
 ));
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "managed-beta-driver"))]
 const EXPECTED_CAT_SHA256: Option<&str> = option_env!("AOKIE_EXPECTED_DRIVER_CAT_SHA256");
+
+/// A job-file boolean alone must never unlock a privileged trust-store
+/// mutation. Only debug helpers and the deliberately distinct managed-beta
+/// release flavour contain the self-signing path.
+const fn self_sign_capable(debug_build: bool, managed_beta_build: bool) -> bool {
+    debug_build || managed_beta_build
+}
+
+const SELF_SIGN_CAPABLE_HELPER: bool = self_sign_capable(
+    cfg!(debug_assertions),
+    cfg!(feature = "managed-beta-driver"),
+);
 
 /// %TEMP%\aokie-driver-helper.log. Lazily initialised the first time
 /// `log_line!` fires so a helper that bails early during arg parsing
@@ -265,29 +277,40 @@ fn validate_install_job_fields(job: &DriverJob) -> Result<(), String> {
             job.inf_sha256
         ));
     }
+    let self_sign = authorized_self_sign(job)?;
     let cat_hash = job.cat_sha256.trim();
-    if !job.allow_dev_self_sign
-        && (cat_hash.len() != 64 || !cat_hash.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
+    if !self_sign && (cat_hash.len() != 64 || !cat_hash.bytes().all(|b| b.is_ascii_hexdigit())) {
         return Err(
             "production install job has no valid cat_sha256; refusing an unbound driver package"
                 .to_string(),
         );
     }
-    if let Some(expected) = EXPECTED_INF_SHA256 {
-        if !expected.eq_ignore_ascii_case(hash) {
-            return Err(format!(
-                "INF digest is not the package pinned into this helper: expected {}, got {}",
-                expected, hash
-            ));
+    if !self_sign {
+        if let Some(expected_inf) = EXPECTED_INF_SHA256 {
+            if !expected_inf.eq_ignore_ascii_case(hash) {
+                return Err(format!(
+                    "INF digest is not the package pinned into this helper: expected {}, got {}",
+                    expected_inf, hash
+                ));
+            }
+        } else if !cfg!(debug_assertions) {
+            return Err(
+                "this helper has no production INF pin; refusing a shipped driver package"
+                    .to_string(),
+            );
         }
-    }
-    if let Some(expected) = EXPECTED_CAT_SHA256 {
-        if !expected.eq_ignore_ascii_case(cat_hash) {
-            return Err(format!(
-                "catalog digest is not the package pinned into this helper: expected {}, got {}",
-                expected, cat_hash
-            ));
+        if let Some(expected_cat) = EXPECTED_CAT_SHA256 {
+            if !expected_cat.eq_ignore_ascii_case(cat_hash) {
+                return Err(format!(
+                    "catalog digest is not the package pinned into this helper: expected {}, got {}",
+                    expected_cat, cat_hash
+                ));
+            }
+        } else if !cfg!(debug_assertions) {
+            return Err(
+                "this helper has no production catalog pin; refusing a shipped driver package"
+                    .to_string(),
+            );
         }
     }
     let expected_hwid = aokie_dongle::winusb::hardware_id(job.vid, job.pid);
@@ -299,6 +322,17 @@ fn validate_install_job_fields(job: &DriverJob) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn authorized_self_sign(job: &DriverJob) -> Result<bool, String> {
+    if job.allow_dev_self_sign && !SELF_SIGN_CAPABLE_HELPER {
+        return Err(
+            "self-signing was requested, but this is a standard production helper; install the \
+             managed-beta build or use the Microsoft-signed driver package"
+                .to_string(),
+        );
+    }
+    Ok(job.allow_dev_self_sign)
 }
 
 /// Read an attacker-writable input through a handle that denies read, write,
@@ -336,6 +370,7 @@ struct PrivilegedPackage {
 
 impl PrivilegedPackage {
     fn copy_from(job: &DriverJob) -> Result<Self, String> {
+        let self_sign = authorized_self_sign(job)?;
         let root = create_admin_only_staging_dir()?;
         let inf_path = root.join(aokie_dongle::winusb::INF_NAME);
         let mut package = Self {
@@ -356,7 +391,7 @@ impl PrivilegedPackage {
             let cat_path = package.root.join(aokie_dongle::winusb::CAT_NAME);
             copy_locked_verified(&source_cat, &cat_path, &job.cat_sha256, 16 * 1024 * 1024)?;
             package.cat_path = Some(cat_path);
-        } else if !job.allow_dev_self_sign {
+        } else if !self_sign {
             return Err(
                 "the Microsoft-signed catalog is missing; refusing production install".into(),
             );
@@ -535,6 +570,7 @@ fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
     // DRIVER-001: every exact-target field is mandatory and well-formed —
     // there is no legacy "empty field skips the check" path anymore.
     validate_install_job_fields(job)?;
+    let self_sign = authorized_self_sign(job)?;
 
     // AK-DRV-02: the source directory remains attacker-controlled. The INF
     // and CAT are copied through no-sharing handles into a fresh admin-only
@@ -576,6 +612,32 @@ fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
         ));
     }
 
+    // Managed-beta packages are rendered per selected VID/PID and therefore
+    // cannot carry one compile-time INF digest. Reconstruct the only INF we
+    // are willing to elevate from trusted helper code and live device facts,
+    // then demand byte-for-byte equality. This retains the important property
+    // that an unelevated process cannot add arbitrary services/co-installers.
+    if self_sign {
+        let supplied = read_locked(&job.inf_path, 4 * 1024 * 1024)?;
+        let expected =
+            aokie_dongle::winusb::WinusbPackage::new(job.vid, job.pid, &device.description)
+                .render_inf();
+        if supplied != expected.as_bytes() {
+            return Err(
+                "managed-beta INF differs from the helper's trusted renderer for the selected \
+                 live dongle; refusing"
+                    .to_string(),
+            );
+        }
+        let rendered_hash = format!("{:x}", Sha256::digest(expected.as_bytes()));
+        if !rendered_hash.eq_ignore_ascii_case(&job.inf_sha256) {
+            return Err(
+                "managed-beta INF digest does not match the helper-rendered package; refusing"
+                    .to_string(),
+            );
+        }
+    }
+
     // Exact INF-bytes match: the helper installs the SAME INF the
     // dispatcher rendered + fingerprinted, so a swapped INF pointing at a
     // different driver payload can't ride in on a tampered job. The hash
@@ -595,7 +657,13 @@ fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
         &actual[..actual.len().min(16)]
     );
 
-    if let (Some(cat_path), Some(expected)) = (&package.cat_path, EXPECTED_CAT_SHA256) {
+    if !self_sign {
+        let cat_path = package
+            .cat_path
+            .as_ref()
+            .ok_or_else(|| "verified production catalog disappeared before install".to_string())?;
+        let expected = EXPECTED_CAT_SHA256
+            .ok_or_else(|| "production catalog pin is missing from this helper".to_string())?;
         let cat_actual = aokie_dongle::sha256_file(cat_path)
             .map_err(|e| format!("could not re-hash privileged catalog: {}", e))?;
         if !expected.eq_ignore_ascii_case(&cat_actual) {
@@ -607,15 +675,11 @@ fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
         "install",
         &format!(
             "staging driver: instance={} inf={:?} inf_sha256={} dev_self_sign={}",
-            device.instance_id, package.inf_path, actual, job.allow_dev_self_sign
+            device.instance_id, package.inf_path, actual, self_sign
         ),
     );
-    let result = aokie_dongle::winusb::install_package(
-        &package.inf_path,
-        job.vid,
-        job.pid,
-        job.allow_dev_self_sign,
-    )?;
+    let result =
+        aokie_dongle::winusb::install_package(&package.inf_path, job.vid, job.pid, self_sign)?;
     if result.reboot_required {
         log_line!("[aokie-driver-helper] WinUSB installed; reboot may be required");
     } else {
@@ -844,6 +908,13 @@ fn validate_inf_path(inf_path: &Path, job_path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn release_self_sign_capability_requires_managed_beta_feature() {
+        assert!(self_sign_capable(true, false));
+        assert!(!self_sign_capable(false, false));
+        assert!(self_sign_capable(false, true));
+    }
+
     fn touch(p: &Path) {
         std::fs::write(p, "").unwrap();
     }
@@ -993,6 +1064,11 @@ mod tests {
         let good = v5_job("USB\\VID_0A5C&PID_21EC\\00198600226C", GOOD_SHA, &hwid);
         validate_install_job_fields(&good).unwrap();
         assert!(!good.allow_dev_self_sign, "self-signing defaults OFF");
+
+        let mut managed = v5_job("USB\\VID_0A5C&PID_21EC\\00198600226C", GOOD_SHA, &hwid);
+        managed.allow_dev_self_sign = true;
+        managed.cat_sha256.clear();
+        validate_install_job_fields(&managed).unwrap();
 
         let err = validate_install_job_fields(&v5_job("", GOOD_SHA, &hwid)).unwrap_err();
         assert!(err.contains("no device instance id"), "got: {}", err);

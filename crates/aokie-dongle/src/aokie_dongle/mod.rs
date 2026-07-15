@@ -494,7 +494,7 @@ pub fn write_winusb_package(vid: u16, pid: u16, work_dir: &Path) -> Result<PathB
         }
     }
 
-    if !cfg!(debug_assertions) {
+    if !cfg!(debug_assertions) && !cfg!(feature = "managed-beta-driver") {
         return Err(format!(
             "the signed WinUSB package is missing; {} and {} must be present in driver-package/ beside the plugin",
             winusb::INF_NAME,
@@ -502,8 +502,11 @@ pub fn write_winusb_package(vid: u16, pid: u16, work_dir: &Path) -> Result<PathB
         ));
     }
 
-    // Development fallback only. The elevated install path will generate a
-    // local test catalog when its explicit self-signing policy permits it.
+    // Development / managed-beta fallback only. The elevated helper compares
+    // these exact bytes with its own trusted renderer before generating a
+    // local catalog, so an unelevated process cannot smuggle arbitrary INF
+    // directives into the privileged install. The runtime opt-in is checked
+    // separately by the dispatcher and helper.
     let device = find_device(vid, pid)?;
     let description = device
         .as_ref()
@@ -513,6 +516,17 @@ pub fn write_winusb_package(vid: u16, pid: u16, work_dir: &Path) -> Result<PathB
 
     let package = winusb::WinusbPackage::new(vid, pid, description);
     let inf_path = work_dir.join(winusb::INF_NAME);
+    // A reused work directory must not accidentally pair the freshly rendered
+    // managed-beta INF with a stale catalog from an earlier production stage.
+    let stale_cat = work_dir.join(winusb::CAT_NAME);
+    if stale_cat.exists() {
+        std::fs::remove_file(&stale_cat).map_err(|e| {
+            format!(
+                "could not remove stale WinUSB catalog {:?}: {}",
+                stale_cat, e
+            )
+        })?;
+    }
     std::fs::write(&inf_path, package.render_inf())
         .map_err(|e| format!("could not write WinUSB INF {:?}: {}", inf_path, e))?;
 

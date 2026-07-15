@@ -14,3 +14,9 @@ a new catalog before attempting another release.
 The release build pins both file digests into the elevated helper, copies the
 same pair into `driver-package/`, includes their digests in the recursively
 signed package manifest, and refuses installation if any byte differs.
+
+The separate `managed-beta-driver` build flavour does not weaken this public
+release path. When explicitly enabled at compile time and opted into at
+runtime, it renders a single selected external dongle's INF inside trusted
+code and locally signs the generated catalog. It must be labelled managed beta,
+not distributed as the normal production package.
