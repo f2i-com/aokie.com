@@ -101,7 +101,11 @@ impl TtsEngine {
     /// alongside). Callers that post-process the waveform (pitch-preserving
     /// time stretch for per-span speaking rates) use this so the stretch runs
     /// at full quality BEFORE the SCO downsample.
-    pub fn synthesize_native(&mut self, text: &str, voice: &str) -> Result<(Vec<i16>, u32), String> {
+    pub fn synthesize_native(
+        &mut self,
+        text: &str,
+        voice: &str,
+    ) -> Result<(Vec<i16>, u32), String> {
         let mut f32_samples: Vec<f32> = Vec::new();
         self.rt.synthesize_stream(text, voice, |chunk, _rate| {
             f32_samples.extend_from_slice(chunk);
@@ -167,9 +171,13 @@ pub fn preflight_assets() -> VoicePreflight {
     let (stt_assets_ok, tts_assets_ok) = match aokie_core::paths::app_data_dir() {
         Some(app_data) => {
             let stt_dir = app_data.join("models").join("parakeet");
-            let stt_ok = ["encoder.int8.onnx", "decoder_joint.int8.onnx", "tokenizer.model"]
-                .iter()
-                .all(|f| stt_dir.join(f).is_file());
+            let stt_ok = [
+                "encoder.int8.onnx",
+                "decoder_joint.int8.onnx",
+                "tokenizer.model",
+            ]
+            .iter()
+            .all(|f| stt_dir.join(f).is_file());
             let tts_ok = onnx_tts_models_dir(&app_data, None).is_ok();
             (stt_ok, tts_ok)
         }
@@ -177,7 +185,13 @@ pub fn preflight_assets() -> VoicePreflight {
     };
     let stt_endpoint = std::env::var("AOKIE_STT_ENDPOINT").is_ok_and(|v| !v.trim().is_empty());
     let tts_endpoint = std::env::var("AOKIE_TTS_ENDPOINT").is_ok_and(|v| !v.trim().is_empty());
-    preflight_decision(ort_ok, stt_assets_ok, tts_assets_ok, stt_endpoint, tts_endpoint)
+    preflight_decision(
+        ort_ok,
+        stt_assets_ok,
+        tts_assets_ok,
+        stt_endpoint,
+        tts_endpoint,
+    )
 }
 
 /// Pure decision half of [`preflight_assets`], unit-testable: which halves of
@@ -302,19 +316,35 @@ mod tests {
     #[test]
     fn preflight_missing_models_is_a_known_failure() {
         let p = preflight_decision(true, false, true, false, false);
-        assert!(p.stt_error.as_deref().unwrap_or("").contains("model files are missing"));
+        assert!(p
+            .stt_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("model files are missing"));
         assert_eq!(p.tts_error, None);
 
         let p = preflight_decision(true, true, false, false, false);
         assert_eq!(p.stt_error, None);
-        assert!(p.tts_error.as_deref().unwrap_or("").contains("model files are missing"));
+        assert!(p
+            .tts_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("model files are missing"));
     }
 
     #[test]
     fn preflight_missing_ort_dll_fails_both_and_names_the_dll() {
         let p = preflight_decision(false, true, true, false, false);
-        assert!(p.stt_error.as_deref().unwrap_or("").contains("ONNX Runtime DLL"));
-        assert!(p.tts_error.as_deref().unwrap_or("").contains("ONNX Runtime DLL"));
+        assert!(p
+            .stt_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("ONNX Runtime DLL"));
+        assert!(p
+            .tts_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("ONNX Runtime DLL"));
     }
 
     /// VOICE-001: the loopback verdict tolerates STT phrasing wobble but
@@ -323,7 +353,10 @@ mod tests {
     fn self_test_verdict_accepts_wobble_and_rejects_garbage() {
         assert!(self_test_verdict("Aokie self test one two three").is_ok());
         assert!(self_test_verdict("okie self test 1 2 3").is_ok());
-        assert!(self_test_verdict("self test one").is_ok(), "3/5 words is enough");
+        assert!(
+            self_test_verdict("self test one").is_ok(),
+            "3/5 words is enough"
+        );
         assert!(self_test_verdict("").is_err());
         assert!(self_test_verdict("hello world").is_err());
         let err = self_test_verdict("mumble").unwrap_err();

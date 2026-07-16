@@ -1,0 +1,14 @@
+{
+  "kind": "assistance_answer",
+  "schemaVersion": 2,
+  "appId": "app_coastal_auto",
+  "requestId": "assist_call_42_1",
+  "idempotencyKey": "device-alex-assist-call-42-1",
+  "answerId": "answer_call_42_1",
+  "callId": "call_42",
+  "callEpoch": 7,
+  "ownerEpoch": 3,
+  "switchboardRevision": 11,
+  "remoteRevision": 13,
+  "answer": "Yes. Offer the secure key drop and an inspection tomorrow morning."
+}

@@ -271,6 +271,21 @@ pub fn parse_lookup_marker(text: &str) -> Option<String> {
     }
 }
 
+/// Typed Companion assistance: extract the bounded question from an exact
+/// `[[ASSISTANCE: ...]]` model verdict. The marker is control-plane data and
+/// is stripped by [`plan_spans`] before any text can reach TTS.
+pub fn parse_assistance_marker(text: &str) -> Option<String> {
+    let start = text.find("[[ASSISTANCE:")?;
+    let rest = &text[start + "[[ASSISTANCE:".len()..];
+    let end = rest.find("]]")?;
+    let question = rest[..end].trim();
+    if question.is_empty() {
+        None
+    } else {
+        Some(question.to_string())
+    }
+}
+
 /// Phase 3: extract the manager-action request from a `[[MANAGER: ...]]`
 /// marker (same shape as the lookup marker). The request is the manager's
 /// change in the model's words — a downstream flow structures and validates
@@ -354,17 +369,40 @@ mod manager_marker_tests {
 
 #[cfg(test)]
 mod lookup_marker_tests {
+    use super::parse_assistance_marker;
+
     #[test]
     fn parse_lookup_marker_shapes() {
         use super::parse_lookup_marker as p;
-        assert_eq!(p("[[LOOKUP: any tables Friday?]]"), Some("any tables Friday?".into()));
+        assert_eq!(
+            p("[[LOOKUP: any tables Friday?]]"),
+            Some("any tables Friday?".into())
+        );
         assert_eq!(
             p("Sure. [[LOOKUP: bookings on the 28th]] thanks"),
             Some("bookings on the 28th".into())
         );
         assert_eq!(p("[[LOOKUP:]]"), None, "empty question is not a lookup");
-        assert_eq!(p("[[LOOKUP: unclosed marker"), None, "unclosed never parses");
+        assert_eq!(
+            p("[[LOOKUP: unclosed marker"),
+            None,
+            "unclosed never parses"
+        );
         assert_eq!(p("no marker here"), None);
+    }
+
+    #[test]
+    fn parse_assistance_marker_shapes() {
+        assert_eq!(
+            parse_assistance_marker("[[ASSISTANCE: Can we accept a late arrival?]]"),
+            Some("Can we accept a late arrival?".into())
+        );
+        assert_eq!(
+            parse_assistance_marker("Please wait. [[ASSISTANCE: confirm the exception]]"),
+            Some("confirm the exception".into())
+        );
+        assert_eq!(parse_assistance_marker("[[ASSISTANCE:]]"), None);
+        assert_eq!(parse_assistance_marker("[[ASSISTANCE: unclosed"), None);
     }
 }
 
@@ -387,8 +425,19 @@ pub fn has_wait_marker(text: &str) -> bool {
 fn digit_word(token: &str) -> bool {
     matches!(
         token,
-        "zero" | "one" | "two" | "three" | "four" | "five" | "six" | "seven" | "eight" | "nine"
-            | "oh" | "double" | "triple"
+        "zero"
+            | "one"
+            | "two"
+            | "three"
+            | "four"
+            | "five"
+            | "six"
+            | "seven"
+            | "eight"
+            | "nine"
+            | "oh"
+            | "double"
+            | "triple"
     )
 }
 
@@ -445,7 +494,10 @@ fn is_money_style(token: &str) -> bool {
 
 fn money_word(token: &str) -> bool {
     matches!(
-        token.trim_matches(|c: char| !c.is_ascii_alphabetic()).to_ascii_lowercase().as_str(),
+        token
+            .trim_matches(|c: char| !c.is_ascii_alphabetic())
+            .to_ascii_lowercase()
+            .as_str(),
         "dollar" | "dollars" | "cent" | "cents" | "euro" | "euros" | "pound" | "pounds" | "bucks"
     )
 }
@@ -596,7 +648,17 @@ pub fn plan_spans(sentence: &str, pace: &PaceState, protected_max_ms: u32) -> Ve
         }
         match seg_mode {
             Mode::Slow(rate) => {
-                push_span(&mut spans, &tokens, 0, tokens.len(), rate, InterruptPolicy::FinishSpan { max_extra_ms: FINISH_PHRASE_MS }, true);
+                push_span(
+                    &mut spans,
+                    &tokens,
+                    0,
+                    tokens.len(),
+                    rate,
+                    InterruptPolicy::FinishSpan {
+                        max_extra_ms: FINISH_PHRASE_MS,
+                    },
+                    true,
+                );
             }
             Mode::Important => {
                 push_span(
@@ -605,7 +667,9 @@ pub fn plan_spans(sentence: &str, pace: &PaceState, protected_max_ms: u32) -> Ve
                     0,
                     tokens.len(),
                     pace.base(),
-                    InterruptPolicy::FinishSpan { max_extra_ms: protected_max_ms },
+                    InterruptPolicy::FinishSpan {
+                        max_extra_ms: protected_max_ms,
+                    },
                     true,
                 );
             }
@@ -675,7 +739,12 @@ fn push_span(
     });
 }
 
-fn push_detail_span(spans: &mut Vec<SpeechSpan>, tokens: &[&str], run: &DetailRun, pace: &PaceState) {
+fn push_detail_span(
+    spans: &mut Vec<SpeechSpan>,
+    tokens: &[&str],
+    run: &DetailRun,
+    pace: &PaceState,
+) {
     let text = tokens[run.start..run.end].join(" ");
     let tts_text = if run.expand {
         tokens[run.start..run.end]
@@ -764,7 +833,9 @@ mod tests {
         assert_eq!(spans[1].rate, 0.75);
         assert_eq!(
             spans[1].policy,
-            InterruptPolicy::FinishSpan { max_extra_ms: FINISH_PHRASE_MS }
+            InterruptPolicy::FinishSpan {
+                max_extra_ms: FINISH_PHRASE_MS
+            }
         );
         assert_eq!(spans[2].text, "Anything else?");
         // Transcript text reconstructs cleanly.
@@ -777,7 +848,10 @@ mod tests {
     #[test]
     fn single_long_numeral_and_plus_prefix_expand() {
         let spans = plan_spans("Call 0491570156 now", &pace(), 2500);
-        assert_eq!(spans[1].tts_text, "zero four nine one five seven zero one five six");
+        assert_eq!(
+            spans[1].tts_text,
+            "zero four nine one five seven zero one five six"
+        );
         let spans = plan_spans("It's +61 491 570 156.", &pace(), 2500);
         let detail = spans.iter().find(|s| s.rate < 1.0).unwrap();
         assert!(detail.tts_text.starts_with("plus six one, "), "{detail:?}");
@@ -796,7 +870,9 @@ mod tests {
         ] {
             let spans = plan_spans(text, &pace(), 2500);
             assert!(
-                spans.iter().all(|s| s.rate == 1.0 && s.policy == InterruptPolicy::Yield),
+                spans
+                    .iter()
+                    .all(|s| s.rate == 1.0 && s.policy == InterruptPolicy::Yield),
                 "{text:?} produced a detail span: {spans:?}"
             );
             assert_eq!(clean_text(&spans), text, "text must be untouched");
@@ -820,7 +896,10 @@ mod tests {
         assert_eq!(spans.len(), 3, "{spans:?}");
         assert_eq!(spans[1].text, "X 4 B 9");
         assert_eq!(spans[1].rate, 0.75);
-        assert!(matches!(spans[1].policy, InterruptPolicy::FinishSpan { .. }));
+        assert!(matches!(
+            spans[1].policy,
+            InterruptPolicy::FinishSpan { .. }
+        ));
         assert!(!clean_text(&spans).contains("[["), "markers stripped");
     }
 
@@ -851,7 +930,9 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(
             spans[0].policy,
-            InterruptPolicy::FinishSpan { max_extra_ms: PROTECTED_MAX_MS_MAX }
+            InterruptPolicy::FinishSpan {
+                max_extra_ms: PROTECTED_MAX_MS_MAX
+            }
         );
         assert_eq!(spans[0].rate, 1.0);
         let spans = plan_spans("[[important]]Short warning[[/important]]", &pace(), 2500);
@@ -888,9 +969,16 @@ mod tests {
 
     #[test]
     fn digit_runs_inside_slow_or_important_segments_still_expand() {
-        let spans = plan_spans("[[important]]Your code is 48291 today[[/important]]", &pace(), 2500);
+        let spans = plan_spans(
+            "[[important]]Your code is 48291 today[[/important]]",
+            &pace(),
+            2500,
+        );
         assert_eq!(spans.len(), 1);
-        assert!(spans[0].tts_text.contains("four eight two nine one"), "{spans:?}");
+        assert!(
+            spans[0].tts_text.contains("four eight two nine one"),
+            "{spans:?}"
+        );
         assert!(spans[0].text.contains("48291"), "transcript keeps digits");
     }
 

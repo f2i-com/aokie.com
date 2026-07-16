@@ -1,0 +1,85 @@
+name: aokie-companion-local
+
+# Loopback-only development profile. It intentionally uses ws:// and TURN
+# without TLS so it works without DNS or an ACME account. Release clients must
+# use the public compose.yaml profile, which exposes signalling only as WSS.
+services:
+  gateway:
+    image: aokie-realtime-self-host:${AOKIE_IMAGE_TAG:-local}
+    build:
+      context: ../..
+      dockerfile: deploy/companion-self-host/Dockerfile
+      args:
+        RUST_VERSION: ${RUST_VERSION:-1.92.0}
+    restart: unless-stopped
+    environment:
+      AOKIE_GATEWAY_BIND: 0.0.0.0:18787
+      AOKIE_GATEWAY_ALLOW_PUBLIC_HTTP: "1"
+      AOKIE_GATEWAY_ADMISSION_HMAC_SECRET_FILE: /run/secrets/admission_hmac
+      AOKIE_GATEWAY_LEASE_HMAC_SECRET_FILE: /run/secrets/lease_hmac
+    secrets: [admission_hmac, lease_hmac]
+    ports:
+      - "127.0.0.1:${LOCAL_GATEWAY_PORT:-18788}:18787/tcp"
+    networks: [local]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    healthcheck:
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+
+  coturn:
+    image: coturn/coturn:4.14.0-r0@sha256:0c0e8fc0c263b85a134e9e4242b5e46e1f4c077c5029633511191c05b5c2c814
+    restart: unless-stopped
+    entrypoint: [/bin/sh, /opt/aokie/coturn-entrypoint.sh]
+    environment:
+      TURN_SECRET_FILE: /run/secrets/turn_rest
+      TURN_REALM: localhost
+      TURN_EXTERNAL_IPV4: 127.0.0.1
+      TURN_MIN_PORT: ${TURN_MIN_PORT:-49160}
+      TURN_MAX_PORT: ${TURN_MAX_PORT:-49200}
+      TURN_USER_QUOTA: 8
+      TURN_TOTAL_QUOTA: 20
+      TURN_MAX_BPS: 2000000
+      TURN_BPS_CAPACITY: 20000000
+      TURN_ALLOW_PRIVATE_PEERS: "1"
+    secrets: [turn_rest]
+    volumes:
+      - ./coturn-entrypoint.sh:/opt/aokie/coturn-entrypoint.sh:ro
+      - ./coturn.base.conf:/etc/coturn/turnserver.base.conf:ro
+    ports:
+      - 127.0.0.1:3478:3478/tcp
+      - 127.0.0.1:3478:3478/udp
+      - "127.0.0.1:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/tcp"
+      - "127.0.0.1:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp"
+    networks: [local]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /var/lib/coturn:size=16m,mode=0700
+      - /var/run:size=4m,mode=0755
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    healthcheck:
+      test: [CMD-SHELL, "turnutils_stunclient -p 3478 -t 1000 127.0.0.1 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+
+secrets:
+  admission_hmac:
+    file: ./secrets/admission-hmac.txt
+  lease_hmac:
+    file: ./secrets/lease-hmac.txt
+  turn_rest:
+    file: ./secrets/turn-rest.txt
+
+networks:
+  local:
+    internal: false

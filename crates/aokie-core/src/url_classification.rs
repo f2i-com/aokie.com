@@ -55,7 +55,9 @@ pub fn parse_base_url(raw: &str) -> Result<ParsedBaseUrl, String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err("endpoint URL must not contain a username or password".to_string());
     }
-    let host = url.host().ok_or_else(|| "endpoint URL has no host".to_string())?;
+    let host = url
+        .host()
+        .ok_or_else(|| "endpoint URL has no host".to_string())?;
     // The URL standard accepts legacy octal, hexadecimal, and integer IPv4
     // spellings, then normalises them. Require the literal to already match
     // the dotted-decimal address the HTTP client will use.
@@ -70,7 +72,11 @@ pub fn parse_base_url(raw: &str) -> Result<ParsedBaseUrl, String> {
         let raw_host = authority
             .rsplit_once(':')
             .map(|(candidate, port)| {
-                if port.chars().all(|c| c.is_ascii_digit()) { candidate } else { authority }
+                if port.chars().all(|c| c.is_ascii_digit()) {
+                    candidate
+                } else {
+                    authority
+                }
             })
             .unwrap_or(authority);
         if raw_host != ip.to_string() {
@@ -86,7 +92,10 @@ pub fn parse_base_url(raw: &str) -> Result<ParsedBaseUrl, String> {
         Host::Ipv6(ip) => format!("[{ip}]"),
     };
     let canonical_origin = format!("{}://{}:{}", url.scheme(), host_token, port);
-    Ok(ParsedBaseUrl { url, canonical_origin })
+    Ok(ParsedBaseUrl {
+        url,
+        canonical_origin,
+    })
 }
 
 /// Output of [`classify_base_url`]. The variants are deliberately the
@@ -384,7 +393,11 @@ mod tests {
     #[test]
     fn missing_or_non_http_scheme_is_invalid() {
         for raw in ["localhost:1234", "127.0.0.1:8080", "ftp://example.com"] {
-            assert_eq!(classify_base_url(raw), BaseUrlClassification::Invalid, "{raw}");
+            assert_eq!(
+                classify_base_url(raw),
+                BaseUrlClassification::Invalid,
+                "{raw}"
+            );
         }
     }
 
@@ -405,7 +418,11 @@ mod tests {
             "http://localhost%40169.254.169.254/v1",
             "https://%6c%6f%63%61%6c%68%6f%73%74@10.0.0.1/v1",
         ] {
-            assert_eq!(classify_base_url(raw), BaseUrlClassification::Invalid, "{raw}");
+            assert_eq!(
+                classify_base_url(raw),
+                BaseUrlClassification::Invalid,
+                "{raw}"
+            );
             assert!(parse_base_url(raw).is_err(), "{raw}");
         }
     }

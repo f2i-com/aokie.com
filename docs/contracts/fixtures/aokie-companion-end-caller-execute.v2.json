@@ -1,0 +1,16 @@
+{
+  "kind": "end_caller_execute",
+  "schemaVersion": 2,
+  "appId": "app_example",
+  "operationId": "end_op_example",
+  "confirmationId": "end_confirm_example",
+  "deviceId": "device_example",
+  "callId": "call_example",
+  "callEpoch": 7,
+  "ownerEpoch": 4,
+  "switchboardRevision": 11,
+  "remoteRevision": 15,
+  "leaseId": "media_example",
+  "leaseJti": "lease_example",
+  "fence": 9
+}

@@ -415,7 +415,9 @@ fn handle_speech(
     // Speech-normalize ("10 a.m.," -> "10 AM,") so every consumer of this
     // service gets stutter-free synthesis, same rewrite as the plugin's TTS.
     let input = aokie_core::speech::normalize_speech_text(input);
-    Ok(HttpResponse::wav(server.synthesize_wav(&input, voice, speed)?))
+    Ok(HttpResponse::wav(
+        server.synthesize_wav(&input, voice, speed)?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -788,8 +790,7 @@ pub fn run_http(server: VoiceServer, port: u16) -> Result<(), String> {
                         )
                     } else if inflight.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT {
                         inflight.fetch_sub(1, Ordering::SeqCst);
-                        AppError::new(503, "voice server is at capacity — retry shortly")
-                            .response()
+                        AppError::new(503, "voice server is at capacity — retry shortly").response()
                     } else {
                         let response = handle_request(
                             &server,
@@ -1245,7 +1246,10 @@ mod tests {
             assert_eq!(response.status, 400, "speed {bad} must be rejected");
             let value = decode_json(&response.body);
             assert!(
-                value["error"]["message"].as_str().unwrap().contains("speed"),
+                value["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("speed"),
                 "error names the field: {value}"
             );
         }
@@ -1297,6 +1301,9 @@ mod tests {
         assert_eq!(value["status"], "degraded");
         assert_eq!(value["stt"], true);
         assert_eq!(value["tts"], false);
-        assert!(value["build"]["version"].is_string(), "build provenance present");
+        assert!(
+            value["build"]["version"].is_string(),
+            "build provenance present"
+        );
     }
 }

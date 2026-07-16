@@ -48,11 +48,19 @@ enum SynthJob {
 
 /// Worker → radio: epoch-tagged PCM blocks and the span's terminal outcome.
 pub enum SynthOut {
-    Frames { epoch: u64, pcm: Vec<i16> },
+    Frames {
+        epoch: u64,
+        pcm: Vec<i16>,
+    },
     /// Synthesis finished (all frames sent). Also sent after an epoch abort —
     /// the radio discards it as stale.
-    Done { epoch: u64 },
-    Failed { epoch: u64, error: String },
+    Done {
+        epoch: u64,
+    },
+    Failed {
+        epoch: u64,
+        error: String,
+    },
 }
 
 /// Block size the worker slices output into (~240 ms at the SCO rate): small
@@ -171,12 +179,25 @@ fn worker(
                 if epoch.load(Ordering::SeqCst) != e {
                     continue; // superseded before we even started
                 }
-                match synth_span(&mut tts, &mut http, &text, &voice, rate, target_rate, &epoch, e, &out_tx) {
+                match synth_span(
+                    &mut tts,
+                    &mut http,
+                    &text,
+                    &voice,
+                    rate,
+                    target_rate,
+                    &epoch,
+                    e,
+                    &out_tx,
+                ) {
                     Ok(()) => {
                         let _ = out_tx.send(SynthOut::Done { epoch: e });
                     }
                     Err(err) => {
-                        let _ = out_tx.send(SynthOut::Failed { epoch: e, error: err });
+                        let _ = out_tx.send(SynthOut::Failed {
+                            epoch: e,
+                            error: err,
+                        });
                     }
                 }
             }
@@ -258,7 +279,9 @@ fn synth_span(
             Err(err) => return Err(format!("TTS load failed: {err}")),
         }
     }
-    let engine = tts.as_mut().ok_or_else(|| "TTS engine unavailable".to_string())?;
+    let engine = tts
+        .as_mut()
+        .ok_or_else(|| "TTS engine unavailable".to_string())?;
     if rated {
         // Rated spans are short (a slowed phone number): synthesize whole,
         // stretch at the model's native rate, then ship.

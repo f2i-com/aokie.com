@@ -1,0 +1,661 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aokie.com/contracts/aokie-companion-realtime.v2.schema.json",
+  "title": "Aokie Companion Realtime Signalling Protocol v2",
+  "description": "Direction-specific control, lease and ephemeral WebRTC signalling. RTP/SRTP media is never a gateway frame.",
+  "anyOf": [
+    { "$ref": "#/$defs/mobileToGateway" },
+    { "$ref": "#/$defs/pluginToGateway" },
+    { "$ref": "#/$defs/gatewayToMobile" },
+    { "$ref": "#/$defs/gatewayToPlugin" },
+    { "$ref": "#/$defs/admissionClaims" }
+  ],
+  "$defs": {
+    "safeInteger": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "positiveSafeInteger": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "safeId": { "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[A-Za-z0-9._:-]+$" },
+    "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "appBase": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": { "const": 2 },
+        "appId": { "$ref": "#/$defs/safeId" }
+      },
+      "required": ["schemaVersion", "appId"]
+    },
+    "grant": {
+      "enum": ["state_read", "caller_read", "captions_read", "assistance_read", "assistance_respond", "monitor", "consult", "takeover", "end_caller", "resume_aokie", "rtc_signal", "participants_read", "participant_identity_read", "audio_levels_read"]
+    },
+    "leaseMode": { "enum": ["monitor", "consult", "takeover"] },
+    "leasePhase": { "enum": ["prepared", "active"] },
+    "mediaTrack": { "enum": ["pstn_in", "pstn_out", "consult_rx", "consult_tx"] },
+    "admissionClaims": {
+      "type": "object",
+      "properties": {
+        "aud": { "const": "aokie-v2-gateway" },
+        "appId": { "$ref": "#/$defs/safeId" },
+        "subjectId": { "$ref": "#/$defs/safeId" },
+        "role": { "enum": ["mobile", "plugin"] },
+        "holderKeyThumbprint": { "$ref": "#/$defs/safeId" },
+        "expectedPeerKeyThumbprint": { "$ref": "#/$defs/safeId" },
+        "approvedPeerKeyThumbprints": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/safeId" } },
+        "peerRosterRevision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "peerRosterHash": { "$ref": "#/$defs/safeId" },
+        "scopes": { "type": "array", "maxItems": 16, "uniqueItems": true, "items": { "$ref": "#/$defs/grant" } },
+        "exp": { "$ref": "#/$defs/positiveSafeInteger" },
+        "jti": { "$ref": "#/$defs/safeId" }
+      },
+      "required": ["aud", "appId", "subjectId", "role", "holderKeyThumbprint", "scopes", "exp", "jti"],
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "properties": { "role": { "const": "mobile" } }, "required": ["role"] }, "then": { "required": ["expectedPeerKeyThumbprint"], "not": { "anyOf": [ { "required": ["approvedPeerKeyThumbprints"] }, { "required": ["peerRosterRevision"] }, { "required": ["peerRosterHash"] } ] } } },
+        { "if": { "properties": { "role": { "const": "plugin" } }, "required": ["role"] }, "then": { "required": ["approvedPeerKeyThumbprints", "peerRosterRevision", "peerRosterHash"], "not": { "required": ["expectedPeerKeyThumbprint"] } } }
+      ]
+    },
+    "endpointPublicKey": {
+      "type": "object",
+      "properties": { "algorithm": { "const": "ed25519" }, "publicKey": { "$ref": "#/$defs/safeId" }, "thumbprint": { "$ref": "#/$defs/safeId" } },
+      "required": ["algorithm", "publicKey", "thumbprint"],
+      "additionalProperties": false
+    },
+    "helloProofClaims": {
+      "type": "object",
+      "properties": {
+        "appId": { "$ref": "#/$defs/safeId" }, "subjectId": { "$ref": "#/$defs/safeId" }, "role": { "enum": ["mobile", "plugin"] },
+        "connectionId": { "$ref": "#/$defs/safeId" }, "challengeNonce": { "$ref": "#/$defs/safeId" }, "admissionJti": { "$ref": "#/$defs/safeId" }, "sessionNonce": { "$ref": "#/$defs/safeId" },
+        "holderKeyThumbprint": { "$ref": "#/$defs/safeId" }, "expectedPeerKeyThumbprint": { "$ref": "#/$defs/safeId" },
+        "approvedPeerKeyThumbprints": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/safeId" } },
+        "peerRosterRevision": { "$ref": "#/$defs/positiveSafeInteger" }, "peerRosterHash": { "$ref": "#/$defs/safeId" },
+        "nonce": { "$ref": "#/$defs/safeId" }, "jti": { "$ref": "#/$defs/safeId" }, "issuedAt": { "$ref": "#/$defs/positiveSafeInteger" }, "expiresAt": { "$ref": "#/$defs/positiveSafeInteger" }
+      },
+      "required": ["appId", "subjectId", "role", "connectionId", "challengeNonce", "admissionJti", "sessionNonce", "holderKeyThumbprint", "approvedPeerKeyThumbprints", "nonce", "jti", "issuedAt", "expiresAt"],
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "properties": { "role": { "const": "mobile" } }, "required": ["role"] }, "then": { "required": ["expectedPeerKeyThumbprint"], "properties": { "approvedPeerKeyThumbprints": { "maxItems": 0 } }, "not": { "anyOf": [ { "required": ["peerRosterRevision"] }, { "required": ["peerRosterHash"] } ] } } },
+        { "if": { "properties": { "role": { "const": "plugin" } }, "required": ["role"] }, "then": { "required": ["peerRosterRevision", "peerRosterHash"], "properties": { "approvedPeerKeyThumbprints": { "minItems": 1 } }, "not": { "required": ["expectedPeerKeyThumbprint"] } } }
+      ]
+    },
+    "signedHelloProof": {
+      "type": "object",
+      "properties": { "endpointKey": { "$ref": "#/$defs/endpointPublicKey" }, "claims": { "$ref": "#/$defs/helloProofClaims" }, "signature": { "type": "string", "minLength": 86, "maxLength": 86 } },
+      "required": ["endpointKey", "claims", "signature"],
+      "additionalProperties": false
+    },
+    "endpointChallenge": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "endpoint_challenge" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "subjectId": { "$ref": "#/$defs/safeId" }, "role": { "enum": ["mobile", "plugin"] },
+        "connectionId": { "$ref": "#/$defs/safeId" }, "challengeNonce": { "$ref": "#/$defs/safeId" },
+        "admissionJti": { "$ref": "#/$defs/safeId" }, "holderKeyThumbprint": { "$ref": "#/$defs/safeId" },
+        "expectedPeerKeyThumbprint": { "$ref": "#/$defs/safeId" },
+        "approvedPeerKeyThumbprints": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/safeId" } },
+        "peerRosterRevision": { "$ref": "#/$defs/positiveSafeInteger" }, "peerRosterHash": { "$ref": "#/$defs/safeId" },
+        "expiresAt": { "$ref": "#/$defs/positiveSafeInteger" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "subjectId", "role", "connectionId", "challengeNonce", "admissionJti", "holderKeyThumbprint", "approvedPeerKeyThumbprints", "expiresAt"],
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "properties": { "role": { "const": "mobile" } }, "required": ["role"] }, "then": { "required": ["expectedPeerKeyThumbprint"], "properties": { "approvedPeerKeyThumbprints": { "maxItems": 0 } }, "not": { "anyOf": [ { "required": ["peerRosterRevision"] }, { "required": ["peerRosterHash"] } ] } } },
+        { "if": { "properties": { "role": { "const": "plugin" } }, "required": ["role"] }, "then": { "required": ["peerRosterRevision", "peerRosterHash"], "properties": { "approvedPeerKeyThumbprints": { "minItems": 1 } }, "not": { "required": ["expectedPeerKeyThumbprint"] } } }
+      ]
+    },
+    "mobileHello": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "mobile_hello" }, "schemaVersion": { "const": 2 },
+        "appId": { "$ref": "#/$defs/safeId" }, "deviceId": { "$ref": "#/$defs/safeId" },
+        "sessionNonce": { "$ref": "#/$defs/safeId" }, "endpointProof": { "$ref": "#/$defs/signedHelloProof" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "deviceId", "sessionNonce", "endpointProof"],
+      "additionalProperties": false
+    },
+    "pluginHello": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "plugin_hello" }, "schemaVersion": { "const": 2 },
+        "appId": { "$ref": "#/$defs/safeId" }, "pluginId": { "$ref": "#/$defs/safeId" },
+        "sessionNonce": { "$ref": "#/$defs/safeId" }, "endpointProof": { "$ref": "#/$defs/signedHelloProof" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "pluginId", "sessionNonce", "endpointProof"],
+      "additionalProperties": false
+    },
+    "caller": {
+      "type": "object",
+      "properties": {
+        "label": { "type": ["string", "null"], "maxLength": 200 },
+        "maskedNumber": { "type": ["string", "null"], "maxLength": 40 }
+      },
+      "required": ["label", "maskedNumber"],
+      "additionalProperties": false
+    },
+    "caption": {
+      "type": "object",
+      "properties": {
+        "captionId": { "$ref": "#/$defs/safeId" }, "speaker": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 2000 }, "occurredAt": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "finalText": { "type": "boolean" }
+      },
+      "required": ["captionId", "speaker", "text", "occurredAt", "finalText"],
+      "additionalProperties": false
+    },
+    "remoteConsent": {
+      "type": "object",
+      "properties": {
+        "policyId": { "$ref": "#/$defs/safeId" },
+        "policyVersion": { "$ref": "#/$defs/positiveSafeInteger" },
+        "enabled": { "type": "boolean" },
+        "acknowledged": { "type": "boolean" },
+        "acknowledgedAt": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "expiresAt": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "captionsEnabled": { "type": "boolean" },
+        "assistanceEnabled": { "type": "boolean" },
+        "monitorEnabled": { "type": "boolean" },
+        "consultEnabled": { "type": "boolean" },
+        "takeoverEnabled": { "type": "boolean" }
+      },
+      "required": ["policyId", "policyVersion", "enabled", "acknowledged", "captionsEnabled", "assistanceEnabled", "monitorEnabled", "consultEnabled", "takeoverEnabled"],
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "properties": { "acknowledged": { "const": true } }, "required": ["acknowledged"] }, "then": { "required": ["acknowledgedAt"] }, "else": { "not": { "required": ["acknowledgedAt"] } } },
+        { "if": { "anyOf": [ { "properties": { "enabled": { "const": false } }, "required": ["enabled"] }, { "properties": { "acknowledged": { "const": false } }, "required": ["acknowledged"] } ] }, "then": { "properties": { "captionsEnabled": { "const": false }, "assistanceEnabled": { "const": false }, "monitorEnabled": { "const": false }, "consultEnabled": { "const": false }, "takeoverEnabled": { "const": false } } } }
+      ]
+    },
+    "remoteCapabilities": {
+      "type": "object",
+      "properties": {
+        "softwareHold": { "type": "boolean" },
+        "carrierHoldEvidence": { "enum": ["unknown", "negotiated", "observed", "proven"] },
+        "secondaryCallObservation": { "enum": ["unknown", "negotiated", "observed"] },
+        "voiceConsult": { "type": "boolean" },
+        "takeover": { "type": "boolean" }
+      },
+      "required": ["softwareHold", "carrierHoldEvidence", "secondaryCallObservation", "voiceConsult", "takeover"],
+      "additionalProperties": false,
+      "allOf": [ { "if": { "properties": { "voiceConsult": { "const": true } }, "required": ["voiceConsult"] }, "then": { "properties": { "softwareHold": { "const": true } } } } ]
+    },
+    "screenedSecondaryCall": {
+      "type": "object",
+      "properties": {
+        "stable": { "type": "boolean" }, "callbackEligible": { "type": "boolean" },
+        "status": { "enum": ["queued", "attempted", "failed"] }, "waitingCallId": { "$ref": "#/$defs/safeId" }
+      },
+      "required": ["stable", "callbackEligible", "status"],
+      "additionalProperties": false,
+      "allOf": [ { "if": { "required": ["waitingCallId"] }, "then": { "properties": { "stable": { "const": true }, "callbackEligible": { "const": true } } } } ]
+    },
+    "audioLevel": {
+      "type": "object",
+      "properties": { "source": { "enum": ["caller", "aokie", "companion"] }, "participantId": { "$ref": "#/$defs/safeId" }, "levelPermille": { "type": "integer", "minimum": 0, "maximum": 1000 } },
+      "required": ["source", "levelPermille"], "additionalProperties": false
+    },
+    "participant": {
+      "type": "object",
+      "properties": {
+        "participantId": { "$ref": "#/$defs/safeId" }, "mode": { "enum": ["observer", "advisor", "talker"] },
+        "state": { "enum": ["connected", "prepared", "active"] }, "subjectId": { "$ref": "#/$defs/safeId" },
+        "displayLabel": { "type": "string", "minLength": 1, "maxLength": 120 }
+      },
+      "required": ["participantId", "mode", "state"], "additionalProperties": false
+    },
+    "pendingMobileOfferClaims": {
+      "type": "object",
+      "properties": {
+        "offerId": { "$ref": "#/$defs/safeId" }, "opportunityId": { "$ref": "#/$defs/safeId" },
+        "targetDeviceId": { "$ref": "#/$defs/safeId" }, "targetHolderKeyThumbprint": { "$ref": "#/$defs/safeId" },
+        "offeredMode": { "$ref": "#/$defs/leaseMode" }, "surface": { "enum": ["in_app", "voice_system_ui"] },
+        "appId": { "$ref": "#/$defs/safeId" }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/safeInteger" },
+        "switchboardRevision": { "$ref": "#/$defs/safeInteger" }, "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "requiredConsentPolicyId": { "$ref": "#/$defs/safeId" }, "requiredConsentPolicyVersion": { "$ref": "#/$defs/positiveSafeInteger" },
+        "requiredGrants": { "type": "array", "minItems": 3, "maxItems": 16, "uniqueItems": true, "items": { "$ref": "#/$defs/grant" } },
+        "issuedAt": { "$ref": "#/$defs/positiveSafeInteger" }, "expiresAt": { "$ref": "#/$defs/positiveSafeInteger" }, "jti": { "$ref": "#/$defs/safeId" }
+      },
+      "required": ["offerId", "opportunityId", "targetDeviceId", "targetHolderKeyThumbprint", "offeredMode", "surface", "appId", "callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "requiredConsentPolicyId", "requiredConsentPolicyVersion", "requiredGrants", "issuedAt", "expiresAt", "jti"],
+      "additionalProperties": false,
+      "allOf": [ { "if": { "properties": { "surface": { "const": "voice_system_ui" } }, "required": ["surface"] }, "then": { "properties": { "offeredMode": { "enum": ["consult", "takeover"] } } } } ]
+    },
+    "signedPendingMobileOffer": {
+      "type": "object",
+      "properties": { "offer": { "$ref": "#/$defs/pendingMobileOfferClaims" }, "offerToken": { "type": "string", "minLength": 1, "maxLength": 16384 } },
+      "required": ["offer", "offerToken"], "additionalProperties": false
+    },
+    "authoritativeSnapshot": {
+      "type": "object",
+      "properties": {
+        "callId": { "$ref": "#/$defs/safeId" }, "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" },
+        "ownerEpoch": { "$ref": "#/$defs/safeInteger" }, "switchboardRevision": { "$ref": "#/$defs/safeInteger" },
+        "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "telephonyState": { "enum": ["ringing", "active", "held", "ending", "ended"] },
+        "serviceMode": { "enum": ["aokie_active", "soft_hold", "consult_pending", "consult_active", "human_pending", "human_active", "returning_to_aokie", "recovering", "ended"] },
+        "mediaState": { "enum": ["none", "ready", "receiving", "connecting", "active", "failed"] },
+        "remoteCapabilities": { "$ref": "#/$defs/remoteCapabilities" },
+        "secondaryCallPolicy": { "enum": ["normal", "miss_and_callback"] },
+        "secondaryCall": { "$ref": "#/$defs/screenedSecondaryCall" },
+        "remoteConsent": { "$ref": "#/$defs/remoteConsent" },
+        "caller": { "$ref": "#/$defs/caller" },
+        "captions": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/caption" } },
+        "audioLevels": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/audioLevel" } },
+        "occurredAt": { "type": "string", "minLength": 1, "maxLength": 64 }
+      },
+      "required": ["callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "telephonyState", "serviceMode", "mediaState", "remoteCapabilities", "secondaryCallPolicy", "remoteConsent", "occurredAt"],
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "required": ["secondaryCall"] }, "then": { "properties": { "remoteCapabilities": { "properties": { "secondaryCallObservation": { "const": "observed" } }, "required": ["secondaryCallObservation"] } } } },
+        { "if": { "properties": { "secondaryCall": { "properties": { "callbackEligible": { "const": true } }, "required": ["callbackEligible"] } }, "required": ["secondaryCall"] }, "then": { "properties": { "secondaryCallPolicy": { "const": "miss_and_callback" } } } }
+      ]
+    },
+    "projectedSnapshot": {
+      "type": "object",
+      "properties": {
+        "callId": { "$ref": "#/$defs/safeId" }, "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" },
+        "ownerEpoch": { "$ref": "#/$defs/safeInteger" }, "switchboardRevision": { "$ref": "#/$defs/safeInteger" },
+        "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "telephonyState": { "enum": ["ringing", "active", "held", "ending", "ended"] },
+        "serviceMode": { "enum": ["aokie_active", "soft_hold", "consult_pending", "consult_active", "human_pending", "human_active", "returning_to_aokie", "recovering", "ended"] },
+        "mediaState": { "enum": ["none", "ready", "receiving", "connecting", "active", "failed"] },
+        "remoteCapabilities": { "$ref": "#/$defs/remoteCapabilities" }, "secondaryCallPolicy": { "enum": ["normal", "miss_and_callback"] },
+        "secondaryCall": { "$ref": "#/$defs/screenedSecondaryCall" }, "remoteConsent": { "$ref": "#/$defs/remoteConsent" },
+        "caller": { "$ref": "#/$defs/caller" }, "captions": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/caption" } },
+        "participants": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/participant" } },
+        "audioLevels": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/audioLevel" } },
+        "pendingMobileOffers": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/signedPendingMobileOffer" } },
+        "occurredAt": { "type": "string", "minLength": 1, "maxLength": 64 }
+      },
+      "required": ["callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "telephonyState", "serviceMode", "mediaState", "remoteCapabilities", "secondaryCallPolicy", "remoteConsent", "participants", "pendingMobileOffers", "occurredAt"],
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "required": ["secondaryCall"] }, "then": { "properties": { "remoteCapabilities": { "properties": { "secondaryCallObservation": { "const": "observed" } }, "required": ["secondaryCallObservation"] } } } },
+        { "if": { "properties": { "secondaryCall": { "properties": { "callbackEligible": { "const": true } }, "required": ["callbackEligible"] } }, "required": ["secondaryCall"] }, "then": { "properties": { "secondaryCallPolicy": { "const": "miss_and_callback" } } } }
+      ]
+    },
+    "pluginSnapshot": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "plugin_snapshot" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "eventId": { "$ref": "#/$defs/safeId" }, "snapshot": { "allOf": [ { "$ref": "#/$defs/authoritativeSnapshot" }, { "required": ["captions"] } ] }
+      },
+      "required": ["kind", "schemaVersion", "appId", "eventId", "snapshot"],
+      "additionalProperties": false
+    },
+    "pluginIdle": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "plugin_idle" }, "schemaVersion": { "const": 2 },
+        "appId": { "$ref": "#/$defs/safeId" }, "eventId": { "$ref": "#/$defs/safeId" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "eventId"],
+      "additionalProperties": false
+    },
+    "leaseRequest": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "lease_request" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" },
+        "callId": { "$ref": "#/$defs/safeId" }, "expectedCallEpoch": { "$ref": "#/$defs/positiveSafeInteger" },
+        "expectedOwnerEpoch": { "$ref": "#/$defs/safeInteger" }, "expectedSwitchboardRevision": { "$ref": "#/$defs/safeInteger" },
+        "expectedRemoteRevision": { "$ref": "#/$defs/safeInteger" }, "mode": { "$ref": "#/$defs/leaseMode" },
+        "rtcSessionId": { "$ref": "#/$defs/safeId" }, "acceptedOfferId": { "$ref": "#/$defs/safeId" }, "acceptedOfferJti": { "$ref": "#/$defs/safeId" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "idempotencyKey", "callId", "expectedCallEpoch", "expectedOwnerEpoch", "expectedSwitchboardRevision", "expectedRemoteRevision", "mode", "rtcSessionId", "acceptedOfferId", "acceptedOfferJti"],
+      "additionalProperties": false
+    },
+    "mobileOfferAnswer": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "mobile_offer_answer" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" },
+        "offerId": { "$ref": "#/$defs/safeId" }, "offerJti": { "$ref": "#/$defs/safeId" },
+        "offerToken": { "type": "string", "minLength": 1, "maxLength": 16384 },
+        "targetDeviceId": { "$ref": "#/$defs/safeId" }, "targetHolderKeyThumbprint": { "$ref": "#/$defs/safeId" },
+        "offeredMode": { "$ref": "#/$defs/leaseMode" }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/safeInteger" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "idempotencyKey", "offerId", "offerJti", "offerToken", "targetDeviceId", "targetHolderKeyThumbprint", "offeredMode", "callId", "callEpoch", "ownerEpoch"],
+      "additionalProperties": false
+    },
+    "mobileOfferAccepted": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "mobile_offer_accepted" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "offerId": { "$ref": "#/$defs/safeId" },
+        "offerJti": { "$ref": "#/$defs/safeId" }, "offeredMode": { "$ref": "#/$defs/leaseMode" }, "accepted": { "const": true }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "offerId", "offerJti", "offeredMode", "accepted"],
+      "additionalProperties": false
+    },
+    "leaseHeartbeat": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "lease_heartbeat" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" },
+        "leaseToken": { "type": "string", "minLength": 1, "maxLength": 16384 }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "idempotencyKey", "leaseToken"],
+      "additionalProperties": false
+    },
+    "leaseRevoke": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "lease_revoke" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" },
+        "leaseToken": { "type": "string", "minLength": 1, "maxLength": 16384 }, "reason": { "type": "string", "minLength": 1, "maxLength": 500 }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "idempotencyKey", "leaseToken", "reason"],
+      "additionalProperties": false
+    },
+    "assistanceRequest": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "assistance_request" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "eventId": { "$ref": "#/$defs/safeId" }, "requestId": { "$ref": "#/$defs/safeId" }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/safeInteger" },
+        "switchboardRevision": { "$ref": "#/$defs/safeInteger" }, "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "question": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "context": { "type": "string", "minLength": 1, "maxLength": 2000 }, "expiresAt": { "$ref": "#/$defs/positiveSafeInteger" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "eventId", "requestId", "callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "question", "expiresAt"],
+      "additionalProperties": false
+    },
+    "mobileAssistanceAnswer": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "assistance_answer" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }, "answerId": { "$ref": "#/$defs/safeId" },
+        "callId": { "$ref": "#/$defs/safeId" }, "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/safeInteger" },
+        "switchboardRevision": { "$ref": "#/$defs/safeInteger" }, "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "answer": { "type": "string", "minLength": 1, "maxLength": 2000 }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "idempotencyKey", "answerId", "callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "answer"],
+      "additionalProperties": false
+    },
+    "pluginAssistanceAnswer": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "assistance_answer" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" }, "deviceId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "answerId": { "$ref": "#/$defs/safeId" }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/safeInteger" },
+        "switchboardRevision": { "$ref": "#/$defs/safeInteger" }, "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "answer": { "type": "string", "minLength": 1, "maxLength": 2000 }
+      },
+      "required": ["kind", "schemaVersion", "appId", "deviceId", "requestId", "answerId", "callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "answer"],
+      "additionalProperties": false
+    },
+    "assistanceAnswerAccepted": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "assistance_answer_accepted" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "answerId": { "$ref": "#/$defs/safeId" }, "accepted": { "const": true }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "answerId", "accepted"],
+      "additionalProperties": false
+    },
+    "mobileEndCallerChallengeRequest": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "end_caller_challenge_request" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" },
+        "leaseToken": { "type": "string", "minLength": 1, "maxLength": 16384 }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/positiveSafeInteger" },
+        "switchboardRevision": { "$ref": "#/$defs/safeInteger" }, "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "fence": { "$ref": "#/$defs/positiveSafeInteger" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "idempotencyKey", "leaseToken", "callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "fence"],
+      "additionalProperties": false
+    },
+    "mobileEndCallerConfirm": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "end_caller_confirm" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" },
+        "confirmationId": { "$ref": "#/$defs/safeId" }, "nonce": { "$ref": "#/$defs/safeId" },
+        "leaseToken": { "type": "string", "minLength": 1, "maxLength": 16384 }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/positiveSafeInteger" },
+        "switchboardRevision": { "$ref": "#/$defs/safeInteger" }, "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "fence": { "$ref": "#/$defs/positiveSafeInteger" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "idempotencyKey", "confirmationId", "nonce", "leaseToken", "callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "fence"],
+      "additionalProperties": false
+    },
+    "endCallerChallenge": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "end_caller_challenge" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "confirmationId": { "$ref": "#/$defs/safeId" }, "nonce": { "$ref": "#/$defs/safeId" },
+        "deviceId": { "$ref": "#/$defs/safeId" }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/positiveSafeInteger" },
+        "switchboardRevision": { "$ref": "#/$defs/safeInteger" }, "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "leaseId": { "$ref": "#/$defs/safeId" }, "fence": { "$ref": "#/$defs/positiveSafeInteger" },
+        "expiresAt": { "$ref": "#/$defs/positiveSafeInteger" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "confirmationId", "nonce", "deviceId", "callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "leaseId", "fence", "expiresAt"],
+      "additionalProperties": false
+    },
+    "endCallerSubmitted": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "end_caller_submitted" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "operationId": { "$ref": "#/$defs/safeId" },
+        "confirmationId": { "$ref": "#/$defs/safeId" }, "accepted": { "const": true }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "operationId", "confirmationId", "accepted"],
+      "additionalProperties": false
+    },
+    "pluginEndCallerExecute": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "end_caller_execute" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "operationId": { "$ref": "#/$defs/safeId" }, "confirmationId": { "$ref": "#/$defs/safeId" },
+        "deviceId": { "$ref": "#/$defs/safeId" }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/positiveSafeInteger" },
+        "switchboardRevision": { "$ref": "#/$defs/safeInteger" }, "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "leaseId": { "$ref": "#/$defs/safeId" }, "leaseJti": { "$ref": "#/$defs/safeId" }, "fence": { "$ref": "#/$defs/positiveSafeInteger" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "operationId", "confirmationId", "deviceId", "callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "leaseId", "leaseJti", "fence"],
+      "additionalProperties": false
+    },
+    "endCallerResult": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "end_caller_result" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "operationId": { "$ref": "#/$defs/safeId" }, "confirmationId": { "$ref": "#/$defs/safeId" },
+        "deviceId": { "$ref": "#/$defs/safeId" }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/positiveSafeInteger" },
+        "switchboardRevision": { "$ref": "#/$defs/safeInteger" }, "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "leaseId": { "$ref": "#/$defs/safeId" }, "fence": { "$ref": "#/$defs/positiveSafeInteger" },
+        "outcome": { "enum": ["completed", "failed"] }, "code": { "$ref": "#/$defs/safeId" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 500 }
+      },
+      "required": ["kind", "schemaVersion", "appId", "operationId", "confirmationId", "deviceId", "callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "leaseId", "fence", "outcome"],
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "properties": { "outcome": { "const": "completed" } }, "required": ["outcome"] }, "then": { "not": { "anyOf": [ { "required": ["code"] }, { "required": ["message"] } ] } } },
+        { "if": { "properties": { "outcome": { "const": "failed" } }, "required": ["outcome"] }, "then": { "required": ["code", "message"] } }
+      ]
+    },
+    "endpointBindingClaims": {
+      "type": "object",
+      "properties": {
+        "appId": { "$ref": "#/$defs/safeId" }, "pluginId": { "$ref": "#/$defs/safeId" }, "deviceId": { "$ref": "#/$defs/safeId" },
+        "rtcSessionId": { "$ref": "#/$defs/safeId" }, "endpointSessionNonce": { "$ref": "#/$defs/safeId" }, "leaseJti": { "$ref": "#/$defs/safeId" },
+        "endpointRole": { "enum": ["mobile", "plugin"] }, "holderKeyThumbprint": { "$ref": "#/$defs/safeId" }, "peerKeyThumbprint": { "$ref": "#/$defs/safeId" },
+        "callId": { "$ref": "#/$defs/safeId" }, "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/safeInteger" }, "fence": { "$ref": "#/$defs/safeInteger" },
+        "sdpRevision": { "$ref": "#/$defs/positiveSafeInteger" }, "transportGeneration": { "$ref": "#/$defs/positiveSafeInteger" },
+        "dtlsFingerprint": { "type": "string", "minLength": 1, "maxLength": 200 }, "sdpSha256": { "$ref": "#/$defs/safeId" },
+        "nonce": { "$ref": "#/$defs/safeId" }, "jti": { "$ref": "#/$defs/safeId" }, "issuedAt": { "$ref": "#/$defs/positiveSafeInteger" }, "expiresAt": { "$ref": "#/$defs/positiveSafeInteger" }
+      },
+      "required": ["appId", "pluginId", "deviceId", "rtcSessionId", "endpointSessionNonce", "leaseJti", "endpointRole", "holderKeyThumbprint", "peerKeyThumbprint", "callId", "callEpoch", "ownerEpoch", "fence", "sdpRevision", "transportGeneration", "dtlsFingerprint", "sdpSha256", "nonce", "jti", "issuedAt", "expiresAt"],
+      "additionalProperties": false
+    },
+    "signedEndpointBinding": {
+      "type": "object", "properties": { "endpointKey": { "$ref": "#/$defs/endpointPublicKey" }, "claims": { "$ref": "#/$defs/endpointBindingClaims" }, "signature": { "type": "string", "minLength": 86, "maxLength": 86 } },
+      "required": ["endpointKey", "claims", "signature"], "additionalProperties": false
+    },
+    "candidateClaims": {
+      "type": "object",
+      "properties": {
+        "appId": { "$ref": "#/$defs/safeId" }, "pluginId": { "$ref": "#/$defs/safeId" }, "deviceId": { "$ref": "#/$defs/safeId" },
+        "rtcSessionId": { "$ref": "#/$defs/safeId" }, "endpointSessionNonce": { "$ref": "#/$defs/safeId" }, "leaseJti": { "$ref": "#/$defs/safeId" },
+        "endpointRole": { "enum": ["mobile", "plugin"] }, "holderKeyThumbprint": { "$ref": "#/$defs/safeId" }, "peerKeyThumbprint": { "$ref": "#/$defs/safeId" },
+        "callId": { "$ref": "#/$defs/safeId" }, "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/safeInteger" }, "fence": { "$ref": "#/$defs/safeInteger" },
+        "sdpRevision": { "$ref": "#/$defs/positiveSafeInteger" }, "transportGeneration": { "$ref": "#/$defs/positiveSafeInteger" },
+        "candidate": { "type": "string", "minLength": 1, "maxLength": 4096 }, "sdpMid": { "type": "string", "minLength": 1, "maxLength": 256 }, "sdpMLineIndex": { "type": "integer", "minimum": 0, "maximum": 65535 }, "endOfCandidates": { "type": "boolean" },
+        "nonce": { "$ref": "#/$defs/safeId" }, "jti": { "$ref": "#/$defs/safeId" }, "issuedAt": { "$ref": "#/$defs/positiveSafeInteger" }, "expiresAt": { "$ref": "#/$defs/positiveSafeInteger" }
+      },
+      "required": ["appId", "pluginId", "deviceId", "rtcSessionId", "endpointSessionNonce", "leaseJti", "endpointRole", "holderKeyThumbprint", "peerKeyThumbprint", "callId", "callEpoch", "ownerEpoch", "fence", "sdpRevision", "transportGeneration", "endOfCandidates", "nonce", "jti", "issuedAt", "expiresAt"],
+      "additionalProperties": false
+    },
+    "signedCandidateEnvelope": {
+      "type": "object", "properties": { "endpointKey": { "$ref": "#/$defs/endpointPublicKey" }, "claims": { "$ref": "#/$defs/candidateClaims" }, "signature": { "type": "string", "minLength": 86, "maxLength": 86 } },
+      "required": ["endpointKey", "claims", "signature"], "additionalProperties": false
+    },
+    "rtcSignalPayload": {
+      "oneOf": [
+        { "type": "object", "properties": { "type": { "const": "offer" }, "sdp": { "type": "string", "minLength": 1, "maxLength": 131072 }, "binding": { "$ref": "#/$defs/signedEndpointBinding" } }, "required": ["type", "sdp", "binding"], "additionalProperties": false },
+        { "type": "object", "properties": { "type": { "const": "answer" }, "sdp": { "type": "string", "minLength": 1, "maxLength": 131072 }, "binding": { "$ref": "#/$defs/signedEndpointBinding" } }, "required": ["type", "sdp", "binding"], "additionalProperties": false },
+        { "type": "object", "properties": { "type": { "const": "ice" }, "candidate": { "type": "string", "minLength": 1, "maxLength": 4096 }, "sdpMid": { "type": ["string", "null"], "maxLength": 256 }, "sdpMLineIndex": { "type": ["integer", "null"], "minimum": 0, "maximum": 65535 }, "envelope": { "$ref": "#/$defs/signedCandidateEnvelope" } }, "required": ["type", "candidate", "envelope"], "additionalProperties": false },
+        { "type": "object", "properties": { "type": { "const": "ice_complete" }, "envelope": { "$ref": "#/$defs/signedCandidateEnvelope" } }, "required": ["type", "envelope"], "additionalProperties": false },
+        { "type": "object", "properties": { "type": { "const": "close" }, "reason": { "type": "string", "minLength": 1, "maxLength": 500 } }, "required": ["type", "reason"], "additionalProperties": false }
+      ]
+    },
+    "mobileRtcSignal": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "rtc_signal" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "signalId": { "$ref": "#/$defs/safeId" }, "pluginId": { "$ref": "#/$defs/safeId" }, "deviceId": { "$ref": "#/$defs/safeId" }, "leaseToken": { "type": "string", "minLength": 1, "maxLength": 16384 }, "leaseJti": { "$ref": "#/$defs/safeId" },
+        "rtcSessionId": { "$ref": "#/$defs/safeId" }, "sdpRevision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "transportGeneration": { "$ref": "#/$defs/positiveSafeInteger" }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/safeInteger" },
+        "fence": { "$ref": "#/$defs/safeInteger" }, "signal": { "$ref": "#/$defs/rtcSignalPayload" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "signalId", "pluginId", "deviceId", "leaseToken", "leaseJti", "rtcSessionId", "sdpRevision", "transportGeneration", "callId", "callEpoch", "ownerEpoch", "fence", "signal"],
+      "additionalProperties": false
+    },
+    "pluginRtcSignal": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "rtc_signal" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "signalId": { "$ref": "#/$defs/safeId" }, "pluginId": { "$ref": "#/$defs/safeId" }, "deviceId": { "$ref": "#/$defs/safeId" }, "leaseJti": { "$ref": "#/$defs/safeId" },
+        "rtcSessionId": { "$ref": "#/$defs/safeId" }, "sdpRevision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "transportGeneration": { "$ref": "#/$defs/positiveSafeInteger" }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/safeInteger" },
+        "fence": { "$ref": "#/$defs/safeInteger" }, "signal": { "$ref": "#/$defs/rtcSignalPayload" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "signalId", "pluginId", "deviceId", "leaseJti", "rtcSessionId", "sdpRevision", "transportGeneration", "callId", "callEpoch", "ownerEpoch", "fence", "signal"],
+      "additionalProperties": false
+    },
+    "gatewayMobileRtcSignal": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "rtc_signal" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "signalId": { "$ref": "#/$defs/safeId" }, "pluginId": { "$ref": "#/$defs/safeId" }, "deviceId": { "$ref": "#/$defs/safeId" }, "leaseJti": { "$ref": "#/$defs/safeId" },
+        "rtcSessionId": { "$ref": "#/$defs/safeId" }, "sdpRevision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "transportGeneration": { "$ref": "#/$defs/positiveSafeInteger" }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "ownerEpoch": { "$ref": "#/$defs/safeInteger" },
+        "fence": { "$ref": "#/$defs/safeInteger" }, "signal": { "$ref": "#/$defs/rtcSignalPayload" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "signalId", "pluginId", "deviceId", "leaseJti", "rtcSessionId", "sdpRevision", "transportGeneration", "callId", "callEpoch", "ownerEpoch", "fence", "signal"],
+      "additionalProperties": false
+    },
+    "claimDecision": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "claim_decision" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "requestId": { "$ref": "#/$defs/safeId" }, "deviceId": { "$ref": "#/$defs/safeId" }, "callId": { "$ref": "#/$defs/safeId" },
+        "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "fence": { "$ref": "#/$defs/safeInteger" },
+        "accepted": { "type": "boolean" }, "mediaReady": { "type": "boolean" }, "confirmedOwnerEpoch": { "$ref": "#/$defs/safeInteger" },
+        "switchboardRevision": { "$ref": "#/$defs/safeInteger" }, "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 500 }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "deviceId", "callId", "callEpoch", "fence", "accepted", "mediaReady", "confirmedOwnerEpoch", "switchboardRevision", "remoteRevision"],
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "properties": { "accepted": { "const": true } }, "required": ["accepted"] }, "then": { "properties": { "mediaReady": { "const": true } }, "not": { "required": ["reason"] } } },
+        { "if": { "properties": { "accepted": { "const": false } }, "required": ["accepted"] }, "then": { "properties": { "mediaReady": { "const": false } }, "required": ["reason"] } }
+      ]
+    },
+    "pluginLeaseRevoke": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "plugin_lease_revoke" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "deviceId": { "$ref": "#/$defs/safeId" }, "leaseId": { "$ref": "#/$defs/safeId" }, "leaseJti": { "$ref": "#/$defs/safeId" },
+        "callId": { "$ref": "#/$defs/safeId" }, "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" },
+        "fence": { "$ref": "#/$defs/safeInteger" }, "reason": { "type": "string", "minLength": 1, "maxLength": 500 }
+      },
+      "required": ["kind", "schemaVersion", "appId", "deviceId", "leaseId", "leaseJti", "callId", "callEpoch", "fence", "reason"],
+      "additionalProperties": false
+    },
+    "leaseClaims": {
+      "type": "object",
+      "properties": {
+        "aud": { "const": "aokie-companion-media" }, "appId": { "$ref": "#/$defs/safeId" }, "pluginId": { "$ref": "#/$defs/safeId" },
+        "deviceId": { "$ref": "#/$defs/safeId" }, "pluginKeyThumbprint": { "$ref": "#/$defs/safeId" }, "mobileKeyThumbprint": { "$ref": "#/$defs/safeId" }, "callId": { "$ref": "#/$defs/safeId" }, "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" },
+        "ownerEpoch": { "$ref": "#/$defs/safeInteger" }, "mode": { "$ref": "#/$defs/leaseMode" }, "phase": { "$ref": "#/$defs/leasePhase" },
+        "tracks": { "type": "array", "items": { "$ref": "#/$defs/mediaTrack" }, "uniqueItems": true }, "expiresAt": { "$ref": "#/$defs/positiveSafeInteger" },
+        "leaseId": { "$ref": "#/$defs/safeId" }, "jti": { "$ref": "#/$defs/safeId" }, "fence": { "$ref": "#/$defs/safeInteger" },
+        "sessionNonce": { "$ref": "#/$defs/safeId" }, "rtcSessionId": { "$ref": "#/$defs/safeId" }
+      },
+      "required": ["aud", "appId", "pluginId", "deviceId", "pluginKeyThumbprint", "mobileKeyThumbprint", "callId", "callEpoch", "ownerEpoch", "mode", "phase", "tracks", "expiresAt", "leaseId", "jti", "fence", "sessionNonce", "rtcSessionId"],
+      "additionalProperties": false
+    },
+    "mobileSnapshot": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "snapshot" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "sequence": { "$ref": "#/$defs/safeInteger" }, "grants": { "type": "array", "items": { "$ref": "#/$defs/grant" } },
+        "snapshot": { "$ref": "#/$defs/projectedSnapshot" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "sequence", "grants", "snapshot"],
+      "additionalProperties": false
+    },
+    "mobileIdleSync": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "idle_sync" }, "schemaVersion": { "const": 2 },
+        "appId": { "$ref": "#/$defs/safeId" }, "sequence": { "$ref": "#/$defs/positiveSafeInteger" },
+        "grants": { "type": "array", "maxItems": 16, "uniqueItems": true, "items": { "$ref": "#/$defs/grant" }, "contains": { "const": "state_read" }, "minContains": 1 }
+      },
+      "required": ["kind", "schemaVersion", "appId", "sequence", "grants"],
+      "additionalProperties": false
+    },
+    "leaseStatus": {
+      "type": "object",
+      "properties": {
+        "kind": { "enum": ["lease_granted", "claim_provisional", "claim_active", "lease_renewed"] },
+        "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" }, "requestId": { "$ref": "#/$defs/safeId" },
+        "leaseToken": { "type": "string", "minLength": 1, "maxLength": 16384 }, "lease": { "$ref": "#/$defs/leaseClaims" },
+        "provisional": { "type": "boolean" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "requestId", "leaseToken", "lease"],
+      "additionalProperties": false
+    },
+    "pluginLeaseStatus": {
+      "type": "object",
+      "properties": {
+        "kind": { "enum": ["lease_granted", "claim_proposal", "lease_renewed"] },
+        "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" }, "requestId": { "$ref": "#/$defs/safeId" },
+        "deviceId": { "$ref": "#/$defs/safeId" }, "leaseToken": { "type": "string", "minLength": 1, "maxLength": 16384 },
+        "lease": { "$ref": "#/$defs/leaseClaims" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "deviceId", "leaseToken", "lease"],
+      "additionalProperties": false
+    },
+    "genericGatewayFrame": {
+      "type": "object",
+      "properties": {
+        "kind": { "enum": ["error", "claim_rejected", "lease_revoked"] }, "schemaVersion": { "const": 2 },
+        "appId": { "$ref": "#/$defs/safeId" }, "requestId": { "type": ["string", "null"], "maxLength": 200 },
+        "code": { "type": "string", "maxLength": 200 }, "message": { "type": "string", "maxLength": 500 },
+        "deviceId": { "$ref": "#/$defs/safeId" }, "leaseId": { "$ref": "#/$defs/safeId" }, "leaseJti": { "$ref": "#/$defs/safeId" },
+        "callId": { "$ref": "#/$defs/safeId" }, "callEpoch": { "$ref": "#/$defs/positiveSafeInteger" }, "fence": { "$ref": "#/$defs/safeInteger" },
+        "reason": { "type": "string", "maxLength": 500 }
+      },
+      "required": ["kind", "schemaVersion"],
+      "additionalProperties": false
+    },
+    "mobileToGateway": { "oneOf": [ { "$ref": "#/$defs/mobileHello" }, { "$ref": "#/$defs/mobileOfferAnswer" }, { "$ref": "#/$defs/leaseRequest" }, { "$ref": "#/$defs/leaseHeartbeat" }, { "$ref": "#/$defs/leaseRevoke" }, { "$ref": "#/$defs/mobileRtcSignal" }, { "$ref": "#/$defs/mobileAssistanceAnswer" }, { "$ref": "#/$defs/mobileEndCallerChallengeRequest" }, { "$ref": "#/$defs/mobileEndCallerConfirm" } ] },
+    "pluginToGateway": { "oneOf": [ { "$ref": "#/$defs/pluginHello" }, { "$ref": "#/$defs/pluginIdle" }, { "$ref": "#/$defs/pluginSnapshot" }, { "$ref": "#/$defs/claimDecision" }, { "$ref": "#/$defs/pluginRtcSignal" }, { "$ref": "#/$defs/pluginLeaseRevoke" }, { "$ref": "#/$defs/assistanceRequest" }, { "$ref": "#/$defs/endCallerResult" } ] },
+    "gatewayToMobile": { "oneOf": [ { "$ref": "#/$defs/endpointChallenge" }, { "$ref": "#/$defs/mobileIdleSync" }, { "$ref": "#/$defs/mobileSnapshot" }, { "$ref": "#/$defs/mobileOfferAccepted" }, { "$ref": "#/$defs/leaseStatus" }, { "$ref": "#/$defs/genericGatewayFrame" }, { "$ref": "#/$defs/gatewayMobileRtcSignal" }, { "$ref": "#/$defs/assistanceRequest" }, { "$ref": "#/$defs/assistanceAnswerAccepted" }, { "$ref": "#/$defs/endCallerChallenge" }, { "$ref": "#/$defs/endCallerSubmitted" }, { "$ref": "#/$defs/endCallerResult" } ] },
+    "gatewayToPlugin": { "oneOf": [ { "$ref": "#/$defs/endpointChallenge" }, { "$ref": "#/$defs/pluginLeaseStatus" }, { "$ref": "#/$defs/genericGatewayFrame" }, { "$ref": "#/$defs/pluginRtcSignal" }, { "$ref": "#/$defs/pluginAssistanceAnswer" }, { "$ref": "#/$defs/pluginEndCallerExecute" } ] }
+  }
+}

@@ -1199,7 +1199,10 @@ impl RfcommClientState {
             target_dlci, server_channel
         );
         // C/R = 1: we are the mux initiator issuing a command.
-        Ok((target_dlci, build_uih(RFCOMM_DLCI_MULTIPLEXER, true, None, &pn)))
+        Ok((
+            target_dlci,
+            build_uih(RFCOMM_DLCI_MULTIPLEXER, true, None, &pn),
+        ))
     }
 
     /// Drain pending secondary-DLCI events whose `dlci` matches; events
@@ -1228,7 +1231,11 @@ impl RfcommClientState {
     /// Build a UIH frame on a secondary `dlci` carrying `payload`
     /// (OBEX bytes). Errors unless the DLCI reached `Open`. Consumes
     /// one transmit credit under credit-based flow control.
-    pub fn build_uih_on_client_dlci(&mut self, dlci: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn build_uih_on_client_dlci(
+        &mut self,
+        dlci: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let client = self
             .secondary_dlcis
             .get_mut(&dlci)
@@ -1410,12 +1417,7 @@ impl RfcommClientState {
                             let refill =
                                 u16::from(CLIENT_INITIAL_CREDITS) - self.rx_credits_outstanding;
                             self.rx_credits_outstanding += refill;
-                            out.push(build_uih(
-                                self.target_dlci,
-                                true,
-                                Some(refill as u8),
-                                &[],
-                            ));
+                            out.push(build_uih(self.target_dlci, true, Some(refill as u8), &[]));
                         }
                     }
                 }
@@ -1472,8 +1474,7 @@ impl RfcommClientState {
             // at zero credits simply stops talking mid-listing.
             if let Some(client) = self.secondary_dlcis.get_mut(&dlci) {
                 if client.credit_flow {
-                    client.rx_credits_outstanding =
-                        client.rx_credits_outstanding.saturating_sub(1);
+                    client.rx_credits_outstanding = client.rx_credits_outstanding.saturating_sub(1);
                     if client.rx_credits_outstanding <= CLIENT_CREDIT_REFILL_THRESHOLD {
                         let refill =
                             u16::from(CLIENT_INITIAL_CREDITS) - client.rx_credits_outstanding;
@@ -1512,7 +1513,8 @@ impl RfcommClientState {
             "[AokieRadio] RFCOMM initiator-mux dlci {} failed: {}",
             dlci, reason
         );
-        self.client_events.push(ClientDlciEvent::Failed { dlci, reason });
+        self.client_events
+            .push(ClientDlciEvent::Failed { dlci, reason });
     }
 
     fn on_ua_multiplexer(&mut self) -> Result<Vec<Vec<u8>>, String> {
@@ -2316,7 +2318,12 @@ mod tests {
         assert_eq!(parse_frame(&responses[0]).unwrap().payload, b"AT+CIND?\r");
 
         let responses = state
-            .handle_packet(&build_uih(aokie_hfp_dlci(), false, None, b"\r\n+CIND: 0,0\r\nOK\r\n"))
+            .handle_packet(&build_uih(
+                aokie_hfp_dlci(),
+                false,
+                None,
+                b"\r\n+CIND: 0,0\r\nOK\r\n",
+            ))
             .unwrap();
         assert!(responses.is_empty());
         assert!(state.hfp_state().service_level_ready());

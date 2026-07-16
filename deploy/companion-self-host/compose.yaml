@@ -1,0 +1,164 @@
+name: aokie-companion
+
+services:
+  gateway:
+    image: aokie-realtime-self-host:${AOKIE_IMAGE_TAG:-local}
+    build:
+      context: ../..
+      dockerfile: deploy/companion-self-host/Dockerfile
+      args:
+        RUST_VERSION: ${RUST_VERSION:-1.92.0}
+    restart: unless-stopped
+    environment:
+      AOKIE_GATEWAY_BIND: 0.0.0.0:18787
+      # This listener is private on the Docker network. Traefik is the only
+      # public WSS edge, so the explicit HTTP override is safe here.
+      AOKIE_GATEWAY_ALLOW_PUBLIC_HTTP: "1"
+      AOKIE_GATEWAY_ADMISSION_HMAC_SECRET_FILE: /run/secrets/admission_hmac
+      AOKIE_GATEWAY_LEASE_HMAC_SECRET_FILE: /run/secrets/lease_hmac
+    secrets:
+      - admission_hmac
+      - lease_hmac
+    expose:
+      - 18787
+    networks:
+      - private
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    healthcheck:
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+
+  coturn:
+    image: coturn/coturn:4.14.0-r0@sha256:0c0e8fc0c263b85a134e9e4242b5e46e1f4c077c5029633511191c05b5c2c814
+    restart: unless-stopped
+    entrypoint: [/bin/sh, /opt/aokie/coturn-entrypoint.sh]
+    environment:
+      TURN_SECRET_FILE: /run/secrets/turn_rest
+      TURN_REALM: ${TURN_REALM:?set TURN_REALM in .env}
+      TURN_EXTERNAL_IPV4: ${TURN_EXTERNAL_IPV4:?set TURN_EXTERNAL_IPV4 in .env}
+      TURN_EXTERNAL_IPV6: ${TURN_EXTERNAL_IPV6:-}
+      TURN_MIN_PORT: ${TURN_MIN_PORT:-49160}
+      TURN_MAX_PORT: ${TURN_MAX_PORT:-49200}
+      TURN_USER_QUOTA: ${TURN_USER_QUOTA:-8}
+      TURN_TOTAL_QUOTA: ${TURN_TOTAL_QUOTA:-200}
+      TURN_MAX_BPS: ${TURN_MAX_BPS:-2000000}
+      TURN_BPS_CAPACITY: ${TURN_BPS_CAPACITY:-100000000}
+      TURN_ALLOW_PRIVATE_PEERS: "0"
+    secrets:
+      - turn_rest
+    volumes:
+      - ./coturn-entrypoint.sh:/opt/aokie/coturn-entrypoint.sh:ro
+      - ./coturn.base.conf:/etc/coturn/turnserver.base.conf:ro
+    ports:
+      - "${PUBLIC_IPV4:-0.0.0.0}:3478:3478/tcp"
+      - "${PUBLIC_IPV4:-0.0.0.0}:3478:3478/udp"
+      - "[${PUBLIC_IPV6:-::}]:3478:3478/tcp"
+      - "[${PUBLIC_IPV6:-::}]:3478:3478/udp"
+      - "${PUBLIC_IPV4:-0.0.0.0}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/tcp"
+      - "${PUBLIC_IPV4:-0.0.0.0}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp"
+      - "[${PUBLIC_IPV6:-::}]:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/tcp"
+      - "[${PUBLIC_IPV6:-::}]:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp"
+    expose:
+      - 3479
+    networks:
+      - private
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /var/lib/coturn:size=16m,mode=0700
+      - /var/run:size=4m,mode=0755
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    # The official image marks turnserver for low-port binding. Keeping this
+    # one bounded capability allows exec under no-new-privileges; all other
+    # Linux capabilities remain dropped.
+    cap_add: [NET_BIND_SERVICE]
+    healthcheck:
+      test: [CMD-SHELL, "turnutils_stunclient -p 3478 -t 1000 127.0.0.1 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+
+  edge-config:
+    image: traefik:v3.7.7@sha256:1cb3845d7a05e1473c9086351426597e911db49db382b6e4769f9b0744962ac8
+    entrypoint: [/bin/sh, /templates/render-traefik-config.sh]
+    environment:
+      SIGNAL_HOST: ${SIGNAL_HOST:?set SIGNAL_HOST in .env}
+      TURN_HOST: ${TURN_HOST:?set TURN_HOST in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./render-traefik-config.sh:/templates/render-traefik-config.sh:ro
+      - ./traefik-static.template.yml:/templates/traefik-static.template.yml:ro
+      - ./traefik-dynamic.template.yml:/templates/traefik-dynamic.template.yml:ro
+      - edge_config:/rendered
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+  edge:
+    image: traefik:v3.7.7@sha256:1cb3845d7a05e1473c9086351426597e911db49db382b6e4769f9b0744962ac8
+    restart: unless-stopped
+    command: [--configFile=/etc/traefik/traefik.yml]
+    depends_on:
+      edge-config:
+        condition: service_completed_successfully
+      gateway:
+        condition: service_healthy
+      coturn:
+        condition: service_healthy
+    volumes:
+      - edge_config:/etc/traefik:ro
+      - acme_data:/var/lib/traefik
+    ports:
+      - "${PUBLIC_IPV4:-0.0.0.0}:80:80/tcp"
+      - "${PUBLIC_IPV4:-0.0.0.0}:443:443/tcp"
+      - "${PUBLIC_IPV4:-0.0.0.0}:5349:5349/tcp"
+      - "[${PUBLIC_IPV6:-::}]:80:80/tcp"
+      - "[${PUBLIC_IPV6:-::}]:443:443/tcp"
+      - "[${PUBLIC_IPV6:-::}]:5349:5349/tcp"
+    networks:
+      - private
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    healthcheck:
+      test: [CMD, traefik, healthcheck, --ping]
+      interval: 10s
+      timeout: 3s
+      start_period: 15s
+      retries: 5
+
+secrets:
+  admission_hmac:
+    file: ./secrets/admission-hmac.txt
+  lease_hmac:
+    file: ./secrets/lease-hmac.txt
+  turn_rest:
+    file: ./secrets/turn-rest.txt
+
+volumes:
+  acme_data:
+  edge_config:
+
+networks:
+  private:
+    internal: false
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: ${AOKIE_IPV4_SUBNET:-172.30.87.0/24}
+        - subnet: ${AOKIE_IPV6_SUBNET:-fd87:a0c1:e000::/64}

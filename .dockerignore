@@ -1,0 +1,16 @@
+# No other Docker build existed when the Companion self-host bundle was added.
+# Keep the workspace context small enough that a local target tree (which can
+# contain tens of gigabytes of desktop/mobile artifacts) is never sent to the
+# Docker daemon.
+**
+!Cargo.lock
+!crates/
+!crates/aokie-protocol/
+!crates/aokie-protocol/**
+!crates/aokie-realtime/
+!crates/aokie-realtime/**
+!deploy/
+!deploy/companion-self-host/
+!deploy/companion-self-host/container-workspace/
+!deploy/companion-self-host/container-workspace/**
+!deploy/companion-self-host/gateway-entrypoint.sh

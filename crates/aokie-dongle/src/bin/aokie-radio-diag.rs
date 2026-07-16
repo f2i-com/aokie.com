@@ -197,8 +197,8 @@ fn duration_arg(
 }
 
 #[cfg(target_os = "windows")]
-fn load_pairing_store() -> Result<aokie_bluetooth::aokie_radio::pairing_store::AokiePairingStore, String>
-{
+fn load_pairing_store(
+) -> Result<aokie_bluetooth::aokie_radio::pairing_store::AokiePairingStore, String> {
     let data_dir = aokie_core::paths::app_data_dir()
         .ok_or_else(|| "could not resolve Windows app data directory".to_string())?;
     let path = aokie_bluetooth::aokie_radio::pairing_store::default_store_path(&data_dir);
@@ -221,7 +221,9 @@ fn pipe_kind(kind: aokie_bluetooth::aokie_radio::winusb::PipeKind) -> String {
         aokie_bluetooth::aokie_radio::winusb::PipeKind::Interrupt => "interrupt".to_string(),
         aokie_bluetooth::aokie_radio::winusb::PipeKind::Isochronous => "isochronous".to_string(),
         aokie_bluetooth::aokie_radio::winusb::PipeKind::Control => "control".to_string(),
-        aokie_bluetooth::aokie_radio::winusb::PipeKind::Unknown(value) => format!("unknown({value})"),
+        aokie_bluetooth::aokie_radio::winusb::PipeKind::Unknown(value) => {
+            format!("unknown({value})")
+        }
     }
 }
 
@@ -234,7 +236,9 @@ fn pipe_direction(direction: aokie_bluetooth::aokie_radio::winusb::PipeDirection
 }
 
 #[cfg(target_os = "windows")]
-fn print_interface_diagnostics(report: &aokie_bluetooth::aokie_radio::winusb::InterfaceDiagnostics) {
+fn print_interface_diagnostics(
+    report: &aokie_bluetooth::aokie_radio::winusb::InterfaceDiagnostics,
+) {
     println!("path: {}", report.device_path);
     println!(
         "control interface={} alt={}",
@@ -368,7 +372,10 @@ fn print_event_record(event: &aokie_bluetooth::aokie_radio::manager::ControllerE
 }
 
 #[cfg(target_os = "windows")]
-fn print_acl_exchange(index: usize, exchange: &aokie_bluetooth::aokie_radio::manager::AclExchangeRecord) {
+fn print_acl_exchange(
+    index: usize,
+    exchange: &aokie_bluetooth::aokie_radio::manager::AclExchangeRecord,
+) {
     println!(
         "  ACL #{index}: inbound={} responses={} lengths={:?}",
         exchange.inbound_len, exchange.responses_sent, exchange.response_lengths

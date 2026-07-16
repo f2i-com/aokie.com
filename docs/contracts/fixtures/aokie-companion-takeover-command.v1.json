@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "commandId": "cmd_takeover_01",
+  "idempotencyKey": "mobile:device_iphone15:cmd_takeover_01",
+  "callId": "call_01JZQ1K6D4B4N7TWM2C3D5E6F7",
+  "expectedSwitchboardRevision": 8,
+  "expectedRemoteRevision": 19,
+  "expectedCallEpoch": 7,
+  "expectedOwnerEpoch": 12,
+  "type": "takeover_claim",
+  "payload": {
+    "offerId": "offer_01JZQ1K9R17APN6BK2F6YHM83B"
+  }
+}

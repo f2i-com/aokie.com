@@ -21,6 +21,7 @@
 
 use crate::aokie_radio::bmessage;
 use crate::aokie_radio::hfp::{ChldAction, HfpAtCommand, HfpEvent};
+use crate::aokie_radio::hfp_connect::{HfpConnectEvent, HfpConnectRuntime};
 use crate::aokie_radio::manager::{
     self, AOKIE_SCO_TX_QUEUE_SAMPLES, AOKIE_SCO_USB_PAYLOAD_BYTES, AOKIE_VOICE_SETTING,
     AOKIE_VOICE_SETTING_TRANSPARENT,
@@ -32,7 +33,6 @@ use crate::aokie_radio::map_mas::{
 use crate::aokie_radio::map_mns::{MnsEvent, MnsServer, MnsState};
 use crate::aokie_radio::map_runtime::{MapRuntime, MapRuntimeEvent};
 use crate::aokie_radio::pairing_store::AokiePairingStore;
-use crate::aokie_radio::hfp_connect::{HfpConnectEvent, HfpConnectRuntime};
 use crate::aokie_radio::pbap_runtime::{PbapRuntime, PbapRuntimeEvent};
 use crate::aokie_radio::rfcomm::{
     build_modem_status_command, build_ua, build_uih, server_channel_dlci, RfcommState,
@@ -87,11 +87,15 @@ pub enum RuntimeEvent {
     /// Phase 4: a SECOND caller is knocking while a call is active (+CCWA /
     /// callsetup-while-active on a call-waiting-negotiated SLC). One per
     /// waiting episode, plus one upgrade when a number arrives late.
-    CallWaiting { number: Option<String> },
+    CallWaiting {
+        number: Option<String>,
+    },
     /// The waiting episode ended with the active call untouched.
     CallWaitingEnded,
     /// `callheld` indicator transition (0 none / 1 held+active / 2 held only).
-    CallHeld { state: i32 },
+    CallHeld {
+        state: i32,
+    },
     /// One parsed `+CLCC:` line (Phase 4 observe topology): `status` 0
     /// active / 1 held / 2 dialing / 3 alerting / 4 incoming / 5 waiting.
     /// A CLCC response bursts one of these per current call.
@@ -780,11 +784,9 @@ impl AokieRuntime {
                 reply: reply_tx,
             })
             .map_err(|_| "aokie-radio runtime is no longer running".to_string())?;
-        reply_rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| {
-                "aokie-radio runtime did not answer the confirmPairing request".to_string()
-            })?
+        reply_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+            "aokie-radio runtime did not answer the confirmPairing request".to_string()
+        })?
     }
 
     /// AOK-BT-001: forget a bonded device. Blocks briefly on the runtime thread
@@ -797,9 +799,9 @@ impl AokieRuntime {
                 reply: reply_tx,
             })
             .map_err(|_| "aokie-radio runtime is no longer running".to_string())?;
-        reply_rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "aokie-radio runtime did not answer the removePaired request".to_string())?
+        reply_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+            "aokie-radio runtime did not answer the removePaired request".to_string()
+        })?
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -2124,8 +2126,7 @@ fn run_runtime(
             if active_map_op.is_none() {
                 active_map_op_since = None;
             }
-            let op_overdue = active_map_op_since
-                .is_some_and(|t| t.elapsed() >= MAP_OP_DEADLINE);
+            let op_overdue = active_map_op_since.is_some_and(|t| t.elapsed() >= MAP_OP_DEADLINE);
             if op_overdue {
                 if let Some(op) = active_map_op.as_ref() {
                     eprintln!(
@@ -2258,7 +2259,10 @@ fn run_runtime(
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[AokieRadio] MAS stall recovery: dlci 4 DISC build: {}", e)
+                                eprintln!(
+                                    "[AokieRadio] MAS stall recovery: dlci 4 DISC build: {}",
+                                    e
+                                )
                             }
                         }
                     }
@@ -2400,8 +2404,7 @@ fn run_runtime(
                     }
                     for packet in &packets {
                         if let Err(e) = transport.write_acl(packet) {
-                            let _ =
-                                event_tx.send(RuntimeEvent::Error(format!("holdSwap: {}", e)));
+                            let _ = event_tx.send(RuntimeEvent::Error(format!("holdSwap: {}", e)));
                         }
                     }
                 }
@@ -2605,8 +2608,10 @@ fn run_runtime(
                         if remote_is_target {
                             Ok(false) // already connected — no-op, not an error
                         } else {
-                            Err("another phone currently holds the link — disconnect it first"
-                                .to_string())
+                            Err(
+                                "another phone currently holds the link — disconnect it first"
+                                    .to_string(),
+                            )
                         }
                     } else if manual_connect_pending.is_some() {
                         Err("a reconnect attempt is already in progress".to_string())
@@ -2644,13 +2649,15 @@ fn run_runtime(
                             } else {
                                 hci::user_confirmation_request_negative_reply_command(pending_addr)
                             };
-                            command.and_then(|cmd| transport.write_command(&cmd)).map(|()| {
-                                eprintln!(
-                                    "[AokieRadio] operator {} SSP numeric comparison for {}",
-                                    if accept { "CONFIRMED" } else { "REJECTED" },
-                                    pending_addr
-                                );
-                            })
+                            command
+                                .and_then(|cmd| transport.write_command(&cmd))
+                                .map(|()| {
+                                    eprintln!(
+                                        "[AokieRadio] operator {} SSP numeric comparison for {}",
+                                        if accept { "CONFIRMED" } else { "REJECTED" },
+                                        pending_addr
+                                    );
+                                })
                         }
                         Some((pending_addr, _)) => Err(format!(
                             "pending pairing confirmation is for {}, not {}",
@@ -2713,11 +2720,17 @@ fn run_runtime(
                     scan_discoverable = want_discoverable;
                     eprintln!(
                         "[AokieRadio] pairing window {} — scan_enable=0x{:02x}",
-                        if want_discoverable { "OPEN (discoverable)" } else { "closed (connectable-only)" },
+                        if want_discoverable {
+                            "OPEN (discoverable)"
+                        } else {
+                            "closed (connectable-only)"
+                        },
                         scan_enable
                     );
                 }
-                Err(e) => eprintln!("[AokieRadio] scan-enable reconcile failed: {e} — retrying next tick"),
+                Err(e) => {
+                    eprintln!("[AokieRadio] scan-enable reconcile failed: {e} — retrying next tick")
+                }
             }
         }
 
@@ -2800,8 +2813,7 @@ fn run_runtime(
                         // degraded until restart (live report
                         // 2026-07-13). Real failures still surface.
                         if !manager::is_timeout_error(&e) {
-                            let _ =
-                                event_tx.send(RuntimeEvent::Error(format!("hci event: {}", e)));
+                            let _ = event_tx.send(RuntimeEvent::Error(format!("hci event: {}", e)));
                         }
                         continue;
                     }
@@ -2930,7 +2942,11 @@ fn run_runtime(
                                 e
                             );
                         }
-                        let _ = event_tx.send(RuntimeEvent::AudioConnected { codec, sample_rate, armed: alt_result.is_ok() });
+                        let _ = event_tx.send(RuntimeEvent::AudioConnected {
+                            codec,
+                            sample_rate,
+                            armed: alt_result.is_ok(),
+                        });
                     } else {
                         eprintln!(
                             "[AokieRadio] SCO link FAILED status 0x{:02x} handle {:#06x}",
@@ -3033,8 +3049,7 @@ fn run_runtime(
                                 // SLC-ready MAP subscribe runs on outbound
                                 // sessions too — SMS send/receive no longer
                                 // waits for a phone-initiated reconnect.
-                                let cmd =
-                                    hci::authentication_requested_command(*connection_handle);
+                                let cmd = hci::authentication_requested_command(*connection_handle);
                                 match transport.write_command(&cmd) {
                                     Ok(()) => {
                                         manual_connect_auth = Some(ManualConnectAuth {
@@ -3049,9 +3064,10 @@ fn run_runtime(
                                             "phone.connect: Authentication_Requested write failed: {}",
                                             e
                                         )));
-                                        let _ = transport.write_command(
-                                            &hci::disconnect_command(*connection_handle, 0x13),
-                                        );
+                                        let _ = transport.write_command(&hci::disconnect_command(
+                                            *connection_handle,
+                                            0x13,
+                                        ));
                                         outbound_connect_session = false;
                                     }
                                 }
@@ -3152,10 +3168,8 @@ fn run_runtime(
                                 "[AokieRadio] phone.connect: {} authenticated — enabling link encryption",
                                 auth.address
                             );
-                            let cmd = hci::set_connection_encryption_command(
-                                *connection_handle,
-                                true,
-                            );
+                            let cmd =
+                                hci::set_connection_encryption_command(*connection_handle, true);
                             match transport.write_command(&cmd) {
                                 Ok(()) => auth.awaiting_encryption = true,
                                 Err(e) => {
@@ -3163,9 +3177,10 @@ fn run_runtime(
                                         "phone.connect: Set_Connection_Encryption write failed: {}",
                                         e
                                     )));
-                                    let _ = transport.write_command(
-                                        &hci::disconnect_command(*connection_handle, 0x13),
-                                    );
+                                    let _ = transport.write_command(&hci::disconnect_command(
+                                        *connection_handle,
+                                        0x13,
+                                    ));
                                     manual_connect_auth = None;
                                     outbound_connect_session = false;
                                 }
@@ -3181,10 +3196,8 @@ fn run_runtime(
                                 auth.address, astatus
                             )));
                             // 0x05 = Authentication Failure: the honest reason.
-                            let _ = transport.write_command(&hci::disconnect_command(
-                                *connection_handle,
-                                0x05,
-                            ));
+                            let _ = transport
+                                .write_command(&hci::disconnect_command(*connection_handle, 0x05));
                             outbound_connect_session = false;
                         }
                     }
@@ -3217,9 +3230,10 @@ fn run_runtime(
                                     let mut started = true;
                                     for packet in &packets {
                                         if let Err(e) = transport.write_acl(packet) {
-                                            let _ = event_tx.send(RuntimeEvent::Error(
-                                                format!("phone.connect SDP start: {}", e),
-                                            ));
+                                            let _ = event_tx.send(RuntimeEvent::Error(format!(
+                                                "phone.connect SDP start: {}",
+                                                e
+                                            )));
                                             started = false;
                                             break;
                                         }
@@ -3229,10 +3243,8 @@ fn run_runtime(
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = event_tx.send(RuntimeEvent::Error(format!(
-                                        "phone.connect: {}",
-                                        e
-                                    )));
+                                    let _ = event_tx
+                                        .send(RuntimeEvent::Error(format!("phone.connect: {}", e)));
                                 }
                             }
                         } else {
@@ -3240,10 +3252,8 @@ fn run_runtime(
                                 "phone.connect: encrypting the link to {} failed (status 0x{:02x}) — try again, or re-pair if it keeps failing",
                                 auth.address, estatus
                             )));
-                            let _ = transport.write_command(&hci::disconnect_command(
-                                *connection_handle,
-                                0x13,
-                            ));
+                            let _ = transport
+                                .write_command(&hci::disconnect_command(*connection_handle, 0x13));
                             outbound_connect_session = false;
                         }
                     }
@@ -3306,7 +3316,8 @@ fn run_runtime(
                             if let Some(op) = active_map_op.take() {
                                 if matches!(
                                     op,
-                                    PendingMapOp::SendReply { .. } | PendingMapOp::FetchMessage { .. }
+                                    PendingMapOp::SendReply { .. }
+                                        | PendingMapOp::FetchMessage { .. }
                                 ) {
                                     pending_map_ops.push_front(op);
                                 }
@@ -3799,8 +3810,7 @@ fn run_runtime(
             // (Subscribe + SendReply complete in <1s), so the original
             // "don't poke a wedged phone" rationale doesn't apply.
             let mns_never_arrived = !mns_active
-                && mns_subscribe_attempted_at
-                    .is_some_and(|t| t.elapsed() >= MNS_ABSENT_POLL_GRACE);
+                && mns_subscribe_attempted_at.is_some_and(|t| t.elapsed() >= MNS_ABSENT_POLL_GRACE);
             let poll_channel_ready = mns_active || mns_never_arrived;
             // Defer PollInbox if a SendReply finished recently. See
             // POLL_SKIP_AFTER_REPLY: poking dlci 11 with a SETPATH
@@ -4812,7 +4822,9 @@ fn handle_map_runtime_event(
             }
             (
                 Some(PendingMapOp::SendReply {
-                    message_id, recipient_phone, ..
+                    message_id,
+                    recipient_phone,
+                    ..
                 }),
                 _,
             ) => {
@@ -5152,7 +5164,9 @@ fn forward_hfp_event(
             let _ = event_tx.send(RuntimeEvent::CallWaiting { number });
         }
         HfpEvent::CallWaitingEnded => {
-            eprintln!("[AokieRadio] HFP CallWaitingEnded — waiting caller gone, active call untouched");
+            eprintln!(
+                "[AokieRadio] HFP CallWaitingEnded — waiting caller gone, active call untouched"
+            );
             let _ = event_tx.send(RuntimeEvent::CallWaitingEnded);
         }
         HfpEvent::CallHeld(state) => {
@@ -5618,7 +5632,10 @@ mod tests {
         for _ in 0..2 {
             note_acl_corruption(&mut times, &mut reported, &tx, t0);
         }
-        assert!(rx.try_recv().is_err(), "below threshold must stay a log line");
+        assert!(
+            rx.try_recv().is_err(),
+            "below threshold must stay a log line"
+        );
         note_acl_corruption(&mut times, &mut reported, &tx, t0);
         match rx.try_recv() {
             Ok(RuntimeEvent::Error(msg)) => {
@@ -5641,20 +5658,40 @@ mod tests {
         let mut reported: u8 = 0;
         let t0 = Instant::now();
         note_acl_corruption(&mut times, &mut reported, &tx, t0);
-        note_acl_corruption(&mut times, &mut reported, &tx, t0 + Duration::from_secs(180));
-        note_acl_corruption(&mut times, &mut reported, &tx, t0 + Duration::from_secs(360));
+        note_acl_corruption(
+            &mut times,
+            &mut reported,
+            &tx,
+            t0 + Duration::from_secs(180),
+        );
+        note_acl_corruption(
+            &mut times,
+            &mut reported,
+            &tx,
+            t0 + Duration::from_secs(360),
+        );
         match rx.try_recv() {
             Ok(RuntimeEvent::Error(msg)) => {
-                assert!(msg.contains("recovered"), "sparse resyncs report the soft notice: {msg}");
+                assert!(
+                    msg.contains("recovered"),
+                    "sparse resyncs report the soft notice: {msg}"
+                );
             }
             other => panic!("expected the soft notice, got {other:?}"),
         }
         // A dense burst AFTER the soft notice escalates to the hard report.
         let burst = t0 + Duration::from_secs(400);
         note_acl_corruption(&mut times, &mut reported, &tx, burst);
-        note_acl_corruption(&mut times, &mut reported, &tx, burst + Duration::from_secs(1));
+        note_acl_corruption(
+            &mut times,
+            &mut reported,
+            &tx,
+            burst + Duration::from_secs(1),
+        );
         match rx.try_recv() {
-            Ok(RuntimeEvent::Error(msg)) => assert!(msg.contains("power-cycled") && !msg.contains("recovered")),
+            Ok(RuntimeEvent::Error(msg)) => {
+                assert!(msg.contains("power-cycled") && !msg.contains("recovered"))
+            }
             other => panic!("expected the escalation, got {other:?}"),
         }
     }

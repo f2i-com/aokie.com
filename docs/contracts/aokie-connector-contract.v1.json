@@ -24,6 +24,8 @@
     "aokie.call.turn.final",
     "aokie.call.turn.corrected",
     "aokie.call.ended",
+    "aokie.call.assistance.requested",
+    "aokie.call.assistance.resolved",
     "aokie.call.waiting",
     "aokie.call.outbound.dialing",
     "aokie.sms.received",

@@ -1,0 +1,52 @@
+{
+  "kind": "rtc_signal",
+  "schemaVersion": 2,
+  "appId": "app_coastal_auto",
+  "signalId": "signal_offer_42_1",
+  "pluginId": "plugin_aokie",
+  "deviceId": "device_alex_phone",
+  "leaseToken": "signed-lease-token-placeholder",
+  "leaseJti": "lease_jti_call_42_alex_1",
+  "rtcSessionId": "rtc_call_42_alex_1",
+  "sdpRevision": 1,
+  "transportGeneration": 1,
+  "callId": "call_42",
+  "callEpoch": 7,
+  "ownerEpoch": 3,
+  "fence": 1,
+  "signal": {
+    "type": "offer",
+    "sdp": "v=0\r\na=fingerprint:sha-256 AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA\r\n",
+    "binding": {
+      "endpointKey": {
+        "algorithm": "ed25519",
+        "publicKey": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "thumbprint": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k"
+      },
+      "claims": {
+        "appId": "app_coastal_auto",
+        "pluginId": "plugin_aokie",
+        "deviceId": "device_alex_phone",
+        "rtcSessionId": "rtc_call_42_alex_1",
+        "endpointSessionNonce": "session_20260716_a",
+        "leaseJti": "lease_jti_call_42_alex_1",
+        "endpointRole": "mobile",
+        "holderKeyThumbprint": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k",
+        "peerKeyThumbprint": "plugin_thumbprint_a",
+        "callId": "call_42",
+        "callEpoch": 7,
+        "ownerEpoch": 3,
+        "fence": 1,
+        "sdpRevision": 1,
+        "transportGeneration": 1,
+        "dtlsFingerprint": "sha-256 AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA",
+        "sdpSha256": "g11_691G8bdcvoSkZf_Hp11lL4RsLVLrk0_LTGiKlLw",
+        "nonce": "binding_nonce_offer_42_1",
+        "jti": "binding_jti_offer_42_1",
+        "issuedAt": 1784160000,
+        "expiresAt": 1784160020
+      },
+      "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+  }
+}

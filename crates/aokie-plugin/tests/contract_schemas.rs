@@ -6,6 +6,7 @@
 //! (canonical copies: formlogic-app repo).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use aokie_plugin::connector::Plugin;
 use aokie_plugin::event_bridge::VecSink;
@@ -14,6 +15,11 @@ use serde_json::{json, Value};
 fn contracts_dir() -> PathBuf {
     // crates/aokie-plugin → repo root → docs/contracts
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/contracts")
+}
+
+fn plugin_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn load_json(path: &Path) -> Value {
@@ -43,6 +49,7 @@ fn assert_valid(validator: &jsonschema::Validator, instance: &Value, what: &str)
 
 #[test]
 fn manifest_validates_against_plugin_manifest_schema() {
+    let _guard = plugin_test_lock().lock().expect("plugin test lock");
     let manifest = load_json(&Path::new(env!("CARGO_MANIFEST_DIR")).join("manifest.json"));
     let validator = validator_for("plugin-manifest.schema.json");
     assert_valid(&validator, &manifest, "manifest.json");
@@ -64,15 +71,11 @@ fn manifest_validates_against_plugin_manifest_schema() {
     let mut plugin = Plugin::ephemeral(true);
     let mut sink = VecSink::default();
     for command in &declared {
-        let payload = match *command {
-            "dongle.setPreferred" => json!({"vid": 1, "pid": 2}),
-            "sms.send" => json!({"to": "+61432123456", "body": "hi"}),
-            "sms.thread" => json!({"threadId": "thread_x"}),
-            "call.operatorSpeak" => json!({"text": "hello"}),
-            "settings.set" => json!({"mockCalls": true}),
-            _ => Value::Null,
-        };
-        let result = plugin.dispatch_command(command, &payload, &mut sink);
+        // Probe the dispatcher with a deliberately invalid field. Every real
+        // handler rejects it during shape validation, before hardware,
+        // consent, pairing, or background-worker side effects can start.
+        // The unknown-command branch remains distinguishable below.
+        let result = plugin.dispatch_command(command, &json!({"__contractProbe": true}), &mut sink);
         // "unknown command" is the only unacceptable outcome — typed
         // command_failed for unwired hardware is contract-legal.
         if let Err(e) = result {
@@ -118,6 +121,7 @@ fn manifest_validates_against_plugin_manifest_schema() {
 
 #[test]
 fn mock_lifecycle_events_validate_against_desktop_event_schema() {
+    let _guard = plugin_test_lock().lock().expect("plugin test lock");
     let validator = validator_for("desktop-event.schema.json");
     let mut plugin = Plugin::ephemeral(true);
     let mut sink = VecSink::default();

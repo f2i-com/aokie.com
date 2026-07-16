@@ -401,15 +401,11 @@ impl SessionTracker {
             // Defensive: the agent only hangs up after answering, so this cannot
             // normally occur — classify as missed rather than leave it unmatched.
             (false, Some(TerminationIntent::AgentHangup)) => ("missed", "agent_hangup"),
-            (false, Some(TerminationIntent::AgentTerminateAbuse)) => {
-                ("rejected", "agent_abuse")
-            }
+            (false, Some(TerminationIntent::AgentTerminateAbuse)) => ("rejected", "agent_abuse"),
             // Defensive: a parked session is always answered — a never-answered
             // one still reads honestly as missed.
             (false, Some(TerminationIntent::AbandonedOnHold))
-            | (false, Some(TerminationIntent::AbandonedInQueue)) => {
-                ("missed", "hung_up_in_queue")
-            }
+            | (false, Some(TerminationIntent::AbandonedInQueue)) => ("missed", "hung_up_in_queue"),
             (false, None) => ("missed", "remote_or_operator"),
         };
         EndedCall {
@@ -569,10 +565,8 @@ mod tests {
         ring(&mut t, "call_hold");
         t.answered();
         let sess = t.park().unwrap();
-        let ended = SessionTracker::terminate_detached(
-            sess,
-            Some(TerminationIntent::AbandonedOnHold),
-        );
+        let ended =
+            SessionTracker::terminate_detached(sess, Some(TerminationIntent::AbandonedOnHold));
         assert_eq!(ended.outcome, "abandoned_on_hold");
         assert_eq!(ended.reason, "hung_up_on_hold");
 
@@ -580,10 +574,8 @@ mod tests {
         ring(&mut t, "call_queue");
         t.answered();
         let sess = t.park().unwrap();
-        let ended = SessionTracker::terminate_detached(
-            sess,
-            Some(TerminationIntent::AbandonedInQueue),
-        );
+        let ended =
+            SessionTracker::terminate_detached(sess, Some(TerminationIntent::AbandonedInQueue));
         assert_eq!(ended.outcome, "abandoned_in_queue");
         assert_eq!(ended.reason, "hung_up_in_queue");
     }
@@ -593,7 +585,12 @@ mod tests {
     #[test]
     fn outbound_answered_call_is_a_completion_with_the_dialed_number() {
         let mut t = SessionTracker::new();
-        t.dial("call_o".into(), Some("+61400111222".into()), "x".into(), true);
+        t.dial(
+            "call_o".into(),
+            Some("+61400111222".into()),
+            "x".into(),
+            true,
+        );
         assert!(t.current().unwrap().outbound);
         assert!(
             !t.current().unwrap().incoming_pending(),
@@ -610,7 +607,12 @@ mod tests {
     #[test]
     fn outbound_alerted_but_unanswered_is_no_answer_never_missed() {
         let mut t = SessionTracker::new();
-        t.dial("call_o".into(), Some("+61400111222".into()), "x".into(), true);
+        t.dial(
+            "call_o".into(),
+            Some("+61400111222".into()),
+            "x".into(),
+            true,
+        );
         t.note_alerted();
         let ended = t.terminate().unwrap();
         assert_eq!(ended.outcome, "no_answer");
@@ -627,7 +629,12 @@ mod tests {
     #[test]
     fn outbound_that_never_alerted_is_failed() {
         let mut t = SessionTracker::new();
-        t.dial("call_o".into(), Some("+61400111222".into()), "x".into(), true);
+        t.dial(
+            "call_o".into(),
+            Some("+61400111222".into()),
+            "x".into(),
+            true,
+        );
         let ended = t.terminate().unwrap();
         assert_eq!(ended.outcome, "failed");
         assert_eq!(ended.reason, "setup_failed");

@@ -101,7 +101,11 @@ impl ConfigStore {
                     let moved = std::fs::rename(&path, &quarantine).is_ok();
                     eprintln!(
                         "[aokie-plugin] settings.json is corrupt ({e}) — {}",
-                        if moved { "quarantined to settings.json.corrupt" } else { "quarantine rename failed; ignoring the file" }
+                        if moved {
+                            "quarantined to settings.json.corrupt"
+                        } else {
+                            "quarantine rename failed; ignoring the file"
+                        }
                     );
                     quarantined = true;
                     restored = restore("was corrupt");
@@ -236,7 +240,10 @@ mod tests {
     fn missing_primary_restores_last_known_good() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::load(dir.path());
-        store.config.settings.insert("greeting".into(), json!("Hi!"));
+        store
+            .config
+            .settings
+            .insert("greeting".into(), json!("Hi!"));
         store.config.config_version = 3;
         store.save().unwrap();
         store.save().unwrap(); // second save captures v3 into .bak
@@ -283,7 +290,10 @@ mod tests {
             &std::fs::read_to_string(dir.path().join("settings.json.bak")).unwrap(),
         )
         .unwrap();
-        assert_eq!(bak.config_version, 1, ".bak holds the version being replaced");
+        assert_eq!(
+            bak.config_version, 1,
+            ".bak holds the version being replaced"
+        );
     }
 
     #[test]

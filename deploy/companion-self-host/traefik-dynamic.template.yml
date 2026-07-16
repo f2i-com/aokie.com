@@ -1,0 +1,53 @@
+http:
+  routers:
+    aokie-signalling:
+      entryPoints: [websecure]
+      rule: "Host(`__SIGNAL_HOST__`) && (Path(`/v2/realtime`) || Path(`/health`) || Path(`/version`))"
+      service: aokie-gateway
+      middlewares: [gateway-security]
+      tls:
+        certResolver: letsencrypt
+        options: strict@file
+  middlewares:
+    gateway-security:
+      headers:
+        contentTypeNosniff: true
+        referrerPolicy: no-referrer
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+  services:
+    aokie-gateway:
+      loadBalancer:
+        healthCheck:
+          path: /health
+          interval: 10s
+          timeout: 2s
+        servers:
+          - url: http://gateway:18787
+
+tcp:
+  serversTransports:
+    coturn-proxy-v2-transport:
+      proxyProtocol:
+        version: 2
+  routers:
+    aokie-turns:
+      entryPoints: [turns]
+      rule: "HostSNI(`__TURN_HOST__`)"
+      service: coturn-proxy-v2
+      tls:
+        certResolver: letsencrypt
+        options: strict@file
+  services:
+    coturn-proxy-v2:
+      loadBalancer:
+        serversTransport: coturn-proxy-v2-transport
+        servers:
+          - address: coturn:3479
+
+tls:
+  options:
+    strict:
+      minVersion: VersionTLS12
+      sniStrict: true

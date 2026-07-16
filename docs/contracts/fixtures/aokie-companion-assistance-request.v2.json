@@ -1,0 +1,15 @@
+{
+  "kind": "assistance_request",
+  "schemaVersion": 2,
+  "appId": "app_coastal_auto",
+  "eventId": "assist_event_call_42_1",
+  "requestId": "assist_call_42_1",
+  "callId": "call_42",
+  "callEpoch": 7,
+  "ownerEpoch": 3,
+  "switchboardRevision": 11,
+  "remoteRevision": 13,
+  "question": "Can we accept an urgent drop-off after 5:00 pm?",
+  "context": "Existing customer; secure key drop is available.",
+  "expiresAt": 1784160300
+}

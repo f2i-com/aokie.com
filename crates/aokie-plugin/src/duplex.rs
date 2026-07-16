@@ -196,10 +196,41 @@ pub fn is_backchannel(text: &str) -> bool {
     tokens.iter().all(|t| {
         matches!(
             t.as_str(),
-            "yeah" | "yep" | "yes" | "ok" | "okay" | "mm" | "mhm" | "hmm" | "uh" | "huh" | "right"
-                | "sure" | "cool" | "awesome" | "great" | "nice" | "good" | "oh" | "ah" | "wow"
-                | "alright" | "thanks" | "thank" | "you" | "got" | "it" | "totally" | "exactly"
-                | "perfect" | "fantastic" | "lovely" | "brilliant" | "that's" | "thats" | "so"
+            "yeah"
+                | "yep"
+                | "yes"
+                | "ok"
+                | "okay"
+                | "mm"
+                | "mhm"
+                | "hmm"
+                | "uh"
+                | "huh"
+                | "right"
+                | "sure"
+                | "cool"
+                | "awesome"
+                | "great"
+                | "nice"
+                | "good"
+                | "oh"
+                | "ah"
+                | "wow"
+                | "alright"
+                | "thanks"
+                | "thank"
+                | "you"
+                | "got"
+                | "it"
+                | "totally"
+                | "exactly"
+                | "perfect"
+                | "fantastic"
+                | "lovely"
+                | "brilliant"
+                | "that's"
+                | "thats"
+                | "so"
         )
     })
 }
@@ -243,8 +274,16 @@ pub fn parse_caller_intent(text: &str) -> CallerIntent {
     if tokens.iter().any(|t| {
         matches!(
             t.as_str(),
-            "person" | "human" | "someone" | "somebody" | "operator" | "staff" | "manager"
-                | "owner" | "representative" | "agent"
+            "person"
+                | "human"
+                | "someone"
+                | "somebody"
+                | "operator"
+                | "staff"
+                | "manager"
+                | "owner"
+                | "representative"
+                | "agent"
         )
     }) {
         return CallerIntent::Content;
@@ -521,38 +560,97 @@ mod floor_shadow_tests {
         // Quiet line → keep the floor.
         assert_eq!(shadow_floor_decision(&ev()).0, FloorDecision::Continue);
         // Explicit stop cuts even a protected span.
-        let stop = FloorEvidence { stable_text: "stop talking".into(), protected_span: true, ..ev() };
-        assert_eq!(shadow_floor_decision(&stop), (FloorDecision::CutNow, "explicit_stop"));
+        let stop = FloorEvidence {
+            stable_text: "stop talking".into(),
+            protected_span: true,
+            ..ev()
+        };
+        assert_eq!(
+            shadow_floor_decision(&stop),
+            (FloorDecision::CutNow, "explicit_stop")
+        );
         // "Wait" pauses and retains.
-        let wait = FloorEvidence { stable_text: "hold on a second".into(), ..ev() };
-        assert_eq!(shadow_floor_decision(&wait).0, FloorDecision::PauseAndRetain);
+        let wait = FloorEvidence {
+            stable_text: "hold on a second".into(),
+            ..ev()
+        };
+        assert_eq!(
+            shadow_floor_decision(&wait).0,
+            FloorDecision::PauseAndRetain
+        );
         // Backchannel ducks, hesitation continues.
-        let yeah = FloorEvidence { stable_text: "yeah".into(), ..ev() };
-        assert_eq!(shadow_floor_decision(&yeah), (FloorDecision::Duck, "short_backchannel"));
-        let uh = FloorEvidence { stable_text: "um".into(), ..ev() };
-        assert_eq!(shadow_floor_decision(&uh), (FloorDecision::Continue, "hesitation_only"));
+        let yeah = FloorEvidence {
+            stable_text: "yeah".into(),
+            ..ev()
+        };
+        assert_eq!(
+            shadow_floor_decision(&yeah),
+            (FloorDecision::Duck, "short_backchannel")
+        );
+        let uh = FloorEvidence {
+            stable_text: "um".into(),
+            ..ev()
+        };
+        assert_eq!(
+            shadow_floor_decision(&uh),
+            (FloorDecision::Continue, "hesitation_only")
+        );
         // Substantive comment: cut a yield span, boundary-yield a protected one.
-        let subst = FloorEvidence { stable_text: "no wait not thursday".into(), substantive: true, ..ev() };
+        let subst = FloorEvidence {
+            stable_text: "no wait not thursday".into(),
+            substantive: true,
+            ..ev()
+        };
         assert_eq!(shadow_floor_decision(&subst).0, FloorDecision::CutNow);
-        let subst_prot = FloorEvidence { protected_span: true, ..subst };
+        let subst_prot = FloorEvidence {
+            protected_span: true,
+            ..subst
+        };
         assert_eq!(
             shadow_floor_decision(&subst_prot),
             (FloorDecision::YieldAtBoundary, "substantive_over_protected")
         );
         // Energy barge with no transcript yet.
-        let energy = FloorEvidence { barge_energy: true, ..ev() };
-        assert_eq!(shadow_floor_decision(&energy), (FloorDecision::CutNow, "energy_barge"));
+        let energy = FloorEvidence {
+            barge_energy: true,
+            ..ev()
+        };
+        assert_eq!(
+            shadow_floor_decision(&energy),
+            (FloorDecision::CutNow, "energy_barge")
+        );
         // Forming speech: continue briefly, duck once it persists.
-        let forming = FloorEvidence { speech_frames: 2, overlap_ms: 120, ..ev() };
+        let forming = FloorEvidence {
+            speech_frames: 2,
+            overlap_ms: 120,
+            ..ev()
+        };
         assert_eq!(shadow_floor_decision(&forming).0, FloorDecision::Continue);
-        let persisting = FloorEvidence { speech_frames: 2, overlap_ms: 450, ..ev() };
-        assert_eq!(shadow_floor_decision(&persisting), (FloorDecision::Duck, "unclassified_overlap"));
+        let persisting = FloorEvidence {
+            speech_frames: 2,
+            overlap_ms: 450,
+            ..ev()
+        };
+        assert_eq!(
+            shadow_floor_decision(&persisting),
+            (FloorDecision::Duck, "unclassified_overlap")
+        );
         // Bot silent → the caller owns the floor.
-        let silent = FloorEvidence { bot_audible: false, stable_text: "stop".into(), ..ev() };
+        let silent = FloorEvidence {
+            bot_audible: false,
+            stable_text: "stop".into(),
+            ..ev()
+        };
         assert_eq!(shadow_floor_decision(&silent).0, FloorDecision::StaySilent);
         // Short echo-suspect fragment → the live paths ignore it; so do we.
-        let echo = FloorEvidence { stable_text: "booked at".into(), ..ev() };
-        assert_eq!(shadow_floor_decision(&echo), (FloorDecision::Continue, "short_or_echo"));
+        let echo = FloorEvidence {
+            stable_text: "booked at".into(),
+            ..ev()
+        };
+        assert_eq!(
+            shadow_floor_decision(&echo),
+            (FloorDecision::Continue, "short_or_echo")
+        );
         // Substantive text whose AUDIO predates the reply: pre-reply residue,
         // never a cut (the 20563f53 self-echo class, now inside the decision).
         let stale = FloorEvidence {
@@ -569,9 +667,17 @@ mod floor_shadow_tests {
 
     #[test]
     fn severity_ranks_order() {
-        assert!(floor_decision_rank(FloorDecision::CutNow) > floor_decision_rank(FloorDecision::YieldAtBoundary));
-        assert!(floor_decision_rank(FloorDecision::YieldAtBoundary) > floor_decision_rank(FloorDecision::Duck));
-        assert!(floor_decision_rank(FloorDecision::Duck) > floor_decision_rank(FloorDecision::Continue));
+        assert!(
+            floor_decision_rank(FloorDecision::CutNow)
+                > floor_decision_rank(FloorDecision::YieldAtBoundary)
+        );
+        assert!(
+            floor_decision_rank(FloorDecision::YieldAtBoundary)
+                > floor_decision_rank(FloorDecision::Duck)
+        );
+        assert!(
+            floor_decision_rank(FloorDecision::Duck) > floor_decision_rank(FloorDecision::Continue)
+        );
         assert_eq!(floor_decision_rank(FloorDecision::PauseAndRetain), 3);
     }
 }
@@ -644,7 +750,14 @@ mod tests {
 
     #[test]
     fn resume_commands_and_lookalikes() {
-        for s in ["continue", "go ahead", "okay go ahead", "keep going", "carry on", "I'm back"] {
+        for s in [
+            "continue",
+            "go ahead",
+            "okay go ahead",
+            "keep going",
+            "carry on",
+            "I'm back",
+        ] {
             assert_eq!(intent(s), CallerIntent::Resume, "{s:?}");
         }
         for s in [
@@ -670,7 +783,11 @@ mod tests {
         for s in ["faster", "speed up", "a bit quicker", "you can talk faster"] {
             assert_eq!(intent(s), CallerIntent::Faster, "{s:?}");
         }
-        for s in ["normal speed", "back to normal speed", "regular speed please"] {
+        for s in [
+            "normal speed",
+            "back to normal speed",
+            "regular speed please",
+        ] {
             assert_eq!(intent(s), CallerIntent::NormalSpeed, "{s:?}");
         }
         // Pace words inside substantive content stay content.
@@ -685,7 +802,13 @@ mod tests {
 
     #[test]
     fn repeat_and_repeat_slower() {
-        for s in ["repeat that", "say that again", "can you repeat that", "pardon", "what was that"] {
+        for s in [
+            "repeat that",
+            "say that again",
+            "can you repeat that",
+            "pardon",
+            "what was that",
+        ] {
             assert_eq!(intent(s), CallerIntent::Repeat, "{s:?}");
         }
         for s in [
@@ -730,7 +853,10 @@ mod tests {
         assert_eq!(d.apply(CallerIntent::Pause), DialogueAction::StaySilent);
         assert!(d.is_paused());
         // More pause words while paused: still silent, still paused.
-        assert_eq!(d.apply(CallerIntent::StopSpeaking), DialogueAction::StaySilent);
+        assert_eq!(
+            d.apply(CallerIntent::StopSpeaking),
+            DialogueAction::StaySilent
+        );
         assert!(d.is_paused());
         // A pace command while paused acts but does not end the pause.
         assert_eq!(
@@ -739,7 +865,10 @@ mod tests {
         );
         assert!(d.is_paused(), "rate tweak does not steal the floor");
         // Substantive content ends the pause and replies.
-        assert_eq!(d.apply(CallerIntent::Content), DialogueAction::ReplyNormally);
+        assert_eq!(
+            d.apply(CallerIntent::Content),
+            DialogueAction::ReplyNormally
+        );
         assert!(!d.is_paused());
 
         // Pause → explicit resume.

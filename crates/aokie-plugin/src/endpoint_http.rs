@@ -99,7 +99,9 @@ pub fn client_for(
         builder = builder.connect_timeout(connect);
     }
 
-    let host = url.host_str().ok_or_else(|| "endpoint URL has no host".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "endpoint URL has no host".to_string())?;
     if let Ok(ip) = host.parse::<IpAddr>() {
         if !ip.is_loopback() && !ip_is_public_unicast(ip) {
             return Err(format!(
@@ -111,7 +113,10 @@ pub fn client_for(
     // Hostname endpoints: resolve, validate every address, pin the first valid one.
     // Url::domain() is Some only for real domain hosts — IP literals return None and
     // (with `localhost`) skip resolution/pinning: vetted at settings time, on-device use.
-    if let Some(host) = url.domain().filter(|h| !h.eq_ignore_ascii_case("localhost")) {
+    if let Some(host) = url
+        .domain()
+        .filter(|h| !h.eq_ignore_ascii_case("localhost"))
+    {
         let port = url.port_or_known_default().unwrap_or(443);
         let addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
@@ -156,22 +161,22 @@ mod tests {
     #[test]
     fn public_unicast_gate_rejects_every_internal_class() {
         for bad in [
-            "127.0.0.1",        // loopback
-            "10.1.2.3",         // RFC1918
-            "192.168.1.10",     // RFC1918
-            "172.16.0.9",       // RFC1918
-            "169.254.169.254",  // cloud metadata (link-local)
-            "169.254.7.9",      // link-local
-            "100.64.0.1",       // CGNAT
-            "224.0.0.1",        // multicast
-            "255.255.255.255",  // broadcast
-            "0.0.0.0",          // unspecified
-            "::1",              // v6 loopback
-            "fe80::1",          // v6 link-local
-            "fc00::1",          // v6 unique-local
-            "ff02::1",          // v6 multicast
-            "::",               // v6 unspecified
-            "::ffff:10.0.0.1",  // v4-mapped private
+            "127.0.0.1",              // loopback
+            "10.1.2.3",               // RFC1918
+            "192.168.1.10",           // RFC1918
+            "172.16.0.9",             // RFC1918
+            "169.254.169.254",        // cloud metadata (link-local)
+            "169.254.7.9",            // link-local
+            "100.64.0.1",             // CGNAT
+            "224.0.0.1",              // multicast
+            "255.255.255.255",        // broadcast
+            "0.0.0.0",                // unspecified
+            "::1",                    // v6 loopback
+            "fe80::1",                // v6 link-local
+            "fc00::1",                // v6 unique-local
+            "ff02::1",                // v6 multicast
+            "::",                     // v6 unspecified
+            "::ffff:10.0.0.1",        // v4-mapped private
             "::ffff:169.254.169.254", // v4-mapped metadata
         ] {
             assert!(!ip_is_public_unicast(v4(bad)), "{bad} must be rejected");

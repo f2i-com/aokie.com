@@ -1,0 +1,9 @@
+# LiveKit's published Windows libwebrtc archive is built against the static
+# MSVC runtime. All Rust/CXX objects that link it must use the same runtime or
+# link.exe rejects the executable with LNK2038. This is target-scoped and does
+# not affect Android, Linux, or macOS builds.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

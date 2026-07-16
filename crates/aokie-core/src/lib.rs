@@ -52,10 +52,9 @@ mod no_tauri {
 
     #[test]
     fn manifest_has_no_tauri_dependency() {
-        let manifest = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
-        )
-        .expect("read Cargo.toml");
+        let manifest =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+                .expect("read Cargo.toml");
         // Any dependency on tauri (or a tauri-* plugin/build crate)
         // must name it in the manifest; the description mentioning the
         // word is fine, a `tauri` dep key or "tauri" package name is not.
@@ -76,7 +75,11 @@ mod no_tauri {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         source_files(&src, &mut files);
-        assert!(!files.is_empty(), "no sources found under {}", src.display());
+        assert!(
+            !files.is_empty(),
+            "no sources found under {}",
+            src.display()
+        );
         // Needles are assembled at runtime so this test file doesn't
         // trip over its own literals.
         let path_ref = ["tauri", "::"].concat();
