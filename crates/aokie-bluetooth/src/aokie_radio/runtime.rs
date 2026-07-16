@@ -1469,6 +1469,12 @@ fn run_runtime(
     let mut answer_sent_for_call = false;
     let mut selected_codec: Option<(String, u16)> = None;
     let mut active_sco_handle: Option<u16> = None;
+    // MAP/PBAP share the same ACL transport as HFP. Once call setup starts,
+    // background profile traffic must stop until the call is over; otherwise
+    // a large OBEX body can occupy (or desynchronise) the WinUSB ACL stream at
+    // exactly the point SCO is being negotiated. This deliberately becomes
+    // true at ringing/dialling rather than waiting for SCO ConnectionComplete.
+    let mut call_profile_busy = false;
     // Phase 3e: track the live ACL handle so we can pass it to
     // `PbapRuntime::new` once HFP service-level connection completes.
     // Cleared on ACL DisconnectionComplete; SCO disconnects don't
@@ -1887,6 +1893,7 @@ fn run_runtime(
             // ACL packet — which may never arrive if the peer is
             // genuinely dead.
             for hfp_event in l2cap_state.take_hfp_events() {
+                call_profile_busy = call_profile_busy_after_event(call_profile_busy, &hfp_event);
                 manager::update_selected_codec(&mut selected_codec, &hfp_event);
                 if let Err(e) = apply_codec_voice_setting(&transport, &hfp_event) {
                     let _ =
@@ -2441,37 +2448,16 @@ fn run_runtime(
                         );
                         continue;
                     }
-                    // Audio level on the way in. If the caller hears
-                    // silence and this is also silence, the upstream
-                    // TTS is producing zeros; if it has level here but
-                    // silence on the air, the codec/transport leg is
-                    // broken.
-                    let (peak, rms) = if samples.is_empty() {
-                        (0i32, 0.0f64)
-                    } else {
-                        let mut peak: i32 = 0;
-                        let mut sum_sq: u128 = 0;
-                        for &s in &samples {
-                            let mag = (s as i32).abs();
-                            if mag > peak {
-                                peak = mag;
-                            }
-                            sum_sq += (mag as u128) * (mag as u128);
-                        }
-                        let mean_sq = (sum_sq / samples.len() as u128) as f64;
-                        (peak, mean_sq.sqrt())
-                    };
                     let accepted = sco_tx_queue.push_samples(&samples);
-                    eprintln!(
-                        "[AokieRadio] SCO TX: queued {}/{} samples \
-                         (peak={}, rms={:.0}; queue depth {}, dropped total {})",
-                        accepted,
-                        samples.len(),
-                        peak,
-                        rms,
-                        sco_tx_queue.len(),
-                        sco_tx_queue.dropped_samples(),
-                    );
+                    if accepted < samples.len() {
+                        eprintln!(
+                            "[AokieRadio] SCO TX overflow: accepted {}/{} samples (queue depth {}, dropped total {})",
+                            accepted,
+                            samples.len(),
+                            sco_tx_queue.len(),
+                            sco_tx_queue.dropped_samples(),
+                        );
+                    }
                 }
                 Ok(ControlCommand::FlushTxAudio) => {
                     let dropped = sco_tx_queue.len();
@@ -3275,6 +3261,7 @@ fn run_runtime(
                             && active_sco_handle != Some(*connection_handle)
                         {
                             active_acl_handle = None;
+                            call_profile_busy = false;
                             if pbap_runtime.is_some() {
                                 eprintln!(
                                     "[AokieRadio] ACL handle {:#06x} dropped — discarding in-flight PBAP runtime",
@@ -3645,36 +3632,18 @@ fn run_runtime(
             // into FetchMessage queue entries; everything else is
             // logged and dropped.
             //
-            // Run BEFORE drive_map_runtime so a freshly-queued
+            // Run before the loop-level drive_map_runtime so a freshly-queued
             // FetchMessage suppresses MAP_IDLE_TIMEOUT — otherwise
             // an SMS arriving exactly when the pool is parked
             // tears MAS down before we get a chance to fetch the
             // body, and (on Pixel) the phone tears down our MNS
             // session in sympathy.
             drain_mns_events(&mns_server, &mut pending_map_ops, &mut seen_handles);
-            // Phase 4e: same shape for the MAP runtime — ticks an
-            // in-flight MAS operation forward, processes its
-            // OperationCompleted output (emitting SmsReceived /
-            // SmsSent / MapNotificationsSubscribed), and pulls
-            // the next pending op off the queue.
-            drive_map_runtime(
-                active_acl_handle,
-                &mut map_runtime,
-                &mut active_map_op,
-                &mut pending_map_ops,
-                &mut map_idle_since,
-                &mns_server,
-                pbap_runtime.is_some(),
-                &mut seen_handles,
-                &mut inbox_poll_seeded,
-                seed_attempts,
-                &mut last_send_reply_at,
-                &mut l2cap_state,
-                &transport,
-                &event_tx,
-            );
-
+            // Apply HFP call-state changes before MAP is driven below. That
+            // ordering is what prevents a PollInbox from starting on the
+            // same packet that announced a ring or answered call.
             for hfp_event in l2cap_state.take_hfp_events() {
+                call_profile_busy = call_profile_busy_after_event(call_profile_busy, &hfp_event);
                 manager::update_selected_codec(&mut selected_codec, &hfp_event);
                 if let Err(e) = apply_codec_voice_setting(&transport, &hfp_event) {
                     let _ =
@@ -3777,6 +3746,7 @@ fn run_runtime(
             &mut map_idle_since,
             &mns_server,
             pbap_runtime.is_some(),
+            !call_profile_busy && active_sco_handle.is_none(),
             &mut seen_handles,
             &mut inbox_poll_seeded,
             seed_attempts,
@@ -3792,6 +3762,8 @@ fn run_runtime(
         // at enqueue time, not at completion, prevents the next loop
         // tick from re-queueing while the listing is still in flight.
         if active_acl_handle.is_some()
+            && !call_profile_busy
+            && active_sco_handle.is_none()
             && active_map_op.is_none()
             && pending_map_ops.is_empty()
             && pbap_runtime.is_none()
@@ -4001,12 +3973,6 @@ fn run_runtime(
                     // never shows H2 sync, the packager isn't
                     // emitting valid mSBC.
                     let mut first_packet_head: Option<[u8; 8]> = None;
-                    // Snapshot the queue depth before the burst so the
-                    // log can suppress noise from "writing silence
-                    // because TTS is paused" while still surfacing real
-                    // audio bursts. With continuous mSBC TX we'd
-                    // otherwise emit a log line every ~30 ms forever.
-                    let queue_len_before = sco_tx_queue.len();
                     while written < to_write {
                         // No early-break on empty queue: CVSD's
                         // `pop_sco_packet` pads with zeros (silence) when
@@ -4045,7 +4011,11 @@ fn run_runtime(
                                 * (written as u32),
                         );
                     }
-                    let log_burst = last_err.is_some() || (written > 0 && queue_len_before > 0);
+                    // Per-burst success logging can emit every ~30 ms during
+                    // speech and evict the signalling trace needed to diagnose
+                    // a takeover. Aggregate liveness is reported elsewhere;
+                    // retain this detail only when the transport actually fails.
+                    let log_burst = last_err.is_some();
                     if log_burst {
                         eprintln!(
                             "[AokieRadio] SCO TX: wrote {} packet(s) of {} bytes (queue depth {} samples remain, codec={}, head={:02x?}){}",
@@ -4478,6 +4448,7 @@ fn drive_map_runtime(
     map_idle_since: &mut Option<std::time::Instant>,
     mns_server: &Arc<StdMutex<MnsServer>>,
     pbap_busy: bool,
+    fresh_work_allowed: bool,
     seen_handles: &mut HashSet<String>,
     inbox_poll_seeded: &mut bool,
     seed_attempts: usize,
@@ -4547,7 +4518,7 @@ fn drive_map_runtime(
         if runtime.is_resting() {
             // Same gate as the slot-free path: don't issue fresh OBEX on the resting MAS while
             // PBAP is mid-stream — Pixel queues MAS responses behind PBAP body chunks and stalls.
-            if !pbap_busy && !pending_map_ops.is_empty() {
+            if fresh_work_allowed && !pbap_busy && !pending_map_ops.is_empty() {
                 if let Some(next_op) = pending_map_ops.pop_front() {
                     feed_pooled_next_op(
                         runtime,
@@ -4589,7 +4560,11 @@ fn drive_map_runtime(
         .map(|g| matches!(*g.state(), MnsState::Connected | MnsState::AssemblingPut))
         .unwrap_or(false);
     if let (Some(runtime), Some(since)) = (map_runtime.as_mut(), *map_idle_since) {
-        if runtime.is_resting() && since.elapsed() >= MAP_IDLE_TIMEOUT && !mns_active {
+        if fresh_work_allowed
+            && runtime.is_resting()
+            && since.elapsed() >= MAP_IDLE_TIMEOUT
+            && !mns_active
+        {
             eprintln!(
                 "[AokieRadio] MAP pooled session idle for {:?} — disconnecting",
                 since.elapsed()
@@ -4612,7 +4587,7 @@ fn drive_map_runtime(
     }
     // Slot free? Pull the next pending op — but defer until PBAP
     // is done (see fn-doc).
-    if map_runtime.is_none() && !pending_map_ops.is_empty() && !pbap_busy {
+    if map_runtime.is_none() && !pending_map_ops.is_empty() && !pbap_busy && fresh_work_allowed {
         if let Some(op) = pending_map_ops.pop_front() {
             start_map_operation(
                 op,
@@ -5121,6 +5096,10 @@ fn forward_hfp_event(
         }
         HfpEvent::CallAnswered => {
             eprintln!("[AokieRadio] HFP CallAnswered");
+            // The HFP call indicator is authoritative. SCO may arrive later
+            // (or fail to arrive), so waiting for SCO ConnectionComplete made
+            // diagnostics incorrectly report an answered call as inactive.
+            status.call_active.store(true, Ordering::Relaxed);
             let _ = event_tx.send(RuntimeEvent::CallAnswered);
         }
         HfpEvent::CallTerminated => {
@@ -5218,6 +5197,24 @@ fn forward_hfp_event(
             // when SynchronousConnectionComplete arrives.
             status.sample_rate.store(sample_rate, Ordering::Relaxed);
         }
+    }
+}
+
+/// Return whether non-HFP Bluetooth profiles must yield after `event`.
+///
+/// The busy window includes call setup, not merely answered/SCO-active time:
+/// MAP inbox listings can be hundreds of bytes and must not race HFP/SCO setup
+/// on controllers where every profile shares one WinUSB ACL stream.
+fn call_profile_busy_after_event(was_busy: bool, event: &HfpEvent) -> bool {
+    match event {
+        HfpEvent::IncomingCall
+        | HfpEvent::Ringing
+        | HfpEvent::OutgoingDialing
+        | HfpEvent::CallAnswered
+        | HfpEvent::CallWaiting(_)
+        | HfpEvent::CallHeld(_) => true,
+        HfpEvent::CallTerminated => false,
+        _ => was_busy,
     }
 }
 
@@ -5621,6 +5618,30 @@ fn build_msbc_sco_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_profiles_yield_for_the_entire_call_window() {
+        let mut busy = false;
+        busy = call_profile_busy_after_event(busy, &HfpEvent::IncomingCall);
+        assert!(busy, "ring setup must reserve the shared ACL transport");
+        busy = call_profile_busy_after_event(busy, &HfpEvent::CallAnswered);
+        assert!(busy, "answered calls stay reserved before SCO is visible");
+        busy = call_profile_busy_after_event(busy, &HfpEvent::CallWaitingEnded);
+        assert!(
+            busy,
+            "an ended waiting episode does not end the active call"
+        );
+        busy = call_profile_busy_after_event(busy, &HfpEvent::CallTerminated);
+        assert!(!busy, "background work resumes only after termination");
+    }
+
+    #[test]
+    fn outbound_setup_reserves_the_shared_acl_transport() {
+        assert!(call_profile_busy_after_event(
+            false,
+            &HfpEvent::OutgoingDialing
+        ));
+    }
 
     #[test]
     fn acl_corruption_dense_burst_demands_a_power_cycle() {

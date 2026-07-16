@@ -44,6 +44,7 @@ const MAX_MOBILES_PER_APP: usize = 16;
 const MAX_LEASES_PER_APP: usize = 64;
 const IDEMPOTENCY_CAPACITY: usize = 512;
 const SIGNAL_DEDUPE_CAPACITY: usize = 1024;
+const PLUGIN_RECONNECT_SIGNAL_CAPACITY: usize = 16;
 const GENERAL_RATE_LIMIT: u32 = 240;
 const RTC_RATE_LIMIT: u32 = 120;
 const RATE_WINDOW: Duration = Duration::from_secs(10);
@@ -54,6 +55,7 @@ const MAX_USED_ENDPOINT_JTIS: usize = 16_384;
 const MAX_ASSISTANCE_TTL: u64 = 300;
 const END_CALLER_CONFIRM_TTL: u64 = 12;
 const END_CALLER_HISTORY_CAPACITY: usize = 128;
+const PLUGIN_RECONNECT_GRACE: Duration = Duration::from_secs(5);
 const ADMISSION_TOKEN_PREFIX: &str = "aokie-adm-v2";
 const MOBILE_OFFER_TOKEN_PREFIX: &str = "aokie-offer-v2";
 
@@ -495,6 +497,11 @@ fn hex_digit(byte: u8) -> Option<u8> {
 struct V2App {
     plugin: Option<V2Peer>,
     plugin_id: Option<String>,
+    retired_plugin_key_thumbprint: Option<String>,
+    plugin_disconnected_at: Option<Instant>,
+    plugin_disconnect_epoch: u64,
+    plugin_reconnect_resumable_leases: HashSet<String>,
+    queued_plugin_signals: VecDeque<PluginRtcSignalFrame>,
     approved_mobile_key_thumbprints: HashSet<String>,
     peer_roster_revision: Option<u64>,
     peer_roster_hash: Option<String>,
@@ -550,6 +557,11 @@ impl Default for V2App {
         Self {
             plugin: None,
             plugin_id: None,
+            retired_plugin_key_thumbprint: None,
+            plugin_disconnected_at: None,
+            plugin_disconnect_epoch: 0,
+            plugin_reconnect_resumable_leases: HashSet::new(),
+            queued_plugin_signals: VecDeque::new(),
             approved_mobile_key_thumbprints: HashSet::new(),
             peer_roster_revision: None,
             peer_roster_hash: None,
@@ -657,6 +669,7 @@ struct V2Peer {
     fenced: watch::Sender<bool>,
     general_rate: RateWindow,
     rtc_rate: RateWindow,
+    authoritative_publication_seen: bool,
 }
 
 impl V2Peer {
@@ -677,6 +690,7 @@ impl V2Peer {
             fenced,
             general_rate: RateWindow::new(),
             rtc_rate: RateWindow::new(),
+            authoritative_publication_seen: false,
         }
     }
 
@@ -747,6 +761,7 @@ impl RateWindow {
 struct LeaseRecord {
     claims: LeaseClaims,
     provisional: bool,
+    offer_opportunity_id: Option<String>,
     mobile_signal: SignalProgress,
     plugin_signal: SignalProgress,
 }
@@ -859,6 +874,21 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
     let peer_roster_revision = authenticated.peer_roster_revision;
     let peer_roster_hash = authenticated.peer_roster_hash;
     let connection_id = format!("v2_conn_{}", uuid::Uuid::new_v4().simple());
+    let role_label = match admission.role {
+        AdmissionRole::Mobile => "mobile",
+        AdmissionRole::Plugin => "plugin",
+        AdmissionRole::Desktop => "desktop",
+    };
+    eprintln!(
+        "[aokie-realtime][session] stage=socket_open app={} role={} subject={} connection={} admission_exp={}",
+        admission.app_id,
+        role_label,
+        admission.subject_id,
+        connection_id,
+        admission_exp
+            .map(|expires_at| expires_at.to_string())
+            .unwrap_or_else(|| "none".into())
+    );
     let (mut writer, mut reader) = socket.split();
     let (tx, mut outbound) = mpsc::channel::<Message>(OUTBOUND_CAPACITY);
     let (fenced, mut fence_rx) = watch::channel(false);
@@ -877,6 +907,10 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
         .claim_admission(admission_jti.as_deref(), admission_exp, &connection_id)
         .await
     {
+        eprintln!(
+            "[aokie-realtime][session] stage=socket_rejected app={} role={} subject={} connection={} code={}",
+            admission.app_id, role_label, admission.subject_id, connection_id, error.code
+        );
         send_error(&tx, &error, None);
         let _ = tx.try_send(Message::Close(None));
         writer_task.abort();
@@ -975,6 +1009,10 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
     let first = match first_result {
         Ok(Some(Ok(Message::Text(text)))) if text.len() <= MAX_MESSAGE_BYTES => text,
         _ => {
+            eprintln!(
+                "[aokie-realtime][session] stage=handshake_closed app={} role={} subject={} connection={} reason=hello_missing",
+                admission.app_id, role_label, admission.subject_id, connection_id
+            );
             let _ = tx.try_send(Message::Close(None));
             writer_task.abort();
             gateway
@@ -1054,6 +1092,10 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
         AdmissionRole::Desktop => Err(GatewayError::fatal("wrong_role", "desktop role is v1 only")),
     };
     if let Err(error) = registration {
+        eprintln!(
+            "[aokie-realtime][session] stage=registration_failed app={} role={} subject={} connection={} code={}",
+            admission.app_id, role_label, admission.subject_id, connection_id, error.code
+        );
         send_error(&tx, &error, None);
         let _ = tx.try_send(Message::Close(None));
         writer_task.abort();
@@ -1064,8 +1106,12 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
             .await;
         return;
     }
+    eprintln!(
+        "[aokie-realtime][session] stage=registered app={} role={} subject={} connection={}",
+        admission.app_id, role_label, admission.subject_id, connection_id
+    );
 
-    loop {
+    let exit_reason = loop {
         let incoming = tokio::select! {
             _ = &mut admission_expiry => {
                 let error = GatewayError::fatal(
@@ -1074,15 +1120,17 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
                 );
                 send_error(&tx, &error, None);
                 let _ = tx.try_send(Message::Close(None));
-                break;
+                break "admission_expired";
             }
             changed = fence_rx.changed() => {
                 let _ = changed;
-                break;
+                break "fenced";
             }
             incoming = reader.next() => incoming,
         };
-        let Some(incoming) = incoming else { break };
+        let Some(incoming) = incoming else {
+            break "peer_eof";
+        };
         let result = match incoming {
             Ok(Message::Text(text)) if text.len() <= MAX_MESSAGE_BYTES => match admission.role {
                 AdmissionRole::Mobile => {
@@ -1099,7 +1147,20 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
                 .try_send(Message::Pong(bytes))
                 .map_err(|_| GatewayError::fatal("peer_unavailable", "peer queue is unavailable")),
             Ok(Message::Pong(_)) => Ok(()),
-            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(Message::Close(_)) => {
+                break "peer_close";
+            }
+            Err(error) => {
+                eprintln!(
+                    "[aokie-realtime][session] stage=socket_read_error app={} role={} subject={} connection={} error={}",
+                    admission.app_id,
+                    role_label,
+                    admission.subject_id,
+                    connection_id,
+                    error
+                );
+                break "read_error";
+            }
             _ => Err(GatewayError::fatal(
                 "invalid_frame",
                 "text frames are required",
@@ -1109,11 +1170,15 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
             send_error(&tx, &error, None);
             if error.fatal {
                 let _ = tx.try_send(Message::Close(None));
-                break;
+                break error.code;
             }
         }
-    }
+    };
 
+    eprintln!(
+        "[aokie-realtime][session] stage=socket_closed app={} role={} subject={} connection={} reason={}",
+        admission.app_id, role_label, admission.subject_id, connection_id, exit_reason
+    );
     unregister(&gateway, &admission, &connection_id).await;
     gateway
         .inner
@@ -1187,6 +1252,201 @@ async fn register_plugin(
         ));
     }
     let app = apps.entry(admission.app_id.clone()).or_default();
+    let approved_mobile_key_thumbprints = challenge
+        .approved_peer_key_thumbprints
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let incoming_plugin_key_thumbprint = &hello.endpoint_proof.endpoint_key.thumbprint;
+    let live_authority_matches = app
+        .plugin
+        .as_ref()
+        .is_some_and(|plugin| plugin.endpoint_key.thumbprint == *incoming_plugin_key_thumbprint);
+    let recently_disconnected_authority_matches = app.plugin.is_none()
+        && app.retired_plugin_key_thumbprint.as_deref()
+            == Some(incoming_plugin_key_thumbprint.as_str())
+        && app
+            .plugin_disconnected_at
+            .is_some_and(|disconnected_at| disconnected_at.elapsed() <= PLUGIN_RECONNECT_GRACE);
+    let rolling_authority_refresh = app.plugin_id.as_deref() == Some(&admission.subject_id)
+        && (live_authority_matches || recently_disconnected_authority_matches);
+    let replacement = V2Peer::new(
+        connection_id.to_owned(),
+        hello.session_nonce,
+        hello.endpoint_proof.endpoint_key,
+        vec![],
+        tx,
+        fenced,
+    );
+
+    if rolling_authority_refresh {
+        if let Some(old) = app.plugin.replace(replacement) {
+            old.fence();
+        }
+        app.approved_mobile_key_thumbprints = approved_mobile_key_thumbprints;
+        app.peer_roster_revision = challenge.peer_roster_revision;
+        app.peer_roster_hash = challenge.peer_roster_hash.clone();
+        app.retired_plugin_key_thumbprint = None;
+        app.plugin_disconnected_at = None;
+
+        // Admission rotation is authentication maintenance for the same
+        // endpoint authority, not a Desktop outage. Keep independently
+        // authenticated mobile sockets and the latest authoritative snapshot
+        // alive. A full drain here used to fence every Companion exactly when
+        // the plugin's 80-second refresh boundary was reached, which could
+        // close a newly-connected mobile before its initial sync arrived.
+        let disapproved_devices = app
+            .mobiles
+            .iter()
+            .filter(|(_, mobile)| {
+                !app.approved_mobile_key_thumbprints
+                    .contains(&mobile.endpoint_key.thumbprint)
+            })
+            .map(|(device_id, _)| device_id.clone())
+            .collect::<Vec<_>>();
+        for device_id in &disapproved_devices {
+            if let Some(mobile) = app.mobiles.remove(device_id) {
+                mobile.fence();
+            }
+            release_device_offer_authority(app, device_id);
+        }
+
+        // A live same-authority replacement is an overlapping authentication
+        // rotation: the old plugin process and all of its native peer/session
+        // state are still present while the replacement hello is registered.
+        // Preserve every lease whose mobile endpoint is still approved. A
+        // sequential reconnect has no such continuity proof, so it remains
+        // limited to a prepared lease with no SDP/ICE progress.
+        let resumable_lease_jtis = app
+            .leases
+            .iter()
+            .filter(|(jti, lease)| {
+                app.mobiles.contains_key(&lease.claims.device_id)
+                    && if live_authority_matches {
+                        true
+                    } else if recently_disconnected_authority_matches {
+                        // The lease was proven unstarted when the old plugin
+                        // socket disappeared. Mobile SDP/ICE that arrived
+                        // during the bounded gap is retained in the gateway's
+                        // ordered queue and is safe to deliver to the same
+                        // endpoint authority after its admission refresh.
+                        lease.provisional
+                            && matches!(lease.claims.phase, LeasePhase::Prepared)
+                            && lease.plugin_signal.sdp_revision == 0
+                            && lease.plugin_signal.transport_generation == 0
+                            && app.plugin_reconnect_resumable_leases.contains(*jti)
+                    } else {
+                        false
+                    }
+            })
+            .map(|(jti, _)| jti.clone())
+            .collect::<HashSet<_>>();
+        let revoked = app
+            .leases
+            .iter()
+            .filter(|(jti, _)| !resumable_lease_jtis.contains(*jti))
+            .map(|(jti, lease)| {
+                (
+                    jti.clone(),
+                    lease.claims.device_id.clone(),
+                    lease.claims.lease_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (jti, device_id, lease_id) in &revoked {
+            let _ = revoke_one(
+                app,
+                &admission.app_id,
+                jti,
+                "plugin_admission_rotated",
+                false,
+            );
+            if app.mobiles.contains_key(device_id) {
+                let _ = send_to_mobile(
+                    app,
+                    device_id,
+                    response_json(
+                        "lease_revoked",
+                        &admission.app_id,
+                        json!({
+                            "leaseId": lease_id,
+                            "leaseJti": jti,
+                            "reason": "plugin_admission_rotated"
+                        }),
+                    )?,
+                );
+            }
+        }
+        let mut queued_signals_replayed = 0usize;
+        if recently_disconnected_authority_matches {
+            app.signals.clear();
+            app.signal_order.clear();
+            refresh_pending_mobile_offers(
+                app,
+                &admission.app_id,
+                gateway.inner.v2.signer()?,
+                unix_now()?,
+            )?;
+
+            for jti in &resumable_lease_jtis {
+                let Some(lease) = app.leases.get(jti) else {
+                    continue;
+                };
+                let token = gateway.inner.v2.signer()?.sign(&lease.claims)?;
+                app.plugin
+                    .as_ref()
+                    .expect("rolling plugin replacement was installed")
+                    .send(response_json(
+                        "claim_proposal",
+                        &admission.app_id,
+                        json!({
+                            "requestId": app
+                                .claim
+                                .as_ref()
+                                .filter(|claim| claim.lease_jti == *jti)
+                                .map(|claim| claim.request_id.clone())
+                                .unwrap_or_else(|| format!("resume_{}", lease.claims.lease_id)),
+                            "deviceId": lease.claims.device_id,
+                            "leaseToken": token,
+                            "lease": lease.claims
+                        }),
+                    )?)?;
+            }
+            let queued_plugin_signals = std::mem::take(&mut app.queued_plugin_signals);
+            for signal in queued_plugin_signals {
+                if resumable_lease_jtis.contains(&signal.lease_jti) {
+                    app.plugin
+                        .as_ref()
+                        .expect("rolling plugin replacement was installed")
+                        .send(serialize(&signal)?)?;
+                    queued_signals_replayed += 1;
+                }
+            }
+        }
+        app.plugin_reconnect_resumable_leases.clear();
+        match (app.snapshot.as_ref(), app.idle.as_ref()) {
+            (Some(_), None) => broadcast_projected_snapshots(app, &admission.app_id)?,
+            (None, Some(_)) => broadcast_idle_sync(app, &admission.app_id)?,
+            _ => {}
+        }
+        eprintln!(
+            "[aokie-realtime][session] stage=plugin_authority_rotated app={} plugin={} continuity={} mobiles_preserved={} leases_preserved={} rtc_signals_replayed={} leases_revoked={} devices_fenced={}",
+            admission.app_id,
+            admission.subject_id,
+            if live_authority_matches {
+                "overlapping"
+            } else {
+                "reconnected"
+            },
+            app.mobiles.len(),
+            resumable_lease_jtis.len(),
+            queued_signals_replayed,
+            revoked.len(),
+            disapproved_devices.len()
+        );
+        return Ok(());
+    }
+
     if let Some(old) = app.plugin.take() {
         old.fence();
     }
@@ -1198,6 +1458,8 @@ async fn register_plugin(
     app.sequence = 0;
     app.claim = None;
     app.leases.clear();
+    app.plugin_reconnect_resumable_leases.clear();
+    app.queued_plugin_signals.clear();
     app.idempotency.clear();
     app.idempotency_order.clear();
     app.signals.clear();
@@ -1214,19 +1476,10 @@ async fn register_plugin(
     app.peer_roster_revision = None;
     app.peer_roster_hash = None;
     app.plugin_id = Some(admission.subject_id.clone());
-    app.plugin = Some(V2Peer::new(
-        connection_id.to_owned(),
-        hello.session_nonce,
-        hello.endpoint_proof.endpoint_key,
-        vec![],
-        tx,
-        fenced,
-    ));
-    app.approved_mobile_key_thumbprints = challenge
-        .approved_peer_key_thumbprints
-        .iter()
-        .cloned()
-        .collect();
+    app.plugin = Some(replacement);
+    app.retired_plugin_key_thumbprint = None;
+    app.plugin_disconnected_at = None;
+    app.approved_mobile_key_thumbprints = approved_mobile_key_thumbprints;
     app.peer_roster_revision = challenge.peer_roster_revision;
     app.peer_roster_hash = challenge.peer_roster_hash.clone();
     Ok(())
@@ -1291,12 +1544,23 @@ async fn register_mobile(
             "mobile capacity is exhausted",
         ));
     }
-    recover_device(
-        app,
-        &admission.app_id,
-        &admission.subject_id,
-        "session_replaced",
-    );
+    let incoming_key_thumbprint = &hello.endpoint_proof.endpoint_key.thumbprint;
+    let rolling_admission_refresh = app
+        .mobiles
+        .get(&admission.subject_id)
+        .is_some_and(|current| {
+            current.session_nonce == hello.session_nonce
+                && current.endpoint_key.thumbprint == *incoming_key_thumbprint
+                && current.grants == admission.scopes
+        });
+    if !rolling_admission_refresh {
+        recover_device(
+            app,
+            &admission.app_id,
+            &admission.subject_id,
+            "session_replaced",
+        );
+    }
     let peer = V2Peer::new(
         connection_id.to_owned(),
         hello.session_nonce,
@@ -1323,6 +1587,17 @@ async fn register_mobile(
         if let Some(assistance) = app.assistance.as_ref().filter(|record| !record.answered) {
             peer.send(serialize(&assistance.request)?)?;
         }
+    }
+    if rolling_admission_refresh {
+        let preserved_leases = app
+            .leases
+            .values()
+            .filter(|lease| lease.claims.device_id == admission.subject_id)
+            .count();
+        eprintln!(
+            "[aokie-realtime][session] stage=mobile_authority_rotated app={} device={} continuity=overlapping leases_preserved={}",
+            admission.app_id, admission.subject_id, preserved_leases
+        );
     }
     Ok(())
 }
@@ -1436,6 +1711,10 @@ async fn handle_idle(
     if app.snapshot.is_none() {
         if let Some(idle) = app.idle.as_mut() {
             idle.assertion = frame;
+            app.plugin
+                .as_mut()
+                .expect("checked plugin")
+                .authoritative_publication_seen = true;
             return Ok(());
         }
     }
@@ -1452,6 +1731,10 @@ async fn handle_idle(
         assertion: frame,
         prior_fence,
     });
+    app.plugin
+        .as_mut()
+        .expect("checked plugin")
+        .authoritative_publication_seen = true;
     broadcast_idle_sync(app, &admission.app_id)
 }
 
@@ -1516,6 +1799,11 @@ async fn handle_snapshot(
         .as_mut()
         .expect("checked plugin")
         .admit_general()?;
+    let first_publication = !app
+        .plugin
+        .as_ref()
+        .expect("checked plugin")
+        .authoritative_publication_seen;
     let regresses = app.snapshot.as_ref().is_some_and(|previous| {
         snapshot_regresses(&AuthoritativeFence::from(previous), &frame.snapshot)
     }) || app
@@ -1523,7 +1811,7 @@ async fn handle_snapshot(
         .as_ref()
         .and_then(|idle| idle.prior_fence.as_ref())
         .is_some_and(|tombstone| frame.snapshot.call_epoch <= tombstone.call_epoch);
-    if regresses {
+    if regresses && !first_publication {
         return Err(GatewayError::fatal(
             "stale_snapshot",
             "plugin snapshot regressed",
@@ -1533,6 +1821,30 @@ async fn handle_snapshot(
     // replacing endpoint truth.  Sequence exhaustion must never leave a
     // state change that no mobile can observe.
     let next_sequence = next_authoritative_sequence(app.sequence)?;
+    if regresses {
+        let prior_call_epoch = app
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.call_epoch)
+            .or_else(|| {
+                app.idle
+                    .as_ref()
+                    .and_then(|idle| idle.prior_fence.as_ref())
+                    .map(|fence| fence.call_epoch)
+            })
+            .unwrap_or_default();
+        eprintln!(
+            "[aokie-realtime][session] stage=plugin_authority_reasserted app={} connection={} prior_call_epoch={} next_call_epoch={}",
+            admission.app_id, connection_id, prior_call_epoch, frame.snapshot.call_epoch
+        );
+        // A freshly authenticated endpoint process may restart its local
+        // counters. Never let that process inherit pre-restart media
+        // authority: revoke every old lease and clear the tombstone before
+        // accepting its first publication. The app sequence and replay
+        // high-waters remain monotonic across the reassertion.
+        clear_call_authority(app, &admission.app_id, "plugin_authority_reasserted");
+        app.idle = None;
+    }
     if let Some(previous) = &app.snapshot {
         if previous.call_id != frame.snapshot.call_id
             || previous.call_epoch != frame.snapshot.call_epoch
@@ -1588,6 +1900,10 @@ async fn handle_snapshot(
         gateway.inner.v2.signer()?,
         unix_now()?,
     )?;
+    app.plugin
+        .as_mut()
+        .expect("checked plugin")
+        .authoritative_publication_seen = true;
 
     let device_ids: Vec<_> = app.mobiles.keys().cloned().collect();
     let mut failed = Vec::new();
@@ -1615,13 +1931,45 @@ fn refresh_pending_mobile_offers(
     signer: &LeaseSigner,
     now: u64,
 ) -> Result<(), GatewayError> {
-    let Some(snapshot) = app.snapshot.as_ref() else {
+    let Some(snapshot) = app.snapshot.clone() else {
         app.pending_mobile_offers.clear();
+        app.accepted_mobile_offers.clear();
+        app.mobile_offer_winners.clear();
         return Ok(());
     };
     if matches!(snapshot.telephony_state, TelephonyState::Ended) {
         app.pending_mobile_offers.clear();
+        app.accepted_mobile_offers.clear();
+        app.mobile_offer_winners.clear();
         return Ok(());
+    }
+    let abandoned_acceptances = app
+        .accepted_mobile_offers
+        .iter()
+        .filter(|(_, offer)| {
+            offer.expires_at <= now
+                || offer.app_id != app_id
+                || offer.call_id != snapshot.call_id
+                || offer.call_epoch != snapshot.call_epoch
+                || offer.owner_epoch != snapshot.owner_epoch
+                || offer.switchboard_revision != snapshot.switchboard_revision
+                || offer.remote_revision != snapshot.remote_revision
+                || offer.required_consent_policy_id != snapshot.remote_consent.policy_id
+                || offer.required_consent_policy_version != snapshot.remote_consent.policy_version
+                || !snapshot.remote_consent.allows(offer.offered_mode)
+                || !app
+                    .mobiles
+                    .get(&offer.target_device_id)
+                    .is_some_and(|peer| {
+                        peer.endpoint_key.thumbprint == offer.target_holder_key_thumbprint
+                            && offer.required_grants.iter().all(|grant| peer.has(*grant))
+                    })
+        })
+        .map(|(jti, offer)| (jti.clone(), offer.opportunity_id.clone()))
+        .collect::<Vec<_>>();
+    for (jti, opportunity_id) in abandoned_acceptances {
+        app.accepted_mobile_offers.remove(&jti);
+        release_offer_winner(app, &opportunity_id, &jti);
     }
     let mobiles = &app.mobiles;
     app.pending_mobile_offers.retain(|_, signed| {
@@ -1682,14 +2030,8 @@ fn refresh_pending_mobile_offers(
             {
                 continue;
             }
-            let opportunity_material = format!(
-                "{app_id}\0{}\0{}\0{:?}",
-                snapshot.call_id, snapshot.owner_epoch, mode
-            );
-            let opportunity_id = format!(
-                "opportunity_{}",
-                &hex(&Sha256::digest(opportunity_material.as_bytes()))[..24]
-            );
+            let opportunity_id =
+                mobile_opportunity_id(app_id, &snapshot.call_id, snapshot.owner_epoch, mode);
             if app.mobile_offer_winners.contains_key(&opportunity_id)
                 || app.pending_mobile_offers.values().any(|signed| {
                     signed.offer.opportunity_id == opportunity_id
@@ -1731,6 +2073,37 @@ fn refresh_pending_mobile_offers(
         }
     }
     Ok(())
+}
+
+fn mobile_opportunity_id(app_id: &str, call_id: &str, owner_epoch: u64, mode: LeaseMode) -> String {
+    let material = format!("{app_id}\0{call_id}\0{owner_epoch}\0{mode:?}");
+    format!(
+        "opportunity_{}",
+        &hex(&Sha256::digest(material.as_bytes()))[..24]
+    )
+}
+
+fn release_offer_winner(app: &mut V2App, opportunity_id: &str, offer_jti: &str) {
+    if app
+        .mobile_offer_winners
+        .get(opportunity_id)
+        .is_some_and(|winner| winner == offer_jti)
+    {
+        app.mobile_offer_winners.remove(opportunity_id);
+    }
+}
+
+fn release_device_offer_authority(app: &mut V2App, device_id: &str) {
+    let abandoned = app
+        .accepted_mobile_offers
+        .iter()
+        .filter(|(_, offer)| offer.target_device_id == device_id)
+        .map(|(jti, offer)| (jti.clone(), offer.opportunity_id.clone()))
+        .collect::<Vec<_>>();
+    for (jti, opportunity_id) in abandoned {
+        app.accepted_mobile_offers.remove(&jti);
+        release_offer_winner(app, &opportunity_id, &jti);
+    }
 }
 
 async fn handle_mobile_offer_answer(
@@ -1833,6 +2206,14 @@ async fn handle_mobile_offer_answer(
         .retain(|_, signed| signed.offer.opportunity_id != verified.opportunity_id);
     app.accepted_mobile_offers
         .insert(verified.jti.clone(), verified.clone());
+    eprintln!(
+        "[aokie-realtime][takeover] stage=offer_accepted app={} device={} call={} mode={:?} offer_jti={}",
+        admission.app_id,
+        admission.subject_id,
+        verified.call_id,
+        verified.offered_mode,
+        verified.jti
+    );
     let response = response_json(
         "mobile_offer_accepted",
         &admission.app_id,
@@ -2065,9 +2446,21 @@ async fn handle_lease_request(
         LeaseRecord {
             claims: claims.clone(),
             provisional,
+            offer_opportunity_id: Some(accepted_offer.opportunity_id),
             mobile_signal: SignalProgress::default(),
             plugin_signal: SignalProgress::default(),
         },
+    );
+    eprintln!(
+        "[aokie-realtime][takeover] stage=lease_created app={} device={} call={} mode={:?} phase={:?} fence={} lease_jti={} rtc={}",
+        admission.app_id,
+        admission.subject_id,
+        claims.call_id,
+        claims.mode,
+        claims.phase,
+        claims.fence,
+        claims.jti,
+        claims.rtc_session_id
     );
     if provisional {
         app.claim = Some(TalkClaim {
@@ -2158,8 +2551,18 @@ async fn handle_claim_decision(
     let old_jti = claim.lease_jti.clone();
     let claim_mode = claim.mode;
     if !frame.accepted {
-        app.leases.remove(&old_jti);
-        app.claim = None;
+        eprintln!(
+            "[aokie-realtime][takeover] stage=claim_rejected app={} device={} call={} fence={} reason={}",
+            admission.app_id,
+            frame.device_id,
+            frame.call_id,
+            frame.fence,
+            frame.reason.as_deref().unwrap_or("endpoint_rejected")
+        );
+        let next_sequence = next_authoritative_sequence(app.sequence)?;
+        revoke_one(app, &admission.app_id, &old_jti, "endpoint_rejected", false)?;
+        refresh_pending_mobile_offers(app, &admission.app_id, &signer, now)?;
+        app.sequence = next_sequence;
         send_to_mobile(
             app,
             &frame.device_id,
@@ -2173,7 +2576,7 @@ async fn handle_claim_decision(
                 }),
             )?,
         )?;
-        return Ok(());
+        return broadcast_projected_snapshots(app, &admission.app_id);
     }
     let snapshot = app
         .snapshot
@@ -2228,9 +2631,20 @@ async fn handle_claim_decision(
         LeaseRecord {
             claims: claims.clone(),
             provisional: false,
+            offer_opportunity_id: previous.offer_opportunity_id,
             mobile_signal: previous.mobile_signal,
             plugin_signal: previous.plugin_signal,
         },
+    );
+    eprintln!(
+        "[aokie-realtime][takeover] stage=claim_active app={} device={} call={} mode={:?} owner_epoch={} fence={} lease_jti={}",
+        admission.app_id,
+        frame.device_id,
+        frame.call_id,
+        claims.mode,
+        claims.owner_epoch,
+        claims.fence,
+        claims.jti
     );
     let claim = app.claim.as_mut().expect("claim remains");
     claim.active = true;
@@ -2281,13 +2695,28 @@ async fn handle_lease_heartbeat(
         }
         Cached::Miss => {}
     }
-    validate_lease_binding(app, admission, &verified)?;
+    validate_lease_binding(app, admission, &verified, false)?;
+    let renewed_expires_at = now + LEASE_TTL;
+    if renewed_expires_at <= verified.expires_at {
+        // Expiry is represented in whole Unix seconds. A heartbeat can arrive
+        // in the same second as a grant/activation, especially when a
+        // session-wide timer was already close to its next tick. Do not rotate
+        // the JTI while returning an unchanged expiry: that is not a renewal,
+        // and clients must retain the still-valid current token.
+        return send_mobile_error(
+            app,
+            &admission.subject_id,
+            "renewal_not_due",
+            "lease renewal is not due yet",
+            Some(&frame.request_id),
+        );
+    }
     let old = app
         .leases
         .remove(&verified.jti)
         .ok_or_else(|| GatewayError::nonfatal("invalid_lease", "lease was revoked"))?;
     let mut renewed = old.claims;
-    renewed.expires_at = now + LEASE_TTL;
+    renewed.expires_at = renewed_expires_at;
     renewed.jti = new_jti();
     let token = signer.sign(&renewed)?;
     app.leases.insert(
@@ -2295,6 +2724,7 @@ async fn handle_lease_heartbeat(
         LeaseRecord {
             claims: renewed.clone(),
             provisional: old.provisional,
+            offer_opportunity_id: old.offer_opportunity_id,
             mobile_signal: old.mobile_signal,
             plugin_signal: old.plugin_signal,
         },
@@ -2357,7 +2787,10 @@ async fn handle_mobile_revoke(
         }
         Cached::Miss => {}
     }
-    validate_lease_binding(app, admission, &claims)?;
+    // Returning authority is fail-closed and must remain available while the
+    // trusted plugin rotates its short-lived admission. The lease is removed
+    // locally and therefore cannot be replayed to the replacement socket.
+    validate_lease_binding(app, admission, &claims, true)?;
     revoke_one(app, &admission.app_id, &claims.jti, &frame.reason, true)?;
     let response = response_json(
         "lease_revoked",
@@ -3188,7 +3621,7 @@ async fn handle_mobile_rtc(
         ));
     }
     let peer_session_nonce = peer.session_nonce.clone();
-    validate_lease_binding(app, admission, &claims)?;
+    validate_lease_binding(app, admission, &claims, true)?;
     if frame.plugin_id != claims.plugin_id
         || frame.device_id != claims.device_id
         || frame.lease_jti != claims.jti
@@ -3225,6 +3658,17 @@ async fn handle_mobile_rtc(
         frame.sdp_revision,
         frame.transport_generation,
     )?;
+    eprintln!(
+        "[aokie-realtime][takeover] stage=rtc_mobile_to_plugin app={} device={} call={} signal={} phase={:?} sdp={} generation={} rtc={}",
+        admission.app_id,
+        admission.subject_id,
+        frame.call_id,
+        rtc_signal_kind(&frame.signal),
+        claims.phase,
+        frame.sdp_revision,
+        frame.transport_generation,
+        frame.rtc_session_id
+    );
     let sender = format!("mobile:{}", admission.subject_id);
     if !app.remember_signal(&sender, &frame.signal_id) {
         return Ok(());
@@ -3246,10 +3690,47 @@ async fn handle_mobile_rtc(
         fence: frame.fence,
         signal: frame.signal,
     };
-    app.plugin
-        .as_ref()
-        .ok_or_else(|| GatewayError::fatal("endpoint_unavailable", "plugin is unavailable"))?
-        .send(serialize(&routed)?)
+    route_mobile_rtc_to_plugin(app, &admission.app_id, routed)
+}
+
+fn route_mobile_rtc_to_plugin(
+    app: &mut V2App,
+    app_id: &str,
+    routed: PluginRtcSignalFrame,
+) -> Result<(), GatewayError> {
+    if let Some(plugin) = app.plugin.as_ref() {
+        return plugin.send(serialize(&routed)?);
+    }
+    let reconnecting_same_authority = app
+        .plugin_disconnected_at
+        .is_some_and(|disconnected_at| disconnected_at.elapsed() <= PLUGIN_RECONNECT_GRACE)
+        && app
+            .plugin_reconnect_resumable_leases
+            .contains(&routed.lease_jti);
+    if !reconnecting_same_authority {
+        return Err(GatewayError::fatal(
+            "endpoint_unavailable",
+            "plugin is unavailable",
+        ));
+    }
+    if app.queued_plugin_signals.len() >= PLUGIN_RECONNECT_SIGNAL_CAPACITY {
+        return Err(GatewayError::fatal(
+            "peer_unavailable",
+            "plugin reconnect signal queue is full",
+        ));
+    }
+    eprintln!(
+        "[aokie-realtime][takeover] stage=rtc_queued_for_plugin_reconnect app={} device={} call={} signal={} sdp={} generation={} rtc={}",
+        app_id,
+        routed.device_id,
+        routed.call_id,
+        rtc_signal_kind(&routed.signal),
+        routed.sdp_revision,
+        routed.transport_generation,
+        routed.rtc_session_id
+    );
+    app.queued_plugin_signals.push_back(routed);
+    Ok(())
 }
 
 async fn handle_plugin_rtc(
@@ -3321,6 +3802,17 @@ async fn handle_plugin_rtc(
             frame.sdp_revision,
             frame.transport_generation,
         )?;
+        eprintln!(
+            "[aokie-realtime][takeover] stage=rtc_plugin_to_mobile app={} device={} call={} signal={} phase={:?} sdp={} generation={} rtc={}",
+            admission.app_id,
+            frame.device_id,
+            frame.call_id,
+            rtc_signal_kind(&frame.signal),
+            lease.claims.phase,
+            frame.sdp_revision,
+            frame.transport_generation,
+            frame.rtc_session_id
+        );
     }
     let sender = format!("plugin:{}", admission.subject_id);
     if !app.remember_signal(&sender, &frame.signal_id) {
@@ -3355,7 +3847,7 @@ async fn unregister(gateway: &Gateway, admission: &Admission, connection_id: &st
     let Some(app) = apps.get_mut(&admission.app_id) else {
         return;
     };
-    match admission.role {
+    let cleanup_epoch = match admission.role {
         AdmissionRole::Mobile => {
             if app
                 .mobiles
@@ -3370,6 +3862,7 @@ async fn unregister(gateway: &Gateway, admission: &Admission, connection_id: &st
                     "endpoint_disconnected",
                 );
             }
+            None
         }
         AdmissionRole::Plugin => {
             if app
@@ -3377,35 +3870,128 @@ async fn unregister(gateway: &Gateway, admission: &Admission, connection_id: &st
                 .as_ref()
                 .is_some_and(|peer| peer.connection_id == connection_id)
             {
-                app.plugin = None;
-                app.plugin_id = None;
-                app.approved_mobile_key_thumbprints.clear();
-                app.peer_roster_revision = None;
-                app.peer_roster_hash = None;
-                for (_, peer) in app.mobiles.drain() {
-                    peer.fence();
+                let plugin = app.plugin.take().expect("checked current plugin");
+                app.retired_plugin_key_thumbprint = Some(plugin.endpoint_key.thumbprint);
+                app.plugin_disconnected_at = Some(Instant::now());
+                app.plugin_disconnect_epoch = app.plugin_disconnect_epoch.wrapping_add(1).max(1);
+
+                let resumable_lease_jtis = app
+                    .leases
+                    .iter()
+                    .filter(|(_, lease)| {
+                        lease.provisional
+                            && matches!(lease.claims.phase, LeasePhase::Prepared)
+                            && lease.mobile_signal.sdp_revision == 0
+                            && lease.mobile_signal.transport_generation == 0
+                            && lease.plugin_signal.sdp_revision == 0
+                            && lease.plugin_signal.transport_generation == 0
+                            && app.mobiles.contains_key(&lease.claims.device_id)
+                    })
+                    .map(|(jti, _)| jti.clone())
+                    .collect::<HashSet<_>>();
+                let revoked = app
+                    .leases
+                    .iter()
+                    .filter(|(jti, _)| !resumable_lease_jtis.contains(*jti))
+                    .map(|(jti, lease)| {
+                        (
+                            jti.clone(),
+                            lease.claims.device_id.clone(),
+                            lease.claims.lease_id.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                app.plugin_reconnect_resumable_leases = resumable_lease_jtis.clone();
+                app.queued_plugin_signals.clear();
+                for (jti, device_id, lease_id) in &revoked {
+                    let _ = revoke_one(app, &admission.app_id, jti, "plugin_disconnected", false);
+                    if app.mobiles.contains_key(device_id) {
+                        if let Ok(encoded) = response_json(
+                            "lease_revoked",
+                            &admission.app_id,
+                            json!({
+                                "leaseId": lease_id,
+                                "leaseJti": jti,
+                                "reason": "plugin_disconnected"
+                            }),
+                        ) {
+                            let _ = send_to_mobile(app, device_id, encoded);
+                        }
+                    }
                 }
-                app.snapshot = None;
-                app.idle = None;
-                app.sequence = 0;
-                app.claim = None;
-                app.leases.clear();
-                app.idempotency.clear();
-                app.idempotency_order.clear();
                 app.signals.clear();
                 app.signal_order.clear();
-                app.assistance = None;
-                app.end_caller_challenges.clear();
-                app.used_end_caller_confirmations.clear();
-                app.used_end_caller_order.clear();
-                app.end_caller_operation = None;
-                app.pending_mobile_offers.clear();
-                app.accepted_mobile_offers.clear();
-                app.mobile_offer_winners.clear();
+                eprintln!(
+                    "[aokie-realtime][session] stage=plugin_reconnect_grace app={} plugin={} mobiles_preserved={} prepared_preserved={} leases_revoked={} grace_ms={}",
+                    admission.app_id,
+                    admission.subject_id,
+                    app.mobiles.len(),
+                    resumable_lease_jtis.len(),
+                    revoked.len(),
+                    PLUGIN_RECONNECT_GRACE.as_millis()
+                );
+                Some(app.plugin_disconnect_epoch)
+            } else {
+                None
             }
         }
-        AdmissionRole::Desktop => {}
-    }
+        AdmissionRole::Desktop => None,
+    };
+    drop(apps);
+
+    let Some(cleanup_epoch) = cleanup_epoch else {
+        return;
+    };
+    let gateway = gateway.clone();
+    let app_id = admission.app_id.clone();
+    let plugin_id = admission.subject_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(PLUGIN_RECONNECT_GRACE).await;
+        let mut apps = gateway.inner.v2.apps.lock().await;
+        let Some(app) = apps.get_mut(&app_id) else {
+            return;
+        };
+        if app.plugin.is_some()
+            || app.plugin_disconnect_epoch != cleanup_epoch
+            || app
+                .plugin_disconnected_at
+                .is_none_or(|disconnected_at| disconnected_at.elapsed() < PLUGIN_RECONNECT_GRACE)
+        {
+            return;
+        }
+        for (_, peer) in app.mobiles.drain() {
+            peer.fence();
+        }
+        app.plugin_id = None;
+        app.retired_plugin_key_thumbprint = None;
+        app.plugin_disconnected_at = None;
+        app.approved_mobile_key_thumbprints.clear();
+        app.peer_roster_revision = None;
+        app.peer_roster_hash = None;
+        app.snapshot = None;
+        app.idle = None;
+        app.sequence = 0;
+        app.claim = None;
+        app.leases.clear();
+        app.plugin_reconnect_resumable_leases.clear();
+        app.queued_plugin_signals.clear();
+        app.idempotency.clear();
+        app.idempotency_order.clear();
+        app.signals.clear();
+        app.signal_order.clear();
+        app.assistance = None;
+        app.end_caller_challenges.clear();
+        app.used_end_caller_confirmations.clear();
+        app.used_end_caller_order.clear();
+        app.end_caller_operation = None;
+        app.pending_mobile_offers.clear();
+        app.accepted_mobile_offers.clear();
+        app.mobile_offer_winners.clear();
+        eprintln!(
+            "[aokie-realtime][session] stage=plugin_reconnect_grace_expired app={} plugin={}",
+            app_id, plugin_id
+        );
+    });
 }
 
 fn authoritative_sync(app: &V2App, app_id: &str, peer: &V2Peer) -> Result<String, GatewayError> {
@@ -3646,20 +4232,35 @@ fn validate_lease_binding(
     app: &V2App,
     admission: &Admission,
     claims: &LeaseClaims,
+    allow_plugin_reconnect: bool,
 ) -> Result<(), GatewayError> {
     let peer = app
         .mobiles
         .get(&admission.subject_id)
         .ok_or_else(|| GatewayError::fatal("stale_session", "mobile session is not current"))?;
+    let live_plugin_key_matches = app
+        .plugin
+        .as_ref()
+        .is_some_and(|plugin| claims.plugin_key_thumbprint == plugin.endpoint_key.thumbprint);
+    let reconnecting_plugin_key_matches = app.plugin.is_none()
+        && app.retired_plugin_key_thumbprint.as_deref()
+            == Some(claims.plugin_key_thumbprint.as_str())
+        && app
+            .plugin_disconnected_at
+            .is_some_and(|disconnected_at| disconnected_at.elapsed() <= PLUGIN_RECONNECT_GRACE)
+        && app.plugin_reconnect_resumable_leases.contains(&claims.jti);
+    if reconnecting_plugin_key_matches && !allow_plugin_reconnect {
+        return Err(GatewayError::nonfatal(
+            "endpoint_reconnecting",
+            "plugin admission is refreshing; retry the lease operation",
+        ));
+    }
     if claims.app_id != admission.app_id
         || app.plugin_id.as_deref() != Some(&claims.plugin_id)
         || claims.device_id != admission.subject_id
         || claims.session_nonce != peer.session_nonce
         || claims.mobile_key_thumbprint != peer.endpoint_key.thumbprint
-        || app
-            .plugin
-            .as_ref()
-            .is_none_or(|plugin| claims.plugin_key_thumbprint != plugin.endpoint_key.thumbprint)
+        || !(live_plugin_key_matches || (allow_plugin_reconnect && reconnecting_plugin_key_matches))
     {
         return Err(GatewayError::fatal(
             "lease_binding",
@@ -3750,6 +4351,16 @@ fn advance_signal(
     }
 }
 
+fn rtc_signal_kind(signal: &RtcSignal) -> &'static str {
+    match signal {
+        RtcSignal::Offer { .. } => "offer",
+        RtcSignal::Answer { .. } => "answer",
+        RtcSignal::Ice { .. } => "ice",
+        RtcSignal::IceComplete { .. } => "ice_complete",
+        RtcSignal::Close { .. } => "close",
+    }
+}
+
 fn current_plugin_mut<'a>(
     apps: &'a mut HashMap<String, V2App>,
     admission: &Admission,
@@ -3804,6 +4415,10 @@ fn require_app(app_id: &str, admission: &Admission) -> Result<(), GatewayError> 
 }
 
 fn recover_device(app: &mut V2App, app_id: &str, device_id: &str, reason: &str) {
+    // An accepted offer is only a short bridge to a durable lease. If its
+    // endpoint disappears before (or during) that handoff, release the exact
+    // first-winner reservation so a freshly authenticated session can retry.
+    release_device_offer_authority(app, device_id);
     let revoked: Vec<_> = app
         .leases
         .iter()
@@ -3836,6 +4451,23 @@ fn revoke_one(
             "lease no longer exists",
         ));
     };
+    app.plugin_reconnect_resumable_leases.remove(jti);
+    app.queued_plugin_signals
+        .retain(|signal| signal.lease_jti != jti);
+    eprintln!(
+        "[aokie-realtime][takeover] stage=lease_revoked app={} device={} call={} mode={:?} phase={:?} fence={} lease_jti={} reason={}",
+        app_id,
+        record.claims.device_id,
+        record.claims.call_id,
+        record.claims.mode,
+        record.claims.phase,
+        record.claims.fence,
+        record.claims.jti,
+        reason
+    );
+    if let Some(opportunity_id) = record.offer_opportunity_id.as_deref() {
+        app.mobile_offer_winners.remove(opportunity_id);
+    }
     app.end_caller_challenges
         .retain(|_, challenge| challenge.lease_jti != jti);
     if app
@@ -3998,9 +4630,9 @@ mod tests {
     use crate::{AdmissionSpec, GatewayConfig};
     use aokie_protocol::v2::{
         AdmissionClaims, AdmissionRole as TokenRole, CarrierHoldEvidence, EndpointBindingClaims,
-        MediaState, RemoteCapabilities, RemoteConsentPolicy, RtcSignal, SecondaryCallObservation,
-        SecondaryCallPolicy, SignedEndpointBinding, SignedTrickleCandidateEnvelope,
-        TrickleCandidateClaims, ADMISSION_AUDIENCE,
+        HelloProofClaims, MediaState, RemoteCapabilities, RemoteConsentPolicy, RtcSignal,
+        SecondaryCallObservation, SecondaryCallPolicy, SignedEndpointBinding,
+        SignedTrickleCandidateEnvelope, TrickleCandidateClaims, ADMISSION_AUDIENCE,
     };
 
     fn test_endpoint_key(seed: u8) -> EndpointPublicKey {
@@ -4168,6 +4800,7 @@ mod tests {
         );
         let mut app = V2App::default();
         app.plugin = Some(plugin);
+        app.plugin.as_mut().unwrap().authoritative_publication_seen = true;
         app.plugin_id = Some("plugin_a".into());
         app.mobiles.insert("device_a".into(), mobile);
         app.snapshot = Some(snapshot(3));
@@ -4202,6 +4835,69 @@ mod tests {
             grants: vec![],
             scopes: vec![],
         }
+    }
+
+    fn plugin_registration(
+        connection_id: &str,
+        session_nonce: &str,
+        approved_mobile_keys: Vec<String>,
+    ) -> (
+        PluginHello,
+        EndpointChallengeFrame,
+        mpsc::Sender<Message>,
+        watch::Sender<bool>,
+        mpsc::Receiver<Message>,
+    ) {
+        let endpoint_key = plugin_key();
+        let proof = SignedHelloProof {
+            claims: aokie_protocol::v2::HelloProofClaims {
+                app_id: "app_a".into(),
+                subject_id: "plugin_a".into(),
+                role: TokenRole::Plugin,
+                connection_id: connection_id.into(),
+                challenge_nonce: format!("challenge_{connection_id}"),
+                admission_jti: format!("admission_{connection_id}"),
+                session_nonce: session_nonce.into(),
+                holder_key_thumbprint: endpoint_key.thumbprint.clone(),
+                expected_peer_key_thumbprint: None,
+                approved_peer_key_thumbprints: approved_mobile_keys.clone(),
+                peer_roster_revision: Some(9),
+                peer_roster_hash: Some("owner_approved_roster_hash".into()),
+                nonce: format!("nonce_{connection_id}"),
+                jti: format!("proof_{connection_id}"),
+                issued_at: 1,
+                expires_at: 2,
+            },
+            endpoint_key: endpoint_key.clone(),
+            signature: "A".repeat(86),
+        };
+        let hello = PluginHello {
+            kind: "plugin_hello".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            plugin_id: "plugin_a".into(),
+            session_nonce: session_nonce.into(),
+            endpoint_proof: proof,
+        };
+        let challenge = EndpointChallengeFrame {
+            kind: "endpoint_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            subject_id: "plugin_a".into(),
+            role: TokenRole::Plugin,
+            connection_id: connection_id.into(),
+            challenge_nonce: format!("challenge_{connection_id}"),
+            admission_jti: format!("admission_{connection_id}"),
+            holder_key_thumbprint: endpoint_key.thumbprint,
+            expected_peer_key_thumbprint: None,
+            approved_peer_key_thumbprints: approved_mobile_keys,
+            peer_roster_revision: Some(9),
+            peer_roster_hash: Some("owner_approved_roster_hash".into()),
+            expires_at: unix_now().unwrap() + 20,
+        };
+        let (tx, rx) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (fenced, _) = watch::channel(false);
+        (hello, challenge, tx, fenced, rx)
     }
 
     fn gateway() -> Gateway {
@@ -4259,6 +4955,7 @@ mod tests {
             LeaseRecord {
                 claims,
                 provisional: false,
+                offer_opportunity_id: None,
                 mobile_signal: SignalProgress::default(),
                 plugin_signal: SignalProgress::default(),
             },
@@ -4367,6 +5064,7 @@ mod tests {
             LeaseRecord {
                 claims: lease,
                 provisional: false,
+                offer_opportunity_id: None,
                 mobile_signal: SignalProgress {
                     sdp_revision: 4,
                     transport_generation: 2,
@@ -4619,6 +5317,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_plugin_restart_can_reassert_lower_counters_only_once() {
+        let gateway = gateway();
+        let (mut app, _old_plugin_rx, mut mobile_rx) = app_with_peers();
+        let now = unix_now().unwrap();
+        let old_lease = new_claims(
+            "app_a",
+            "plugin_a",
+            "device_a",
+            "call_a",
+            7,
+            3,
+            LeaseMode::Takeover,
+            LeasePhase::Active,
+            17,
+            "mobile_nonce",
+            "rtc_before_restart",
+            &plugin_key().thumbprint,
+            &mobile_key().thumbprint,
+            now,
+        );
+        app.claim = Some(TalkClaim {
+            request_id: "claim_before_restart".into(),
+            device_id: "device_a".into(),
+            mode: LeaseMode::Takeover,
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            fence: 17,
+            lease_jti: old_lease.jti.clone(),
+            active: true,
+        });
+        app.leases.insert(
+            old_lease.jti.clone(),
+            LeaseRecord {
+                claims: old_lease,
+                provisional: false,
+                offer_opportunity_id: None,
+                mobile_signal: SignalProgress::default(),
+                plugin_signal: SignalProgress::default(),
+            },
+        );
+        let (restarted_plugin, mut restarted_plugin_rx) =
+            peer("plugin_conn_restarted", "plugin_nonce_restarted", vec![]);
+        app.plugin = Some(restarted_plugin);
+        gateway
+            .inner
+            .v2
+            .apps
+            .lock()
+            .await
+            .insert("app_a".into(), app);
+
+        let mut restarted_snapshot = snapshot(1);
+        restarted_snapshot.call_epoch = 1;
+        restarted_snapshot.switchboard_revision = 1;
+        restarted_snapshot.remote_revision = 1;
+        handle_snapshot(
+            &gateway,
+            &plugin_admission(),
+            "plugin_conn_restarted",
+            PluginSnapshotFrame {
+                kind: "plugin_snapshot".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                event_id: "snapshot_after_process_restart".into(),
+                snapshot: restarted_snapshot,
+            },
+        )
+        .await
+        .unwrap();
+
+        let revoked = text_json(&mut restarted_plugin_rx).await;
+        assert_eq!(revoked["kind"], "lease_revoked");
+        assert_eq!(revoked["reason"], "plugin_authority_reasserted");
+        let projected = text_json(&mut mobile_rx).await;
+        assert_eq!(projected["kind"], "snapshot");
+        assert_eq!(projected["sequence"], 2);
+        {
+            let apps = gateway.inner.v2.apps.lock().await;
+            let app = &apps["app_a"];
+            assert!(app.leases.is_empty());
+            assert!(app.claim.is_none());
+            assert!(app.idle.is_none());
+            assert_eq!(app.snapshot.as_ref().unwrap().call_epoch, 1);
+            assert!(app.plugin.as_ref().unwrap().authoritative_publication_seen);
+        }
+
+        let mut replayed_snapshot = snapshot(0);
+        replayed_snapshot.call_epoch = 0;
+        replayed_snapshot.switchboard_revision = 0;
+        replayed_snapshot.remote_revision = 0;
+        let error = handle_snapshot(
+            &gateway,
+            &plugin_admission(),
+            "plugin_conn_restarted",
+            PluginSnapshotFrame {
+                kind: "plugin_snapshot".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                event_id: "replayed_snapshot_after_restart".into(),
+                snapshot: replayed_snapshot,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "stale_snapshot");
+        let apps = gateway.inner.v2.apps.lock().await;
+        assert_eq!(apps["app_a"].sequence, 2);
+        assert_eq!(apps["app_a"].snapshot.as_ref().unwrap().call_epoch, 1);
+    }
+
+    #[tokio::test]
     async fn sequence_exhaustion_cannot_apply_an_unpublishable_state_change() {
         let gateway = gateway();
         let (mut app, mut plugin_rx, mut mobile_rx) = app_with_peers();
@@ -4656,6 +5465,7 @@ mod tests {
             LeaseRecord {
                 claims: lease,
                 provisional: false,
+                offer_opportunity_id: None,
                 mobile_signal: SignalProgress::default(),
                 plugin_signal: SignalProgress::default(),
             },
@@ -4859,6 +5669,490 @@ mod tests {
         assert_eq!(idle.sequence, 1);
         assert!(idle.grants.contains(&Grant::StateRead));
         assert_eq!(gateway.inner.v2.stats().await.mobiles, 1);
+    }
+
+    #[tokio::test]
+    async fn sequential_plugin_admission_refresh_preserves_mobile_and_replays_unstarted_takeover() {
+        let gateway = gateway();
+        let (mut app, _old_plugin_rx, mut mobile_rx) = app_with_peers();
+        let mobile_thumbprint = mobile_key().thumbprint;
+        app.approved_mobile_key_thumbprints
+            .insert(mobile_thumbprint.clone());
+        app.peer_roster_revision = Some(9);
+        app.peer_roster_hash = Some("owner_approved_roster_hash".into());
+        let now = unix_now().unwrap();
+        let claims = new_claims(
+            "app_a",
+            "plugin_a",
+            "device_a",
+            "call_a",
+            7,
+            3,
+            LeaseMode::Takeover,
+            LeasePhase::Prepared,
+            1,
+            "mobile_nonce",
+            "rtc_rotation",
+            &plugin_key().thumbprint,
+            &mobile_thumbprint,
+            now,
+        );
+        app.claim = Some(TalkClaim {
+            request_id: "request_rotation".into(),
+            device_id: "device_a".into(),
+            mode: LeaseMode::Takeover,
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            fence: 1,
+            lease_jti: claims.jti.clone(),
+            active: false,
+        });
+        app.leases.insert(
+            claims.jti.clone(),
+            LeaseRecord {
+                claims: claims.clone(),
+                provisional: true,
+                offer_opportunity_id: Some("opportunity_rotation".into()),
+                mobile_signal: SignalProgress::default(),
+                plugin_signal: SignalProgress::default(),
+            },
+        );
+        gateway
+            .inner
+            .v2
+            .apps
+            .lock()
+            .await
+            .insert("app_a".into(), app);
+
+        // The managed plugin refreshes sequentially: its old WebSocket closes
+        // before it obtains and connects the next admission.
+        unregister(&gateway, &plugin_admission(), "plugin_conn").await;
+        {
+            let mut apps = gateway.inner.v2.apps.lock().await;
+            let app = apps.get_mut("app_a").unwrap();
+            assert!(app.plugin.is_none());
+            assert_eq!(app.mobiles.len(), 1);
+            assert!(app.leases.contains_key(&claims.jti));
+            validate_lease_binding(app, &admission("device_a"), &claims, true).unwrap();
+            let signal = RtcSignal::Offer {
+                sdp: "v=0".into(),
+                binding: dummy_binding(TokenRole::Mobile, 1, 1),
+            };
+            advance_signal(
+                &mut app.leases.get_mut(&claims.jti).unwrap().mobile_signal,
+                &signal,
+                1,
+                1,
+            )
+            .unwrap();
+            route_mobile_rtc_to_plugin(
+                app,
+                "app_a",
+                PluginRtcSignalFrame {
+                    kind: "rtc_signal".into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: "app_a".into(),
+                    signal_id: "signal_during_refresh".into(),
+                    plugin_id: "plugin_a".into(),
+                    device_id: "device_a".into(),
+                    lease_jti: claims.jti.clone(),
+                    rtc_session_id: claims.rtc_session_id.clone(),
+                    sdp_revision: 1,
+                    transport_generation: 1,
+                    call_id: claims.call_id.clone(),
+                    call_epoch: claims.call_epoch,
+                    owner_epoch: claims.owner_epoch,
+                    fence: claims.fence,
+                    signal,
+                },
+            )
+            .unwrap();
+            assert_eq!(app.queued_plugin_signals.len(), 1);
+        }
+
+        let (hello, challenge, tx, fenced, mut refreshed_plugin_rx) = plugin_registration(
+            "plugin_conn_refreshed",
+            "plugin_nonce_refreshed",
+            vec![mobile_thumbprint],
+        );
+        register_plugin(
+            &gateway,
+            &plugin_admission(),
+            "plugin_conn_refreshed",
+            hello,
+            &challenge,
+            tx,
+            fenced,
+        )
+        .await
+        .unwrap();
+
+        {
+            let apps = gateway.inner.v2.apps.lock().await;
+            let app = &apps["app_a"];
+            assert_eq!(app.mobiles.len(), 1);
+            assert_eq!(app.mobiles["device_a"].connection_id, "mobile_conn");
+            assert_eq!(
+                app.plugin.as_ref().unwrap().connection_id,
+                "plugin_conn_refreshed"
+            );
+            assert!(app.snapshot.is_some());
+            assert!(app.leases.contains_key(&claims.jti));
+        }
+        let replay = text_json(&mut refreshed_plugin_rx).await;
+        assert_eq!(replay["kind"], "claim_proposal");
+        assert_eq!(replay["requestId"], "request_rotation");
+        assert_eq!(replay["lease"]["jti"], claims.jti);
+        let replayed_signal = text_json(&mut refreshed_plugin_rx).await;
+        assert_eq!(replayed_signal["kind"], "rtc_signal");
+        assert_eq!(replayed_signal["signalId"], "signal_during_refresh");
+        assert_eq!(text_json(&mut mobile_rx).await["kind"], "snapshot");
+    }
+
+    #[tokio::test]
+    async fn overlapping_mobile_admission_refresh_preserves_active_takeover() {
+        let gateway = gateway();
+        let (mut app, _plugin_rx, _old_mobile_rx) = app_with_peers();
+        let mut old_fenced = app
+            .mobiles
+            .get("device_a")
+            .expect("mobile is present")
+            .fenced
+            .subscribe();
+        app.approved_mobile_key_thumbprints
+            .insert(mobile_key().thumbprint);
+        app.snapshot = Some(AuthoritativeCallSnapshot {
+            service_mode: ServiceMode::HumanActive,
+            media_state: MediaState::Active,
+            ..snapshot(4)
+        });
+        let now = unix_now().unwrap();
+        let claims = new_claims(
+            "app_a",
+            "plugin_a",
+            "device_a",
+            "call_a",
+            7,
+            4,
+            LeaseMode::Takeover,
+            LeasePhase::Active,
+            4,
+            "mobile_nonce",
+            "rtc_mobile_rotation",
+            &plugin_key().thumbprint,
+            &mobile_key().thumbprint,
+            now,
+        );
+        app.claim = Some(TalkClaim {
+            request_id: "request_mobile_rotation".into(),
+            device_id: "device_a".into(),
+            mode: LeaseMode::Takeover,
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            fence: 4,
+            lease_jti: claims.jti.clone(),
+            active: true,
+        });
+        app.leases.insert(
+            claims.jti.clone(),
+            LeaseRecord {
+                claims: claims.clone(),
+                provisional: false,
+                offer_opportunity_id: Some("opportunity_mobile_rotation".into()),
+                mobile_signal: SignalProgress {
+                    sdp_revision: 2,
+                    transport_generation: 2,
+                    ..SignalProgress::default()
+                },
+                plugin_signal: SignalProgress {
+                    sdp_revision: 2,
+                    transport_generation: 2,
+                    ..SignalProgress::default()
+                },
+            },
+        );
+        let scopes = app.mobiles["device_a"].grants.clone();
+        gateway
+            .inner
+            .v2
+            .apps
+            .lock()
+            .await
+            .insert("app_a".into(), app);
+
+        let endpoint_key = mobile_key();
+        let connection_id = "mobile_conn_rotated";
+        let admission_jti = "admission_mobile_rotated";
+        let challenge_nonce = "challenge_mobile_rotated";
+        let hello = MobileHello {
+            kind: "mobile_hello".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            device_id: "device_a".into(),
+            session_nonce: "mobile_nonce".into(),
+            endpoint_proof: SignedHelloProof {
+                claims: HelloProofClaims {
+                    app_id: "app_a".into(),
+                    subject_id: "device_a".into(),
+                    role: TokenRole::Mobile,
+                    connection_id: connection_id.into(),
+                    challenge_nonce: challenge_nonce.into(),
+                    admission_jti: admission_jti.into(),
+                    session_nonce: "mobile_nonce".into(),
+                    holder_key_thumbprint: endpoint_key.thumbprint.clone(),
+                    expected_peer_key_thumbprint: Some(plugin_key().thumbprint),
+                    approved_peer_key_thumbprints: vec![],
+                    peer_roster_revision: None,
+                    peer_roster_hash: None,
+                    nonce: "proof_nonce_mobile_rotated".into(),
+                    jti: "proof_mobile_rotated".into(),
+                    issued_at: 1,
+                    expires_at: 2,
+                },
+                endpoint_key: endpoint_key.clone(),
+                signature: "A".repeat(86),
+            },
+        };
+        let challenge = EndpointChallengeFrame {
+            kind: "endpoint_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            subject_id: "device_a".into(),
+            role: TokenRole::Mobile,
+            connection_id: connection_id.into(),
+            challenge_nonce: challenge_nonce.into(),
+            admission_jti: admission_jti.into(),
+            holder_key_thumbprint: endpoint_key.thumbprint,
+            expected_peer_key_thumbprint: Some(plugin_key().thumbprint),
+            approved_peer_key_thumbprints: vec![],
+            peer_roster_revision: None,
+            peer_roster_hash: None,
+            expires_at: now + 60,
+        };
+        let refreshed_admission = Admission {
+            scopes,
+            ..admission("device_a")
+        };
+        let (tx, mut rotated_rx) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (fenced, _) = watch::channel(false);
+        register_mobile(
+            &gateway,
+            &refreshed_admission,
+            connection_id,
+            hello,
+            &challenge,
+            tx,
+            fenced,
+        )
+        .await
+        .unwrap();
+
+        assert!(*old_fenced.borrow_and_update());
+        assert_eq!(text_json(&mut rotated_rx).await["kind"], "snapshot");
+        {
+            let apps = gateway.inner.v2.apps.lock().await;
+            let app = &apps["app_a"];
+            assert_eq!(app.mobiles["device_a"].connection_id, "mobile_conn_rotated");
+            assert!(app.leases.contains_key(&claims.jti));
+            assert_eq!(
+                app.claim.as_ref().map(|claim| claim.lease_jti.as_str()),
+                Some(claims.jti.as_str())
+            );
+            validate_lease_binding(app, &refreshed_admission, &claims, false).unwrap();
+        }
+
+        // Closing the fenced predecessor must not recover/revoke the route
+        // now owned by the already-authoritative overlapping replacement.
+        unregister(&gateway, &refreshed_admission, "mobile_conn").await;
+        let apps = gateway.inner.v2.apps.lock().await;
+        assert!(apps["app_a"].leases.contains_key(&claims.jti));
+        assert!(apps["app_a"].claim.is_some());
+    }
+
+    #[tokio::test]
+    async fn overlapping_plugin_admission_refresh_preserves_active_takeover() {
+        let gateway = gateway();
+        let (mut app, _old_plugin_rx, mut mobile_rx) = app_with_peers();
+        let mobile_thumbprint = mobile_key().thumbprint;
+        app.approved_mobile_key_thumbprints
+            .insert(mobile_thumbprint.clone());
+        app.peer_roster_revision = Some(9);
+        app.peer_roster_hash = Some("owner_approved_roster_hash".into());
+        app.snapshot = Some(AuthoritativeCallSnapshot {
+            service_mode: ServiceMode::HumanActive,
+            media_state: MediaState::Active,
+            ..snapshot(4)
+        });
+        let now = unix_now().unwrap();
+        let claims = new_claims(
+            "app_a",
+            "plugin_a",
+            "device_a",
+            "call_a",
+            7,
+            4,
+            LeaseMode::Takeover,
+            LeasePhase::Active,
+            1,
+            "mobile_nonce",
+            "rtc_active_rotation",
+            &plugin_key().thumbprint,
+            &mobile_thumbprint,
+            now,
+        );
+        app.claim = Some(TalkClaim {
+            request_id: "request_active_rotation".into(),
+            device_id: "device_a".into(),
+            mode: LeaseMode::Takeover,
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            fence: 1,
+            lease_jti: claims.jti.clone(),
+            active: true,
+        });
+        app.leases.insert(
+            claims.jti.clone(),
+            LeaseRecord {
+                claims: claims.clone(),
+                provisional: false,
+                offer_opportunity_id: Some("opportunity_active_rotation".into()),
+                mobile_signal: SignalProgress {
+                    sdp_revision: 2,
+                    transport_generation: 2,
+                    ..SignalProgress::default()
+                },
+                plugin_signal: SignalProgress {
+                    sdp_revision: 2,
+                    transport_generation: 2,
+                    ..SignalProgress::default()
+                },
+            },
+        );
+        gateway
+            .inner
+            .v2
+            .apps
+            .lock()
+            .await
+            .insert("app_a".into(), app);
+
+        // The replacement registers while the predecessor is still live.
+        // This is positive continuity proof for the same endpoint authority,
+        // so an active native/WebRTC route must not be revoked or replayed.
+        let (hello, challenge, tx, fenced, mut refreshed_plugin_rx) = plugin_registration(
+            "plugin_conn_refreshed",
+            "plugin_nonce_refreshed",
+            vec![mobile_thumbprint],
+        );
+        register_plugin(
+            &gateway,
+            &plugin_admission(),
+            "plugin_conn_refreshed",
+            hello,
+            &challenge,
+            tx,
+            fenced,
+        )
+        .await
+        .unwrap();
+
+        {
+            let apps = gateway.inner.v2.apps.lock().await;
+            let app = &apps["app_a"];
+            assert_eq!(
+                app.plugin.as_ref().unwrap().connection_id,
+                "plugin_conn_refreshed"
+            );
+            assert!(app.leases.contains_key(&claims.jti));
+            assert!(app.claim.as_ref().is_some_and(|claim| claim.active));
+            validate_lease_binding(app, &admission("device_a"), &claims, false).unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), refreshed_plugin_rx.recv())
+                .await
+                .is_err(),
+            "an overlapping rotation must retain in-process session state instead of replaying a claim"
+        );
+        assert_ne!(text_json(&mut mobile_rx).await["kind"], "lease_revoked");
+    }
+
+    #[tokio::test]
+    async fn mobile_can_return_a_lease_while_plugin_admission_is_refreshing() {
+        let gateway = gateway();
+        let (mut app, _plugin_rx, mut mobile_rx) = app_with_peers();
+        let now = unix_now().unwrap();
+        let claims = new_claims(
+            "app_a",
+            "plugin_a",
+            "device_a",
+            "call_a",
+            7,
+            3,
+            LeaseMode::Takeover,
+            LeasePhase::Prepared,
+            1,
+            "mobile_nonce",
+            "rtc_return_during_refresh",
+            &plugin_key().thumbprint,
+            &mobile_key().thumbprint,
+            now,
+        );
+        let token = gateway.inner.v2.signer().unwrap().sign(&claims).unwrap();
+        app.claim = Some(TalkClaim {
+            request_id: "claim_return_during_refresh".into(),
+            device_id: "device_a".into(),
+            mode: LeaseMode::Takeover,
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            fence: 1,
+            lease_jti: claims.jti.clone(),
+            active: false,
+        });
+        app.leases.insert(
+            claims.jti.clone(),
+            LeaseRecord {
+                claims: claims.clone(),
+                provisional: true,
+                offer_opportunity_id: None,
+                mobile_signal: SignalProgress::default(),
+                plugin_signal: SignalProgress::default(),
+            },
+        );
+        gateway
+            .inner
+            .v2
+            .apps
+            .lock()
+            .await
+            .insert("app_a".into(), app);
+
+        unregister(&gateway, &plugin_admission(), "plugin_conn").await;
+        handle_mobile_revoke(
+            &gateway,
+            &admission("device_a"),
+            "mobile_conn",
+            LeaseRevokeFrame {
+                kind: "lease_revoke".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                request_id: "return_during_refresh".into(),
+                idempotency_key: "mobile:device_a:return-during-refresh".into(),
+                lease_token: token,
+                reason: "operator_return".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = text_json(&mut mobile_rx).await;
+        assert_eq!(response["kind"], "lease_revoked");
+        assert_eq!(response["requestId"], "return_during_refresh");
+        let apps = gateway.inner.v2.apps.lock().await;
+        let app = &apps["app_a"];
+        assert!(app.leases.is_empty());
+        assert!(app.claim.is_none());
+        assert!(!app.plugin_reconnect_resumable_leases.contains(&claims.jti));
     }
 
     #[test]
@@ -5300,7 +6594,7 @@ mod tests {
         let gateway = gateway();
         let (mut app, mut plugin_rx, mut mobile_rx) = app_with_peers();
         let now = unix_now().unwrap();
-        let claims = new_claims(
+        let mut claims = new_claims(
             "app_a",
             "plugin_a",
             "device_a",
@@ -5316,6 +6610,7 @@ mod tests {
             &mobile_key().thumbprint,
             now,
         );
+        claims.expires_at = now + LEASE_TTL - 1;
         let old_token = gateway.inner.v2.signer().unwrap().sign(&claims).unwrap();
         let old_jti = claims.jti.clone();
         let stable_lease_id = claims.lease_id.clone();
@@ -5324,6 +6619,7 @@ mod tests {
             LeaseRecord {
                 claims,
                 provisional: false,
+                offer_opportunity_id: None,
                 mobile_signal: SignalProgress::default(),
                 plugin_signal: SignalProgress::default(),
             },
@@ -5381,6 +6677,74 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(rejected.code, "invalid_lease");
+    }
+
+    #[tokio::test]
+    async fn same_second_heartbeat_retains_the_current_lease() {
+        let gateway = gateway();
+        let (mut app, mut plugin_rx, mut mobile_rx) = app_with_peers();
+        let now = unix_now().unwrap();
+        let claims = new_claims(
+            "app_a",
+            "plugin_a",
+            "device_a",
+            "call_a",
+            7,
+            3,
+            LeaseMode::Takeover,
+            LeasePhase::Active,
+            9,
+            "mobile_nonce",
+            "rtc_a",
+            &plugin_key().thumbprint,
+            &mobile_key().thumbprint,
+            now,
+        );
+        let token = gateway.inner.v2.signer().unwrap().sign(&claims).unwrap();
+        let original_jti = claims.jti.clone();
+        app.leases.insert(
+            claims.jti.clone(),
+            LeaseRecord {
+                claims,
+                provisional: false,
+                offer_opportunity_id: None,
+                mobile_signal: SignalProgress::default(),
+                plugin_signal: SignalProgress::default(),
+            },
+        );
+        gateway
+            .inner
+            .v2
+            .apps
+            .lock()
+            .await
+            .insert("app_a".into(), app);
+
+        handle_lease_heartbeat(
+            &gateway,
+            &admission("device_a"),
+            "mobile_conn",
+            LeaseHeartbeatFrame {
+                kind: "lease_heartbeat".into(),
+                schema_version: 2,
+                app_id: "app_a".into(),
+                request_id: "heartbeat_fresh".into(),
+                idempotency_key: "heartbeat-key-fresh".into(),
+                lease_token: token,
+            },
+        )
+        .await
+        .unwrap();
+
+        let Message::Text(response) = mobile_rx.recv().await.unwrap() else {
+            panic!("expected not-due response")
+        };
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["code"], "renewal_not_due");
+        assert!(plugin_rx.try_recv().is_err());
+        let apps = gateway.inner.v2.apps.lock().await;
+        assert!(apps["app_a"].leases.contains_key(&original_jti));
+        assert_eq!(apps["app_a"].leases.len(), 1);
     }
 
     #[test]
@@ -5632,6 +6996,78 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_accepted_offer_reopens_takeover_after_device_recovery() {
+        let gateway = gateway();
+        let (mut app, _plugin_rx, _mobile_rx) = app_with_peers();
+        let now = unix_now().unwrap();
+        refresh_pending_mobile_offers(&mut app, "app_a", gateway.inner.v2.signer().unwrap(), now)
+            .unwrap();
+        let accepted = app
+            .pending_mobile_offers
+            .values()
+            .find(|signed| signed.offer.offered_mode == LeaseMode::Takeover)
+            .unwrap()
+            .offer
+            .clone();
+        app.pending_mobile_offers
+            .retain(|_, signed| signed.offer.opportunity_id != accepted.opportunity_id);
+        app.mobile_offer_winners
+            .insert(accepted.opportunity_id.clone(), accepted.jti.clone());
+        app.accepted_mobile_offers
+            .insert(accepted.jti.clone(), accepted.clone());
+
+        recover_device(&mut app, "app_a", "device_a", "session_replaced");
+
+        assert!(app.accepted_mobile_offers.is_empty());
+        assert!(app.mobile_offer_winners.is_empty());
+        refresh_pending_mobile_offers(&mut app, "app_a", gateway.inner.v2.signer().unwrap(), now)
+            .unwrap();
+        assert!(app.pending_mobile_offers.values().any(|signed| {
+            signed.offer.offered_mode == LeaseMode::Takeover
+                && signed.offer.opportunity_id == accepted.opportunity_id
+                && signed.offer.jti != accepted.jti
+        }));
+    }
+
+    #[test]
+    fn expired_accepted_offer_reopens_takeover_without_call_epoch_change() {
+        let gateway = gateway();
+        let (mut app, _plugin_rx, _mobile_rx) = app_with_peers();
+        let now = unix_now().unwrap();
+        refresh_pending_mobile_offers(&mut app, "app_a", gateway.inner.v2.signer().unwrap(), now)
+            .unwrap();
+        let accepted = app
+            .pending_mobile_offers
+            .values()
+            .find(|signed| signed.offer.offered_mode == LeaseMode::Takeover)
+            .unwrap()
+            .offer
+            .clone();
+        app.pending_mobile_offers
+            .retain(|_, signed| signed.offer.opportunity_id != accepted.opportunity_id);
+        app.mobile_offer_winners
+            .insert(accepted.opportunity_id.clone(), accepted.jti.clone());
+        app.accepted_mobile_offers
+            .insert(accepted.jti.clone(), accepted.clone());
+
+        refresh_pending_mobile_offers(
+            &mut app,
+            "app_a",
+            gateway.inner.v2.signer().unwrap(),
+            accepted.expires_at,
+        )
+        .unwrap();
+
+        assert!(!app.accepted_mobile_offers.contains_key(&accepted.jti));
+        assert_eq!(app.mobile_offer_winners.get(&accepted.opportunity_id), None);
+        assert!(app.pending_mobile_offers.values().any(|signed| {
+            signed.offer.offered_mode == LeaseMode::Takeover
+                && signed.offer.opportunity_id == accepted.opportunity_id
+                && signed.offer.jti != accepted.jti
+        }));
+    }
+
+    #[test]
     fn signal_dedupe_is_bounded_and_sender_specific() {
         let mut app = V2App::default();
         assert!(app.remember_signal("mobile:a", "signal_1"));
@@ -5672,11 +7108,16 @@ mod tests {
             lease_jti: claims.jti.clone(),
             active: false,
         });
+        let opportunity_id =
+            mobile_opportunity_id("app_a", &claims.call_id, claims.owner_epoch, claims.mode);
+        app.mobile_offer_winners
+            .insert(opportunity_id.clone(), "accepted_offer_jti".into());
         app.leases.insert(
             claims.jti.clone(),
             LeaseRecord {
                 claims,
                 provisional: true,
+                offer_opportunity_id: Some(opportunity_id),
                 mobile_signal: SignalProgress::default(),
                 plugin_signal: SignalProgress::default(),
             },
@@ -5684,6 +7125,7 @@ mod tests {
         recover_device(&mut app, "app_a", "device_a", "endpoint_disconnected");
         assert!(app.leases.is_empty());
         assert!(app.claim.is_none());
+        assert!(app.mobile_offer_winners.is_empty());
         let Message::Text(notice) = plugin_rx.try_recv().unwrap() else {
             panic!("expected revocation notice")
         };
@@ -5721,11 +7163,12 @@ mod tests {
             fence: 9,
             signal: RtcSignal::Offer {
                 sdp: "v=0".into(),
-                binding: dummy_binding(TokenRole::Plugin, 1, 1),
+                binding: dummy_binding(TokenRole::Mobile, 1, 1),
             },
         };
         let encoded = serialize(&routed).unwrap();
         assert!(encoded.contains("deviceId"));
+        assert!(encoded.contains("\"endpointRole\":\"mobile\""));
         assert!(!encoded.contains("pcm"));
         assert!(!encoded.contains("rtp"));
     }

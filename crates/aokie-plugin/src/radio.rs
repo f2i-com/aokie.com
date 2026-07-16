@@ -5825,7 +5825,17 @@ fn run_loop(
                     let same_call = tracker
                         .current()
                         .is_some_and(|call| call.is_active() && call.id == binding.call_id);
-                    if same_call && bt.get_sample_rate() > 0 {
+                    let sample_rate = bt.get_sample_rate();
+                    eprintln!(
+                        "[aokie-plugin][takeover] stage=radio_prepare call={} same_call={} sample_rate={} owner_epoch={} fence={} rtc={}",
+                        binding.call_id,
+                        same_call,
+                        sample_rate,
+                        binding.owner_epoch,
+                        binding.fence,
+                        binding.rtc_session_id
+                    );
+                    if same_call && sample_rate > 0 {
                         // Receive-only preparation: flush Aokie's tail and
                         // advance the ownership epoch, but do not install a
                         // microphone RoutePermit. A fresh active offer is
@@ -5836,6 +5846,11 @@ fn run_loop(
                                 "[aokie-plugin] Companion soft-hold physical ACK refused: {error}"
                             );
                             let _ = remote_media.revoke(&binding, "physical_prepare_failed");
+                        } else {
+                            eprintln!(
+                                "[aokie-plugin][takeover] stage=radio_prepare_acked call={} fence={} rtc={}",
+                                binding.call_id, binding.fence, binding.rtc_session_id
+                            );
                         }
                     } else {
                         let _ = remote_media.revoke(
@@ -5927,7 +5942,17 @@ fn run_loop(
                     let same_call = tracker
                         .current()
                         .is_some_and(|call| call.is_active() && call.id == binding.call_id);
-                    if same_call && bt.get_sample_rate() > 0 {
+                    let sample_rate = bt.get_sample_rate();
+                    eprintln!(
+                        "[aokie-plugin][takeover] stage=radio_enter call={} same_call={} sample_rate={} owner_epoch={} fence={} rtc={}",
+                        binding.call_id,
+                        same_call,
+                        sample_rate,
+                        binding.owner_epoch,
+                        binding.fence,
+                        binding.rtc_session_id
+                    );
+                    if same_call && sample_rate > 0 {
                         // Pending state already blocks every Aokie/TTS TX
                         // chokepoint. Remove its previously queued tail, then
                         // open the exact permit/fence.
@@ -5937,6 +5962,11 @@ fn run_loop(
                                 "[aokie-plugin] Companion takeover physical ACK refused: {error}"
                             );
                             let _ = remote_media.revoke(&binding, "physical_ack_failed");
+                        } else {
+                            eprintln!(
+                                "[aokie-plugin][takeover] stage=radio_enter_acked call={} fence={} rtc={}",
+                                binding.call_id, binding.fence, binding.rtc_session_id
+                            );
                         }
                     } else {
                         let _ = remote_media.revoke(
@@ -5996,6 +6026,7 @@ fn run_loop(
         // Consult audio lives on a distinct queue and can never arrive here.
         let remote_tx_rate = bt.get_sample_rate() as u32;
         if remote_tx_rate > 0 {
+            let talk_binding = remote_media.active_talk_binding();
             for _ in 0..24 {
                 let Some(frame) = remote_media.try_recv_talk_pcm() else {
                     break;
@@ -6009,7 +6040,11 @@ fn run_loop(
                     // Explicitly caller-owned TX; this is the one path that
                     // intentionally bypasses Aokie/TTS suppression.
                     remote_media.try_push_caller_output(&pcm, remote_tx_rate);
-                    bt.send_audio(&pcm);
+                    if aokie_dongle::bluetooth::BluetoothManager::send_audio(bt, &pcm) {
+                        if let Some(binding) = talk_binding.as_ref() {
+                            remote_media.mark_talk_audio_forwarded(binding, &pcm);
+                        }
+                    }
                 }
             }
         }

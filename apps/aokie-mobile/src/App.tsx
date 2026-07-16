@@ -4,9 +4,11 @@ import {
   ArrowLeft,
   Bot,
   CheckCircle2,
+  Clock3,
   Headphones,
   History,
   LockKeyhole,
+  MessageSquareText,
   Mic,
   PhoneOff,
   Radio,
@@ -14,6 +16,7 @@ import {
   Send,
   Server,
   ShieldCheck,
+  Sparkles,
   Smartphone,
   Users,
   Volume2,
@@ -118,6 +121,13 @@ export function shouldAcceptV2AuthoritativeSequence(
 export function assistanceExpiryDelayMs(expiresAtSeconds: number, nowMs = Date.now()): number {
   if (!Number.isSafeInteger(expiresAtSeconds) || expiresAtSeconds <= 0 || !Number.isFinite(nowMs)) return 0;
   return Math.max(0, Math.min(expiresAtSeconds * 1_000 - nowMs, 2_147_000_000));
+}
+
+export function formatAssistanceCountdown(remainingSeconds: number): string {
+  const bounded = Number.isFinite(remainingSeconds) ? Math.max(0, Math.floor(remainingSeconds)) : 0;
+  const minutes = Math.floor(bounded / 60);
+  const seconds = bounded % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
 const V2_OFFER_CLOCK_SKEW_SECONDS = 5;
@@ -285,6 +295,11 @@ export function shouldAutoArmConfirmedTakeover(
   );
 }
 
+export function isRetryableMediaArmFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /WebRTC is still connecting|before WebRTC is connected/i.test(message);
+}
+
 function nativeMediaSessionAttemptKey(session: NativeMediaSession): string {
   return [
     session.appId,
@@ -321,6 +336,27 @@ export function isExactCurrentV2NativeMediaSession(
     && native.transportGeneration === expected.transportGeneration
     && Number.isFinite(Date.parse(expected.expiresAt))
     && Date.parse(expected.expiresAt) > nowMilliseconds;
+}
+
+export function isExpectedPreparedTakeoverReplacement(
+  target: ConfirmedTakeoverTarget | null,
+  lease: V2LeaseEvent | null,
+  nativeMediaState: NativeMediaStateEvent,
+  nowMilliseconds = Date.now(),
+): boolean {
+  return Boolean(
+    target && lease &&
+    nativeMediaState.phase === "replaced" &&
+    nativeMediaState.session.mode === "prepared_talk" &&
+    lease.mode === "takeover" &&
+    lease.phase === "prepared" &&
+    lease.provisional &&
+    lease.session.ownerEpoch === target.ownerEpoch &&
+    lease.session.appId === target.appId &&
+    lease.session.callId === target.callId &&
+    lease.session.callEpoch === target.callEpoch &&
+    isExactCurrentV2NativeMediaSession(lease, nativeMediaState, nowMilliseconds),
+  );
 }
 
 export function currentV2InAppOffer(
@@ -375,6 +411,7 @@ function App() {
   const [v2Snapshot, setV2Snapshot] = useState<V2CallSnapshotEvent | null>(null);
   const [v2IdleSync, setV2IdleSync] = useState<V2IdleSyncEvent | null>(null);
   const [v2Lease, setV2Lease] = useState<V2LeaseEvent | null>(null);
+  const v2LeaseRef = useRef<V2LeaseEvent | null>(null);
   const [v2Assistance, setV2Assistance] = useState<V2AssistanceRequestEvent | null>(null);
   const [v2AssistanceAccepted, setV2AssistanceAccepted] = useState<V2AssistanceAnswerAcceptedEvent | null>(null);
   const [v2EndCaller, setV2EndCaller] = useState<V2EndCallerEvent | null>(null);
@@ -427,10 +464,15 @@ function App() {
       else if (event.type === "media_state") {
         setNativeMediaState(event.value);
         const terminalMedia = ["closed", "expired", "failed", "revoked", "replaced"].includes(event.value.phase);
+        const expectedTakeoverUpgrade = isExpectedPreparedTakeoverReplacement(
+          v2TakeoverAttemptRef.current.target,
+          v2LeaseRef.current,
+          event.value,
+        );
         if (!event.value.microphoneActive || terminalMedia) {
           setLocalMediaProof(null);
         }
-        if (terminalMedia && protocolVersionRef.current === 2) {
+        if (terminalMedia && !expectedTakeoverUpgrade && protocolVersionRef.current === 2) {
           transitionV2TakeoverAttempt({ type: "failed_or_idle" });
           v2AutoArmAttemptedSessions.current.clear();
           setV2AutoArmInFlight(false);
@@ -444,6 +486,7 @@ function App() {
           transitionV2TakeoverAttempt({ type: "failed_or_idle" });
           v2AutoArmAttemptedSessions.current.clear();
           setV2AutoArmInFlight(false);
+          v2LeaseRef.current = null;
           setV2Lease(null);
           setV2Assistance(null);
           setV2AssistanceAccepted(null);
@@ -461,6 +504,7 @@ function App() {
         v2CallId.current = null;
         setV2Snapshot(null);
         setV2IdleSync(event.value);
+        v2LeaseRef.current = null;
         setV2Lease(null);
         setV2Assistance(null);
         setV2AssistanceAccepted(null);
@@ -473,6 +517,7 @@ function App() {
         v2FailureDispatch({ type: "authoritative_idle" });
       }
       else if (event.type === "v2_lease") {
+        v2LeaseRef.current = event.value;
         setV2Lease(event.value);
         if (event.value?.mode === "takeover" && (event.value.provisional || event.value.phase === "prepared" || event.value.phase === "active")) {
           transitionV2TakeoverAttempt({ type: "lease_published" });
@@ -541,6 +586,7 @@ function App() {
           v2LastSequence.current = 0;
           setLocalMediaProof(null);
           setNativeMediaState(null);
+          v2LeaseRef.current = null;
           setV2Lease(null);
           setV2Assistance(null);
           setV2AssistanceAccepted(null);
@@ -637,6 +683,8 @@ function App() {
     void bridge.armMediaMicrophone(media.session)
       .catch((caught) => {
         if (v2TakeoverAttemptRef.current.generation !== armGeneration) return;
+        v2AutoArmAttemptedSessions.current.delete(attemptKey);
+        if (isRetryableMediaArmFailure(caught)) return;
         reportV2Failure(
           displayError(caught, "Takeover was accepted, but the microphone could not be armed. You can retry with Unmute microphone."),
           "microphone",
@@ -671,6 +719,7 @@ function App() {
     setV2Snapshot(null);
     setV2IdleSync(null);
     v2CallId.current = null;
+    v2LeaseRef.current = null;
     setV2Lease(null);
     setV2Assistance(null);
     setV2AssistanceAccepted(null);
@@ -710,6 +759,7 @@ function App() {
       setV2Snapshot(null);
       setV2IdleSync(null);
       v2CallId.current = null;
+      v2LeaseRef.current = null;
       setV2Lease(null);
       setV2Assistance(null);
       setV2AssistanceAccepted(null);
@@ -1540,7 +1590,7 @@ function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistan
   const monitorAllowed = Boolean(monitorOffer && mediaUsable && currentConsent && call?.remoteConsent.monitorEnabled && grants.has("monitor"));
   const takeoverAllowed = Boolean(takeoverOffer && mediaUsable && currentConsent && call?.remoteCapabilities.takeover && call.remoteConsent.takeoverEnabled && grants.has("takeover") && grants.has("resume_aokie"));
   const assistanceMatchesCall = assistanceMatchesV2Call(assistance, call);
-  const assistanceAllowed = Boolean(assistanceMatchesCall && currentConsent && call?.remoteConsent.assistanceEnabled && grants.has("assistance_read") && grants.has("assistance_respond"));
+  const assistanceAllowed = Boolean(connected && assistanceMatchesCall && currentConsent && call?.remoteConsent.assistanceEnabled && grants.has("assistance_read") && grants.has("assistance_respond"));
   const assistanceRemaining = assistanceMatchesCall && assistance ? Math.max(0, assistance.expiresAt - nowSeconds) : 0;
   const consultAllowed = Boolean(
     consultOffer && mediaUsable && currentConsent && call?.remoteCapabilities.softwareHold && call.remoteCapabilities.voiceConsult &&
@@ -1586,6 +1636,7 @@ function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistan
   );
   const truthfulTalkProof = Boolean(
     lease?.mode === "takeover" && lease.phase === "active" && exactNativeSession &&
+    call?.mediaState === "active" &&
     nativeMediaState?.microphoneActive && nativeMediaState.remoteAudioReady && exactLocalMediaProof &&
     localMediaProof?.mode === "talk",
   );
@@ -1705,6 +1756,27 @@ function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistan
           {currentAccessPolicy && <aside className="media-gate" aria-label="Current access policy"><LockKeyhole size={19} /><div><strong>{currentAccessPolicy.title}</strong><p>{currentAccessPolicy.detail}</p></div></aside>}
           {nativeMediaState && <section className="runtime-proof" aria-label="Native media state"><span><Radio size={14} /> {nativeMediaState.session.mode} · {nativeMediaState.phase}</span><span><Headphones size={14} /> {nativeMediaState.remoteAudioReady ? "Caller audio ready" : "Waiting for caller audio"}</span><span><Mic size={14} /> {nativeMediaState.microphoneActive ? "Microphone armed" : "Microphone blocked"}</span></section>}
           {call?.telephonyState !== "ended" && audioEndpointControls}
+          {assistance && <V2AssistanceRequestCard
+            assistance={assistance}
+            remainingSeconds={assistanceRemaining}
+            answer={assistanceAnswer}
+            available={assistanceAllowed}
+            busy={busy}
+            awaitingAcknowledgement={assistanceAwaitingAcknowledgement === assistance.requestId}
+            onAnswerChange={setAssistanceAnswer}
+            onSubmit={() => {
+              const requestId = assistance.requestId;
+              const answer = assistanceAnswer.trim();
+              void run(
+                () => onAnswerAssistance(requestId, answer),
+                "request",
+                "The private answer could not be queued",
+              ).then((accepted) => {
+                if (accepted) setAssistanceAwaitingAcknowledgement(requestId);
+              });
+            }}
+          />}
+          {assistance && assistanceRemaining > 0 && !lease && <aside className="media-gate assistance-consult"><Mic size={19} /><div><strong>Would you rather speak with Aokie?</strong><p>Start a private consultation. Desktop isolates the caller on software hold before this microphone can open.</p><button className="primary-button" disabled={!consultAllowed || busy || assistanceAwaitingAcknowledgement === assistance.requestId} onClick={() => void run(() => onRequestLease("consult"))}>Consult privately with Aokie</button></div></aside>}
           {call?.secondaryCall && call.remoteCapabilities.secondaryCallObservation === "observed" && (
             <section className="secondary-call-banner" aria-label="Screened secondary caller status">
               <PhoneOff size={19} />
@@ -1714,8 +1786,6 @@ function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistan
           )}
           <V2Participants participants={call?.participants ?? []} audioLevels={call?.audioLevels} />
           <section className="runtime-captions"><div className="section-title-line"><h2>Live captions</h2><span>Protocol v2</span></div>{!grants.has("captions_read") ? <p className="runtime-muted">Caption access is not granted for this device.</p> : call?.captions?.length ? call.captions.map((caption) => <article key={caption.captionId}><strong>{caption.speaker}</strong><p>{caption.text}</p><time>{new Date(caption.occurredAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></article>) : <p className="runtime-muted">No permission-filtered captions have arrived.</p>}</section>
-          {assistance && <section className="runtime-captions" aria-label="Aokie assistance request"><div className="section-title-line"><h2>Aokie needs a typed answer</h2><span>{assistanceRemaining}s</span></div><article><strong>Private v2 request</strong><p>{assistance.question}</p>{assistance.context && <small>{assistance.context}</small>}</article>{assistanceAllowed && assistanceRemaining > 0 ? <><label className="answer-field"><span>Your one-use answer</span><textarea rows={3} value={assistanceAnswer} maxLength={2_000} disabled={assistanceAwaitingAcknowledgement === assistance.requestId} onChange={(event) => setAssistanceAnswer(event.target.value)} /></label><button className="primary-button" disabled={busy || assistanceAwaitingAcknowledgement === assistance.requestId || !assistanceAnswer.trim()} onClick={() => { const requestId = assistance.requestId; const answer = assistanceAnswer.trim(); void run(() => onAnswerAssistance(requestId, answer), "request", "The private answer could not be queued").then((accepted) => { if (accepted) setAssistanceAwaitingAcknowledgement(requestId); }); }}><Send size={17} /> {assistanceAwaitingAcknowledgement === assistance.requestId ? "Waiting for Aokie…" : "Send privately to Aokie"}</button><p className="runtime-muted">{assistanceAwaitingAcknowledgement === assistance.requestId ? "Answer queued once. Waiting for the authenticated gateway acknowledgement." : "Typed signalling only. This does not open your microphone."}</p></> : <p className="runtime-muted">Answering is locked because consent, admission, or the request lifetime is no longer current.</p>}</section>}
-          {assistance && assistanceRemaining > 0 && !lease && <aside className="media-gate"><Mic size={19} /><div><strong>Private voice consultation</strong><p>Desktop first isolates the caller on software hold. Only after that proof will this device request and arm its microphone.</p><button className="primary-button" disabled={!consultAllowed || busy || assistanceAwaitingAcknowledgement === assistance.requestId} onClick={() => void run(() => onRequestLease("consult"))}>Consult privately with Aokie</button></div></aside>}
           {!runtime.mediaBridge && <aside className="media-gate"><AlertTriangle size={19} /><div><strong>Native voice bridge is unavailable</strong><p>Lease controls remain locked because this runtime cannot prove native WebRTC/audio readiness.</p></div></aside>}
           {endCallerSubmitted && <div className="setup-result is-warning" role="status"><RefreshCw className="spin" size={18} /><span>End request accepted. Waiting for Desktop to confirm the cellular call has ended.</span></div>}
           {endCallerCompleted && <div className="setup-result is-success" role="status"><CheckCircle2 size={18} /><span>Desktop confirmed that the caller call ended.</span></div>}
@@ -1892,6 +1962,71 @@ function V2AssistanceAcceptedNotice({ onDismiss }: { onDismiss(): void }) {
       </div>
       <button type="button" onClick={onDismiss} aria-label="Dismiss assistance delivery confirmation">Dismiss</button>
     </div>
+  );
+}
+
+function V2AssistanceRequestCard({ assistance, remainingSeconds, answer, available, busy, awaitingAcknowledgement, onAnswerChange, onSubmit }: {
+  assistance: V2AssistanceRequestEvent;
+  remainingSeconds: number;
+  answer: string;
+  available: boolean;
+  busy: boolean;
+  awaitingAcknowledgement: boolean;
+  onAnswerChange(value: string): void;
+  onSubmit(): void;
+}) {
+  const expired = remainingSeconds <= 0;
+  const enabled = available && !expired;
+  const urgency = expired ? "is-expired" : remainingSeconds <= 10 ? "is-urgent" : "";
+  const countdown = formatAssistanceCountdown(remainingSeconds);
+  return (
+    <section className={`runtime-assistance ${urgency}`} aria-labelledby="v2-assistance-title">
+      <header className="assistance-header">
+        <span className="assistance-aokie-mark"><Sparkles size={21} /></span>
+        <div>
+          <span className="section-kicker">PRIVATE REQUEST FROM AOKIE</span>
+          <h2 id="v2-assistance-title">Aokie needs your confirmation</h2>
+          <p>Your response goes privately to Aokie, not to the caller.</p>
+        </div>
+        <span className={`assistance-countdown ${urgency}`} aria-label={expired ? "Request expired" : `${remainingSeconds} seconds remaining`}>
+          <Clock3 size={15} />
+          <span><strong>{countdown}</strong><small>{expired ? "expired" : "remaining"}</small></span>
+        </span>
+      </header>
+      <article className="assistance-question">
+        <div className="assistance-question-label"><MessageSquareText size={16} /><span>Question from Aokie</span></div>
+        <p>{assistance.question}</p>
+        {assistance.context && <aside className="assistance-context"><span>Call context</span><small>{assistance.context}</small></aside>}
+      </article>
+      {enabled ? (
+        <>
+          <label className="assistance-answer-field" htmlFor="v2-assistance-answer">
+            <span><strong>Your private answer</strong><small>{answer.length.toLocaleString()} / {MAX_ASSISTANCE_ANSWER_CHARACTERS.toLocaleString()}</small></span>
+            <textarea
+              id="v2-assistance-answer"
+              rows={3}
+              value={answer}
+              maxLength={MAX_ASSISTANCE_ANSWER_CHARACTERS}
+              disabled={awaitingAcknowledgement}
+              placeholder="Type the confirmation or detail Aokie needs…"
+              onChange={(event) => onAnswerChange(event.target.value)}
+            />
+          </label>
+          <div className="assistance-submit-row">
+            <button className="primary-button" disabled={busy || awaitingAcknowledgement || !answer.trim()} onClick={onSubmit}>
+              {awaitingAcknowledgement ? <RefreshCw className="spin" size={17} /> : <Send size={17} />}
+              {awaitingAcknowledgement ? "Waiting for Aokie…" : "Send answer privately"}
+            </button>
+            <p><ShieldCheck size={14} />{awaitingAcknowledgement ? "Sent once. Waiting for authenticated acknowledgement." : "Typed signalling only. Your microphone stays off."}</p>
+          </div>
+        </>
+      ) : (
+        <div className="assistance-locked" role="status">
+          {expired ? <Clock3 size={18} /> : <LockKeyhole size={18} />}
+          <div><strong>{expired ? "This request has expired" : "Reply is currently locked"}</strong><p>{expired ? "Wait for Aokie to send a fresh question before replying." : "Consent, admission, or the signed request is no longer current."}</p></div>
+        </div>
+      )}
+    </section>
   );
 }
 
