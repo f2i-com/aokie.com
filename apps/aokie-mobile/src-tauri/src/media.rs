@@ -6,8 +6,8 @@ use std::time::Duration;
 use std::collections::HashSet;
 
 use aokie_media::{
-    CompanionPeer, IceCandidateSignal, IceServerConfig, MediaMode, PeerEvent, PeerOptions,
-    SdpSignal, SessionBinding,
+    CompanionPeer, IceCandidateSignal, IceServerConfig, MediaError, MediaMode, PeerEvent,
+    PeerOptions, SdpSignal, SessionBinding,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -698,6 +698,16 @@ pub async fn media_arm_microphone(
         )
         .await?;
     }
+    if !active.peer.lock().await.is_connected() {
+        emit_status(
+            &app,
+            &active,
+            "connecting",
+            Some("WebRTC is still connecting; microphone arm will be retried".into()),
+        )
+        .await;
+        return Err("native WebRTC is still connecting; retry microphone arm".into());
+    }
     if let Err(message) = ensure_microphone_permission(&app).await {
         state
             .close_if_current(
@@ -710,12 +720,35 @@ pub async fn media_arm_microphone(
         return Err(message);
     }
     let lifetime = remaining_lifetime(request.session.expires_at)?;
-    if let Err(error) = active
-        .peer
-        .lock()
-        .await
-        .arm_microphone(&request.session.binding, lifetime)
-    {
+    let arm_result = {
+        let peer = active.peer.lock().await;
+        if !peer.is_connected() {
+            drop(peer);
+            emit_status(
+                &app,
+                &active,
+                "connecting",
+                Some("WebRTC is still connecting; microphone arm will be retried".into()),
+            )
+            .await;
+            return Err("native WebRTC is still connecting; retry microphone arm".into());
+        }
+        peer.arm_microphone(&request.session.binding, lifetime)
+    };
+    if let Err(error) = arm_result {
+        if matches!(
+            error,
+            MediaError::UnsafeTransition("microphone cannot open before WebRTC is connected")
+        ) {
+            emit_status(
+                &app,
+                &active,
+                "connecting",
+                Some("WebRTC is still connecting; microphone arm will be retried".into()),
+            )
+            .await;
+            return Err("native WebRTC is still connecting; retry microphone arm".into());
+        }
         state
             .close_if_current(
                 &app,
@@ -796,18 +829,8 @@ pub(crate) async fn renew_lease(
     let lifetime = remaining_lifetime(request.session.expires_at)?;
     if active.evidence.microphone_active.load(Ordering::Acquire) {
         let peer = active.peer.lock().await;
-        peer.disarm_microphone();
-        active
-            .evidence
-            .microphone_active
-            .store(false, Ordering::Release);
-        reset_proof_if_active(app, &active.evidence);
-        peer.arm_microphone(&request.session.binding, lifetime)
+        peer.renew_microphone_lease(&request.session.binding, lifetime)
             .map_err(|error| error.to_string())?;
-        active
-            .evidence
-            .microphone_active
-            .store(true, Ordering::Release);
     }
     *active.session.write().await = request.session;
     emit_status(app, &active, "lease_renewed", None).await;
@@ -908,7 +931,13 @@ async fn watch_peer(state: NativeMediaState, app: AppHandle, active: ActiveMedia
                     .evidence
                     .remote_audio_ready
                     .store(true, Ordering::Release);
-                emit_status(&app, &active, "remote_audio_ready", None).await;
+                emit_status(
+                    &app,
+                    &active,
+                    remote_audio_status_phase(active.evidence.connected.load(Ordering::Acquire)),
+                    None,
+                )
+                .await;
             }
             Ok(Some(PeerEvent::ConnectionState(connection))) => {
                 let connected = connection == "connected";
@@ -1073,16 +1102,41 @@ async fn emit_status(
     phase: &'static str,
     reason: Option<String>,
 ) {
+    let session = active.session.read().await.clone();
+    let microphone_active = active.evidence.microphone_active.load(Ordering::Acquire);
+    let remote_audio_ready = active.evidence.remote_audio_ready.load(Ordering::Acquire);
+    eprintln!(
+        "[AokieCompanion][media] phase={} call={} rtc={} mode={:?} connected={} remote_audio_ready={} microphone_active={}{}",
+        phase,
+        session.binding.call_id,
+        session.binding.rtc_session_id,
+        session.binding.mode,
+        active.evidence.connected.load(Ordering::Acquire),
+        remote_audio_ready,
+        microphone_active,
+        reason
+            .as_deref()
+            .map(|value| format!(" reason={value}"))
+            .unwrap_or_default(),
+    );
     let _ = app.emit(
         "aokie-companion://media-state",
         MediaStatusEvent {
-            session: active.session.read().await.clone(),
+            session,
             phase,
-            microphone_active: active.evidence.microphone_active.load(Ordering::Acquire),
-            remote_audio_ready: active.evidence.remote_audio_ready.load(Ordering::Acquire),
+            microphone_active,
+            remote_audio_ready,
             reason,
         },
     );
+}
+
+fn remote_audio_status_phase(connected: bool) -> &'static str {
+    if connected {
+        "remote_audio_ready"
+    } else {
+        "connecting"
+    }
 }
 
 async fn emit_signal(app: &AppHandle, active: &ActiveMedia, signal: LocalSignal) {
@@ -1494,6 +1548,12 @@ mod tests {
         assert!(validate_audio_device_id("").is_err());
         assert!(validate_audio_device_id("speaker\nendpoint").is_err());
         assert!(validate_audio_device_id(&"x".repeat(1_025)).is_err());
+    }
+
+    #[test]
+    fn early_remote_track_does_not_claim_microphone_arm_readiness() {
+        assert_eq!(remote_audio_status_phase(false), "connecting");
+        assert_eq!(remote_audio_status_phase(true), "remote_audio_ready");
     }
 
     #[cfg(target_os = "windows")]

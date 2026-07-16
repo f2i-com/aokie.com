@@ -679,6 +679,17 @@ enum WorkerErrorKind {
     Rebootstrap,
 }
 
+impl WorkerErrorKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Reconnect => "reconnect",
+            Self::Expired => "expired",
+            Self::AdmissionRefresh => "admission_refresh",
+            Self::Rebootstrap => "rebootstrap",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct WorkerError {
     kind: WorkerErrorKind,
@@ -696,13 +707,6 @@ impl WorkerError {
     fn expired(message: impl Into<String>) -> Self {
         Self {
             kind: WorkerErrorKind::Expired,
-            message: message.into(),
-        }
-    }
-
-    fn admission_refresh(message: impl Into<String>) -> Self {
-        Self {
-            kind: WorkerErrorKind::AdmissionRefresh,
             message: message.into(),
         }
     }
@@ -799,7 +803,15 @@ async fn gateway_worker(
         let outcome = match credentials {
             Ok(credentials) => {
                 app_id = Some(credentials.app_id.clone());
-                run_socket(&credentials, &radio, &mut stop_rx, &status, attempt).await
+                run_socket(
+                    credentials,
+                    &host_rpc,
+                    &radio,
+                    &mut stop_rx,
+                    &status,
+                    attempt,
+                )
+                .await
             }
             Err(error) => Err(error),
         };
@@ -811,12 +823,17 @@ async fn gateway_worker(
             .lock()
             .map(|status| status.connected)
             .unwrap_or(false);
-        radio
-            .remote_media()
-            .inspect(|media| media.fail_closed_all("gateway_disconnected"));
         let error = outcome
             .err()
             .unwrap_or_else(|| WorkerError::reconnect("Companion gateway disconnected"));
+        eprintln!(
+            "[aokie-plugin][companion] stage=socket_ended kind={} detail={}",
+            error.kind.label(),
+            sanitize_status_message(&error.message)
+        );
+        radio
+            .remote_media()
+            .inspect(|media| media.fail_closed_all("gateway_disconnected"));
         let retry = retry_schedule(error.kind, attempt, had_connected_session);
         attempt = retry.attempt;
         set_status(&status, retry.phase, attempt, Some(error.message));
@@ -1089,6 +1106,33 @@ impl GatewaySession {
             pending_end_caller: HashMap::new(),
         }
     }
+
+    fn rotate_credentials(
+        &mut self,
+        credentials: &SessionCredentials,
+        plugin_session_nonce: String,
+    ) -> Result<(), WorkerError> {
+        if self.app_id != credentials.app_id
+            || self.plugin_id != credentials.plugin_id
+            || self.endpoint_authority.endpoint_key != credentials.endpoint_authority.endpoint_key
+            || self.endpoint_authority.roster_revision
+                != credentials.endpoint_authority.roster_revision
+            || self.endpoint_authority.roster_hash != credentials.endpoint_authority.roster_hash
+        {
+            return Err(WorkerError::rebootstrap(
+                "Rotated Companion admission changed the endpoint authority",
+            ));
+        }
+        self.plugin_session_nonce = plugin_session_nonce;
+        self.endpoint_authority = credentials.endpoint_authority.clone();
+        self.ice_servers = credentials.ice_servers.clone();
+        self.relay_only = credentials.relay_only;
+        self.last_snapshot_sent = None;
+        self.authoritative_idle = false;
+        self.next_snapshot_poll = Instant::now();
+        self.last_assistance_request_sent = None;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1192,6 +1236,75 @@ mod tests {
             .into_credentials(None, "aokie", authority)
             .unwrap();
         GatewaySession::new(&credentials, "plugin_session_a".into())
+    }
+
+    fn remote_snapshot(
+        service_mode: LocalServiceMode,
+        talk_audio_forwarded: bool,
+    ) -> crate::remote_media::RemoteMediaSnapshot {
+        crate::remote_media::RemoteMediaSnapshot {
+            call_id: Some("call_a".into()),
+            call_epoch: 1,
+            owner_epoch: 1,
+            remote_revision: 1,
+            service_mode,
+            peer_count: 1,
+            talk_device_id: Some("device_a".into()),
+            talk_lease_id: Some("lease_a".into()),
+            talk_fence: 1,
+            talk_audio_forwarded,
+            radio_reserved: true,
+            dropped_sco_frames: 0,
+            quarantined_talk_frames: 0,
+            dropped_events: 0,
+            consent: crate::remote_media::RemoteConsentGate::default(),
+            captions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn human_media_is_connecting_until_pcm_reaches_the_caller_tx_seam() {
+        let waiting = remote_snapshot(LocalServiceMode::HumanActive, false);
+        assert_eq!(
+            authoritative_media_state(&waiting, true),
+            MediaState::Connecting
+        );
+
+        let proven = remote_snapshot(LocalServiceMode::HumanActive, true);
+        assert_eq!(authoritative_media_state(&proven, true), MediaState::Active);
+
+        let consult = remote_snapshot(LocalServiceMode::ConsultActive, false);
+        assert_eq!(
+            authoritative_media_state(&consult, true),
+            MediaState::Active
+        );
+    }
+
+    #[test]
+    fn admission_rotation_updates_transport_identity_without_dropping_native_routes() {
+        let authority = test_authority();
+        let credentials = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority.clone())
+            .unwrap();
+        let mut session = GatewaySession::new(&credentials, "plugin_session_old".into());
+        install_takeover_route(&mut session, LeasePhase::Active);
+        let lease_count = session.leases.len();
+        let peer_count = session.peers.len();
+
+        let mut refreshed = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority)
+            .unwrap();
+        refreshed.relay_only = false;
+        refreshed.ice_servers.clear();
+        session
+            .rotate_credentials(&refreshed, "plugin_session_new".into())
+            .unwrap();
+
+        assert_eq!(session.plugin_session_nonce, "plugin_session_new");
+        assert!(!session.relay_only);
+        assert!(session.ice_servers.is_empty());
+        assert_eq!(session.leases.len(), lease_count);
+        assert_eq!(session.peers.len(), peer_count);
     }
 
     fn takeover_claims(session: &GatewaySession, phase: LeasePhase) -> LeaseClaims {
@@ -1726,15 +1839,33 @@ mod tests {
             assert!(normalize_gateway_url("ws://localhost:18787/v2/realtime").is_err());
         }
     }
+
+    #[test]
+    fn gateway_error_envelope_accepts_typed_fields_without_app_identity() {
+        let encoded = json!({
+            "kind": "error",
+            "schemaVersion": SCHEMA_VERSION,
+            "code": "stale_snapshot",
+            "message": "plugin snapshot regressed",
+            "requestId": null
+        })
+        .to_string();
+
+        let envelope: Envelope = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(envelope.kind, "error");
+        assert_eq!(envelope.schema_version, SCHEMA_VERSION);
+        assert!(envelope.app_id.is_none());
+
+        let notice: ErrorNotice = parse_gateway_frame(&encoded).unwrap();
+        assert_eq!(notice.code, "stale_snapshot");
+    }
 }
 
-async fn run_socket(
+async fn open_gateway_socket(
     credentials: &SessionCredentials,
-    radio: &RadioHandle,
-    stop_rx: &mut watch::Receiver<bool>,
     status: &Arc<Mutex<GatewayStatusSnapshot>>,
     attempt: u32,
-) -> Result<(), WorkerError> {
+) -> Result<(GatewaySocket, String), WorkerError> {
     let mut request = credentials
         .endpoint
         .as_str()
@@ -1833,25 +1964,76 @@ async fn run_socket(
         .map_err(|_| WorkerError::rebootstrap("Companion plugin hello is invalid"))?;
     send_json(&mut socket, &hello).await?;
     set_status(status, GatewayConnectionPhase::Connected, attempt, None);
+    Ok((socket, session_nonce))
+}
 
+async fn run_socket(
+    mut credentials: SessionCredentials,
+    host_rpc: &HostRpc,
+    radio: &RadioHandle,
+    stop_rx: &mut watch::Receiver<bool>,
+    status: &Arc<Mutex<GatewayStatusSnapshot>>,
+    attempt: u32,
+) -> Result<(), WorkerError> {
+    let (mut socket, session_nonce) = open_gateway_socket(&credentials, status, attempt).await?;
     let media = radio
         .remote_media()
         .ok_or_else(|| WorkerError::reconnect("Companion media endpoint is unavailable"))?;
-    let mut session = GatewaySession::new(credentials, session_nonce);
-    let admission_deadline = Instant::now() + credentials.lifetime;
+    let mut session = GatewaySession::new(&credentials, session_nonce);
+    let mut admission_deadline = Instant::now() + credentials.lifetime;
+    let mut retiring_socket: Option<(GatewaySocket, Instant)> = None;
     let mut next_ping = Instant::now() + PING_INTERVAL;
     let mut awaiting_pong: Option<Instant> = None;
 
     loop {
+        if retiring_socket
+            .as_ref()
+            .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+        {
+            retiring_socket.take();
+        }
         if *stop_rx.borrow() {
             let _ = socket.send(Message::Close(None)).await;
+            if let Some((mut retiring, _)) = retiring_socket.take() {
+                let _ = retiring.send(Message::Close(None)).await;
+            }
             return Ok(());
         }
         if Instant::now() >= admission_deadline {
-            let _ = socket.send(Message::Close(None)).await;
-            return Err(WorkerError::admission_refresh(
-                "Companion admission reached its refresh boundary",
-            ));
+            set_status(
+                status,
+                GatewayConnectionPhase::AdmissionRefresh,
+                attempt,
+                None,
+            );
+            let refreshed = refresh_admission(
+                host_rpc,
+                Some(&credentials.app_id),
+                &credentials.plugin_id,
+                credentials.endpoint_authority.clone(),
+            )?;
+            let (replacement, replacement_nonce) =
+                open_gateway_socket(&refreshed, status, attempt).await?;
+            session.rotate_credentials(&refreshed, replacement_nonce)?;
+
+            // Keep the authenticated predecessor alive briefly while the
+            // gateway consumes the replacement hello. The gateway then sees a
+            // live same-authority rotation, preserves every current lease and
+            // fences the predecessor itself. Dropping the old socket first
+            // would make an otherwise healthy active call look like an outage.
+            let predecessor = std::mem::replace(&mut socket, replacement);
+            retiring_socket = Some((predecessor, Instant::now() + Duration::from_secs(2)));
+            credentials = refreshed;
+            admission_deadline = Instant::now() + credentials.lifetime;
+            next_ping = Instant::now() + PING_INTERVAL;
+            awaiting_pong = None;
+            eprintln!(
+                "[aokie-plugin][companion] stage=admission_rotated continuity=preserved app={} plugin={} active_peers={}",
+                credentials.app_id,
+                credentials.plugin_id,
+                session.peers.len()
+            );
+            continue;
         }
 
         for encoded in session.drain_end_caller_results()? {
@@ -1901,7 +2083,20 @@ async fn run_socket(
         match tokio::time::timeout(READ_TICK, socket.next()).await {
             Err(_) => {}
             Ok(Some(Ok(Message::Text(encoded)))) => {
-                let outbound = session.handle_inbound(encoded.as_str(), media, radio)?;
+                let inbound_kind = serde_json::from_str::<Envelope>(encoded.as_str())
+                    .map(|frame| frame.kind)
+                    .unwrap_or_else(|_| "malformed".into());
+                let outbound = session
+                    .handle_inbound(encoded.as_str(), media, radio)
+                    .map_err(|error| {
+                        eprintln!(
+                            "[aokie-plugin][companion] stage=inbound_rejected frame={} kind={} detail={}",
+                            inbound_kind,
+                            error.kind.label(),
+                            sanitize_status_message(&error.message)
+                        );
+                        error
+                    })?;
                 for encoded in outbound {
                     socket
                         .send(Message::Text(encoded.into()))
@@ -2011,17 +2206,7 @@ impl GatewaySession {
         }
         let active = radio.is_call_active();
         let service_mode = map_service_mode(remote.service_mode);
-        let media_state = match remote.service_mode {
-            LocalServiceMode::ConsultActive | LocalServiceMode::HumanActive => MediaState::Active,
-            LocalServiceMode::SoftHold
-            | LocalServiceMode::ConsultPending
-            | LocalServiceMode::HumanPending
-            | LocalServiceMode::ReturningToAokie
-            | LocalServiceMode::Recovering => MediaState::Connecting,
-            _ if remote.peer_count > 0 => MediaState::Receiving,
-            _ if active => MediaState::Ready,
-            _ => MediaState::None,
-        };
+        let media_state = authoritative_media_state(&remote, active);
         let caller = radio.current_caller().map(|number| CallerProjection {
             label: None,
             masked_number: mask_number(&number),
@@ -2177,6 +2362,45 @@ fn map_service_mode(mode: LocalServiceMode) -> ProtocolServiceMode {
     }
 }
 
+fn authoritative_media_state(
+    remote: &crate::remote_media::RemoteMediaSnapshot,
+    physical_call_active: bool,
+) -> MediaState {
+    match remote.service_mode {
+        LocalServiceMode::ConsultActive => MediaState::Active,
+        LocalServiceMode::HumanActive if remote.talk_audio_forwarded => MediaState::Active,
+        LocalServiceMode::HumanActive => MediaState::Connecting,
+        LocalServiceMode::SoftHold
+        | LocalServiceMode::ConsultPending
+        | LocalServiceMode::HumanPending
+        | LocalServiceMode::ReturningToAokie
+        | LocalServiceMode::Recovering => MediaState::Connecting,
+        _ if remote.peer_count > 0 => MediaState::Receiving,
+        _ if physical_call_active => MediaState::Ready,
+        _ => MediaState::None,
+    }
+}
+
+fn remote_media_event_kind(kind: &RemoteMediaEventKind) -> &'static str {
+    match kind {
+        RemoteMediaEventKind::SdpAnswer { .. } => "sdp_answer",
+        RemoteMediaEventKind::LocalIce { .. } => "local_ice",
+        RemoteMediaEventKind::IceComplete => "ice_complete",
+        RemoteMediaEventKind::ConnectionState { .. } => "connection_state",
+        RemoteMediaEventKind::RemoteAudioReady => "remote_audio_ready",
+        RemoteMediaEventKind::ProtocolViolation { .. } => "protocol_violation",
+        RemoteMediaEventKind::TakeoverPending => "takeover_pending",
+        RemoteMediaEventKind::TakeoverPrepared { .. } => "takeover_prepared",
+        RemoteMediaEventKind::ConsultPrepared { .. } => "consult_prepared",
+        RemoteMediaEventKind::ConsultActive => "consult_active",
+        RemoteMediaEventKind::HumanActive => "human_active",
+        RemoteMediaEventKind::ReturningToAokie { .. } => "returning_to_aokie",
+        RemoteMediaEventKind::AokieActive => "aokie_active",
+        RemoteMediaEventKind::Closed { .. } => "closed",
+        RemoteMediaEventKind::Error { .. } => "error",
+    }
+}
+
 fn mask_number(number: &str) -> Option<String> {
     let digits = number
         .chars()
@@ -2198,7 +2422,7 @@ fn mask_number(number: &str) -> Option<String> {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct Envelope {
     kind: String,
     schema_version: u16,
@@ -2288,7 +2512,7 @@ impl GatewaySession {
             }
             "rtc_signal" => {
                 let frame: PluginRtcSignalFrame = parse_gateway_frame(encoded)?;
-                frame.validate().map_err(|_| {
+                frame.validate_routed_mobile().map_err(|_| {
                     WorkerError::reconnect("Companion RTC signal failed contract validation")
                 })?;
                 self.handle_rtc_signal(frame, media, radio)?;
@@ -2572,6 +2796,18 @@ impl GatewaySession {
             provisional_transport_generation: 0,
             decision_sent: false,
         });
+        if let Some(prepared) = self.prepared.as_ref() {
+            eprintln!(
+                "[aokie-plugin][takeover] stage=claim_proposed app={} device={} call={} mode={:?} fence={} lease_jti={} rtc={}",
+                self.app_id,
+                prepared.provisional.device_id,
+                prepared.provisional.call_id,
+                prepared.provisional.mode,
+                prepared.provisional.fence,
+                prepared.provisional.jti,
+                prepared.provisional.rtc_session_id
+            );
+        }
         Ok(Vec::new())
     }
 
@@ -2858,7 +3094,20 @@ impl GatewaySession {
                             candidate,
                         },
                     )
-                    .map_err(|_| WorkerError::reconnect("Remote ICE candidate was rejected"))
+                    .map_err(|error| {
+                        eprintln!(
+                            "[aokie-plugin][takeover] stage=remote_ice_rejected call={} owner_epoch={} fence={} rtc={} detail={}",
+                            frame.call_id,
+                            frame.owner_epoch,
+                            frame.fence,
+                            frame.rtc_session_id,
+                            sanitize_status_message(&error)
+                        );
+                        WorkerError::reconnect(format!(
+                            "Remote ICE candidate was rejected: {}",
+                            sanitize_status_message(&error)
+                        ))
+                    })
             }
             RtcSignal::IceComplete { .. } => {
                 let _ = self.route_for_frame(&frame)?;
@@ -3004,7 +3253,31 @@ impl GatewaySession {
                 ice_servers: self.ice_servers.clone(),
                 relay_only: self.relay_only,
             })
-            .map_err(|_| WorkerError::reconnect("Native Companion peer could not open"))?;
+            .map_err(|error| {
+                eprintln!(
+                    "[aokie-plugin][takeover] stage=peer_open_failed call={} mode={:?} owner_epoch={} fence={} rtc={} detail={}",
+                    binding.call_id,
+                    binding.mode,
+                    binding.owner_epoch,
+                    binding.fence,
+                    binding.rtc_session_id,
+                    sanitize_status_message(&error)
+                );
+                WorkerError::reconnect(format!(
+                    "Native Companion peer could not open: {}",
+                    sanitize_status_message(&error)
+                ))
+            })?;
+        eprintln!(
+            "[aokie-plugin][takeover] stage=peer_opened call={} mode={:?} owner_epoch={} fence={} sdp={} generation={} rtc={}",
+            binding.call_id,
+            binding.mode,
+            binding.owner_epoch,
+            binding.fence,
+            frame.sdp_revision,
+            frame.transport_generation,
+            binding.rtc_session_id
+        );
         if matches!(
             binding.mode,
             MediaMode::PreparedTalk | MediaMode::PreparedConsult
@@ -3121,6 +3394,13 @@ impl GatewaySession {
     ) -> Result<Vec<String>, WorkerError> {
         let mut outbound = Vec::new();
         for event in media.drain_events(64) {
+            eprintln!(
+                "[aokie-plugin][takeover] stage=media_event call={} owner_epoch={} rtc={} event={}",
+                event.call_id,
+                event.owner_epoch,
+                event.rtc_session_id,
+                remote_media_event_kind(&event.kind)
+            );
             match event.kind.clone() {
                 RemoteMediaEventKind::TakeoverPrepared {
                     confirmed_owner_epoch,
@@ -3276,6 +3556,20 @@ impl GatewaySession {
         let Some((action, binding, ttl)) = action else {
             return Ok(());
         };
+        let action_name = match action {
+            0 => "prepare_consult",
+            1 => "prepare_takeover",
+            2 => "enter_consult",
+            _ => "enter_takeover",
+        };
+        eprintln!(
+            "[aokie-plugin][takeover] stage=transition_requested action={} call={} owner_epoch={} fence={} rtc={}",
+            action_name,
+            binding.call_id,
+            binding.owner_epoch,
+            binding.fence,
+            binding.rtc_session_id
+        );
         let result = match action {
             0 => media.request_consult_hold(binding, ttl),
             1 => media.request_soft_hold(binding, ttl),
@@ -3344,6 +3638,16 @@ impl GatewaySession {
         })?;
         prepared.confirmed_owner_epoch = Some(confirmed_owner_epoch);
         prepared.decision_sent = true;
+        eprintln!(
+            "[aokie-plugin][takeover] stage=preparation_complete app={} device={} call={} mode={:?} owner_epoch={} fence={} rtc={}",
+            self.app_id,
+            prepared.provisional.device_id,
+            prepared.provisional.call_id,
+            prepared.provisional.mode,
+            confirmed_owner_epoch,
+            prepared.provisional.fence,
+            prepared.provisional.rtc_session_id
+        );
 
         // DesktopPeer bindings are immutable. Close the receive-only peer;
         // the gateway rotates JTI/ownerEpoch and the Companion must send a
@@ -3538,6 +3842,15 @@ impl GatewaySession {
         let Some(route) = self.peers.remove(rtc_session_id) else {
             return Ok(None);
         };
+        eprintln!(
+            "[aokie-plugin][takeover] stage=peer_failed call={} mode={:?} owner_epoch={} fence={} rtc={} reason={}",
+            route.binding.call_id,
+            route.binding.mode,
+            route.binding.owner_epoch,
+            route.binding.fence,
+            rtc_session_id,
+            reason
+        );
         let lease_id = route.binding.lease_id.clone().ok_or_else(|| {
             WorkerError::reconnect("Failed media route omitted stable lease identity")
         })?;

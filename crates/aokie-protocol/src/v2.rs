@@ -2052,6 +2052,19 @@ pub struct PluginRtcSignalFrame {
 
 impl PluginRtcSignalFrame {
     pub fn validate(&self) -> Result<(), V2ProtocolError> {
+        self.validate_from(AdmissionRole::Plugin)
+    }
+
+    /// Validate a mobile-authenticated RTC signal after the gateway has
+    /// removed the bearer lease token and routed it to the target plugin.
+    ///
+    /// The wire shape is shared with plugin-originated RTC responses, but the
+    /// endpoint binding must still retain the original mobile signer role.
+    pub fn validate_routed_mobile(&self) -> Result<(), V2ProtocolError> {
+        self.validate_from(AdmissionRole::Mobile)
+    }
+
+    fn validate_from(&self, expected_role: AdmissionRole) -> Result<(), V2ProtocolError> {
         exact("kind", &self.kind, "rtc_signal")?;
         schema(self.schema_version)?;
         safe_id("appId", &self.app_id)?;
@@ -2069,7 +2082,7 @@ impl PluginRtcSignalFrame {
         self.signal.validate()?;
         validate_signal_route(
             &self.signal,
-            AdmissionRole::Plugin,
+            expected_role,
             &self.app_id,
             &self.plugin_id,
             &self.device_id,
@@ -2968,6 +2981,31 @@ mod tests {
         let mut substituted_key = binding;
         substituted_key.endpoint_key = test_endpoint_key(10);
         assert!(substituted_key.verify_for_sdp(&sdp, 101).is_err());
+    }
+
+    #[test]
+    fn routed_mobile_rtc_frame_preserves_the_mobile_signer_role() {
+        let (sdp, binding) = signed_binding(9, 100);
+        let frame = PluginRtcSignalFrame {
+            kind: "rtc_signal".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            signal_id: "signal_a".into(),
+            plugin_id: "plugin_a".into(),
+            device_id: "device_a".into(),
+            lease_jti: "lease_a".into(),
+            rtc_session_id: "rtc_a".into(),
+            sdp_revision: 1,
+            transport_generation: 1,
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            owner_epoch: 3,
+            fence: 9,
+            signal: RtcSignal::Offer { sdp, binding },
+        };
+
+        frame.validate_routed_mobile().unwrap();
+        assert!(frame.validate().is_err());
     }
 
     #[test]

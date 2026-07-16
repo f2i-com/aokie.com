@@ -69,6 +69,9 @@ pub struct RemoteMediaSnapshot {
     pub talk_device_id: Option<String>,
     pub talk_lease_id: Option<String>,
     pub talk_fence: u64,
+    /// True only after an authorized microphone frame for the exact active
+    /// talk binding reached the caller-bound Bluetooth enqueue seam.
+    pub talk_audio_forwarded: bool,
     pub radio_reserved: bool,
     pub dropped_sco_frames: u64,
     pub quarantined_talk_frames: u64,
@@ -323,6 +326,7 @@ struct RemoteMediaState {
     active_consult: Option<ActiveConsult>,
     pending_route: Option<PendingRoute>,
     active_route: Option<ActiveRoute>,
+    talk_audio_binding: Option<SessionBinding>,
     return_binding: Option<SessionBinding>,
     return_reason: Option<String>,
     return_dispatched: bool,
@@ -346,6 +350,7 @@ impl Default for RemoteMediaState {
             active_consult: None,
             pending_route: None,
             active_route: None,
+            talk_audio_binding: None,
             return_binding: None,
             return_reason: None,
             return_dispatched: false,
@@ -470,6 +475,7 @@ impl RemoteMediaHandle {
             service_mode,
             peer_count,
             binding,
+            talk_audio_forwarded,
             consent,
             captions,
         ) = state
@@ -507,6 +513,7 @@ impl RemoteMediaHandle {
                     state.service_mode,
                     state.peers.len(),
                     route.cloned(),
+                    route.is_some_and(|binding| state.talk_audio_binding.as_ref() == Some(binding)),
                     state.consent.effective(),
                     state.captions.iter().cloned().collect::<Vec<_>>(),
                 )
@@ -519,6 +526,7 @@ impl RemoteMediaHandle {
                 ServiceMode::Recovering,
                 0,
                 None,
+                false,
                 RemoteConsentGate::default(),
                 Vec::new(),
             ));
@@ -534,6 +542,7 @@ impl RemoteMediaHandle {
                 .as_ref()
                 .and_then(|binding| binding.lease_id.clone()),
             talk_fence: binding.as_ref().map_or(0, |binding| binding.fence),
+            talk_audio_forwarded,
             radio_reserved: self.radio_reserved(),
             dropped_sco_frames: self.inner.dropped_sco_frames.load(Ordering::Relaxed),
             quarantined_talk_frames: self.inner.quarantined_talk_frames.load(Ordering::Relaxed),
@@ -776,6 +785,53 @@ impl RemoteMediaHandle {
                 .as_ref()
                 .map(|route| route.binding.clone())
         })
+    }
+
+    pub fn active_talk_binding(&self) -> Option<SessionBinding> {
+        self.inner.state.lock().ok().and_then(|state| {
+            state
+                .active_route
+                .as_ref()
+                .map(|route| route.permit.binding.clone())
+        })
+    }
+
+    /// Records the first exact caller-bound frame accepted by the Bluetooth
+    /// runtime. This is deliberately later than "microphone armed" and later
+    /// than WebRTC track negotiation, so protocol snapshots cannot claim an
+    /// active talk media route before PCM reaches the Desktop-to-SCO seam.
+    pub fn mark_talk_audio_forwarded(&self, binding: &SessionBinding, samples: &[i16]) -> bool {
+        if samples.is_empty() {
+            return false;
+        }
+        let first = {
+            let Ok(mut state) = self.inner.state.lock() else {
+                return false;
+            };
+            if !state.allows_talk(binding, Instant::now()) {
+                return false;
+            }
+            if state.talk_audio_binding.as_ref() == Some(binding) {
+                false
+            } else {
+                state.talk_audio_binding = Some(binding.clone());
+                state.bump_revision();
+                true
+            }
+        };
+        if first {
+            let (peak, level_permille) = pcm_level_summary(samples);
+            eprintln!(
+                "[aokie-plugin][takeover] stage=microphone_pcm_to_sco call={} owner_epoch={} rtc={} samples={} rate_level_permille={} peak={}",
+                binding.call_id,
+                binding.owner_epoch,
+                binding.rtc_session_id,
+                samples.len(),
+                level_permille,
+                peak,
+            );
+        }
+        first
     }
 
     pub fn end_active_consult(&self, reason: &str) -> Result<(), String> {
@@ -2374,6 +2430,7 @@ async fn peer_actor(
     quarantined: Arc<AtomicU64>,
 ) {
     let binding = peer.binding().clone();
+    let mut microphone_pcm_observed = false;
     loop {
         let mut worked = false;
         while let Ok(command) = commands.try_recv() {
@@ -2443,6 +2500,20 @@ async fn peer_actor(
         };
         if let Some((frame, destination)) = received {
             worked = true;
+            if !microphone_pcm_observed {
+                microphone_pcm_observed = true;
+                let (peak, level_permille) = pcm_level_summary(&frame.samples);
+                eprintln!(
+                    "[aokie-plugin][takeover] stage=microphone_pcm_received call={} owner_epoch={} rtc={} samples={} sample_rate={} level_permille={} peak={}",
+                    binding.call_id,
+                    binding.owner_epoch,
+                    binding.rtc_session_id,
+                    frame.samples.len(),
+                    frame.sample_rate,
+                    level_permille,
+                    peak,
+                );
+            }
             if destination
                 .try_send(RoutedAudio {
                     binding: binding.clone(),
@@ -2493,6 +2564,30 @@ fn sanitize_reason(reason: &str) -> String {
     } else {
         trimmed.chars().take(160).collect()
     }
+}
+
+fn pcm_level_summary(samples: &[i16]) -> (u16, u16) {
+    if samples.is_empty() {
+        return (0, 0);
+    }
+    let peak = samples
+        .iter()
+        .map(|sample| sample.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let mean_square = samples
+        .iter()
+        .map(|sample| {
+            let sample = f64::from(*sample);
+            sample * sample
+        })
+        .sum::<f64>()
+        / samples.len() as f64;
+    let rms = mean_square.sqrt();
+    let level_permille = ((rms / f64::from(i16::MAX)) * 1_000.0)
+        .round()
+        .clamp(0.0, 1_000.0) as u16;
+    (peak, level_permille)
 }
 
 /// Small deterministic mono resampler for the HFP rates used by the radio
@@ -2692,6 +2787,52 @@ mod tests {
         assert_eq!(state.current_record().unwrap().owner_epoch, 2);
         assert_eq!(state.service_mode, ServiceMode::AokieActive);
         assert!(!state.radio_reserved());
+    }
+
+    #[test]
+    fn human_talk_audio_proof_is_binding_exact_and_survives_renewal() {
+        let handle = RemoteMediaHandle::spawn().unwrap();
+        let talk = {
+            let mut state = handle.inner.state.lock().unwrap();
+            *state = active_state();
+            let talk = prepare_active_talk(&mut state, "talk-proof", 9, Duration::from_secs(30));
+            state
+                .request_takeover(talk.clone(), Duration::from_secs(20))
+                .unwrap();
+            assert!(matches!(
+                state.next_transition(Instant::now()).0,
+                Some(RadioTransition::EnterHuman { .. })
+            ));
+            state.ack_enter(&talk, Instant::now()).unwrap();
+            talk
+        };
+        handle.refresh_reserved();
+        assert_eq!(handle.snapshot().service_mode, ServiceMode::HumanActive);
+        assert!(!handle.snapshot().talk_audio_forwarded);
+
+        let mut stale = talk.clone();
+        stale.fence += 1;
+        assert!(!handle.mark_talk_audio_forwarded(&stale, &[1, 2, 3]));
+        assert!(!handle.snapshot().talk_audio_forwarded);
+
+        assert!(handle.mark_talk_audio_forwarded(&talk, &[1, 2, 3]));
+        assert!(handle.snapshot().talk_audio_forwarded);
+        assert!(!handle.mark_talk_audio_forwarded(&talk, &[4, 5, 6]));
+
+        handle
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .renew(&talk, Duration::from_secs(20))
+            .expect("renew exact active route");
+        assert!(
+            handle.snapshot().talk_audio_forwarded,
+            "lease expiry extension must not erase an already-proven media path"
+        );
+
+        handle.revoke(&talk, "operator_return").unwrap();
+        assert!(!handle.snapshot().talk_audio_forwarded);
     }
 
     #[test]

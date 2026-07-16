@@ -24,7 +24,7 @@ import {
   WifiOff,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   CompanionActivity,
   CompanionAvailabilityRecord,
@@ -58,6 +58,27 @@ export type CompanionBootstrapView = CompanionBootstrap;
 type WorkspaceScreen = "home" | "live" | "calls" | "call-detail" | "team" | "settings";
 type Transport = "idle" | "connecting" | "connected" | "reconnecting" | "offline";
 export type CallRecordFilter = "all" | "follow_up" | `status:${string}`;
+
+export const CALL_RECORD_PAGE_SIZE = 25;
+export const CALL_RECORD_MAX_LIMIT = 100;
+
+export function nextCallRecordLimit(currentLimit: number): number {
+  const current = Number.isFinite(currentLimit) ? Math.max(0, Math.floor(currentLimit)) : 0;
+  return Math.min(CALL_RECORD_MAX_LIMIT, Math.max(CALL_RECORD_PAGE_SIZE, current + CALL_RECORD_PAGE_SIZE));
+}
+
+export function callRecordsHaveMore(recordCount: number, requestedLimit: number, access: CompanionCallRecords["access"]): boolean {
+  return access !== "none" && requestedLimit < CALL_RECORD_MAX_LIMIT && recordCount === requestedLimit;
+}
+
+export function loadedCallRecordCountLabel(count: number, hasMore: boolean): string {
+  return `${Math.max(0, count)} ${hasMore ? "shown" : "records"}`;
+}
+
+export function visibleCallRecordWindow(records: CompanionCallRecord[], visibleLimit: number): CompanionCallRecord[] {
+  const limit = Number.isFinite(visibleLimit) ? Math.max(0, Math.floor(visibleLimit)) : 0;
+  return records.slice(0, Math.min(CALL_RECORD_MAX_LIMIT, limit));
+}
 
 interface V2WorkspaceShellProps {
   runtime: RuntimeCapabilities;
@@ -125,6 +146,10 @@ export default function V2WorkspaceShell({
   const [callRecords, setCallRecords] = useState<CompanionCallRecords | null>(null);
   const [callRecordsError, setCallRecordsError] = useState<string | null>(null);
   const [callRecordsUpdatedAt, setCallRecordsUpdatedAt] = useState<number | null>(null);
+  const [callRecordsHasMore, setCallRecordsHasMore] = useState(false);
+  const [callRecordsLoadingMore, setCallRecordsLoadingMore] = useState(false);
+  const callRecordsLimit = useRef(CALL_RECORD_PAGE_SIZE);
+  const callRecordsRequest = useRef(0);
   const [callDetail, setCallDetail] = useState<CompanionCallRecordDetail | null>(null);
   const [callDetailLoading, setCallDetailLoading] = useState(false);
   const [callDetailError, setCallDetailError] = useState<string | null>(null);
@@ -138,16 +163,30 @@ export default function V2WorkspaceShell({
   const [serverProfilesError, setServerProfilesError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const refreshCallRecords = useCallback(async (limit = 50) => {
+  const refreshCallRecords = useCallback(async (requestedLimit = callRecordsLimit.current, loadingMore = false) => {
+    const limit = Math.min(CALL_RECORD_MAX_LIMIT, Math.max(1, Math.floor(requestedLimit)));
+    callRecordsLimit.current = Math.max(callRecordsLimit.current, limit);
+    const request = ++callRecordsRequest.current;
+    setCallRecordsLoadingMore(loadingMore);
     try {
       const records = await loadCallRecords(limit);
+      if (request !== callRecordsRequest.current) return;
       setCallRecords(records);
+      setCallRecordsHasMore(callRecordsHaveMore(records.records.length, limit, records.access));
       setCallRecordsError(null);
       setCallRecordsUpdatedAt(Date.now());
     } catch (caught) {
+      if (request !== callRecordsRequest.current) return;
       setCallRecordsError(displayError(caught, "FormLogic call records are unavailable"));
+    } finally {
+      if (request === callRecordsRequest.current) setCallRecordsLoadingMore(false);
     }
   }, [loadCallRecords]);
+
+  const loadMoreCallRecords = useCallback(() => {
+    if (callRecordsLoadingMore || !callRecordsHasMore) return;
+    void refreshCallRecords(nextCallRecordLimit(callRecordsLimit.current), true);
+  }, [callRecordsHasMore, callRecordsLoadingMore, refreshCallRecords]);
 
   const refresh = useCallback(async (quiet = false) => {
     if (quiet) setRefreshing(true);
@@ -306,7 +345,10 @@ export default function V2WorkspaceShell({
             records={callRecords}
             error={callRecordsError}
             lastUpdatedAt={callRecordsUpdatedAt}
+            hasMore={callRecordsHasMore}
+            loadingMore={callRecordsLoadingMore}
             onRefresh={() => void refreshCallRecords()}
+            onLoadMore={loadMoreCallRecords}
             onOpenRecord={(recordId) => void openCallRecord(recordId)}
           />
         )}
@@ -496,21 +538,59 @@ export function callRecordTone(record: CompanionCallRecord): "handled" | "hold" 
   return "handled";
 }
 
-export function HistoryScreen({ records, error, lastUpdatedAt = null, onRefresh, onOpenRecord }: {
+export function HistoryScreen({ records, error, lastUpdatedAt = null, hasMore = false, loadingMore = false, onRefresh, onLoadMore = () => undefined, onOpenRecord }: {
   records: CompanionCallRecords | null;
   error: string | null;
   lastUpdatedAt?: number | null;
+  hasMore?: boolean;
+  loadingMore?: boolean;
   onRefresh(): void;
+  onLoadMore?(): void;
   onOpenRecord(recordId: string): void;
 }) {
   const [filter, setFilter] = useState<CallRecordFilter>("all");
-  const visibleRecords = useMemo(() => filterCallRecords(records?.records ?? [], filter), [filter, records]);
+  const [visibleLimit, setVisibleLimit] = useState(CALL_RECORD_PAGE_SIZE);
+  const loadMoreSentinel = useRef<HTMLDivElement | null>(null);
+  const loadRequested = useRef(false);
+  const filteredRecords = useMemo(() => filterCallRecords(records?.records ?? [], filter), [filter, records]);
+  const visibleRecords = useMemo(() => visibleCallRecordWindow(filteredRecords, visibleLimit), [filteredRecords, visibleLimit]);
+  const bufferedRecordsRemain = visibleRecords.length < filteredRecords.length;
+  const hasAdditionalRecords = bufferedRecordsRemain || hasMore;
   const filters = useMemo(() => callRecordFilters(records?.records ?? []), [records]);
   const totals = useMemo(() => ({
     records: records?.records.length ?? 0,
     inbound: records?.records.filter((record) => record.direction === "inbound").length ?? 0,
     followUps: filterCallRecords(records?.records ?? [], "follow_up").length,
   }), [records]);
+  useEffect(() => {
+    if (!loadingMore) loadRequested.current = false;
+  }, [filter, loadingMore, records?.records.length, visibleLimit]);
+  const loadNextRecords = useCallback(() => {
+    if (loadingMore) return;
+    if (bufferedRecordsRemain) {
+      setVisibleLimit((current) => nextCallRecordLimit(current));
+      return;
+    }
+    onLoadMore();
+  }, [bufferedRecordsRemain, loadingMore, onLoadMore]);
+  useEffect(() => {
+    const sentinel = loadMoreSentinel.current;
+    if (!sentinel || !hasAdditionalRecords || loadingMore || error || typeof IntersectionObserver === "undefined") return;
+    const scrollRoot = sentinel.closest(".live-workspace-scroll");
+    const observerRoot = scrollRoot instanceof HTMLElement && scrollRoot.scrollHeight > scrollRoot.clientHeight
+      ? scrollRoot
+      : null;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting) || loadRequested.current) return;
+      loadRequested.current = true;
+      loadNextRecords();
+    }, {
+      root: observerRoot,
+      rootMargin: "240px 0px",
+    });
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [error, hasAdditionalRecords, loadNextRecords, loadingMore, visibleRecords.length]);
   return (
     <div className="screen calls-screen live-workspace-screen">
       <WorkspaceHeader eyebrow="FORMLOGIC RECORDS" title="Calls" action={<button className="icon-button" aria-label="Refresh call records" onClick={onRefresh}><RefreshCw size={19} /></button>} />
@@ -519,11 +599,15 @@ export function HistoryScreen({ records, error, lastUpdatedAt = null, onRefresh,
         <div className="empty-state live-role-empty"><LockKeyhole size={30} /><strong>Call records are not available to this role</strong><p>FormLogic did not grant call-record access to this Companion role or installed pack. Companion media history remains audited separately.</p></div>
       ) : records ? (
         <>
-          <div className="history-summary"><div><strong>{totals.records}</strong><span>Records</span></div><div><strong>{totals.inbound}</strong><span>Inbound</span></div><div><strong>{totals.followUps}</strong><span>Follow-up</span></div></div>
-          <div className="filter-scroller" role="group" aria-label="Filter FormLogic call records">{filters.map((option) => <button key={option.value} className={filter === option.value ? "is-active" : ""} onClick={() => setFilter(option.value)}>{option.label}</button>)}</div>
-          <section className="call-history-list"><div className="section-title-line"><h2>{filters.find((option) => option.value === filter)?.label ?? "Calls"}</h2><span>{visibleRecords.length} records</span></div>
+          <div className="history-summary"><div><strong>{totals.records}</strong><span>{hasAdditionalRecords ? "Loaded" : "Records"}</span></div><div><strong>{totals.inbound}</strong><span>{hasAdditionalRecords ? "Inbound shown" : "Inbound"}</span></div><div><strong>{totals.followUps}</strong><span>{hasAdditionalRecords ? "Follow-up shown" : "Follow-up"}</span></div></div>
+          <div className="filter-scroller" role="group" aria-label="Filter FormLogic call records">{filters.map((option) => <button key={option.value} className={filter === option.value ? "is-active" : ""} aria-pressed={filter === option.value} onClick={() => { setFilter(option.value); setVisibleLimit(CALL_RECORD_PAGE_SIZE); }}>{option.label}</button>)}</div>
+          <section className="call-history-list"><div className="section-title-line"><h2>{filters.find((option) => option.value === filter)?.label ?? "Calls"}</h2><span>{loadedCallRecordCountLabel(visibleRecords.length, hasAdditionalRecords)}</span></div>
             {visibleRecords.map((record) => <CallRecordRow key={record.id} record={record} onOpen={() => onOpenRecord(record.id)} />)}
             {visibleRecords.length === 0 && <div className="empty-state"><History size={28} /><strong>No records in this view</strong><p>Choose another filter or refresh the role-filtered FormLogic records.</p></div>}
+            {(hasAdditionalRecords || loadingMore) && <div ref={loadMoreSentinel} className="call-history-sentinel" aria-live="polite" aria-busy={loadingMore}>
+              {loadingMore ? <><RefreshCw className="spin" size={18} /><span><strong>Loading older calls</strong><small>Fetching the next {CALL_RECORD_PAGE_SIZE} role-visible records…</small></span></> : <button type="button" onClick={loadNextRecords}><History size={16} /><span><strong>{error ? "Try loading older calls" : "Load older calls"}</strong><small>More records load automatically as you scroll</small></span></button>}
+            </div>}
+            {!hasAdditionalRecords && !loadingMore && visibleRecords.length > 0 && <div className="call-history-end"><CheckCircle2 size={15} /><span>{(records?.records.length ?? 0) >= CALL_RECORD_MAX_LIMIT ? `Latest ${CALL_RECORD_MAX_LIMIT} records loaded` : "All available records loaded"}</span></div>}
           </section>
         </>
       ) : (

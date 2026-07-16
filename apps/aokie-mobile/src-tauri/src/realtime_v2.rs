@@ -23,11 +23,13 @@ use aokie_protocol::v2::{
     SCHEMA_VERSION,
 };
 use chrono::{DateTime, Utc};
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, State};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant;
 use tokio_tungstenite::{
@@ -38,10 +40,11 @@ use tokio_tungstenite::{
         protocol::WebSocketConfig,
         Error as WebSocketError, Message,
     },
+    MaybeTlsStream, WebSocketStream,
 };
 use url::Url;
 
-use crate::managed_auth::{ManagedAdmissionError, ManagedAuthState};
+use crate::managed_auth::{ManagedAdmission, ManagedAdmissionError, ManagedAuthState};
 use crate::media::{
     self, AcceptAnswerRequest, AddIceRequest, CreateOfferRequest, LocalSignal, MediaSession,
     MediaSignalEvent, NativeMediaState, RevokeRequest, SessionRequest,
@@ -60,12 +63,23 @@ const INBOUND_FRESHNESS: Duration = Duration::from_secs(45);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(7);
+// A lease currently lasts 20 seconds. Renew only once it has entered this
+// window so a session-wide heartbeat tick cannot land in the same clock
+// second as a freshly granted/activated lease and produce an expiry that does
+// not advance. Two heartbeat intervals leave a full retry opportunity before
+// expiry without churning authority immediately after a claim transition.
+const LEASE_RENEWAL_WINDOW: Duration = Duration::from_secs(HEARTBEAT_INTERVAL.as_secs() * 2);
 const MAX_RECONNECT_DELAY: u64 = 20;
+const ADMISSION_REFRESH_MARGIN: Duration = Duration::from_secs(20);
 const NATIVE_ACTION_POLL: Duration = Duration::from_millis(200);
 const NATIVE_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const LEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const REVOKE_ACK_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_ANSWERED_ASSISTANCE_REQUESTS: usize = 64;
+
+type V2WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type V2Writer = SplitSink<V2WebSocket, Message>;
+type V2Reader = SplitStream<V2WebSocket>;
 
 #[derive(Clone, Default)]
 pub(crate) struct V2State {
@@ -332,6 +346,12 @@ impl V2State {
         self.inner.lock().await.peer_key_thumbprint = Some(thumbprint);
     }
 
+    async fn rotate_admission_policy(&self, ice_servers: &[IceServerConfig], relay_only: bool) {
+        let mut state = self.inner.lock().await;
+        state.ice_servers = ice_servers.to_vec();
+        state.relay_only = relay_only;
+    }
+
     async fn reset_generation(&self, generation: u64) {
         let mut state = self.inner.lock().await;
         if state.generation == generation {
@@ -543,6 +563,24 @@ struct ErrorFrame {
     message: String,
     #[serde(default)]
     request_id: Option<String>,
+}
+
+fn tracks_gateway_request(client: &ClientState, request_id: &str) -> bool {
+    client.pending.as_ref().is_some_and(|pending| {
+        pending.request_id == request_id || pending.offer_request_id == request_id
+    }) || client
+        .pending_revoke
+        .as_ref()
+        .is_some_and(|pending| pending.request_id == request_id)
+        || (client.pending_assistance_answer.is_some()
+            && client
+                .assistance
+                .as_ref()
+                .is_some_and(|assistance| assistance.request_id == request_id))
+        || client
+            .pending_end_caller
+            .as_ref()
+            .is_some_and(|pending| pending.request_id() == request_id)
 }
 
 fn grant_for_requested_mode(mode: LeaseMode) -> Result<Grant, String> {
@@ -1531,6 +1569,116 @@ async fn fail_native_call_actions_on_disconnect(app: &AppHandle, state: &V2State
     }
 }
 
+struct ManagedTransportRotation {
+    writer: V2Writer,
+    reader: V2Reader,
+    admission: ManagedAdmission,
+}
+
+enum ManagedTransportRotationError {
+    Admission(ManagedAdmissionError),
+    Transport(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_overlapping_managed_transport(
+    app: &AppHandle,
+    state: &V2State,
+    media_state: &NativeMediaState,
+    managed_auth: &ManagedAuthState,
+    endpoint_identity: &crate::endpoint_identity::EndpointIdentity,
+    peer_trust: &PeerTrustState,
+    profile_id: &str,
+    deployment_id: &str,
+    app_id: &str,
+    device_id: &str,
+    session_nonce: &str,
+    app_header: &HeaderValue,
+    device_header: &HeaderValue,
+) -> Result<ManagedTransportRotation, ManagedTransportRotationError> {
+    let admission = managed_auth
+        .admission(
+            profile_id,
+            deployment_id,
+            app_id,
+            device_id,
+            endpoint_identity.thumbprint(),
+        )
+        .await
+        .map_err(ManagedTransportRotationError::Admission)?;
+    let gateway_url = managed_gateway_url(&admission.gateway_url)
+        .map_err(ManagedTransportRotationError::Transport)?;
+    let authorization =
+        bearer_header(&admission.access_token).map_err(ManagedTransportRotationError::Transport)?;
+    let mut request = gateway_url.as_str().into_client_request().map_err(|_| {
+        ManagedTransportRotationError::Transport(
+            "could not create replacement protocol-v2 realtime request".into(),
+        )
+    })?;
+    request.headers_mut().insert("authorization", authorization);
+    request
+        .headers_mut()
+        .insert("x-aokie-app-id", app_header.clone());
+    request
+        .headers_mut()
+        .insert("x-aokie-device-id", device_header.clone());
+    let websocket_config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_MESSAGE_BYTES));
+    let socket = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_async_with_config(request, Some(websocket_config), false),
+    )
+    .await
+    {
+        Ok(Ok((socket, _))) => socket,
+        Ok(Err(error)) => {
+            let message = if matches!(
+                &error,
+                WebSocketError::Http(response)
+                    if matches!(
+                        response.status(),
+                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                    )
+            ) {
+                "replacement protocol-v2 admission was rejected"
+            } else {
+                "replacement protocol-v2 realtime endpoint is unavailable"
+            };
+            return Err(ManagedTransportRotationError::Transport(message.into()));
+        }
+        Err(_) => {
+            return Err(ManagedTransportRotationError::Transport(
+                "replacement protocol-v2 connection attempt timed out".into(),
+            ));
+        }
+    };
+    let (mut writer, mut reader) = socket.split();
+    endpoint_handshake(
+        app,
+        state,
+        endpoint_identity,
+        peer_trust,
+        profile_id,
+        app_id,
+        device_id,
+        session_nonce,
+        Some(&admission.expected_peer_key_thumbprint),
+        &mut writer,
+        &mut reader,
+    )
+    .await
+    .map_err(ManagedTransportRotationError::Transport)?;
+    initial_sync(app, state, media_state, app_id, &mut writer, &mut reader)
+        .await
+        .map_err(ManagedTransportRotationError::Transport)?;
+    Ok(ManagedTransportRotation {
+        writer,
+        reader,
+        admission,
+    })
+}
+
 pub(crate) fn spawn(
     app: AppHandle,
     connection: Arc<Mutex<ConnectionSlot>>,
@@ -1576,6 +1724,7 @@ pub(crate) fn spawn(
                 attempt_ice_servers,
                 attempt_relay_only,
                 admission_expected_peer_key_thumbprint,
+                admission_refresh_deadline,
             ) = if let Some(deployment_id) = config.managed_deployment_id.as_deref() {
                 match managed_auth
                     .admission(
@@ -1622,6 +1771,7 @@ pub(crate) fn spawn(
                             admission.ice_servers,
                             admission.relay_only,
                             Some(admission.expected_peer_key_thumbprint),
+                            Some(managed_admission_refresh_deadline(admission.expires_at)),
                         )
                     }
                     Err(error) => {
@@ -1640,6 +1790,7 @@ pub(crate) fn spawn(
                     authorization.clone(),
                     config.ice_servers.clone(),
                     config.relay_only,
+                    None,
                     None,
                 )
             };
@@ -1699,7 +1850,15 @@ pub(crate) fn spawn(
                     )
                     .await;
                     if let Err(message) = handshake {
-                        emit_error(&app, &message);
+                        if config.managed_deployment_id.is_some()
+                            && transient_managed_sync_failure(&message)
+                        {
+                            eprintln!(
+                                "[AokieCompanion][realtime] managed session rotated during endpoint proof; retrying"
+                            );
+                        } else {
+                            emit_error(&app, &message);
+                        }
                     } else {
                         let synced = initial_sync(
                             &app,
@@ -1711,7 +1870,17 @@ pub(crate) fn spawn(
                         )
                         .await;
                         match synced {
-                            Err(message) => emit_error(&app, &message),
+                            Err(message) => {
+                                if config.managed_deployment_id.is_some()
+                                    && transient_managed_sync_failure(&message)
+                                {
+                                    eprintln!(
+                                        "[AokieCompanion][realtime] managed session rotated before sync; retrying"
+                                    );
+                                } else {
+                                    emit_error(&app, &message);
+                                }
+                            }
                             Ok(()) => {
                                 reconnect_attempt = 0;
                                 let (generation, mut outbound) = match activate_session(&connection)
@@ -1748,9 +1917,78 @@ pub(crate) fn spawn(
                                     tokio::time::MissedTickBehavior::Delay,
                                 );
                                 native_actions.tick().await;
+                                let admission_refresh = tokio::time::sleep_until(
+                                    admission_refresh_deadline.unwrap_or_else(|| {
+                                        Instant::now() + Duration::from_secs(24 * 60 * 60)
+                                    }),
+                                );
+                                tokio::pin!(admission_refresh);
+                                let managed_deployment_id = config.managed_deployment_id.as_deref();
 
                                 loop {
                                     tokio::select! {
+                                        _ = &mut admission_refresh, if managed_deployment_id.is_some() => {
+                                            eprintln!(
+                                                "[AokieCompanion][realtime] opening overlapping managed admission before expiry"
+                                            );
+                                            match open_overlapping_managed_transport(
+                                                &app,
+                                                &state,
+                                                &media_state,
+                                                &managed_auth,
+                                                &endpoint_identity,
+                                                &peer_trust,
+                                                &profile_id,
+                                                managed_deployment_id.expect("managed rotation checked"),
+                                                &config.app_id,
+                                                &config.device_id,
+                                                &session_nonce,
+                                                &app_header,
+                                                &device_header,
+                                            ).await {
+                                                Ok(rotation) => {
+                                                    state
+                                                        .rotate_admission_policy(
+                                                            &rotation.admission.ice_servers,
+                                                            rotation.admission.relay_only,
+                                                        )
+                                                        .await;
+                                                    writer = rotation.writer;
+                                                    reader = rotation.reader;
+                                                    admission_refresh.as_mut().reset(
+                                                        managed_admission_refresh_deadline(
+                                                            rotation.admission.expires_at,
+                                                        ),
+                                                    );
+                                                    freshness.as_mut().reset(
+                                                        Instant::now() + INBOUND_FRESHNESS,
+                                                    );
+                                                    awaiting_pong = false;
+                                                    ping.reset();
+                                                    heartbeat.reset();
+                                                    eprintln!(
+                                                        "[AokieCompanion][realtime] managed admission rotated with media continuity preserved"
+                                                    );
+                                                }
+                                                Err(ManagedTransportRotationError::Admission(error)) => {
+                                                    emit_managed_admission_state(&app, &error);
+                                                    eprintln!(
+                                                        "[AokieCompanion][realtime] managed admission rotation retry: {error}"
+                                                    );
+                                                    admission_refresh.as_mut().reset(
+                                                        Instant::now() + Duration::from_secs(1),
+                                                    );
+                                                }
+                                                Err(ManagedTransportRotationError::Transport(message)) => {
+                                                    eprintln!(
+                                                        "[AokieCompanion][realtime] managed transport rotation retry: {message}"
+                                                    );
+                                                    admission_refresh.as_mut().reset(
+                                                        Instant::now() + Duration::from_secs(1),
+                                                    );
+                                                }
+                                            }
+                                        }
                                         _ = &mut freshness => {
                                             emit_error(&app, "protocol-v2 inbound heartbeat timed out");
                                             break;
@@ -1882,7 +2120,25 @@ pub(crate) fn spawn(
                                                     awaiting_pong = false;
                                                     ping.reset();
                                                 }
-                                                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                                                Some(Ok(Message::Close(frame))) => {
+                                                    eprintln!(
+                                                        "[AokieCompanion][realtime] gateway closed the active socket: {:?}",
+                                                        frame,
+                                                    );
+                                                    break;
+                                                }
+                                                Some(Err(error)) => {
+                                                    eprintln!(
+                                                        "[AokieCompanion][realtime] active socket read failed: {error}"
+                                                    );
+                                                    break;
+                                                }
+                                                None => {
+                                                    eprintln!(
+                                                        "[AokieCompanion][realtime] active socket reached EOF"
+                                                    );
+                                                    break;
+                                                }
                                                 Some(Ok(_)) => {
                                                     emit_error(&app, "gateway sent a non-text protocol-v2 frame");
                                                     break;
@@ -2501,6 +2757,24 @@ async fn handle_gateway_frame(
             )?;
             validate_text(&frame.code, 200, "gateway error code")?;
             validate_text(&frame.message, 500, "gateway error message")?;
+            if matches!(
+                frame.code.as_str(),
+                "endpoint_reconnecting" | "renewal_not_due"
+            ) {
+                if let Some(request_id) = frame.request_id.as_deref() {
+                    validate_id(request_id, "gateway requestId")?;
+                    let client = state.inner.lock().await;
+                    if !tracks_gateway_request(&client, request_id) {
+                        // Lease heartbeats are deliberately not tracked as UI
+                        // operations. The next due heartbeat retries with the
+                        // current token, so a short plugin admission refresh
+                        // or a same-second "not due" response is expected
+                        // transport maintenance rather than a user-visible
+                        // media failure.
+                        return Ok(());
+                    }
+                }
+            }
             let mut end_caller_failed = false;
             let mut native_answer_failed = None;
             let mut native_revoke_failed = None;
@@ -3181,8 +3455,9 @@ async fn heartbeat_frame(state: &V2State, app_id: &str) -> Result<Option<String>
         let Some(lease) = &client.lease else {
             return Ok(None);
         };
-        if lease.claims.expires_at <= unix_now()? {
-            return Err("protocol-v2 media lease expired before renewal".into());
+        let now = unix_now()?;
+        if !lease_heartbeat_due(lease.claims.expires_at, now)? {
+            return Ok(None);
         }
         (
             lease.token.clone(),
@@ -3205,6 +3480,13 @@ async fn heartbeat_frame(state: &V2State, app_id: &str) -> Result<Option<String>
     serde_json::to_string(&frame)
         .map(Some)
         .map_err(|_| "could not encode protocol-v2 lease heartbeat".into())
+}
+
+fn lease_heartbeat_due(expires_at: u64, now: u64) -> Result<bool, String> {
+    if expires_at <= now {
+        return Err("protocol-v2 media lease expired before renewal".into());
+    }
+    Ok(expires_at.saturating_sub(now) <= LEASE_RENEWAL_WINDOW.as_secs())
 }
 
 async fn local_rtc_frame(
@@ -3693,6 +3975,19 @@ fn fresh_session_nonce(state: &V2State, configured: Option<&str>, device_id: &st
     format!("{prefix}{suffix}")
 }
 
+fn managed_admission_refresh_deadline(expires_at: u64) -> Instant {
+    let remaining = expires_at.saturating_sub(unix_now().unwrap_or(expires_at));
+    Instant::now() + Duration::from_secs(remaining).saturating_sub(ADMISSION_REFRESH_MARGIN)
+}
+
+fn transient_managed_sync_failure(message: &str) -> bool {
+    matches!(
+        message,
+        "protocol-v2 transport closed before authoritative sync"
+            | "v2 transport closed before endpoint proof"
+    )
+}
+
 fn reconnect_delay(attempt: u32) -> Duration {
     Duration::from_secs((1_u64 << attempt.min(4)).min(MAX_RECONNECT_DELAY))
 }
@@ -3718,6 +4013,7 @@ where
 }
 
 fn emit_error(app: &AppHandle, message: &str) {
+    eprintln!("[AokieCompanion][error] {message}");
     emit_transport(app, TransportEvent::Error { message });
 }
 
@@ -3759,6 +4055,18 @@ mod tests {
         tracks_for, CarrierHoldEvidence, MediaTrack, ProjectedCallSnapshot, RemoteCapabilities,
         SecondaryCallObservation, SecondaryCallPolicy, LEASE_AUDIENCE,
     };
+
+    #[test]
+    fn scheduled_heartbeat_refresh_is_not_mistaken_for_a_user_operation() {
+        let mut client = ClientState::default();
+        assert!(!tracks_gateway_request(&client, "heartbeat_1"));
+
+        client.pending_end_caller = Some(PendingEndCaller::AwaitingChallenge {
+            request_id: "end_prepare_1".into(),
+        });
+        assert!(tracks_gateway_request(&client, "end_prepare_1"));
+        assert!(!tracks_gateway_request(&client, "heartbeat_1"));
+    }
 
     #[test]
     fn managed_admission_policy_maps_to_strict_ui_states() {
@@ -4060,6 +4368,16 @@ mod tests {
         assert!(validate_renewal(&current, &active).is_err());
         let session = session_from_claims(&active, 2, 2).unwrap();
         assert_eq!(session.binding.mode, MediaMode::Talk);
+    }
+
+    #[test]
+    fn fresh_lease_waits_for_the_real_renewal_window() {
+        let now = 1_700_000_000;
+        assert!(!lease_heartbeat_due(now + 20, now).unwrap());
+        assert!(!lease_heartbeat_due(now + 15, now).unwrap());
+        assert!(lease_heartbeat_due(now + 14, now).unwrap());
+        assert!(lease_heartbeat_due(now + 1, now).unwrap());
+        assert!(lease_heartbeat_due(now, now).is_err());
     }
 
     #[test]
