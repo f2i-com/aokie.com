@@ -173,10 +173,14 @@ pub fn active_stt_with_runtimes(
         tokio::sync::Mutex<Option<crate::runtimes::parakeet_onnx::ParakeetOnnxRuntime>>,
     >,
     moonshine_instance: std::sync::Arc<
-        tokio::sync::Mutex<Option<crate::runtimes::moonshine_transcribe::MoonshineTranscribeRuntime>>,
+        tokio::sync::Mutex<
+            Option<crate::runtimes::moonshine_transcribe::MoonshineTranscribeRuntime>,
+        >,
     >,
     qwen3_asr_instance: std::sync::Arc<
-        tokio::sync::Mutex<Option<crate::runtimes::qwen3_asr_transcribe::Qwen3AsrTranscribeRuntime>>,
+        tokio::sync::Mutex<
+            Option<crate::runtimes::qwen3_asr_transcribe::Qwen3AsrTranscribeRuntime>,
+        >,
     >,
 ) -> Box<dyn SttProvider> {
     use crate::adapters::{

@@ -268,17 +268,15 @@ impl LlmClient {
         let mut deltas: u32 = 0;
         let mut malformed: u32 = 0;
         for line in reader.lines() {
-            let line = line.map_err(|e| {
-                match first_delta_at {
-                    None => format!(
-                        "llm produced NO first token within {:?} (endpoint up but not generating): {e}",
-                        started.elapsed()
-                    ),
-                    Some(_) => format!(
-                        "llm stream STALLED after {deltas} delta(s), {:?} since the last one: {e}",
-                        last_delta_at.elapsed()
-                    ),
-                }
+            let line = line.map_err(|e| match first_delta_at {
+                None => format!(
+                    "llm produced NO first token within {:?} (endpoint up but not generating): {e}",
+                    started.elapsed()
+                ),
+                Some(_) => format!(
+                    "llm stream STALLED after {deltas} delta(s), {:?} since the last one: {e}",
+                    last_delta_at.elapsed()
+                ),
             })?;
             on_activity();
             // Per-line cancellation (AOK-CTRL-001): the caller hung up /
@@ -411,8 +409,7 @@ fn first_clause_end(s: &str) -> Option<usize> {
         if i < MIN {
             continue;
         }
-        if matches!(c, ',' | ';' | ':')
-            && it.peek().is_some_and(|&(_, next)| next.is_whitespace())
+        if matches!(c, ',' | ';' | ':') && it.peek().is_some_and(|&(_, next)| next.is_whitespace())
         {
             return Some(i);
         }
@@ -466,7 +463,10 @@ mod tests {
     #[test]
     fn eager_first_clause_starts_speech_early() {
         assert_eq!(
-            chunks("I can certainly book that table for ye, right after I check the tides.", 4),
+            chunks(
+                "I can certainly book that table for ye, right after I check the tides.",
+                4
+            ),
             vec![
                 "I can certainly book that table for ye,",
                 "right after I check the tides.",
@@ -474,7 +474,10 @@ mod tests {
         );
         // Only the FIRST chunk is eager — the second sentence keeps its commas.
         assert_eq!(
-            chunks("Aye that works for me matey, good choice. We open at nine, ten on Sundays.", 5),
+            chunks(
+                "Aye that works for me matey, good choice. We open at nine, ten on Sundays.",
+                5
+            ),
             vec![
                 "Aye that works for me matey,",
                 "good choice.",
@@ -488,7 +491,10 @@ mod tests {
         );
         // Digits around ':' / ',' stay intact.
         assert_eq!(
-            chunks("The total for the party comes to 1,250 doubloons exactly.", 4),
+            chunks(
+                "The total for the party comes to 1,250 doubloons exactly.",
+                4
+            ),
             vec!["The total for the party comes to 1,250 doubloons exactly."]
         );
     }
@@ -536,7 +542,10 @@ mod tests {
             vec!["Hello there.", "How can I help you today?"]
         );
         // Newlines are always boundaries.
-        assert_eq!(chunks("First line\nSecond line", 100), vec!["First line", "Second line"]);
+        assert_eq!(
+            chunks("First line\nSecond line", 100),
+            vec!["First line", "Second line"]
+        );
         // A period as the LAST char seen so far waits for the next delta /
         // the trailing flush instead of splitting blind.
         assert_eq!(sentence_end("Booked for 9 A."), None);

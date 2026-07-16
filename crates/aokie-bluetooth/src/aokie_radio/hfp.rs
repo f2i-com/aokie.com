@@ -135,7 +135,10 @@ pub enum HfpAgResult {
     SupportedFeatures(u32),
     Indicators(Vec<String>),
     IndicatorStatus(Vec<i32>),
-    IndicatorUpdate { index: u8, value: i32 },
+    IndicatorUpdate {
+        index: u8,
+        value: i32,
+    },
     CallerId(String),
     /// `+CHLD: (…)` — the AG's supported call-hold modes (SLC probe reply).
     CallHoldModes(Vec<String>),
@@ -1208,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn cind_definitions_split_across_frames_reassemble(){
+    fn cind_definitions_split_across_frames_reassemble() {
         // Live incident 2026-07-14 (phantom answer): the +CIND=? DEFINITIONS
         // line fragmented at the mux MTU; per-frame parsing saw two garbage
         // halves, the default call/callsetup indices stood, and a phone with
@@ -1222,11 +1225,9 @@ mod tests {
         .unwrap();
         // The fragment is HELD, not parsed as a half-line.
         assert!(first.is_empty(), "fragment must not parse: {first:?}");
-        let second = parse_ag_results_buffered(
-            &mut carry,
-            b"ice\",(0,1)),(\"signal\",(0-5))\r\nOK\r\n",
-        )
-        .unwrap();
+        let second =
+            parse_ag_results_buffered(&mut carry, b"ice\",(0,1)),(\"signal\",(0-5))\r\nOK\r\n")
+                .unwrap();
         let indicators = second
             .iter()
             .find_map(|r| match r {
@@ -1693,11 +1694,12 @@ mod tests {
         let results = parse_ag_results(b"\r\n+CLCC: 1,1,0,0,0\r\n").unwrap();
         assert_eq!(results.len(), 1);
         let events = state.apply_result(&results[0]);
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, HfpEvent::CallerId(_))));
+        assert!(!events.iter().any(|e| matches!(e, HfpEvent::CallerId(_))));
         // And the command renders per spec.
-        assert_eq!(build_at_command(HfpAtCommand::ListCurrentCalls), b"AT+CLCC\r".to_vec());
+        assert_eq!(
+            build_at_command(HfpAtCommand::ListCurrentCalls),
+            b"AT+CLCC\r".to_vec()
+        );
     }
 
     /// Phase 4 regression (the neighbour-number class): with a held or
@@ -1897,7 +1899,9 @@ mod tests {
         let mut state = negotiated_state();
         state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
         state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
-        state.apply_result(&HfpAgResult::CallWaitingNotification("0491570157".to_string()));
+        state.apply_result(&HfpAgResult::CallWaitingNotification(
+            "0491570157".to_string(),
+        ));
         // Caller A hangs up while B is still knocking: B becomes a normal
         // incoming ring (callsetup is already 1, so no fresh edge will come).
         assert_eq!(
@@ -1932,10 +1936,12 @@ mod tests {
         ]));
         state.apply_result(&HfpAgResult::IndicatorUpdate { index: 1, value: 1 }); // A active
         state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 }); // B held + active
-        state.apply_result(&HfpAgResult::CallWaitingNotification("0491570157".to_string()));
+        state.apply_result(&HfpAgResult::CallWaitingNotification(
+            "0491570157".to_string(),
+        ));
         state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 2 }); // held only
-        // A ends (this Pixel reports call=0 even with B still held): the
-        // honest termination, NO promotion.
+                                                                                  // A ends (this Pixel reports call=0 even with B still held): the
+                                                                                  // honest termination, NO promotion.
         assert_eq!(
             state.apply_result(&HfpAgResult::IndicatorUpdate { index: 1, value: 0 }),
             vec![HfpEvent::CallTerminated]
@@ -1943,7 +1949,10 @@ mod tests {
         assert!(!state.incoming_call());
         // The knocker's re-presenting RING is swallowed too — an ATA here
         // would answer them ahead of the held caller.
-        assert_eq!(state.apply_result(&HfpAgResult::Ring), Vec::<HfpEvent>::new());
+        assert_eq!(
+            state.apply_result(&HfpAgResult::Ring),
+            Vec::<HfpEvent>::new()
+        );
         // Once nothing is held any more, a ring mints normally again.
         state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 });
         assert_eq!(

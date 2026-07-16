@@ -1,0 +1,11 @@
+{
+  "aud": "aokie-v2-gateway",
+  "appId": "app_coastal_auto",
+  "subjectId": "device_alex_phone",
+  "role": "mobile",
+  "holderKeyThumbprint": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k",
+  "expectedPeerKeyThumbprint": "plugin_thumbprint_a",
+  "scopes": ["state_read", "caller_read", "captions_read", "assistance_read", "assistance_respond", "monitor", "takeover", "rtc_signal"],
+  "exp": 1784160300,
+  "jti": "admission_20260716_alex_1"
+}

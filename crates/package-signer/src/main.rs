@@ -77,7 +77,9 @@ fn sha256_file(path: &Path) -> Result<(String, u64), String> {
     let mut size = 0u64;
     let mut buf = vec![0u8; 1 << 20];
     loop {
-        let n = f.read(&mut buf).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
         if n == 0 {
             break;
         }
@@ -91,7 +93,9 @@ fn sha256_file(path: &Path) -> Result<(String, u64), String> {
 /// excluding the manifest itself. Sorted for a deterministic payload.
 fn collect_files(dir: &Path) -> Result<Vec<FileEntry>, String> {
     fn walk(root: &Path, base: &Path, out: &mut Vec<FileEntry>) -> Result<(), String> {
-        for entry in std::fs::read_dir(root).map_err(|e| format!("read_dir {}: {e}", root.display()))? {
+        for entry in
+            std::fs::read_dir(root).map_err(|e| format!("read_dir {}: {e}", root.display()))?
+        {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
             let ft = entry.file_type().map_err(|e| e.to_string())?;
@@ -111,7 +115,11 @@ fn collect_files(dir: &Path) -> Result<Vec<FileEntry>, String> {
                 continue;
             }
             let (sha256, size) = sha256_file(&path)?;
-            out.push(FileEntry { path: rel, sha256, size });
+            out.push(FileEntry {
+                path: rel,
+                sha256,
+                size,
+            });
         }
         Ok(())
     }
@@ -156,7 +164,8 @@ pub fn sign_dir(
 pub fn verify_dir(dir: &Path, pubkey_b64: &str) -> Result<Payload, String> {
     let text = std::fs::read_to_string(dir.join(MANIFEST_FILE))
         .map_err(|e| format!("read {MANIFEST_FILE}: {e}"))?;
-    let envelope: Envelope = serde_json::from_str(&text).map_err(|e| format!("parse envelope: {e}"))?;
+    let envelope: Envelope =
+        serde_json::from_str(&text).map_err(|e| format!("parse envelope: {e}"))?;
     if envelope.alg != "Ed25519" {
         return Err(format!("unsupported alg {:?}", envelope.alg));
     }
@@ -218,7 +227,8 @@ fn load_seed(args: &[String]) -> Result<[u8; 32], String> {
         return Err("provide --key-file <path> or --key-env <VAR>".into());
     };
     let bytes = hex_decode(&hex)?;
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| "signing seed must be 32 bytes of hex".into())
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| "signing seed must be 32 bytes of hex".into())
 }
 
 fn main() {
@@ -260,8 +270,11 @@ fn cmd_sign(args: &[String]) -> Result<(), String> {
     let created_at = httpdate_now();
     let envelope = sign_dir(&dir, &name, &version, &key_id, &seed, created_at)?;
     let out = dir.join(MANIFEST_FILE);
-    std::fs::write(&out, serde_json::to_string_pretty(&envelope).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("write {}: {e}", out.display()))?;
+    std::fs::write(
+        &out,
+        serde_json::to_string_pretty(&envelope).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("write {}: {e}", out.display()))?;
     // Self-check with the just-derived public key so a bad write can't ship.
     let pubkey = base64::engine::general_purpose::STANDARD
         .encode(SigningKey::from_bytes(&seed).verifying_key().to_bytes());
@@ -333,7 +346,11 @@ mod tests {
 
     fn sign_into(dir: &Path) {
         let env = sign_dir(dir, "test-bundle", "1.2.3", "test-key", &SEED, "t0".into()).unwrap();
-        std::fs::write(dir.join(MANIFEST_FILE), serde_json::to_string(&env).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            serde_json::to_string(&env).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -388,8 +405,11 @@ mod tests {
         let d = tmp("wrongkey");
         std::fs::write(d.join("plugin.exe"), b"binary bytes").unwrap();
         sign_into(&d);
-        let other = base64::engine::general_purpose::STANDARD
-            .encode(SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes());
+        let other = base64::engine::general_purpose::STANDARD.encode(
+            SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
         let err = verify_dir(&d, &other).unwrap_err();
         assert!(err.contains("signature verification failed"), "{err}");
         let _ = std::fs::remove_dir_all(&d);
@@ -406,10 +426,14 @@ mod tests {
             name: "test-bundle".into(),
             version: "1.2.3".into(),
             created_at: "t0".into(),
-            files: vec![FileEntry { path: "plugin.exe".into(), sha256: "00".repeat(32), size: 5 }],
+            files: vec![FileEntry {
+                path: "plugin.exe".into(),
+                sha256: "00".repeat(32),
+                size: 5,
+            }],
         };
-        env.payload_b64 = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&forged).unwrap());
+        env.payload_b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&forged).unwrap());
         std::fs::write(d.join(MANIFEST_FILE), serde_json::to_string(&env).unwrap()).unwrap();
         let err = verify_dir(&d, &pubkey()).unwrap_err();
         assert!(err.contains("signature verification failed"), "{err}");

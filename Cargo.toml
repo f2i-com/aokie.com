@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "apps/aokie-mobile/src-tauri",
+    "crates/aokie-media",
+    "crates/aokie-protocol",
+    "crates/aokie-realtime",
     "crates/aokie-core",
     "crates/aokie-bluetooth",
     "crates/aokie-dongle",

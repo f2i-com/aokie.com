@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Aokie Companion",
+  "version": "0.1.0",
+  "identifier": "com.aokie.companion",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Aokie Companion",
+        "width": 430,
+        "height": 820,
+        "minWidth": 360,
+        "minHeight": 640,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; font-src 'self'; connect-src ipc: http://ipc.localhost",
+      "devCsp": "default-src 'self' http://localhost:1420; base-uri 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self' 'unsafe-eval' http://localhost:1420; style-src 'self' 'unsafe-inline' http://localhost:1420; img-src 'self' asset: data: http://localhost:1420; font-src 'self' http://localhost:1420; connect-src ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1421"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

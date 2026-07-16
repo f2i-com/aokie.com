@@ -232,14 +232,24 @@ mod tests {
         assert_eq!(step_for_event_name("aokie.call.answered"), "answered");
         assert_eq!(step_for_event_name("aokie.call.ended"), "ended");
         // Non-call events keep their subsystem prefix in the step.
-        assert_eq!(step_for_event_name("aokie.dongle.detected"), "dongle.detected");
+        assert_eq!(
+            step_for_event_name("aokie.dongle.detected"),
+            "dongle.detected"
+        );
         assert_eq!(step_for_event_name("aokie.sms.received"), "sms.received");
-        assert_eq!(step_for_event_name("aokie.hardware.error"), "hardware.error");
+        assert_eq!(
+            step_for_event_name("aokie.hardware.error"),
+            "hardware.error"
+        );
     }
 
     #[test]
     fn aokie_event_fills_conventions() {
-        let ev = aokie_event("aokie.call.incoming", "call_abc", json!({"from": "+61...456"}));
+        let ev = aokie_event(
+            "aokie.call.incoming",
+            "call_abc",
+            json!({"from": "+61...456"}),
+        );
         assert_eq!(ev.schema_version, 1);
         assert_eq!(ev.source, "aokie");
         assert_eq!(ev.plugin_id.as_deref(), Some("aokie"));
@@ -260,18 +270,32 @@ mod tests {
         assert_eq!(occ_a.len(), 12);
         assert!(occ_a.chars().all(|c| c.is_ascii_hexdigit()));
 
-        let first = aokie_event_occurrence("aokie.hardware.error", "radio", &occ_a, json!({"m": 1}));
-        let second = aokie_event_occurrence("aokie.hardware.error", "radio", &occ_b, json!({"m": 2}));
-        assert_eq!(first.idempotency_key, format!("aokie:radio:hardware.error.{occ_a}:v1"));
+        let first =
+            aokie_event_occurrence("aokie.hardware.error", "radio", &occ_a, json!({"m": 1}));
+        let second =
+            aokie_event_occurrence("aokie.hardware.error", "radio", &occ_b, json!({"m": 2}));
+        assert_eq!(
+            first.idempotency_key,
+            format!("aokie:radio:hardware.error.{occ_a}:v1")
+        );
         assert_ne!(first.idempotency_key, second.idempotency_key);
 
         // Re-building the SAME occurrence (same id) reproduces the same key.
-        let replay = aokie_event_occurrence("aokie.hardware.error", "radio", &occ_a, json!({"m": 1}));
+        let replay =
+            aokie_event_occurrence("aokie.hardware.error", "radio", &occ_a, json!({"m": 1}));
         assert_eq!(replay.idempotency_key, first.idempotency_key);
 
         // call.* events still drop the call. prefix in the step.
-        let audio = aokie_event_occurrence("aokie.call.audio.connected", "call_x", "abc123abc123", json!({}));
-        assert_eq!(audio.idempotency_key, "aokie:call_x:audio.connected.abc123abc123:v1");
+        let audio = aokie_event_occurrence(
+            "aokie.call.audio.connected",
+            "call_x",
+            "abc123abc123",
+            json!({}),
+        );
+        assert_eq!(
+            audio.idempotency_key,
+            "aokie:call_x:audio.connected.abc123abc123:v1"
+        );
     }
 
     #[test]

@@ -19,6 +19,8 @@ managed-beta-driver = ["aokie-dongle/managed-beta-driver"]
 
 [dependencies]
 aokie-core = { path = "../aokie-core" }
+aokie-media = { path = "../aokie-media" }
+aokie-protocol = { path = "../aokie-protocol" }
 # Streaming LLM client for the in-plugin real-time reply (voice feature). Blocking
 # API read line-by-line = SSE streaming without a tokio runtime. rustls to match
 # aokie-ai and avoid a native-TLS build.
@@ -44,6 +46,10 @@ regex = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 sha2 = "0.10"
 uuid = { version = "1.0", features = ["v4"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "time", "net", "macros"] }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2"
 
 # Windows multimedia-timer API (winmm) — raise this process's timer resolution
 # to 1 ms while the radio runs. The isochronous SCO audio path services a USB
@@ -59,5 +65,7 @@ windows-sys = { version = "0.59", features = ["Win32_Media", "Win32_Security_Cry
 # Contract tests: manifest.json against plugin-manifest.schema.json,
 # mock lifecycle events against desktop-event.schema.json (local
 # copies under docs/contracts/).
+aokie-realtime = { path = "../aokie-realtime" }
+axum = "0.7"
 jsonschema = "0.30"
 tempfile = "3"

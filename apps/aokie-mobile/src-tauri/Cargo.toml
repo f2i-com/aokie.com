@@ -1,0 +1,55 @@
+[package]
+name = "aokie-mobile"
+version = "0.1.0"
+description = "Aokie Companion mobile receptionist"
+authors = ["Aokie"]
+edition = "2021"
+publish = false
+
+[features]
+default = []
+# Tauri's production asset protocol is opt-in. Release packaging must enable
+# this feature so the compiled app embeds `frontendDist` instead of attempting
+# to load the development server from localhost.
+custom-protocol = ["tauri/custom-protocol"]
+# Deliberate local managed-pilot build. This permits only the exact WAMP
+# `api.formlogic.local` API host over HTTP and a numeric loopback gateway WS;
+# normal release builds remain HTTPS/WSS-only.
+managed-beta-local = []
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "aokie_mobile_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.22"
+ed25519-dalek = "2"
+sha2 = "0.10"
+rand = "0.8"
+aokie-protocol = { path = "../../../crates/aokie-protocol" }
+aokie-media = { path = "../../../crates/aokie-media" }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "rustls"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "sync", "time"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2.5"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+libwebrtc = "=0.3.41"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }

@@ -1,0 +1,348 @@
+import { describe, expect, it } from "vitest";
+import {
+  assistanceMatchesV2Call,
+  assistanceExpiryDelayMs,
+  currentV2InAppOffer,
+  desktopPairingOpenAfterAdmission,
+  INITIAL_V2_TAKEOVER_ATTEMPT,
+  shouldAutoArmConfirmedTakeover,
+  shouldAcceptV2AuthoritativeSequence,
+  takeoverConfirmationMode,
+  v2CurrentAccessPolicyPresentation,
+  v2LeaseExitLabel,
+  v2RecoveryProgressStages,
+  v2RouteProgressStages,
+  v2RuntimeFailureReducer,
+  v2TakeoverAttemptReducer,
+} from "./App";
+import type { NativeMediaSession, NativeMediaStateEvent, V2AssistanceRequestEvent, V2CallSnapshotEvent, V2LeaseEvent } from "./bridge";
+
+const OFFER_NOW = 1_800_000_000;
+type OfferClaims = V2CallSnapshotEvent["snapshot"]["pendingMobileOffers"][number]["offer"];
+
+function takeoverSnapshot(offerOverrides: Partial<OfferClaims> = {}): V2CallSnapshotEvent {
+  const offer: OfferClaims = {
+    offerId: "offer_takeover_a",
+    opportunityId: "opportunity_takeover_a",
+    targetDeviceId: "device_a",
+    targetHolderKeyThumbprint: "holder_key_a",
+    offeredMode: "takeover",
+    surface: "in_app",
+    appId: "app_a",
+    callId: "call_a",
+    callEpoch: 7,
+    ownerEpoch: 4,
+    switchboardRevision: 11,
+    remoteRevision: 13,
+    requiredConsentPolicyId: "aokie_remote_access",
+    requiredConsentPolicyVersion: 3,
+    requiredGrants: ["state_read", "rtc_signal", "takeover"],
+    issuedAt: OFFER_NOW - 1,
+    expiresAt: OFFER_NOW + 20,
+    jti: "offer_jti_takeover_a",
+    ...offerOverrides,
+  };
+  return {
+    kind: "snapshot",
+    schemaVersion: 2,
+    appId: "app_a",
+    sequence: 8,
+    grants: ["state_read", "rtc_signal", "monitor", "consult", "takeover", "resume_aokie"],
+    snapshot: {
+      callId: "call_a",
+      callEpoch: 7,
+      ownerEpoch: 4,
+      switchboardRevision: 11,
+      remoteRevision: 13,
+      telephonyState: "active",
+      serviceMode: "aokie_active",
+      mediaState: "ready",
+      remoteCapabilities: {
+        softwareHold: true,
+        carrierHoldEvidence: "unknown",
+        secondaryCallObservation: "unknown",
+        voiceConsult: true,
+        takeover: true,
+      },
+      secondaryCallPolicy: "normal",
+      remoteConsent: {
+        policyId: "aokie_remote_access",
+        policyVersion: 3,
+        enabled: true,
+        acknowledged: true,
+        acknowledgedAt: "2027-01-15T08:00:00Z",
+        captionsEnabled: false,
+        assistanceEnabled: true,
+        monitorEnabled: true,
+        consultEnabled: true,
+        takeoverEnabled: true,
+      },
+      participants: [],
+      pendingMobileOffers: [{ offer, offerToken: "signed.offer.token" }],
+      occurredAt: "2027-01-15T08:00:00Z",
+    },
+  };
+}
+
+function takeoverMedia(ownerEpoch = 5): { lease: V2LeaseEvent; media: NativeMediaStateEvent } {
+  const session: NativeMediaSession = {
+    appId: "app_a",
+    streamNonce: "stream_a",
+    rtcSessionId: "rtc_a",
+    callId: "call_a",
+    callEpoch: 7,
+    ownerEpoch,
+    deviceId: "device_a",
+    mode: "talk",
+    leaseId: "lease_a",
+    fence: 1,
+    sdpRevision: 1,
+    transportGeneration: 1,
+    expiresAt: "2099-01-01T00:00:00Z",
+  };
+  return {
+    lease: { session, mode: "takeover", phase: "active", provisional: false },
+    media: { session, phase: "remote_audio_ready", microphoneActive: false, remoteAudioReady: true },
+  };
+}
+
+describe("desktopPairingOpenAfterAdmission", () => {
+  it("opens automatically when native admission requires pairing", () => {
+    expect(desktopPairingOpenAfterAdmission(false, "pairing_required")).toBe(true);
+  });
+
+  it("does not close a pairing sheet the owner opened manually", () => {
+    expect(desktopPairingOpenAfterAdmission(true, "desktop_unavailable")).toBe(true);
+  });
+
+  it("does not open the sheet for unrelated admission states", () => {
+    expect(desktopPairingOpenAfterAdmission(false, "desktop_unavailable")).toBe(false);
+  });
+});
+
+describe("shouldAcceptV2AuthoritativeSequence", () => {
+  it("keeps one high-water mark across snapshots and authenticated idle state", () => {
+    let lastSequence = 8;
+    expect(shouldAcceptV2AuthoritativeSequence(lastSequence, 9)).toBe(true);
+    lastSequence = 9;
+    expect(shouldAcceptV2AuthoritativeSequence(lastSequence, 8)).toBe(false);
+    expect(shouldAcceptV2AuthoritativeSequence(lastSequence, 9)).toBe(false);
+    expect(shouldAcceptV2AuthoritativeSequence(lastSequence, 10)).toBe(true);
+  });
+
+  it("rejects invalid sequence values", () => {
+    expect(shouldAcceptV2AuthoritativeSequence(0, 0)).toBe(false);
+    expect(shouldAcceptV2AuthoritativeSequence(0, Number.NaN)).toBe(false);
+    expect(shouldAcceptV2AuthoritativeSequence(0, Number.MAX_SAFE_INTEGER + 1)).toBe(false);
+  });
+});
+
+describe("assistanceExpiryDelayMs", () => {
+  it("expires locally and caps a hostile far-future timeout", () => {
+    expect(assistanceExpiryDelayMs(1_800_000_000, 1_800_000_000_000)).toBe(0);
+    expect(assistanceExpiryDelayMs(1_800_000_001, 1_800_000_000_000)).toBe(1_000);
+    expect(assistanceExpiryDelayMs(Number.MAX_SAFE_INTEGER, 0)).toBe(2_147_000_000);
+    expect(assistanceExpiryDelayMs(Number.NaN, 0)).toBe(0);
+  });
+});
+
+describe("currentV2InAppOffer", () => {
+  it("returns the single current foreground offer bound to this device and call", () => {
+    expect(currentV2InAppOffer(takeoverSnapshot(), "device_a", "takeover", OFFER_NOW)?.offer.offerId)
+      .toBe("offer_takeover_a");
+  });
+
+  it("does not let the foreground control consume a voice-system-UI offer", () => {
+    const snapshot = takeoverSnapshot({ surface: "voice_system_ui" });
+    expect(currentV2InAppOffer(snapshot, "device_a", "takeover", OFFER_NOW)).toBeNull();
+  });
+
+  it("expires locally without waiting for another gateway snapshot", () => {
+    const snapshot = takeoverSnapshot({ expiresAt: OFFER_NOW });
+    expect(currentV2InAppOffer(snapshot, "device_a", "takeover", OFFER_NOW)).toBeNull();
+  });
+
+  it("rejects wrong-device, future, and call-fence mismatches", () => {
+    expect(currentV2InAppOffer(takeoverSnapshot(), "device_b", "takeover", OFFER_NOW)).toBeNull();
+    expect(currentV2InAppOffer(takeoverSnapshot({ issuedAt: OFFER_NOW + 6 }), "device_a", "takeover", OFFER_NOW)).toBeNull();
+    expect(currentV2InAppOffer(takeoverSnapshot({ remoteRevision: 14 }), "device_a", "takeover", OFFER_NOW)).toBeNull();
+  });
+
+  it("stays locked when more than one offer could satisfy the same foreground action", () => {
+    const snapshot = takeoverSnapshot();
+    const duplicate = structuredClone(snapshot.snapshot.pendingMobileOffers[0]);
+    duplicate.offer.offerId = "offer_takeover_b";
+    duplicate.offer.jti = "offer_jti_takeover_b";
+    snapshot.snapshot.pendingMobileOffers.push(duplicate);
+    expect(currentV2InAppOffer(snapshot, "device_a", "takeover", OFFER_NOW)).toBeNull();
+  });
+});
+
+describe("v2RuntimeFailureReducer", () => {
+  const failure = { message: "signed offer rejected", operation: "takeover" as const, occurredAt: 123 };
+
+  it("keeps a V2 failure visible when authoritative idle follows it", () => {
+    const reported = v2RuntimeFailureReducer(null, { type: "report", failure });
+    expect(v2RuntimeFailureReducer(reported, { type: "authoritative_idle" })).toEqual(failure);
+  });
+
+  it("clears a recovered realtime failure after authoritative idle sync", () => {
+    const realtimeFailure = { message: "transport closed before authoritative sync", operation: "realtime" as const, occurredAt: 124 };
+    const reported = v2RuntimeFailureReducer(null, { type: "report", failure: realtimeFailure });
+    expect(v2RuntimeFailureReducer(reported, { type: "authoritative_idle" })).toBeNull();
+  });
+
+  it("clears stale failure only for dismissal or a newly confirmed takeover", () => {
+    const reported = v2RuntimeFailureReducer(null, { type: "report", failure });
+    expect(v2RuntimeFailureReducer(reported, { type: "dismiss" })).toBeNull();
+    expect(v2RuntimeFailureReducer(reported, { type: "begin_takeover" })).toBeNull();
+  });
+});
+
+describe("takeover confirmation and automatic microphone arm", () => {
+  it("uses an explicit two-step confirmation on Windows", () => {
+    expect(takeoverConfirmationMode("windows")).toBe("two_step");
+    expect(takeoverConfirmationMode("android")).toBe("press_and_hold");
+  });
+
+  it("arms once only after the active claim advances ownerEpoch", () => {
+    const target = { appId: "app_a", callId: "call_a", callEpoch: 7, ownerEpoch: 4 };
+    const advanced = takeoverMedia(5);
+    expect(shouldAutoArmConfirmedTakeover(target, advanced.lease, advanced.media, true, false)).toBe(true);
+    expect(shouldAutoArmConfirmedTakeover(target, advanced.lease, advanced.media, true, true)).toBe(false);
+
+    const preClaim = takeoverMedia(4);
+    expect(shouldAutoArmConfirmedTakeover(target, preClaim.lease, preClaim.media, true, false)).toBe(false);
+  });
+});
+
+describe("lease exit presentation", () => {
+  it("uses an action-specific label without changing the lease mode", () => {
+    expect(v2LeaseExitLabel("monitor")).toBe("Stop listening");
+    expect(v2LeaseExitLabel("consult")).toBe("Finish private consult");
+    expect(v2LeaseExitLabel("takeover")).toBe("Return to Aokie");
+  });
+});
+
+describe("current live access policy presentation", () => {
+  it("explains when the current remote disclosure is not acknowledged", () => {
+    const snapshot = takeoverSnapshot();
+    snapshot.snapshot.remoteConsent.acknowledged = false;
+
+    expect(v2CurrentAccessPolicyPresentation(snapshot, false)).toEqual({
+      title: "Current remote access is not acknowledged",
+      detail: expect.stringContaining("currently published disclosure and acknowledgement"),
+    });
+  });
+
+  it("explains current live-media grant limits without making hardware claims", () => {
+    const snapshot = takeoverSnapshot();
+    snapshot.grants = snapshot.grants.filter((grant) => grant !== "rtc_signal");
+    const presentation = v2CurrentAccessPolicyPresentation(snapshot, true);
+
+    expect(presentation?.title).toBe("Current live-media authority is limited");
+    expect(presentation?.detail).toContain("current FormLogic grants");
+    expect(presentation?.detail).not.toMatch(/hardware|revoked|permanent/i);
+  });
+
+  it("explains when mode policy and device grants have no authorized intersection", () => {
+    const snapshot = takeoverSnapshot();
+    snapshot.grants = ["state_read", "rtc_signal"];
+    expect(v2CurrentAccessPolicyPresentation(snapshot, true)?.title)
+      .toBe("Current device policy permits no live actions");
+
+    snapshot.snapshot.remoteConsent.monitorEnabled = false;
+    snapshot.snapshot.remoteConsent.consultEnabled = false;
+    snapshot.snapshot.remoteConsent.takeoverEnabled = false;
+    expect(v2CurrentAccessPolicyPresentation(snapshot, true)?.title)
+      .toBe("Current remote policy permits no live actions");
+  });
+
+  it("stays silent when at least one current policy path is authorized", () => {
+    expect(v2CurrentAccessPolicyPresentation(takeoverSnapshot(), true)).toBeNull();
+    expect(v2CurrentAccessPolicyPresentation(null, false)).toBeNull();
+  });
+});
+
+describe("authoritative media transition guidance", () => {
+  it("advances takeover guidance only from published hold and native media facts", () => {
+    expect(v2RouteProgressStages("takeover", "human_pending", "prepared", false, false).map((stage) => stage.status))
+      .toEqual(["done", "done", "active", "waiting"]);
+    expect(v2RouteProgressStages("takeover", "human_active", "active", true, true).map((stage) => stage.status))
+      .toEqual(["done", "done", "done", "done"]);
+    expect(v2RouteProgressStages("takeover", "aokie_active", "prepared", true, true).map((stage) => stage.status))
+      .toEqual(["done", "active", "waiting", "waiting"]);
+  });
+
+  it("keeps recovery on the first unsafe fact and never manufactures completion", () => {
+    expect(v2RecoveryProgressStages("reconnecting", true, true).map((stage) => stage.status))
+      .toEqual(["done", "active", "waiting", "waiting"]);
+    expect(v2RecoveryProgressStages("connected", false, false).map((stage) => stage.status))
+      .toEqual(["done", "done", "done", "active"]);
+  });
+});
+
+describe("assistance call fencing", () => {
+  const request: V2AssistanceRequestEvent = {
+    kind: "assistance_request",
+    schemaVersion: 2,
+    appId: "app_a",
+    eventId: "event_help_a",
+    requestId: "request_help_a",
+    callId: "call_a",
+    callEpoch: 7,
+    ownerEpoch: 4,
+    switchboardRevision: 11,
+    remoteRevision: 13,
+    question: "Can we accept the booking?",
+    expiresAt: OFFER_NOW + 30,
+  };
+
+  it("enables help only for the exact active authoritative call fence", () => {
+    const call = takeoverSnapshot().snapshot;
+    expect(assistanceMatchesV2Call(request, call)).toBe(true);
+    expect(assistanceMatchesV2Call({ ...request, ownerEpoch: 5 }, call)).toBe(false);
+    expect(assistanceMatchesV2Call(request, { ...call, telephonyState: "ended", serviceMode: "ended" })).toBe(false);
+  });
+});
+
+describe("v2TakeoverAttemptReducer", () => {
+  const target = { appId: "app_a", callId: "call_a", callEpoch: 7, ownerEpoch: 4 };
+
+  it("does not resurrect pending status when an error beats the enqueue receipt", () => {
+    let state = v2TakeoverAttemptReducer(INITIAL_V2_TAKEOVER_ATTEMPT, { type: "begin" });
+    const failedGeneration = state.generation;
+    state = v2TakeoverAttemptReducer(state, { type: "target_confirmed", generation: failedGeneration, target });
+    state = v2TakeoverAttemptReducer(state, { type: "failed_or_idle" });
+    state = v2TakeoverAttemptReducer(state, { type: "request_enqueued", generation: failedGeneration });
+
+    expect(state.requestPending).toBe(false);
+    expect(state.target).toBeNull();
+    expect(state.generation).toBeGreaterThan(failedGeneration);
+  });
+
+  it("preserves the accepted status and confirmation target across workspace navigation", () => {
+    let state = v2TakeoverAttemptReducer(INITIAL_V2_TAKEOVER_ATTEMPT, { type: "begin" });
+    const generation = state.generation;
+    state = v2TakeoverAttemptReducer(state, { type: "target_confirmed", generation, target });
+    state = v2TakeoverAttemptReducer(state, { type: "request_enqueued", generation });
+    const navigated = v2TakeoverAttemptReducer(state, { type: "workspace_navigation" });
+
+    expect(navigated).toBe(state);
+    expect(navigated.requestPending).toBe(true);
+    expect(navigated.target).toEqual(target);
+  });
+
+  it("invalidates preserved consent when a published takeover lease is reset", () => {
+    let state = v2TakeoverAttemptReducer(INITIAL_V2_TAKEOVER_ATTEMPT, { type: "begin" });
+    const confirmedGeneration = state.generation;
+    state = v2TakeoverAttemptReducer(state, { type: "target_confirmed", generation: confirmedGeneration, target });
+    state = v2TakeoverAttemptReducer(state, { type: "lease_published" });
+    expect(state.target).toEqual(target);
+
+    state = v2TakeoverAttemptReducer(state, { type: "failed_or_idle" });
+    expect(state.target).toBeNull();
+    expect(state.requestPending).toBe(false);
+    expect(state.generation).toBeGreaterThan(confirmedGeneration);
+  });
+});

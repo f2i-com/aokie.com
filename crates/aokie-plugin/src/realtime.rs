@@ -155,18 +155,26 @@ mod tests {
         assert!(a.contains("\"turnId\":\"t1\""));
         assert!(a.contains("\"callEpoch\":7"));
         // Inside the throttle window: dropped.
-        assert!(lane.user_partial("hello wor", t0 + Duration::from_millis(100)).is_none());
+        assert!(lane
+            .user_partial("hello wor", t0 + Duration::from_millis(100))
+            .is_none());
         // Past it: revision 2, seq advanced.
-        let b = lane.user_partial("hello world", t0 + Duration::from_millis(400)).unwrap();
+        let b = lane
+            .user_partial("hello world", t0 + Duration::from_millis(400))
+            .unwrap();
         assert!(b.contains("\"revision\":2"));
         assert!(b.contains("\"seq\":2"));
         // Finalized turn: next partial is t2 revision 1.
         lane.turn_final();
-        let c = lane.user_partial("next", t0 + Duration::from_millis(500)).unwrap();
+        let c = lane
+            .user_partial("next", t0 + Duration::from_millis(500))
+            .unwrap();
         assert!(c.contains("\"turnId\":\"t2\""));
         assert!(c.contains("\"revision\":1"));
         // Empty text never emits.
-        assert!(lane.user_partial("  ", t0 + Duration::from_secs(9)).is_none());
+        assert!(lane
+            .user_partial("  ", t0 + Duration::from_secs(9))
+            .is_none());
     }
 
     #[test]
@@ -188,7 +196,9 @@ mod tests {
         assert!(a.contains("\"assistant.delivery\""));
         assert!(a.contains("\"sent_to_sco\""));
         assert!(a.contains("\"revision\":1"));
-        let b = lane.delivery("Second sentence.", "sent_to_sco", t0).unwrap();
+        let b = lane
+            .delivery("Second sentence.", "sent_to_sco", t0)
+            .unwrap();
         assert!(b.contains("\"revision\":2"));
         lane.turn_final();
         let c = lane.delivery("Next reply.", "sent_to_sco", t0).unwrap();

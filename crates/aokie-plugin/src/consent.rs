@@ -37,7 +37,12 @@ use std::path::{Path, PathBuf};
 /// Bump when the consent surface changes materially (a new access scope, a
 /// new default destination, a new retention posture) so operators are
 /// forced to re-accept. v1 is the initial scoped grant.
-pub const CURRENT_CONSENT_VERSION: u32 = 1;
+// v2 added remote live captions, typed assistance, listen-only WebRTC and
+// takeover. v3 adds the separately acknowledged private-consult microphone
+// and audio destination. An older grant must
+// never silently authorize those new destinations.
+pub const CURRENT_CONSENT_VERSION: u32 = 3;
+pub const REMOTE_POLICY_ID: &str = "aokie_remote_access";
 
 const FILENAME: &str = "consent.json";
 
@@ -58,6 +63,16 @@ pub struct ConsentScopes {
     pub transcription: bool,
     #[serde(default)]
     pub recording: bool,
+    #[serde(default)]
+    pub remote_captions: bool,
+    #[serde(default)]
+    pub remote_assistance: bool,
+    #[serde(default)]
+    pub remote_monitoring: bool,
+    #[serde(default)]
+    pub remote_consult: bool,
+    #[serde(default)]
+    pub remote_takeover: bool,
     /// Operator-chosen retention window for captured records, if any. Not
     /// gated here (retention is enforced by FormLogic's record TTL); kept
     /// on the grant so a material change forces re-consent via the version.
@@ -117,11 +132,17 @@ pub struct SignedConsent {
 
 /// Verify a signed envelope against the Desktop's verify key and return the
 /// signed grant. Errors name the exact failure (surfaced to the operator).
-pub fn verify_envelope(envelope: &SignedConsent, verify_key_b64: &str) -> Result<ConsentGrant, String> {
+pub fn verify_envelope(
+    envelope: &SignedConsent,
+    verify_key_b64: &str,
+) -> Result<ConsentGrant, String> {
     use base64::Engine as _;
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     if envelope.alg != "Ed25519" {
-        return Err(format!("unsupported consent signature alg {:?}", envelope.alg));
+        return Err(format!(
+            "unsupported consent signature alg {:?}",
+            envelope.alg
+        ));
     }
     let payload_bytes = base64::engine::general_purpose::STANDARD
         .decode(envelope.payload_b64.trim())
@@ -133,11 +154,13 @@ pub fn verify_envelope(envelope: &SignedConsent, verify_key_b64: &str) -> Result
         .decode(verify_key_b64.trim())
         .map_err(|e| format!("consent verify key base64: {e}"))?;
     let key = VerifyingKey::from_bytes(
-        &<[u8; 32]>::try_from(key_bytes.as_slice()).map_err(|_| "consent verify key must be 32 bytes")?,
+        &<[u8; 32]>::try_from(key_bytes.as_slice())
+            .map_err(|_| "consent verify key must be 32 bytes")?,
     )
     .map_err(|e| format!("consent verify key invalid: {e}"))?;
     let sig = Signature::from_bytes(
-        &<[u8; 64]>::try_from(sig_bytes.as_slice()).map_err(|_| "consent signature must be 64 bytes")?,
+        &<[u8; 64]>::try_from(sig_bytes.as_slice())
+            .map_err(|_| "consent signature must be 64 bytes")?,
     );
     key.verify(&payload_bytes, &sig)
         .map_err(|_| "consent grant signature verification failed".to_string())?;
@@ -183,6 +206,11 @@ pub enum Scope {
     Sms,
     Transcription,
     Recording,
+    RemoteCaptions,
+    RemoteAssistance,
+    RemoteMonitoring,
+    RemoteConsult,
+    RemoteTakeover,
 }
 
 impl Scope {
@@ -193,6 +221,11 @@ impl Scope {
             Scope::Sms => "sms",
             Scope::Transcription => "transcription",
             Scope::Recording => "recording",
+            Scope::RemoteCaptions => "remote_captions",
+            Scope::RemoteAssistance => "remote_assistance",
+            Scope::RemoteMonitoring => "remote_monitoring",
+            Scope::RemoteConsult => "remote_consult",
+            Scope::RemoteTakeover => "remote_takeover",
         }
     }
 }
@@ -204,6 +237,11 @@ fn scope_granted(scopes: &ConsentScopes, scope: Scope) -> bool {
         Scope::Sms => scopes.sms,
         Scope::Transcription => scopes.transcription,
         Scope::Recording => scopes.recording,
+        Scope::RemoteCaptions => scopes.remote_captions,
+        Scope::RemoteAssistance => scopes.remote_assistance,
+        Scope::RemoteMonitoring => scopes.remote_monitoring,
+        Scope::RemoteConsult => scopes.remote_consult,
+        Scope::RemoteTakeover => scopes.remote_takeover,
     }
 }
 
@@ -302,7 +340,11 @@ pub fn load_verified(data_dir: &Path, verify_key_b64: Option<&str>) -> LoadedCon
     let raw = match std::fs::read_to_string(&path) {
         Ok(r) => r,
         Err(_) => {
-            return LoadedConsent { grant: None, signed: false, note: None };
+            return LoadedConsent {
+                grant: None,
+                signed: false,
+                note: None,
+            };
         }
     };
     // Signed envelope first (has payloadB64 + signature keys).
@@ -319,7 +361,11 @@ pub fn load_verified(data_dir: &Path, verify_key_b64: Option<&str>) -> LoadedCon
                 };
             };
             return match verify_envelope(&envelope, key) {
-                Ok(grant) => LoadedConsent { grant: Some(grant), signed: true, note: None },
+                Ok(grant) => LoadedConsent {
+                    grant: Some(grant),
+                    signed: true,
+                    note: None,
+                },
                 Err(e) => LoadedConsent {
                     grant: None,
                     signed: false,
@@ -343,7 +389,11 @@ pub fn load_verified(data_dir: &Path, verify_key_b64: Option<&str>) -> LoadedCon
                     ),
                 }
             } else {
-                LoadedConsent { grant: Some(grant), signed: false, note: None }
+                LoadedConsent {
+                    grant: Some(grant),
+                    signed: false,
+                    note: None,
+                }
             }
         }
         Err(e) => {
@@ -369,7 +419,8 @@ pub fn save_signed(data_dir: &Path, envelope: &SignedConsent) -> Result<(), Stri
 /// a caller can't back-date it over the wire.
 pub fn save(data_dir: &Path, mut grant: ConsentGrant) -> Result<ConsentGrant, String> {
     grant.accepted_at = aokie_core::events::now_iso8601();
-    let json = serde_json::to_string_pretty(&grant).map_err(|e| format!("serialize consent: {e}"))?;
+    let json =
+        serde_json::to_string_pretty(&grant).map_err(|e| format!("serialize consent: {e}"))?;
     aokie_core::paths::atomic_write(&config_path(data_dir), json.as_bytes())?;
     Ok(grant)
 }
@@ -400,6 +451,11 @@ mod tests {
                 sms: true,
                 transcription: true,
                 recording: false,
+                remote_captions: true,
+                remote_assistance: true,
+                remote_monitoring: true,
+                remote_consult: true,
+                remote_takeover: true,
                 retention_days: Some(90),
                 destinations: vec!["http://127.0.0.1:17920".to_string()],
             },
@@ -412,33 +468,57 @@ mod tests {
 
     #[test]
     fn mode_defaults_to_enforce_and_warn_is_explicit() {
-        assert_eq!(ConsentMode::from_setting(Some("enforce")), ConsentMode::Enforce);
+        assert_eq!(
+            ConsentMode::from_setting(Some("enforce")),
+            ConsentMode::Enforce
+        );
         assert_eq!(ConsentMode::from_setting(Some("Off")), ConsentMode::Off);
         assert_eq!(ConsentMode::from_setting(Some("warn")), ConsentMode::Warn);
         // CONSENT-001: production default is ENFORCE — unset/garbage never
         // silently degrades to warn or off.
         assert_eq!(ConsentMode::from_setting(None), ConsentMode::Enforce);
-        assert_eq!(ConsentMode::from_setting(Some("banana")), ConsentMode::Enforce);
+        assert_eq!(
+            ConsentMode::from_setting(Some("banana")),
+            ConsentMode::Enforce
+        );
     }
 
     #[test]
     fn off_mode_always_allows() {
         assert_eq!(
-            evaluate(None, CURRENT_CONSENT_VERSION, ConsentMode::Off, Scope::Bluetooth, NOW),
+            evaluate(
+                None,
+                CURRENT_CONSENT_VERSION,
+                ConsentMode::Off,
+                Scope::Bluetooth,
+                NOW
+            ),
             ConsentDecision::Allow
         );
     }
 
     #[test]
     fn enforce_denies_missing_grant() {
-        let d = evaluate(None, CURRENT_CONSENT_VERSION, ConsentMode::Enforce, Scope::Bluetooth, NOW);
+        let d = evaluate(
+            None,
+            CURRENT_CONSENT_VERSION,
+            ConsentMode::Enforce,
+            Scope::Bluetooth,
+            NOW,
+        );
         assert!(d.is_denied());
         assert!(d.reason().contains("no consent"));
     }
 
     #[test]
     fn warn_allows_but_flags_missing_grant() {
-        let d = evaluate(None, CURRENT_CONSENT_VERSION, ConsentMode::Warn, Scope::Bluetooth, NOW);
+        let d = evaluate(
+            None,
+            CURRENT_CONSENT_VERSION,
+            ConsentMode::Warn,
+            Scope::Bluetooth,
+            NOW,
+        );
         assert!(matches!(d, ConsentDecision::Warn(_)));
         assert!(!d.is_denied());
     }
@@ -447,11 +527,23 @@ mod tests {
     fn enforce_allows_a_full_current_grant() {
         let g = full_grant();
         assert_eq!(
-            evaluate(Some(&g), CURRENT_CONSENT_VERSION, ConsentMode::Enforce, Scope::Bluetooth, NOW),
+            evaluate(
+                Some(&g),
+                CURRENT_CONSENT_VERSION,
+                ConsentMode::Enforce,
+                Scope::Bluetooth,
+                NOW
+            ),
             ConsentDecision::Allow
         );
         assert_eq!(
-            evaluate(Some(&g), CURRENT_CONSENT_VERSION, ConsentMode::Enforce, Scope::Sms, NOW),
+            evaluate(
+                Some(&g),
+                CURRENT_CONSENT_VERSION,
+                ConsentMode::Enforce,
+                Scope::Sms,
+                NOW
+            ),
             ConsentDecision::Allow
         );
     }
@@ -459,7 +551,13 @@ mod tests {
     #[test]
     fn enforce_denies_an_ungranted_scope() {
         let g = full_grant(); // recording is false
-        let d = evaluate(Some(&g), CURRENT_CONSENT_VERSION, ConsentMode::Enforce, Scope::Recording, NOW);
+        let d = evaluate(
+            Some(&g),
+            CURRENT_CONSENT_VERSION,
+            ConsentMode::Enforce,
+            Scope::Recording,
+            NOW,
+        );
         assert!(d.is_denied());
         assert!(d.reason().contains("recording"));
     }
@@ -468,11 +566,23 @@ mod tests {
     fn version_mismatch_forces_reconsent() {
         let mut g = full_grant();
         g.version = CURRENT_CONSENT_VERSION + 1; // a future or stale version
-        let d = evaluate(Some(&g), CURRENT_CONSENT_VERSION, ConsentMode::Enforce, Scope::Bluetooth, NOW);
+        let d = evaluate(
+            Some(&g),
+            CURRENT_CONSENT_VERSION,
+            ConsentMode::Enforce,
+            Scope::Bluetooth,
+            NOW,
+        );
         assert!(d.is_denied());
         assert!(d.reason().contains("re-consent"));
         // In warn mode the same mismatch is a warning, not a block.
-        let d = evaluate(Some(&g), CURRENT_CONSENT_VERSION, ConsentMode::Warn, Scope::Bluetooth, NOW);
+        let d = evaluate(
+            Some(&g),
+            CURRENT_CONSENT_VERSION,
+            ConsentMode::Warn,
+            Scope::Bluetooth,
+            NOW,
+        );
         assert!(matches!(d, ConsentDecision::Warn(_)));
     }
 
@@ -480,13 +590,25 @@ mod tests {
     fn expired_grant_forces_reconsent() {
         let mut g = full_grant();
         g.expires_at = Some("2026-07-01T00:00:00Z".into()); // already past NOW
-        let d = evaluate(Some(&g), CURRENT_CONSENT_VERSION, ConsentMode::Enforce, Scope::Bluetooth, NOW);
+        let d = evaluate(
+            Some(&g),
+            CURRENT_CONSENT_VERSION,
+            ConsentMode::Enforce,
+            Scope::Bluetooth,
+            NOW,
+        );
         assert!(d.is_denied());
         assert!(d.reason().contains("expired"));
         // A still-valid expiry allows.
         g.expires_at = Some("2027-07-01T00:00:00Z".into());
         assert_eq!(
-            evaluate(Some(&g), CURRENT_CONSENT_VERSION, ConsentMode::Enforce, Scope::Bluetooth, NOW),
+            evaluate(
+                Some(&g),
+                CURRENT_CONSENT_VERSION,
+                ConsentMode::Enforce,
+                Scope::Bluetooth,
+                NOW
+            ),
             ConsentDecision::Allow
         );
     }
@@ -571,8 +693,8 @@ mod tests {
         let mut forged = full_grant();
         forged.scopes.recording = true;
         use base64::Engine as _;
-        envelope.payload_b64 = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&forged).unwrap());
+        envelope.payload_b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&forged).unwrap());
         save_signed(&dir, &envelope).unwrap();
         let loaded = load_verified(&dir, Some(&pub_b64));
         assert!(loaded.grant.is_none(), "forged payload must not load");
@@ -586,7 +708,10 @@ mod tests {
         let dir = tmp_dir();
         save(&dir, full_grant()).unwrap(); // legacy plain record
         let loaded = load_verified(&dir, Some(&pub_b64));
-        assert!(loaded.grant.is_none(), "legacy record must not satisfy a signing desktop");
+        assert!(
+            loaded.grant.is_none(),
+            "legacy record must not satisfy a signing desktop"
+        );
         assert!(loaded.note.unwrap().contains("re-consent"));
         // …but a legacy host (no key) still accepts it.
         let legacy = load_verified(&dir, None);
@@ -601,10 +726,16 @@ mod tests {
         let dir = tmp_dir();
         save_signed(&dir, &signed_envelope(&full_grant(), &key)).unwrap();
         use base64::Engine as _;
-        let other = base64::engine::general_purpose::STANDARD
-            .encode(ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes());
+        let other = base64::engine::general_purpose::STANDARD.encode(
+            ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
         let loaded = load_verified(&dir, Some(&other));
-        assert!(loaded.grant.is_none(), "a grant signed by ANOTHER install must not verify");
+        assert!(
+            loaded.grant.is_none(),
+            "a grant signed by ANOTHER install must not verify"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

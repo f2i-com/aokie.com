@@ -149,7 +149,11 @@ impl AokiePairingStore {
         let Some(record) = self.records.get_mut(&normalize_address(address)) else {
             return Ok(false);
         };
-        let new = if name.is_empty() { None } else { Some(name.to_string()) };
+        let new = if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        };
         if record.name == new {
             return Ok(false);
         }
@@ -355,9 +359,13 @@ mod tests {
         assert_eq!(store.list_devices()[0].name, None);
 
         // Capture the name (Remote Name Request result); it persists.
-        assert!(store.set_name("04:C8:B0:E1:3F:F3", "Lance's Pixel 8").unwrap());
+        assert!(store
+            .set_name("04:C8:B0:E1:3F:F3", "Lance's Pixel 8")
+            .unwrap());
         // A redundant set is a no-op (never rewrites the file).
-        assert!(!store.set_name("04:c8:b0:e1:3f:f3", "Lance's Pixel 8").unwrap());
+        assert!(!store
+            .set_name("04:c8:b0:e1:3f:f3", "Lance's Pixel 8")
+            .unwrap());
         // Naming an unbonded device is a no-op, not an error.
         assert!(!store.set_name("aa:bb:cc:dd:ee:ff", "Ghost").unwrap());
 

@@ -15,8 +15,8 @@ use aokie_core::events::{aokie_event, aokie_turn_event, now_iso8601};
 use aokie_core::redact::{validate_sms_body, validate_sms_recipient};
 use serde_json::{json, Map, Value};
 
-use crate::config::{ConfigStore, PreferredDongle};
 use crate::command_journal::{CommandJournal, Prepare as JournalPrepare};
+use crate::config::{ConfigStore, PreferredDongle};
 use crate::event_bridge::{emit_event, Sink};
 use crate::outbox::Outbox;
 use crate::rpc::{self, RpcMessage};
@@ -189,6 +189,9 @@ pub struct Plugin {
     /// stdio loop (which routes responses back) and the radio (which makes
     /// mid-call `flow.run` lookups through it).
     pub host_rpc: std::sync::Arc<crate::host_rpc::HostRpc>,
+    /// Direct authenticated v2 signalling socket. It owns no PCM; native
+    /// WebRTC peers bridge the radio and Companion independently.
+    pub companion_gateway: Option<crate::companion_gateway::CompanionGatewayHandle>,
 }
 
 impl Plugin {
@@ -220,6 +223,7 @@ impl Plugin {
             replay_heartbeat: None,
             consent_blocked: None,
             host_rpc: crate::host_rpc::HostRpc::new(),
+            companion_gateway: None,
         })
     }
 
@@ -247,6 +251,7 @@ impl Plugin {
             replay_heartbeat: None,
             consent_blocked: None,
             host_rpc: crate::host_rpc::HostRpc::new(),
+            companion_gateway: None,
         }
     }
 
@@ -649,10 +654,13 @@ impl Plugin {
                     "[aokie-plugin] live radio starting (real mode, auto_answer={auto_answer})"
                 );
                 // Initial config revision for call records (AOK-CONFIG-002).
+                handle.status.config_version.store(
+                    self.store.config.config_version,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 handle
-                    .status
-                    .config_version
-                    .store(self.store.config.config_version, std::sync::atomic::Ordering::Relaxed);
+                    .remote_media()
+                    .inspect(|media| media.set_remote_consent(self.remote_consent_gate()));
                 self.radio = Some(handle);
                 self.radio_start_error = None;
             }
@@ -766,6 +774,7 @@ impl Plugin {
             "mode": mode.as_str(),
             "signatureRequired": self.consent_verify_key().is_some(),
             "bluetooth": { "allowed": !decision.is_denied(), "reason": decision.reason() },
+            "remotePolicy": self.remote_consent_gate(),
             "blocked": self.consent_blocked,
         }))
     }
@@ -798,6 +807,7 @@ impl Plugin {
             crate::consent::save_signed(&self.data_dir, &envelope).map_err(CmdError::failed)?;
             self.consent_blocked = None;
             self.ensure_radio_started();
+            self.sync_remote_consent();
             return Ok(json!({
                 "recorded": true,
                 "signed": true,
@@ -840,6 +850,7 @@ impl Plugin {
         // radio up (idempotent; a no-op if it's already running or unavailable).
         self.consent_blocked = None;
         self.ensure_radio_started();
+        self.sync_remote_consent();
         Ok(json!({
             "recorded": true,
             "version": saved.version,
@@ -864,6 +875,9 @@ impl Plugin {
             .insert("autoAnswer".to_string(), json!(false));
         self.store.config.config_version += 1;
         self.save_config()?;
+        if let Some(gateway) = self.companion_gateway.take() {
+            gateway.stop();
+        }
         let radio_stopped = if let Some(radio) = self.radio.take() {
             let _ = radio.send(crate::radio::RadioControl::Shutdown);
             true
@@ -900,6 +914,9 @@ impl Plugin {
             "plugin.health" => Some(rpc::success_line(&id, self.build_health())),
             "plugin.shutdown" => {
                 self.shutdown_requested = true;
+                if let Some(gateway) = self.companion_gateway.take() {
+                    gateway.stop();
+                }
                 if let Some(radio) = self.radio.as_ref() {
                     let _ = radio.send(crate::radio::RadioControl::Shutdown);
                 }
@@ -916,6 +933,14 @@ impl Plugin {
     }
 
     fn handle_init(&mut self, id: &Value, params: &Value) -> String {
+        // Re-init replaces (or removes) the complete host-provided trust
+        // snapshot. Stop the old gateway before parsing anything so a
+        // malformed, revoked or otherwise unusable replacement can never
+        // leave a previously-authorised remote path running.
+        if let Some(existing) = self.companion_gateway.take() {
+            existing.stop();
+        }
+        let mut companion_bootstrap = None;
         // {desktopVersion, pluginApiVersion, dataDir, devMode} — all
         // advisory except dataDir (re-roots storage) and devMode.
         if let Some(obj) = params.as_object() {
@@ -953,6 +978,16 @@ impl Plugin {
             if let Some(dev) = obj.get("devMode").and_then(Value::as_bool) {
                 self.dev_mode = self.dev_mode || dev;
             }
+            if let Some(value) = obj.get("privateBootstrap") {
+                if !value.is_null() {
+                    match crate::companion_gateway::CompanionBootstrap::parse(value) {
+                        Ok(bootstrap) => companion_bootstrap = Some(bootstrap),
+                        Err(error) => {
+                            return rpc::error_line(Some(id), rpc::INVALID_PARAMS, &error, None)
+                        }
+                    }
+                }
+            }
             // Host feature negotiation (audit INT-003): `eventAck` = the host
             // durably journals every event.emit and confirms with an
             // `event.ack` notification. Outboxed events then stay pending
@@ -981,7 +1016,103 @@ impl Plugin {
         // before any command still reaches the flow. Non-blocking: init
         // status surfaces asynchronously via aokie.dongle.ready / hardware.error.
         self.ensure_radio_started();
-        rpc::success_line(id, json!({"ok": true}))
+        // The Desktop deliberately omits this private, host-proofed material
+        // until at least one Companion is approved. Absence is therefore a
+        // valid local-radio configuration, not permission to discover or
+        // fabricate a weaker endpoint identity. A later plugin restart after
+        // enrollment supplies the complete bootstrap and takes this explicit
+        // start path.
+        let companion_status = match companion_bootstrap {
+            None => Value::Null,
+            Some(bootstrap) => {
+                let Some(radio) = self.radio.as_ref().cloned() else {
+                    return rpc::error_line(
+                        Some(id),
+                        rpc::INVALID_PARAMS,
+                        "privateBootstrap requires a running Aokie radio/media endpoint",
+                        None,
+                    );
+                };
+                match crate::companion_gateway::CompanionGatewayHandle::spawn(
+                    bootstrap,
+                    radio,
+                    self.host_rpc.clone(),
+                ) {
+                    Ok(gateway) => {
+                        let status = gateway.status();
+                        self.companion_gateway = Some(gateway);
+                        serde_json::to_value(status).unwrap_or(Value::Null)
+                    }
+                    Err(error) => {
+                        return rpc::error_line(
+                            Some(id),
+                            rpc::INVALID_PARAMS,
+                            &format!("Companion gateway could not start: {error}"),
+                            None,
+                        )
+                    }
+                }
+            }
+        };
+        rpc::success_line(
+            id,
+            json!({"ok": true, "companionGateway": companion_status}),
+        )
+    }
+
+    /// Remote access never inherits the warn/off compatibility posture used
+    /// for legacy local radio operation. Every capability requires an actual,
+    /// current acknowledgement of its exact versioned scope.
+    fn remote_consent_gate(&self) -> crate::remote_media::RemoteConsentGate {
+        let loaded = self.consent_loaded();
+        let now = aokie_core::events::now_iso8601();
+        let current = loaded.grant.as_ref().is_some_and(|grant| {
+            grant.version == crate::consent::CURRENT_CONSENT_VERSION
+                && grant
+                    .expires_at
+                    .as_deref()
+                    .is_none_or(|expiry| expiry > now.as_str())
+        });
+        let scopes = loaded.grant.as_ref().map(|grant| &grant.scopes);
+        let captions_enabled = current && scopes.is_some_and(|scope| scope.remote_captions);
+        let assistance_enabled = current && scopes.is_some_and(|scope| scope.remote_assistance);
+        let monitor_enabled = current && scopes.is_some_and(|scope| scope.remote_monitoring);
+        let consult_enabled = current && scopes.is_some_and(|scope| scope.remote_consult);
+        let takeover_enabled = current && scopes.is_some_and(|scope| scope.remote_takeover);
+        crate::remote_media::RemoteConsentGate {
+            policy_id: crate::consent::REMOTE_POLICY_ID.into(),
+            policy_version: crate::consent::CURRENT_CONSENT_VERSION,
+            enabled: captions_enabled
+                || assistance_enabled
+                || monitor_enabled
+                || consult_enabled
+                || takeover_enabled,
+            acknowledged: current,
+            acknowledged_at: loaded
+                .grant
+                .as_ref()
+                .filter(|_| current)
+                .map(|grant| grant.accepted_at.clone()),
+            expires_at: loaded
+                .grant
+                .as_ref()
+                .and_then(|grant| grant.expires_at.clone()),
+            captions_enabled,
+            assistance_enabled,
+            monitor_enabled,
+            consult_enabled,
+            takeover_enabled,
+        }
+    }
+
+    fn sync_remote_consent(&self) {
+        if let Some(media) = self
+            .radio
+            .as_ref()
+            .and_then(crate::radio::RadioHandle::remote_media)
+        {
+            media.set_remote_consent(self.remote_consent_gate());
+        }
     }
 
     fn handle_connector_request(
@@ -1036,9 +1167,7 @@ impl Plugin {
             {
                 return connector_error_line(
                     id,
-                    &CmdError::failed(
-                        "requestId must be 1..=128 safe identifier characters",
-                    ),
+                    &CmdError::failed("requestId must be 1..=128 safe identifier characters"),
                 );
             }
         }
@@ -1159,10 +1288,10 @@ impl Plugin {
         match self.save_config() {
             Ok(()) => {
                 if let Some(radio) = self.radio.as_ref() {
-                    radio
-                        .status
-                        .config_version
-                        .store(self.store.config.config_version, std::sync::atomic::Ordering::Relaxed);
+                    radio.status.config_version.store(
+                        self.store.config.config_version,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 // Env follows the store so any later policy rebuild keeps the
                 // block; the running radio already applied it in-thread.
@@ -1192,6 +1321,166 @@ impl Plugin {
         // abuse auto-blocks (the desktop health poll guarantees a bounded lag).
         self.drain_pending_blocks();
         match command {
+            // Private Desktop/gateway adapter surface for Companion media.
+            // It carries authenticated signalling and leases, never PCM.
+            "_companion.media.snapshot" => {
+                expect_fields(payload, &[])?;
+                let media = self
+                    .radio
+                    .as_ref()
+                    .and_then(crate::radio::RadioHandle::remote_media)
+                    .ok_or_else(|| {
+                        CmdError::failed("the native Companion media endpoint is unavailable")
+                    })?;
+                serde_json::to_value(media.snapshot())
+                    .map_err(|error| CmdError::failed(format!("serialize media snapshot: {error}")))
+            }
+            "_companion.media.offer" => {
+                let request: crate::remote_media::OpenPeerRequest =
+                    serde_json::from_value(payload.clone()).map_err(|error| {
+                        CmdError::failed(format!("invalid Companion media offer: {error}"))
+                    })?;
+                let media = self
+                    .radio
+                    .as_ref()
+                    .and_then(crate::radio::RadioHandle::remote_media)
+                    .ok_or_else(|| {
+                        CmdError::failed("the native Companion media endpoint is unavailable")
+                    })?;
+                let accepted = media.open_peer(request).map_err(CmdError::failed)?;
+                // SDP answer and trickle ICE are delivered asynchronously by
+                // _companion.media.events.
+                serde_json::to_value(accepted).map_err(|error| {
+                    CmdError::failed(format!("serialize media acceptance: {error}"))
+                })
+            }
+            "_companion.media.ice" => {
+                let obj = expect_fields(payload, &["rtcSessionId", "candidate"])?;
+                let rtc_session_id = require_str(&obj, "rtcSessionId")?;
+                let candidate: aokie_media::IceCandidateSignal = serde_json::from_value(
+                    obj.get("candidate")
+                        .cloned()
+                        .ok_or_else(|| CmdError::failed("candidate is required"))?,
+                )
+                .map_err(|error| CmdError::failed(format!("invalid ICE candidate: {error}")))?;
+                let media = self
+                    .radio
+                    .as_ref()
+                    .and_then(crate::radio::RadioHandle::remote_media)
+                    .ok_or_else(|| {
+                        CmdError::failed("the native Companion media endpoint is unavailable")
+                    })?;
+                media
+                    .add_remote_ice(&rtc_session_id, candidate)
+                    .map_err(CmdError::failed)?;
+                Ok(json!({"accepted": true, "rtcSessionId": rtc_session_id}))
+            }
+            "_companion.media.takeover" => {
+                let obj = expect_fields(payload, &["binding", "leaseTtlMs"])?;
+                let binding: aokie_media::SessionBinding = serde_json::from_value(
+                    obj.get("binding")
+                        .cloned()
+                        .ok_or_else(|| CmdError::failed("binding is required"))?,
+                )
+                .map_err(|error| CmdError::failed(format!("invalid media binding: {error}")))?;
+                let ttl = obj
+                    .get("leaseTtlMs")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| CmdError::failed("leaseTtlMs must be a positive integer"))?;
+                let media = self
+                    .radio
+                    .as_ref()
+                    .and_then(crate::radio::RadioHandle::remote_media)
+                    .ok_or_else(|| {
+                        CmdError::failed("the native Companion media endpoint is unavailable")
+                    })?;
+                media
+                    .request_takeover(binding.clone(), ttl)
+                    .map_err(CmdError::failed)?;
+                Ok(json!({
+                    "accepted": true,
+                    "pendingPhysicalAck": true,
+                    "rtcSessionId": binding.rtc_session_id,
+                }))
+            }
+            "_companion.media.renew" => {
+                let obj = expect_fields(payload, &["binding", "leaseTtlMs"])?;
+                let binding: aokie_media::SessionBinding = serde_json::from_value(
+                    obj.get("binding")
+                        .cloned()
+                        .ok_or_else(|| CmdError::failed("binding is required"))?,
+                )
+                .map_err(|error| CmdError::failed(format!("invalid media binding: {error}")))?;
+                let ttl = obj
+                    .get("leaseTtlMs")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| CmdError::failed("leaseTtlMs must be a positive integer"))?;
+                let media = self
+                    .radio
+                    .as_ref()
+                    .and_then(crate::radio::RadioHandle::remote_media)
+                    .ok_or_else(|| {
+                        CmdError::failed("the native Companion media endpoint is unavailable")
+                    })?;
+                media.renew_lease(binding, ttl).map_err(CmdError::failed)?;
+                Ok(json!({"accepted": true}))
+            }
+            "_companion.media.revoke" => {
+                let obj = expect_fields(payload, &["binding", "reason"])?;
+                let binding: aokie_media::SessionBinding = serde_json::from_value(
+                    obj.get("binding")
+                        .cloned()
+                        .ok_or_else(|| CmdError::failed("binding is required"))?,
+                )
+                .map_err(|error| CmdError::failed(format!("invalid media binding: {error}")))?;
+                let reason = obj
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("gateway_revoke");
+                let media = self
+                    .radio
+                    .as_ref()
+                    .and_then(crate::radio::RadioHandle::remote_media)
+                    .ok_or_else(|| {
+                        CmdError::failed("the native Companion media endpoint is unavailable")
+                    })?;
+                media.revoke(&binding, reason).map_err(CmdError::failed)?;
+                Ok(json!({"accepted": true, "returnPending": true}))
+            }
+            "_companion.media.close" => {
+                let obj = expect_fields(payload, &["rtcSessionId", "reason"])?;
+                let rtc_session_id = require_str(&obj, "rtcSessionId")?;
+                let reason = obj
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("peer_closed");
+                let media = self
+                    .radio
+                    .as_ref()
+                    .and_then(crate::radio::RadioHandle::remote_media)
+                    .ok_or_else(|| {
+                        CmdError::failed("the native Companion media endpoint is unavailable")
+                    })?;
+                media
+                    .close_peer(&rtc_session_id, reason)
+                    .map_err(CmdError::failed)?;
+                Ok(json!({"closed": true, "rtcSessionId": rtc_session_id}))
+            }
+            "_companion.media.events" => {
+                let obj = expect_fields(payload, &["max"])?;
+                let max = obj.get("max").and_then(Value::as_u64).unwrap_or(64);
+                if !(1..=128).contains(&max) {
+                    return Err(CmdError::failed("max must be between 1 and 128"));
+                }
+                let media = self
+                    .radio
+                    .as_ref()
+                    .and_then(crate::radio::RadioHandle::remote_media)
+                    .ok_or_else(|| {
+                        CmdError::failed("the native Companion media endpoint is unavailable")
+                    })?;
+                Ok(json!({"events": media.drain_events(max as usize)}))
+            }
             "dongle.list" => {
                 expect_fields(payload, &[])?;
                 // The compatibility catalog: dongles Aokie is known to support (back-compat `dongles`).
@@ -1359,8 +1648,20 @@ impl Plugin {
                         &session_id,
                         json!({"at": now_iso8601(), "simulated": true}),
                     );
-                    emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
-                    return Ok(json!({"sessionId": session_id, "status": "pairing", "simulated": true}));
+                    emit_event(
+                        sink,
+                        &self.outbox,
+                        &ev,
+                        false,
+                        crate::event_bridge::EmitMode::for_host(
+                            self.ack_mode,
+                            self.dev_mode || crate::event_bridge::legacy_host_allowed(),
+                        ),
+                    )
+                    .map_err(CmdError::failed)?;
+                    return Ok(
+                        json!({"sessionId": session_id, "status": "pairing", "simulated": true}),
+                    );
                 };
                 radio.start_pairing(seconds).map_err(CmdError::failed)?;
                 let session_id = format!("pair_{}", uuid::Uuid::new_v4().simple());
@@ -1369,7 +1670,17 @@ impl Plugin {
                     &session_id,
                     json!({"at": now_iso8601(), "windowSeconds": seconds}),
                 );
-                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
+                emit_event(
+                    sink,
+                    &self.outbox,
+                    &ev,
+                    false,
+                    crate::event_bridge::EmitMode::for_host(
+                        self.ack_mode,
+                        self.dev_mode || crate::event_bridge::legacy_host_allowed(),
+                    ),
+                )
+                .map_err(CmdError::failed)?;
                 Ok(json!({
                     "sessionId": session_id,
                     "status": if radio.is_initialized() { "discoverable" } else { "starting" },
@@ -1431,7 +1742,9 @@ impl Plugin {
                 let address = require_str(&obj, "address")?;
                 self.require_radio_or_dev("phone.removePaired")?;
                 if let Some(radio) = self.radio.as_ref() {
-                    let removed = radio.remove_paired(address.clone()).map_err(CmdError::failed)?;
+                    let removed = radio
+                        .remove_paired(address.clone())
+                        .map_err(CmdError::failed)?;
                     return Ok(json!({"removed": removed, "address": address}));
                 }
                 // Dev mode: nothing bonded to remove.
@@ -1448,8 +1761,9 @@ impl Plugin {
                 self.check_consent("phone.disconnect", crate::consent::Scope::Bluetooth)?;
                 self.require_radio_or_dev("phone.disconnect")?;
                 if let Some(radio) = self.radio.as_ref() {
-                    let disconnected =
-                        radio.disconnect(address.clone()).map_err(CmdError::failed)?;
+                    let disconnected = radio
+                        .disconnect(address.clone())
+                        .map_err(CmdError::failed)?;
                     return Ok(json!({"disconnected": disconnected, "address": address}));
                 }
                 // Dev mode: nothing connected to drop.
@@ -1507,6 +1821,7 @@ impl Plugin {
                     // Canonical shape (audit C-02) — the SAME keys the browser
                     // mock returns and the Live Call screen parses, so a
                     // refreshed page recovers a real in-flight call.
+                    let media = radio.remote_media().map(|media| media.snapshot());
                     let call = radio.current_call_id().map(|call_id| {
                         json!({
                             "callId": call_id,
@@ -1517,9 +1832,12 @@ impl Plugin {
                                 crate::contract::call_state::RINGING
                             },
                             "startedAt": radio.call_started_at(),
+                            "callEpoch": media.as_ref().map(|media| media.call_epoch),
+                            "ownerEpoch": media.as_ref().map(|media| media.owner_epoch),
+                            "serviceMode": media.as_ref().map(|media| media.service_mode),
                         })
                     });
-                    return Ok(json!({"call": call}));
+                    return Ok(json!({"call": call, "companionMedia": media}));
                 }
                 self.require_radio_or_dev("call.current")?;
                 Ok(json!({"call": self.mock.current_call.as_ref().map(call_json)}))
@@ -1562,6 +1880,11 @@ impl Plugin {
                         "call.activate needs the radio — the dev mock has no switchboard",
                     ));
                 };
+                if radio.remote_media_reserved() {
+                    return Err(CmdError::failed(
+                        "Companion remote ownership is pending/active; call.activate is blocked until Aokie owns the radio again",
+                    ));
+                }
                 let revision = radio.switchboard_revision();
                 if let Some(expected) = expected_revision {
                     if expected != revision {
@@ -1575,9 +1898,7 @@ impl Plugin {
                         "a switch is already in progress — re-read call.switchboard once it settles",
                     ));
                 }
-                let is_waiting = radio
-                    .waiting_call()
-                    .is_some_and(|w| w.call_id == call_id);
+                let is_waiting = radio.waiting_call().is_some_and(|w| w.call_id == call_id);
                 let is_parked = radio
                     .parked_call_leg()
                     .is_some_and(|p| p.call_id == call_id);
@@ -1639,8 +1960,22 @@ impl Plugin {
                     let c = self.mock.current_call.as_ref().unwrap();
                     (c.correlation_id.clone(), call_json(c))
                 };
-                let ev = aokie_event(crate::contract::events::CALL_ANSWERED, &corr, json!({"at": now_iso8601()}));
-                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
+                let ev = aokie_event(
+                    crate::contract::events::CALL_ANSWERED,
+                    &corr,
+                    json!({"at": now_iso8601()}),
+                );
+                emit_event(
+                    sink,
+                    &self.outbox,
+                    &ev,
+                    false,
+                    crate::event_bridge::EmitMode::for_host(
+                        self.ack_mode,
+                        self.dev_mode || crate::event_bridge::legacy_host_allowed(),
+                    ),
+                )
+                .map_err(CmdError::failed)?;
                 Ok(json!({"accepted": true, "answered": true, "call": snapshot}))
             }
             "call.reject" => {
@@ -1669,8 +2004,22 @@ impl Plugin {
                 let call = self.require_call(&[MockCallState::Incoming], "call.reject")?;
                 call.state = MockCallState::Ended;
                 let corr = call.correlation_id.clone();
-                let ev = aokie_event(crate::contract::events::CALL_REJECTED, &corr, json!({"at": now_iso8601()}));
-                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
+                let ev = aokie_event(
+                    crate::contract::events::CALL_REJECTED,
+                    &corr,
+                    json!({"at": now_iso8601()}),
+                );
+                emit_event(
+                    sink,
+                    &self.outbox,
+                    &ev,
+                    false,
+                    crate::event_bridge::EmitMode::for_host(
+                        self.ack_mode,
+                        self.dev_mode || crate::event_bridge::legacy_host_allowed(),
+                    ),
+                )
+                .map_err(CmdError::failed)?;
                 Ok(json!({"accepted": true, "rejected": true}))
             }
             "call.hangup" => {
@@ -1717,7 +2066,17 @@ impl Plugin {
                         "outcome": "completed",
                     }),
                 );
-                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
+                emit_event(
+                    sink,
+                    &self.outbox,
+                    &ev,
+                    false,
+                    crate::event_bridge::EmitMode::for_host(
+                        self.ack_mode,
+                        self.dev_mode || crate::event_bridge::legacy_host_allowed(),
+                    ),
+                )
+                .map_err(CmdError::failed)?;
                 Ok(json!({"accepted": true, "ended": true}))
             }
             "call.operatorSpeak" => {
@@ -1746,6 +2105,11 @@ impl Plugin {
                     if !cfg!(feature = "voice") {
                         return Err(CmdError::failed(
                             "this plugin build has no voice output (voice feature not compiled) — operatorSpeak cannot be spoken",
+                        ));
+                    }
+                    if radio.remote_media_reserved() {
+                        return Err(CmdError::failed(
+                            "a Companion user owns or is taking the caller audio route; operatorSpeak is refused until the caller returns to Aokie",
                         ));
                     }
                     // AOK-CTRL-001: while the RUNNING radio's in-plugin agent
@@ -1921,7 +2285,11 @@ impl Plugin {
                         "a call is already in progress — outbound dialing needs an idle line",
                     ));
                 }
-                if !radio.status.connected.load(std::sync::atomic::Ordering::Relaxed) {
+                if !radio
+                    .status
+                    .connected
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     return Err(CmdError::failed(
                         "no phone is connected — reconnect the phone before dialing",
                     ));
@@ -2040,7 +2408,9 @@ impl Plugin {
                             body,
                         })
                         .map_err(CmdError::failed)?;
-                    return Ok(json!({"messageId": message_id, "to": to, "status": "queued", "via": "radio"}));
+                    return Ok(
+                        json!({"messageId": message_id, "to": to, "status": "queued", "via": "radio"}),
+                    );
                 }
                 // Real mode with no radio: the message can NOT be sent — a
                 // fabricated "queued" here is the audit's canonical fake
@@ -2054,7 +2424,17 @@ impl Plugin {
                     &message_id,
                     json!({"messageId": message_id, "to": to, "at": at, "simulated": true}),
                 );
-                emit_event(sink, &self.outbox, &ev, false, crate::event_bridge::EmitMode::for_host(self.ack_mode, self.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
+                emit_event(
+                    sink,
+                    &self.outbox,
+                    &ev,
+                    false,
+                    crate::event_bridge::EmitMode::for_host(
+                        self.ack_mode,
+                        self.dev_mode || crate::event_bridge::legacy_host_allowed(),
+                    ),
+                )
+                .map_err(CmdError::failed)?;
                 let thread = self.mock.thread_for(&to);
                 thread.messages.push(MockSmsMessage {
                     id: message_id.clone(),
@@ -2082,7 +2462,9 @@ impl Plugin {
                     .redrive_dead(key)
                     .map_err(|e| CmdError::failed(format!("outbox redrive failed: {e}")))?;
                 if revived > 0 {
-                    eprintln!("[aokie-plugin] operator redrive revived {revived} dead outbox event(s)");
+                    eprintln!(
+                        "[aokie-plugin] operator redrive revived {revived} dead outbox event(s)"
+                    );
                 }
                 Ok(json!({ "revived": revived }))
             }
@@ -2122,7 +2504,9 @@ impl Plugin {
                 if self.consent_mode() == crate::consent::ConsentMode::Enforce {
                     if let Some(grant) = self.consent_loaded().grant.as_ref() {
                         for key in ["aiEndpoint", "sttEndpoint", "ttsEndpoint"] {
-                            let Some(url) = obj.get(key).and_then(Value::as_str) else { continue };
+                            let Some(url) = obj.get(key).and_then(Value::as_str) else {
+                                continue;
+                            };
                             let url = url.trim();
                             if url.is_empty() || is_loopback_endpoint(url) {
                                 continue; // clearing / local processing needs no destination grant
@@ -2160,10 +2544,10 @@ impl Plugin {
                 // call.ended records which configuration it ran under
                 // (audit AOK-CONFIG-002).
                 if let Some(radio) = self.radio.as_ref() {
-                    radio
-                        .status
-                        .config_version
-                        .store(self.store.config.config_version, std::sync::atomic::Ordering::Relaxed);
+                    radio.status.config_version.store(
+                        self.store.config.config_version,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 // Live-reconfigure a running receptionist so a flow (or the desktop)
                 // can push the Receptionist Settings — persona/greeting/voice/model —
@@ -2241,7 +2625,17 @@ impl Plugin {
         let mut emit = |plugin: &mut Plugin, ev: aokie_core::events::DesktopEvent| {
             // The scripted run records EVERY step in the outbox so
             // integration tests can assert write-before-emit.
-            emit_event(sink, &plugin.outbox, &ev, true, crate::event_bridge::EmitMode::for_host(plugin.ack_mode, plugin.dev_mode || crate::event_bridge::legacy_host_allowed())).map_err(CmdError::failed)?;
+            emit_event(
+                sink,
+                &plugin.outbox,
+                &ev,
+                true,
+                crate::event_bridge::EmitMode::for_host(
+                    plugin.ack_mode,
+                    plugin.dev_mode || crate::event_bridge::legacy_host_allowed(),
+                ),
+            )
+            .map_err(CmdError::failed)?;
             emitted.push(ev.name.clone());
             Ok::<(), CmdError>(())
         };
@@ -2280,7 +2674,11 @@ impl Plugin {
 
         emit(
             self,
-            aokie_event(crate::contract::events::CALL_ANSWERED, &corr, json!({"at": now_iso8601()})),
+            aokie_event(
+                crate::contract::events::CALL_ANSWERED,
+                &corr,
+                json!({"at": now_iso8601()}),
+            ),
         )?;
         if let Some(call) = self.mock.current_call.as_mut() {
             call.state = MockCallState::Active;
@@ -2474,12 +2872,15 @@ impl Plugin {
         // silently freezing is exactly the failure health must not hide.
         let replay_age = self.replay_heartbeat.as_ref().map(|hb| {
             let v = hb.load(std::sync::atomic::Ordering::Relaxed);
-            if v == 0 { u64::MAX } else { crate::event_bridge::unix_now().saturating_sub(v) }
+            if v == 0 {
+                u64::MAX
+            } else {
+                crate::event_bridge::unix_now().saturating_sub(v)
+            }
         });
         match replay_age {
-            Some(u64::MAX) => reasons.push(
-                "outbox replay thread failed to start — durable delivery halted".to_string(),
-            ),
+            Some(u64::MAX) => reasons
+                .push("outbox replay thread failed to start — durable delivery halted".to_string()),
             Some(age) if age > 30 => reasons.push(format!(
                 "outbox replay thread stalled ({age}s since last tick) — durable delivery frozen"
             )),
@@ -2555,6 +2956,21 @@ impl Plugin {
                 json!("replies are produced by host flows — check the desktop's FormLogic link and the reply flow binding")
             },
         });
+        let companion = self
+            .companion_gateway
+            .as_ref()
+            .map(|gateway| gateway.status());
+        if let Some(status) = companion.as_ref().filter(|status| !status.connected) {
+            reasons.push(format!(
+                "Companion gateway is {:?}{}",
+                status.phase,
+                status
+                    .last_error
+                    .as_deref()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            ));
+        }
         json!({
             "status": if reasons.is_empty() { "ok" } else { "degraded" },
             "detail": if reasons.is_empty() { Value::Null } else { json!(reasons.join("; ")) },
@@ -2563,6 +2979,7 @@ impl Plugin {
                 "devMode": self.dev_mode,
                 "radio": radio,
                 "responder": responder,
+                "companionGateway": companion,
                 "consent": consent,
                 "outbox": {
                     "pending": counts.pending,
@@ -2676,7 +3093,9 @@ impl Plugin {
         let work_dir = self.data_dir.join("winusb-install");
         match aokie_dongle::installer::restore_original_driver(vid, pid, &work_dir) {
             Ok(()) => Ok(json!({"restored": true, "vid": vid, "pid": pid})),
-            Err(e) => Err(CmdError::failed(format!("restore original driver failed: {e}"))),
+            Err(e) => Err(CmdError::failed(format!(
+                "restore original driver failed: {e}"
+            ))),
         }
     }
 
@@ -2917,72 +3336,230 @@ pub enum SettingKind {
 /// Every known operational setting. Unknown keys stay allowed (the bag is
 /// deliberately extensible) but must be scalar and bounded.
 pub const SETTING_SPECS: &[SettingSpec] = &[
-    SettingSpec { key: "autoAnswer", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "aiReceptionist", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "bargeIn", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "sendAudio", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "audioTranscript", kind: SettingKind::Bool, applies_live: false },
+    SettingSpec {
+        key: "autoAnswer",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "aiReceptionist",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "bargeIn",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "sendAudio",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "audioTranscript",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
     // Phase 4 (call waiting / hold): advertise HFP three-way calling and
     // negotiate AT+CHLD / AT+CCWA at the next connect. OBSERVE-ONLY for now
     // (a second caller is detected + recorded, never answered/held) —
     // default OFF keeps the legacy wire behaviour byte-for-byte.
-    SettingSpec { key: "holdAndCallWaiting", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "autoHoldQueue", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "blockedNumbers", kind: SettingKind::Str { max_chars: 4000 }, applies_live: true },
-    SettingSpec { key: "acceptPattern", kind: SettingKind::Str { max_chars: 200 }, applies_live: true },
-    SettingSpec { key: "rejectPrivate", kind: SettingKind::Bool, applies_live: true },
-    SettingSpec { key: "screenMessage", kind: SettingKind::Str { max_chars: 500 }, applies_live: true },
-    SettingSpec { key: "blockedMessage", kind: SettingKind::Str { max_chars: 500 }, applies_live: true },
+    SettingSpec {
+        key: "holdAndCallWaiting",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "autoHoldQueue",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "blockedNumbers",
+        kind: SettingKind::Str { max_chars: 4000 },
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "acceptPattern",
+        kind: SettingKind::Str { max_chars: 200 },
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "rejectPrivate",
+        kind: SettingKind::Bool,
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "screenMessage",
+        kind: SettingKind::Str { max_chars: 500 },
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "blockedMessage",
+        kind: SettingKind::Str { max_chars: 500 },
+        applies_live: true,
+    },
     // Phase 1 abuse handling: when the agent flags an abusive caller
     // ([[ABUSE]]), also append their number to blockedNumbers. Default ON —
     // only an explicit false turns the auto-block off (the notice + hangup
     // always happen regardless).
-    SettingSpec { key: "autoBlockAbuse", kind: SettingKind::Bool, applies_live: true },
+    SettingSpec {
+        key: "autoBlockAbuse",
+        kind: SettingKind::Bool,
+        applies_live: true,
+    },
     // Phase 3 manager line: numbers whose callers get the MANAGER persona +
     // name-inclusive lookups (READ-ONLY — caller ID is spoofable; writes will
     // additionally require the spoken PIN). Applies live via the screening
     // reload machinery.
-    SettingSpec { key: "managerNumbers", kind: SettingKind::Str { max_chars: 2000 }, applies_live: true },
+    SettingSpec {
+        key: "managerNumbers",
+        kind: SettingKind::Str { max_chars: 2000 },
+        applies_live: true,
+    },
     // Phase 3 slice 2: the spoken PIN that unlocks manager WRITE actions
     // (verified by deterministic digit comparison, never the model). Read at
     // PIN time from env like the other screening-family keys.
-    SettingSpec { key: "managerPin", kind: SettingKind::Str { max_chars: 32 }, applies_live: true },
+    SettingSpec {
+        key: "managerPin",
+        kind: SettingKind::Str { max_chars: 32 },
+        applies_live: true,
+    },
     // Phase 2 outbound guardrails — read at DISPATCH time (call.dial), so
     // they apply immediately with no reconnect. outboundEnabled is the kill
     // switch and DEFAULTS OFF: the receptionist can never place a call until
     // the operator explicitly turns outbound on.
-    SettingSpec { key: "outboundEnabled", kind: SettingKind::Bool, applies_live: true },
-    SettingSpec { key: "maxDailyDials", kind: SettingKind::Int { min: 1, max: 200 }, applies_live: true },
+    SettingSpec {
+        key: "outboundEnabled",
+        kind: SettingKind::Bool,
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "maxDailyDials",
+        kind: SettingKind::Int { min: 1, max: 200 },
+        applies_live: true,
+    },
     // Local-time do-not-dial window [start, end): 21/8 = no automated calls
     // 9pm–8am. start == end disables the window.
-    SettingSpec { key: "quietHoursStart", kind: SettingKind::Int { min: 0, max: 23 }, applies_live: true },
-    SettingSpec { key: "quietHoursEnd", kind: SettingKind::Int { min: 0, max: 23 }, applies_live: true },
-    SettingSpec { key: "agentHangup", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "reenumerateHwid", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "legacyPairingPin", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "mockCalls", kind: SettingKind::Bool, applies_live: false },
-    SettingSpec { key: "bargeSensitivity", kind: SettingKind::Int { min: 50, max: 5000 }, applies_live: false },
-    SettingSpec { key: "sttEndpointMs", kind: SettingKind::Int { min: STT_ENDPOINT_MS_MIN as i64, max: STT_ENDPOINT_MS_MAX as i64 }, applies_live: false },
+    SettingSpec {
+        key: "quietHoursStart",
+        kind: SettingKind::Int { min: 0, max: 23 },
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "quietHoursEnd",
+        kind: SettingKind::Int { min: 0, max: 23 },
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "agentHangup",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "reenumerateHwid",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "legacyPairingPin",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "mockCalls",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "bargeSensitivity",
+        kind: SettingKind::Int { min: 50, max: 5000 },
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "sttEndpointMs",
+        kind: SettingKind::Int {
+            min: STT_ENDPOINT_MS_MIN as i64,
+            max: STT_ENDPOINT_MS_MAX as i64,
+        },
+        applies_live: false,
+    },
     // AOK-CTRL-001: seconds of MUTUAL silence before the agent checks in, then
     // (after a second silent window) says goodbye and hangs up. 0 = disabled.
-    SettingSpec { key: "maxSilenceSecs", kind: SettingKind::Int { min: 0, max: 600 }, applies_live: false },
+    SettingSpec {
+        key: "maxSilenceSecs",
+        kind: SettingKind::Int { min: 0, max: 600 },
+        applies_live: false,
+    },
     // Speech pacing (percent of normal speed): the call-baseline rate and the
     // rate for detail spans (phone numbers/codes, read digit-by-digit). The
     // caller can still say "slower"/"faster" live; these set each call's start.
-    SettingSpec { key: "defaultSpeechRate", kind: SettingKind::Int { min: 60, max: 140 }, applies_live: false },
-    SettingSpec { key: "detailSpeechRate", kind: SettingKind::Int { min: 50, max: 100 }, applies_live: false },
+    SettingSpec {
+        key: "defaultSpeechRate",
+        kind: SettingKind::Int { min: 60, max: 140 },
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "detailSpeechRate",
+        kind: SettingKind::Int { min: 50, max: 100 },
+        applies_live: false,
+    },
     // Cap on how long an [[important]] span may keep playing once the caller
     // has started talking over it (explicit controls always cut instantly).
-    SettingSpec { key: "protectedSpeechMaxMs", kind: SettingKind::Int { min: 500, max: 5000 }, applies_live: false },
-    SettingSpec { key: "hfpCodec", kind: SettingKind::Enum(&["auto", "cvsd", "wbs"]), applies_live: false },
-    SettingSpec { key: "persona", kind: SettingKind::Str { max_chars: 4000 }, applies_live: true },
-    SettingSpec { key: "greeting", kind: SettingKind::Str { max_chars: 1000 }, applies_live: true },
-    SettingSpec { key: "ttsVoice", kind: SettingKind::Str { max_chars: 200 }, applies_live: true },
-    SettingSpec { key: "aiModel", kind: SettingKind::Str { max_chars: 200 }, applies_live: true },
-    SettingSpec { key: "replyMode", kind: SettingKind::Str { max_chars: 200 }, applies_live: false },
-    SettingSpec { key: "aiEndpoint", kind: SettingKind::EndpointUrl, applies_live: true },
-    SettingSpec { key: "sttEndpoint", kind: SettingKind::EndpointUrl, applies_live: true },
-    SettingSpec { key: "ttsEndpoint", kind: SettingKind::EndpointUrl, applies_live: true },
+    SettingSpec {
+        key: "protectedSpeechMaxMs",
+        kind: SettingKind::Int {
+            min: 500,
+            max: 5000,
+        },
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "hfpCodec",
+        kind: SettingKind::Enum(&["auto", "cvsd", "wbs"]),
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "persona",
+        kind: SettingKind::Str { max_chars: 4000 },
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "greeting",
+        kind: SettingKind::Str { max_chars: 1000 },
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "ttsVoice",
+        kind: SettingKind::Str { max_chars: 200 },
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "aiModel",
+        kind: SettingKind::Str { max_chars: 200 },
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "replyMode",
+        kind: SettingKind::Str { max_chars: 200 },
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "aiEndpoint",
+        kind: SettingKind::EndpointUrl,
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "sttEndpoint",
+        kind: SettingKind::EndpointUrl,
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "ttsEndpoint",
+        kind: SettingKind::EndpointUrl,
+        applies_live: true,
+    },
 ];
 
 fn setting_spec(key: &str) -> Option<&'static SettingSpec> {
@@ -3142,14 +3719,17 @@ fn validate_manager_pin(value: &Value) -> Result<(), CmdError> {
     }
     let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
     let repeated = digits.chars().all(|c| Some(c) == digits.chars().next());
-    let sequential = "01234567890123456789".contains(&digits)
-        || "98765432109876543210".contains(&digits);
+    let sequential =
+        "01234567890123456789".contains(&digits) || "98765432109876543210".contains(&digits);
     if digits.len() < 6 || digits.len() > 12 || repeated || sequential {
         return Err(CmdError::failed(
             "managerPin must be a non-repeating, non-sequential 6-12 digit PIN",
         ));
     }
-    if raw.chars().any(|c| !c.is_ascii_digit() && !c.is_ascii_whitespace() && c != '-') {
+    if raw
+        .chars()
+        .any(|c| !c.is_ascii_digit() && !c.is_ascii_whitespace() && c != '-')
+    {
         return Err(CmdError::failed(
             "managerPin may contain digits, spaces, and hyphens only",
         ));
@@ -3172,7 +3752,9 @@ fn auto_answer_from_settings(settings: &Map<String, Value>) -> bool {
 /// a PUBLIC endpoint must be HTTPS — caller audio/transcripts never leave
 /// the machine in cleartext.
 fn validate_endpoint_setting(key: &str, value: &Value) -> Result<(), CmdError> {
-    use aokie_core::url_classification::{classify_base_url, parse_base_url, BaseUrlClassification as C};
+    use aokie_core::url_classification::{
+        classify_base_url, parse_base_url, BaseUrlClassification as C,
+    };
     let raw = match value {
         Value::Null => return Ok(()),
         Value::String(s) => s.trim(),
@@ -3186,8 +3768,8 @@ fn validate_endpoint_setting(key: &str, value: &Value) -> Result<(), CmdError> {
     if raw.is_empty() {
         return Ok(()); // clearing the endpoint is always fine
     }
-    let parsed = parse_base_url(raw)
-        .map_err(|e| CmdError::failed(format!("{key} rejected: {e}")))?;
+    let parsed =
+        parse_base_url(raw).map_err(|e| CmdError::failed(format!("{key} rejected: {e}")))?;
     match classify_base_url(raw) {
         C::Empty | C::Loopback => Ok(()),
         C::Private => Err(CmdError::failed(format!(
@@ -3246,7 +3828,11 @@ fn apply_endpoint_env_from_settings(
     setting_key: &str,
     env_key: &str,
 ) {
-    match settings.get(setting_key).and_then(Value::as_str).map(str::trim) {
+    match settings
+        .get(setting_key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
         Some(ep) if !ep.is_empty() => std::env::set_var(env_key, ep),
         _ => std::env::remove_var(env_key),
     }
@@ -3279,7 +3865,9 @@ fn endpoint_update(obj: &Map<String, Value>, key: &str) -> crate::radio::Endpoin
     match obj.get(key) {
         None => crate::radio::EndpointUpdate::Unchanged,
         Some(Value::Null) => crate::radio::EndpointUpdate::Clear,
-        Some(Value::String(value)) if value.trim().is_empty() => crate::radio::EndpointUpdate::Clear,
+        Some(Value::String(value)) if value.trim().is_empty() => {
+            crate::radio::EndpointUpdate::Clear
+        }
         Some(Value::String(value)) => crate::radio::EndpointUpdate::Set(value.trim().to_string()),
         Some(_) => crate::radio::EndpointUpdate::Unchanged,
     }
@@ -3301,8 +3889,46 @@ mod tests {
     use super::*;
     use crate::event_bridge::VecSink;
     use crate::outbox::OutboxStatus;
+    use aokie_protocol::v2::{peer_roster_hash, EndpointPublicKey};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ed25519_dalek::SigningKey;
 
     static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn valid_companion_bootstrap() -> Value {
+        let endpoint_signing_key = SigningKey::from_bytes(&[41; 32]);
+        let endpoint_key =
+            EndpointPublicKey::from_ed25519_bytes(&endpoint_signing_key.verifying_key().to_bytes());
+        let mobile_signing_key = SigningKey::from_bytes(&[42; 32]);
+        let mobile_key =
+            EndpointPublicKey::from_ed25519_bytes(&mobile_signing_key.verifying_key().to_bytes());
+        let roster_revision = 1;
+        let roster_hash = peer_roster_hash(roster_revision, &[mobile_key.thumbprint.clone()]);
+        json!({
+            "schemaVersion": 2,
+            "gatewayUrl": "wss://127.0.0.1:9",
+            "accessToken": "test-private-bootstrap-token",
+            "appId": "app_a",
+            "pluginId": "aokie",
+            "iceServers": [{
+                "urls": ["stun:stun.example.test:3478"],
+                "username": "",
+                "credential": ""
+            }],
+            "relayOnly": false,
+            "endpointIdentity": {
+                "algorithm": endpoint_key.algorithm,
+                "publicKey": endpoint_key.public_key,
+                "thumbprint": endpoint_key.thumbprint,
+                "privateKeySeed": URL_SAFE_NO_PAD.encode(endpoint_signing_key.to_bytes())
+            },
+            "approvedMobileRoster": {
+                "revision": roster_revision,
+                "rosterHash": roster_hash,
+                "keys": [mobile_key]
+            }
+        })
+    }
 
     #[test]
     fn blank_or_missing_greeting_resolves_to_the_default_never_silence() {
@@ -3325,7 +3951,10 @@ mod tests {
         }
         // A real greeting wins.
         let mut settings = Map::new();
-        settings.insert("greeting".to_string(), json!("G'day, you've reached Lance."));
+        settings.insert(
+            "greeting".to_string(),
+            json!("G'day, you've reached Lance."),
+        );
         assert_eq!(
             greeting_from_settings(&settings).as_deref(),
             Some("G'day, you've reached Lance.")
@@ -3386,6 +4015,124 @@ mod tests {
             .unwrap();
         assert_eq!(parse(&resp)["result"]["ok"], json!(true));
         assert!(plugin.shutdown_requested);
+    }
+
+    #[test]
+    fn ready_radio_init_without_bootstrap_is_local_only_then_accepts_explicit_bootstrap() {
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+        let (radio, _controls) = crate::radio::RadioHandle::test_handle();
+        plugin.radio = Some(radio);
+
+        // This is the production branch that regressed: a ready radio with no
+        // approved mobile roster. It must not attempt an identity-less broker
+        // bootstrap merely because unit tests are being compiled.
+        let response = plugin
+            .handle_rpc(
+                request(1, "plugin.init", json!({"pluginApiVersion": 1})),
+                &mut sink,
+            )
+            .unwrap();
+        let response = parse(&response);
+        assert_eq!(response["result"]["ok"], json!(true));
+        assert!(response["result"]["companionGateway"].is_null());
+        assert!(plugin.radio.is_some());
+        assert!(plugin.companion_gateway.is_none());
+
+        // After Companion enrollment the Desktop restarts/re-initializes the
+        // plugin with a complete host-proofed trust snapshot. That explicit
+        // bootstrap remains consumable and starts the gateway normally.
+        let response = plugin
+            .handle_rpc(
+                request(
+                    2,
+                    "plugin.init",
+                    json!({
+                        "pluginApiVersion": 1,
+                        "privateBootstrap": valid_companion_bootstrap()
+                    }),
+                ),
+                &mut sink,
+            )
+            .unwrap();
+        let response = parse(&response);
+        assert_eq!(response["result"]["ok"], json!(true));
+        assert_eq!(
+            response["result"]["companionGateway"]["configured"],
+            json!(true)
+        );
+        assert!(plugin.companion_gateway.is_some());
+    }
+
+    #[test]
+    fn explicit_unusable_bootstrap_fails_closed_and_stops_any_old_gateway() {
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+        let (radio, _controls) = crate::radio::RadioHandle::test_handle();
+        plugin.radio = Some(radio);
+
+        let started = plugin
+            .handle_rpc(
+                request(
+                    1,
+                    "plugin.init",
+                    json!({
+                        "pluginApiVersion": 1,
+                        "privateBootstrap": valid_companion_bootstrap()
+                    }),
+                ),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(parse(&started)["result"]["ok"], json!(true));
+        assert!(plugin.companion_gateway.is_some());
+
+        let mut malformed = valid_companion_bootstrap();
+        malformed["unexpected"] = json!(true);
+        let rejected = plugin
+            .handle_rpc(
+                request(
+                    2,
+                    "plugin.init",
+                    json!({
+                        "pluginApiVersion": 1,
+                        "privateBootstrap": malformed
+                    }),
+                ),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(
+            parse(&rejected)["error"]["code"],
+            json!(rpc::INVALID_PARAMS)
+        );
+        assert!(plugin.companion_gateway.is_none());
+    }
+
+    #[test]
+    fn explicit_bootstrap_without_radio_fails_closed() {
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+        let response = plugin
+            .handle_rpc(
+                request(
+                    1,
+                    "plugin.init",
+                    json!({
+                        "pluginApiVersion": 1,
+                        "privateBootstrap": valid_companion_bootstrap()
+                    }),
+                ),
+                &mut sink,
+            )
+            .unwrap();
+        let response = parse(&response);
+        assert_eq!(response["error"]["code"], json!(rpc::INVALID_PARAMS));
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires a running Aokie radio/media endpoint"));
+        assert!(plugin.companion_gateway.is_none());
     }
 
     #[test]
@@ -3691,7 +4438,11 @@ mod tests {
         let mut plugin = Plugin::ephemeral(true);
         let mut sink = VecSink::default();
         plugin
-            .dispatch_command("dongle.diagnostics", &json!({"simulate": "call"}), &mut sink)
+            .dispatch_command(
+                "dongle.diagnostics",
+                &json!({"simulate": "call"}),
+                &mut sink,
+            )
             .unwrap();
         {
             let call = plugin.mock.current_call.as_mut().unwrap();
@@ -3724,7 +4475,11 @@ mod tests {
         let mut plugin = Plugin::ephemeral(true);
         let mut sink = VecSink::default();
         plugin
-            .dispatch_command("dongle.diagnostics", &json!({"simulate": "call"}), &mut sink)
+            .dispatch_command(
+                "dongle.diagnostics",
+                &json!({"simulate": "call"}),
+                &mut sink,
+            )
             .unwrap();
         {
             let call = plugin.mock.current_call.as_mut().unwrap();
@@ -3814,7 +4569,10 @@ mod tests {
         assert_eq!(data["answered"], json!(true));
         assert_eq!(data["call"]["state"], json!("active"));
         let v = parse(&sink.lines[0]);
-        assert_eq!(v["params"]["event"]["name"], json!(crate::contract::events::CALL_ANSWERED));
+        assert_eq!(
+            v["params"]["event"]["name"],
+            json!(crate::contract::events::CALL_ANSWERED)
+        );
 
         let data = plugin
             .dispatch_command("call.current", &Value::Null, &mut sink)
@@ -3836,7 +4594,10 @@ mod tests {
             .unwrap();
         assert_eq!(data["ended"], json!(true));
         let v = parse(&sink.lines[0]);
-        assert_eq!(v["params"]["event"]["name"], json!(crate::contract::events::CALL_ENDED));
+        assert_eq!(
+            v["params"]["event"]["name"],
+            json!(crate::contract::events::CALL_ENDED)
+        );
 
         // Ended call: hangup again fails.
         assert!(plugin
@@ -3855,7 +4616,10 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         let health = &v["result"];
-        assert_eq!(health["components"]["voice"], json!(cfg!(feature = "voice")));
+        assert_eq!(
+            health["components"]["voice"],
+            json!(cfg!(feature = "voice"))
+        );
         assert_eq!(health["components"]["devMode"], json!(true));
         assert_eq!(health["components"]["radio"]["present"], json!(false));
         assert!(health["components"]["outbox"]["dead"].is_u64());
@@ -3929,18 +4693,34 @@ mod tests {
 
         // Flip to enforce.
         plugin
-            .dispatch_command("settings.set", &json!({"consentMode": "enforce"}), &mut sink)
+            .dispatch_command(
+                "settings.set",
+                &json!({"consentMode": "enforce"}),
+                &mut sink,
+            )
             .unwrap();
 
         // No grant yet → pairing + sms.send are refused with a consent message.
         let err = plugin
             .dispatch_command("phone.startPairing", &json!({}), &mut sink)
             .unwrap_err();
-        assert!(err.message.to_lowercase().contains("consent"), "got: {}", err.message);
+        assert!(
+            err.message.to_lowercase().contains("consent"),
+            "got: {}",
+            err.message
+        );
         let err = plugin
-            .dispatch_command("sms.send", &json!({"to": "+61400000000", "body": "hi"}), &mut sink)
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "+61400000000", "body": "hi"}),
+                &mut sink,
+            )
             .unwrap_err();
-        assert!(err.message.to_lowercase().contains("consent"), "got: {}", err.message);
+        assert!(
+            err.message.to_lowercase().contains("consent"),
+            "got: {}",
+            err.message
+        );
 
         // consent.get reflects the block.
         let g = plugin
@@ -3968,7 +4748,11 @@ mod tests {
         let err = plugin
             .dispatch_command("phone.startPairing", &json!({}), &mut sink)
             .unwrap_err();
-        assert!(!err.message.to_lowercase().contains("consent"), "got: {}", err.message);
+        assert!(
+            !err.message.to_lowercase().contains("consent"),
+            "got: {}",
+            err.message
+        );
 
         // Revoke: grant gone, auto-answer disabled, gate blocks again.
         let rev = plugin
@@ -4067,18 +4851,31 @@ mod tests {
             (json!({"sttEndpointMs": 5}), "below range"),
             (json!({"hfpCodec": "mp3"}), "bogus enum"),
             (json!({"persona": "x".repeat(4001)}), "unbounded blob"),
-            (json!({"customKey": {"nested": true}}), "non-scalar unknown key"),
+            (
+                json!({"customKey": {"nested": true}}),
+                "non-scalar unknown key",
+            ),
             // Atomicity: the valid key must not survive its bad sibling.
             (json!({"greeting": "Hi!", "hfpCodec": "mp3"}), "bad sibling"),
         ] {
             assert!(
-                plugin.dispatch_command("settings.set", &payload, &mut sink).is_err(),
+                plugin
+                    .dispatch_command("settings.set", &payload, &mut sink)
+                    .is_err(),
                 "{why} must be rejected"
             );
         }
-        let all = plugin.dispatch_command("settings.get", &json!({}), &mut sink).unwrap();
-        assert_eq!(all["configVersion"], 0, "rejected writes must not bump the version");
-        assert!(all["settings"].get("greeting").is_none(), "bad batch persisted its valid key");
+        let all = plugin
+            .dispatch_command("settings.get", &json!({}), &mut sink)
+            .unwrap();
+        assert_eq!(
+            all["configVersion"], 0,
+            "rejected writes must not bump the version"
+        );
+        assert!(
+            all["settings"].get("greeting").is_none(),
+            "bad batch persisted its valid key"
+        );
         assert_eq!(all["configQuarantined"], false);
 
         // Valid writes: version bumps, apply-state is truthful (no radio in
@@ -4103,7 +4900,9 @@ mod tests {
         assert!(plugin
             .dispatch_command("settings.set", &json!({"hfpCodec": "wbs"}), &mut sink)
             .is_ok());
-        let all = plugin.dispatch_command("settings.get", &json!({}), &mut sink).unwrap();
+        let all = plugin
+            .dispatch_command("settings.get", &json!({}), &mut sink)
+            .unwrap();
         assert_eq!(all["configVersion"], 2);
     }
 
@@ -4135,8 +4934,16 @@ mod tests {
             )
             .unwrap();
         for (key, url, why) in [
-            ("aiEndpoint", "http://api.example.com/v1", "cleartext public"),
-            ("aiEndpoint", "http://169.254.169.254/latest/meta-data", "metadata"),
+            (
+                "aiEndpoint",
+                "http://api.example.com/v1",
+                "cleartext public",
+            ),
+            (
+                "aiEndpoint",
+                "http://169.254.169.254/latest/meta-data",
+                "metadata",
+            ),
             ("ttsEndpoint", "http://169.254.7.9:9000/tts", "link-local"),
         ] {
             let err = plugin
@@ -4145,7 +4952,13 @@ mod tests {
             assert_eq!(err.code, crate::contract::errors::COMMAND_FAILED, "{why}");
             // Rejected values are NEVER persisted.
             assert!(
-                plugin.store.config.settings.get(key).map(|v| v != &json!(url)).unwrap_or(true),
+                plugin
+                    .store
+                    .config
+                    .settings
+                    .get(key)
+                    .map(|v| v != &json!(url))
+                    .unwrap_or(true),
                 "{why}: rejected URL must not be stored"
             );
         }
@@ -4195,7 +5008,10 @@ mod tests {
             &plugin.outbox,
             &ev,
             false,
-            crate::event_bridge::EmitMode::for_host(plugin.ack_mode, plugin.dev_mode || crate::event_bridge::legacy_host_allowed()),
+            crate::event_bridge::EmitMode::for_host(
+                plugin.ack_mode,
+                plugin.dev_mode || crate::event_bridge::legacy_host_allowed(),
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -4250,7 +5066,11 @@ mod tests {
         // The same host WITH eventAck: no ack-related reason.
         plugin
             .handle_rpc(
-                request(2, "plugin.init", json!({"pluginApiVersion": 1, "features": ["eventAck"]})),
+                request(
+                    2,
+                    "plugin.init",
+                    json!({"pluginApiVersion": 1, "features": ["eventAck"]}),
+                ),
                 &mut sink,
             )
             .unwrap();
@@ -4517,7 +5337,10 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(list.contains("0491570156"), "existing entries kept: {list}");
-        assert!(list.contains("+61 400 111 222"), "new block appended: {list}");
+        assert!(
+            list.contains("+61 400 111 222"),
+            "new block appended: {list}"
+        );
         assert_eq!(plugin.store.config.config_version, v0 + 1);
         assert!(
             plugin
@@ -4628,7 +5451,13 @@ mod tests {
         let call_id = data["callId"].as_str().unwrap().to_string();
         assert!(call_id.starts_with("call_"));
         match control_rx.try_recv().unwrap() {
-            crate::radio::RadioControl::Dial { call_id: sent, number, opening_line, purpose, op } => {
+            crate::radio::RadioControl::Dial {
+                call_id: sent,
+                number,
+                opening_line,
+                purpose,
+                op,
+            } => {
                 assert_eq!(sent, call_id);
                 assert_eq!(number, "+61 400 111 222");
                 assert!(opening_line.contains("confirming your booking"));
@@ -4638,19 +5467,33 @@ mod tests {
             _ => panic!("expected the Dial control"),
         }
         // The attempt is counted + persisted (a restart can't reset the cap).
-        assert_eq!(
-            plugin.store.config.dial_ledger.as_ref().unwrap().count,
-            1
-        );
+        assert_eq!(plugin.store.config.dial_ledger.as_ref().unwrap().count, 1);
 
         // A live call refuses further dials.
-        *plugin.radio.as_ref().unwrap().status.current_call_id.lock().unwrap() =
-            Some("call_busy".into());
+        *plugin
+            .radio
+            .as_ref()
+            .unwrap()
+            .status
+            .current_call_id
+            .lock()
+            .unwrap() = Some("call_busy".into());
         let err = plugin
             .dispatch_command("call.dial", &dial, &mut sink)
             .unwrap_err();
-        assert!(err.message.contains("already in progress"), "{}", err.message);
-        *plugin.radio.as_ref().unwrap().status.current_call_id.lock().unwrap() = None;
+        assert!(
+            err.message.contains("already in progress"),
+            "{}",
+            err.message
+        );
+        *plugin
+            .radio
+            .as_ref()
+            .unwrap()
+            .status
+            .current_call_id
+            .lock()
+            .unwrap() = None;
 
         // Daily cap: second dial fits (cap 2), third refuses typed.
         plugin
@@ -4738,8 +5581,8 @@ mod tests {
         use ed25519_dalek::Signer as _;
         let _env = consent_env_lock();
         let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
-        let pub_b64 = base64::engine::general_purpose::STANDARD
-            .encode(key.verifying_key().to_bytes());
+        let pub_b64 =
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
         std::env::set_var("FORMLOGIC_CONSENT_VERIFY_KEY", &pub_b64);
 
         let dir = std::env::temp_dir().join(format!(
@@ -4758,7 +5601,11 @@ mod tests {
                 &mut sink,
             )
             .unwrap_err();
-        assert!(err.message.contains("signs consent grants"), "{}", err.message);
+        assert!(
+            err.message.contains("signs consent grants"),
+            "{}",
+            err.message
+        );
 
         // A correctly signed envelope records + satisfies the gate.
         let grant = crate::consent::ConsentGrant {
@@ -4769,6 +5616,11 @@ mod tests {
                 transcription: true,
                 contacts: false,
                 recording: false,
+                remote_captions: true,
+                remote_assistance: true,
+                remote_monitoring: true,
+                remote_consult: true,
+                remote_takeover: true,
                 retention_days: Some(90),
                 destinations: vec!["https://api.example.com/v1".into()],
             },
@@ -4806,7 +5658,11 @@ mod tests {
         let err = plugin
             .dispatch_command("consent.set", &json!({"envelope": forged}), &mut sink)
             .unwrap_err();
-        assert!(err.message.contains("verification failed"), "{}", err.message);
+        assert!(
+            err.message.contains("verification failed"),
+            "{}",
+            err.message
+        );
 
         // CONSENT-001 destinations: with the signed grant recorded, a remote
         // endpoint NOT in grant.destinations is refused at settings.set…
@@ -4817,7 +5673,11 @@ mod tests {
                 &mut sink,
             )
             .unwrap_err();
-        assert!(err.message.contains("not a consented destination"), "{}", err.message);
+        assert!(
+            err.message.contains("not a consented destination"),
+            "{}",
+            err.message
+        );
         // …a consented one is accepted, and loopback needs no destination grant.
         plugin
             .dispatch_command(
@@ -4885,7 +5745,10 @@ mod tests {
         assert_eq!(err.code, "command_failed");
         assert!(err.message.contains("radio is not running"));
         assert!(err.message.contains("not performed"));
-        assert!(sink.lines.is_empty(), "no sms.sent event for an unsendable message");
+        assert!(
+            sink.lines.is_empty(),
+            "no sms.sent event for an unsendable message"
+        );
 
         // The dev-only mock thread reads fail typed in real mode too.
         let err = plugin
@@ -4925,12 +5788,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(data["status"], json!("queued"));
-        assert_eq!(data["simulated"], json!(true), "dev-mode results are stamped simulated");
+        assert_eq!(
+            data["simulated"],
+            json!(true),
+            "dev-mode results are stamped simulated"
+        );
         let message_id = data["messageId"].as_str().unwrap();
         assert!(message_id.starts_with("sms_"));
 
         let v = parse(&sink.lines[0]);
-        assert_eq!(v["params"]["event"]["name"], json!(crate::contract::events::SMS_SENT));
+        assert_eq!(
+            v["params"]["event"]["name"],
+            json!(crate::contract::events::SMS_SENT)
+        );
         assert_eq!(v["params"]["event"]["correlationId"], json!(message_id));
         let key = v["params"]["event"]["idempotencyKey"].as_str().unwrap();
         assert_eq!(key, format!("aokie:{message_id}:sms.sent:v1"));
@@ -5047,9 +5917,18 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        assert_eq!(endpoint_update(&cleared, "sttEndpoint"), crate::radio::EndpointUpdate::Clear);
-        assert_eq!(endpoint_update(&cleared, "ttsEndpoint"), crate::radio::EndpointUpdate::Clear);
-        assert_eq!(endpoint_update(&cleared, "aiEndpoint"), crate::radio::EndpointUpdate::Unchanged);
+        assert_eq!(
+            endpoint_update(&cleared, "sttEndpoint"),
+            crate::radio::EndpointUpdate::Clear
+        );
+        assert_eq!(
+            endpoint_update(&cleared, "ttsEndpoint"),
+            crate::radio::EndpointUpdate::Clear
+        );
+        assert_eq!(
+            endpoint_update(&cleared, "aiEndpoint"),
+            crate::radio::EndpointUpdate::Unchanged
+        );
 
         let obj = json!({"mockCalls": true}).as_object().unwrap().clone();
         assert!(!has_receptionist_config_key(&obj));
@@ -5105,7 +5984,10 @@ mod tests {
             .dispatch_command("phone.startPairing", &Value::Null, &mut sink)
             .unwrap_err();
         assert!(err.message.contains("radio is not running"));
-        assert!(sink.lines.is_empty(), "no phone.pairing.started event for a dead radio");
+        assert!(
+            sink.lines.is_empty(),
+            "no phone.pairing.started event for a dead radio"
+        );
 
         // AOK-BT-001: stopPairing without a radio is a typed outage (was previously
         // a "nothing was stopped" FL-CONN-001 stub — now unified with the gate).
@@ -5116,19 +5998,31 @@ mod tests {
 
         // removePaired is likewise gated on a running radio.
         let err = plugin
-            .dispatch_command("phone.removePaired", &json!({"address": "00:11:22:33:44:55"}), &mut sink)
+            .dispatch_command(
+                "phone.removePaired",
+                &json!({"address": "00:11:22:33:44:55"}),
+                &mut sink,
+            )
             .unwrap_err();
         assert!(err.message.contains("radio is not running"));
 
         // phone.disconnect (remote reconnect/unstick) is gated the same way.
         let err = plugin
-            .dispatch_command("phone.disconnect", &json!({"address": "00:11:22:33:44:55"}), &mut sink)
+            .dispatch_command(
+                "phone.disconnect",
+                &json!({"address": "00:11:22:33:44:55"}),
+                &mut sink,
+            )
             .unwrap_err();
         assert!(err.message.contains("radio is not running"));
 
         // phone.connect (HARD-001 outbound reconnect) is gated the same way.
         let err = plugin
-            .dispatch_command("phone.connect", &json!({"address": "00:11:22:33:44:55"}), &mut sink)
+            .dispatch_command(
+                "phone.connect",
+                &json!({"address": "00:11:22:33:44:55"}),
+                &mut sink,
+            )
             .unwrap_err();
         assert!(err.message.contains("radio is not running"));
 

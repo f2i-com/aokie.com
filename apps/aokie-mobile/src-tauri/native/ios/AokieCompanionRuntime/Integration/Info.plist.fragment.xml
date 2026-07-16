@@ -1,0 +1,8 @@
+<!-- Merge these keys into the generated iOS app target; this is not a full plist. -->
+<key>NSMicrophoneUsageDescription</key>
+<string>Aokie Companion uses the microphone only after you answer and win control of the call.</string>
+<key>UIBackgroundModes</key>
+<array>
+    <string>audio</string>
+    <string>voip</string>
+</array>

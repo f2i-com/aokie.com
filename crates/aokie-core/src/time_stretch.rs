@@ -144,7 +144,11 @@ mod tests {
         assert_eq!(stretch_i16(&s, 16_000, 1.004), s, "within 1% of unity");
         assert_eq!(stretch_i16(&[], 16_000, 0.7), Vec::<i16>::new());
         let tiny = vec![100i16; 40];
-        assert_eq!(stretch_i16(&tiny, 16_000, 0.7), tiny, "shorter than a window");
+        assert_eq!(
+            stretch_i16(&tiny, 16_000, 0.7),
+            tiny,
+            "shorter than a window"
+        );
         assert_eq!(stretch_i16(&s, 0, 0.7), s, "zero sample rate is a no-op");
     }
 

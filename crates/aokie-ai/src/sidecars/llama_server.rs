@@ -718,7 +718,9 @@ pub async fn llama_server_start(
     // chatty sidecar can't deadlock on a full buffer), echoes each line
     // to our own stderr to preserve the dev-console view, and retains
     // the last STDERR_TAIL_CAP lines for failure diagnostics.
-    let stderr_tail = Arc::new(Mutex::new(VecDeque::<String>::with_capacity(STDERR_TAIL_CAP)));
+    let stderr_tail = Arc::new(Mutex::new(VecDeque::<String>::with_capacity(
+        STDERR_TAIL_CAP,
+    )));
     if let Some(child_stderr) = child.stderr.take() {
         let tail = stderr_tail.clone();
         let _ = std::thread::Builder::new()
@@ -1032,7 +1034,10 @@ fn exit_failure_message(code: Option<i32>, stderr_tail: &[String]) -> String {
         String::new()
     } else {
         let start = tail.len().saturating_sub(12);
-        format!("\n\nLast output from llama-server:\n{}", tail[start..].join("\n"))
+        format!(
+            "\n\nLast output from llama-server:\n{}",
+            tail[start..].join("\n")
+        )
     };
     format!(
         "llama-server exited during startup ({code_str}).{quoted}\n\n\
@@ -1393,7 +1398,10 @@ mod tests {
             "tail header missing: {msg}"
         );
         // The actionable checklist still rides along as a fallback.
-        assert!(msg.contains("GPU out of memory"), "checklist missing: {msg}");
+        assert!(
+            msg.contains("GPU out of memory"),
+            "checklist missing: {msg}"
+        );
     }
 
     #[test]

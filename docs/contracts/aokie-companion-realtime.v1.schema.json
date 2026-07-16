@@ -1,0 +1,559 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aokie.com/contracts/aokie-companion-realtime.v1.schema.json",
+  "title": "Aokie Companion Realtime Protocol v1",
+  "description": "Canonical idle sync proofs, call snapshots, mutating commands and command acknowledgements. Audio, SDP, ICE, tokens and endpoint keys are intentionally outside persisted public messages.",
+  "oneOf": [
+    { "$ref": "#/$defs/syncReadyFrame" },
+    { "$ref": "#/$defs/callSnapshot" },
+    { "$ref": "#/$defs/commandEnvelope" },
+    { "$ref": "#/$defs/commandAck" }
+  ],
+  "$defs": {
+    "safeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "positiveSafeInteger": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "safeId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "safeToken": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "timestamp": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "format": "date-time"
+    },
+    "aokieTalkOwner": {
+      "type": "object",
+      "properties": { "kind": { "const": "aokie" } },
+      "required": ["kind"],
+      "additionalProperties": false
+    },
+    "holdTalkOwner": {
+      "type": "object",
+      "properties": { "kind": { "const": "hold" } },
+      "required": ["kind"],
+      "additionalProperties": false
+    },
+    "userTalkOwner": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "user" },
+        "userId": { "$ref": "#/$defs/safeId" },
+        "deviceId": { "$ref": "#/$defs/safeId" },
+        "leaseId": { "$ref": "#/$defs/safeId" },
+        "fence": { "$ref": "#/$defs/positiveSafeInteger" }
+      },
+      "required": ["kind", "userId", "deviceId", "leaseId", "fence"],
+      "additionalProperties": false
+    },
+    "noneTalkOwner": {
+      "type": "object",
+      "properties": { "kind": { "const": "none" } },
+      "required": ["kind"],
+      "additionalProperties": false
+    },
+    "talkOwner": {
+      "oneOf": [
+        { "$ref": "#/$defs/aokieTalkOwner" },
+        { "$ref": "#/$defs/holdTalkOwner" },
+        { "$ref": "#/$defs/userTalkOwner" },
+        { "$ref": "#/$defs/noneTalkOwner" }
+      ]
+    },
+    "capabilities": {
+      "type": "object",
+      "required": [
+        "liveCaptions",
+        "monitorAudio",
+        "softwareHold",
+        "voiceConsult",
+        "takeover",
+        "endCaller"
+      ],
+      "properties": {
+        "liveCaptions": { "type": "boolean" },
+        "monitorAudio": { "type": "boolean" },
+        "softwareHold": { "type": "boolean" },
+        "voiceConsult": { "type": "boolean" },
+        "takeover": { "type": "boolean" },
+        "endCaller": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "disclosure": {
+      "type": "object",
+      "required": ["required", "verified", "policyVersion"],
+      "properties": {
+        "required": { "type": "boolean" },
+        "verified": { "type": "boolean" },
+        "policyVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "caller": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "properties": {
+            "label": {
+              "oneOf": [
+                { "type": "null" },
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "pattern": "\\S"
+                }
+              ]
+            },
+            "maskedNumber": {
+              "oneOf": [
+                { "type": "null" },
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 40,
+                  "pattern": "\\S"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "participant": {
+      "type": "object",
+      "required": ["userId", "deviceId", "displayName", "role", "mode"],
+      "properties": {
+        "userId": { "$ref": "#/$defs/safeId" },
+        "deviceId": { "$ref": "#/$defs/safeId" },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "pattern": "\\S"
+        },
+        "role": { "$ref": "#/$defs/safeToken" },
+        "mode": { "$ref": "#/$defs/safeToken" }
+      },
+      "additionalProperties": false
+    },
+    "caption": {
+      "type": "object",
+      "required": ["captionId", "speaker", "text", "occurredAt", "finalText"],
+      "properties": {
+        "captionId": { "$ref": "#/$defs/safeId" },
+        "speaker": { "$ref": "#/$defs/safeToken" },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "\\S"
+        },
+        "occurredAt": { "$ref": "#/$defs/timestamp" },
+        "finalText": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "takeoverOffer": {
+      "type": "object",
+      "required": ["offerId", "expiresAt"],
+      "properties": {
+        "offerId": { "$ref": "#/$defs/safeId" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "assistanceRequest": {
+      "type": "object",
+      "required": ["requestId", "expiresAt"],
+      "properties": {
+        "requestId": { "$ref": "#/$defs/safeId" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "endConfirmation": {
+      "type": "object",
+      "required": ["confirmationId", "expiresAt"],
+      "properties": {
+        "confirmationId": { "$ref": "#/$defs/safeId" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "syncReadyFrame": {
+      "description": "Authenticated gateway proof that the current app-bound authoritative realtime state is idle.",
+      "type": "object",
+      "required": ["kind", "schemaVersion", "appId", "streamNonce", "sequence"],
+      "properties": {
+        "kind": { "const": "sync_ready" },
+        "schemaVersion": { "const": 1 },
+        "appId": { "$ref": "#/$defs/safeId" },
+        "streamNonce": {
+          "description": "Gateway/lane restart fence; sequence is monotonic only within this nonce.",
+          "$ref": "#/$defs/safeId"
+        },
+        "sequence": {
+          "description": "Current client-visible cursor for the idle authoritative state.",
+          "$ref": "#/$defs/safeInteger"
+        }
+      },
+      "additionalProperties": false
+    },
+    "callSnapshot": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "appId",
+        "callId",
+        "streamNonce",
+        "sequence",
+        "callEpoch",
+        "ownerEpoch",
+        "switchboardRevision",
+        "remoteRevision",
+        "telephonyState",
+        "serviceMode",
+        "talkOwner",
+        "mediaState",
+        "gatewayReachable",
+        "capabilities",
+        "disclosure",
+        "secondaryCallPolicy",
+        "participants",
+        "captions",
+        "occurredAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "appId": { "$ref": "#/$defs/safeId" },
+        "callId": { "$ref": "#/$defs/safeId" },
+        "streamNonce": {
+          "description": "Gateway/lane restart fence; sequence is monotonic only within this nonce.",
+          "$ref": "#/$defs/safeId"
+        },
+        "sequence": {
+          "description": "Client-visible ordering value scoped by streamNonce.",
+          "$ref": "#/$defs/positiveSafeInteger"
+        },
+        "callEpoch": { "$ref": "#/$defs/safeInteger" },
+        "ownerEpoch": { "$ref": "#/$defs/safeInteger" },
+        "switchboardRevision": { "$ref": "#/$defs/safeInteger" },
+        "remoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "telephonyState": {
+          "enum": ["ringing", "active", "held", "ending", "ended"]
+        },
+        "serviceMode": {
+          "enum": [
+            "aokie_active",
+            "soft_hold",
+            "consult_pending",
+            "consult_active",
+            "human_pending",
+            "human_active",
+            "returning_to_aokie",
+            "recovering",
+            "unreachable",
+            "ended"
+          ]
+        },
+        "talkOwner": { "$ref": "#/$defs/talkOwner" },
+        "mediaState": {
+          "enum": ["none", "ready", "receiving", "connecting", "active", "failed"]
+        },
+        "gatewayReachable": { "type": "boolean" },
+        "capabilities": { "$ref": "#/$defs/capabilities" },
+        "disclosure": { "$ref": "#/$defs/disclosure" },
+        "secondaryCallPolicy": { "const": "miss_and_callback" },
+        "caller": { "$ref": "#/$defs/caller" },
+        "participants": {
+          "type": "array",
+          "maxItems": 6,
+          "items": { "$ref": "#/$defs/participant" }
+        },
+        "captions": {
+          "type": "array",
+          "maxItems": 200,
+          "items": { "$ref": "#/$defs/caption" }
+        },
+        "takeoverOffer": {
+          "oneOf": [{ "$ref": "#/$defs/takeoverOffer" }, { "type": "null" }]
+        },
+        "assistanceRequest": {
+          "oneOf": [{ "$ref": "#/$defs/assistanceRequest" }, { "type": "null" }]
+        },
+        "endConfirmation": {
+          "oneOf": [{ "$ref": "#/$defs/endConfirmation" }, { "type": "null" }]
+        },
+        "occurredAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "serviceMode": { "const": "aokie_active" } } },
+          "then": { "properties": { "talkOwner": { "$ref": "#/$defs/aokieTalkOwner" } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "serviceMode": {
+                "enum": [
+                  "soft_hold",
+                  "consult_pending",
+                  "consult_active",
+                  "human_pending",
+                  "returning_to_aokie",
+                  "recovering",
+                  "unreachable"
+                ]
+              }
+            }
+          },
+          "then": { "properties": { "talkOwner": { "$ref": "#/$defs/holdTalkOwner" } } }
+        },
+        {
+          "if": { "properties": { "serviceMode": { "const": "human_active" } } },
+          "then": {
+            "properties": {
+              "talkOwner": { "$ref": "#/$defs/userTalkOwner" },
+              "mediaState": { "const": "active" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "serviceMode": { "const": "ended" } } },
+          "then": {
+            "properties": {
+              "telephonyState": { "const": "ended" },
+              "talkOwner": { "$ref": "#/$defs/noneTalkOwner" },
+              "mediaState": { "const": "none" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "telephonyState": { "const": "ended" } } },
+          "then": { "properties": { "serviceMode": { "const": "ended" } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "capabilities": {
+                "properties": { "liveCaptions": { "const": false } },
+                "required": ["liveCaptions"]
+              }
+            },
+            "required": ["capabilities"]
+          },
+          "then": { "properties": { "captions": { "maxItems": 0 } } }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "emptyPayload": {
+      "type": "object",
+      "maxProperties": 0,
+      "additionalProperties": false
+    },
+    "offerClaimPayload": {
+      "type": "object",
+      "required": ["offerId"],
+      "properties": { "offerId": { "$ref": "#/$defs/safeId" } },
+      "additionalProperties": false
+    },
+    "consultEndPayload": {
+      "type": "object",
+      "required": ["leaseId"],
+      "properties": { "leaseId": { "$ref": "#/$defs/safeId" } },
+      "additionalProperties": false
+    },
+    "resumeAokiePayload": {
+      "type": "object",
+      "required": ["leaseId", "reason"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/safeId" },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false
+    },
+    "endCallerPayload": {
+      "type": "object",
+      "required": ["confirmationId"],
+      "properties": { "confirmationId": { "$ref": "#/$defs/safeId" } },
+      "additionalProperties": false
+    },
+    "assistanceRespondPayload": {
+      "type": "object",
+      "required": ["requestId", "answerId", "answer"],
+      "properties": {
+        "requestId": { "$ref": "#/$defs/safeId" },
+        "answerId": { "$ref": "#/$defs/safeId" },
+        "answer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false
+    },
+    "commandEnvelope": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "commandId",
+        "idempotencyKey",
+        "callId",
+        "expectedSwitchboardRevision",
+        "expectedRemoteRevision",
+        "expectedCallEpoch",
+        "expectedOwnerEpoch",
+        "type",
+        "payload"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "commandId": { "$ref": "#/$defs/safeId" },
+        "idempotencyKey": { "$ref": "#/$defs/safeId" },
+        "callId": { "$ref": "#/$defs/safeId" },
+        "expectedSwitchboardRevision": { "$ref": "#/$defs/safeInteger" },
+        "expectedRemoteRevision": { "$ref": "#/$defs/safeInteger" },
+        "expectedCallEpoch": { "$ref": "#/$defs/safeInteger" },
+        "expectedOwnerEpoch": { "$ref": "#/$defs/safeInteger" },
+        "type": {
+          "enum": [
+            "monitor_start",
+            "monitor_stop",
+            "assistance_respond",
+            "consult_claim",
+            "consult_end",
+            "takeover_claim",
+            "resume_aokie",
+            "end_caller"
+          ]
+        },
+        "payload": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "enum": ["monitor_start", "monitor_stop"] } }
+          },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } }
+        },
+        {
+          "if": {
+            "properties": { "type": { "enum": ["consult_claim", "takeover_claim"] } }
+          },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/offerClaimPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "consult_end" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/consultEndPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "resume_aokie" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/resumeAokiePayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "end_caller" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/endCallerPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "assistance_respond" } } },
+          "then": {
+            "properties": { "payload": { "$ref": "#/$defs/assistanceRespondPayload" } }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "protocolErrorCode": {
+      "enum": [
+        "invalid_message",
+        "unauthorized",
+        "forbidden",
+        "stale_call",
+        "stale_call_epoch",
+        "stale_owner_epoch",
+        "stale_remote_revision",
+        "stale_switchboard_revision",
+        "offer_expired",
+        "claim_lost",
+        "lease_expired",
+        "media_unavailable",
+        "endpoint_unreachable",
+        "command_failed"
+      ]
+    },
+    "commandError": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "$ref": "#/$defs/protocolErrorCode" },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false
+    },
+    "commandAck": {
+      "type": "object",
+      "required": ["commandId", "accepted"],
+      "properties": {
+        "commandId": { "$ref": "#/$defs/safeId" },
+        "accepted": { "type": "boolean" },
+        "error": {
+          "oneOf": [
+            { "$ref": "#/$defs/commandError" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "accepted": { "const": true } } },
+          "then": { "properties": { "error": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "accepted": { "const": false } } },
+          "then": {
+            "required": ["error"],
+            "properties": { "error": { "$ref": "#/$defs/commandError" } }
+          }
+        }
+      ],
+      "additionalProperties": false
+    }
+  }
+}

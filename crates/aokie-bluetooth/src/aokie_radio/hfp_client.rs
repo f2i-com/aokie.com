@@ -106,7 +106,11 @@ impl HfpClientState {
     }
 
     /// Build an OBEX-bearing UIH on a secondary DLCI.
-    pub fn build_uih_on_client_dlci(&mut self, dlci: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn build_uih_on_client_dlci(
+        &mut self,
+        dlci: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, String> {
         self.client.build_uih_on_client_dlci(dlci, payload)
     }
 
@@ -141,9 +145,7 @@ impl HfpClientState {
                     // only emits Opened then) — same precondition the
                     // server path waits for before kicking AT (HFP
                     // §4.2.1). Queue the SLC and fire AT+BRSF.
-                    eprintln!(
-                        "[AokieRadio] HFP client DLCI open — kicking outbound SLC sequence"
-                    );
+                    eprintln!("[AokieRadio] HFP client DLCI open — kicking outbound SLC sequence");
                     self.pending_commands = hfp::HfpHandsFreeState::initial_service_level_commands(
                         self.wbs_supported,
                         self.hfp_state.call_waiting_enabled(),
@@ -167,9 +169,7 @@ impl HfpClientState {
                                 "peer closed the RFCOMM channel during outbound SLC".to_string(),
                             ));
                     } else {
-                        eprintln!(
-                            "[AokieRadio] HFP client channel closed by peer (post-SLC)"
-                        );
+                        eprintln!("[AokieRadio] HFP client channel closed by peer (post-SLC)");
                     }
                 }
                 RfcommClientEvent::Failed(reason) => {
@@ -200,10 +200,7 @@ impl HfpClientState {
     /// Build a call-control (or keepalive) AT command frame, exactly
     /// like `RfcommState::build_call_control_command` — gated on the
     /// channel being open.
-    pub fn build_call_control_command(
-        &mut self,
-        command: hfp::HfpAtCommand,
-    ) -> Option<Vec<u8>> {
+    pub fn build_call_control_command(&mut self, command: hfp::HfpAtCommand) -> Option<Vec<u8>> {
         if !self.is_open() {
             return None;
         }
@@ -833,9 +830,7 @@ mod tests {
         // and tore down a healthy HFP link mid-conversation.
         let mut state = HfpClientState::new(AG_CHANNEL, false, false);
         open_channel(&mut state);
-        state
-            .handle_packet(&build_dm(4, false))
-            .expect("stray dm");
+        state.handle_packet(&build_dm(4, false)).expect("stray dm");
         assert!(state.is_open(), "HFP must survive a DM for dlci 4");
         assert!(state.mux_is_open());
         let out = state

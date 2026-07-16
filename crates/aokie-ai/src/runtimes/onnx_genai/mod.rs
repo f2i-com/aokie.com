@@ -739,7 +739,10 @@ mod gemma_perf_tests {
         if std::env::var_os("ORT_DYLIB_PATH").is_none() {
             std::env::set_var(
                 "ORT_DYLIB_PATH",
-                concat!(env!("CARGO_MANIFEST_DIR"), r"\resources\onnxruntime_1.25.0.dll"),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    r"\resources\onnxruntime_1.25.0.dll"
+                ),
             );
         }
         let dir = std::env::var("GEMMA_MODEL_DIR").unwrap_or_else(|_| {

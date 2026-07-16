@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "appId": "app_coastal_auto",
+  "callId": "call_01JZQ1K6D4B4N7TWM2C3D5E6F7",
+  "streamNonce": "stream_01JZQ1K5M8P4R2V7X9C6B3N0DT",
+  "sequence": 42,
+  "callEpoch": 7,
+  "ownerEpoch": 12,
+  "switchboardRevision": 8,
+  "remoteRevision": 19,
+  "telephonyState": "active",
+  "serviceMode": "aokie_active",
+  "talkOwner": { "kind": "aokie" },
+  "mediaState": "ready",
+  "gatewayReachable": true,
+  "capabilities": {
+    "liveCaptions": true,
+    "monitorAudio": false,
+    "softwareHold": true,
+    "voiceConsult": false,
+    "takeover": true,
+    "endCaller": true
+  },
+  "disclosure": {
+    "required": true,
+    "verified": true,
+    "policyVersion": "au-nsw-preview-1"
+  },
+  "secondaryCallPolicy": "miss_and_callback",
+  "caller": {
+    "label": "Mia Thompson",
+    "maskedNumber": "+61 4•• ••• 042"
+  },
+  "participants": [
+    {
+      "userId": "user_priya",
+      "deviceId": "device_priya_phone",
+      "displayName": "Priya Shah",
+      "role": "observer",
+      "mode": "captions"
+    }
+  ],
+  "captions": [
+    {
+      "captionId": "caption_0041",
+      "speaker": "caller",
+      "text": "Could I leave the keys somewhere secure?",
+      "occurredAt": "2026-07-15T06:00:04Z",
+      "finalText": true
+    }
+  ],
+  "takeoverOffer": {
+    "offerId": "offer_01JZQ1K9R17APN6BK2F6YHM83B",
+    "expiresAt": "2026-07-15T06:01:00Z"
+  },
+  "assistanceRequest": {
+    "requestId": "request_01JZQ1KA4FE2JNCX7S0QY6MPV9",
+    "expiresAt": "2026-07-15T06:01:00Z"
+  },
+  "endConfirmation": {
+    "confirmationId": "confirmation_01JZQ1KB8TQ6V2P0R3M4N5C7D9",
+    "expiresAt": "2026-07-15T06:00:35Z"
+  },
+  "occurredAt": "2026-07-15T06:00:05Z"
+}

@@ -1,0 +1,31 @@
+{
+  "kind": "mobile_hello",
+  "schemaVersion": 2,
+  "appId": "app_coastal_auto",
+  "deviceId": "device_alex_phone",
+  "sessionNonce": "session_20260716_a",
+  "endpointProof": {
+    "endpointKey": {
+      "algorithm": "ed25519",
+      "publicKey": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+      "thumbprint": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k"
+    },
+    "claims": {
+      "appId": "app_coastal_auto",
+      "subjectId": "device_alex_phone",
+      "role": "mobile",
+      "connectionId": "connection_20260716_a",
+      "challengeNonce": "challenge_20260716_a",
+      "admissionJti": "admission_20260716_alex_1",
+      "sessionNonce": "session_20260716_a",
+      "holderKeyThumbprint": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k",
+      "expectedPeerKeyThumbprint": "plugin_thumbprint_a",
+      "approvedPeerKeyThumbprints": [],
+      "nonce": "proof_nonce_20260716_a",
+      "jti": "proof_jti_20260716_a",
+      "issuedAt": 1784160000,
+      "expiresAt": 1784160020
+    },
+    "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  }
+}

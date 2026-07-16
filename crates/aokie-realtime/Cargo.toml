@@ -1,0 +1,20 @@
+[package]
+name = "aokie-realtime"
+description = "Self-hostable Aokie Companion signalling and control gateway."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aokie-protocol = { path = "../aokie-protocol" }
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tokio = { version = "1.40", features = ["full"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
