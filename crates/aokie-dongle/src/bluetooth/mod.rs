@@ -188,9 +188,13 @@ impl BluetoothManager {
         })
     }
 
-    pub fn send_audio(&self, samples: &[i16]) {
-        if let Err(e) = self.runtime.send_audio(samples.to_vec()) {
-            eprintln!("[BTManager] aokie send_audio failed: {}", e);
+    pub fn send_audio(&self, samples: &[i16]) -> bool {
+        match self.runtime.send_audio(samples.to_vec()) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("[BTManager] aokie send_audio failed: {}", e);
+                false
+            }
         }
     }
 

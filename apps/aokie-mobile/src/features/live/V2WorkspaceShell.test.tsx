@@ -20,16 +20,20 @@ import V2WorkspaceShell, {
   boundedFingerprint,
   callRecordFilters,
   callRecordTone,
+  callRecordsHaveMore,
   connectedParticipantCounts,
   connectedParticipantSummary,
   countAvailableRoutingMembers,
   exactCallRecordId,
   findCurrentStaff,
   filterCallRecords,
+  loadedCallRecordCountLabel,
+  nextCallRecordLimit,
   settingsValueTone,
   sortRoutingMembers,
   staffCountLabel,
   staffGreeting,
+  visibleCallRecordWindow,
 } from "./V2WorkspaceShell";
 
 const runtime: RuntimeCapabilities = {
@@ -240,6 +244,41 @@ const callRecords: CompanionCallRecord[] = [
 ];
 
 describe("FormLogic call-record presentation helpers", () => {
+  it("advances bounded call-record windows and labels partial results", () => {
+    expect(nextCallRecordLimit(0)).toBe(25);
+    expect(nextCallRecordLimit(25)).toBe(50);
+    expect(nextCallRecordLimit(90)).toBe(100);
+    expect(nextCallRecordLimit(Number.NaN)).toBe(25);
+    expect(callRecordsHaveMore(25, 25, "full")).toBe(true);
+    expect(callRecordsHaveMore(24, 25, "full")).toBe(false);
+    expect(callRecordsHaveMore(26, 25, "full")).toBe(false);
+    expect(callRecordsHaveMore(25, 25, "none")).toBe(false);
+    expect(callRecordsHaveMore(100, 100, "full")).toBe(false);
+    expect(loadedCallRecordCountLabel(25, true)).toBe("25 shown");
+    expect(loadedCallRecordCountLabel(24, false)).toBe("24 records");
+    const manyRecords = Array.from({ length: 30 }, (_, index) => ({ ...callRecords[0], id: `record_${index}` }));
+    expect(visibleCallRecordWindow(manyRecords, 25)).toHaveLength(25);
+    expect(visibleCallRecordWindow(manyRecords, 50)).toHaveLength(30);
+    expect(visibleCallRecordWindow(manyRecords, Number.NaN)).toHaveLength(0);
+  });
+
+  it("renders the accessible progressive-loading fallback for partial records", () => {
+    const html = renderToStaticMarkup(<HistoryScreen
+      records={{ records: callRecords, access: "full" }}
+      error={null}
+      hasMore
+      onRefresh={() => undefined}
+      onLoadMore={() => undefined}
+      onOpenRecord={() => undefined}
+    />);
+
+    expect(html).toContain("2 shown");
+    expect(html).toContain("Load older calls");
+    expect(html).toContain("More records load automatically as you scroll");
+    expect(html).toContain('aria-pressed="true"');
+    expect(html).not.toContain("All available records loaded");
+  });
+
   it("filters only real server records without manufacturing outcomes", () => {
     expect(filterCallRecords(callRecords, "all")).toHaveLength(2);
     expect(filterCallRecords(callRecords, "status:completed").map((record) => record.id)).toEqual(["record_complete"]);

@@ -4,7 +4,10 @@ import {
   assistanceExpiryDelayMs,
   currentV2InAppOffer,
   desktopPairingOpenAfterAdmission,
+  formatAssistanceCountdown,
   INITIAL_V2_TAKEOVER_ATTEMPT,
+  isExpectedPreparedTakeoverReplacement,
+  isRetryableMediaArmFailure,
   shouldAutoArmConfirmedTakeover,
   shouldAcceptV2AuthoritativeSequence,
   takeoverConfirmationMode,
@@ -18,6 +21,16 @@ import {
 import type { NativeMediaSession, NativeMediaStateEvent, V2AssistanceRequestEvent, V2CallSnapshotEvent, V2LeaseEvent } from "./bridge";
 
 const OFFER_NOW = 1_800_000_000;
+
+describe("formatAssistanceCountdown", () => {
+  it("formats a bounded minute and second countdown", () => {
+    expect(formatAssistanceCountdown(65.9)).toBe("1:05");
+    expect(formatAssistanceCountdown(9)).toBe("0:09");
+    expect(formatAssistanceCountdown(-1)).toBe("0:00");
+    expect(formatAssistanceCountdown(Number.NaN)).toBe("0:00");
+  });
+});
+
 type OfferClaims = V2CallSnapshotEvent["snapshot"]["pendingMobileOffers"][number]["offer"];
 
 function takeoverSnapshot(offerOverrides: Partial<OfferClaims> = {}): V2CallSnapshotEvent {
@@ -213,6 +226,38 @@ describe("takeover confirmation and automatic microphone arm", () => {
 
     const preClaim = takeoverMedia(4);
     expect(shouldAutoArmConfirmedTakeover(target, preClaim.lease, preClaim.media, true, false)).toBe(false);
+  });
+
+  it("waits when a remote track arrives before the peer is connected", () => {
+    const target = { appId: "app_a", callId: "call_a", callEpoch: 7, ownerEpoch: 4 };
+    const advanced = takeoverMedia(5);
+    advanced.media.phase = "connecting";
+
+    expect(shouldAutoArmConfirmedTakeover(target, advanced.lease, advanced.media, true, false)).toBe(false);
+    expect(isRetryableMediaArmFailure(new Error("native WebRTC is still connecting; retry microphone arm"))).toBe(true);
+    expect(isRetryableMediaArmFailure(new Error("microphone permission was denied"))).toBe(false);
+  });
+
+  it("keeps explicit consent across the expected prepared-to-active peer replacement only", () => {
+    const target = { appId: "app_a", callId: "call_a", callEpoch: 7, ownerEpoch: 4 };
+    const prepared = takeoverMedia(4);
+    prepared.lease.phase = "prepared";
+    prepared.lease.provisional = true;
+    prepared.lease.session.mode = "prepared_talk";
+    prepared.media.session = prepared.lease.session;
+    prepared.media.phase = "replaced";
+
+    expect(isExpectedPreparedTakeoverReplacement(target, prepared.lease, prepared.media)).toBe(true);
+    expect(isExpectedPreparedTakeoverReplacement(
+      target,
+      prepared.lease,
+      { ...prepared.media, phase: "failed" },
+    )).toBe(false);
+    expect(isExpectedPreparedTakeoverReplacement(
+      { ...target, callId: "call_other" },
+      prepared.lease,
+      prepared.media,
+    )).toBe(false);
   });
 });
 

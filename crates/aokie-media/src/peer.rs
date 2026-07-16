@@ -287,25 +287,13 @@ impl DesktopPeer {
 
         let remote = SessionDescription::parse(&offer.sdp, SdpType::Offer)?;
         peer.set_remote_description(remote).await?;
-        let audio_transceivers = peer
-            .transceivers()
-            .into_iter()
-            .filter(|transceiver| {
-                transceiver
-                    .receiver()
-                    .track()
-                    .is_some_and(|track| matches!(track, MediaStreamTrack::Audio(_)))
-            })
-            .collect::<Vec<_>>();
-        if audio_transceivers.len() != 1 {
-            peer.close();
-            return Err(MediaError::InvalidSignal(
-                "offer must negotiate exactly one audio transceiver",
-            ));
-        }
-        audio_transceivers[0]
-            .sender()
-            .set_track(Some(caller_track.into()))?;
+        // `RtpSender::set_track` alone does not update an answerer's
+        // transceiver direction. `add_track` follows the WebRTC AddTrack
+        // algorithm: it reuses the offered audio transceiver and changes
+        // inactive/recvonly into sendonly/sendrecv before answer creation.
+        // Without this, ICE/DTLS can connect while the answer remains
+        // `a=inactive`, so Companion never receives caller audio.
+        peer.add_track(caller_track.into(), &[binding.rtc_session_id.as_str()])?;
         let answer = peer.create_answer(AnswerOptions::default()).await?;
         peer.set_local_description(answer.clone()).await?;
         let answer = SdpSignal {
@@ -313,6 +301,7 @@ impl DesktopPeer {
             sdp: answer.to_string(),
         };
         answer.validate()?;
+        validate_answer_media_policy(&answer.sdp, binding.mode)?;
 
         let packetizer = PcmPacketizer::new(
             options.sample_rate,
@@ -686,6 +675,46 @@ impl CompanionPeer {
             ));
         }
         self.microphone_active.store(true, Ordering::Release);
+        self.schedule_microphone_expiry(lease_lifetime);
+        Ok(())
+    }
+
+    /// Extends the watchdog for an already-open microphone without stopping
+    /// the operating-system capture session or toggling the negotiated track.
+    /// A lease renewal changes only expiry authority; restarting the ADM here
+    /// creates audible transmit gaps and can repeatedly reset WebRTC capture.
+    pub fn renew_microphone_lease(
+        &self,
+        binding: &SessionBinding,
+        lease_lifetime: Duration,
+    ) -> Result<(), MediaError> {
+        self.ensure_open()?;
+        if binding != &self.binding || !binding.mode.needs_microphone() || lease_lifetime.is_zero()
+        {
+            return Err(MediaError::UnsafeTransition(
+                "microphone lease does not match this native peer",
+            ));
+        }
+        if self.peer.connection_state() != PeerConnectionState::Connected {
+            return Err(MediaError::UnsafeTransition(
+                "microphone lease cannot renew while WebRTC is disconnected",
+            ));
+        }
+        if !self.microphone_active.load(Ordering::Acquire) {
+            return Err(MediaError::UnsafeTransition(
+                "microphone lease cannot renew before the microphone is armed",
+            ));
+        }
+        self.schedule_microphone_expiry(lease_lifetime);
+        Ok(())
+    }
+
+    fn schedule_microphone_expiry(&self, lease_lifetime: Duration) {
+        let track = self
+            .microphone_track
+            .as_ref()
+            .expect("microphone watchdog requires a microphone track")
+            .clone();
         let generation = self
             .microphone_generation
             .fetch_add(1, Ordering::AcqRel)
@@ -693,7 +722,6 @@ impl CompanionPeer {
         let active = self.microphone_active.clone();
         let current_generation = self.microphone_generation.clone();
         let factory = self.factory.clone();
-        let track = track.clone();
         tokio::runtime::Handle::current().spawn(async move {
             tokio::time::sleep(lease_lifetime).await;
             if current_generation.load(Ordering::Acquire) == generation {
@@ -703,7 +731,6 @@ impl CompanionPeer {
                 active.store(false, Ordering::Release);
             }
         });
-        Ok(())
     }
 
     pub fn disarm_microphone(&self) {
@@ -718,6 +745,10 @@ impl CompanionPeer {
 
     pub fn microphone_active(&self) -> bool {
         self.microphone_active.load(Ordering::Acquire)
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.peer.connection_state() == PeerConnectionState::Connected
     }
 
     pub async fn next_event(&mut self) -> Option<PeerEvent> {
@@ -785,6 +816,30 @@ fn connection_state_label(state: PeerConnectionState) -> &'static str {
 }
 
 fn validate_offer_media_policy(sdp: &str, mode: MediaMode) -> Result<(), MediaError> {
+    validate_media_policy(sdp, offer_direction_for_mode(mode))
+}
+
+fn validate_answer_media_policy(sdp: &str, mode: MediaMode) -> Result<(), MediaError> {
+    let expected = if mode.needs_microphone() {
+        "sendrecv"
+    } else {
+        "sendonly"
+    };
+    validate_media_policy(sdp, expected)
+}
+
+fn offer_direction_for_mode(mode: MediaMode) -> &'static str {
+    if matches!(
+        mode,
+        MediaMode::Monitor | MediaMode::PreparedConsult | MediaMode::PreparedTalk
+    ) {
+        "recvonly"
+    } else {
+        "sendrecv"
+    }
+}
+
+fn validate_media_policy(sdp: &str, expected_direction: &str) -> Result<(), MediaError> {
     let normalized = sdp.replace("\r\n", "\n");
     let mut audio_sections = Vec::new();
     let mut current: Option<Vec<&str>> = None;
@@ -823,17 +878,13 @@ fn validate_offer_media_policy(sdp: &str, mode: MediaMode) -> Result<(), MediaEr
             _ => None,
         })
         .unwrap_or("sendrecv");
-    let expected = if matches!(
-        mode,
-        MediaMode::Monitor | MediaMode::PreparedConsult | MediaMode::PreparedTalk
-    ) {
-        "recvonly"
-    } else {
-        "sendrecv"
-    };
-    if direction != expected {
+    if direction != expected_direction {
+        eprintln!(
+            "[aokie-media] rejected negotiated audio direction actual={} expected={}",
+            direction, expected_direction
+        );
         return Err(MediaError::InvalidSignal(
-            "offer media direction does not match the lease mode",
+            "media direction does not match the lease mode",
         ));
     }
     Ok(())
@@ -857,6 +908,19 @@ mod tests {
         assert!(validate_offer_media_policy(recvonly, MediaMode::Consult).is_err());
         assert!(validate_offer_media_policy(sendrecv, MediaMode::Talk).is_ok());
         assert!(validate_offer_media_policy(recvonly, MediaMode::Talk).is_err());
+    }
+
+    #[test]
+    fn desktop_answers_send_caller_audio_for_every_mode() {
+        let sendonly = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\n";
+        let sendrecv = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendrecv\r\n";
+        assert!(validate_answer_media_policy(sendonly, MediaMode::Monitor).is_ok());
+        assert!(validate_answer_media_policy(sendonly, MediaMode::PreparedTalk).is_ok());
+        assert!(validate_answer_media_policy(sendonly, MediaMode::PreparedConsult).is_ok());
+        assert!(validate_answer_media_policy(sendrecv, MediaMode::Consult).is_ok());
+        assert!(validate_answer_media_policy(sendrecv, MediaMode::Talk).is_ok());
+        assert!(validate_answer_media_policy(sendrecv, MediaMode::Monitor).is_err());
+        assert!(validate_answer_media_policy(sendonly, MediaMode::Talk).is_err());
     }
 
     #[test]

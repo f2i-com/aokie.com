@@ -147,6 +147,7 @@ pub struct ManagedConnectConfig {
 pub(crate) struct ManagedAdmission {
     pub(crate) gateway_url: String,
     pub(crate) access_token: String,
+    pub(crate) expires_at: u64,
     pub(crate) ice_servers: Vec<IceServerConfig>,
     pub(crate) relay_only: bool,
     pub(crate) oauth_device_id: String,
@@ -1262,6 +1263,7 @@ async fn request_admission(
         expected_peer_key_thumbprint: admission.expected_peer_key_thumbprint,
         gateway_url: admission.gateway_url,
         access_token: admission.access_token,
+        expires_at: admission.expires_at,
         ice_servers,
         relay_only: admission.relay_only,
     })

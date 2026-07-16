@@ -497,14 +497,16 @@ impl RfcommState {
 
     pub fn handle_packet(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         let frame = parse_frame(packet)?;
-        eprintln!(
-            "[AokieRadio] RFCOMM frame in: kind={:?} dlci={} cr={} pf={} payload={}B",
-            frame.kind,
-            frame.dlci,
-            frame.command_response,
-            frame.poll_final,
-            frame.payload.len()
-        );
+        if should_log_frame_header(&frame) {
+            eprintln!(
+                "[AokieRadio] RFCOMM frame in: kind={:?} dlci={} cr={} pf={} payload={}B",
+                frame.kind,
+                frame.dlci,
+                frame.command_response,
+                frame.poll_final,
+                frame.payload.len()
+            );
+        }
         match frame.kind {
             RfcommFrameKind::Sabm => Ok(self.handle_sabm(frame.dlci)),
             RfcommFrameKind::Ua if self.client_dlcis.contains_key(&frame.dlci) => {
@@ -1317,14 +1319,16 @@ impl RfcommClientState {
     /// / Payload / Closed / Failed) are observable via `take_events`.
     pub fn handle_packet(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         let frame = parse_frame(packet)?;
-        eprintln!(
-            "[AokieRadio] RFCOMM client frame in: kind={:?} dlci={} target={} payload={}B (phase {:?})",
-            frame.kind,
-            frame.dlci,
-            self.target_dlci,
-            frame.payload.len(),
-            self.phase
-        );
+        if should_log_frame_header(&frame) {
+            eprintln!(
+                "[AokieRadio] RFCOMM client frame in: kind={:?} dlci={} target={} payload={}B (phase {:?})",
+                frame.kind,
+                frame.dlci,
+                self.target_dlci,
+                frame.payload.len(),
+                self.phase
+            );
+        }
         match (frame.kind, frame.dlci) {
             (RfcommFrameKind::Ua, RFCOMM_DLCI_MULTIPLEXER) => self.on_ua_multiplexer(),
             (RfcommFrameKind::Ua, dlci) if dlci == self.target_dlci => self.on_ua_target(),
@@ -2078,9 +2082,43 @@ fn require_len(payload: &[u8], min_len: usize, name: &str) -> Result<(), String>
     Ok(())
 }
 
+/// Keep control/HFP-sized frame diagnostics while avoiding one log row for
+/// every large MAP/PBAP OBEX body chunk. The Desktop log ring is intentionally
+/// bounded; bulk UIH rows previously evicted the actual call/takeover failure.
+fn should_log_frame_header(frame: &RfcommFrame<'_>) -> bool {
+    !matches!(frame.kind, RfcommFrameKind::Uih) || frame.payload.len() < 64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_uih_body_headers_do_not_evict_control_diagnostics() {
+        let bulk = [0_u8; 127];
+        let body = RfcommFrame {
+            dlci: 11,
+            command_response: false,
+            kind: RfcommFrameKind::Uih,
+            poll_final: false,
+            credits: None,
+            payload: &bulk,
+        };
+        assert!(!should_log_frame_header(&body));
+
+        let hfp = RfcommFrame {
+            dlci: aokie_hfp_dlci(),
+            payload: b"+CIEV: 2,1\r\n",
+            ..body
+        };
+        assert!(should_log_frame_header(&hfp));
+
+        let control = RfcommFrame {
+            kind: RfcommFrameKind::Disc,
+            ..body
+        };
+        assert!(should_log_frame_header(&control));
+    }
 
     #[test]
     fn parses_and_builds_sabm_ua_dm_frames() {
