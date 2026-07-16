@@ -316,7 +316,10 @@ mod tests {
 
     #[test]
     fn dongle_tier_maps_catalog_and_rejects_strangers() {
-        assert_eq!(dongle_tier(0x0a5c, 0x21ec), Some(DongleCompatTier::Certified));
+        assert_eq!(
+            dongle_tier(0x0a5c, 0x21ec),
+            Some(DongleCompatTier::Certified)
+        );
         assert_eq!(dongle_tier(0x0bda, 0x8771), Some(DongleCompatTier::Beta));
         assert_eq!(dongle_tier(0x1234, 0x5678), None);
     }
@@ -330,21 +333,33 @@ mod tests {
 
     #[test]
     fn rejects_absent_device_before_anything_else() {
-        let facts = DeviceFacts { present: false, ..good_facts() };
+        let facts = DeviceFacts {
+            present: false,
+            ..good_facts()
+        };
         assert_eq!(
             evaluate_install_target(&facts, true).unwrap_err(),
-            InstallRejection::NotPresent { vid: 0x0a5c, pid: 0x21ec }
+            InstallRejection::NotPresent {
+                vid: 0x0a5c,
+                pid: 0x21ec
+            }
         );
     }
 
     #[test]
     fn rejects_hub_and_composite_even_with_opt_in() {
-        let hub = DeviceFacts { is_hub_or_controller: true, ..good_facts() };
+        let hub = DeviceFacts {
+            is_hub_or_controller: true,
+            ..good_facts()
+        };
         assert_eq!(
             evaluate_install_target(&hub, true).unwrap_err(),
             InstallRejection::HubOrController
         );
-        let combo = DeviceFacts { is_composite: true, ..good_facts() };
+        let combo = DeviceFacts {
+            is_composite: true,
+            ..good_facts()
+        };
         assert_eq!(
             evaluate_install_target(&combo, true).unwrap_err(),
             InstallRejection::Composite
@@ -355,7 +370,12 @@ mod tests {
     fn rejects_denied_classes_even_with_opt_in() {
         // A keyboard whose VID/PID somehow matched the opt-in path must
         // still fail on class.
-        let kbd = DeviceFacts { vid: 0x1234, pid: 0x5678, class: "HIDClass", ..good_facts() };
+        let kbd = DeviceFacts {
+            vid: 0x1234,
+            pid: 0x5678,
+            class: "HIDClass",
+            ..good_facts()
+        };
         match evaluate_install_target(&kbd, true).unwrap_err() {
             InstallRejection::DisallowedClass { class } => assert_eq!(class, "HIDClass"),
             other => panic!("expected DisallowedClass, got {:?}", other),
@@ -370,10 +390,17 @@ mod tests {
 
     #[test]
     fn unknown_dongle_needs_the_opt_in() {
-        let stranger = DeviceFacts { vid: 0x1111, pid: 0x2222, ..good_facts() };
+        let stranger = DeviceFacts {
+            vid: 0x1111,
+            pid: 0x2222,
+            ..good_facts()
+        };
         assert_eq!(
             evaluate_install_target(&stranger, false).unwrap_err(),
-            InstallRejection::UnknownDongle { vid: 0x1111, pid: 0x2222 }
+            InstallRejection::UnknownDongle {
+                vid: 0x1111,
+                pid: 0x2222
+            }
         );
         let approval = evaluate_install_target(&stranger, true).unwrap();
         assert_eq!(approval.tier, None);
@@ -385,6 +412,9 @@ mod tests {
         assert!(InstallRejection::UnknownDongle { vid: 1, pid: 2 }
             .message()
             .contains(UNKNOWN_DONGLE_OPT_IN));
-        assert!(InstallRejection::Composite.message().to_lowercase().contains("combo"));
+        assert!(InstallRejection::Composite
+            .message()
+            .to_lowercase()
+            .contains("combo"));
     }
 }

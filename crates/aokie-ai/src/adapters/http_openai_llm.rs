@@ -419,7 +419,10 @@ mod tests {
         let msgs = HttpOpenAiLlm::build_messages(&req, false);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
-        assert_eq!(msgs[0].content, "You are the receptionist for Jake's Mowing.");
+        assert_eq!(
+            msgs[0].content,
+            "You are the receptionist for Jake's Mowing."
+        );
         assert_eq!(msgs[1].role, "user");
         assert_eq!(msgs[1].content, "how much for a mow?");
     }

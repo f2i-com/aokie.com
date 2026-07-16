@@ -1,0 +1,14 @@
+{
+  "kind": "end_caller_challenge_request",
+  "schemaVersion": 2,
+  "appId": "app_example",
+  "requestId": "end_prepare_1",
+  "idempotencyKey": "mobile:device_example:end_prepare_1",
+  "leaseToken": "v2.redacted.signature",
+  "callId": "call_example",
+  "callEpoch": 7,
+  "ownerEpoch": 4,
+  "switchboardRevision": 11,
+  "remoteRevision": 15,
+  "fence": 9
+}

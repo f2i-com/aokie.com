@@ -130,8 +130,18 @@ fn expand_date_abbreviations(input: &str) -> String {
         ("Dec", "December"),
     ];
     const MONTH_FULL: [&str; 12] = [
-        "January", "February", "March", "April", "May", "June", "July", "August", "September",
-        "October", "November", "December",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
     ];
     fn is_day_number(w: &str) -> bool {
         let w = w.trim_end_matches(|c: char| !c.is_ascii_digit());
@@ -150,14 +160,10 @@ fn expand_date_abbreviations(input: &str) -> String {
     let mut seps: Vec<&str> = Vec::new();
     let mut rest = input;
     while !rest.is_empty() {
-        let word_end = rest
-            .find(char::is_whitespace)
-            .unwrap_or(rest.len());
+        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let (w, r) = rest.split_at(word_end);
         words.push(w);
-        let sep_end = r
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(r.len());
+        let sep_end = r.find(|c: char| !c.is_whitespace()).unwrap_or(r.len());
         let (s, r2) = r.split_at(sep_end);
         seps.push(s);
         rest = r2;
@@ -213,9 +219,7 @@ fn normalize_currency(input: &str) -> String {
                 if chars[j].is_ascii_digit() {
                     whole.push(chars[j]);
                     j += 1;
-                } else if chars[j] == ','
-                    && chars.get(j + 1).is_some_and(|c| c.is_ascii_digit())
-                {
+                } else if chars[j] == ',' && chars.get(j + 1).is_some_and(|c| c.is_ascii_digit()) {
                     // A thousands separator ONLY when digits follow — the
                     // comma in "$18, steak" is prose punctuation and stays.
                     j += 1;
@@ -234,7 +238,11 @@ fn normalize_currency(input: &str) -> String {
                     k += 1;
                 }
                 if frac.len() <= 2 {
-                    let padded = if frac.len() == 1 { format!("{frac}0") } else { frac };
+                    let padded = if frac.len() == 1 {
+                        format!("{frac}0")
+                    } else {
+                        frac
+                    };
                     cents = padded.parse::<u32>().ok();
                     j = k;
                 }
@@ -354,7 +362,10 @@ mod tests {
         );
         assert_eq!(c("$1 coin"), "1 dollar coin");
         assert_eq!(c("$1,200 deposit"), "1200 dollars deposit");
-        assert_eq!(c("that's $18.50 all up"), "that's 18 dollars and 50 cents all up");
+        assert_eq!(
+            c("that's $18.50 all up"),
+            "that's 18 dollars and 50 cents all up"
+        );
         assert_eq!(c("$9.5 special"), "9 dollars and 50 cents special");
         assert_eq!(c("just $0.50"), "just 50 cents");
         assert_eq!(c("$18.00 even"), "18 dollars even");
@@ -377,8 +388,14 @@ mod tests {
             normalize_speech_text("I have you booked for 10 a.m., and we'll call you."),
             "I have you booked for 10 a em, and we'll call you."
         );
-        assert_eq!(normalize_speech_text("See you at 2 p.m."), "See you at 2 pee em.");
-        assert_eq!(normalize_speech_text("See you at 2 P.M.!"), "See you at 2 pee em!");
+        assert_eq!(
+            normalize_speech_text("See you at 2 p.m."),
+            "See you at 2 pee em."
+        );
+        assert_eq!(
+            normalize_speech_text("See you at 2 P.M.!"),
+            "See you at 2 pee em!"
+        );
         assert_eq!(
             normalize_speech_text("Open until 9p.m. tomorrow"),
             "Open until 9 pee em. tomorrow"
@@ -392,33 +409,69 @@ mod tests {
 
     #[test]
     fn bare_am_pm_only_converts_after_a_time() {
-        assert_eq!(normalize_speech_text("see you at 10 AM."), "see you at 10 a em.");
-        assert_eq!(normalize_speech_text("booked for 10am sharp"), "booked for 10 a em sharp");
-        assert_eq!(normalize_speech_text("at 10:30 PM tonight"), "at 10 30 pee em tonight");
+        assert_eq!(
+            normalize_speech_text("see you at 10 AM."),
+            "see you at 10 a em."
+        );
+        assert_eq!(
+            normalize_speech_text("booked for 10am sharp"),
+            "booked for 10 a em sharp"
+        );
+        assert_eq!(
+            normalize_speech_text("at 10:30 PM tonight"),
+            "at 10 30 pee em tonight"
+        );
         // NOT times — never rewritten.
         assert_eq!(normalize_speech_text("I AM HERE"), "I AM HERE");
         assert_eq!(normalize_speech_text("am I early?"), "am I early?");
-        assert_eq!(normalize_speech_text("the PM will visit"), "the PM will visit");
+        assert_eq!(
+            normalize_speech_text("the PM will visit"),
+            "the PM will visit"
+        );
     }
 
     #[test]
     fn clock_times_read_naturally() {
         // The reported bug: "10:00" spoken as "ten zero zero" / colon noise.
-        assert_eq!(normalize_speech_text("booked for 10:00 AM."), "booked for 10 a em.");
-        assert_eq!(normalize_speech_text("see you at 10:15."), "see you at 10 15.");
+        assert_eq!(
+            normalize_speech_text("booked for 10:00 AM."),
+            "booked for 10 a em."
+        );
+        assert_eq!(
+            normalize_speech_text("see you at 10:15."),
+            "see you at 10 15."
+        );
         assert_eq!(normalize_speech_text("at 10:05 pm"), "at 10 oh 5 pee em");
-        assert_eq!(normalize_speech_text("open 9:00 to 17:30"), "open 9 to 17 30");
+        assert_eq!(
+            normalize_speech_text("open 9:00 to 17:30"),
+            "open 9 to 17 30"
+        );
         // NOT clock times — untouched.
         assert_eq!(normalize_speech_text("a 3:1 ratio"), "a 3:1 ratio");
-        assert_eq!(normalize_speech_text("code 10:154 please"), "code 10:154 please");
-        assert_eq!(normalize_speech_text("item 100:30 stays"), "item 100:30 stays");
-        assert_eq!(normalize_speech_text("at 75:00 minutes?"), "at 75:00 minutes?");
+        assert_eq!(
+            normalize_speech_text("code 10:154 please"),
+            "code 10:154 please"
+        );
+        assert_eq!(
+            normalize_speech_text("item 100:30 stays"),
+            "item 100:30 stays"
+        );
+        assert_eq!(
+            normalize_speech_text("at 75:00 minutes?"),
+            "at 75:00 minutes?"
+        );
     }
 
     #[test]
     fn words_survive_and_markdown_is_stripped() {
         assert_eq!(normalize_speech_text("Sam. said hi"), "Sam. said hi");
-        assert_eq!(normalize_speech_text("the spam. filter"), "the spam. filter");
-        assert_eq!(normalize_speech_text("**Great** — see you `then`"), "Great — see you then");
+        assert_eq!(
+            normalize_speech_text("the spam. filter"),
+            "the spam. filter"
+        );
+        assert_eq!(
+            normalize_speech_text("**Great** — see you `then`"),
+            "Great — see you then"
+        );
     }
 }

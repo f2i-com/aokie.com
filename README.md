@@ -221,6 +221,8 @@ guarantee because controller firmware, endpoint layouts and SCO support vary.
 ```bash
 cargo test --workspace
 cargo check -p aokie-plugin --features voice
+cargo test -p aokie-protocol -p aokie-mobile
+(cd apps/aokie-mobile && npm ci && npm test && npm run build)
 cargo clippy --workspace --all-targets
 cargo audit
 ```
@@ -271,6 +273,8 @@ the dongle to the operating system's normal Bluetooth stack.
 | Crate | Responsibility |
 |---|---|
 | `aokie-plugin` | FormLogic Desktop plugin process, JSON-RPC connector, call state, voice agent and durable outbox |
+| `aokie-protocol` | Canonical Companion snapshot/command models, revision fences and cross-language fixtures |
+| `aokie-realtime` | Self-hostable authenticated Companion WSS gateway, bounded replay and Desktop/mobile routing |
 | `aokie-bluetooth` | WinUSB HCI/ACL/SCO runtime, HFP, audio codecs, MAP/PBAP protocol support and recovery |
 | `aokie-dongle` | Dongle discovery, guarded driver installation, restoration and event mapping |
 | `aokie-ai` | Local ONNX speech-to-text and text-to-speech runtimes |
@@ -278,6 +282,7 @@ the dongle to the operating system's normal Bluetooth stack.
 | `aokie-core` | Tauri-free shared policy, catalog, contracts, security and native logic |
 | `aokie-audio`, `aokie-db` | Shared audio and storage infrastructure |
 | `aokie-receptionist` | Reserved shared receptionist crate surface; the active business UI and workflows live in FormLogic |
+| `apps/aokie-mobile` | Aokie Companion Tauri v2 shell, realtime client, safety state, demo and native integration seams |
 
 The plugin speaks JSON-RPC 2.0 over newline-delimited stdio. Its events, commands, errors, settings schema and default persona are frozen in `docs/contracts/*.json`, with test-locked copies in the FormLogic repository.
 
@@ -288,6 +293,7 @@ The plugin speaks JSON-RPC 2.0 over newline-delimited stdio. Its events, command
 | [Architecture](docs/ARCHITECTURE.md) | Process shape, call state, voice pipeline, durability and invariants |
 | [Supported hardware](docs/HARDWARE.md) | Dongle catalog, compatibility tiers, phone notes and Windows timing |
 | [FormLogic plugin contract](docs/FORMLOGIC_PLUGIN_CONTRACT.md) | Cross-repository commands, events, manifests and obligations |
+| [Aokie Companion](apps/aokie-mobile/README.md) | Mobile shell, current capabilities, security boundaries and local builds |
 | [Security policy](SECURITY.md) | Supported versions, security boundaries and private reporting |
 | [FormLogic Aokie operations](https://github.com/f2i-com/formlogic.com/blob/main/docs/AOKIE_OPERATIONS.md) | Stack supervision, deployment, diagnostics, retention and event recovery |
 | [FormLogic troubleshooting](https://github.com/f2i-com/formlogic.com/blob/main/docs/AOKIE_TROUBLESHOOTING.md) | Concrete call, audio, flow and hardware failures |

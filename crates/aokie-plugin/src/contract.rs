@@ -55,16 +55,22 @@ pub mod events {
     /// it must never be treated as a fresh caller turn (no replies).
     pub const CALL_TURN_CORRECTED: &str = "aokie.call.turn.corrected";
     pub const CALL_ENDED: &str = "aokie.call.ended";
-    /// Phase 4 (call waiting, observe-only slice): a SECOND caller rang
-    /// while `callId` was active — {callId, from, at}. `callId` is the
-    /// ACTIVE call the knock happened during (the waiting caller has no
-    /// session of their own yet); `from` is the waiting caller's number,
-    /// "" when the network withheld it. Emitted once per waiting episode,
-    /// only on connections where call waiting negotiated (holdAndCallWaiting
-    /// setting + phone capability). Aokie does NOT yet answer or hold —
-    /// the waiting caller hears the network's tone until they give up (a
-    /// flow may e.g. text them); if the active call ends while they are
-    /// still waiting, their ring is promoted to a normal incoming call.
+    /// Redacted durable typed-help lifecycle records. The request event is
+    /// `{requestId, callId, outcome:"requested", urgency:"normal", at}`.
+    /// The resolution event has outcome `answered|expired` and adds only the
+    /// authenticated `responderDeviceId` for `answered`. Question, context,
+    /// answer and transcript content are deliberately never event payloads.
+    pub const CALL_ASSISTANCE_REQUESTED: &str = "aokie.call.assistance.requested";
+    pub const CALL_ASSISTANCE_RESOLVED: &str = "aokie.call.assistance.resolved";
+    /// Phase 4 call-waiting episode — {callId, from, waitingCallId, at}.
+    /// `callId` is the ACTIVE foreground call and `waitingCallId` is the
+    /// stable identity accepted by `call.activate`; `from` is empty when the
+    /// network withheld it. Emitted once per negotiated waiting episode.
+    /// Operator switchboard and optional auto-hold policy may later accept or
+    /// queue the leg. If it remains unclaimed and gives up, the same stable ID
+    /// receives an honest missed/gave_up_waiting terminal event; promotion to
+    /// a normal incoming ring occurs only when no parked caller would be
+    /// queue-jumped.
     pub const CALL_WAITING: &str = "aokie.call.waiting";
     /// Phase 2 (outbound calling): an OUTBOUND call attempt started —
     /// {callId, to, purpose?, at}. The rest of the outbound lifecycle rides
@@ -110,6 +116,8 @@ pub mod events {
         CALL_TURN_FINAL,
         CALL_TURN_CORRECTED,
         CALL_ENDED,
+        CALL_ASSISTANCE_REQUESTED,
+        CALL_ASSISTANCE_RESOLVED,
         CALL_WAITING,
         CALL_OUTBOUND_DIALING,
         SMS_RECEIVED,
@@ -136,6 +144,21 @@ pub mod events {
 
 /// Connector command names (`connector.request` `command` field).
 pub mod commands {
+    /// Host-internal Companion media adapter commands. They are deliberately
+    /// not advertised as Flow/pack capabilities: the Desktop maps only
+    /// authenticated gateway signalling and leases onto this surface, and
+    /// raw audio is never representable here.
+    pub const PRIVATE_COMPANION_MEDIA: &[&str] = &[
+        "_companion.media.snapshot",
+        "_companion.media.offer",
+        "_companion.media.ice",
+        "_companion.media.takeover",
+        "_companion.media.renew",
+        "_companion.media.revoke",
+        "_companion.media.close",
+        "_companion.media.events",
+    ];
+
     /// Every command the dispatcher implements — MUST equal
     /// `manifest.json`'s `connectors[0].commands` (test-enforced).
     pub const ALL: &[&str] = &[
@@ -264,8 +287,16 @@ mod tests {
                 .map(|v| v.as_str().unwrap().to_string())
                 .collect()
         };
-        assert_eq!(arr("events"), super::events::ALL, "fixture events drifted from contract.rs");
-        assert_eq!(arr("commands"), super::commands::ALL, "fixture commands drifted from contract.rs");
+        assert_eq!(
+            arr("events"),
+            super::events::ALL,
+            "fixture events drifted from contract.rs"
+        );
+        assert_eq!(
+            arr("commands"),
+            super::commands::ALL,
+            "fixture commands drifted from contract.rs"
+        );
         assert_eq!(
             arr("errors"),
             [
@@ -278,10 +309,18 @@ mod tests {
         );
         assert_eq!(
             arr("callStates"),
-            [super::call_state::RINGING, super::call_state::ACTIVE, super::call_state::ENDED],
+            [
+                super::call_state::RINGING,
+                super::call_state::ACTIVE,
+                super::call_state::ENDED
+            ],
             "fixture call states drifted"
         );
-        assert_eq!(fixture["pluginApiVersion"], manifest()["pluginApiVersion"], "pluginApiVersion drifted");
+        assert_eq!(
+            fixture["pluginApiVersion"],
+            manifest()["pluginApiVersion"],
+            "pluginApiVersion drifted"
+        );
     }
 
     fn manifest() -> Value {

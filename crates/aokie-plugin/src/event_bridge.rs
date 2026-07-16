@@ -25,6 +25,8 @@ pub const ESSENTIAL_EVENTS: &[&str] = &[
     crate::contract::events::CALL_ANSWERED,
     crate::contract::events::CALL_TURN_FINAL,
     crate::contract::events::CALL_ENDED,
+    crate::contract::events::CALL_ASSISTANCE_REQUESTED,
+    crate::contract::events::CALL_ASSISTANCE_RESOLVED,
     crate::contract::events::SMS_RECEIVED,
     crate::contract::events::SMS_SENT,
     crate::contract::events::SMS_FAILED,
@@ -168,8 +170,7 @@ pub fn emit_event(
                     event.name
                 ));
             }
-            crate::outbox::InsertOutcome::Inserted
-            | crate::outbox::InsertOutcome::Duplicate => {}
+            crate::outbox::InsertOutcome::Inserted | crate::outbox::InsertOutcome::Duplicate => {}
         }
         if mode == EmitMode::RequireAck {
             // AOK-DUR-001 item 3: the host cannot acknowledge durable receipt.
@@ -264,7 +265,8 @@ pub fn replay_once(sink: &mut dyn Sink, outbox: &Outbox, limit: u32) -> usize {
                 }
             }
             Err(e) => {
-                let _ = outbox.mark_failed(&row.idempotency_key, &e.to_string(), Some(row.attempts));
+                let _ =
+                    outbox.mark_failed(&row.idempotency_key, &e.to_string(), Some(row.attempts));
             }
         }
     }
@@ -371,6 +373,12 @@ mod tests {
     #[test]
     fn essential_set_matches_contract() {
         assert!(is_essential(crate::contract::events::CALL_INCOMING));
+        assert!(is_essential(
+            crate::contract::events::CALL_ASSISTANCE_REQUESTED
+        ));
+        assert!(is_essential(
+            crate::contract::events::CALL_ASSISTANCE_RESOLVED
+        ));
         assert!(is_essential(crate::contract::events::SMS_SENT));
         assert!(is_essential(crate::contract::events::HARDWARE_ERROR));
         assert!(!is_essential(crate::contract::events::DONGLE_DETECTED));
@@ -382,13 +390,20 @@ mod tests {
     fn essential_event_is_outboxed_and_marked_sent() {
         let outbox = Outbox::open_in_memory().unwrap();
         let mut sink = VecSink::default();
-        let ev = aokie_event(crate::contract::events::CALL_INCOMING, "call_a", json!({"from": "x"}));
+        let ev = aokie_event(
+            crate::contract::events::CALL_INCOMING,
+            "call_a",
+            json!({"from": "x"}),
+        );
         emit_event(&mut sink, &outbox, &ev, false, EmitMode::Legacy).unwrap();
 
         assert_eq!(sink.lines.len(), 1);
         let v: Value = serde_json::from_str(&sink.lines[0]).unwrap();
         assert_eq!(v["method"], json!("event.emit"));
-        assert_eq!(v["params"]["event"]["name"], json!(crate::contract::events::CALL_INCOMING));
+        assert_eq!(
+            v["params"]["event"]["name"],
+            json!(crate::contract::events::CALL_INCOMING)
+        );
         assert_eq!(
             outbox.status_of(&ev.idempotency_key).unwrap(),
             Some(OutboxStatus::Sent)
@@ -399,7 +414,11 @@ mod tests {
     fn non_essential_event_skips_outbox_unless_forced() {
         let outbox = Outbox::open_in_memory().unwrap();
         let mut sink = VecSink::default();
-        let ev = aokie_event(crate::contract::events::DONGLE_DETECTED, "call_b", json!({}));
+        let ev = aokie_event(
+            crate::contract::events::DONGLE_DETECTED,
+            "call_b",
+            json!({}),
+        );
         emit_event(&mut sink, &outbox, &ev, false, EmitMode::Legacy).unwrap();
         assert_eq!(outbox.status_of(&ev.idempotency_key).unwrap(), None);
 
@@ -464,8 +483,7 @@ mod tests {
         let a: Value = serde_json::from_str(&sink.lines[0]).unwrap();
         let b: Value = serde_json::from_str(&sink.lines[1]).unwrap();
         assert_eq!(
-            a["params"]["event"]["idempotencyKey"],
-            b["params"]["event"]["idempotencyKey"],
+            a["params"]["event"]["idempotencyKey"], b["params"]["event"]["idempotencyKey"],
             "replay uses the same occurrence id so the host can dedupe"
         );
 
@@ -522,8 +540,16 @@ mod tests {
     fn for_host_matrix_requires_ack_in_production() {
         assert_eq!(EmitMode::for_host(true, false), EmitMode::AckExpected);
         assert_eq!(EmitMode::for_host(true, true), EmitMode::AckExpected);
-        assert_eq!(EmitMode::for_host(false, true), EmitMode::Legacy, "explicit override only");
-        assert_eq!(EmitMode::for_host(false, false), EmitMode::RequireAck, "production default");
+        assert_eq!(
+            EmitMode::for_host(false, true),
+            EmitMode::Legacy,
+            "explicit override only"
+        );
+        assert_eq!(
+            EmitMode::for_host(false, false),
+            EmitMode::RequireAck,
+            "production default"
+        );
     }
 
     /// Item 3: on a host without eventAck (no override), an essential event

@@ -127,7 +127,10 @@ mod tests {
         // The matching response resolves the receiver and is consumed.
         let resp = json!({"jsonrpc": "2.0", "id": id, "result": {"status": "succeeded"}});
         assert!(rpc.try_route_response(&resp));
-        let got = rx.recv_timeout(Duration::from_millis(200)).unwrap().unwrap();
+        let got = rx
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap()
+            .unwrap();
         assert_eq!(got["status"], json!("succeeded"));
         assert_eq!(rpc.pending_count(), 0);
     }
@@ -138,7 +141,10 @@ mod tests {
         let (id, _line, rx) = rpc.begin("flow.run", json!({}));
         let resp = json!({"id": id, "error": {"code": -32000, "message": "not linked"}});
         assert!(rpc.try_route_response(&resp));
-        let err = rx.recv_timeout(Duration::from_millis(200)).unwrap().unwrap_err();
+        let err = rx
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap()
+            .unwrap_err();
         assert!(err.contains("not linked"), "{err}");
 
         // Timeout path: forget, then the late response is consumed silently.
@@ -146,7 +152,10 @@ mod tests {
         rpc.forget(id2);
         assert!(rx2.recv_timeout(Duration::from_millis(50)).is_err());
         let late = json!({"id": id2, "result": {}});
-        assert!(rpc.try_route_response(&late), "late responses are consumed, not dispatched");
+        assert!(
+            rpc.try_route_response(&late),
+            "late responses are consumed, not dispatched"
+        );
     }
 
     #[test]

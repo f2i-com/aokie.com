@@ -32,9 +32,7 @@ pub trait DbHost {
     fn on_db_error(&self, message: &str);
 }
 
-pub fn db_path(
-    host: &dyn DbHost,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+pub fn db_path(host: &dyn DbHost) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let app_data_dir = host.data_dir();
     std::fs::create_dir_all(&app_data_dir)?;
     Ok(app_data_dir.join("aokie.db"))
@@ -582,8 +580,7 @@ fn run_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error + S
     // an ALTER TABLE that fails partway (FK constraint, disk full) leaves
     // `user_version` unchanged, so the next launch re-applies cleanly
     // instead of hitting a half-modified schema.
-    let tx =
-        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     // R3-#17: re-read `user_version` INSIDE the lock. The loser of the
     // IMMEDIATE-lock race observes the winner's committed version and
     // skips the whole (already-applied) ladder rather than re-running

@@ -1,0 +1,39 @@
+{
+  "kind": "plugin_snapshot",
+  "schemaVersion": 2,
+  "appId": "app_coastal_auto",
+  "eventId": "event_call_42_1",
+  "snapshot": {
+    "callId": "call_42",
+    "callEpoch": 7,
+    "ownerEpoch": 3,
+    "switchboardRevision": 11,
+    "remoteRevision": 13,
+    "telephonyState": "active",
+    "serviceMode": "aokie_active",
+    "mediaState": "ready",
+    "remoteCapabilities": {
+      "softwareHold": true,
+      "carrierHoldEvidence": "unknown",
+      "secondaryCallObservation": "unknown",
+      "voiceConsult": true,
+      "takeover": true
+    },
+    "secondaryCallPolicy": "normal",
+    "remoteConsent": {
+      "policyId": "aokie_remote_access",
+      "policyVersion": 3,
+      "enabled": true,
+      "acknowledged": true,
+      "acknowledgedAt": "2026-07-15T23:00:00Z",
+      "captionsEnabled": true,
+      "assistanceEnabled": true,
+      "monitorEnabled": true,
+      "consultEnabled": true,
+      "takeoverEnabled": true
+    },
+    "caller": { "label": "Private caller", "maskedNumber": "***123" },
+    "captions": [],
+    "occurredAt": "2026-07-16T00:00:00Z"
+  }
+}

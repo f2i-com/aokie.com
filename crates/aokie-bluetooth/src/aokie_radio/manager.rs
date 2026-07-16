@@ -852,10 +852,7 @@ pub enum PairingOutcome {
     /// display and answers with `user_confirmation_request_reply_command`
     /// (accept) or `user_confirmation_request_negative_reply_command`
     /// (reject / timeout) — never silently.
-    ConfirmationPending {
-        address: String,
-        numeric_value: u32,
-    },
+    ConfirmationPending { address: String, numeric_value: u32 },
 }
 
 fn handle_pairing_event(
@@ -1029,22 +1026,20 @@ pub(crate) fn handle_diagnostic_hci_event(
     // Diagnostic sessions (the `aokie-dongle` listen/call tools) are an EXPLICIT
     // operator action to exercise pairing: window treated as open, legacy PIN
     // available, SSP auto-confirmed (PairingPolicy::diagnostic()).
-    Ok(
-        handle_hci_event_with_policy(
-            transport,
-            pairing_store,
-            event,
-            None,
-            PairingPolicy::diagnostic(),
-        )?
-        .map(|outcome| match outcome {
-            PairingOutcome::Logged(action) => action,
-            // Unreachable with operator_confirm=false, but stay total.
-            PairingOutcome::ConfirmationPending { address, .. } => {
-                format!("pairing confirmation pending for {}", address)
-            }
-        }),
-    )
+    Ok(handle_hci_event_with_policy(
+        transport,
+        pairing_store,
+        event,
+        None,
+        PairingPolicy::diagnostic(),
+    )?
+    .map(|outcome| match outcome {
+        PairingOutcome::Logged(action) => action,
+        // Unreachable with operator_confirm=false, but stay total.
+        PairingOutcome::ConfirmationPending { address, .. } => {
+            format!("pairing confirmation pending for {}", address)
+        }
+    }))
 }
 
 pub(crate) fn handle_hci_event_with_policy(
@@ -1487,7 +1482,10 @@ mod tests {
         );
 
         // Fresh-bond completion (PIN / SSP replies + link-key store).
-        assert!(may_complete_new_bond(true), "new bond allowed in the window");
+        assert!(
+            may_complete_new_bond(true),
+            "new bond allowed in the window"
+        );
         assert!(
             !may_complete_new_bond(false),
             "no new bond can complete at rest, even for a device mid-handshake"

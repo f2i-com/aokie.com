@@ -1,0 +1,12 @@
+**
+!Cargo.lock
+!crates/
+!crates/aokie-protocol/
+!crates/aokie-protocol/**
+!crates/aokie-realtime/
+!crates/aokie-realtime/**
+!deploy/
+!deploy/companion-self-host/
+!deploy/companion-self-host/container-workspace/
+!deploy/companion-self-host/container-workspace/**
+!deploy/companion-self-host/gateway-entrypoint.sh

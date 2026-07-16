@@ -1,0 +1,76 @@
+import type { CompanionBridge } from "./CompanionBridge";
+import { DemoCompanionBridge } from "./demoBridge";
+import { nativeBridgeAvailable, TauriCompanionBridge } from "./tauriBridge";
+import { UnavailableCompanionBridge } from "./unavailableBridge";
+
+export type {
+  BridgeEvent,
+  CompanionActivity,
+  CompanionAvailability,
+  CompanionAvailabilityRecord,
+  CompanionAvailabilityState,
+  CompanionBootstrap,
+  CompanionCallFollowUp,
+  CompanionCallRecord,
+  CompanionCallRecordDetail,
+  CompanionCallRecords,
+  CompanionCallTranscriptTurn,
+  CompanionBridge,
+  CompanionCapability,
+  CompanionHistory,
+  CompanionPushEndpoint,
+  CompanionRouting,
+  CompanionRoutingGroup,
+  CompanionSession,
+  CompanionSessionMode,
+  CompanionStaffMember,
+  CompanionTeamMember,
+  CustomServerAuthorization,
+  DiscoveryDocument,
+  DesktopPairingDecision,
+  DesktopPairingConfirmation,
+  DesktopPairingReview,
+  DesktopPeerTrustChallenge,
+  ForgetServerProfileResult,
+  LocalMediaProof,
+  ManagedAdmissionState,
+  NativeAudioDevice,
+  NativeAudioDevices,
+  NativeIceCandidate,
+  NativeIceServer,
+  NativeMediaMode,
+  NativeMediaOffer,
+  NativeMediaOfferRequest,
+  NativeMediaSession,
+  NativeMediaSignal,
+  NativeMediaSignalEvent,
+  NativeMediaStateEvent,
+  NativeSdpSignal,
+  RealtimeConfig,
+  RuntimeCapabilities,
+  ServerProfile,
+  ServerTrustState,
+  SyncReady,
+  V2CallSnapshotEvent,
+  V2AssistanceRequestEvent,
+  V2AssistanceAnswerAcceptedEvent,
+  V2EndCallerChallengeEvent,
+  V2EndCallerEvent,
+  V2EndCallerFailureEvent,
+  V2EndCallerResultEvent,
+  V2EndCallerSubmittedEvent,
+  V2Grant,
+  V2IdleSyncEvent,
+  V2LeaseEvent,
+  V2LeaseMode,
+  V2LeasePhase,
+  V2PendingMobileOffer,
+  V2RequestReceipt,
+} from "./CompanionBridge";
+
+export function createCompanionBridge(): CompanionBridge {
+  const query = new URLSearchParams(globalThis.location?.search ?? "");
+  if (query.get("demo") === "1") return new DemoCompanionBridge();
+  if (nativeBridgeAvailable()) return new TauriCompanionBridge();
+  return new UnavailableCompanionBridge();
+}

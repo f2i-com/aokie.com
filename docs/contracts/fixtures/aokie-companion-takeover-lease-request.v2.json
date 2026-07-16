@@ -1,0 +1,16 @@
+{
+  "kind": "lease_request",
+  "schemaVersion": 2,
+  "appId": "app_coastal_auto",
+  "requestId": "request_takeover_42",
+  "idempotencyKey": "takeover-device-alex-call-42",
+  "callId": "call_42",
+  "expectedCallEpoch": 7,
+  "expectedOwnerEpoch": 3,
+  "expectedSwitchboardRevision": 11,
+  "expectedRemoteRevision": 13,
+  "mode": "takeover",
+  "rtcSessionId": "rtc_call_42_alex_1",
+  "acceptedOfferId": "offer_call_42_takeover",
+  "acceptedOfferJti": "offer_jti_call_42_takeover"
+}

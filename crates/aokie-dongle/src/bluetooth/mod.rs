@@ -221,7 +221,8 @@ impl BluetoothManager {
         body: String,
         msg_type: Option<String>,
     ) -> Result<(), String> {
-        self.runtime.send_sms(message_id, recipient_phone, body, msg_type)
+        self.runtime
+            .send_sms(message_id, recipient_phone, body, msg_type)
     }
 
     pub fn answer_call(&self) -> Result<(), String> {
@@ -411,9 +412,15 @@ fn bluetooth_event_from_runtime(
         RuntimeEvent::OutgoingDialing => BluetoothEvent::OutgoingDialing,
         RuntimeEvent::CallAnswered => BluetoothEvent::CallAnswered,
         RuntimeEvent::CallTerminated => BluetoothEvent::CallTerminated,
-        RuntimeEvent::AudioConnected { codec, sample_rate, armed } => {
-            BluetoothEvent::AudioConnected { codec, sample_rate, armed }
-        }
+        RuntimeEvent::AudioConnected {
+            codec,
+            sample_rate,
+            armed,
+        } => BluetoothEvent::AudioConnected {
+            codec,
+            sample_rate,
+            armed,
+        },
         RuntimeEvent::AudioDisconnected => BluetoothEvent::AudioDisconnected,
         RuntimeEvent::CallerId(num) => BluetoothEvent::CallerId(num),
         RuntimeEvent::CallWaiting { number } => BluetoothEvent::CallWaiting { number },
@@ -455,7 +462,13 @@ fn bluetooth_event_from_runtime(
             handle,
             msg_type,
         }),
-        RuntimeEvent::SmsSent { message_id, recipient_phone } => BluetoothEvent::SmsSent { message_id, recipient_phone },
+        RuntimeEvent::SmsSent {
+            message_id,
+            recipient_phone,
+        } => BluetoothEvent::SmsSent {
+            message_id,
+            recipient_phone,
+        },
         RuntimeEvent::SmsSendFailed {
             message_id,
             recipient_phone,
@@ -485,13 +498,19 @@ pub fn bluetooth_event_from_aokie_hfp(
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::ServiceLevelConnectionFailed(reason) => Some(
             BluetoothEvent::Error(format!("HFP SLC failed at {}", reason)),
         ),
-        aokie_bluetooth::aokie_radio::hfp::HfpEvent::IncomingCall => Some(BluetoothEvent::CallIncoming),
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::IncomingCall => {
+            Some(BluetoothEvent::CallIncoming)
+        }
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::Ringing => Some(BluetoothEvent::CallRinging),
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::OutgoingDialing => {
             Some(BluetoothEvent::OutgoingDialing)
         }
-        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallAnswered => Some(BluetoothEvent::CallAnswered),
-        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallTerminated => Some(BluetoothEvent::CallTerminated),
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallAnswered => {
+            Some(BluetoothEvent::CallAnswered)
+        }
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallTerminated => {
+            Some(BluetoothEvent::CallTerminated)
+        }
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallerId(number) => {
             Some(BluetoothEvent::CallerId(number))
         }
@@ -516,7 +535,11 @@ pub fn bluetooth_event_from_aokie_hfp(
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CodecSelected { codec, sample_rate } => {
             // Codec selection precedes iso arming; this legacy path never
             // observed an arming failure, so it reports armed.
-            Some(BluetoothEvent::AudioConnected { codec, sample_rate, armed: true })
+            Some(BluetoothEvent::AudioConnected {
+                codec,
+                sample_rate,
+                armed: true,
+            })
         }
     }
 }
@@ -528,7 +551,9 @@ mod tests {
     #[test]
     fn maps_aokie_hfp_events_to_existing_bluetooth_events() {
         assert_eq!(
-            bluetooth_event_from_aokie_hfp(aokie_bluetooth::aokie_radio::hfp::HfpEvent::IncomingCall),
+            bluetooth_event_from_aokie_hfp(
+                aokie_bluetooth::aokie_radio::hfp::HfpEvent::IncomingCall
+            ),
             Some(BluetoothEvent::CallIncoming)
         );
         assert_eq!(
@@ -538,10 +563,12 @@ mod tests {
             Some(BluetoothEvent::CallerId("+15551234567".to_string()))
         );
         assert_eq!(
-            bluetooth_event_from_aokie_hfp(aokie_bluetooth::aokie_radio::hfp::HfpEvent::CodecSelected {
-                codec: "mSBC".to_string(),
-                sample_rate: 16000,
-            }),
+            bluetooth_event_from_aokie_hfp(
+                aokie_bluetooth::aokie_radio::hfp::HfpEvent::CodecSelected {
+                    codec: "mSBC".to_string(),
+                    sample_rate: 16000,
+                }
+            ),
             Some(BluetoothEvent::AudioConnected {
                 codec: "mSBC".to_string(),
                 sample_rate: 16000,

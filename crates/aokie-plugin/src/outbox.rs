@@ -91,7 +91,10 @@ fn dpapi_protect(plain: &str) -> Result<String, String> {
             cbData: plain.len() as u32,
             pbData: plain.as_ptr() as *mut u8,
         };
-        let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+        let mut out = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
         if CryptProtectData(
             &mut input,
             std::ptr::null(),
@@ -120,7 +123,10 @@ fn dpapi_unprotect(b64: &str) -> Result<String, String> {
             cbData: bytes.len() as u32,
             pbData: bytes.as_ptr() as *mut u8,
         };
-        let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+        let mut out = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
         if CryptUnprotectData(
             &mut input,
             std::ptr::null_mut(),
@@ -182,12 +188,24 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(B64[(n >> 18) as usize & 63] as char);
         out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -540,7 +558,11 @@ impl Outbox {
     /// one occurrence), different content →
     /// [`InsertOutcome::PayloadCollision`] (key-derivation bug — rejected,
     /// logged, counted; audit AOK-EVENT-001).
-    pub fn insert_pending(&self, event: &DesktopEvent, target: &str) -> rusqlite::Result<InsertOutcome> {
+    pub fn insert_pending(
+        &self,
+        event: &DesktopEvent,
+        target: &str,
+    ) -> rusqlite::Result<InsertOutcome> {
         let now = now_iso8601();
         let hash = Self::payload_fingerprint(event);
         let plain = serde_json::to_string(event).expect("DesktopEvent serialises");
@@ -651,7 +673,14 @@ impl Outbox {
              WHERE idempotency_key = ?1
                AND status IN ('pending', 'failed')
                AND (?6 IS NULL OR attempts = ?6)",
-            params![idempotency_key, error, MAX_ATTEMPTS, now_iso8601(), next, expected_attempts],
+            params![
+                idempotency_key,
+                error,
+                MAX_ATTEMPTS,
+                now_iso8601(),
+                next,
+                expected_attempts
+            ],
         )?;
         Ok(self
             .status_of(idempotency_key)?
@@ -684,7 +713,13 @@ impl Outbox {
              WHERE idempotency_key = ?1
                AND status IN ('pending', 'failed')
                AND (?5 IS NULL OR attempts = ?5)",
-            params![idempotency_key, MAX_ATTEMPTS, now_iso8601(), next, expected_attempts],
+            params![
+                idempotency_key,
+                MAX_ATTEMPTS,
+                now_iso8601(),
+                next,
+                expected_attempts
+            ],
         )?;
         Ok(self
             .status_of(idempotency_key)?
@@ -732,10 +767,8 @@ impl Outbox {
                         "[aokie-plugin] outbox row {} payload is unreadable ({e}) — dead-lettering",
                         row.idempotency_key
                     );
-                    let _ = self.mark_dead_typed(
-                        &row.idempotency_key,
-                        &format!("payload_unreadable: {e}"),
-                    );
+                    let _ = self
+                        .mark_dead_typed(&row.idempotency_key, &format!("payload_unreadable: {e}"));
                 }
             }
         }
@@ -868,9 +901,7 @@ impl Outbox {
         let mut revived = 0usize;
         for (key, stored) in candidates {
             if let Err(e) = unprotect_payload(&stored) {
-                eprintln!(
-                    "[aokie-plugin] redrive skipped {key}: payload is undeliverable ({e})"
-                );
+                eprintln!("[aokie-plugin] redrive skipped {key}: payload is undeliverable ({e})");
                 continue;
             }
             revived += self.conn.execute(
@@ -956,18 +987,25 @@ mod tests {
         let ob = Outbox::open_in_memory().unwrap();
         let mut first = event("sms_dev1_h42", "aokie.sms.received");
         first.data = json!({"from": "+61", "body": "hello", "at": "2026-07-11T00:00:00.000Z"});
-        assert_eq!(ob.insert_pending(&first, TARGET_DESKTOP).unwrap(), InsertOutcome::Inserted);
+        assert_eq!(
+            ob.insert_pending(&first, TARGET_DESKTOP).unwrap(),
+            InsertOutcome::Inserted
+        );
 
         // The same MAP message re-fetched: fresh envelope timestamps, same content.
         let mut refetch = first.clone();
         refetch.occurred_at = now_iso8601();
         refetch.data = json!({"from": "+61", "body": "hello", "at": "2026-07-11T00:05:00.000Z"});
-        assert_eq!(ob.insert_pending(&refetch, TARGET_DESKTOP).unwrap(), InsertOutcome::Duplicate);
+        assert_eq!(
+            ob.insert_pending(&refetch, TARGET_DESKTOP).unwrap(),
+            InsertOutcome::Duplicate
+        );
         assert_eq!(ob.collision_count().unwrap(), 0);
 
         // A different message colliding on the key: rejected + counted.
         let mut clash = first.clone();
-        clash.data = json!({"from": "+61", "body": "TRANSFER $9000 NOW", "at": "2026-07-11T00:06:00.000Z"});
+        clash.data =
+            json!({"from": "+61", "body": "TRANSFER $9000 NOW", "at": "2026-07-11T00:06:00.000Z"});
         assert_eq!(
             ob.insert_pending(&clash, TARGET_DESKTOP).unwrap(),
             InsertOutcome::PayloadCollision
@@ -1005,13 +1043,17 @@ mod tests {
         ack_conn.mark_sent(&ev.idempotency_key).unwrap();
 
         // Late bookkeeping from the replay side: all no-ops against `sent`.
-        replay_conn.mark_emitted(&ev.idempotency_key, Some(row.attempts)).unwrap();
+        replay_conn
+            .mark_emitted(&ev.idempotency_key, Some(row.attempts))
+            .unwrap();
         replay_conn
             .mark_failed(&ev.idempotency_key, "late failure", Some(row.attempts))
             .unwrap();
         for _ in 0..MAX_ATTEMPTS {
             replay_conn.mark_emitted(&ev.idempotency_key, None).unwrap();
-            replay_conn.mark_failed(&ev.idempotency_key, "storm", None).unwrap();
+            replay_conn
+                .mark_failed(&ev.idempotency_key, "storm", None)
+                .unwrap();
         }
         assert_eq!(
             ack_conn.status_of(&ev.idempotency_key).unwrap(),
@@ -1023,10 +1065,17 @@ mod tests {
         let ev2 = event("call_race2", "aokie.call.ended");
         ack_conn.insert_pending(&ev2, TARGET_DESKTOP).unwrap();
         let gen0 = ack_conn.due_for_retry(10).unwrap().last().unwrap().attempts;
-        ack_conn.mark_emitted(&ev2.idempotency_key, Some(gen0)).unwrap();
-        replay_conn.mark_emitted(&ev2.idempotency_key, Some(gen0)).unwrap(); // stale generation
+        ack_conn
+            .mark_emitted(&ev2.idempotency_key, Some(gen0))
+            .unwrap();
+        replay_conn
+            .mark_emitted(&ev2.idempotency_key, Some(gen0))
+            .unwrap(); // stale generation
         let rows = replay_conn.retryable(10).unwrap();
-        let row2 = rows.iter().find(|r| r.idempotency_key == ev2.idempotency_key).unwrap();
+        let row2 = rows
+            .iter()
+            .find(|r| r.idempotency_key == ev2.idempotency_key)
+            .unwrap();
         assert_eq!(row2.attempts, 1, "stale-generation bookkeeping is a no-op");
 
         drop(ack_conn);
@@ -1086,10 +1135,14 @@ mod tests {
         let ev = event("call_c", "aokie.sms.sent");
         ob.insert_pending(&ev, TARGET_DESKTOP).unwrap();
         for attempt in 1..MAX_ATTEMPTS {
-            let status = ob.mark_failed(&ev.idempotency_key, "desktop down", None).unwrap();
+            let status = ob
+                .mark_failed(&ev.idempotency_key, "desktop down", None)
+                .unwrap();
             assert_eq!(status, OutboxStatus::Failed, "attempt {attempt}");
         }
-        let status = ob.mark_failed(&ev.idempotency_key, "desktop down", None).unwrap();
+        let status = ob
+            .mark_failed(&ev.idempotency_key, "desktop down", None)
+            .unwrap();
         assert_eq!(status, OutboxStatus::Dead);
         let counts = ob.counts().unwrap();
         assert_eq!(counts.dead, 1);
@@ -1103,9 +1156,11 @@ mod tests {
         let dying = event("call_e", "aokie.call.incoming");
         ob.insert_pending(&alive, TARGET_DESKTOP).unwrap();
         ob.insert_pending(&dying, TARGET_DESKTOP).unwrap();
-        ob.mark_failed(&alive.idempotency_key, "once", None).unwrap();
+        ob.mark_failed(&alive.idempotency_key, "once", None)
+            .unwrap();
         for _ in 0..MAX_ATTEMPTS {
-            ob.mark_failed(&dying.idempotency_key, "always", None).unwrap();
+            ob.mark_failed(&dying.idempotency_key, "always", None)
+                .unwrap();
         }
         let retryable = ob.retryable(10).unwrap();
         let keys: Vec<_> = retryable
@@ -1145,7 +1200,10 @@ mod tests {
             ob.mark_emitted(&ev.idempotency_key, None).unwrap(),
             OutboxStatus::Pending
         );
-        assert!(ob.due_for_retry(10).unwrap().is_empty(), "backoff gates re-emission");
+        assert!(
+            ob.due_for_retry(10).unwrap().is_empty(),
+            "backoff gates re-emission"
+        );
 
         // The host's ack arrives → sent, and never due again.
         ob.mark_sent(&ev.idempotency_key).unwrap();
@@ -1173,7 +1231,10 @@ mod tests {
             ob.mark_emitted(&ev.idempotency_key, None).unwrap(),
             OutboxStatus::Dead
         );
-        assert!(ob.due_for_retry(10).unwrap().is_empty(), "dead rows never re-emit");
+        assert!(
+            ob.due_for_retry(10).unwrap().is_empty(),
+            "dead rows never re-emit"
+        );
     }
 
     /// Acked rows past retention are pruned (bounded PII — audit C-06);
@@ -1189,15 +1250,23 @@ mod tests {
 
         let raw: String = ob
             .conn
-            .query_row("SELECT payload_json FROM aokie_outbox LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT payload_json FROM aokie_outbox LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         if cfg!(windows) {
             assert!(raw.starts_with(DPAPI_PREFIX), "stored protected: {raw:.20}");
-            assert!(!raw.contains("4111"), "PII must not be readable in the file");
+            assert!(
+                !raw.contains("4111"),
+                "PII must not be readable in the file"
+            );
         }
         let rows = ob.due_for_retry(10).unwrap();
         let back: DesktopEvent = serde_json::from_str(&rows[0].payload_json).unwrap();
-        assert_eq!(back.data["text"], "my card number is 4111", "reads round-trip");
+        assert_eq!(
+            back.data["text"], "my card number is 4111",
+            "reads round-trip"
+        );
     }
 
     /// Legacy plaintext rows (pre-protection installs) stay readable.
@@ -1211,7 +1280,13 @@ mod tests {
                 "INSERT INTO aokie_outbox (event_name, correlation_id, idempotency_key, target,
                     payload_json, status, attempts, created_at, updated_at)
                  VALUES (?1, ?2, ?3, 'desktop', ?4, 'pending', 0, ?5, ?5)",
-                params![ev.name, ev.correlation_id, ev.idempotency_key, plain, now_iso8601()],
+                params![
+                    ev.name,
+                    ev.correlation_id,
+                    ev.idempotency_key,
+                    plain,
+                    now_iso8601()
+                ],
             )
             .unwrap();
         let rows = ob.due_for_retry(10).unwrap();
@@ -1316,21 +1391,32 @@ mod tests {
         // No plaintext hit the file — the payload column holds only the marker.
         let raw: String = ob
             .conn
-            .query_row("SELECT payload_json FROM aokie_outbox LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT payload_json FROM aokie_outbox LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(!raw.contains("SECRET-QUARANTINE-BODY"));
         assert!(raw.starts_with(QUARANTINED_PAYLOAD));
         // Typed dead letter with repair metadata (name/key/timestamps survive).
-        assert_eq!(ob.status_of(&ev.idempotency_key).unwrap(), Some(OutboxStatus::Dead));
+        assert_eq!(
+            ob.status_of(&ev.idempotency_key).unwrap(),
+            Some(OutboxStatus::Dead)
+        );
         let err: String = ob
             .conn
-            .query_row("SELECT last_error FROM aokie_outbox LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT last_error FROM aokie_outbox LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(err.starts_with("payload_protect_failed:"), "typed: {err}");
         // Never emitted, never redriven.
         assert!(ob.due_for_retry(10).unwrap().is_empty());
         assert!(ob.retryable(10).unwrap().is_empty());
-        assert_eq!(ob.redrive_dead(None).unwrap(), 0, "nothing deliverable to revive");
+        assert_eq!(
+            ob.redrive_dead(None).unwrap(),
+            0,
+            "nothing deliverable to revive"
+        );
         assert_eq!(ob.counts().unwrap().dead, 1);
     }
 
@@ -1353,7 +1439,10 @@ mod tests {
             .unwrap();
 
         assert!(ob.due_for_retry(10).unwrap().is_empty(), "never emitted");
-        assert_eq!(ob.status_of(&ev.idempotency_key).unwrap(), Some(OutboxStatus::Dead));
+        assert_eq!(
+            ob.status_of(&ev.idempotency_key).unwrap(),
+            Some(OutboxStatus::Dead)
+        );
         let (name, err): (String, String) = ob
             .conn
             .query_row(
@@ -1364,14 +1453,22 @@ mod tests {
             .unwrap();
         assert_eq!(name, "aokie.sms.received", "repair metadata retained");
         assert!(err.starts_with("payload_unreadable:"), "typed: {err}");
-        assert_eq!(ob.redrive_dead(None).unwrap(), 0, "undeliverable rows are not revived");
+        assert_eq!(
+            ob.redrive_dead(None).unwrap(),
+            0,
+            "undeliverable rows are not revived"
+        );
         // A HEALTHY dead row alongside it still redrives fine.
         let ok = event("call_u2", "aokie.call.ended");
         ob.insert_pending(&ok, TARGET_DESKTOP).unwrap();
         for _ in 0..MAX_ATTEMPTS {
             ob.mark_failed(&ok.idempotency_key, "down", None).unwrap();
         }
-        assert_eq!(ob.redrive_dead(None).unwrap(), 1, "deliverable dead rows revive");
+        assert_eq!(
+            ob.redrive_dead(None).unwrap(),
+            1,
+            "deliverable dead rows revive"
+        );
     }
 
     /// Item 4 acceptance (Windows): legacy plaintext rows are sealed in place
@@ -1396,7 +1493,13 @@ mod tests {
                     "INSERT INTO aokie_outbox (event_name, correlation_id, idempotency_key, target,
                         payload_json, status, attempts, created_at, updated_at)
                      VALUES (?1, ?2, ?3, 'desktop', ?4, 'pending', 0, ?5, ?5)",
-                    params![ev.name, ev.correlation_id, ev.idempotency_key, plain, now_iso8601()],
+                    params![
+                        ev.name,
+                        ev.correlation_id,
+                        ev.idempotency_key,
+                        plain,
+                        now_iso8601()
+                    ],
                 )
                 .unwrap();
         }
@@ -1417,7 +1520,9 @@ mod tests {
             let ob = Outbox::open(&path).unwrap();
             let stored: String = ob
                 .conn
-                .query_row("SELECT payload_json FROM aokie_outbox LIMIT 1", [], |r| r.get(0))
+                .query_row("SELECT payload_json FROM aokie_outbox LIMIT 1", [], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             assert!(stored.starts_with(DPAPI_PREFIX), "sealed: {stored:.20}");
             // Round-trips for delivery.

@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Aokie Companion">
+  <defs>
+    <linearGradient id="bg" x1="120" y1="80" x2="880" y2="944" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#12213f"/>
+      <stop offset="1" stop-color="#071126"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="260" y1="250" x2="760" y2="780" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#42ead4"/>
+      <stop offset="1" stop-color="#0aa899"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="228" fill="url(#bg)"/>
+  <circle cx="512" cy="512" r="330" fill="none" stroke="#22d2bd" stroke-opacity=".12" stroke-width="36"/>
+  <g fill="url(#signal)">
+    <rect x="250" y="430" width="68" height="164" rx="34"/>
+    <rect x="340" y="336" width="68" height="352" rx="34"/>
+    <rect x="430" y="242" width="68" height="540" rx="34"/>
+    <rect x="520" y="368" width="68" height="288" rx="34"/>
+    <rect x="610" y="290" width="68" height="444" rx="34"/>
+    <rect x="700" y="406" width="68" height="212" rx="34"/>
+  </g>
+  <circle cx="790" cy="250" r="76" fill="#d7444d" stroke="#fff" stroke-width="22"/>
+</svg>
