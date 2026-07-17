@@ -1,4 +1,24 @@
+/* Self-hosted variable fonts (the CSP is font-src 'self' — remote fonts never
+   load, so without these files everything silently fell back to Segoe UI). */
+@font-face {
+  font-family: 'DM Sans';
+  font-style: normal;
+  /* Full wght axis of the variable file — the stylesheet leans on 720–800
+     weights, which a 400–700 declaration would clamp flat. */
+  font-weight: 100 1000;
+  font-display: swap;
+  src: url('../assets/fonts/dm-sans-latin.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Plus Jakarta Sans';
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url('../assets/fonts/plus-jakarta-sans-latin.woff2') format('woff2');
+}
+
 :root {
+  --font-geist-sans: 'Plus Jakarta Sans';
   --canvas: #f3f1ec;
   --surface: #ffffff;
   --surface-soft: #f7f8fa;
@@ -175,6 +195,20 @@ svg { flex: 0 0 auto; }
 .v2-recovery-panel .stepper-row.is-active small { color: #7c5a22; }
 .v2-unconfirmed-panel .unknown-diagnostics strong { color: var(--amber); text-transform: uppercase; }
 .v2-call-ended-panel { border-color: rgba(10, 168, 153, 0.18); }
+/* Production readability floor: the base transition/recovery styles carry the
+   demo phone-frame's miniature type — the REAL runtime panels get ≥11px. */
+.v2-route-progress > p,
+.v2-recovery-panel > p,
+.v2-unconfirmed-panel > p,
+.v2-call-ended-panel > p { font-size: 12px; }
+.v2-route-progress .stepper-row strong,
+.v2-recovery-panel .stepper-row strong { font-size: 11.5px; }
+.v2-route-progress .stepper-row small,
+.v2-recovery-panel .stepper-row small { font-size: 10.5px; }
+.v2-recovery-panel .recovery-status span { font-size: 11px; }
+.v2-recovery-panel > small { font-size: 10px; }
+.v2-unconfirmed-panel .unknown-diagnostics { font-size: 10px; }
+.v2-call-ended-panel .outcome-summary { font-size: 10.5px; }
 
 /* Modals */
 .modal-layer { position: absolute; inset: 0; z-index: 50; display: flex; align-items: flex-end; background: rgba(8,17,36,.48); backdrop-filter: blur(3px); animation: fade .18s ease-out; }.modal-layer.is-centered { align-items: center; padding: 18px; }.modal-sheet { width: 100%; max-height: 88%; overflow: auto; background: white; border-radius: 24px 24px 0 0; padding: 10px 18px calc(20px + env(safe-area-inset-bottom)); box-shadow: 0 -18px 50px rgba(11,23,48,.22); animation: sheetUp .24s ease-out; }.modal-sheet.is-dialog { border-radius: 20px; text-align: center; padding: 22px 18px; }.sheet-handle { width: 38px; height: 4px; border-radius: 99px; background: #d9dee5; margin: 0 auto 14px; }.sheet-title-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }.sheet-title-row > div { flex: 1; }.sheet-title-row h2 { font-size: 18px; }.question-card { display: grid; grid-template-columns: 20px 1fr auto; gap: 8px; background: var(--violet-soft); color: #4d3aa9; border: 1px solid rgba(114,89,232,.18); border-radius: 14px; padding: 11px; margin-bottom: 12px; }.question-card strong { font-size: 10.5px; line-height: 1.4; }.question-card p { color: #7167a2; font-size: 8.5px; margin: 4px 0 0; }.countdown { font-size: 8px; font-weight: 750; background: white; height: 22px; padding: 0 6px; border-radius: 7px; display: grid; place-items: center; }.answer-field { display: grid; gap: 6px; margin-bottom: 10px; }.answer-field > span { font-size: 9px; font-weight: 720; }.answer-field textarea { width: 100%; resize: none; border: 1px solid var(--border); background: #f8f9fb; border-radius: 12px; padding: 10px; font-size: 11px; line-height: 1.5; color: var(--ink); }.or-divider { height: 24px; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 8px; }.or-divider::before, .or-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }.private-button { color: var(--violet); border-color: rgba(114,89,232,.22); background: #faf8ff; }.permission-note { color: var(--muted); font-size: 8px; display: flex; align-items: flex-start; gap: 5px; line-height: 1.4; }.answer-success { text-align: center; color: var(--teal); padding: 8px 0 2px; }.answer-success strong { display: block; font-size: 14px; margin-top: 6px; }.answer-success p { color: var(--muted); font-size: 10px; line-height: 1.5; }.answer-success .primary-button { margin-top: 12px; }.takeover-hero-icon, .danger-modal-icon { width: 52px; height: 52px; border-radius: 17px; display: grid; place-items: center; margin: 0 auto 10px; background: var(--teal-soft); color: var(--teal); }.modal-sheet > h2 { text-align: center; font-size: 19px; }.modal-lead { text-align: center; color: var(--muted); font-size: 10px; line-height: 1.55; margin: 7px auto 12px; max-width: 360px; }.takeover-safety-list { display: grid; gap: 7px; border-radius: 12px; background: #f6f8f9; padding: 10px; margin-bottom: 12px; }.takeover-safety-list span { display: flex; align-items: center; gap: 7px; font-size: 9px; }.takeover-safety-list svg { color: var(--teal); }.hold-to-confirm { --hold-progress: 0%; width: 100%; min-height: 49px; border: 1px solid rgba(10,168,153,.3); border-radius: 13px; background: var(--teal-soft); color: #08766c; position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 11px; font-weight: 760; cursor: pointer; }.hold-fill { position: absolute; inset: 0 auto 0 0; width: var(--hold-progress); background: rgba(10,168,153,.18); }.hold-to-confirm > *:not(.hold-fill) { position: relative; }.accessible-confirm { display: flex; align-items: center; justify-content: center; gap: 5px; margin: 9px 0 4px; color: var(--muted); font-size: 8px; }.accessible-confirm button { border: 0; background: transparent; color: var(--teal); padding: 0; font-weight: 700; cursor: pointer; }.accessible-confirm .confirm-link { color: var(--red); }.modal-sheet > .text-button { width: 100%; min-height: 34px; }.danger-modal-icon { background: var(--red-soft); color: var(--red); }.modal-sheet.is-dialog .danger-button { margin: 14px 0 7px; }
@@ -263,6 +297,15 @@ svg { flex: 0 0 auto; }
   border-radius: 26px;
   background: rgba(255, 255, 255, 0.94);
   box-shadow: 0 24px 80px rgba(11, 23, 48, 0.13);
+}
+
+/* Wide screens: the setup card used to stay a 470px phone column floating in
+   empty canvas on a maximized window — give it room to breathe instead.
+   (The h1 max-width companion rule lives in the wide-screen block at the END
+   of this file — the base .native-setup-card > h1 rule below would otherwise
+   win the equal-specificity cascade.) */
+@media (min-width: 900px) {
+  .native-setup-card { width: min(100%, 720px); padding: 36px 40px; }
 }
 
 .setup-brand {
@@ -381,8 +424,8 @@ svg { flex: 0 0 auto; }
 .setup-footnote,
 .developer-fields > p {
   color: var(--muted);
-  font-size: 11px;
-  line-height: 1.45;
+  font-size: 12.5px;
+  line-height: 1.5;
 }
 
 .runtime-grid {
@@ -1799,7 +1842,7 @@ svg { flex: 0 0 auto; }
   gap: 5px;
   margin-top: -1px;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1.4;
 }
 
@@ -1807,6 +1850,20 @@ svg { flex: 0 0 auto; }
   display: grid;
   grid-template-columns: minmax(0, 0.72fr) minmax(0, 1fr);
   gap: 9px;
+}
+
+/* On the SETUP card the row usually holds one or two buttons, not the pairing
+   sheet's paste-field + file-picker pair — the 0.72fr track crushed "Review
+   Desktop pairing offer" into a wrapped ~160px pill on wide windows. Let the
+   buttons size to their content and wrap naturally instead. */
+.setup-desktop-pairing .pairing-import-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.setup-desktop-pairing .pairing-import-row .secondary-button {
+  width: auto;
+  padding: 0 18px;
 }
 
 .pairing-file-button { position: relative; cursor: pointer; }
@@ -2001,11 +2058,11 @@ svg { flex: 0 0 auto; }
   text-align: left;
 }
 
-.pairing-next-steps > strong { color: var(--navy); font-size: 11px; }
+.pairing-next-steps > strong { color: var(--navy); font-size: 12px; }
 .pairing-next-steps ol { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 9px 0 0; padding: 0; list-style: none; }
 .pairing-next-steps li { min-width: 0; display: flex; align-items: center; gap: 7px; border-radius: 10px; background: #fff; padding: 8px; }
-.pairing-next-steps li > span { width: 23px; height: 23px; flex: 0 0 23px; display: grid; place-items: center; border-radius: 7px; background: var(--teal-soft); color: #087a70; font-size: 8px; font-weight: 800; }
-.pairing-next-steps li p { margin: 0; color: #4c5b70; font-size: 9px; line-height: 1.35; }
+.pairing-next-steps li > span { width: 23px; height: 23px; flex: 0 0 23px; display: grid; place-items: center; border-radius: 7px; background: var(--teal-soft); color: #087a70; font-size: 9px; font-weight: 800; }
+.pairing-next-steps li p { margin: 0; color: #4c5b70; font-size: 11px; line-height: 1.4; }
 
 .desktop-pairing-sheet > .setup-result:last-child { margin-top: 12px; }
 
@@ -2053,4 +2110,13 @@ svg { flex: 0 0 auto; }
 
 @media (prefers-reduced-motion: reduce) {
   .pairing-confirmation { transition: none; }
+}
+
+/* Wide screens: the live runtime / workspace columns keep their focused
+   reading width but stop feeling cramped on a maximized window. (This block
+   must stay AFTER all base rules — it wins equal-specificity cascades.) */
+@media (min-width: 900px) {
+  .live-runtime-root,
+  .live-workspace-root { max-width: 720px; }
+  .native-setup-card > h1 { max-width: 560px; }
 }

@@ -242,9 +242,13 @@ impl OnnxTtsRuntime {
 
         // Default to the int8 variants — ~5× smaller, and the quality loss
         // is negligible for conversational TTS. Fall back to fp32 only if
-        // the int8 file isn't on disk. Every session registers the CPU EP
-        // explicitly: these models are small (<=80 MB) and autoregressive,
-        // so CUDA would add launch overhead without meaningful speedup.
+        // the int8 file isn't on disk. Sessions register the CPU EP by
+        // default: these models are small (<=80 MB) and autoregressive, so
+        // CUDA adds launch overhead without a guaranteed speedup — but
+        // LAT-005 makes the experiment one env var away: builds with the
+        // `cuda` cargo feature honor AOKIE_TTS_ORT_EP=cuda (CUDA first, CPU
+        // fallback; also needs a CUDA-enabled onnxruntime dylib + cuDNN on
+        // the deploy box). Builds without the feature log and stay on CPU.
         let load = |stem: &str| -> Result<ort::session::Session, String> {
             use ort::execution_providers::CPUExecutionProvider;
 
@@ -262,12 +266,40 @@ impl OnnxTtsRuntime {
                 ));
             };
             eprintln!("[pocket_tts_onnx] load {}", path.display());
-            ort::session::Session::builder()
+            let want_cuda = std::env::var("AOKIE_TTS_ORT_EP")
+                .map(|v| v.trim().eq_ignore_ascii_case("cuda"))
+                .unwrap_or(false);
+            let mut builder = ort::session::Session::builder()
                 .map_err(|e| format!("ort builder ({stem}): {e}"))?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
-                .map_err(|e| format!("opt level ({stem}): {e}"))?
-                .with_execution_providers([CPUExecutionProvider::default().build()])
-                .map_err(|e| format!("register CPU EP ({stem}): {e}"))?
+                .map_err(|e| format!("opt level ({stem}): {e}"))?;
+            #[cfg(feature = "cuda")]
+            let mut builder = if want_cuda {
+                use ort::execution_providers::CUDAExecutionProvider;
+                eprintln!("[pocket_tts_onnx] AOKIE_TTS_ORT_EP=cuda — registering CUDA EP ({stem}, CPU fallback)");
+                builder
+                    .with_execution_providers([
+                        CUDAExecutionProvider::default().build(),
+                        CPUExecutionProvider::default().build(),
+                    ])
+                    .map_err(|e| format!("register CUDA+CPU EPs ({stem}): {e}"))?
+            } else {
+                builder
+                    .with_execution_providers([CPUExecutionProvider::default().build()])
+                    .map_err(|e| format!("register CPU EP ({stem}): {e}"))?
+            };
+            #[cfg(not(feature = "cuda"))]
+            let mut builder = {
+                if want_cuda {
+                    eprintln!(
+                        "[pocket_tts_onnx] AOKIE_TTS_ORT_EP=cuda ignored — this build lacks the `cuda` feature; staying on CPU"
+                    );
+                }
+                builder
+                    .with_execution_providers([CPUExecutionProvider::default().build()])
+                    .map_err(|e| format!("register CPU EP ({stem}): {e}"))?
+            };
+            builder
                 .commit_from_file(&path)
                 .map_err(|e| format!("commit {} ({}): {e}", path.display(), stem))
         };

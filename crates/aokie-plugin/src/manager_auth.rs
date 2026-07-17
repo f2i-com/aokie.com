@@ -22,6 +22,22 @@ pub enum Decision {
     Locked { retry_after_secs: u64 },
 }
 
+/// Constant-time byte-string equality (AOK-304A). No early return on the first
+/// differing byte, so a caller can't learn a correct PIN prefix from response
+/// timing. A length mismatch fails immediately — a spoken PIN's LENGTH is not
+/// the secret its digits are, and the device-wide 5-attempt lockout already
+/// bounds guessing regardless.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -60,7 +76,7 @@ pub fn verify(data_dir: &Path, expected: &str, given: &str) -> Decision {
             retry_after_secs: state.lockout_until - now,
         };
     }
-    if !expected.is_empty() && expected == given {
+    if !expected.is_empty() && ct_eq(expected.as_bytes(), given.as_bytes()) {
         state = State::default();
         save(data_dir, &state);
         return Decision::Verified;
@@ -108,6 +124,27 @@ mod tests {
         assert!(matches!(
             verify(dir.path(), "731905", "731905"),
             Decision::Locked { .. }
+        ));
+    }
+
+    #[test]
+    fn ct_eq_matches_only_identical_bytes() {
+        assert!(ct_eq(b"731905", b"731905"));
+        assert!(!ct_eq(b"731905", b"731906")); // last digit differs
+        assert!(!ct_eq(b"731905", b"831905")); // first digit differs
+        assert!(!ct_eq(b"731905", b"73190")); // length differs
+        assert!(!ct_eq(b"", b"0")); // empty vs non-empty
+        assert!(ct_eq(b"", b"")); // both empty (verify() gates empty separately)
+    }
+
+    #[test]
+    fn empty_expected_pin_never_verifies() {
+        // A blank managerPin is a read-only manager line — an empty spoken PIN
+        // must never authenticate, even though ct_eq("","") is true.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            verify(dir.path(), "", ""),
+            Decision::Rejected { .. }
         ));
     }
 
