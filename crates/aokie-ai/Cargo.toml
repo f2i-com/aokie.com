@@ -98,6 +98,19 @@ candle = [
 # sherpa-onnx STT/TTS via sherpa-rs (needs CMake).
 sherpa = ["dep:sherpa-rs"]
 
+# ⚠️ STATIC sherpa is a DEAD END in binaries that also link aec-rs: both
+# speexdsp (the echo canceller) and sherpa-onnx vendor KISS FFT with the
+# same un-namespaced symbols (kiss_fftr_alloc/kiss_fftr/kiss_fftri), so a
+# static sherpa multiply-defines against speexdsp.lib at link time — and
+# /FORCE:MULTIPLE would silently mix potentially ABI-incompatible FFTs into
+# the AEC. The `sherpa` feature therefore builds sherpa-rs-sys DYNAMIC
+# (CMake source build; DLLs land in target/<profile> and must ship next to
+# the exe): sherpa-onnx-c-api.dll + its own onnxruntime.dll (1.17.1).
+# Consumers that ALSO use the ort-based engines must resolve their ORT DLL
+# by explicit versioned name (see ensure_ort_dylib in aokie-plugin/
+# aokie-voice-server) so sherpa's onnxruntime.dll never shadows it.
+# Builds need libclang for bindgen (LIBCLANG_PATH in .cargo/config.toml).
+
 # GPU execution providers. Turns on the ML stack it accelerates, then
 # flips the CUDA feature on ort + candle. Requires the CUDA toolkit +
 # matching VS integration; opt-in only.
