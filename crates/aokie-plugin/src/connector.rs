@@ -28,7 +28,7 @@ pub const CONNECTOR_ID: &str = "aokie";
 pub const OUTBOX_FILE: &str = "outbox.sqlite";
 pub const COMMAND_JOURNAL_FILE: &str = "command-journal.sqlite3";
 
-const RECEPTIONIST_CONFIG_KEYS: [&str; 7] = [
+const RECEPTIONIST_CONFIG_KEYS: [&str; 9] = [
     "persona",
     "greeting",
     "ttsVoice",
@@ -36,6 +36,8 @@ const RECEPTIONIST_CONFIG_KEYS: [&str; 7] = [
     "aiEndpoint",
     "sttEndpoint",
     "ttsEndpoint",
+    "ttsEngine",
+    "ttsModelDir",
 ];
 
 /// Settings whose values are URLs that will receive caller audio/transcripts —
@@ -446,6 +448,24 @@ impl Plugin {
                 std::env::set_var("AOKIE_TTS_VOICE", v.trim());
                 eprintln!(
                     "[aokie-plugin] ttsVoice setting → AOKIE_TTS_VOICE={}",
+                    v.trim()
+                );
+            }
+        }
+        // In-process TTS engine selection: ttsEngine (blank/pocket = Pocket-TTS,
+        // sherpa = sherpa-onnx VITS/Piper or Kokoro voices) + the sherpa voice
+        // bundle folder (ttsModelDir). Read by the synth worker at engine load.
+        apply_tts_engine_env(&self.store.config.settings);
+        if let Some(v) = self
+            .store
+            .config
+            .settings
+            .get("ttsEngine")
+            .and_then(|v| v.as_str())
+        {
+            if !v.trim().is_empty() {
+                eprintln!(
+                    "[aokie-plugin] ttsEngine setting → AOKIE_TTS_ENGINE={}",
                     v.trim()
                 );
             }
@@ -2596,6 +2616,14 @@ impl Plugin {
                     ),
                     None => None,
                 };
+                // ttsEngine / ttsModelDir reselect the in-process TTS engine.
+                // Detect a REAL change BEFORE the persist loop overwrites the
+                // old values — the reload drops + reloads a heavy engine, so a
+                // same-value re-push (a console card re-save) stays a no-op.
+                let tts_engine_changed = ["ttsEngine", "ttsModelDir"].iter().any(|k| {
+                    obj.get(*k)
+                        .is_some_and(|new| self.store.config.settings.get(*k) != Some(new))
+                });
                 for (key, value) in obj {
                     if key == "managerPin" {
                         // Never persist the plaintext PIN — store the sealed token.
@@ -2620,6 +2648,11 @@ impl Plugin {
                     if obj.contains_key(setting) {
                         apply_endpoint_env_from_settings(&self.store.config.settings, setting, env);
                     }
+                }
+                if tts_engine_changed {
+                    // Re-stamp BEFORE the Configure below queues the engine
+                    // reload — the synth worker reads env at load time.
+                    apply_tts_engine_env(&self.store.config.settings);
                 }
                 // Stamp the live revision into the radio status so the NEXT
                 // call.ended records which configuration it ran under
@@ -2668,6 +2701,7 @@ impl Plugin {
                             endpoint: endpoint_update(obj, "aiEndpoint"),
                             stt_endpoint: endpoint_update(obj, "sttEndpoint"),
                             tts_endpoint: endpoint_update(obj, "ttsEndpoint"),
+                            reload_tts_engine: tts_engine_changed,
                         });
                     }
                 }
@@ -3675,6 +3709,16 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
         kind: SettingKind::EndpointUrl,
         applies_live: true,
     },
+    SettingSpec {
+        key: "ttsEngine",
+        kind: SettingKind::Enum(&["", "pocket", "sherpa"]),
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "ttsModelDir",
+        kind: SettingKind::Str { max_chars: 400 },
+        applies_live: true,
+    },
 ];
 
 fn setting_spec(key: &str) -> Option<&'static SettingSpec> {
@@ -4044,6 +4088,24 @@ fn has_receptionist_config_key(obj: &Map<String, Value>) -> bool {
     RECEPTIONIST_CONFIG_KEYS
         .iter()
         .any(|k| obj.contains_key(*k))
+}
+
+/// Stamp the in-process TTS engine selection env from the merged config:
+/// `ttsEngine` → AOKIE_TTS_ENGINE (blank/absent = pocket-tts) and
+/// `ttsModelDir` → AOKIE_TTS_MODEL_DIR (the sherpa voice-bundle folder;
+/// blank = scan `<app_data>/models/tts`). The synth worker reads these at
+/// engine-load time, so a change also needs a `ReloadEngine` nudge (the
+/// settings.set handler sends it via `RadioControl::Configure`).
+fn apply_tts_engine_env(settings: &Map<String, Value>) {
+    for (setting_key, env_key) in [
+        ("ttsEngine", "AOKIE_TTS_ENGINE"),
+        ("ttsModelDir", "AOKIE_TTS_MODEL_DIR"),
+    ] {
+        match settings.get(setting_key).and_then(Value::as_str).map(str::trim) {
+            Some(v) if !v.is_empty() => std::env::set_var(env_key, v),
+            _ => std::env::remove_var(env_key),
+        }
+    }
 }
 
 /// Resolve the spoken greeting from settings. BLANK and MISSING both mean the

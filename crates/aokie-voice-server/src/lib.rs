@@ -685,7 +685,11 @@ fn ensure_ort_dylib() {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for name in ["onnxruntime.dll", "onnxruntime_1.25.0.dll"] {
+            // ⚠️ ORDER MATTERS: the VERSIONED name must win. The plugin's
+            // sherpa-onnx TTS engine ships its own `onnxruntime.dll` (1.17.1)
+            // into this same directory; resolving the unversioned name first
+            // would silently load that older ORT and break Parakeet/pocket.
+            for name in ["onnxruntime_1.25.0.dll", "onnxruntime.dll"] {
                 let dll = dir.join(name);
                 if dll.exists() {
                     std::env::set_var("ORT_DYLIB_PATH", &dll);

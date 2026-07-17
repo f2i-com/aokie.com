@@ -241,6 +241,22 @@
       "key": "ttsEndpoint",
       "type": "endpointUrl",
       "appliesLive": true
+    },
+    {
+      "key": "ttsEngine",
+      "type": "enum",
+      "options": [
+        "",
+        "pocket",
+        "sherpa"
+      ],
+      "appliesLive": true
+    },
+    {
+      "key": "ttsModelDir",
+      "type": "string",
+      "maxChars": 400,
+      "appliesLive": true
     }
   ]
 }

@@ -120,6 +120,11 @@ pub enum RadioControl {
         endpoint: EndpointUpdate,
         stt_endpoint: EndpointUpdate,
         tts_endpoint: EndpointUpdate,
+        /// The `ttsEngine`/`ttsModelDir` selection changed: the connector
+        /// re-stamped AOKIE_TTS_ENGINE / AOKIE_TTS_MODEL_DIR before sending
+        /// this, so the radio just tells the synth worker to reload its
+        /// in-process engine from the new env.
+        reload_tts_engine: bool,
     },
     /// §9.3 call-scoped agent config (`call.configureAgent`): persona /
     /// greeting for ONE named call, wiped at the call boundary. The
@@ -12507,6 +12512,7 @@ fn run_loop(
                     endpoint,
                     stt_endpoint,
                     tts_endpoint,
+                    reload_tts_engine,
                 }) => {
                     // Live-reconfigure the agent from a flow / settings.set push. Each
                     // field is Some only when it changed. Greeting applies to the NEXT
@@ -12570,6 +12576,12 @@ fn run_loop(
                             EndpointUpdate::Clear => synth.configure(None),
                             EndpointUpdate::Set(e) => synth.configure(normalize_endpoint(Some(e))),
                         }
+                        if reload_tts_engine {
+                            // Env already re-stamped by the connector; the
+                            // worker reloads eagerly so a bad ttsModelDir
+                            // shows up in the log now, not on the next call.
+                            synth.reload_engine();
+                        }
                         eprintln!("[aokie-plugin] agent reconfigured (persona/greeting/voice/model/endpoints)");
                     }
                     #[cfg(not(feature = "voice"))]
@@ -12582,6 +12594,7 @@ fn run_loop(
                             endpoint,
                             stt_endpoint,
                             tts_endpoint,
+                            reload_tts_engine,
                         );
                     }
                 }
