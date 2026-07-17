@@ -1677,6 +1677,12 @@ fn run_runtime(
     let mut acl_corruption_reported: u8 = 0;
     let mut loop_iter: u64 = 0;
     let mut last_heartbeat = Instant::now();
+    // LAT-001 (2026-07-17): the heartbeat LINE at a 2s cadence wrapped the
+    // 500-line plugin log ring in minutes, making every post-call diagnosis
+    // read "logs wrapped". The 2s TICK stays (the ACL keepalive below rides
+    // it); the LOG LINE now prints on SCO-state changes or every 30s.
+    let mut last_heartbeat_logged = Instant::now() - Duration::from_secs(60);
+    let mut last_heartbeat_sco = false;
     // ACL keepalive: during a call the SCO link monopolises the air and the AG
     // stops sending ACL, so if nothing is received the controller hits the
     // link-supervision timeout (Disconnection reason 0x08) and drops the whole
@@ -1769,33 +1775,40 @@ fn run_runtime(
             // last_send_reply_at is set, but no inbound traffic for tens
             // of seconds, we're either looking at a Pixel-side wedge or
             // RCS swallowing the customer's follow-up.
-            let map_diag = if active_acl_handle.is_some() {
-                let mns_state = mns_server
-                    .lock()
-                    .map(|g| format!("{:?}", g.state()))
-                    .unwrap_or_else(|_| "poisoned".to_string());
-                let since_inbound = last_acl_inbound_at.elapsed().as_secs();
-                let since_reply = last_send_reply_at
-                    .map(|t| format!("{}s", t.elapsed().as_secs()))
-                    .unwrap_or_else(|| "n/a".to_string());
-                format!(
-                    " mns={} pending_map={} active_map={} acl_in={}s_ago reply_ack={}",
-                    mns_state,
-                    pending_map_ops.len(),
-                    active_map_op.is_some() as u8,
-                    since_inbound,
-                    since_reply
-                )
-            } else {
-                String::new()
-            };
-            eprintln!(
-                "[AokieRadio] heartbeat iter={} sco_active={} sco_tx_queue={} samples{}",
-                loop_iter,
-                active_sco_handle.is_some(),
-                sco_tx_queue.len(),
-                map_diag,
-            );
+            let sco_now = active_sco_handle.is_some();
+            if sco_now != last_heartbeat_sco
+                || last_heartbeat_logged.elapsed() >= Duration::from_secs(30)
+            {
+                last_heartbeat_sco = sco_now;
+                last_heartbeat_logged = Instant::now();
+                let map_diag = if active_acl_handle.is_some() {
+                    let mns_state = mns_server
+                        .lock()
+                        .map(|g| format!("{:?}", g.state()))
+                        .unwrap_or_else(|_| "poisoned".to_string());
+                    let since_inbound = last_acl_inbound_at.elapsed().as_secs();
+                    let since_reply = last_send_reply_at
+                        .map(|t| format!("{}s", t.elapsed().as_secs()))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    format!(
+                        " mns={} pending_map={} active_map={} acl_in={}s_ago reply_ack={}",
+                        mns_state,
+                        pending_map_ops.len(),
+                        active_map_op.is_some() as u8,
+                        since_inbound,
+                        since_reply
+                    )
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "[AokieRadio] heartbeat iter={} sco_active={} sco_tx_queue={} samples{}",
+                    loop_iter,
+                    sco_now,
+                    sco_tx_queue.len(),
+                    map_diag,
+                );
+            }
             // ACL keepalive (see decl above): once the ACL has been quiet for a
             // few seconds while connected, send AT+CIND? to draw a +CIND reply,
             // which resets the link-supervision timer and holds the call up.

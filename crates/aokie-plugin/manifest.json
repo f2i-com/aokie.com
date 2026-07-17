@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "id": "aokie",
   "name": "Aokie Phone Bridge",
   "version": "0.1.0",
@@ -120,5 +120,86 @@
     "aokie.sms.failed",
     "aokie.manager.action",
     "aokie.hardware.error"
-  ]
+  ],
+  "ui": {
+    "nav": [
+      {
+        "id": "receptionist",
+        "label": "AI Receptionist",
+        "icon": "phone",
+        "badge": "New"
+      }
+    ],
+    "overview": [
+      {
+        "id": "aokie-hero",
+        "kind": "hero",
+        "title": "Aokie receptionist",
+        "icon": "phone",
+        "bind": {
+          "headline": "$health.status",
+          "body": "$health.detail",
+          "cta": { "label": "Open AI Receptionist", "nav": "receptionist" }
+        }
+      }
+    ],
+    "statusCards": [
+      {
+        "id": "phone-bridge",
+        "title": "Phone bridge",
+        "poll": { "command": "phone.status", "intervalMs": 5000 },
+        "fields": [
+          { "label": "Phone", "path": "device.name" },
+          { "label": "Connected", "path": "connected" },
+          { "label": "Paired", "path": "paired" },
+          { "label": "In call", "path": "callActive" }
+        ]
+      },
+      {
+        "id": "data-delivery",
+        "title": "Data delivery",
+        "poll": { "command": "dongle.diagnostics", "intervalMs": 10000 },
+        "fields": [
+          { "label": "Radio connected", "path": "radio.connected" },
+          { "label": "Outbox pending", "path": "outbox.pending" },
+          { "label": "Outbox failed", "path": "outbox.failed" },
+          { "label": "Dead letters", "path": "outbox.dead" }
+        ]
+      }
+    ]
+  },
+  "commands": {
+    "journalled": [
+      "phone.startPairing",
+      "phone.stopPairing",
+      "phone.removePaired",
+      "phone.disconnect",
+      "phone.connect",
+      "phone.confirmPairing",
+      "call.activate",
+      "call.answer",
+      "call.reject",
+      "call.hangup",
+      "call.operatorSpeak",
+      "call.configureAgent",
+      "call.dial",
+      "sms.send"
+    ]
+  },
+  "data": {
+    "externalInventory": [
+      {
+        "path": "%APPDATA%/com.aokie.app",
+        "label": "Aokie radio data (phone pairing keys, models, call database, logs)"
+      },
+      {
+        "credential": "Aokie/*",
+        "label": "Sealed keys in Windows Credential Manager (endpoint identity, manager PIN)"
+      },
+      {
+        "path": "%ProgramData%/Aokie/driver-transactions.jsonl",
+        "label": "WinUSB driver transaction journal"
+      }
+    ]
+  }
 }

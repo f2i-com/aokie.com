@@ -28,7 +28,23 @@
       "appliesLive": false
     },
     {
+      "key": "audioTranscriptEndpoint",
+      "type": "endpointUrl",
+      "appliesLive": false
+    },
+    {
+      "key": "audioTranscriptModel",
+      "type": "string",
+      "maxChars": 200,
+      "appliesLive": false
+    },
+    {
       "key": "holdAndCallWaiting",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "autoConnectPhone",
       "type": "bool",
       "appliesLive": false
     },

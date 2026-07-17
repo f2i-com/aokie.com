@@ -45,6 +45,7 @@ pub mod endpoint_http;
 pub mod event_bridge;
 pub mod host_rpc;
 pub mod manager_auth;
+pub mod manager_pin;
 #[cfg(feature = "voice")]
 pub mod model_distribution;
 pub mod outbox;
