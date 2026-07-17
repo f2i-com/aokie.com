@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -442,10 +443,17 @@ enum SttBackend {
 }
 
 /// Loaded TTS engine — lazily constructed on the first speech request.
+/// Sherpa holds a small per-bundle runtime cache instead of one runtime:
+/// the request's "voice" field selects the bundle per call, and each Piper
+/// model is ~60-120MB RAM / ~1-3s to load, so recently used voices stay
+/// resident (capacity `SHERPA_BUNDLE_CACHE_CAPACITY`, LRU eviction).
 enum TtsBackend {
     Pocket(OnnxTtsRuntime),
-    Sherpa(SherpaOnnxTtsRuntime),
+    Sherpa(LruCache<SherpaOnnxTtsRuntime>),
 }
+
+/// How many sherpa voice bundles stay loaded at once.
+pub const SHERPA_BUNDLE_CACHE_CAPACITY: usize = 3;
 
 pub struct VoiceServer {
     config: ServerConfig,
@@ -453,6 +461,9 @@ pub struct VoiceServer {
     max_body_bytes: usize,
     stt: Mutex<Option<SttBackend>>,
     tts: Mutex<Option<TtsBackend>>,
+    /// Unknown sherpa voice values already logged — one warning per distinct
+    /// value, never per request (bounded; see `warn_unknown_voice`).
+    warned_voices: Mutex<HashSet<String>>,
 }
 
 impl VoiceServer {
@@ -469,6 +480,7 @@ impl VoiceServer {
             max_body_bytes,
             stt: Mutex::new(None),
             tts: Mutex::new(None),
+            warned_voices: Mutex::new(HashSet::new()),
         }
     }
 
@@ -501,6 +513,12 @@ impl VoiceServer {
 
     fn resolve_sherpa_bundle(&self) -> Result<PathBuf, String> {
         sherpa_voice_dir(self.config.tts_model_dir.as_deref(), &self.app_data)
+    }
+
+    /// The folder that named sherpa voices resolve against (and the
+    /// alphabetical default-bundle scan walks): `<app_data>/models/tts`.
+    fn sherpa_scan_root(&self) -> PathBuf {
+        self.app_data.join("models").join("tts")
     }
 
     /// Presence-only readiness for the selected STT engine (no model load —
@@ -612,7 +630,7 @@ impl VoiceServer {
                 }
             };
             eprintln!(
-                "[aokie-voice-server] STT ({}) loaded in {:?}",
+                "[{}] STT ({}) loaded in {:?}", log_tag(),
                 self.config.stt_engine.as_str(),
                 started.elapsed()
             );
@@ -659,24 +677,19 @@ impl VoiceServer {
                 }
                 TtsEngineKind::Sherpa => {
                     // Dynamic sherpa brings its own ORT DLL — ensure_ort_dylib
-                    // is deliberately NOT involved here.
-                    let dir = self.resolve_sherpa_bundle().map_err(|e| {
-                        AppError::new(503, format!("TTS model files are not ready: {e}"))
-                    })?;
-                    let cfg = sherpa_config_for_dir(&dir).map_err(|e| {
-                        AppError::new(503, format!("TTS model files are not ready: {e}"))
-                    })?;
-                    TtsBackend::Sherpa(
-                        SherpaOnnxTtsRuntime::load(&cfg)
-                            .map_err(|e| AppError::new(500, format!("TTS load failed: {e}")))?,
-                    )
+                    // is deliberately NOT involved here. Bundles load LAZILY
+                    // per requested voice through the LRU cache (each load is
+                    // logged there) — nothing to do up front.
+                    TtsBackend::Sherpa(LruCache::new(SHERPA_BUNDLE_CACHE_CAPACITY))
                 }
             };
-            eprintln!(
-                "[aokie-voice-server] TTS ({}) loaded in {:?}",
-                self.config.tts_engine.as_str(),
-                started.elapsed()
-            );
+            if matches!(backend, TtsBackend::Pocket(_)) {
+                eprintln!(
+                    "[{}] TTS ({}) loaded in {:?}", log_tag(),
+                    self.config.tts_engine.as_str(),
+                    started.elapsed()
+                );
+            }
             *guard = Some(backend);
         }
         Ok(guard)
@@ -698,20 +711,9 @@ impl VoiceServer {
                 .map_err(|e| AppError::new(500, format!("TTS synthesize failed: {e}")))?;
                 (f32_to_i16(&f32_samples), sample_rate)
             }
-            TtsBackend::Sherpa(rt) => {
-                let mut audio = rt
-                    .synthesize(input, sherpa_voice(voice))
-                    .map_err(|e| AppError::new(500, format!("TTS synthesize failed: {e}")))?;
-                // Sherpa/Piper voices synthesize HOT — attenuate-only loudness
-                // normalization before the i16 conversion so peaks never clip.
-                let scale = attenuate_hot_signal(&mut audio.samples);
-                if scale < 1.0 {
-                    eprintln!(
-                        "[aokie-voice-server] sherpa loudness attenuated x{scale:.3} ({} samples)",
-                        audio.samples.len()
-                    );
-                }
-                (f32_to_i16(&audio.samples), audio.sample_rate)
+            TtsBackend::Sherpa(cache) => {
+                let (samples, sample_rate) = self.sherpa_synthesize(cache, input, voice)?;
+                (f32_to_i16(&samples), sample_rate)
             }
         };
         // Pitch-preserving rate change at the model's native sample rate
@@ -761,22 +763,94 @@ impl VoiceServer {
                 result.map_err(|e| AppError::new(500, format!("TTS synthesize failed: {e}")))?;
                 Ok(PcmOutcome::Completed)
             }
-            TtsBackend::Sherpa(rt) => {
-                let mut audio = rt
-                    .synthesize(input, sherpa_voice(voice))
-                    .map_err(|e| AppError::new(500, format!("TTS synthesize failed: {e}")))?;
-                // Same loudness guard as the WAV path — sherpa/Piper voices
-                // synthesize HOT and would clip after i16 conversion.
-                let scale = attenuate_hot_signal(&mut audio.samples);
-                if scale < 1.0 {
-                    eprintln!(
-                        "[aokie-voice-server] sherpa loudness attenuated x{scale:.3} ({} samples)",
-                        audio.samples.len()
-                    );
-                }
-                let pcm = f32_to_i16(&audio.samples);
-                Ok(stream_pcm_slices(&pcm, audio.sample_rate, sink))
+            TtsBackend::Sherpa(cache) => {
+                let (samples, sample_rate) = self.sherpa_synthesize(cache, input, voice)?;
+                let pcm = f32_to_i16(&samples);
+                Ok(stream_pcm_slices(&pcm, sample_rate, sink))
             }
+        }
+    }
+
+    /// The ONE sherpa dispatch point (WAV and PCM both land here): resolve
+    /// the request's voice to a bundle + speaker, load-or-reuse the bundle's
+    /// runtime through the LRU cache, synthesize, and apply the loudness
+    /// guard. An unknown/invalid voice logs once per value and falls back to
+    /// the default bundle — a bad voice NEVER fails the span.
+    fn sherpa_synthesize(
+        &self,
+        cache: &mut LruCache<SherpaOnnxTtsRuntime>,
+        input: &str,
+        voice: &str,
+    ) -> Result<(Vec<f32>, u32), AppError> {
+        let (dir, speaker) = match resolve_sherpa_voice(voice, &self.sherpa_scan_root()) {
+            SherpaVoice::Default { speaker } => (
+                self.resolve_sherpa_bundle().map_err(|e| {
+                    AppError::new(503, format!("TTS model files are not ready: {e}"))
+                })?,
+                speaker,
+            ),
+            SherpaVoice::Bundle { dir, speaker } => (dir, speaker),
+            SherpaVoice::Unknown { requested } => {
+                self.warn_unknown_voice(&requested);
+                (
+                    self.resolve_sherpa_bundle().map_err(|e| {
+                        AppError::new(503, format!("TTS model files are not ready: {e}"))
+                    })?,
+                    String::new(),
+                )
+            }
+        };
+        // ⚠️ NEVER fs::canonicalize the bundle dir: on Windows it returns an
+        // extended-length `\\?\C:\...` path, and sherpa's espeak layer joins
+        // `espeak-ng-data/phontab` onto it with a FORWARD slash — which the
+        // `\\?\` form does not tolerate. The config then fails validation,
+        // SherpaOnnxCreateOfflineTts hands back a NULL engine, and the next
+        // synthesize SEGFAULTS the whole process (live 2026-07-17: every
+        // synthesis crashed the aokie-tts service until crash-recovery
+        // restarted it). Key the cache on a case-folded plain-path string
+        // instead — name-form and abs-path-form of the same bundle still
+        // share a slot, and the CONFIG always gets a plain path.
+        let key = PathBuf::from(dir.to_string_lossy().to_lowercase());
+        let rt = cache.get_or_insert_with(&key, || {
+            let cfg = sherpa_config_for_dir(&dir)
+                .map_err(|e| AppError::new(503, format!("TTS model files are not ready: {e}")))?;
+            let started = Instant::now();
+            let rt = SherpaOnnxTtsRuntime::load(&cfg)
+                .map_err(|e| AppError::new(500, format!("TTS load failed: {e}")))?;
+            eprintln!(
+                "[{}] sherpa bundle {} loaded in {:?}", log_tag(),
+                dir.display(),
+                started.elapsed()
+            );
+            Ok(rt)
+        })?;
+        let mut audio = rt
+            .synthesize(input, &speaker)
+            .map_err(|e| AppError::new(500, format!("TTS synthesize failed: {e}")))?;
+        // Sherpa/Piper voices synthesize HOT — attenuate-only loudness
+        // normalization before the i16 conversion so peaks never clip.
+        // Applies to EVERY sherpa synthesis regardless of bundle.
+        let scale = attenuate_hot_signal(&mut audio.samples);
+        if scale < 1.0 {
+            eprintln!(
+                "[{}] sherpa loudness attenuated x{scale:.3} ({} samples)", log_tag(),
+                audio.samples.len()
+            );
+        }
+        Ok((audio.samples, audio.sample_rate))
+    }
+
+    /// Log an unknown sherpa voice value ONCE (bounded set — a flood of
+    /// distinct junk values can't grow memory or spam the log forever).
+    fn warn_unknown_voice(&self, requested: &str) {
+        let Ok(mut warned) = self.warned_voices.lock() else {
+            return;
+        };
+        if warned.len() < 64 && warned.insert(requested.to_string()) {
+            eprintln!(
+                "[{}] unknown sherpa voice {requested:?} - using the default bundle (installed voices: {:?})", log_tag(),
+                installed_sherpa_bundles(&self.sherpa_scan_root())
+            );
         }
     }
 }
@@ -900,14 +974,168 @@ pub fn attenuate_hot_signal(samples: &mut [f32]) -> f32 {
     scale.min(1.0)
 }
 
-/// Sherpa voice selection is a numeric speaker id; anything else (a leftover
-/// Pocket-TTS preset name like "alba") would warn on every request, so map it
-/// to "" (= the bundle's default speaker). Same rule as the plugin.
-fn sherpa_voice(voice: &str) -> &str {
-    if voice.trim().parse::<i32>().is_ok() {
-        voice
-    } else {
-        ""
+/// Where a sherpa speech request's "voice" field resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SherpaVoice {
+    /// The configured default bundle; `speaker` is "" (bundle default) or a
+    /// numeric speaker id string.
+    Default { speaker: String },
+    /// A specific installed bundle (by folder name under the scan root, or
+    /// an absolute path), optionally with a numeric speaker id.
+    Bundle { dir: PathBuf, speaker: String },
+    /// Nothing matched — the caller falls back to the default bundle with
+    /// the default speaker, logging once per distinct value.
+    Unknown { requested: String },
+}
+
+/// Per-request sherpa voice resolution:
+/// - ""            → default bundle, default speaker
+/// - "3"           → default bundle, speaker id 3 (kokoro multi-speaker)
+/// - "jenny"       → installed bundle folder `<scan_root>/jenny`
+/// - "C:\...\dir"  → absolute path to a valid bundle dir
+/// - "jenny:2"     → that bundle + numeric speaker id
+/// - anything else → `Unknown` (caller falls back, never fails the span)
+///
+/// A "valid bundle" is a directory holding tokens.txt + exactly one .onnx
+/// (`is_sherpa_bundle`). Pure over the filesystem — unit-tested with fake
+/// bundle dirs.
+pub fn resolve_sherpa_voice(voice: &str, scan_root: &Path) -> SherpaVoice {
+    let v = voice.trim();
+    if v.is_empty() {
+        return SherpaVoice::Default {
+            speaker: String::new(),
+        };
+    }
+    if v.parse::<i32>().is_ok() {
+        return SherpaVoice::Default {
+            speaker: v.to_string(),
+        };
+    }
+    if let Some(dir) = bundle_for_token(v, scan_root) {
+        return SherpaVoice::Bundle {
+            dir,
+            speaker: String::new(),
+        };
+    }
+    // Combined "bundlename:N" (also works for "C:\abs\bundle:N" — the split
+    // is at the LAST colon, so a drive letter never confuses it).
+    if let Some((prefix, suffix)) = v.rsplit_once(':') {
+        if suffix.parse::<i32>().is_ok() {
+            if let Some(dir) = bundle_for_token(prefix.trim(), scan_root) {
+                return SherpaVoice::Bundle {
+                    dir,
+                    speaker: suffix.to_string(),
+                };
+            }
+        }
+    }
+    SherpaVoice::Unknown {
+        requested: v.to_string(),
+    }
+}
+
+/// Resolve one bundle token: an absolute path is taken as-is (when valid);
+/// a plain folder NAME (no separators, no traversal) resolves under the
+/// scan root. Anything else is no match.
+fn bundle_for_token(token: &str, scan_root: &Path) -> Option<PathBuf> {
+    if token.is_empty() {
+        return None;
+    }
+    let path = Path::new(token);
+    if path.is_absolute() {
+        return is_sherpa_bundle(path).then(|| path.to_path_buf());
+    }
+    if token.contains(['/', '\\']) || token == "." || token == ".." {
+        return None;
+    }
+    let candidate = scan_root.join(token);
+    is_sherpa_bundle(&candidate).then_some(candidate)
+}
+
+/// The bundle test: a directory with tokens.txt + EXACTLY one .onnx (the
+/// same shape `sherpa_config_for_dir` will accept).
+fn is_sherpa_bundle(dir: &Path) -> bool {
+    if !dir.is_dir() || !dir.join("tokens.txt").is_file() {
+        return false;
+    }
+    let onnx_count = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    let p = e.path();
+                    p.is_file() && p.extension().is_some_and(|x| x == "onnx")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    onnx_count == 1
+}
+
+/// Installed bundle folder names under the scan root, sorted — the
+/// discoverable "voices" surfaced by /v1/models in sherpa mode.
+pub fn installed_sherpa_bundles(scan_root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(scan_root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| is_sherpa_bundle(p))
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Tiny path-keyed LRU (front = most recently used). Capacity is small (3
+/// sherpa bundles) so a Vec scan beats any linked-map machinery.
+pub struct LruCache<V> {
+    capacity: usize,
+    entries: Vec<(PathBuf, V)>,
+}
+
+impl<V> LruCache<V> {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Fetch the value for `key`, loading it with `load` on a miss (evicting
+    /// the least-recently-used entry when at capacity). A failed load caches
+    /// NOTHING. Either way the touched entry becomes most-recently-used.
+    pub fn get_or_insert_with<E>(
+        &mut self,
+        key: &Path,
+        load: impl FnOnce() -> Result<V, E>,
+    ) -> Result<&mut V, E> {
+        if let Some(pos) = self.entries.iter().position(|(k, _)| k == key) {
+            let entry = self.entries.remove(pos);
+            self.entries.insert(0, entry);
+        } else {
+            let value = load()?;
+            if self.entries.len() >= self.capacity {
+                self.entries.pop();
+            }
+            self.entries.insert(0, (key.to_path_buf(), value));
+        }
+        Ok(&mut self.entries[0].1)
+    }
+
+    /// Keys in MRU→LRU order (tests assert the eviction order through this).
+    pub fn keys(&self) -> Vec<&Path> {
+        self.entries.iter().map(|(k, _)| k.as_path()).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -1092,7 +1320,12 @@ fn sherpa_config_for_dir(dir: &Path) -> Result<SherpaTtsConfig, String> {
         .into_iter()
         .chain(dir.parent().map(|p| p.join("espeak-ng-data")))
     {
-        if data_dir.is_dir() {
+        // Require the phontab file, not just the folder: sherpa validates it
+        // at engine-create time and hands back a NULL engine when it's
+        // missing — which the next synthesize turns into a process SEGFAULT
+        // (sherpa-rs never surfaces the null). Refusing here keeps it a
+        // clean 503 instead.
+        if data_dir.is_dir() && data_dir.join("phontab").is_file() {
             cfg.data_dir = data_dir.to_string_lossy().to_string();
             break;
         }
@@ -1100,6 +1333,12 @@ fn sherpa_config_for_dir(dir: &Path) -> Result<SherpaTtsConfig, String> {
     let lexicon = dir.join("lexicon.txt");
     if lexicon.is_file() {
         cfg.lexicon = lexicon.to_string_lossy().to_string();
+    }
+    if cfg.engine == "vits" && cfg.data_dir.is_empty() && cfg.lexicon.is_empty() {
+        return Err(format!(
+            "no usable espeak-ng-data (with phontab) or lexicon.txt in {} or its parent - a Piper/VITS bundle needs one",
+            dir.display()
+        ));
     }
     let dict = dir.join("dict");
     if dict.is_dir() {
@@ -1346,6 +1585,9 @@ fn models_response(server: &VoiceServer) -> HttpResponse {
                         entry["bundle"] = json!(name.to_string_lossy());
                     }
                 }
+                // Voice discovery: the installed bundle folder names, sorted
+                // — each is a valid per-request "voice" value.
+                entry["voices"] = json!(installed_sherpa_bundles(&server.sherpa_scan_root()));
                 data.push(entry);
             }
         }
@@ -1827,7 +2069,7 @@ fn ensure_ort_dylib() {
                 let dll = dir.join(name);
                 if dll.exists() {
                     std::env::set_var("ORT_DYLIB_PATH", &dll);
-                    eprintln!("[aokie-voice-server] ORT_DYLIB_PATH -> {}", dll.display());
+                    eprintln!("[{}] ORT_DYLIB_PATH -> {}", log_tag(), dll.display());
                     return;
                 }
             }
@@ -1835,13 +2077,34 @@ fn ensure_ort_dylib() {
     }
 }
 
+/// Mode-aware log tag (user report 2026-07-17: the "Aokie Speech to Text"
+/// service's log lines all read `[aokie-voice-server]` — the BINARY's name,
+/// not the service identity). Set once at startup from the resolved mode;
+/// callers before init (or tests) get the binary name.
+static LOG_TAG: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+fn log_tag() -> &'static str {
+    LOG_TAG.get().copied().unwrap_or("aokie-voice-server")
+}
+
+fn init_log_tag(mode: ServerMode) {
+    let tag = match (mode.stt_enabled(), mode.tts_enabled()) {
+        (true, false) => "aokie-stt",
+        (false, true) => "aokie-tts",
+        _ => "aokie-voice-server",
+    };
+    let _ = LOG_TAG.set(tag);
+}
+
 pub fn run_from_env() -> Result<(), String> {
     let cli = parse_cli_args(std::env::args())?;
     let env = EnvConfig::from_process_env();
     let file = load_file_config(cli.config_path.as_deref())?;
     let config = merge_config(&cli, &env, &file)?;
+    init_log_tag(config.mode);
     eprintln!(
-        "[aokie-voice-server] mode {} (stt: {}, tts: {})",
+        "[{}] mode {} (stt: {}, tts: {})",
+        log_tag(),
         config.mode.as_str(),
         if config.mode.stt_enabled() {
             config.stt_engine.as_str()
@@ -1872,7 +2135,7 @@ pub fn run_http(server: VoiceServer, port: u16) -> Result<(), String> {
 
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| format!("bind 127.0.0.1:{port}: {e}"))?;
-    eprintln!("[aokie-voice-server] listening on http://127.0.0.1:{port}");
+    eprintln!("[{}] listening on http://127.0.0.1:{port}", log_tag());
 
     let server = Arc::new(server);
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -1880,7 +2143,7 @@ pub fn run_http(server: VoiceServer, port: u16) -> Result<(), String> {
         let mut stream = match stream {
             Ok(stream) => stream,
             Err(e) => {
-                eprintln!("[aokie-voice-server] accept failed: {e}");
+                eprintln!("[{}] accept failed: {e}", log_tag());
                 continue;
             }
         };
@@ -1893,7 +2156,7 @@ pub fn run_http(server: VoiceServer, port: u16) -> Result<(), String> {
         std::thread::spawn(move || {
             fn respond(stream: &mut TcpStream, response: HttpResponse) {
                 if let Err(e) = write_http_response(stream, response) {
-                    eprintln!("[aokie-voice-server] respond failed: {e}");
+                    eprintln!("[{}] respond failed: {e}", log_tag());
                 }
             }
 
@@ -1986,11 +2249,11 @@ fn stream_pcm_to_client(server: &VoiceServer, stream: &mut TcpStream, req: &PcmS
                 // The 200 head is on the wire — nothing left but an early
                 // close; the client sees a truncated stream.
                 eprintln!(
-                    "[aokie-voice-server] pcm stream failed mid-flight: {}",
+                    "[{}] pcm stream failed mid-flight: {}", log_tag(),
                     err.message
                 );
             } else if let Err(e) = write_http_response(stream, err.response()) {
-                eprintln!("[aokie-voice-server] respond failed: {e}");
+                eprintln!("[{}] respond failed: {e}", log_tag());
             }
         }
     }
@@ -2009,7 +2272,7 @@ impl TcpPcmSink<'_> {
         if !self.disconnected {
             self.disconnected = true;
             eprintln!(
-                "[aokie-voice-server] pcm client disconnected mid-stream - synthesis cancelled: {err}"
+                "[{}] pcm client disconnected mid-stream - synthesis cancelled: {err}", log_tag()
             );
         }
     }
@@ -2649,7 +2912,11 @@ mod tests {
         fs::create_dir_all(root.join("b-voice")).unwrap();
         fs::write(root.join("b-voice/model.onnx"), b"x").unwrap();
         fs::write(root.join("b-voice/tokens.txt"), b"x").unwrap();
+        // The shared parent espeak data needs its phontab — the config
+        // composer refuses a VITS bundle without one (a missing phontab
+        // makes sherpa hand back a NULL engine that segfaults on use).
         fs::create_dir_all(root.join("espeak-ng-data")).unwrap();
+        fs::write(root.join("espeak-ng-data/phontab"), b"x").unwrap();
 
         let value = decode_json(&handle_request(&server, "GET", "/health", &[], b"").body);
         assert_eq!(value["status"], "ok", "{value}");
@@ -2664,6 +2931,9 @@ mod tests {
         assert_eq!(data.len(), 1, "tts mode reports only the TTS lane");
         assert_eq!(data[0]["id"], "sherpa");
         assert_eq!(data[0]["bundle"], "b-voice");
+        // Voice discovery: only the VALID bundle is listed ("a-voice" has no
+        // tokens.txt).
+        assert_eq!(data[0]["voices"], json!(["b-voice"]));
 
         // The bundle config replicates the plugin's composition rules:
         // shared espeak-ng-data in the PARENT + VITS when no voices.bin.
@@ -2682,6 +2952,158 @@ mod tests {
         assert!(sherpa_config_for_dir(&root.join("b-voice"))
             .unwrap_err()
             .contains("exactly one"));
+    }
+
+    // -------------------------------------------------------------------
+    // Per-request sherpa voice resolution + bundle cache
+    // -------------------------------------------------------------------
+
+    /// Seed a valid bundle folder (tokens.txt + exactly one .onnx) under
+    /// `root/name`, following the pattern the models tests use.
+    fn seed_bundle(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("model.onnx"), b"x").unwrap();
+        fs::write(dir.join("tokens.txt"), b"x").unwrap();
+        dir
+    }
+
+    /// The resolution table: empty / numeric / installed name / absolute
+    /// path / name:speaker / unknowns — pure over a fake scan root.
+    #[test]
+    fn sherpa_voice_resolution_table() {
+        let tmp = TestDir::new();
+        let root = tmp.path().join("models/tts");
+        let jenny = seed_bundle(&root, "jenny");
+        // "broken" fails the bundle test (no tokens.txt).
+        fs::create_dir_all(root.join("broken")).unwrap();
+        fs::write(root.join("broken/model.onnx"), b"x").unwrap();
+        // "twin" fails it too (two .onnx files).
+        let twin = seed_bundle(&root, "twin");
+        fs::write(twin.join("other.onnx"), b"x").unwrap();
+
+        let def = |speaker: &str| SherpaVoice::Default {
+            speaker: speaker.to_string(),
+        };
+        let bundle = |dir: &Path, speaker: &str| SherpaVoice::Bundle {
+            dir: dir.to_path_buf(),
+            speaker: speaker.to_string(),
+        };
+        let unknown = |req: &str| SherpaVoice::Unknown {
+            requested: req.to_string(),
+        };
+
+        // Empty / whitespace → default bundle, default speaker.
+        assert_eq!(resolve_sherpa_voice("", &root), def(""));
+        assert_eq!(resolve_sherpa_voice("   ", &root), def(""));
+        // Numeric → default bundle + that speaker id.
+        assert_eq!(resolve_sherpa_voice("3", &root), def("3"));
+        assert_eq!(resolve_sherpa_voice(" 12 ", &root), def("12"));
+        // Installed bundle folder name → that bundle, default speaker.
+        assert_eq!(resolve_sherpa_voice("jenny", &root), bundle(&jenny, ""));
+        // Absolute path to a valid bundle dir.
+        let abs = jenny.to_string_lossy().to_string();
+        assert!(Path::new(&abs).is_absolute(), "temp dir must be absolute");
+        assert_eq!(resolve_sherpa_voice(&abs, &root), bundle(&jenny, ""));
+        // Combined name:speaker and abs-path:speaker.
+        assert_eq!(resolve_sherpa_voice("jenny:2", &root), bundle(&jenny, "2"));
+        assert_eq!(
+            resolve_sherpa_voice(&format!("{abs}:5"), &root),
+            bundle(&jenny, "5")
+        );
+        // Unknowns: absent name, invalid bundles, pocket preset leftovers,
+        // traversal attempts, abs path to a non-bundle.
+        assert_eq!(resolve_sherpa_voice("nope", &root), unknown("nope"));
+        assert_eq!(resolve_sherpa_voice("broken", &root), unknown("broken"));
+        assert_eq!(resolve_sherpa_voice("twin", &root), unknown("twin"));
+        assert_eq!(resolve_sherpa_voice("alba", &root), unknown("alba"));
+        assert_eq!(
+            resolve_sherpa_voice("../jenny", &root),
+            unknown("../jenny")
+        );
+        assert_eq!(
+            resolve_sherpa_voice("..\\jenny", &root),
+            unknown("..\\jenny")
+        );
+        let non_bundle = root.join("broken").to_string_lossy().to_string();
+        assert_eq!(
+            resolve_sherpa_voice(&non_bundle, &root),
+            unknown(&non_bundle)
+        );
+        // A bad speaker suffix on a good bundle is unknown as a WHOLE (never
+        // half-applied).
+        assert_eq!(
+            resolve_sherpa_voice("jenny:loud", &root),
+            unknown("jenny:loud")
+        );
+    }
+
+    /// Installed-bundle discovery is sorted and skips invalid folders.
+    #[test]
+    fn installed_bundles_listing_is_sorted_and_valid_only() {
+        let tmp = TestDir::new();
+        let root = tmp.path().join("models/tts");
+        seed_bundle(&root, "zeta");
+        seed_bundle(&root, "alpha");
+        fs::create_dir_all(root.join("not-a-bundle")).unwrap();
+        fs::create_dir_all(root.join("espeak-ng-data")).unwrap();
+        assert_eq!(installed_sherpa_bundles(&root), vec!["alpha", "zeta"]);
+        // Missing root = no voices, no error.
+        assert_eq!(
+            installed_sherpa_bundles(&tmp.path().join("nowhere")),
+            Vec::<String>::new()
+        );
+    }
+
+    /// LRU semantics: capacity 3, access refreshes recency, the least
+    /// recently used entry is evicted, a failed load caches nothing.
+    #[test]
+    fn lru_cache_evicts_least_recently_used() {
+        let mut cache: LruCache<u32> = LruCache::new(3);
+        let (a, b, c, d) = (
+            PathBuf::from("a"),
+            PathBuf::from("b"),
+            PathBuf::from("c"),
+            PathBuf::from("d"),
+        );
+        let loads = std::cell::Cell::new(0usize);
+        let get = |cache: &mut LruCache<u32>, key: &Path, value: u32| -> u32 {
+            *cache
+                .get_or_insert_with(key, || -> Result<u32, ()> {
+                    loads.set(loads.get() + 1);
+                    Ok(value)
+                })
+                .unwrap()
+        };
+        assert_eq!(get(&mut cache, &a, 1), 1);
+        assert_eq!(get(&mut cache, &b, 2), 2);
+        assert_eq!(get(&mut cache, &c, 3), 3);
+        assert_eq!(loads.get(), 3);
+        assert_eq!(cache.keys(), vec![c.as_path(), b.as_path(), a.as_path()]);
+
+        // Hit on `a` refreshes it (no reload) — `b` becomes LRU.
+        assert_eq!(get(&mut cache, &a, 99), 1, "hit returns the cached value");
+        assert_eq!(loads.get(), 3, "a hit never reloads");
+        assert_eq!(cache.keys(), vec![a.as_path(), c.as_path(), b.as_path()]);
+
+        // Insert `d` at capacity — `b` (LRU) is evicted.
+        assert_eq!(get(&mut cache, &d, 4), 4);
+        assert_eq!(loads.get(), 4);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.keys(), vec![d.as_path(), a.as_path(), c.as_path()]);
+
+        // Re-fetching the evicted `b` loads again.
+        assert_eq!(get(&mut cache, &b, 5), 5);
+        assert_eq!(loads.get(), 5);
+        assert_eq!(cache.keys(), vec![b.as_path(), d.as_path(), a.as_path()]);
+
+        // A failed load caches nothing and surfaces the error.
+        let e = PathBuf::from("e");
+        assert!(cache
+            .get_or_insert_with(&e, || Err::<u32, &str>("boom"))
+            .is_err());
+        assert_eq!(cache.len(), 3);
+        assert!(!cache.keys().contains(&e.as_path()));
     }
 
     #[test]
