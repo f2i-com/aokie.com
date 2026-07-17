@@ -2556,12 +2556,23 @@ impl Plugin {
                     None => {
                         let mut public = self.store.config.settings.clone();
                         public.remove("managerPin");
-                        Ok(json!({
+                        #[allow(unused_mut)]
+                        let mut resp = json!({
                             "settings": public,
                             "managerPinSet": pin_set,
                             "configVersion": self.store.config.config_version,
                             "configQuarantined": self.store.quarantined,
-                        }))
+                        });
+                        // Side-metadata (like managerPinSet): the per-engine
+                        // voice catalog for the console's engine-first voice
+                        // picker. Pure filesystem scan — never loads an
+                        // engine. Absent on non-voice builds; consumers
+                        // degrade to their built-in lists.
+                        #[cfg(feature = "voice")]
+                        {
+                            resp["ttsVoiceCatalog"] = crate::voice::tts_voice_catalog();
+                        }
+                        Ok(resp)
                     }
                 }
             }
