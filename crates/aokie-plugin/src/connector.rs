@@ -506,7 +506,9 @@ impl Plugin {
         // asks the audio-capable model to correct the on-device STT from the
         // turn's actual audio; the corrected text rides
         // aokie.call.turn.corrected and updates the transcript record.
-        // Meaningless without sendAudio's audio capture, so gated on it.
+        // INDEPENDENT of sendAudio (2026-07-17): the radio runs the per-turn
+        // audio capture whenever EITHER feature is on, so "corrections only"
+        // (text-only reply model) works without attaching audio to replies.
         let audio_transcript = self
             .store
             .config
@@ -514,7 +516,7 @@ impl Plugin {
             .get("audioTranscript")
             .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
             .unwrap_or(false);
-        if send_audio && audio_transcript {
+        if audio_transcript {
             std::env::set_var("AOKIE_AUDIO_TRANSCRIPT", "1");
             eprintln!(
                 "[aokie-plugin] audioTranscript ON → the audio model corrects each caller turn's transcript"
