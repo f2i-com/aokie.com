@@ -2008,6 +2008,24 @@ fn take_utt_audio(
     map.remove(pos).map(|(_, pcm)| pcm)
 }
 
+/// Audio-understanding lane gates (2026-07-17): `sendAudio` (attach the
+/// caller turn's PCM to the reply request) and `audioTranscript` (side-run
+/// a detached transcript-correction request) are INDEPENDENT settings —
+/// either may be on without the other. Both ride the same per-turn AUDIO
+/// CAPTURE machinery (utterance-id → PCM stash paired into the flushed
+/// turn), so capture runs when EITHER is on. Both are agent-mode features.
+/// Returns `(send_audio, audio_transcript, audio_capture)`.
+#[cfg(feature = "voice")]
+fn audio_lane_gates(
+    agent_enabled: bool,
+    send_audio_env: bool,
+    audio_transcript_env: bool,
+) -> (bool, bool, bool) {
+    let send_audio = agent_enabled && send_audio_env;
+    let audio_transcript = agent_enabled && audio_transcript_env;
+    (send_audio, audio_transcript, send_audio || audio_transcript)
+}
+
 /// Merge one utterance's PCM into its turn's accumulated audio, keeping the
 /// most recent 30 s (the WAV cap the LLM request also uses).
 #[cfg(feature = "voice")]
@@ -5857,15 +5875,20 @@ fn run_loop(
     // alongside the transcript — for audio-capable models (Gemma 3n /
     // Qwen2-Audio class). The snapshot is taken where the utterance is sent
     // to STT; capped at ~30 s so a rambling turn can't balloon the request.
-    #[cfg(feature = "voice")]
-    let send_audio = agent_enabled && std::env::var_os("AOKIE_SEND_AUDIO").is_some();
+    //
     // audioTranscript: after each caller turn a small DETACHED request asks
     // the audio model to correct the STT from the turn's audio; results ride
     // this channel back (tagged with their call id + turn, so a correction
-    // for an ENDED call still lands on its transcript row). Gated on
-    // send_audio - without the audio capture there is nothing to hear.
+    // for an ENDED call still lands on its transcript row). INDEPENDENT of
+    // sendAudio (2026-07-17): "corrections only" (text-only reply model) and
+    // "direct audio only" (no side run) both work — the shared per-turn
+    // AUDIO CAPTURE machinery runs when either is on (`audio_capture`).
     #[cfg(feature = "voice")]
-    let audio_transcript = send_audio && std::env::var_os("AOKIE_AUDIO_TRANSCRIPT").is_some();
+    let (send_audio, audio_transcript, audio_capture) = audio_lane_gates(
+        agent_enabled,
+        std::env::var_os("AOKIE_SEND_AUDIO").is_some(),
+        std::env::var_os("AOKIE_AUDIO_TRANSCRIPT").is_some(),
+    );
     #[cfg(feature = "voice")]
     let (heard_tx, heard_rx) = std::sync::mpsc::channel::<(String, u32, String, String)>();
     // Correction-lane client override (2026-07-17 latency round): an optional
@@ -5883,9 +5906,9 @@ fn run_loop(
     if screen_policy.is_active() {
         eprintln!("[aokie-plugin] call screening ACTIVE (block list / accept pattern / private-number policy)");
     }
-    // sendAudio: utterance-id → PCM, written at every STT send and consumed
-    // by the result drains into the pending turn (exact pairing — see
-    // PendingTurn::audio).
+    // Audio capture (sendAudio OR audioTranscript): utterance-id → PCM,
+    // written at every STT send and consumed by the result drains into the
+    // pending turn (exact pairing — see PendingTurn::audio).
     #[cfg(feature = "voice")]
     let mut utt_audio: std::collections::VecDeque<(u32, Vec<i16>)> = Default::default();
     // When AOKIE_AGENT_HANGUP is set (the `agentHangup` setting) the agent ends
@@ -6140,7 +6163,7 @@ fn run_loop(
                         // waits for that result; never send it twice.
                     } else if let Some(s) = tracker.current_mut() {
                         let utterance = s.next_utterance_id();
-                        if send_audio {
+                        if audio_capture {
                             stash_utt_audio(&mut utt_audio, utterance, &stt_buf);
                         }
                         if stt_tx
@@ -9154,7 +9177,7 @@ fn run_loop(
             {
                 if let Some(s) = tracker.current_mut() {
                     let utterance = s.next_utterance_id();
-                    if send_audio {
+                    if audio_capture {
                         stash_utt_audio(&mut utt_audio, utterance, &stt_buf);
                     }
                     if stt_tx
@@ -9182,7 +9205,7 @@ fn run_loop(
                     // Stamp the job with the call it belongs to (audit C-05).
                     if let Some(s) = tracker.current_mut() {
                         let utterance = s.next_utterance_id();
-                        if send_audio {
+                        if audio_capture {
                             stash_utt_audio(&mut utt_audio, utterance, &stt_buf);
                         }
                         if stt_tx
@@ -9881,7 +9904,9 @@ fn run_loop(
                     // Every caller turn with audio becomes the next turn's
                     // continuity context (hesitations included — their audio
                     // is real), tracked AFTER the spawn read the previous one.
-                    if send_audio && !ctx.last_turn_audio.is_empty() {
+                    // Capture-gated (not sendAudio): the only consumer is the
+                    // correction lane's split-utterance continuity prepend.
+                    if audio_capture && !ctx.last_turn_audio.is_empty() {
                         ctx.prev_heard =
                             Some((ctx.last_turn_audio.clone(), text.clone(), Instant::now()));
                     }
@@ -13634,6 +13659,24 @@ mod tests {
 
     #[cfg(feature = "voice")]
     use std::time::{Duration as D, Instant};
+
+    /// sendAudio and audioTranscript are INDEPENDENT (2026-07-17): either
+    /// alone must arm the shared per-turn audio capture; the attach gate
+    /// stays sendAudio-only and the correction gate audioTranscript-only.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn audio_lanes_are_independently_selectable() {
+        // (agent, sendAudio env, audioTranscript env) → (attach, correct, capture)
+        assert_eq!(audio_lane_gates(true, false, false), (false, false, false));
+        // Direct audio only: attach + capture, NO side-run corrections.
+        assert_eq!(audio_lane_gates(true, true, false), (true, false, true));
+        // Corrections only (text-only reply model): capture still runs so
+        // the correction lane has PCM to hear — no reply attach.
+        assert_eq!(audio_lane_gates(true, false, true), (false, true, true));
+        assert_eq!(audio_lane_gates(true, true, true), (true, true, true));
+        // Both are agent-mode features: nothing arms without the agent.
+        assert_eq!(audio_lane_gates(false, true, true), (false, false, false));
+    }
 
     /// The reply watchdog names WHICH deadline expired: first-activity (the
     /// endpoint accepted but never produced stream data), idle (mid-stream
