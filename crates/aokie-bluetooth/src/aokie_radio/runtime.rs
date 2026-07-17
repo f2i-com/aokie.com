@@ -1209,13 +1209,19 @@ fn note_acl_corruption(
                 .to_string(),
         ));
     } else if times.len() >= 3 && *reported == 0 {
+        // SOFT tier (2026-07-17, user request): a self-recovered hiccup is
+        // NOT an error — the old RuntimeEvent::Error here rippled into a
+        // degraded plugin.health, a durable aokie.hardware.error (outbox row
+        // + host ack), a Hardware Events record and TWO console toasts,
+        // ~2×/day under normal load, for something already handled. Keep the
+        // `reported = 1` latch (it is what makes a FOLLOWING dense burst
+        // raise the hard power-cycle report exactly once) and log locally;
+        // per-incident forensics stay in the per-resync log lines.
         *reported = 1;
-        let _ = event_tx.send(RuntimeEvent::Error(
-            "Bluetooth dongle USB stream hiccuped (garbage in reads) but recovered - a call's \
-             audio may have glitched. If calls go silent or drop, power-cycle the dongle: \
-             unplug it, wait 5 seconds, plug it back in"
-                .to_string(),
-        ));
+        eprintln!(
+            "[AokieRadio] ACL corruption: 3 garbage-prefix resyncs inside 10min - dongle \
+             marginal under load but recovered; a dense burst will raise the power-cycle error"
+        );
     }
 }
 
@@ -5686,7 +5692,11 @@ mod tests {
     #[test]
     fn acl_corruption_slow_accumulation_is_a_recovered_hiccup_then_escalates() {
         // Three resyncs SPREAD across minutes = marginal-under-load, not a
-        // wedge (live 2026-07-15: the line kept working) — soft notice only.
+        // wedge (live 2026-07-15: the line kept working). Since 2026-07-17
+        // the soft tier is LOG-ONLY — a self-recovered hiccup must not
+        // degrade health, write a Hardware Events row, or toast (it fired
+        // ~2×/day for a non-event). The latch must still arm so a FOLLOWING
+        // dense burst raises the hard power-cycle report exactly once.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut times = std::collections::VecDeque::new();
         let mut reported: u8 = 0;
@@ -5704,16 +5714,13 @@ mod tests {
             &tx,
             t0 + Duration::from_secs(360),
         );
-        match rx.try_recv() {
-            Ok(RuntimeEvent::Error(msg)) => {
-                assert!(
-                    msg.contains("recovered"),
-                    "sparse resyncs report the soft notice: {msg}"
-                );
-            }
-            other => panic!("expected the soft notice, got {other:?}"),
-        }
-        // A dense burst AFTER the soft notice escalates to the hard report.
+        assert!(
+            rx.try_recv().is_err(),
+            "a recovered hiccup must stay off the event channel (soft tier is log-only)"
+        );
+        assert_eq!(reported, 1, "the escalation latch still arms");
+        // A dense burst AFTER the (silent) soft episode escalates to the
+        // hard report — this is what the latch preserves.
         let burst = t0 + Duration::from_secs(400);
         note_acl_corruption(&mut times, &mut reported, &tx, burst);
         note_acl_corruption(
