@@ -159,10 +159,12 @@ impl LlmClient {
             .client
             .as_ref()
             .map_err(|reason| format!("llm endpoint rejected: {reason}"))?;
-        let resp = client
-            .post(&self.endpoint)
-            .json(&body)
-            .send()
+        let resp = crate::endpoint_http::with_gateway_bearer(
+            client.post(&self.endpoint),
+            &self.endpoint,
+        )
+        .json(&body)
+        .send()
             .map_err(|e| format!("llm warm failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("llm warm responded {}", resp.status()));
@@ -221,10 +223,12 @@ impl LlmClient {
             .client
             .as_ref()
             .map_err(|reason| format!("llm endpoint rejected: {reason}"))?;
-        let resp = client
-            .post(&self.endpoint)
-            .json(&body)
-            .send()
+        let resp = crate::endpoint_http::with_gateway_bearer(
+            client.post(&self.endpoint),
+            &self.endpoint,
+        )
+        .json(&body)
+        .send()
             .map_err(|e| format!("transcript correction failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("transcript correction responded {}", resp.status()));
@@ -305,10 +309,12 @@ impl LlmClient {
             .client
             .as_ref()
             .map_err(|reason| format!("llm endpoint rejected: {reason}"))?;
-        let resp = client
-            .post(&self.endpoint)
-            .json(&body)
-            .send()
+        let resp = crate::endpoint_http::with_gateway_bearer(
+            client.post(&self.endpoint),
+            &self.endpoint,
+        )
+        .json(&body)
+        .send()
             .map_err(|e| format!("llm request failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("llm responded {}", resp.status()));
@@ -669,8 +675,7 @@ mod tests {
 /// First model id advertised at `<endpoint>/../models`.
 fn discover_model(client: &reqwest::blocking::Client, chat_endpoint: &str) -> Option<String> {
     let url = chat_endpoint.replace("/chat/completions", "/models");
-    let resp = client
-        .get(&url)
+    let resp = crate::endpoint_http::with_gateway_bearer(client.get(&url), &url)
         .timeout(Duration::from_secs(4))
         .send()
         .ok()?;
@@ -717,8 +722,7 @@ pub fn discover_endpoint(configured: Option<&str>) -> Option<String> {
             continue;
         };
         let models = ep.replace("/chat/completions", "/models");
-        if client
-            .get(&models)
+        if crate::endpoint_http::with_gateway_bearer(client.get(&models), &models)
             .send()
             .map(|r| r.status().is_success())
             .unwrap_or(false)

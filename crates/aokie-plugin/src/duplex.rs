@@ -231,6 +231,11 @@ pub fn is_backchannel(text: &str) -> bool {
                 | "that's"
                 | "thats"
                 | "so"
+                // "thank you so MUCH" / "thanks VERY much" — live call
+                // 066d2237: "Thank you so much." read as substantive (4
+                // non-backchannel-listed words) and cut the goodbye.
+                | "much"
+                | "very"
         )
     })
 }
@@ -492,7 +497,16 @@ pub fn shadow_floor_decision(ev: &FloorEvidence) -> (FloorDecision, &'static str
             | CallerIntent::Repeat
             | CallerIntent::RepeatSlower
             | CallerIntent::Resume => {
-                return (FloorDecision::YieldAtBoundary, "pace_or_replay_command")
+                // Convenience commands yield only for speech that began during
+                // THIS reply's playback — a probe result covering the tail of
+                // the caller's own ALREADY-ANSWERED turn must not cut the
+                // reply answering it (live call 066d2237: "Sorry. Sorry"
+                // classified 137 ms into the next reply). Stop/wait keep
+                // their unconditional path above — going quiet is always safe.
+                if !ev.speech_began_in_reply {
+                    return (FloorDecision::Continue, "stale_or_pre_reply");
+                }
+                return (FloorDecision::YieldAtBoundary, "pace_or_replay_command");
             }
             CallerIntent::Content => {}
         }
@@ -650,6 +664,36 @@ mod floor_shadow_tests {
         assert_eq!(
             shadow_floor_decision(&echo),
             (FloorDecision::Continue, "short_or_echo")
+        );
+        // A pace/replay command whose AUDIO predates the reply: the tail of
+        // an already-answered turn, never a yield (066d2237 "Sorry. Sorry").
+        let stale_cmd = FloorEvidence {
+            stable_text: "say that again".into(),
+            speech_began_in_reply: false,
+            ..ev()
+        };
+        assert_eq!(
+            shadow_floor_decision(&stale_cmd),
+            (FloorDecision::Continue, "stale_or_pre_reply")
+        );
+        // The same command spoken DURING the reply still yields.
+        let live_cmd = FloorEvidence {
+            stable_text: "say that again".into(),
+            ..ev()
+        };
+        assert_eq!(
+            shadow_floor_decision(&live_cmd),
+            (FloorDecision::YieldAtBoundary, "pace_or_replay_command")
+        );
+        // "Thank you so much" is a goodbye-class backchannel — Duck, never a
+        // substantive cut (066d2237 cut the goodbye on exactly this).
+        let thanks = FloorEvidence {
+            stable_text: "Thank you so much.".into(),
+            ..ev()
+        };
+        assert_eq!(
+            shadow_floor_decision(&thanks),
+            (FloorDecision::Duck, "short_backchannel")
         );
         // Substantive text whose AUDIO predates the reply: pre-reply residue,
         // never a cut (the 20563f53 self-echo class, now inside the decision).

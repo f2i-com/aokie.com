@@ -106,6 +106,42 @@ fn f32_to_i16(samples: &[f32]) -> Vec<i16> {
         .collect()
 }
 
+/// Attenuate-only loudness guard for one-shot engines (sherpa/Piper): VITS
+/// output is un-normalized and routinely sits near (or beyond) full scale.
+/// Hard-clipping at the i16 conversion adds nonlinear products a linear echo
+/// canceller cannot model, and a hotter far-end raises the AEC residual
+/// against the fixed capture gates — the sherpa false-barge class from live
+/// call 066d2237. Scales the whole utterance down so peak ≤ 0.85 and
+/// RMS ≤ 0.12; never amplifies, silence passes untouched. Returns the gain.
+fn loudness_guard(samples: &mut [f32]) -> f32 {
+    if samples.is_empty() {
+        return 1.0;
+    }
+    let mut peak = 0f32;
+    let mut sum_sq = 0f64;
+    for &s in samples.iter() {
+        peak = peak.max(s.abs());
+        sum_sq += (s as f64) * (s as f64);
+    }
+    if peak <= 0.0 {
+        return 1.0;
+    }
+    let rms = (sum_sq / samples.len() as f64).sqrt() as f32;
+    let mut scale = 1.0f32;
+    if peak > 0.85 {
+        scale = scale.min(0.85 / peak);
+    }
+    if rms > 0.12 {
+        scale = scale.min(0.12 / rms);
+    }
+    if scale < 1.0 {
+        for s in samples.iter_mut() {
+            *s *= scale;
+        }
+    }
+    scale
+}
+
 /// Sherpa voice selection is a numeric speaker id; anything else (a leftover
 /// Pocket-TTS preset name like "alba") would warn on every span, so map it to
 /// "" (= the bundle's default speaker) here.
@@ -199,7 +235,8 @@ impl TtsEngine {
                 Ok(f32_to_i16(&resampled))
             }
             TtsBackend::Sherpa(rt) => {
-                let audio = rt.synthesize(text, sherpa_voice(voice))?;
+                let mut audio = rt.synthesize(text, sherpa_voice(voice))?;
+                loudness_guard(&mut audio.samples);
                 let resampled = crate::speech_wire::resample_linear(
                     &audio.samples,
                     audio.sample_rate,
@@ -229,7 +266,8 @@ impl TtsEngine {
                 Ok((f32_to_i16(&f32_samples), self.native_rate))
             }
             TtsBackend::Sherpa(rt) => {
-                let audio = rt.synthesize(text, sherpa_voice(voice))?;
+                let mut audio = rt.synthesize(text, sherpa_voice(voice))?;
+                loudness_guard(&mut audio.samples);
                 Ok((f32_to_i16(&audio.samples), audio.sample_rate))
             }
         }
@@ -268,7 +306,11 @@ impl TtsEngine {
                 Ok(total)
             }
             TtsBackend::Sherpa(rt) => {
-                let audio = rt.synthesize(text, sherpa_voice(voice))?;
+                let mut audio = rt.synthesize(text, sherpa_voice(voice))?;
+                let gain = loudness_guard(&mut audio.samples);
+                if gain < 0.9 {
+                    eprintln!("[aokie-plugin] sherpa loudness guard: x{gain:.2}");
+                }
                 let resampled = crate::speech_wire::resample_linear(
                     &audio.samples,
                     audio.sample_rate,
@@ -331,6 +373,94 @@ fn dir_has_onnx(dir: &Path) -> bool {
                 .any(|e| e.path().extension().is_some_and(|x| x == "onnx"))
         })
         .unwrap_or(false)
+}
+
+/// Installed Pocket-TTS voice preset names: the basenames of
+/// `<app_data>/models/pocket_tts_onnx/voices/*.{safetensors,wav}`, deduped and
+/// sorted. Empty when the bundle (or app_data) is missing — the console falls
+/// back to its built-in list.
+pub fn pocket_voice_names() -> Vec<String> {
+    let Some(app_data) = aokie_core::paths::app_data_dir() else {
+        return Vec::new();
+    };
+    let dir = app_data
+        .join("models")
+        .join("pocket_tts_onnx")
+        .join("voices");
+    let mut names = std::collections::BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_file() {
+                continue;
+            }
+            let preset = p
+                .extension()
+                .is_some_and(|x| x == "safetensors" || x == "wav");
+            if !preset {
+                continue;
+            }
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                if !stem.is_empty() {
+                    names.insert(stem.to_string());
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// The console's per-engine voice catalog (`settings.get` →
+/// `ttsVoiceCatalog`): pocket voice preset names + installed sherpa voice
+/// bundles under the scan root, plus the currently-configured
+/// `AOKIE_TTS_MODEL_DIR` when it's a valid bundle OUTSIDE the scan root (the
+/// E:\models\piper class). Pure filesystem — never loads an engine.
+pub fn tts_voice_catalog() -> serde_json::Value {
+    let scan_root = aokie_core::paths::app_data_dir().map(|d| d.join("models").join("tts"));
+    let is_bundle = |p: &Path| p.is_dir() && p.join("tokens.txt").is_file() && dir_has_onnx(p);
+    let bundle_json = |p: &Path| {
+        serde_json::json!({
+            "dir": p.to_string_lossy(),
+            "name": p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            "kind": if p.join("voices.bin").is_file() { "kokoro" } else { "vits" },
+        })
+    };
+    let mut bundles: Vec<PathBuf> = scan_root
+        .as_deref()
+        .and_then(|root| std::fs::read_dir(root).ok())
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| is_bundle(p))
+                .collect()
+        })
+        .unwrap_or_default();
+    bundles.sort();
+    if let Ok(v) = std::env::var("AOKIE_TTS_MODEL_DIR") {
+        let configured = PathBuf::from(v.trim());
+        if !v.trim().is_empty() && is_bundle(&configured) && !bundles.contains(&configured) {
+            bundles.push(configured);
+        }
+    }
+    serde_json::json!({
+        "engines": [
+            {
+                "id": "pocket",
+                "label": "Pocket-TTS",
+                "voices": pocket_voice_names(),
+            },
+            {
+                "id": "sherpa",
+                "label": "Sherpa (Piper/VITS/Kokoro)",
+                "bundles": bundles.iter().map(|p| bundle_json(p)).collect::<Vec<_>>(),
+                "scanRoot": scan_root
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            },
+        ],
+    })
 }
 
 /// Compose the sherpa engine config from a voice-bundle folder, following the
@@ -636,6 +766,31 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("model files are missing"));
+    }
+
+    /// The sherpa loudness guard attenuates hot/clipping output but never
+    /// touches normal-level or silent audio (attenuate-only by design).
+    #[test]
+    fn loudness_guard_attenuates_hot_output_only() {
+        // Silence: untouched.
+        let mut silence = vec![0.0f32; 4_000];
+        assert_eq!(loudness_guard(&mut silence), 1.0);
+        assert!(silence.iter().all(|&s| s == 0.0));
+        // Normal speech level (peak ~0.4, rms well under 0.12): untouched.
+        let mut normal: Vec<f32> = (0..4_000)
+            .map(|i| (i as f32 * 0.05).sin() * 0.15)
+            .collect();
+        assert_eq!(loudness_guard(&mut normal), 1.0);
+        // Hot Piper-class output (peak beyond full scale): peak capped ≤0.85,
+        // rms capped ≤0.12.
+        let mut hot: Vec<f32> = (0..4_000).map(|i| (i as f32 * 0.05).sin() * 1.4).collect();
+        let gain = loudness_guard(&mut hot);
+        assert!(gain < 1.0);
+        let peak = hot.iter().fold(0f32, |a, &s| a.max(s.abs()));
+        let rms =
+            (hot.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / hot.len() as f64).sqrt();
+        assert!(peak <= 0.85 + 1e-4, "peak {peak}");
+        assert!(rms <= 0.12 + 1e-4, "rms {rms}");
     }
 
     /// ttsEngine setting values map deterministically; unknown never breaks

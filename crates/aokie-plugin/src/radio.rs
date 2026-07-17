@@ -2297,6 +2297,15 @@ enum SttWork {
     /// arrives as a normal `Utterance` at its endpoint.
     Probe {
         generation: u64,
+        /// Which probe consumer this snapshot belongs to (066d2237 stale-probe
+        /// fencing): results echo it back in `SttResult::utterance`, and each
+        /// consumer drops results carrying a foreign lane id. Sherpa-fast
+        /// replies exposed the race — a probe covering the caller's ALREADY-
+        /// ANSWERED previous turn landed after the next reply's lane armed and
+        /// was credited as live overlap, cutting the very reply answering it.
+        /// Lane 0 = the main loop's live-hypothesis lane; playback
+        /// [`SttProbeLane`]s allocate unique ids from [`PROBE_LANE_SEQ`].
+        lane: u32,
         samples: Vec<f32>,
     },
     Configure {
@@ -2323,6 +2332,12 @@ struct SttResult {
 #[cfg(feature = "voice")]
 pub(crate) struct HttpTtsRuntime {
     fallback: HttpSpeechFallback,
+    /// VOX-404: the endpoint answered a streaming-PCM attempt with a
+    /// non-streaming response this call (non-200 / no `X-Sample-Rate`) —
+    /// spec-compliant third parties do exactly that, so don't burn an extra
+    /// request per span re-asking; go straight to the whole-utterance wav
+    /// path until the next call / reconfigure.
+    pcm_stream_unsupported: bool,
 }
 
 #[cfg(feature = "voice")]
@@ -2330,15 +2345,28 @@ impl HttpTtsRuntime {
     pub(crate) fn from_env(var: &str) -> Self {
         Self {
             fallback: HttpSpeechFallback::from_env(var),
+            pcm_stream_unsupported: false,
         }
     }
 
     pub(crate) fn configure(&mut self, endpoint: Option<String>) {
         self.fallback.configure(endpoint);
+        self.pcm_stream_unsupported = false;
     }
 
     pub(crate) fn reset_call(&mut self) {
         self.fallback.reset_call();
+        self.pcm_stream_unsupported = false;
+    }
+
+    /// Whether a span should attempt the streaming-PCM request first.
+    pub(crate) fn pcm_streaming_enabled_for_call(&self) -> bool {
+        !self.pcm_stream_unsupported
+    }
+
+    /// Remember (per call) that the endpoint doesn't stream PCM.
+    pub(crate) fn mark_pcm_stream_unsupported(&mut self) {
+        self.pcm_stream_unsupported = true;
     }
 
     pub(crate) fn endpoint_for_call(&self) -> Option<String> {
@@ -2372,6 +2400,11 @@ fn http_speech_client(endpoint: &str) -> Result<reqwest::blocking::Client, Strin
     crate::endpoint_http::client_for(endpoint, std::time::Duration::from_secs(30), None)
 }
 
+/// OpenAI-spec STT (VOX-403): `POST <endpoint>` as `multipart/form-data` with
+/// a `file` part (audio.wav — 16 kHz mono PCM16 WAV) + `response_format=json`,
+/// expecting `{"text": …}` back. This is the `/v1/audio/transcriptions` wire
+/// shape, so ANY OpenAI-compatible STT server works; the legacy base64-JSON
+/// body is gone (the aokie services accept multipart too).
 #[cfg(feature = "voice")]
 fn http_stt_transcribe(
     client: &reqwest::blocking::Client,
@@ -2383,13 +2416,9 @@ fn http_stt_transcribe(
         .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
         .collect();
     let wav = crate::speech_wire::encode_wav_pcm16_mono(&pcm, 16_000);
-    let audio = format!(
-        "data:audio/wav;base64,{}",
-        crate::speech_wire::base64_encode(&wav)
-    );
-    let resp = client
-        .post(endpoint)
-        .json(&serde_json::json!({ "audio": audio }))
+    let form = stt_multipart_form(wav).map_err(|e| format!("stt multipart build failed: {e}"))?;
+    let resp = crate::endpoint_http::with_gateway_bearer(client.post(endpoint), endpoint)
+        .multipart(form)
         .send()
         .map_err(|e| format!("stt http request failed: {e}"))?;
     if !resp.status().is_success() {
@@ -2405,6 +2434,23 @@ fn http_stt_transcribe(
         .to_string())
 }
 
+/// The OpenAI transcription multipart body: `file` (audio.wav, audio/wav) +
+/// `response_format=json`. Extracted so the request shape stays testable.
+#[cfg(feature = "voice")]
+fn stt_multipart_form(wav: Vec<u8>) -> Result<reqwest::blocking::multipart::Form, String> {
+    let file = reqwest::blocking::multipart::Part::bytes(wav)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| e.to_string())?;
+    Ok(reqwest::blocking::multipart::Form::new()
+        .part("file", file)
+        .text("response_format", "json"))
+}
+
+/// Whole-utterance OpenAI-spec TTS: `POST` JSON `{input, voice,
+/// response_format:"wav"}`, accepting raw audio bytes back (or, tolerated,
+/// JSON `{b64_json|audio}` base64). The fallback rung under the streaming-PCM
+/// attempt ([`http_tts_stream_pcm_at`]).
 #[cfg(feature = "voice")]
 fn http_tts_synthesize(
     client: &reqwest::blocking::Client,
@@ -2412,9 +2458,8 @@ fn http_tts_synthesize(
     text: &str,
     voice: &str,
 ) -> Result<crate::speech_wire::WavPcm, String> {
-    let resp = client
-        .post(endpoint)
-        .json(&serde_json::json!({ "input": text, "voice": voice }))
+    let resp = crate::endpoint_http::with_gateway_bearer(client.post(endpoint), endpoint)
+        .json(&serde_json::json!({ "input": text, "voice": voice, "response_format": "wav" }))
         .send()
         .map_err(|e| format!("tts http request failed: {e}"))?;
     if !resp.status().is_success() {
@@ -2453,6 +2498,245 @@ fn decode_tts_json_audio(bytes: &[u8]) -> Result<Vec<u8>, String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "tts http JSON response missing b64_json/audio".to_string())?;
     crate::speech_wire::base64_decode_text(audio)
+}
+
+/// Outcome of one streaming-PCM TTS attempt ([`http_tts_stream_pcm_at`]).
+/// The variants encode the fallback ladder: `Unsupported` = nothing was
+/// consumed, try the whole-utterance wav request; `FailedMidStream` = audio
+/// already reached the caller's ear, the span must FAIL (re-synthesizing it
+/// would double-speak the prefix); `Aborted` = the consumer stopped it
+/// (epoch moved — dropping the connection is the cancel signal the server
+/// sees); `Streamed` = the span completed.
+#[cfg(feature = "voice")]
+pub(crate) enum HttpTtsStream {
+    Streamed,
+    Aborted,
+    Unsupported(String),
+    FailedMidStream(String),
+}
+
+/// Incremental PCM16LE → target-rate block chunker (VOX-404). Feed raw body
+/// bytes as they arrive; it carries the odd trailing byte across reads,
+/// accumulates ~240 ms of SOURCE-rate samples, and emits blocks already
+/// resampled to the SCO rate — the same block granularity the synth worker's
+/// local streaming path ships. Pure (no IO) so the slicing/resample decision
+/// is unit-testable.
+#[cfg(feature = "voice")]
+pub(crate) struct PcmStreamChunker {
+    src_rate: u32,
+    target_rate: u32,
+    /// Source-rate samples not yet emitted.
+    pending: Vec<i16>,
+    /// A dangling low byte when a read split an i16 sample.
+    carry: Option<u8>,
+    /// Emit threshold in SOURCE-rate samples (~240 ms).
+    block: usize,
+}
+
+#[cfg(feature = "voice")]
+impl PcmStreamChunker {
+    pub(crate) fn new(src_rate: u32, target_rate: u32) -> Self {
+        Self {
+            src_rate,
+            target_rate,
+            pending: Vec::new(),
+            carry: None,
+            block: (src_rate as usize / 4).max(160),
+        }
+    }
+
+    fn resample(&self, samples: &[i16]) -> Vec<i16> {
+        if self.src_rate == self.target_rate {
+            samples.to_vec()
+        } else {
+            crate::speech_wire::resample_i16_mono(samples, self.src_rate, self.target_rate)
+        }
+    }
+
+    /// Feed raw bytes; returns zero or more target-rate blocks ready to ship.
+    pub(crate) fn push(&mut self, mut bytes: &[u8]) -> Vec<Vec<i16>> {
+        if let Some(lo) = self.carry.take() {
+            if let Some((&hi, rest)) = bytes.split_first() {
+                self.pending.push(i16::from_le_bytes([lo, hi]));
+                bytes = rest;
+            } else {
+                self.carry = Some(lo);
+                return Vec::new();
+            }
+        }
+        let mut iter = bytes.chunks_exact(2);
+        for pair in &mut iter {
+            self.pending.push(i16::from_le_bytes([pair[0], pair[1]]));
+        }
+        if let [lo] = iter.remainder() {
+            self.carry = Some(*lo);
+        }
+        let mut out = Vec::new();
+        while self.pending.len() >= self.block {
+            let chunk: Vec<i16> = self.pending.drain(..self.block).collect();
+            out.push(self.resample(&chunk));
+        }
+        out
+    }
+
+    /// Flush whatever remains at end-of-stream (a dangling odd byte is
+    /// dropped — a truncated final sample, not audio).
+    pub(crate) fn finish(&mut self) -> Option<Vec<i16>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let tail: Vec<i16> = std::mem::take(&mut self.pending);
+        Some(self.resample(&tail))
+    }
+}
+
+/// Streaming-PCM TTS attempt (VOX-404): `POST` JSON `{input, voice,
+/// response_format:"pcm"}`; a streaming server answers 200 with an
+/// `X-Sample-Rate` header and raw PCM16LE mono in the body, which is read
+/// INCREMENTALLY — each ~240 ms block is resampled to `target_rate` and
+/// handed to `on_block` as it arrives, so pointing `ttsEndpoint` at a
+/// service is no longer a whole-utterance latency hit. `on_block` returning
+/// `false` (epoch moved) drops the connection, which is how the server
+/// learns the span was cancelled. Non-200 / missing header = not a
+/// streaming server → [`HttpTtsStream::Unsupported`], nothing consumed.
+#[cfg(feature = "voice")]
+pub(crate) fn http_tts_stream_pcm_at(
+    endpoint: &str,
+    text: &str,
+    voice: &str,
+    target_rate: u32,
+    mut on_block: impl FnMut(Vec<i16>) -> bool,
+) -> HttpTtsStream {
+    use std::io::Read as _;
+    let client = match http_speech_client(endpoint) {
+        Ok(c) => c,
+        Err(e) => return HttpTtsStream::Unsupported(format!("TTS endpoint rejected ({e})")),
+    };
+    let resp = match crate::endpoint_http::with_gateway_bearer(client.post(endpoint), endpoint)
+        .json(&serde_json::json!({ "input": text, "voice": voice, "response_format": "pcm" }))
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => return HttpTtsStream::Unsupported(format!("tts stream request failed: {e}")),
+    };
+    if !resp.status().is_success() {
+        return HttpTtsStream::Unsupported(format!("tts stream responded {}", resp.status()));
+    }
+    let Some(src_rate) = resp
+        .headers()
+        .get("x-sample-rate")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&r| (4_000..=192_000).contains(&r))
+    else {
+        return HttpTtsStream::Unsupported(
+            "tts response has no usable X-Sample-Rate header (not a streaming-PCM server)"
+                .to_string(),
+        );
+    };
+    let mut chunker = PcmStreamChunker::new(src_rate, target_rate);
+    let mut body = resp;
+    let mut buf = [0u8; 8192];
+    let mut shipped = false;
+    loop {
+        match body.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                for block in chunker.push(&buf[..n]) {
+                    if !on_block(block) {
+                        return HttpTtsStream::Aborted;
+                    }
+                    shipped = true;
+                }
+            }
+            Err(e) => {
+                // Before any audio reached the pipeline the wav fallback can
+                // still speak the whole span; after, the span must fail.
+                return if shipped {
+                    HttpTtsStream::FailedMidStream(format!("tts stream died mid-span: {e}"))
+                } else {
+                    HttpTtsStream::Unsupported(format!("tts stream died before audio: {e}"))
+                };
+            }
+        }
+    }
+    if let Some(tail) = chunker.finish() {
+        if !on_block(tail) {
+            return HttpTtsStream::Aborted;
+        }
+        shipped = true;
+    }
+    if !shipped {
+        return HttpTtsStream::Unsupported("tts stream contained no audio".to_string());
+    }
+    HttpTtsStream::Streamed
+}
+
+#[cfg(all(test, feature = "voice"))]
+mod pcm_stream_chunker_tests {
+    use super::PcmStreamChunker;
+
+    fn le_bytes(samples: &[i16]) -> Vec<u8> {
+        samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn same_rate_blocks_pass_through_at_240ms_granularity() {
+        // 8 kHz → 8 kHz: block threshold = 2000 samples (~250 ms), no resample.
+        let mut c = PcmStreamChunker::new(8_000, 8_000);
+        let samples: Vec<i16> = (0..2_500).map(|i| i as i16).collect();
+        let blocks = c.push(&le_bytes(&samples));
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].len(), 2_000);
+        assert_eq!(blocks[0][..4], [0, 1, 2, 3]);
+        // The 500-sample remainder flushes at end-of-stream.
+        let tail = c.finish().expect("tail");
+        assert_eq!(tail.len(), 500);
+        assert_eq!(tail[0], 2_000);
+        assert!(c.finish().is_none());
+    }
+
+    #[test]
+    fn odd_byte_reads_carry_across_push_boundaries() {
+        // Split one i16 across two reads: no sample lost, none invented.
+        let mut c = PcmStreamChunker::new(8_000, 8_000);
+        let samples: Vec<i16> = (0..2_001).map(|i| i as i16).collect();
+        let bytes = le_bytes(&samples);
+        let (a, b) = bytes.split_at(3); // 1 whole sample + a dangling low byte
+        assert!(c.push(a).is_empty());
+        let blocks = c.push(b);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].len(), 2_000);
+        assert_eq!(blocks[0][..3], [0, 1, 2]); // the split sample survived intact
+        let tail = c.finish().expect("tail");
+        assert_eq!(tail, vec![2_000]);
+    }
+
+    #[test]
+    fn rate_mismatch_resamples_each_block_to_the_sco_rate() {
+        // 24 kHz source → 8 kHz SCO: a 6000-sample source block (~250 ms)
+        // lands as ~2000 target samples — the resample decision is per block.
+        let mut c = PcmStreamChunker::new(24_000, 8_000);
+        let samples: Vec<i16> = vec![100; 6_000];
+        let blocks = c.push(&le_bytes(&samples));
+        assert_eq!(blocks.len(), 1);
+        let n = blocks[0].len();
+        assert!((1_900..=2_100).contains(&n), "got {n} samples");
+        assert!(blocks[0].iter().all(|&s| (s - 100).abs() <= 1));
+    }
+
+    #[test]
+    fn trailing_odd_byte_is_dropped_not_fabricated() {
+        let mut c = PcmStreamChunker::new(8_000, 8_000);
+        assert!(c.push(&[0x01]).is_empty()); // half a sample only
+        assert!(c.finish().is_none());
+    }
+
+    #[test]
+    fn stt_multipart_form_builds_with_wav_part() {
+        let wav = crate::speech_wire::encode_wav_pcm16_mono(&[0i16; 160], 16_000);
+        assert!(super::stt_multipart_form(wav).is_ok());
+    }
 }
 
 /// Feed one captured mic chunk through the echo canceller and update the
@@ -3722,12 +4006,26 @@ fn may_queue_more(
 /// to a hard floor command ("wait"/"stop") cuts playback MID-SENTENCE — even
 /// through a protected span. Probes never touch the content buffer; the full
 /// utterance still arrives at its normal endpoint.
+/// Monotonic probe-lane id source (066d2237 stale-probe fencing). Lane 0 is
+/// reserved for the main loop's live-hypothesis lane; playback lanes start
+/// at 1. Each lane only ever consumes results carrying ITS id, so a probe of
+/// the caller's previous (already-answered) utterance can never be credited
+/// as live overlap by the NEXT reply's lane.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+static PROBE_LANE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// The live-hypothesis lane's fixed probe-lane id (main loop, bot silent).
+#[cfg(all(target_os = "windows", feature = "voice"))]
+const LIVE_HYP_LANE: u32 = 0;
+
 #[cfg(all(target_os = "windows", feature = "voice"))]
 struct SttProbeLane<'a> {
     stt_tx: &'a std::sync::mpsc::Sender<SttWork>,
     results: &'a std::sync::mpsc::Receiver<SttResult>,
     status: &'a RadioStatus,
     generation: u64,
+    /// This lane's unique probe id — results with a foreign id are dropped.
+    lane_id: u32,
     last_probe_at: Option<std::time::Instant>,
     probed_len: usize,
     in_flight: u32,
@@ -3760,13 +4058,17 @@ impl<'a> SttProbeLane<'a> {
     ) -> Self {
         // Discard results from a PREVIOUS span: a "wait" heard over sentence
         // 3 must not cut sentence 4 seconds later — probes are instant-or-
-        // nothing; the turn-level grammar still catches the command.
+        // nothing; the turn-level grammar still catches the command. The
+        // unique lane id below covers the residual race this drain cannot: a
+        // probe still IN FLIGHT here lands after construction and would
+        // otherwise be credited to this lane (066d2237).
         while results.try_recv().is_ok() {}
         Self {
             stt_tx,
             results,
             status,
             generation,
+            lane_id: PROBE_LANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             last_probe_at: None,
             probed_len: 0,
             in_flight: 0,
@@ -3885,6 +4187,7 @@ impl<'a> SttProbeLane<'a> {
         self.status.probes_sent.fetch_add(1, Ordering::Relaxed);
         let _ = self.stt_tx.send(SttWork::Probe {
             generation: self.generation,
+            lane: self.lane_id,
             samples: snapshot,
         });
     }
@@ -3894,6 +4197,13 @@ impl<'a> SttProbeLane<'a> {
     /// current scratchpad content (latest, longest partial wins).
     fn drain(&mut self) {
         while let Ok(res) = self.results.try_recv() {
+            // A foreign lane's result (a probe sent by a PREVIOUS reply's
+            // lane, still in flight when this lane was built) is not ours:
+            // it neither clears our in-flight slot nor feeds our content —
+            // crediting it cut two live replies on call 066d2237.
+            if res.utterance != self.lane_id {
+                continue;
+            }
             self.in_flight = self.in_flight.saturating_sub(1);
             if res.generation != self.generation {
                 continue;
@@ -5208,7 +5518,7 @@ fn run_loop(
                     // answered on the probe channel, generation-gated like
                     // everything else. Best-effort — a failed probe is silence,
                     // never an error path.
-                    if let SttWork::Probe { generation, samples } = &work {
+                    if let SttWork::Probe { generation, lane, samples } = &work {
                         if stt_disabled || *generation != worker_gen.load(Ordering::Relaxed) {
                             continue;
                         }
@@ -5233,7 +5543,10 @@ fn run_loop(
                                 Ok(text) if !text.is_empty() => {
                                     let _ = probe_tx.send(SttResult {
                                         generation: *generation,
-                                        utterance: 0,
+                                        // Echo the probe's LANE id so each
+                                        // consumer can drop foreign results
+                                        // (stale-probe fencing, 066d2237).
+                                        utterance: *lane,
                                         text,
                                     });
                                 }
@@ -8922,6 +9235,7 @@ fn run_loop(
                         if stt_tx
                             .send(SttWork::Probe {
                                 generation: sess.generation,
+                                lane: LIVE_HYP_LANE,
                                 samples: stt_buf[from..].to_vec(),
                             })
                             .is_ok()
@@ -8934,6 +9248,12 @@ fn run_loop(
                     }
                 }
                 while let Ok(res) = probe_result_rx.try_recv() {
+                    // Foreign-lane result (a playback lane's probe landing
+                    // after its lane was dropped): not ours — it must not
+                    // clear OUR in-flight slot or become a hypothesis.
+                    if res.utterance != LIVE_HYP_LANE {
+                        continue;
+                    }
                     live_probe_in_flight = false;
                     if res.generation != voice_call_gen || res.text.trim().is_empty() {
                         continue;
@@ -15538,15 +15858,26 @@ mod synthetic_audio {
         res_tx
             .send(SttResult {
                 generation: 6,
-                utterance: 0,
+                utterance: lane.lane_id,
                 text: "stop".into(),
             })
             .unwrap();
         assert!(lane.check().is_none(), "stale generation must be dropped");
+        // A FOREIGN-LANE result (a previous reply's in-flight probe landing
+        // late — the 066d2237 class) is dropped even with the right
+        // generation: it must never park a command or feed content.
         res_tx
             .send(SttResult {
                 generation: 7,
-                utterance: 0,
+                utterance: lane.lane_id + 1,
+                text: "say that again".into(),
+            })
+            .unwrap();
+        assert!(lane.check().is_none(), "foreign lane id must be dropped");
+        res_tx
+            .send(SttResult {
+                generation: 7,
+                utterance: lane.lane_id,
                 text: "wait".into(),
             })
             .unwrap();
@@ -15559,7 +15890,7 @@ mod synthetic_audio {
         res_tx
             .send(SttResult {
                 generation: 7,
-                utterance: 0,
+                utterance: lane.lane_id,
                 text: "yeah".into(),
             })
             .unwrap();
@@ -15569,7 +15900,7 @@ mod synthetic_audio {
         res_tx
             .send(SttResult {
                 generation: 7,
-                utterance: 0,
+                utterance: lane.lane_id,
                 text: "actually I need to change my order".into(),
             })
             .unwrap();
@@ -15596,7 +15927,7 @@ mod synthetic_audio {
         res_tx2
             .send(SttResult {
                 generation: 7,
-                utterance: 0,
+                utterance: lane2.lane_id,
                 text: "yeah".into(),
             })
             .unwrap();
