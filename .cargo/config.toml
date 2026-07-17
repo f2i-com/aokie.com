@@ -5,5 +5,11 @@
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
+# sherpa-rs-sys runs bindgen at build time (its SHERPA_SKIP_GENERATE_BINDINGS
+# fallback is broken in 0.6.8 — src/bindings.rs isn't packaged in the published
+# crate), so point bindgen at the installed LLVM's libclang.
+[env]
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
+
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

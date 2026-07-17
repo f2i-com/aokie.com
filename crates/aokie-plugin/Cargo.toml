@@ -32,7 +32,13 @@ aec-rs = { version = "1.0", optional = true }
 # cfg(target_os = "windows") inside the crate; on other targets the plugin returns an unsupported error.
 aokie-dongle = { path = "../aokie-dongle" }
 # Optional in-process speech (TTS greeting + STT), behind the `voice` feature.
-aokie-ai = { path = "../aokie-ai", features = ["onnx"], optional = true }
+# `sherpa` adds the sherpa-onnx VITS/Piper + Kokoro TTS engines (selectable via
+# the ttsEngine setting). Dynamic by necessity (static sherpa's vendored KISS
+# FFT collides with aec-rs's speexdsp at link time): deploys must ship
+# sherpa-onnx-c-api.dll + sherpa's onnxruntime.dll (1.17.1) next to the exe,
+# and ensure_ort_dylib pins the ort engines to onnxruntime_1.25.0.dll by
+# explicit name so sherpa's ORT can never shadow it.
+aokie-ai = { path = "../aokie-ai", features = ["onnx", "sherpa"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # CONSENT-001: verify the Desktop-issued signature on consent grants (the

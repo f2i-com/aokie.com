@@ -44,6 +44,12 @@ enum SynthJob {
     /// while the phone is still ringing — so the greeting synthesizes hot.
     /// A cold engine after a plugin restart cost seconds on a live call.
     Warm,
+    /// Live engine reselection (settings.set `ttsEngine`/`ttsModelDir`): the
+    /// connector re-stamped the AOKIE_TTS_ENGINE / AOKIE_TTS_MODEL_DIR env
+    /// BEFORE queueing this; drop the loaded engine and reload from the new
+    /// selection now, so a config mistake surfaces in the log immediately
+    /// instead of as a dead span on the next call.
+    ReloadEngine,
 }
 
 /// Worker → radio: epoch-tagged PCM blocks and the span's terminal outcome.
@@ -138,6 +144,13 @@ impl SynthHandle {
         let _ = self.job_tx.send(SynthJob::Warm);
     }
 
+    /// Live engine reselection: reload the in-process engine from the freshly
+    /// stamped AOKIE_TTS_ENGINE / AOKIE_TTS_MODEL_DIR env. Send AFTER the env
+    /// is updated — jobs are serviced in order.
+    pub fn reload_engine(&self) {
+        let _ = self.job_tx.send(SynthJob::ReloadEngine);
+    }
+
     /// Call boundary: clear the HTTP endpoint's sticky per-call fallback and
     /// invalidate any in-flight span.
     pub fn reset_call(&self) {
@@ -162,11 +175,29 @@ fn worker(
                 if tts.is_none() {
                     match crate::voice::TtsEngine::load() {
                         Ok(engine) => {
-                            eprintln!("[aokie-plugin] TTS engine pre-warmed (ring)");
+                            eprintln!(
+                                "[aokie-plugin] TTS engine pre-warmed (ring): {}",
+                                engine.engine_name()
+                            );
                             tts = Some(engine);
                         }
                         Err(err) => eprintln!("[aokie-plugin] TTS pre-warm failed: {err}"),
                     }
+                }
+            }
+            SynthJob::ReloadEngine => {
+                tts = None;
+                match crate::voice::TtsEngine::load() {
+                    Ok(engine) => {
+                        eprintln!(
+                            "[aokie-plugin] TTS engine reselected: {}",
+                            engine.engine_name()
+                        );
+                        tts = Some(engine);
+                    }
+                    Err(err) => eprintln!(
+                        "[aokie-plugin] TTS engine reload failed: {err} (will retry on the next span)"
+                    ),
                 }
             }
             SynthJob::Span {
@@ -273,7 +304,7 @@ fn synth_span(
     if tts.is_none() {
         match crate::voice::TtsEngine::load() {
             Ok(engine) => {
-                eprintln!("[aokie-plugin] TTS engine loaded");
+                eprintln!("[aokie-plugin] TTS engine loaded: {}", engine.engine_name());
                 *tts = Some(engine);
             }
             Err(err) => return Err(format!("TTS load failed: {err}")),
