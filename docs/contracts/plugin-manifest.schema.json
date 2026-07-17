@@ -2,11 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://formlogic.com/schemas/plugin-manifest.schema.json",
   "title": "FormLogic Desktop plugin manifest",
-  "description": "manifest.json at the root of a FormLogic Desktop plugin directory (e.g. plugins/aokie/manifest.json). Canonical copy: formlogic-app/docs/contracts/.",
+  "description": "manifest.json at the root of a FormLogic Desktop plugin directory (e.g. plugins/aokie/manifest.json). Canonical copy: formlogic-app/docs/contracts/. schemaVersion 2 adds the additive ui/services/commands/data sections; v2-only sections are refused under schemaVersion 1 by the desktop validator.",
   "type": "object",
   "required": ["schemaVersion", "id", "name", "version", "entry"],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "enum": [1, 2] },
     "id": {
       "type": "string",
       "description": "Stable plugin id. Also the default connector namespace.",
@@ -80,6 +80,145 @@
       "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_]+)+$", "maxLength": 128 },
       "maxItems": 256,
       "uniqueItems": true
+    },
+    "ui": {
+      "type": "object",
+      "description": "schemaVersion 2 — declarative UI contributions (PLG-203). Presentation-only: forward-compatible (unknown fields tolerated by the host).",
+      "properties": {
+        "nav": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "required": ["id", "label"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+              "label": { "type": "string", "minLength": 1, "maxLength": 60 },
+              "icon": { "type": "string" },
+              "badge": { "type": "string" }
+            }
+          }
+        },
+        "overview": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "required": ["id", "title"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+              "kind": { "enum": ["hero", "status"] },
+              "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+              "icon": { "type": "string" },
+              "bind": {
+                "type": "object",
+                "properties": {
+                  "headline": { "type": "string", "maxLength": 200, "pattern": "^\\$?[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)*$" },
+                  "body": { "type": "string", "maxLength": 200, "pattern": "^\\$?[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)*$" },
+                  "cta": {
+                    "type": "object",
+                    "required": ["label", "nav"],
+                    "properties": {
+                      "label": { "type": "string" },
+                      "nav": { "type": "string" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "statusCards": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "required": ["id", "title", "poll"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+              "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+              "poll": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                  "command": { "type": "string" },
+                  "intervalMs": { "type": "integer", "minimum": 0 }
+                }
+              },
+              "fields": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["label", "path"],
+                  "properties": {
+                    "label": { "type": "string" },
+                    "path": { "type": "string", "maxLength": 200 }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label", "command"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+              "label": { "type": "string" },
+              "command": { "type": "string" },
+              "confirm": { "type": "string" },
+              "devOnly": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "services": {
+      "type": "array",
+      "description": "schemaVersion 2 — plugin-owned service templates (PLG-206), installed with the plugin.",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["templateFile"],
+        "properties": {
+          "templateFile": { "type": "string", "description": "Package-relative ServiceTemplate JSON path (no '..', no absolute)." }
+        },
+        "additionalProperties": false
+      }
+    },
+    "commands": {
+      "type": "object",
+      "description": "schemaVersion 2 — command metadata (PLG-202).",
+      "properties": {
+        "journalled": {
+          "type": "array",
+          "description": "Commands requiring a durable requestId (physical side effects). Each must be a declared connector command.",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "data": {
+      "type": "object",
+      "description": "schemaVersion 2 — data the plugin stores OUTSIDE the desktop tree (shown on purge, never auto-deleted).",
+      "properties": {
+        "externalInventory": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["label"],
+            "properties": {
+              "path": { "type": "string" },
+              "credential": { "type": "string" },
+              "label": { "type": "string", "minLength": 1, "maxLength": 200 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

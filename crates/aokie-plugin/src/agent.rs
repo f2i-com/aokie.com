@@ -11,6 +11,60 @@ use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// Shrink a caller-turn PCM clip before it rides an LLM request (2026-07-17
+/// latency round): trim leading/trailing silence and collapse long internal
+/// pauses, so the attached WAV — and the audio tokens the model must prefill —
+/// only cover actual speech. Conservative by design: the silence threshold sits
+/// well below the STT speech gate (RMS 350), a padded pre/post-roll is kept
+/// around every speech region, and anything that would trim the clip to under
+/// 200 ms returns the input unchanged.
+pub fn trim_silence_for_llm(pcm: &[i16], sample_rate: u32) -> Vec<i16> {
+    const SILENCE_RMS: f64 = 150.0;
+    let win = (sample_rate as usize / 50).max(1); // 20 ms windows
+    let pad_windows = 6; // 120 ms kept around each speech region
+    let collapse_after = 30; // every internal pause is capped at 600 ms
+    let min_out = (sample_rate as usize) / 5; // 200 ms safety floor
+
+    if pcm.len() < win * 4 {
+        return pcm.to_vec();
+    }
+    let loud: Vec<bool> = pcm
+        .chunks(win)
+        .map(|w| {
+            let sum: f64 = w.iter().map(|&s| (s as f64) * (s as f64)).sum();
+            (sum / w.len() as f64).sqrt() > SILENCE_RMS
+        })
+        .collect();
+    let Some(first) = loud.iter().position(|&l| l) else {
+        // No speech at all — send a short slice so the model still hears
+        // "silence" rather than nothing (the prompt handles that case).
+        return pcm[..pcm.len().min(win * 25)].to_vec();
+    };
+    let last = loud.iter().rposition(|&l| l).unwrap_or(first);
+
+    let start = first.saturating_sub(pad_windows);
+    let end = (last + 1 + pad_windows).min(loud.len());
+    let mut out: Vec<i16> = Vec::with_capacity((end - start) * win);
+    let mut silent_run = 0usize;
+    for (idx, is_loud) in loud.iter().enumerate().take(end).skip(start) {
+        if *is_loud {
+            silent_run = 0;
+        } else {
+            silent_run += 1;
+            if silent_run > collapse_after {
+                continue; // pause budget spent — drop the rest of this gap
+            }
+        }
+        let s = idx * win;
+        let e = (s + win).min(pcm.len());
+        out.extend_from_slice(&pcm[s..e]);
+    }
+    if out.len() < min_out {
+        return pcm.to_vec();
+    }
+    out
+}
+
 /// Cloneable so a reply can run on a detached worker thread (AOK-CTRL-001):
 /// the radio loop hands a clone to the worker and stays free to service
 /// hangup/reject while the stream runs. reqwest clients are Arc inside, so a
@@ -60,6 +114,15 @@ impl LlmClient {
     }
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    /// A clone of this client that names a different model on its requests —
+    /// the transcript-correction lane can use a lighter audio model on the
+    /// SAME server without a second connection pool.
+    pub fn with_model(&self, model: String) -> Self {
+        let mut c = self.clone();
+        c.model = Some(model);
+        c
     }
 
     /// Stream a reply for `messages` (an OpenAI chat array). Calls `on_sentence`
@@ -420,6 +483,56 @@ fn first_clause_end(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::sentence_end;
+    use super::trim_silence_for_llm;
+
+    /// 1 s of silence + 1 s of tone + 2 s of silence + 1 s of tone + 1 s of
+    /// silence: the trim must drop the outer silence (minus pad), cap the
+    /// internal pause, and keep every speech window.
+    #[test]
+    fn trim_silence_drops_padding_and_caps_pauses() {
+        const SR: u32 = 16_000;
+        let sec = SR as usize;
+        let tone = |n: usize| -> Vec<i16> {
+            (0..n)
+                .map(|i| ((i as f64 * 0.3).sin() * 3000.0) as i16)
+                .collect()
+        };
+        let mut pcm = vec![0i16; sec];
+        pcm.extend(tone(sec));
+        pcm.extend(vec![0i16; 2 * sec]);
+        pcm.extend(tone(sec));
+        pcm.extend(vec![0i16; sec]);
+        let out = trim_silence_for_llm(&pcm, SR);
+        // Expected ≈ 120ms pad + 1s tone + 600ms capped pause + 1s tone +
+        // 120ms pad ≈ 2.85 s, from 6 s in. Assert generous bounds.
+        assert!(out.len() < 3 * sec + sec / 2, "too little trimmed: {}", out.len());
+        assert!(out.len() > 2 * sec, "speech lost: {}", out.len());
+    }
+
+    /// Quiet-only audio still returns a short non-empty clip (the correction
+    /// prompt handles "silence" explicitly — sending nothing would error).
+    #[test]
+    fn trim_silence_on_pure_silence_returns_short_clip() {
+        const SR: u32 = 16_000;
+        let pcm = vec![0i16; 5 * SR as usize];
+        let out = trim_silence_for_llm(&pcm, SR);
+        assert!(!out.is_empty());
+        assert!(out.len() <= SR as usize / 2);
+    }
+
+    /// Continuous speech passes through untouched; tiny clips are never
+    /// trimmed below the safety floor.
+    #[test]
+    fn trim_silence_keeps_continuous_speech_and_tiny_clips() {
+        const SR: u32 = 16_000;
+        let tone: Vec<i16> = (0..2 * SR as usize)
+            .map(|i| ((i as f64 * 0.3).sin() * 3000.0) as i16)
+            .collect();
+        let out = trim_silence_for_llm(&tone, SR);
+        assert!(out.len() >= tone.len() - SR as usize / 4);
+        let tiny = vec![100i16; 500];
+        assert_eq!(trim_silence_for_llm(&tiny, SR), tiny);
+    }
 
     /// Split `text` the way stream_reply does, feeding `delta`-sized pieces —
     /// returns the spoken chunks including the eager first clause and the

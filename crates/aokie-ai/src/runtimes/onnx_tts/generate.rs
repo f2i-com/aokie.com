@@ -51,6 +51,22 @@ const EOS_THRESHOLD: f32 = -4.0;
 /// the first audio lands in well under a second.
 const DECODE_CHUNK: usize = 15;
 
+/// LAT-003 (2026-07-17): the decode chunk gates TIME-TO-FIRST-AUDIO — at the
+/// measured per-frame cost, 15 frames ≈ 0.7–1.0 s before the first sample can
+/// play. `AOKIE_TTS_DECODE_CHUNK_FRAMES` (clamped 3..=60) trades more mimi
+/// decoder calls for earlier first audio (5 ≈ 0.4 s of audio per decode);
+/// mimi is stateful/streaming, so smaller chunks are correct by construction.
+fn decode_chunk_frames() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("AOKIE_TTS_DECODE_CHUNK_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(3, 60))
+            .unwrap_or(DECODE_CHUNK)
+    })
+}
+
 /// Bail-out cap for generation (~12 s of audio at 12.5 frames/s).
 /// Real stop is driven by the EOS logit; this is a safety net.
 const MAX_GEN_FRAMES_HARD_CAP: usize = 150;
@@ -242,8 +258,8 @@ impl OnnxTtsRuntime {
             // 5f. Opportunistically decode whenever enough latents have
             // piled up — keeps time-to-first-audio low without making the
             // decoder thrash on 1-frame chunks.
-            while n_frames - decoded_frames >= DECODE_CHUNK {
-                let end = (decoded_frames + DECODE_CHUNK).min(n_frames);
+            while n_frames - decoded_frames >= decode_chunk_frames() {
+                let end = (decoded_frames + decode_chunk_frames()).min(n_frames);
                 let n = end - decoded_frames;
                 let chunk = Array3::<f32>::from_shape_vec(
                     (1, n, latent_dim),

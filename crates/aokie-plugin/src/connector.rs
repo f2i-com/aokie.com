@@ -16,7 +16,7 @@ use aokie_core::redact::{validate_sms_body, validate_sms_recipient};
 use serde_json::{json, Map, Value};
 
 use crate::command_journal::{CommandJournal, Prepare as JournalPrepare};
-use crate::config::{ConfigStore, PreferredDongle};
+use crate::config::{ConfigStore, PluginConfig, PreferredDongle};
 use crate::event_bridge::{emit_event, Sink};
 use crate::outbox::Outbox;
 use crate::rpc::{self, RpcMessage};
@@ -203,7 +203,10 @@ impl Plugin {
         // construction — see the `host_rpc` field.)
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
-        let store = ConfigStore::load(&data_dir);
+        let mut store = ConfigStore::load(&data_dir);
+        // AOK-304A: seal a legacy PLAINTEXT managerPin at rest and scrub the
+        // plaintext copies the recovery ladder may have left behind.
+        migrate_manager_pin_at_rest(&mut store);
         let outbox = Outbox::open(&data_dir.join(OUTBOX_FILE))
             .map_err(|e| format!("cannot open outbox: {e}"))?;
         let command_journal = CommandJournal::open(&data_dir.join(COMMAND_JOURNAL_FILE))
@@ -496,6 +499,46 @@ impl Plugin {
             eprintln!(
                 "[aokie-plugin] audioTranscript ON → the audio model corrects each caller turn's transcript"
             );
+        }
+        // Correction-lane overrides (2026-07-17 latency round): an optional
+        // SEPARATE endpoint and/or model for the transcript-correction
+        // requests, so a lighter audio model can own corrections while the
+        // main model owns replies. Empty = the agent's own client/model.
+        apply_endpoint_env_from_settings(
+            &self.store.config.settings,
+            "audioTranscriptEndpoint",
+            "AOKIE_AUDIO_TRANSCRIPT_ENDPOINT",
+        );
+        match self
+            .store
+            .config
+            .settings
+            .get("audioTranscriptModel")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+        {
+            Some(m) if !m.is_empty() => {
+                std::env::set_var("AOKIE_AUDIO_TRANSCRIPT_MODEL", m);
+                eprintln!("[aokie-plugin] audioTranscriptModel → {m}");
+            }
+            _ => std::env::remove_var("AOKIE_AUDIO_TRANSCRIPT_MODEL"),
+        }
+        // autoConnectPhone (2026-07-17): on radio start, page the last
+        // connected/bonded phone from OUR side so the receptionist line comes
+        // up when the desktop app starts — no manual "Reconnect" click. The
+        // page can stall if the phone's stack is mid-teardown (HARD-001), so
+        // run_loop retries a few times with spacing. Default ON; env "0"
+        // disables. The setting default is true (see SETTING_SPECS).
+        let auto_connect = self
+            .store
+            .config
+            .settings
+            .get("autoConnectPhone")
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() != Some("false")))
+            .unwrap_or(true);
+        std::env::set_var("AOKIE_AUTO_CONNECT_PHONE", if auto_connect { "1" } else { "0" });
+        if auto_connect {
+            eprintln!("[aokie-plugin] autoConnectPhone ON → will page the last phone at radio start");
         }
         // holdAndCallWaiting (Phase 4): the radio advertises HFP three-way
         // calling in BRSF and negotiates AT+CHLD=? / AT+CCWA=1 at SLC time,
@@ -2469,17 +2512,37 @@ impl Plugin {
                 Ok(json!({ "revived": revived }))
             }
             "settings.get" => {
+                // AOK-304A: managerPin is WRITE-ONLY. It is never returned here
+                // (the desktop console and the cloud relay both read this) — the
+                // caller only learns whether one is set, via `managerPinSet`.
+                let pin_set = crate::manager_pin::is_set(
+                    self.store
+                        .config
+                        .settings
+                        .get("managerPin")
+                        .and_then(Value::as_str),
+                );
                 let obj = expect_fields(payload, &["key"])?;
                 match obj.get("key").and_then(Value::as_str) {
+                    Some("managerPin") => Ok(json!({
+                        "key": "managerPin",
+                        "value": Value::Null,
+                        "set": pin_set,
+                    })),
                     Some(key) => Ok(json!({
                         "key": key,
                         "value": self.store.config.settings.get(key).cloned(),
                     })),
-                    None => Ok(json!({
-                        "settings": self.store.config.settings,
-                        "configVersion": self.store.config.config_version,
-                        "configQuarantined": self.store.quarantined,
-                    })),
+                    None => {
+                        let mut public = self.store.config.settings.clone();
+                        public.remove("managerPin");
+                        Ok(json!({
+                            "settings": public,
+                            "managerPinSet": pin_set,
+                            "configVersion": self.store.config.config_version,
+                            "configQuarantined": self.store.quarantined,
+                        }))
+                    }
                 }
             }
             "settings.set" => {
@@ -2523,11 +2586,29 @@ impl Plugin {
                         }
                     }
                 }
+                // AOK-304A: seal the managerPin write BEFORE it touches disk (or
+                // the settings.get readback). Done up front so a seal failure
+                // changes nothing (all-or-nothing, like validation above).
+                let sealed_manager_pin = match obj.get("managerPin") {
+                    Some(v) => Some(
+                        crate::manager_pin::seal(v.as_str().unwrap_or(""))
+                            .map_err(|e| CmdError::failed(format!("cannot secure managerPin: {e}")))?,
+                    ),
+                    None => None,
+                };
                 for (key, value) in obj {
-                    self.store
-                        .config
-                        .settings
-                        .insert(key.clone(), value.clone());
+                    if key == "managerPin" {
+                        // Never persist the plaintext PIN — store the sealed token.
+                        self.store.config.settings.insert(
+                            key.clone(),
+                            json!(sealed_manager_pin.clone().unwrap_or_default()),
+                        );
+                    } else {
+                        self.store
+                            .config
+                            .settings
+                            .insert(key.clone(), value.clone());
+                    }
                 }
                 self.store.config.config_version += 1;
                 self.save_config()?;
@@ -2602,8 +2683,20 @@ impl Plugin {
                         None => {}
                     }
                 }
+                // AOK-304A: the response is a READ path too — redact managerPin
+                // exactly like settings.get (the relay carries this response to
+                // the web console on every settings save).
+                let mut public = self.store.config.settings.clone();
+                public.remove("managerPin");
                 Ok(json!({
-                    "settings": self.store.config.settings,
+                    "settings": public,
+                    "managerPinSet": crate::manager_pin::is_set(
+                        self.store
+                            .config
+                            .settings
+                            .get("managerPin")
+                            .and_then(Value::as_str),
+                    ),
                     "configVersion": self.store.config.config_version,
                     "appliedLive": applied_live,
                     "appliesAtReconnect": applies_at_reconnect,
@@ -3361,12 +3454,34 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
         kind: SettingKind::Bool,
         applies_live: false,
     },
+    // Correction-lane overrides: route the audioTranscript correction
+    // requests to a separate OpenAI-compatible endpoint and/or a different
+    // (typically lighter) audio model. Both optional; empty = the agent's
+    // own endpoint/model. Endpoint values get the standard classification
+    // (public must be https; metadata/link-local refused).
+    SettingSpec {
+        key: "audioTranscriptEndpoint",
+        kind: SettingKind::EndpointUrl,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "audioTranscriptModel",
+        kind: SettingKind::Str { max_chars: 200 },
+        applies_live: false,
+    },
     // Phase 4 (call waiting / hold): advertise HFP three-way calling and
     // negotiate AT+CHLD / AT+CCWA at the next connect. OBSERVE-ONLY for now
     // (a second caller is detected + recorded, never answered/held) —
     // default OFF keeps the legacy wire behaviour byte-for-byte.
     SettingSpec {
         key: "holdAndCallWaiting",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    // Auto-connect the last phone at radio start (default ON, applies at the
+    // next radio start). Off leaves the line requiring a manual Reconnect.
+    SettingSpec {
+        key: "autoConnectPhone",
         kind: SettingKind::Bool,
         applies_live: false,
     },
@@ -3603,6 +3718,91 @@ fn quiet_hours_block(start: i64, end: i64, hour: u32) -> bool {
     }
 }
 
+/// AOK-304A: at load, seal a legacy PLAINTEXT managerPin in place and scrub the
+/// plaintext copies the recovery ladder (`settings.json.bak` / `.corrupt`) may
+/// hold. Idempotent — an already-sealed or empty PIN is untouched (siblings are
+/// still swept, since a plaintext `.bak` can outlive an already-sealed live
+/// file). Only seals where the platform supports DPAPI (dev keeps the readback
+/// redaction, which is the surface that leaked; production is Windows).
+fn migrate_manager_pin_at_rest(store: &mut ConfigStore) {
+    let raw = store
+        .config
+        .settings
+        .get("managerPin")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let needs_seal = !raw.trim().is_empty()
+        && !aokie_core::dpapi::is_sealed(&raw)
+        && aokie_core::dpapi::platform_supported();
+    if needs_seal {
+        match crate::manager_pin::seal(raw.trim()) {
+            Ok(sealed) => {
+                store
+                    .config
+                    .settings
+                    .insert("managerPin".to_string(), json!(sealed));
+                match store.save() {
+                    Ok(()) => eprintln!(
+                        "[aokie-plugin] managerPin sealed at rest (legacy plaintext migrated)"
+                    ),
+                    Err(e) => {
+                        eprintln!("[aokie-plugin] managerPin seal-in-place save failed: {e}");
+                        return; // don't scrub siblings if the live file isn't sealed yet
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[aokie-plugin] managerPin could not be sealed ({e}); left as-is");
+                return;
+            }
+        }
+    }
+    scrub_manager_pin_siblings(store.path());
+}
+
+/// Remove any PLAINTEXT managerPin left in the recovery siblings. `.bak` is
+/// re-copied from the (sealed) live file so last-known-good recovery survives
+/// but carries no PIN; `.corrupt` is deleted only when it actually contains a
+/// plaintext managerPin (its purpose is corruption evidence, but a leaked
+/// secret wins).
+fn scrub_manager_pin_siblings(live: &std::path::Path) {
+    let bak = live.with_extension("json.bak");
+    if file_has_plaintext_manager_pin(&bak) {
+        if live.is_file() {
+            let _ = std::fs::copy(live, &bak);
+        } else {
+            let _ = std::fs::remove_file(&bak);
+        }
+    }
+    let corrupt = live.with_extension("json.corrupt");
+    if file_has_plaintext_manager_pin(&corrupt) {
+        let _ = std::fs::remove_file(&corrupt);
+    }
+}
+
+/// True when `path` holds a NON-sealed, non-empty managerPin (a leak). A file
+/// that fails to parse (a `.corrupt` quarantine) falls back to a substring
+/// probe so an unparseable-but-leaking file is still scrubbed — but a sealed
+/// token marker anywhere in the text reads as already-sealed (post-migration
+/// corruption evidence keeps its value; a `dpapi:` blob never leaks the PIN).
+fn file_has_plaintext_manager_pin(path: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    match serde_json::from_str::<PluginConfig>(&text) {
+        Ok(cfg) => cfg
+            .settings
+            .get("managerPin")
+            .and_then(Value::as_str)
+            .map(|v| !v.trim().is_empty() && !aokie_core::dpapi::is_sealed(v))
+            .unwrap_or(false),
+        Err(_) => {
+            text.contains("\"managerPin\"") && !text.contains(aokie_core::dpapi::DPAPI_PREFIX)
+        }
+    }
+}
+
 /// Screening settings → process env (spec Phase 0). Called at radio start
 /// and from settings.set (followed by a RadioControl::ReloadScreening so the
 /// running radio rebuilds its policy). Empty string clears the var.
@@ -3615,13 +3815,15 @@ fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
         ("managerNumbers", "AOKIE_MANAGER_NUMBERS"),
         ("managerPin", "AOKIE_MANAGER_PIN"),
     ] {
-        let v = settings
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if v.is_empty() {
+        let stored = settings.get(key).and_then(|v| v.as_str()).unwrap_or("").trim();
+        // AOK-304A: the stored managerPin is a sealed token — reveal it to the
+        // plaintext PIN the radio compares against, only in this process's env.
+        let v = if key == "managerPin" {
+            crate::manager_pin::reveal(stored)
+        } else {
+            stored.to_string()
+        };
+        if v.trim().is_empty() {
             std::env::remove_var(env);
         } else {
             std::env::set_var(env, v);
@@ -5859,6 +6061,137 @@ mod tests {
         assert!(plugin
             .dispatch_command("settings.set", &json!(null), &mut sink)
             .is_err());
+    }
+
+    /// AOK-304A: the manager PIN is write-only — `settings.set` seals it, and
+    /// no read path (`settings.get` whole-object OR single-key) ever returns it;
+    /// the caller only learns whether one is set.
+    #[test]
+    fn manager_pin_is_write_only_and_sealed() {
+        // settings.set(managerPin) also writes AOKIE_MANAGER_PIN (a screening
+        // key) — serialize against the other env-touching tests.
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+
+        let set_res = plugin
+            .dispatch_command("settings.set", &json!({"managerPin": "731905"}), &mut sink)
+            .unwrap();
+        // The settings.set RESPONSE is a read path too (it rides the relay to
+        // the web console) — it must be redacted exactly like settings.get.
+        assert!(
+            set_res["settings"].get("managerPin").is_none(),
+            "settings.set response must never echo the stored managerPin"
+        );
+        assert_eq!(set_res["managerPinSet"], json!(true));
+
+        // Whole-object get: managerPin absent, managerPinSet true.
+        let all = plugin
+            .dispatch_command("settings.get", &Value::Null, &mut sink)
+            .unwrap();
+        assert!(
+            all["settings"].get("managerPin").is_none(),
+            "managerPin must never be returned in the settings object"
+        );
+        assert_eq!(all["managerPinSet"], json!(true));
+
+        // Single-key get: value null, set true.
+        let one = plugin
+            .dispatch_command("settings.get", &json!({"key": "managerPin"}), &mut sink)
+            .unwrap();
+        assert_eq!(one["value"], Value::Null, "the PIN is never read back");
+        assert_eq!(one["set"], json!(true));
+
+        // At rest: not the plaintext PIN (sealed on Windows), and reveal() — the
+        // only thing that turns it back into the PIN — recovers it.
+        let stored = plugin
+            .store
+            .config
+            .settings
+            .get("managerPin")
+            .and_then(Value::as_str)
+            .expect("managerPin persisted");
+        assert!(!stored.is_empty());
+        if aokie_core::dpapi::platform_supported() {
+            assert!(aokie_core::dpapi::is_sealed(stored), "windows seals the PIN at rest");
+            assert_ne!(stored, "731905", "the PIN is never stored in the clear");
+        }
+        assert_eq!(crate::manager_pin::reveal(stored), "731905");
+
+        // Clearing it flips managerPinSet back to false.
+        plugin
+            .dispatch_command("settings.set", &json!({"managerPin": ""}), &mut sink)
+            .unwrap();
+        let one = plugin
+            .dispatch_command("settings.get", &json!({"key": "managerPin"}), &mut sink)
+            .unwrap();
+        assert_eq!(one["set"], json!(false));
+
+        std::env::remove_var("AOKIE_MANAGER_PIN");
+    }
+
+    /// AOK-304A: a pre-migration install with a PLAINTEXT managerPin (in both
+    /// settings.json and the .bak) is sealed in place at load, the PIN stays
+    /// usable, and the plaintext copies are scrubbed.
+    #[test]
+    fn legacy_plaintext_manager_pin_is_sealed_and_scrubbed_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = ConfigStore::load(dir.path());
+            store
+                .config
+                .settings
+                .insert("managerPin".into(), json!("731905"));
+            store.save().unwrap(); // writes the live file
+            store.save().unwrap(); // second save copies the plaintext live → .bak
+        }
+        let bak = dir.path().join("settings.json.bak");
+        assert!(
+            std::fs::read_to_string(&bak).unwrap().contains("731905"),
+            "precondition: the .bak leaks the plaintext PIN"
+        );
+
+        // Loading through Plugin::new runs migrate_manager_pin_at_rest.
+        let plugin = Plugin::new(false, dir.path().to_path_buf()).unwrap();
+        let stored = plugin
+            .store
+            .config
+            .settings
+            .get("managerPin")
+            .and_then(Value::as_str)
+            .expect("managerPin survives migration");
+        assert_eq!(
+            crate::manager_pin::reveal(stored),
+            "731905",
+            "the PIN is still usable after migration"
+        );
+        if aokie_core::dpapi::platform_supported() {
+            assert!(aokie_core::dpapi::is_sealed(stored), "sealed in place");
+            let live = std::fs::read_to_string(dir.path().join("settings.json")).unwrap();
+            assert!(!live.contains("731905"), "live file scrubbed of plaintext");
+            let bak_after = std::fs::read_to_string(&bak).unwrap_or_default();
+            assert!(!bak_after.contains("731905"), ".bak scrubbed of plaintext");
+        }
+    }
+
+    /// AOK-304A: the sibling scrub removes only PLAINTEXT leaks. A `.corrupt`
+    /// quarantine whose managerPin is already SEALED keeps its evidentiary
+    /// value (the AK-006 quarantine exists to preserve corruption evidence; a
+    /// `dpapi:` blob never leaks the PIN), while a plaintext-leaking one goes.
+    #[test]
+    fn corrupt_quarantine_with_sealed_pin_survives_the_sibling_scrub() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("settings.json");
+        std::fs::write(&live, r#"{"settings":{}}"#).unwrap();
+        let corrupt = dir.path().join("settings.json.corrupt");
+        // Unparseable (truncated) but carrying a SEALED managerPin token.
+        std::fs::write(&corrupt, r#"{"settings":{"managerPin":"dpapi:AAAA","truncated"#).unwrap();
+        scrub_manager_pin_siblings(&live);
+        assert!(corrupt.is_file(), "sealed-PIN corruption evidence is kept");
+        // The same file carrying a PLAINTEXT pin is a leak — scrubbed.
+        std::fs::write(&corrupt, r#"{"settings":{"managerPin":"731905","truncated"#).unwrap();
+        scrub_manager_pin_siblings(&live);
+        assert!(!corrupt.is_file(), "plaintext-PIN corruption evidence is scrubbed");
     }
 
     #[test]
