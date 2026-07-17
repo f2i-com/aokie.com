@@ -652,16 +652,30 @@ fn compose_agent_system_prompt(
     persona: &str,
     agent_hangup: bool,
     cut_context: Option<&str>,
+    manager_call: bool,
 ) -> String {
     // An explicit "today" anchor: the model has to resolve relative dates
     // ("first Saturday of August", "next Tuesday") both when speaking and
     // when composing lookup questions, and without this line it had nothing
     // to resolve them against but conversational vibes.
     let today = aokie_core::events::today_spoken_local();
-    let mut p = if agent_hangup {
-        format!("{persona}\n\nToday is {today}.{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}{ASSISTANCE_INSTRUCTION}{MANAGER_CHALLENGE_INSTRUCTION}{ABUSE_INSTRUCTION}{END_CALL_INSTRUCTION}")
+    // The [[MANAGER:]] marker is taught ONLY on manager-number calls (where
+    // the marker legitimately routes into the PIN flow). Ordinary calls used
+    // to carry the challenge instruction as a deterministic-denial funnel,
+    // but small models kept marking ordinary own-bookings questions as
+    // manager requests despite ever-sharper wording (live calls 8c689f13 and
+    // 0576e7eb: "what do I have booked next week?" → "that's manager-only").
+    // A caller who never hears about the marker can't be mis-routed by it;
+    // the non-manager [[MANAGER]] refusal handler stays as a safety net.
+    let manager = if manager_call {
+        MANAGER_CHALLENGE_INSTRUCTION
     } else {
-        format!("{persona}\n\nToday is {today}.{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}{ASSISTANCE_INSTRUCTION}{MANAGER_CHALLENGE_INSTRUCTION}{ABUSE_INSTRUCTION}")
+        ""
+    };
+    let mut p = if agent_hangup {
+        format!("{persona}\n\nToday is {today}.{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}{ASSISTANCE_INSTRUCTION}{manager}{ABUSE_INSTRUCTION}{END_CALL_INSTRUCTION}")
+    } else {
+        format!("{persona}\n\nToday is {today}.{SPEECH_STYLE_INSTRUCTION}{BOOKING_INSTRUCTION}{TOOL_INSTRUCTION}{ASSISTANCE_INSTRUCTION}{manager}{ABUSE_INSTRUCTION}")
     };
     if let Some(tail) = cut_context {
         p.push_str(&format!(
@@ -6146,7 +6160,7 @@ fn run_loop(
                         &agent_endpoint,
                         agent_model.clone(),
                         &status,
-                        compose_agent_system_prompt(&agent_persona, agent_hangup, None),
+                        compose_agent_system_prompt(&agent_persona, agent_hangup, None, false),
                         Vec::new(),
                         "ring",
                         Some(pending_agent_client.clone()),
@@ -8645,63 +8659,86 @@ fn run_loop(
                 Some(s)
                     if !s.greeted && s.is_active() && sr > 0 && (!s.outbound || s.agent_owned) =>
                 {
-                    // §9.3 personalization race: the caller-id flow's
-                    // call-scoped overlay ("Hi <name>!") usually lands 1–3 s
-                    // after answer — briefly hold the greeting for it instead
-                    // of speaking the generic one a beat too early. Under the
-                    // old GLOBAL settings.set design a lost race left the
-                    // personalized greeting stuck in settings, so the NEXT
-                    // call (or caller!) inherited it — the exact leak
-                    // call-scoping removed; this hold is the leak-free way to
-                    // win the race within the call it belongs to.
+                    // The caller sometimes OPENS the conversation before the
+                    // greeting speaks (long ring window + personalize hold =
+                    // a beat of silence, so they say "hello?"/"yeah?"): the
+                    // agent's reply to that turn already opened the call, and
+                    // a greeting after it is a SECOND hello (live call
+                    // 2122425933: generic reply-greeting at turn 2, then the
+                    // late overlay's "Hi Lance!" greeting at turn 3). Any
+                    // assistant turn in this call's history means the
+                    // conversation is underway — mark greeted, never speak.
                     #[cfg(feature = "voice")]
-                    let hold = {
-                        let overlay_matches = ctx
-                            .call_agent_overlay
-                            .as_ref()
-                            .is_some_and(|o| o.call_id == s.id);
-                        let started = *greet_hold_started.get_or_insert_with(Instant::now);
-                        // rejectPrivate needs to KNOW the id is absent, not
-                        // merely late: this phone's CLCC id lands ~100ms
-                        // post-answer, so give it a bounded window before
-                        // declaring the number withheld.
-                        let private_id_wait = screen_policy.reject_private
-                            && s.caller_id.is_none()
-                            && started.elapsed() < std::time::Duration::from_millis(1200);
-                        // A manager-number call greets with the fixed manager
-                        // line — the personalization overlay is irrelevant to
-                        // it, so don't delay the greeting waiting for one.
-                        let manager_line =
-                            !s.outbound && screen_policy.is_manager(s.caller_id.as_deref());
-                        private_id_wait
-                            || (!manager_line
-                                && hold_greeting_for_overlay(
-                                    overlay_matches,
-                                    s.caller_id.is_some(),
-                                    started.elapsed(),
-                                    GREETING_PERSONALIZE_HOLD,
-                                ))
-                    };
+                    let already_conversed = ctx.history.iter().any(|m| {
+                        m.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                    });
                     #[cfg(not(feature = "voice"))]
-                    let hold = false;
-                    if hold {
-                        idle = false;
+                    let already_conversed = false;
+                    if already_conversed {
+                        s.greeted = true;
+                        eprintln!(
+                            "[aokie-plugin] greeting skipped — the agent already replied before it could speak (conversation underway)"
+                        );
                         None
                     } else {
-                        s.greeted = true;
-                        // Screening is an INBOUND policy: never screen the
-                        // number WE dialed (a blocked-list hit or accept-
-                        // pattern miss on our own outbound target would
-                        // hang up our own call).
+                        // §9.3 personalization race: the caller-id flow's
+                        // call-scoped overlay ("Hi <name>!") usually lands 1–3 s
+                        // after answer — briefly hold the greeting for it instead
+                        // of speaking the generic one a beat too early. Under the
+                        // old GLOBAL settings.set design a lost race left the
+                        // personalized greeting stuck in settings, so the NEXT
+                        // call (or caller!) inherited it — the exact leak
+                        // call-scoping removed; this hold is the leak-free way to
+                        // win the race within the call it belongs to.
                         #[cfg(feature = "voice")]
-                        let screened = if s.outbound {
-                            None
-                        } else {
-                            screen_policy.verdict(s.caller_id.as_deref())
+                        let hold = {
+                            let overlay_matches = ctx
+                                .call_agent_overlay
+                                .as_ref()
+                                .is_some_and(|o| o.call_id == s.id);
+                            let started = *greet_hold_started.get_or_insert_with(Instant::now);
+                            // rejectPrivate needs to KNOW the id is absent, not
+                            // merely late: this phone's CLCC id lands ~100ms
+                            // post-answer, so give it a bounded window before
+                            // declaring the number withheld.
+                            let private_id_wait = screen_policy.reject_private
+                                && s.caller_id.is_none()
+                                && started.elapsed() < std::time::Duration::from_millis(1200);
+                            // A manager-number call greets with the fixed manager
+                            // line — the personalization overlay is irrelevant to
+                            // it, so don't delay the greeting waiting for one.
+                            let manager_line =
+                                !s.outbound && screen_policy.is_manager(s.caller_id.as_deref());
+                            private_id_wait
+                                || (!manager_line
+                                    && hold_greeting_for_overlay(
+                                        overlay_matches,
+                                        s.caller_id.is_some(),
+                                        started.elapsed(),
+                                        GREETING_PERSONALIZE_HOLD,
+                                    ))
                         };
                         #[cfg(not(feature = "voice"))]
-                        let screened: Option<&'static str> = None;
-                        Some((s.id.clone(), sr, screened))
+                        let hold = false;
+                        if hold {
+                            idle = false;
+                            None
+                        } else {
+                            s.greeted = true;
+                            // Screening is an INBOUND policy: never screen the
+                            // number WE dialed (a blocked-list hit or accept-
+                            // pattern miss on our own outbound target would
+                            // hang up our own call).
+                            #[cfg(feature = "voice")]
+                            let screened = if s.outbound {
+                                None
+                            } else {
+                                screen_policy.verdict(s.caller_id.as_deref())
+                            };
+                            #[cfg(not(feature = "voice"))]
+                            let screened: Option<&'static str> = None;
+                            Some((s.id.clone(), sr, screened))
+                        }
                     }
                 }
                 _ => None,
@@ -9348,6 +9385,7 @@ fn run_loop(
                                     &persona_now,
                                     agent_hangup,
                                     ctx.last_cut_context.as_deref(),
+                                    is_mgr_call,
                                 );
                                 let mut messages =
                                     vec![serde_json::json!({ "role": "system", "content": sys })];
@@ -10278,6 +10316,7 @@ fn run_loop(
                                     &persona_now,
                                     agent_hangup,
                                     ctx.last_cut_context.take().as_deref(),
+                                    is_mgr_call,
                                 );
                                 let mut messages = vec![
                                     serde_json::json!({ "role": "system", "content": system_prompt }),
@@ -12816,7 +12855,7 @@ fn run_loop(
                                         &agent_endpoint,
                                         agent_model.clone(),
                                         &status,
-                                        compose_agent_system_prompt(p, agent_hangup, None),
+                                        compose_agent_system_prompt(p, agent_hangup, None, false),
                                         ctx.history.clone(),
                                         "overlay",
                                         None,
@@ -13930,10 +13969,23 @@ mod tests {
         assert!(ABUSE_LINE.is_ascii(), "the notice goes straight to TTS");
         assert!(ABUSE_INSTRUCTION.contains("[[ABUSE]]"));
         assert!(ABUSE_INSTRUCTION.contains("NOT abuse"));
-        let p = compose_agent_system_prompt("persona", false, None);
+        let p = compose_agent_system_prompt("persona", false, None, false);
         assert!(p.contains("[[ABUSE]]"), "prompt must teach the marker");
-        let p2 = compose_agent_system_prompt("persona", true, None);
+        let p2 = compose_agent_system_prompt("persona", true, None, false);
         assert!(p2.contains("[[ABUSE]]"));
+        // The MANAGER marker is taught ONLY on manager-number calls: an
+        // ordinary caller's prompt must never mention it (live calls
+        // 8c689f13 + 0576e7eb: own-bookings questions kept getting marked
+        // manager-only despite ever-sharper challenge wording).
+        assert!(
+            !p.contains("[[MANAGER"),
+            "ordinary calls must not be taught the manager marker"
+        );
+        let mgr = compose_agent_system_prompt("persona", false, None, true);
+        assert!(
+            mgr.contains("[[MANAGER:"),
+            "manager-number calls still get the marker instruction"
+        );
         assert!(is_exact_abuse_marker(" [[ABUSE]] \n"));
         for incomplete in ["[[ABUSE", "hello [[ABUSE]]", "[[ABUSE]] more", "[[abuse]]"] {
             assert!(!is_exact_abuse_marker(incomplete), "{incomplete}");
@@ -13943,7 +13995,7 @@ mod tests {
     #[cfg(all(target_os = "windows", feature = "voice"))]
     #[test]
     fn assistance_prompt_and_caller_text_are_control_safe() {
-        let prompt = compose_agent_system_prompt("persona", false, None);
+        let prompt = compose_agent_system_prompt("persona", false, None, false);
         assert!(prompt.contains("[[ASSISTANCE:"));
         assert!(prompt.contains("Never name or choose a recipient"));
         let spoken = caller_facing_assistance_answer(
