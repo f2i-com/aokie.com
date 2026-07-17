@@ -277,6 +277,43 @@ fn synth_span(
     let rated = (aokie_core::time_stretch::clamp_rate(rate) - 1.0).abs() >= 0.01;
     // HTTP endpoint first (sticky per-call fallback semantics unchanged).
     if let Some(endpoint) = http.endpoint_for_call() {
+        // VOX-404 streaming-PCM lane: ask for response_format:"pcm" and ship
+        // blocks AS THEY ARRIVE. Rated spans skip it — WSOLA stretching wants
+        // the whole utterance, and they're short (slowed digit runs) anyway.
+        if !rated && http.pcm_streaming_enabled_for_call() {
+            match crate::radio::http_tts_stream_pcm_at(&endpoint, text, voice, target_rate, |pcm| {
+                if epoch.load(Ordering::SeqCst) != e {
+                    return false;
+                }
+                out_tx.send(SynthOut::Frames { epoch: e, pcm }).is_ok()
+            }) {
+                crate::radio::HttpTtsStream::Streamed | crate::radio::HttpTtsStream::Aborted => {
+                    // Aborted = epoch moved; the trailing Done/Failed the
+                    // caller sends reads as stale, same as ship_blocks.
+                    return Ok(());
+                }
+                crate::radio::HttpTtsStream::Unsupported(reason) => {
+                    // Spec-compliant third parties land here (no PCM
+                    // streaming): remember for the rest of the call and use
+                    // the whole-utterance wav request below.
+                    eprintln!(
+                        "[aokie-plugin] HTTP TTS streaming unavailable at {endpoint}: {reason}; using whole-utterance requests for this call"
+                    );
+                    http.mark_pcm_stream_unsupported();
+                }
+                crate::radio::HttpTtsStream::FailedMidStream(err) => {
+                    // Audio already reached the caller — re-synthesizing the
+                    // span would double-speak its prefix, so the span FAILS
+                    // (existing failed-span semantics) and later spans take
+                    // the sticky in-process fallback.
+                    http.mark_failed_for_call();
+                    eprintln!(
+                        "[aokie-plugin] HTTP TTS stream failed at {endpoint}: {err}; falling back to in-process TTS for this call"
+                    );
+                    return Err(format!("HTTP TTS stream failed mid-span: {err}"));
+                }
+            }
+        }
         match crate::radio::http_tts_synthesize_at(&endpoint, text, voice) {
             Ok(wav) => {
                 // Stretch at the provider's native rate (full quality), then

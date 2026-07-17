@@ -150,12 +150,77 @@ pub fn client_for(
     Ok(client)
 }
 
+/// True when `endpoint` targets the FormLogic desktop AI gateway — EXACTLY
+/// host `127.0.0.1`, port `17872` (the desktop's loopback management/gateway
+/// listener). Pure so the match rule is unit-testable; anything else (other
+/// loopback ports, `localhost` spellings, LAN/public hosts) is NOT the
+/// gateway and must never receive the gateway token.
+pub fn is_formlogic_gateway(endpoint: &str) -> bool {
+    let Ok(parsed) = aokie_core::url_classification::parse_base_url(endpoint) else {
+        return false;
+    };
+    let url = parsed.url();
+    url.host_str() == Some("127.0.0.1") && url.port_or_known_default() == Some(17_872)
+}
+
+/// The `Authorization: Bearer` token for the FormLogic AI gateway, read from
+/// `FORMLOGIC_AI_GATEWAY_TOKEN` — returned ONLY when the endpoint is the
+/// gateway itself ([`is_formlogic_gateway`]), so the token can never leak to
+/// any other endpoint an operator configures.
+pub fn gateway_bearer(endpoint: &str) -> Option<String> {
+    if !is_formlogic_gateway(endpoint) {
+        return None;
+    }
+    std::env::var("FORMLOGIC_AI_GATEWAY_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Attach the gateway bearer to a request when (and only when) its endpoint
+/// is the FormLogic AI gateway. One call site per outbound speech/LLM request
+/// keeps the rule uniform.
+pub fn with_gateway_bearer(
+    rb: reqwest::blocking::RequestBuilder,
+    endpoint: &str,
+) -> reqwest::blocking::RequestBuilder {
+    match gateway_bearer(endpoint) {
+        Some(token) => rb.bearer_auth(token),
+        None => rb,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn v4(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn gateway_match_is_exact_host_and_port() {
+        // The one shape that gets the token.
+        assert!(is_formlogic_gateway(
+            "http://127.0.0.1:17872/api/ai/v1/chat/completions"
+        ));
+        assert!(is_formlogic_gateway("http://127.0.0.1:17872/api/ai/v1"));
+        // Everything else must NOT match — other ports, other loopback
+        // spellings, remote hosts, a look-alike path on a foreign host,
+        // missing/default ports, garbage.
+        for not_gateway in [
+            "http://127.0.0.1:8080/v1/chat/completions",
+            "http://127.0.0.1/api/ai/v1/chat/completions", // default port 80
+            "http://localhost:17872/api/ai/v1/chat/completions",
+            "http://192.168.1.5:17872/api/ai/v1/chat/completions",
+            "https://api.example.com:17872/api/ai/v1/chat/completions",
+            "https://api.example.com/v1/chat/completions",
+            "http://[::1]:17872/api/ai/v1/chat/completions",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_formlogic_gateway(not_gateway), "{not_gateway}");
+        }
     }
 
     #[test]

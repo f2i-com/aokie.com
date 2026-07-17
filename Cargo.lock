@@ -307,6 +307,7 @@ dependencies = [
  "hound",
  "serde",
  "serde_json",
+ "transcribe-rs",
 ]
 
 [[package]]
@@ -5336,6 +5337,7 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
+ "mime_guess",
  "once_cell",
  "percent-encoding",
  "pin-project-lite",
