@@ -795,6 +795,29 @@ button {
 
 .rcp-hint.is-warn { color: var(--warn); }
 
+/* Ownership notice above the settings form: which fields a linked FormLogic
+   app re-applies on every call. The quiet variant states the relationship;
+   the warn variant appears once an external re-apply has been observed. */
+.rcp-notice {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ink-faint);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--ink-dim);
+  font-size: 10.5px;
+  line-height: 1.55;
+  overflow-wrap: break-word;
+}
+
+.rcp-notice--warn {
+  border-left-color: var(--warn);
+  color: var(--ink);
+}
+
+.rcp-notice--warn strong { color: var(--warn); }
+
 .rcp-actions {
   display: flex;
   align-items: center;
