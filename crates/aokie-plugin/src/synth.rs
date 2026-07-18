@@ -176,7 +176,7 @@ fn worker(
                     match crate::voice::TtsEngine::load() {
                         Ok(engine) => {
                             eprintln!(
-                                "[aokie-plugin] TTS engine pre-warmed (ring): {}",
+                                "[aokie-plugin] TTS engine pre-warmed: {}",
                                 engine.engine_name()
                             );
                             tts = Some(engine);
