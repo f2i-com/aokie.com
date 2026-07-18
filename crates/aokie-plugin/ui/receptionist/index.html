@@ -1,0 +1,100 @@
+<!--
+  Aokie AI Receptionist — plugin-shipped home console (manifest v2 ui.screens).
+
+  This is BODY MARKUP ONLY: the FormLogic Desktop host inlines this fragment,
+  styles.css and app.js into a sandboxed srcDoc iframe (opaque origin, CSP
+  default-src 'none') and injects window.PluginHost before app.js runs.
+  No external assets can load — every icon is inline SVG.
+-->
+<main class="rcp" id="rcp-root">
+  <!-- Hero: plugin health + version -->
+  <section class="rcp-hero">
+    <div class="rcp-hero__copy">
+      <span class="rcp-eyebrow">CURRENT STATUS</span>
+      <h1 id="hero-headline">Checking the receptionist&hellip;</h1>
+      <p id="hero-sub">Contacting the Aokie plugin.</p>
+    </div>
+    <div class="rcp-hero__meta">
+      <span class="rcp-pill is-neutral" id="hero-pill"><i></i><span id="hero-pill-text">Checking</span></span>
+      <small class="rcp-version" id="hero-version"></small>
+    </div>
+  </section>
+
+  <!-- Readiness grid (phone bridge / responder / radio / delivery) -->
+  <section class="rcp-grid" id="readiness" aria-label="Readiness checks">
+    <p class="rcp-loading">Loading&hellip;</p>
+  </section>
+
+  <div class="rcp-columns">
+    <!-- Live call strip -->
+    <section class="rcp-card rcp-live-card">
+      <div class="rcp-card__heading">
+        <div class="rcp-card__heading-copy">
+          <small>LIVE CALL</small>
+          <h3 id="live-title">Checking for a live call&hellip;</h3>
+        </div>
+        <span class="rcp-pill is-neutral" id="live-pill" hidden><i></i><span id="live-pill-text"></span></span>
+      </div>
+      <div id="live-body">
+        <p class="rcp-loading">Loading&hellip;</p>
+      </div>
+      <!-- The composer is STATIC so re-renders never eat the operator's typing. -->
+      <div class="rcp-speak" id="speak-row" hidden>
+        <input
+          type="text"
+          id="speak-input"
+          maxlength="500"
+          placeholder="Say something to the caller&hellip;"
+          aria-label="Text for Aokie to speak to the caller"
+        />
+        <button type="button" class="rcp-button" id="speak-send">Speak</button>
+      </div>
+    </section>
+
+    <!-- Delivery: outbox counts + dead-letter redrive -->
+    <section class="rcp-card">
+      <div class="rcp-card__heading">
+        <div class="rcp-card__heading-copy">
+          <small>DATA DELIVERY</small>
+          <h3 id="delivery-title">Loading&hellip;</h3>
+        </div>
+        <span class="rcp-pill is-neutral" id="delivery-pill"><i></i><span id="delivery-pill-text">Checking</span></span>
+      </div>
+      <div id="delivery-body">
+        <p class="rcp-loading">Loading&hellip;</p>
+      </div>
+    </section>
+  </div>
+
+  <div class="rcp-columns">
+    <!-- Bonded phones with reconnect / disconnect -->
+    <section class="rcp-card">
+      <div class="rcp-card__heading">
+        <div class="rcp-card__heading-copy">
+          <small>PAIRED PHONES</small>
+          <h3 id="phones-title">Loading&hellip;</h3>
+        </div>
+      </div>
+      <div id="phones-body">
+        <p class="rcp-loading">Loading&hellip;</p>
+      </div>
+    </section>
+
+    <!-- Read-only settings summary -->
+    <section class="rcp-card">
+      <div class="rcp-card__heading">
+        <div class="rcp-card__heading-copy">
+          <small>RECEPTIONIST SETTINGS</small>
+          <h3 id="settings-title">Loading&hellip;</h3>
+        </div>
+      </div>
+      <div id="settings-body">
+        <p class="rcp-loading">Loading&hellip;</p>
+      </div>
+      <p class="rcp-footnote">
+        Read-only summary &mdash; full settings editing is coming to this screen.
+        Until then, the existing settings editor still works.
+      </p>
+    </section>
+  </div>
+</main>

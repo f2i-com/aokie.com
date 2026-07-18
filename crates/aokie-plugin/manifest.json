@@ -127,7 +127,20 @@
         "id": "receptionist",
         "label": "AI Receptionist",
         "icon": "phone",
-        "badge": "New"
+        "badge": "New",
+        "screen": "receptionist-home"
+      }
+    ],
+    "screens": [
+      {
+        "id": "receptionist-home",
+        "title": "AI Receptionist",
+        "entry": "ui/receptionist/index.html",
+        "files": [
+          "ui/receptionist/index.html",
+          "ui/receptionist/styles.css",
+          "ui/receptionist/app.js"
+        ]
       }
     ],
     "overview": [
