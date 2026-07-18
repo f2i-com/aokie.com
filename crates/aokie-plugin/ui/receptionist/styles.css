@@ -478,6 +478,10 @@ button {
   padding: 12px 15px 14px;
 }
 
+/* An author display rule beats the UA [hidden] styling — restore it. */
+.rcp-speak[hidden],
+.rcp-pill[hidden] { display: none; }
+
 .rcp-speak input {
   flex: 1;
   min-width: 0;
@@ -613,13 +617,582 @@ button {
   white-space: nowrap;
 }
 
+/* ── Tab bar ────────────────────────────────────────────────────────────── */
+
+.rcp-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 0 2px;
+  border-bottom: 1px solid var(--line);
+}
+
+.rcp-tab-btn {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  padding: 9px 11px 8px;
+  color: var(--ink-faint);
+  font-size: 10.5px;
+  font-weight: 740;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 130ms ease, border-color 130ms ease;
+}
+
+.rcp-tab-btn:hover { color: var(--ink); }
+
+.rcp-tab-btn.is-active {
+  color: var(--signal-strong);
+  border-bottom-color: var(--signal);
+}
+
+.rcp-tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  min-width: 0;
+}
+
+.rcp-tab-panel[hidden] { display: none; }
+
+/* ── Inline "open tab" link ─────────────────────────────────────────────── */
+
+.rcp-link-btn {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--signal-strong);
+  font: inherit;
+  font-weight: 650;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* ── Card body (generic padded section for the tab cards) ───────────────── */
+
+.rcp-card__body {
+  padding: 12px 15px 0;
+  min-width: 0;
+}
+
+.rcp-card__body p { overflow-wrap: break-word; }
+
+/* ── Buttons: variants shared by the tabs ───────────────────────────────── */
+
+.rcp-button.is-primary {
+  border-color: var(--signal);
+  background: var(--signal);
+  color: var(--signal-ink);
+}
+
+.rcp-button.is-primary:hover:not(:disabled) {
+  border-color: var(--signal-bright);
+  background: var(--signal-bright);
+  color: var(--signal-ink);
+}
+
+.rcp-button.is-danger {
+  border-color: var(--err-line);
+  background: var(--err-soft);
+  color: var(--err-text);
+}
+
+.rcp-button.is-warn {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* ── Forms (Settings tab + shared) ──────────────────────────────────────── */
+
+.rcp-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 780px;
+  padding: 12px 15px 0;
+}
+
+.rcp-group-title {
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 740;
+  letter-spacing: -0.01em;
+}
+
+.rcp-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.rcp-field > span {
+  color: var(--ink-dim);
+  font-size: 10.5px;
+  font-weight: 650;
+}
+
+.rcp-field > span small {
+  color: var(--ink-faint);
+  font-weight: 500;
+}
+
+.rcp-field input[type='text'],
+.rcp-field input[type='number'],
+.rcp-field select,
+.rcp-field textarea,
+.rcp-textarea {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-0);
+  color: var(--ink);
+  font-size: 11.5px;
+  font-family: inherit;
+  min-width: 0;
+}
+
+.rcp-field textarea,
+.rcp-textarea {
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.rcp-field input:focus-visible,
+.rcp-field select:focus-visible,
+.rcp-field textarea:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 1px;
+}
+
+.rcp-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.rcp-check input { accent-color: var(--signal); }
+
+.rcp-hint {
+  margin: 3px 0 0;
+  color: var(--ink-faint);
+  font-size: 9.5px;
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
+
+.rcp-hint.is-warn { color: var(--warn); }
+
+.rcp-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+/* ── Badges ─────────────────────────────────────────────────────────────── */
+
+.rcp-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.rcp-badge.is-ok { background: var(--ok-soft); color: var(--ok-text); }
+.rcp-badge.is-pending { background: var(--warn-soft); color: var(--warn); }
+.rcp-badge.is-neutral { background: var(--hover-wash); color: var(--ink-faint); }
+
+/* ── Inline confirm (destructive actions — no host dialog in the sandbox) ── */
+
+.rcp-confirm {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--warn);
+  border-radius: 9px;
+  background: var(--warn-soft);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+
+.rcp-confirm.is-danger {
+  border-color: var(--err-line);
+  background: var(--err-soft);
+}
+
+.rcp-confirm p {
+  margin: 0 0 8px;
+  overflow-wrap: break-word;
+}
+
+.rcp-confirm .rcp-actions { margin-top: 0; }
+
+/* ── Code / mono ────────────────────────────────────────────────────────── */
+
+.rcp-code {
+  display: block;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+.rcp-paircode {
+  margin: 8px 0;
+  font-family: var(--font-mono);
+  font-size: 26px;
+  font-weight: 750;
+  letter-spacing: 6px;
+}
+
+/* ── Wizard rows (Dongle tab) ───────────────────────────────────────────── */
+
+.rcp-step-meta {
+  margin: 0;
+  color: var(--ink-dim);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+
+.rcp-step-meta + .rcp-step-meta { margin-top: 8px; }
+
+.rcp-wizard-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.rcp-wizard-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.rcp-wizard-row.is-selected {
+  border-color: var(--signal-line);
+  background: var(--signal-soft);
+}
+
+.rcp-wizard-row input { accent-color: var(--signal); }
+
+.rcp-wizard-row__name {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 650;
+  overflow-wrap: break-word;
+}
+
+.rcp-wizard-row__name small {
+  color: var(--ink-faint);
+  font-weight: 500;
+  font-family: var(--font-mono);
+}
+
+.rcp-wizard-row__badges {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+/* ── QR / offer block (Companion tab) ───────────────────────────────────── */
+
+.rcp-qr {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.rcp-qr img {
+  width: 170px;
+  height: 170px;
+  padding: 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  /* Always white behind the QR so it scans in dark mode too. */
+  background: #ffffff;
+}
+
+.rcp-qr__meta {
+  flex: 1;
+  min-width: 220px;
+}
+
+.rcp-qr__meta strong { font-size: 11.5px; }
+
+.rcp-qr__meta p {
+  margin: 3px 0 6px;
+  color: var(--ink-dim);
+  font-size: 10px;
+}
+
+.rcp-qr__meta small {
+  display: block;
+  color: var(--ink-faint);
+  font-size: 9px;
+  margin-bottom: 3px;
+}
+
+/* ── Identity grid (Companion tab) ──────────────────────────────────────── */
+
+.rcp-id-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.rcp-id-grid > span {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-2);
+}
+
+.rcp-id-grid > span.is-wide { grid-column: 1 / -1; }
+
+.rcp-id-grid small {
+  display: block;
+  color: var(--ink-faint);
+  font-size: 9px;
+}
+
+.rcp-id-grid strong { font-size: 11px; }
+
+.rcp-id-grid code {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  word-break: break-all;
+  line-height: 1.45;
+}
+
+/* ── People/device rows (Companion lists) ───────────────────────────────── */
+
+.rcp-list { margin-top: 10px; }
+
+.rcp-list h4 {
+  margin: 0 0 2px;
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.rcp-person-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-top: 1px solid var(--line);
+  min-width: 0;
+}
+
+.rcp-person-row:first-of-type { border-top: 0; }
+
+.rcp-person-row__icon {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--signal-soft);
+  color: var(--signal-strong);
+}
+
+.rcp-person-row__icon.is-ok {
+  background: var(--ok-soft);
+  color: var(--ok-text);
+}
+
+.rcp-person-row__id {
+  flex: 1;
+  min-width: 0;
+}
+
+.rcp-person-row__id strong {
+  display: block;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rcp-person-row__id small {
+  display: block;
+  color: var(--ink-faint);
+  font-size: 9.5px;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rcp-person-row__id code {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  word-break: break-all;
+  color: var(--ink-dim);
+}
+
+/* ── Callout (topology / privacy notes) ─────────────────────────────────── */
+
+.rcp-callout {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  margin-top: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--signal-line);
+  border-radius: 9px;
+  background: var(--signal-soft);
+  color: var(--ink-dim);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.rcp-callout.is-warn {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.rcp-callout svg { flex: none; margin-top: 1px; }
+
+/* ── Details/summary (Companion relay test) ─────────────────────────────── */
+
+.rcp-details {
+  margin-top: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.rcp-details summary {
+  cursor: pointer;
+  font-size: 10.5px;
+  font-weight: 650;
+  color: var(--ink-dim);
+}
+
+.rcp-details p {
+  margin: 8px 0 0;
+  color: var(--ink-faint);
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+
+.rcp-details textarea {
+  width: 100%;
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+/* ── Consent scope rows ─────────────────────────────────────────────────── */
+
+.rcp-scope-row {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.rcp-scope-row:first-of-type { border-top: 0; }
+
+.rcp-scope-row input {
+  margin-top: 2px;
+  accent-color: var(--signal);
+  flex: none;
+}
+
+.rcp-scope-row strong {
+  display: block;
+  font-size: 11px;
+}
+
+.rcp-scope-detail {
+  display: block;
+  margin-top: 1px;
+  color: var(--ink-dim);
+  font-size: 9.8px;
+  line-height: 1.5;
+}
+
+.rcp-dest-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 10px;
+}
+
+.rcp-dest-list li { margin-top: 3px; }
+
+.rcp-dest-list code {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  word-break: break-all;
+}
+
+/* ── Status line helpers ────────────────────────────────────────────────── */
+
+.rcp-status-ok {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ok-text);
+  font-size: 10.5px;
+}
+
+.rcp-inline-note {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
 /* ── Responsive ─────────────────────────────────────────────────────────── */
 
 @media (max-width: 899px) {
   .rcp-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .rcp-columns { grid-template-columns: 1fr; }
+  .rcp-id-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 559px) {
   .rcp-grid { grid-template-columns: 1fr; }
+  .rcp-id-grid { grid-template-columns: 1fr; }
 }

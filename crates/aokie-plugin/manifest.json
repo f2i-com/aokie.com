@@ -139,7 +139,12 @@
         "files": [
           "ui/receptionist/index.html",
           "ui/receptionist/styles.css",
-          "ui/receptionist/app.js"
+          "ui/receptionist/app.js",
+          "ui/receptionist/tabs/settings.js",
+          "ui/receptionist/tabs/phone.js",
+          "ui/receptionist/tabs/companion.js",
+          "ui/receptionist/tabs/consent.js",
+          "ui/receptionist/tabs/dongle.js"
         ]
       }
     ],

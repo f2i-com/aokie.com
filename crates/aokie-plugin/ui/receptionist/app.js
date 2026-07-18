@@ -1,15 +1,22 @@
 /*
- * Aokie AI Receptionist — plugin-shipped home console (manifest v2 ui.screens).
+ * Aokie AI Receptionist — plugin-shipped desktop console (manifest v2
+ * ui.screens). CORE module: boot, shared helpers, the tab registry/switcher,
+ * the declared-events subscription, and the Overview tab.
  *
  * Runs inside FormLogic Desktop's sandboxed plugin-screen iframe. The host
  * injects `window.PluginHost` (postMessage RPC) before this file executes;
  * there is NO network, NO framework and NO build step here — plain DOM.
  *
- * Structure: one `state` object, per-card render helpers, two visibility-aware
- * timers (5 s readiness/roster, 2 s live call), a declared-events subscription
- * for instant refresh, and event delegation for the dynamic buttons. Every
- * card paints "Loading…" first and then either data or an honest inline
- * error — never a blank card.
+ * The host CONCATENATES every .js file in manifest files-list order with
+ * '\n;' separators — this file runs FIRST and defines `window.__aokieTabs`
+ * (a registration API); each tabs/*.js file is an IIFE that registers
+ * itself. This file mounts/unmounts tabs on switch and forwards subscribed
+ * plugin events to the active tab.
+ *
+ * Overview structure: one `state` object, per-card render helpers, two
+ * visibility-aware timers (5 s readiness/roster, 2 s live call), and event
+ * delegation for the dynamic buttons. Every card paints "Loading…" first
+ * and then either data or an honest inline error — never a blank card.
  */
 (function () {
   'use strict';
@@ -79,6 +86,79 @@
     check: svg('<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>', 14),
     alert: svg('<path d="m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>', 14),
   };
+
+  // ---- tab registry -------------------------------------------------------
+  // Each tabs/*.js module registers { mount(el), unmount()?, onEvent(frame)? }.
+  // The Overview tab is owned by THIS file (static markup + the timers below);
+  // switching mounts/unmounts the registered module for every other tab.
+  // Tab state is in-memory only (the sandbox has no location.hash).
+
+  var tabRegistry = {};
+  var activeTab = 'overview';
+  var activeDef = null; // the mounted module for a non-overview tab
+
+  window.__aokieTabs = {
+    register: function (id, def) {
+      tabRegistry[id] = def || {};
+    },
+    /** Shared helpers for tab modules (defined above in this file). */
+    util: { esc: esc, errMsg: errMsg, setHtml: setHtml, svg: svg, icons: ICONS },
+    switchTo: function (id) {
+      switchTab(id);
+    },
+  };
+
+  function tabContainer(id) {
+    return $('tab-' + id);
+  }
+
+  function switchTab(id) {
+    if (!id || id === activeTab || !tabContainer(id)) return;
+
+    // Leave the old tab.
+    if (activeTab === 'overview') {
+      stopTimers();
+    } else if (activeDef && typeof activeDef.unmount === 'function') {
+      try {
+        activeDef.unmount();
+      } catch (e) {
+        /* a tab's cleanup must never block switching */
+      }
+    }
+    var oldEl = tabContainer(activeTab);
+    if (oldEl) oldEl.hidden = true;
+    activeDef = null;
+    activeTab = id;
+
+    // Tab-bar state.
+    var btns = document.querySelectorAll('.rcp-tab-btn');
+    for (var i = 0; i < btns.length; i++) {
+      var on = btns[i].getAttribute('data-tab') === id;
+      btns[i].classList.toggle('is-active', on);
+      btns[i].setAttribute('aria-selected', on ? 'true' : 'false');
+    }
+
+    // Enter the new tab.
+    var el = tabContainer(id);
+    el.hidden = false;
+    if (id === 'overview') {
+      if (!document.hidden) startTimers();
+      return;
+    }
+    var def = tabRegistry[id];
+    if (def && typeof def.mount === 'function') {
+      activeDef = def;
+      try {
+        def.mount(el);
+      } catch (e) {
+        el.innerHTML =
+          '<p class="rcp-error">This tab failed to load: ' + esc(errMsg(e)) + '</p>';
+      }
+    } else {
+      el.innerHTML =
+        '<p class="rcp-error">This tab did not register — the screen bundle may be incomplete.</p>';
+    }
+  }
 
   // ---- state --------------------------------------------------------------
   // `undefined` = first fetch still in flight (cards show "Loading…");
@@ -609,7 +689,9 @@
       title.textContent = 'No phones paired';
       setHtml(
         body,
-        '<p class="rcp-loading">No phones are bonded yet. Pair one from the Aokie plugin console and it will appear here.</p>'
+        '<p class="rcp-loading">No phones are bonded yet. Open the ' +
+          '<button type="button" class="rcp-link-btn" data-tabgo="phone">Phone setup tab</button>' +
+          ' to pair one.</p>'
       );
       return;
     }
@@ -812,6 +894,18 @@
 
   document.addEventListener('click', function (e) {
     var el = e.target;
+    // Tab bar + inline "open tab" links (any tab's markup may carry these).
+    var tabBtn = el && el.closest ? el.closest('[data-tab]') : null;
+    if (tabBtn) {
+      switchTab(tabBtn.getAttribute('data-tab'));
+      return;
+    }
+    var tabGo = el && el.closest ? el.closest('[data-tabgo]') : null;
+    if (tabGo) {
+      switchTab(tabGo.getAttribute('data-tabgo'));
+      return;
+    }
+    // Overview action buttons.
     var btn = el && el.closest ? el.closest('[data-act]') : null;
     if (!btn || btn.disabled) return;
     var act = btn.getAttribute('data-act');
@@ -831,9 +925,15 @@
   // ---- live events (instant refresh; polling remains the safety net) ------
 
   // Every name below is declared in manifest.json "events" — the host refuses
-  // undeclared subscriptions.
+  // undeclared subscriptions. The list covers what EVERY tab reacts to; the
+  // frame is forwarded to the active tab's onEvent (Overview routes below).
   var SUBSCRIBED_EVENTS = [
+    'aokie.dongle.detected',
+    'aokie.dongle.driver_required',
     'aokie.dongle.ready',
+    'aokie.dongle.error',
+    'aokie.phone.pairing_started',
+    'aokie.phone.pairing_confirm_required',
     'aokie.phone.connected',
     'aokie.phone.disconnected',
     'aokie.phone.paired',
@@ -846,21 +946,35 @@
 
   var eventHandle = null;
 
+  function routeOverviewEvent(name) {
+    if (name.indexOf('aokie.dongle.') === 0) {
+      refreshPhoneStatus();
+      refreshDiag();
+      return;
+    }
+    if (name.indexOf('aokie.phone.') === 0) {
+      refreshPhones();
+      refreshPhoneStatus();
+      return;
+    }
+    if (name.indexOf('aokie.call.') === 0) {
+      refreshCall();
+    }
+  }
+
   HOST.events
     .subscribe(SUBSCRIBED_EVENTS, function (evt) {
       var name = (evt && evt.name) || '';
-      if (name === 'aokie.dongle.ready') {
-        refreshPhoneStatus();
-        refreshDiag();
+      if (activeTab === 'overview') {
+        routeOverviewEvent(name);
         return;
       }
-      if (name.indexOf('aokie.phone.') === 0) {
-        refreshPhones();
-        refreshPhoneStatus();
-        return;
-      }
-      if (name.indexOf('aokie.call.') === 0) {
-        refreshCall();
+      if (activeDef && typeof activeDef.onEvent === 'function') {
+        try {
+          activeDef.onEvent(evt);
+        } catch (e) {
+          /* a tab's event handler must never kill the feed */
+        }
       }
     })
     .then(function (h) {
@@ -874,12 +988,22 @@
   // ---- lifecycle ----------------------------------------------------------
 
   document.addEventListener('visibilitychange', function () {
+    // Overview's timers only run while Overview is the active tab; other
+    // tabs' own intervals check document.hidden themselves.
     if (document.hidden) stopTimers();
-    else startTimers();
+    else if (activeTab === 'overview') startTimers();
   });
 
   window.addEventListener('pagehide', function () {
     stopTimers();
+    if (activeDef && typeof activeDef.unmount === 'function') {
+      try {
+        activeDef.unmount();
+      } catch (e) {
+        /* the document is going away */
+      }
+      activeDef = null;
+    }
     if (eventHandle) {
       try {
         eventHandle.unsubscribe();
