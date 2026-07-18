@@ -83,17 +83,33 @@ struct V2SignedPayload {
     remote_consent: RemoteConsentDiscovery,
     #[serde(default)]
     ice_servers: Vec<DiscoveryIceServer>,
+    // Pack-services wave 1: a per-app document whose companion-relay service
+    // is DISABLED withholds the gateway/ICE bootstrap entirely — these fields
+    // default instead of failing the parse (signature verification is over
+    // the envelope's raw payload, so parser defaults never affect it).
+    #[serde(default)]
     relay_only: bool,
-    #[serde(deserialize_with = "deserialize_nullable_unix_timestamp")]
+    #[serde(default, deserialize_with = "deserialize_nullable_unix_timestamp")]
     turn_credential_expires_at: NullableUnixTimestamp,
     media: MediaDiscovery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     app_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     app_slug: Option<String>,
+    /// Present ONLY when the app's companion-relay service is disabled
+    /// (absence = enabled — the exact shape earlier builds were built
+    /// against, so the backend never sends it on the enabled path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    companion_relay: Option<CompanionRelayDiscovery>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompanionRelayDiscovery {
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(transparent)]
 pub(crate) struct NullableUnixTimestamp(Option<u64>);
 
@@ -516,6 +532,18 @@ fn select_v2_gateway(payload: &V2SignedPayload) -> Result<Option<String>, String
         (None, Some(legacy)) => Some(legacy),
         (None, None) => None,
     };
+    // Pack-services wave 1: the owner turned the app's Companion relay
+    // service OFF — the document deliberately carries no gateway. Say so
+    // instead of misreading it as a malformed deployment.
+    if payload.companion_relay.is_some_and(|r| !r.enabled) {
+        if selected.is_some() {
+            return Err("disabled companion relay unexpectedly advertises gatewayUrl".into());
+        }
+        return Err(
+            "the app owner has disabled the Companion relay service for this app (App Settings → Included services)"
+                .into(),
+        );
+    }
     if payload.available && selected.is_none() {
         return Err("available deployment omitted gatewayUrl".into());
     }
