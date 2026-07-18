@@ -36,6 +36,11 @@
   var restoreArm = null; // "vid:pid" with the inline restore confirm open
   var verifyTimer = null;
   var verifyAttempts = 0;
+  // The device a verify poll is checking. Kept OUTSIDE the live list because
+  // the target legitimately disappears from `connected` mid-verify (the
+  // rebind re-enumerates it) — "Check again" and a remount mid-verify must
+  // still know which device they're waiting on.
+  var verifyTarget = null;
 
   function key(d) {
     return d.vid + ':' + d.pid;
@@ -95,11 +100,12 @@
     step = 'verify';
     error = null;
     verifyAttempts = 0;
+    verifyTarget = target;
     render();
     var targetKey = key(target);
     var poll = function () {
       refresh().then(function (data) {
-        if (!root) return; // tab left mid-verify
+        if (!root) return; // tab left mid-verify (mount resumes the poll)
         var now = null;
         var conn = (data && data.connected) || [];
         for (var i = 0; i < conn.length; i++) {
@@ -108,6 +114,7 @@
         if (now && now.driverBound) {
           step = 'done';
           selectedKey = targetKey;
+          verifyTarget = null;
           HOST.toast(
             'success',
             'Dongle driver installed — ' + dongleLabel(target) + ' is now bound to WinUSB and ready for Aokie.'
@@ -379,11 +386,15 @@
         var sel = selectedDevice();
         if (sel && key(sel) === btn.getAttribute('data-pick')) restore(sel);
       } else if (act === 'dg-verify-again') {
-        var target = selectedDevice();
+        // The verify target may be ABSENT from the live list mid-rebind —
+        // retry against the captured target, not the (possibly null)
+        // current selection.
+        var target = verifyTarget || selectedDevice();
         if (target) verifySelected(target);
       } else if (act === 'dg-again') {
         step = 'select';
         error = null;
+        verifyTarget = null;
         refresh();
       }
     });
@@ -393,6 +404,12 @@
     mount: function (el) {
       root = el;
       wire(el);
+      if (step === 'verify' && verifyTarget) {
+        // The tab was left mid-verify (unmount cleared the poll timer) —
+        // resume the verification instead of showing "Checking…" forever.
+        verifySelected(verifyTarget);
+        return;
+      }
       render();
       refresh();
     },
