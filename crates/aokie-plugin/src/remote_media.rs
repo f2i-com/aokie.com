@@ -100,6 +100,29 @@ pub struct RemoteMediaSnapshot {
     pub captions: Vec<RemoteCaption>,
 }
 
+/// Exact proof that Aokie, rather than a pending/active Companion route, owns
+/// one physical caller. Autonomous radio actions capture this fence before
+/// starting and must re-present it while the media-state lock is held. A
+/// takeover/consult claim (including a claim that is later returned) changes
+/// at least the service state or dedicated action epoch (while a new physical
+/// call changes the call epoch) and therefore fences a stale AI hangup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AokieOwnerFence {
+    pub call_id: String,
+    pub call_epoch: u64,
+    pub action_epoch: u64,
+}
+
+/// Stronger fence for an Aokie-owned physical switchboard command. Prepared
+/// or active non-monitor media makes this unavailable, and the owner epoch
+/// pins the exact foreground leg while CHLD is issued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AokieSwitchFence {
+    pub owner: AokieOwnerFence,
+    pub owner_epoch: u64,
+    pub switch_epoch: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteConsentGate {
@@ -188,6 +211,10 @@ pub struct OpenPeerRequest {
     pub ice_servers: Vec<IceServerConfig>,
     #[serde(default)]
     pub relay_only: bool,
+    /// Local-only proof captured before the gateway admits a non-monitor
+    /// offer. A peer-controlled payload can never supply this value.
+    #[serde(skip)]
+    pub expected_switch_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -358,6 +385,14 @@ struct RemoteMediaState {
     calls: HashMap<String, CallRecord>,
     call_order: VecDeque<String>,
     next_call_epoch: u64,
+    /// Advances only when proven Companion PCM is about to reserve the caller.
+    /// Unlike remote_revision, monitor/negotiation/heartbeat churn cannot
+    /// spuriously cancel an in-flight Aokie reply.
+    aokie_action_epoch: u64,
+    /// Advances only for a physical switchboard command. Native peer opens
+    /// capture this before asynchronous SDP work and must re-present it at
+    /// slot insertion, making CHLD and non-monitor registration exclusive.
+    aokie_switch_epoch: u64,
     remote_revision: u64,
     current_call_id: Option<String>,
     current_call_active: bool,
@@ -383,6 +418,8 @@ impl Default for RemoteMediaState {
             calls: HashMap::new(),
             call_order: VecDeque::new(),
             next_call_epoch: 0,
+            aokie_action_epoch: 0,
+            aokie_switch_epoch: 0,
             remote_revision: 0,
             current_call_id: None,
             current_call_active: false,
@@ -598,6 +635,100 @@ impl RemoteMediaHandle {
             consent,
             captions,
         }
+    }
+
+    /// Capture the exact current Aokie caller-owner fence. `None` is the
+    /// fail-closed answer while the call is inactive or any Companion
+    /// takeover/consult transition reserves the radio.
+    pub fn aokie_owner_fence(&self) -> Option<AokieOwnerFence> {
+        self.inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.aokie_owner_fence())
+    }
+
+    /// Capture an exact foreground-leg fence only while no prepared or active
+    /// Companion media claim can race a physical switchboard command.
+    pub fn aokie_switch_fence(&self) -> Option<AokieSwitchFence> {
+        self.inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.aokie_switch_fence())
+    }
+
+    /// Capture the physical-switch epoch before the gateway makes its
+    /// marker/revision admission decision. Non-monitor peer opening carries
+    /// this proof through asynchronous SDP work and rechecks it both when the
+    /// manager dequeues the request and when the native slot is inserted.
+    pub fn capture_aokie_switch_epoch(&self) -> Result<u64, String> {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.aokie_switch_epoch)
+            .map_err(|_| "remote media state poisoned".to_string())
+    }
+
+    /// Linearize one short CHLD/physical-switch command against media claims.
+    /// The state lock is held only for the command send; callers must bump the
+    /// public switchboard revision inside `action` before touching the phone,
+    /// so any claim starting after the lock is released sees a stale offer.
+    pub fn with_aokie_switch_owner<T>(
+        &self,
+        expected: &AokieSwitchFence,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| "remote media state poisoned".to_string())?;
+        if state.aokie_switch_fence().as_ref() != Some(expected) {
+            return Err("the exact Aokie switchboard fence changed".into());
+        }
+        state.aokie_switch_epoch = state.aokie_switch_epoch.saturating_add(1).max(1);
+        state.fence_autonomous_aokie_actions();
+        Ok(action())
+    }
+
+    /// Execute one autonomous physical action only if the exact Aokie owner
+    /// captured by the caller is still current. The state mutex remains held
+    /// through `action`, atomically ordering it against a concurrent remote
+    /// claim: whichever acquires the lock first owns the decision.
+    pub fn with_aokie_owner<T>(
+        &self,
+        expected: &AokieOwnerFence,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| "remote media state poisoned".to_string())?;
+        if state.aokie_owner_fence().as_ref() != Some(expected) {
+            return Err("the exact Aokie caller-owner fence changed".into());
+        }
+        Ok(action())
+    }
+
+    /// Linearize a short decision for an autonomous side effect whose actual
+    /// I/O must not run while the media-state mutex is held (for example a
+    /// durable host event). If this succeeds, the action won ownership before
+    /// any later Companion claim and may finish after the lock is released.
+    /// Advancing the dedicated epoch makes every other stale Aokie decision
+    /// fail closed; it does not alter the externally published call epochs.
+    pub fn linearize_aokie_action(&self, expected: &AokieOwnerFence) -> Result<(), String> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| "remote media state poisoned".to_string())?;
+        if state.aokie_owner_fence().as_ref() != Some(expected) {
+            return Err("the exact Aokie caller-owner fence changed".into());
+        }
+        state.fence_autonomous_aokie_actions();
+        Ok(())
     }
 
     /// Run one physical caller-ending action while the remote-owner mutex is
@@ -1627,6 +1758,52 @@ pub fn human_reserves_radio_globally() -> bool {
 }
 
 impl RemoteMediaState {
+    fn aokie_owner_fence(&self) -> Option<AokieOwnerFence> {
+        if !self.current_call_active
+            || self.service_mode != ServiceMode::AokieActive
+            || self.radio_reserved()
+        {
+            return None;
+        }
+        let call_id = self.current_call_id.as_ref()?;
+        let record = self.calls.get(call_id)?;
+        Some(AokieOwnerFence {
+            call_id: call_id.clone(),
+            call_epoch: record.call_epoch,
+            action_epoch: self.aokie_action_epoch,
+        })
+    }
+
+    fn aokie_switch_fence(&self) -> Option<AokieSwitchFence> {
+        let owner = self.aokie_owner_fence()?;
+        // Monitor is observational. Every other peer/pending claim can become
+        // a caller route and therefore excludes a concurrent CHLD topology
+        // change, even before exact PCM is ready to reserve the radio.
+        let media_claim_exists = self.pending_prepare.is_some()
+            || self.prepared_claim.is_some()
+            || self.pending_consult.is_some()
+            || self.active_consult.is_some()
+            || self.pending_route.is_some()
+            || self.active_route.is_some()
+            || self
+                .peers
+                .values()
+                .any(|slot| slot.binding.mode != MediaMode::Monitor);
+        if media_claim_exists {
+            return None;
+        }
+        let owner_epoch = self.current_record()?.owner_epoch;
+        Some(AokieSwitchFence {
+            owner,
+            owner_epoch,
+            switch_epoch: self.aokie_switch_epoch,
+        })
+    }
+
+    fn fence_autonomous_aokie_actions(&mut self) {
+        self.aokie_action_epoch = self.aokie_action_epoch.saturating_add(1).max(1);
+    }
+
     fn bump_revision(&mut self) {
         self.remote_revision = self.remote_revision.saturating_add(1).max(1);
     }
@@ -1831,8 +2008,24 @@ impl RemoteMediaState {
         Ok(())
     }
 
-    fn reserve_open(&self, binding: &SessionBinding) -> Result<(), String> {
-        self.validate_open(binding)
+    fn reserve_open_after_switch_epoch(
+        &self,
+        binding: &SessionBinding,
+        expected_switch_epoch: Option<u64>,
+    ) -> Result<(), String> {
+        self.validate_open(binding)?;
+        if binding.mode != MediaMode::Monitor {
+            let expected = expected_switch_epoch.ok_or_else(|| {
+                "non-monitor media open omitted its physical switchboard proof".to_string()
+            })?;
+            if self.aokie_switch_epoch != expected {
+                return Err(
+                    "physical switchboard changed before the media manager admitted the peer"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn insert_peer(&mut self, slot: PeerSlot) -> Result<(), String> {
@@ -1858,6 +2051,19 @@ impl RemoteMediaState {
         self.peers.insert(slot.binding.rtc_session_id.clone(), slot);
         self.bump_revision();
         Ok(())
+    }
+
+    fn insert_peer_after_switch_epoch(
+        &mut self,
+        slot: PeerSlot,
+        expected_switch_epoch: Option<u64>,
+    ) -> Result<(), String> {
+        if expected_switch_epoch.is_some_and(|expected| self.aokie_switch_epoch != expected) {
+            return Err(
+                "physical switchboard changed while the media peer was opening".to_string(),
+            );
+        }
+        self.insert_peer(slot)
     }
 
     fn request_soft_hold(
@@ -1979,6 +2185,7 @@ impl RemoteMediaState {
         self.prepared_claim = None;
         // Exact decoded microphone PCM is now proven. Reserve new Aokie TX
         // while the radio performs the final flush/ACK on its next tick.
+        self.fence_autonomous_aokie_actions();
         self.service_mode = ServiceMode::ConsultPending;
         self.bump_revision();
         Ok(())
@@ -2042,6 +2249,7 @@ impl RemoteMediaState {
             transition_dispatched: false,
         });
         self.prepared_claim = None;
+        self.fence_autonomous_aokie_actions();
         self.service_mode = ServiceMode::HumanPending;
         self.bump_revision();
         Ok(())
@@ -2846,10 +3054,13 @@ async fn manager_loop(
         match command {
             ManagerCommand::Open { request, reply } => {
                 let binding = request.binding.clone();
+                let expected_switch_epoch = request.expected_switch_epoch;
                 let reserved = state
                     .lock()
                     .map_err(|_| "remote media state poisoned".to_string())
-                    .and_then(|state| state.reserve_open(&binding));
+                    .and_then(|state| {
+                        state.reserve_open_after_switch_epoch(&binding, expected_switch_epoch)
+                    });
                 if let Err(error) = reserved {
                     let _ = reply.send(Err(error));
                     continue;
@@ -2877,7 +3088,9 @@ async fn manager_loop(
                         let inserted = state
                             .lock()
                             .map_err(|_| "remote media state poisoned".to_string())
-                            .and_then(|mut state| state.insert_peer(slot));
+                            .and_then(|mut state| {
+                                state.insert_peer_after_switch_epoch(slot, expected_switch_epoch)
+                            });
                         if let Err(error) = inserted {
                             peer.close();
                             let _ = reply.send(Err(error));
@@ -3244,6 +3457,184 @@ mod tests {
         };
         state.observe_call(Some("call_a"), true);
         state
+    }
+
+    #[test]
+    fn autonomous_aokie_actions_require_the_exact_unchanged_owner_fence() {
+        let handle = RemoteMediaHandle::spawn().unwrap();
+        {
+            let mut state = handle.inner.state.lock().unwrap();
+            *state = active_state();
+        }
+        handle.refresh_reserved();
+
+        let original = handle
+            .aokie_owner_fence()
+            .expect("active Aokie call has an owner fence");
+        let mut ran = false;
+        assert_eq!(
+            handle.with_aokie_owner(&original, || {
+                ran = true;
+                7
+            }),
+            Ok(7)
+        );
+        assert!(ran);
+
+        // Monitor peers, signalling, and heartbeats use remote_revision but do
+        // not transfer the caller; they must not cut a healthy Aokie reply.
+        {
+            let mut state = handle.inner.state.lock().unwrap();
+            state.bump_revision();
+        }
+        assert!(handle.with_aokie_owner(&original, || ()).is_ok());
+
+        handle
+            .linearize_aokie_action(&original)
+            .expect("the first exact action wins its linearization point");
+        let linearized = handle
+            .aokie_owner_fence()
+            .expect("linearization keeps Aokie as the current owner");
+        assert_eq!(linearized.call_id, original.call_id);
+        assert_eq!(linearized.call_epoch, original.call_epoch);
+        assert_eq!(linearized.action_epoch, original.action_epoch + 1);
+        assert!(handle.linearize_aokie_action(&original).is_err());
+
+        // A later legitimate preparation starts from the fresh owner state;
+        // the local action epoch is not a remote-media kill switch.
+        {
+            let mut state = handle.inner.state.lock().unwrap();
+            let prepared = binding(MediaMode::PreparedTalk, 0, 11, "after_action");
+            insert(&mut state, prepared.clone(), Duration::from_secs(5));
+            state
+                .request_soft_hold(prepared, Duration::from_secs(5))
+                .expect("a later exact claim can still proceed");
+            state.pending_prepare = None;
+            state.peers.clear();
+        }
+        // Any pending/active remote service state fails closed.
+        for mode in [
+            ServiceMode::SoftHold,
+            ServiceMode::ConsultPending,
+            ServiceMode::ConsultActive,
+            ServiceMode::HumanPending,
+            ServiceMode::HumanActive,
+            ServiceMode::ReturningToAokie,
+            ServiceMode::Recovering,
+        ] {
+            {
+                let mut state = handle.inner.state.lock().unwrap();
+                state.service_mode = mode;
+            }
+            handle.refresh_reserved();
+            assert!(handle.aokie_owner_fence().is_none(), "{mode:?}");
+            let mut stale_ran = false;
+            assert!(
+                handle
+                    .with_aokie_owner(&original, || stale_ran = true)
+                    .is_err(),
+                "{mode:?}"
+            );
+            assert!(!stale_ran, "{mode:?}");
+        }
+
+        // Returning to Aokie does not revive a pre-claim autonomous action:
+        // the dedicated action epoch changed.
+        {
+            let mut state = handle.inner.state.lock().unwrap();
+            state.service_mode = ServiceMode::AokieActive;
+        }
+        handle.refresh_reserved();
+        assert!(handle.aokie_owner_fence().is_some());
+        let mut stale_ran = false;
+        assert!(handle
+            .with_aokie_owner(&original, || stale_ran = true)
+            .is_err());
+        assert!(!stale_ran);
+    }
+
+    #[test]
+    fn physical_switch_and_non_monitor_peer_registration_are_mutually_exclusive() {
+        let handle = RemoteMediaHandle::spawn().unwrap();
+        {
+            let mut state = handle.inner.state.lock().unwrap();
+            *state = active_state();
+        }
+
+        let first = handle
+            .aokie_switch_fence()
+            .expect("an idle Aokie-owned call can switch");
+        assert_eq!(
+            handle.with_aokie_switch_owner(&first, || 7),
+            Ok(7),
+            "the switch command wins atomically"
+        );
+        assert!(handle.with_aokie_switch_owner(&first, || ()).is_err());
+        let after_switch = handle
+            .aokie_switch_fence()
+            .expect("Aokie still owns the call after the command send");
+        assert_eq!(after_switch.switch_epoch, first.switch_epoch + 1);
+
+        // A monitor peer remains observational and does not block CHLD.
+        {
+            let mut state = handle.inner.state.lock().unwrap();
+            let monitor = binding(MediaMode::Monitor, 0, 0, "monitor_switch");
+            insert(&mut state, monitor, Duration::from_secs(5));
+        }
+        assert!(handle.aokie_switch_fence().is_some());
+
+        // The gateway captured this proof while admitting the offer, but CHLD
+        // won before the async media manager dequeued Open. The manager must
+        // reject the queued non-monitor request rather than capture/bless the
+        // already-advanced epoch at dequeue time.
+        let admitted_epoch = handle.capture_aokie_switch_epoch().unwrap();
+        let queued_binding = binding(MediaMode::PreparedTalk, 0, 12, "manager_dequeue");
+        let chld = handle
+            .aokie_switch_fence()
+            .expect("monitor-only state still permits CHLD");
+        handle
+            .with_aokie_switch_owner(&chld, || ())
+            .expect("CHLD wins after offer admission");
+        {
+            let state = handle.inner.state.lock().unwrap();
+            assert!(state
+                .reserve_open_after_switch_epoch(&queued_binding, Some(admitted_epoch))
+                .is_err());
+        }
+
+        // If asynchronous SDP reserved a non-monitor open before CHLD, the
+        // switch epoch must still match when its slot is finally inserted.
+        let captured_epoch = {
+            let state = handle.inner.state.lock().unwrap();
+            state.aokie_switch_epoch
+        };
+        let prepared_binding = binding(MediaMode::PreparedTalk, 0, 13, "peer_race");
+        let prepared_slot = PeerSlot {
+            binding: prepared_binding,
+            lease_expires_at: Instant::now() + Duration::from_secs(5),
+            actor_tx: actor(),
+            remote_ice_tx: remote_ice(),
+            caller_pcm_tx: caller_pcm(),
+        };
+        {
+            let mut state = handle.inner.state.lock().unwrap();
+            state.aokie_switch_epoch = state.aokie_switch_epoch.saturating_add(1);
+            assert!(state
+                .insert_peer_after_switch_epoch(prepared_slot, Some(captured_epoch))
+                .is_err());
+        }
+
+        // Conversely, if peer insertion wins first, the switch fence vanishes
+        // until that prepared/active route is gone.
+        {
+            let mut state = handle.inner.state.lock().unwrap();
+            state
+                .peers
+                .retain(|_, slot| slot.binding.mode != MediaMode::Monitor);
+            let prepared = binding(MediaMode::PreparedTalk, 0, 14, "peer_first");
+            insert(&mut state, prepared, Duration::from_secs(5));
+        }
+        assert!(handle.aokie_switch_fence().is_none());
     }
 
     fn prepare_active_talk(

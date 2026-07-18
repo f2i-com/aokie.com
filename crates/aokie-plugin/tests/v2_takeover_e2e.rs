@@ -888,6 +888,11 @@ async fn open_native_peer(media: &RemoteMediaHandle, binding: SessionBinding) ->
     let (mut companion, offer) = CompanionPeer::offer(binding.clone(), PeerOptions::default())
         .await
         .expect("Companion offer");
+    let expected_switch_epoch = (binding.mode != MediaMode::Monitor).then(|| {
+        media
+            .capture_aokie_switch_epoch()
+            .expect("physical switch epoch")
+    });
     media
         .open_peer(OpenPeerRequest {
             binding,
@@ -895,6 +900,7 @@ async fn open_native_peer(media: &RemoteMediaHandle, binding: SessionBinding) ->
             lease_ttl_ms: 15_000,
             ice_servers: vec![],
             relay_only: false,
+            expected_switch_epoch,
         })
         .expect("Desktop peer");
     wait_for_remote_answer(media, &mut companion).await;

@@ -847,9 +847,124 @@ impl SilenceTimer {
     }
 }
 
-/// The configured max-silence window: `maxSilenceSecs` setting →
-/// AOKIE_MAX_SILENCE_SECS env (set by the connector at radio start).
-/// 0 disables; anything else clamps to a sane band. Default 30s.
+/// One continuous interval in which an answered call has no SCO channel.
+/// Total call age is deliberately irrelevant: any recovered sample rate or
+/// expected switchboard transition resets this outage from scratch.
+#[derive(Debug)]
+struct NoScoOutage {
+    call_id: String,
+    since: std::time::Instant,
+    remote_return_requested: bool,
+    hangup_sent: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoScoAction {
+    RequestRemoteReturn,
+    HangUp,
+}
+
+#[derive(Debug, Default)]
+struct NoScoWatchdog {
+    outage: Option<NoScoOutage>,
+}
+
+impl NoScoWatchdog {
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+
+    fn check(
+        &mut self,
+        call_id: Option<&str>,
+        sco_available: bool,
+        switch_suppressed: bool,
+        aokie_owner_current: bool,
+        remote_reserved: bool,
+        now: std::time::Instant,
+    ) -> Option<NoScoAction> {
+        let Some(call_id) = call_id else {
+            self.outage = None;
+            return None;
+        };
+        if sco_available || switch_suppressed {
+            self.outage = None;
+            return None;
+        }
+
+        if self
+            .outage
+            .as_ref()
+            .is_none_or(|outage| outage.call_id != call_id)
+        {
+            self.outage = Some(NoScoOutage {
+                call_id: call_id.to_string(),
+                since: now,
+                remote_return_requested: false,
+                hangup_sent: false,
+            });
+        }
+        let outage = self.outage.as_mut().expect("installed above");
+
+        if remote_reserved {
+            if !outage.remote_return_requested {
+                outage.remote_return_requested = true;
+                return Some(NoScoAction::RequestRemoteReturn);
+            }
+            // A Companion-owned or returning route can never be ended by this
+            // watchdog. The media state machine must return the caller first.
+            return None;
+        }
+
+        if !aokie_owner_current {
+            return None;
+        }
+        if outage.remote_return_requested {
+            // Return to Aokie succeeded. Give SCO one complete fresh grace
+            // period to recover before considering a hardware hangup.
+            outage.remote_return_requested = false;
+            outage.hangup_sent = false;
+            outage.since = now;
+            return None;
+        }
+        if !outage.hangup_sent && now.saturating_duration_since(outage.since) >= Self::GRACE {
+            outage.hangup_sent = true;
+            return Some(NoScoAction::HangUp);
+        }
+        None
+    }
+
+    fn rearm_after_owner_race(&mut self, now: std::time::Instant) {
+        if let Some(outage) = self.outage.as_mut() {
+            outage.hangup_sent = false;
+            outage.remote_return_requested = false;
+            // The old owner fence can fail because a complete Companion
+            // claim-and-return crossed the physical action. Treat that as a
+            // fresh Aokie-owned outage, exactly like a return observed by
+            // `check`, rather than carrying the stale eight-second clock into
+            // the replacement owner.
+            outage.since = now;
+        }
+    }
+}
+
+#[cfg(feature = "voice")]
+fn aokie_owner_for_call(
+    remote_media: &crate::remote_media::RemoteMediaHandle,
+    call_id: &str,
+) -> Option<crate::remote_media::AokieOwnerFence> {
+    remote_media
+        .aokie_owner_fence()
+        .filter(|owner| owner.call_id == call_id)
+}
+
+#[cfg(feature = "voice")]
+fn reply_owner_is_current(
+    remote_media: &crate::remote_media::RemoteMediaHandle,
+    expected: Option<&crate::remote_media::AokieOwnerFence>,
+) -> bool {
+    expected.is_some_and(|expected| remote_media.aokie_owner_fence().as_ref() == Some(expected))
+}
+
+/// Read the configured maximum conversational-silence window.
 #[cfg(feature = "voice")]
 fn max_silence_window() -> std::time::Duration {
     let secs = std::env::var("AOKIE_MAX_SILENCE_SECS")
@@ -894,6 +1009,7 @@ enum HangupVerdict {
 #[allow(clippy::too_many_arguments)]
 fn agent_hangup_verdict(
     requested: bool,
+    aokie_owner_current: bool,
     barged: bool,
     operator_ended: bool,
     ended_by_failsafe: bool,
@@ -905,6 +1021,9 @@ fn agent_hangup_verdict(
 ) -> HangupVerdict {
     if !requested {
         return HangupVerdict::Skip("no hangup requested");
+    }
+    if !aokie_owner_current {
+        return HangupVerdict::Skip("the exact Aokie caller-owner fence changed");
     }
     if barged {
         return HangupVerdict::Skip("the caller barged in — they may have more to say");
@@ -1421,14 +1540,14 @@ impl RadioHandle {
         self.status.switchboard_revision.load(Ordering::Relaxed)
     }
 
-    /// A CHLD switch we sent within the last ~4s that hasn't settled.
+    /// A CHLD switch marker held until the radio loop explicitly settles or
+    /// clears it. Wall-clock age cannot make an in-progress topology safe.
     pub fn switch_in_flight(&self) -> bool {
         self.status
             .switch_in_flight
             .lock()
             .unwrap()
-            .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() < std::time::Duration::from_secs(4))
+            .is_some()
     }
 
     /// The authoritative `call.switchboard` snapshot: foreground (the
@@ -3385,13 +3504,21 @@ fn manager_plan_and_execute(
     outbox: OutboxRef<'_>,
     screen_policy: &mut crate::screen::ScreenPolicy,
     status: &Arc<RadioStatus>,
+    remote_media: &crate::remote_media::RemoteMediaHandle,
+    expected_owner: &crate::remote_media::AokieOwnerFence,
     corr: &str,
     from: &str,
     request: &str,
-) -> String {
+) -> Option<String> {
     use aokie_core::events::{aokie_event, now_iso8601};
     const FAIL_LINE: &str =
         "I couldn't put that change through just now - I'll note it for the team instead.";
+    if remote_media.aokie_owner_fence().as_ref() != Some(expected_owner) {
+        return None;
+    }
+    let line_if_current = |line: String| {
+        (remote_media.aokie_owner_fence().as_ref() == Some(expected_owner)).then_some(line)
+    };
     let manager_action_id = format!("manager_{}", uuid::Uuid::new_v4().simple());
     let params = serde_json::json!({
         "flowSlug": "manager-action-plan",
@@ -3408,18 +3535,18 @@ fn manager_plan_and_execute(
     let (id, line, rx) = host.begin("flow.run", params);
     if sink.send_line(&line).is_err() {
         host.forget(id);
-        return FAIL_LINE.to_string();
+        return line_if_current(FAIL_LINE.to_string());
     }
     let v = match rx.recv_timeout(std::time::Duration::from_millis(8500)) {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             eprintln!("[aokie-plugin] manager plan flow failed: {e}");
-            return FAIL_LINE.to_string();
+            return line_if_current(FAIL_LINE.to_string());
         }
         Err(_) => {
             host.forget(id);
             eprintln!("[aokie-plugin] manager plan flow timed out");
-            return FAIL_LINE.to_string();
+            return line_if_current(FAIL_LINE.to_string());
         }
     };
     let done = matches!(
@@ -3437,9 +3564,25 @@ fn manager_plan_and_execute(
     if !ok {
         // Validation refusals carry their own honest line ("which booking do
         // you mean?", "say the change again") — speak that when present.
-        return spoken.unwrap_or_else(|| FAIL_LINE.to_string());
+        return line_if_current(spoken.unwrap_or_else(|| FAIL_LINE.to_string()));
     }
     let has_update = r.get("hasUpdate").and_then(serde_json::Value::as_bool) == Some(true);
+    let block_number = r
+        .get("blockNumber")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let has_block = r.get("hasBlock").and_then(serde_json::Value::as_bool) == Some(true)
+        && !block_number.is_empty();
+
+    // The host call above only plans. Linearize the short irreversible commit
+    // against takeover: if Companion ownership changed while planning, no
+    // durable update or live block mutation may escape from this stale turn.
+    if let Err(reason) = remote_media.linearize_aokie_action(expected_owner) {
+        eprintln!("[aokie-plugin] manager action commit skipped: {reason}");
+        return None;
+    }
     if has_update {
         emit(
             outbox,
@@ -3459,35 +3602,29 @@ fn manager_plan_and_execute(
             ),
         );
     }
-    let block_number = r
-        .get("blockNumber")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    if r.get("hasBlock").and_then(serde_json::Value::as_bool) == Some(true)
-        && !block_number.trim().is_empty()
-        && screen_policy.block_number(block_number)
-    {
+    if has_block && screen_policy.block_number(&block_number) {
         let mut env_list = std::env::var("AOKIE_BLOCKED_NUMBERS").unwrap_or_default();
         if !env_list.trim().is_empty() {
             env_list.push(',');
         }
-        env_list.push_str(block_number.trim());
+        env_list.push_str(&block_number);
         std::env::set_var("AOKIE_BLOCKED_NUMBERS", env_list);
         status
             .pending_blocked_numbers
             .lock()
             .unwrap()
-            .push(block_number.trim().to_string());
+            .push(block_number.clone());
         eprintln!(
             "[aokie-plugin] manager blocked a number (live now; persisted at the next host poll)"
         );
     }
-    if has_update {
+
+    Some(if has_update {
         "I've securely queued that change. I'll only confirm it after the system accepts it."
             .to_string()
     } else {
         spoken.unwrap_or_else(|| "Done - that change is in.".to_string())
-    }
+    })
 }
 
 /// Run the read-only `business-lookup` flow on the HOST mid-call (guide
@@ -5952,9 +6089,14 @@ fn run_loop(
     // already cancelled — the CHUP is sent exactly once per attempt (ids are
     // never reused, so no reset is needed).
     let mut dial_cancel_sent: Option<String> = None;
-    // Dead-air watchdog: the call id whose no-SCO hangup was already sent
-    // (one CHUP per call — the CIEV stream finishes the termination).
-    let mut no_sco_hangup_for: Option<String> = None;
+    // Dead-air watchdog: one continuously timed SCO outage. A Companion-owned
+    // caller must return to Aokie before this path may ever send CHUP.
+    let mut no_sco_watchdog = NoScoWatchdog::default();
+    // A screened caller may be claimed during the bounded screen message.
+    // The human route wins immediately; if it later returns the same caller,
+    // re-apply the already-decided screen hangup before Aokie can converse.
+    #[cfg(feature = "voice")]
+    let mut screened_hangup_pending_for: Option<String> = None;
     // Consecutive CallIncoming events observed while the tracker held an
     // ACTIVE inbound session — the phantom-answer self-heal counter (see the
     // guard in the event loop).
@@ -6842,12 +6984,13 @@ fn run_loop(
                             "[aokie-plugin] SWITCHBOARD: foreground ended with a caller parked AND {} knocking — serving FIFO (accept, ask to hold, return to the parked caller)",
                             w.call_id
                         );
+                        *status.switch_in_flight.lock().unwrap() =
+                            Some(("cascade_accept".to_string(), std::time::Instant::now()));
+                        status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
                         bt.flush_tx_audio();
                         if let Err(e) = bt.hold_swap() {
                             eprintln!("[aokie-plugin] SWITCHBOARD: cascade CHLD=2 failed: {e}");
                         } else {
-                            *status.switch_in_flight.lock().unwrap() =
-                                Some(("cascade_accept".to_string(), std::time::Instant::now()));
                             let knock_id = w.call_id.clone();
                             // Accepted here = the knock resolved into a
                             // held+active pair (the parked caller stays held
@@ -7018,12 +7161,15 @@ fn run_loop(
                                     eprintln!("[aokie-plugin] SWITCHBOARD: a new caller knocked mid-cascade — swap skipped (CHLD=2 would accept them)");
                                     SwapBackVerdict::StayedOnNewcomer
                                 } else {
-                                    bt.flush_tx_audio();
-                                    swap_sent = bt.hold_swap();
                                     *status.switch_in_flight.lock().unwrap() = Some((
                                         "cascade_return".to_string(),
                                         std::time::Instant::now(),
                                     ));
+                                    status
+                                        .switchboard_revision
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    bt.flush_tx_audio();
+                                    swap_sent = bt.hold_swap();
                                     if swap_sent.is_err() {
                                         SwapBackVerdict::StayedOnNewcomer
                                     } else {
@@ -7058,12 +7204,15 @@ fn run_loop(
                                         None,
                                         |_, _| false,
                                     );
+                                    *status.switch_in_flight.lock().unwrap() = Some((
+                                        "cascade_return_retry".to_string(),
+                                        std::time::Instant::now(),
+                                    ));
+                                    status
+                                        .switchboard_revision
+                                        .fetch_add(1, Ordering::Relaxed);
                                     bt.flush_tx_audio();
                                     if bt.hold_swap().is_ok() {
-                                        *status.switch_in_flight.lock().unwrap() = Some((
-                                            "cascade_return_retry".to_string(),
-                                            std::time::Instant::now(),
-                                        ));
                                         verdict = settle_and_judge_swap_back(
                                             bt,
                                             &mut tracker,
@@ -7468,10 +7617,11 @@ fn run_loop(
                         "[aokie-plugin] SWITCHBOARD: foreground ended with {} parked — retrieving them (AT+CHLD=2)",
                         sess.id
                     );
-                        bt.flush_tx_audio();
-                        let _ = bt.hold_swap();
                         *status.switch_in_flight.lock().unwrap() =
                             Some(("auto_retrieve".to_string(), std::time::Instant::now()));
+                        status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
+                        bt.flush_tx_audio();
+                        let _ = bt.hold_swap();
                         let resumed_id = sess.id.clone();
                         let resumed_from = sess.caller_id.clone();
                         let was_greeted = sess.greeted;
@@ -7693,6 +7843,9 @@ fn run_loop(
             let primary_active = tracker
                 .current()
                 .is_some_and(|s| s.is_active() && !s.outbound);
+            let auto_hold_switch = remote_media.aokie_switch_fence().filter(|fence| {
+                tracker.call_id() == Some(fence.owner.call_id.as_str())
+            });
             let busy = ctx.manager_gate.awaiting_pin || ctx.agent_hung_up;
             // ⚠️ Bind the snapshot BEFORE the if-let. In edition 2021 an
             // if-let scrutinee's temporaries — here the waiting_call mutex
@@ -7704,7 +7857,7 @@ fn run_loop(
             // juggle (WATCHDOG "stalled in phase 1" forever, line dead).
             let waiting_snapshot = status.waiting_call.lock().unwrap().clone();
             if let Some(w) = waiting_snapshot {
-                if primary_active && !busy {
+                if primary_active && !busy && auto_hold_switch.is_some() {
                     auto_hold_done_for = Some(w.call_id.clone());
                     // Screened callers (blocked list / accept-filter miss /
                     // withheld id with rejectPrivate) NEVER interrupt a live
@@ -7748,14 +7901,27 @@ fn run_loop(
                             // abandon the juggle (the phone promotes the waiting
                             // caller to a fresh incoming, which auto-answers).
                             perform_cancel_action(action, bt, &mut tracker, outbox, sink);
-                        } else if let Err(e) = {
-                            bt.flush_tx_audio();
-                            bt.hold_swap()
-                        } {
-                            eprintln!("[aokie-plugin] AUTO-HOLD: CHLD=2 to reach the newcomer failed: {e}");
+                        } else if let Err(e) = remote_media
+                            .with_aokie_switch_owner(
+                                auto_hold_switch
+                                    .as_ref()
+                                    .expect("auto-hold entry captured a switch fence"),
+                                || {
+                                    *status.switch_in_flight.lock().unwrap() = Some((
+                                        "auto_hold_accept".to_string(),
+                                        Instant::now(),
+                                    ));
+                                    status
+                                        .switchboard_revision
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    bt.flush_tx_audio();
+                                    bt.hold_swap()
+                                },
+                            )
+                            .and_then(|result| result)
+                        {
+                            eprintln!("[aokie-plugin] AUTO-HOLD: exact-owner CHLD=2 to reach the newcomer refused/failed: {e}");
                         } else {
-                            *status.switch_in_flight.lock().unwrap() =
-                                Some(("auto_hold_accept".to_string(), Instant::now()));
                             // 2) VERIFY the accept BEFORE any session state
                             // moves: the knock must resolve into a held+active
                             // pair. The settle pump keeps the tracker truthful
@@ -7909,10 +8075,30 @@ fn run_loop(
                                         eprintln!("[aokie-plugin] AUTO-HOLD: a new caller knocked mid-juggle — swap-back skipped (CHLD=2 would accept them, not swap)");
                                         SwapBackVerdict::StayedOnNewcomer
                                     } else {
-                                        bt.flush_tx_audio();
-                                        swap_back_sent = bt.hold_swap();
-                                        *status.switch_in_flight.lock().unwrap() =
-                                            Some(("auto_hold_return".to_string(), Instant::now()));
+                                        swap_back_sent = remote_media
+                                            .aokie_switch_fence()
+                                            .ok_or_else(|| {
+                                                "Companion media claim crossed the switch-back"
+                                                    .to_string()
+                                            })
+                                            .and_then(|fence| {
+                                                remote_media
+                                                    .with_aokie_switch_owner(&fence, || {
+                                                        *status
+                                                            .switch_in_flight
+                                                            .lock()
+                                                            .unwrap() = Some((
+                                                            "auto_hold_return".to_string(),
+                                                            Instant::now(),
+                                                        ));
+                                                        status
+                                                            .switchboard_revision
+                                                            .fetch_add(1, Ordering::Relaxed);
+                                                        bt.flush_tx_audio();
+                                                        bt.hold_swap()
+                                                    })
+                                                    .and_then(|result| result)
+                                            });
                                         if swap_back_sent.is_err() {
                                             eprintln!("[aokie-plugin] AUTO-HOLD: swap-back CHLD=2 failed to send — staying with the newcomer");
                                             SwapBackVerdict::StayedOnNewcomer
@@ -7953,12 +8139,31 @@ fn run_loop(
                                             None,
                                             |_, _| false,
                                         );
-                                        bt.flush_tx_audio();
-                                        if bt.hold_swap().is_ok() {
-                                            *status.switch_in_flight.lock().unwrap() = Some((
-                                                "auto_hold_return_retry".to_string(),
-                                                Instant::now(),
-                                            ));
+                                        let retry_sent = remote_media
+                                            .aokie_switch_fence()
+                                            .ok_or_else(|| {
+                                                "Companion media claim crossed the switch retry"
+                                                    .to_string()
+                                            })
+                                            .and_then(|fence| {
+                                                remote_media
+                                                    .with_aokie_switch_owner(&fence, || {
+                                                        *status
+                                                            .switch_in_flight
+                                                            .lock()
+                                                            .unwrap() = Some((
+                                                            "auto_hold_return_retry".to_string(),
+                                                            Instant::now(),
+                                                        ));
+                                                        status
+                                                            .switchboard_revision
+                                                            .fetch_add(1, Ordering::Relaxed);
+                                                        bt.flush_tx_audio();
+                                                        bt.hold_swap()
+                                                    })
+                                                    .and_then(|result| result)
+                                            });
+                                        if retry_sent.is_ok() {
                                             verdict = settle_and_judge_swap_back(
                                                 bt,
                                                 &mut tracker,
@@ -8643,15 +8848,12 @@ fn run_loop(
             }
         }
 
-        // Dead-air watchdog: a call ANSWERED whose audio channel never
-        // arrives is silence the caller can do nothing about — every speaker
-        // gates on sample_rate > 0, so not even the greeting can play. Live
-        // 2026-07-15 15:07 (corrupted-USB window): call 82fc29bb sat
-        // answered with NO SCO for 13s until the caller gave up; the very
-        // next attempt worked. Hang up after a bounded wait instead — the
-        // line drops honestly and the caller simply calls again. Suppressed
-        // around our own CHLD switches (the SCO legitimately bounces during
-        // a juggle and its settles are bounded well under this).
+        // Dead-air watchdog: an answered call whose audio channel remains
+        // absent for one continuous bounded window is silence the caller can
+        // do nothing about. A transient late-call bounce starts a new window;
+        // total call age is irrelevant. Companion ownership is unwound first
+        // and receives a complete fresh Aokie recovery window. Suppressed
+        // around our own CHLD switches, where SCO legitimately bounces.
         {
             let switch_recent = status
                 .switch_in_flight
@@ -8659,22 +8861,90 @@ fn run_loop(
                 .unwrap()
                 .as_ref()
                 .is_some_and(|(_, at)| at.elapsed() < std::time::Duration::from_secs(10));
-            if !switch_recent && bt.get_sample_rate() == 0 {
-                if let Some(s) = tracker.current() {
-                    if s.is_active()
-                        && s.active_for_ms() > 8_000
-                        && no_sco_hangup_for.as_deref() != Some(s.id.as_str())
-                    {
-                        eprintln!(
-                            "[aokie-plugin] call {} answered but NO audio channel after 8s — hanging up (dead air beats silence)",
-                            s.id
-                        );
-                        no_sco_hangup_for = Some(s.id.clone());
+            let active_call_id = tracker
+                .current()
+                .filter(|session| session.is_active())
+                .map(|session| session.id.clone());
+            let aokie_owner = remote_media.aokie_owner_fence();
+            // The mutex-backed owner proof wins over the cached atomic if a
+            // refresh is crossing this exact tick.
+            let remote_reserved = aokie_owner.is_none() && remote_media.radio_reserved();
+            match no_sco_watchdog.check(
+                active_call_id.as_deref(),
+                bt.get_sample_rate() > 0,
+                switch_recent,
+                aokie_owner.is_some(),
+                remote_reserved,
+                std::time::Instant::now(),
+            ) {
+                Some(NoScoAction::RequestRemoteReturn) => {
+                    eprintln!(
+                        "[aokie-plugin] call audio channel lost during Companion ownership - returning the caller to Aokie before the hardware watchdog may act"
+                    );
+                    remote_media.fail_closed_all("sco_unavailable");
+                }
+                Some(NoScoAction::HangUp) => {
+                    let expected = aokie_owner
+                        .as_ref()
+                        .expect("watchdog only returns HangUp for a proven Aokie owner");
+                    let call_id = active_call_id.as_deref().unwrap_or("unknown");
+                    eprintln!(
+                        "[aokie-plugin] call {call_id} has had NO audio channel continuously for 8s under Aokie ownership - hanging up (dead air beats silence)"
+                    );
+                    match remote_media.with_aokie_owner(expected, || {
                         tracker.note_intent(crate::call_session::TerminationIntent::DeviceLost);
-                        if let Err(e) = bt.hangup() {
-                            eprintln!("[aokie-plugin] dead-air hangup failed: {e}");
+                        bt.hangup()
+                    }) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            eprintln!("[aokie-plugin] dead-air hangup failed: {error}");
+                        }
+                        Err(reason) => {
+                            eprintln!("[aokie-plugin] dead-air hangup skipped: {reason}");
+                            no_sco_watchdog.rearm_after_owner_race(
+                                std::time::Instant::now(),
+                            );
                         }
                     }
+                }
+                None => {}
+            }
+        }
+
+        // A takeover may legitimately win while the fixed screening message
+        // is playing. Never CHUP underneath that human route; retain the
+        // disposition and apply it only if the exact same caller later returns
+        // to Aokie. A changed/ended physical call retires the pending action.
+        #[cfg(feature = "voice")]
+        if let Some(screened_call_id) = screened_hangup_pending_for.clone() {
+            let same_active_call = tracker
+                .current()
+                .is_some_and(|session| session.is_active() && session.id == screened_call_id);
+            if !same_active_call {
+                screened_hangup_pending_for = None;
+            } else if let Some(owner) =
+                aokie_owner_for_call(&remote_media, &screened_call_id)
+            {
+                eprintln!(
+                    "[aokie-plugin] screened caller returned from Companion - applying deferred screen hangup"
+                );
+                match remote_media.with_aokie_owner(&owner, || {
+                    tracker.note_intent(crate::call_session::TerminationIntent::AgentHangup);
+                    bt.flush_tx_audio();
+                    bt.hangup()
+                }) {
+                    Ok(Ok(())) => {
+                        ctx.agent_hung_up = true;
+                        screened_hangup_pending_for = None;
+                    }
+                    Ok(Err(error)) => {
+                        eprintln!("[aokie-plugin] deferred screened-call hangup failed: {error}");
+                        ctx.agent_hung_up = true;
+                        screened_hangup_pending_for = None;
+                    }
+                    Err(reason) => eprintln!(
+                        "[aokie-plugin] deferred screened-call hangup still waiting: {reason}"
+                    ),
                 }
             }
         }
@@ -8942,6 +9212,7 @@ fn run_loop(
             let _ = (&corr, sr, screened, egress_gate);
             #[cfg(feature = "voice")]
             if let Some(reason) = screened {
+                let screened_owner = aokie_owner_for_call(&remote_media, &corr);
                 // Screened call (spec Phase 0): no greeting, no agent — the
                 // optional screen message, then hangup. Enforced HERE because
                 // it is universally correct: phones that only deliver the id
@@ -8980,12 +9251,36 @@ fn run_loop(
                     // the agent-hangup drain uses the same bounded sleep.
                     std::thread::sleep(Duration::from_millis(900));
                 }
-                tracker.note_intent(crate::call_session::TerminationIntent::AgentHangup);
-                bt.flush_tx_audio();
-                if let Err(e) = bt.hangup() {
-                    eprintln!("[aokie-plugin] screened-call hangup failed: {e}");
+                if let Some(expected) = screened_owner.as_ref() {
+                    match remote_media.with_aokie_owner(expected, || {
+                        tracker.note_intent(
+                            crate::call_session::TerminationIntent::AgentHangup,
+                        );
+                        bt.flush_tx_audio();
+                        bt.hangup()
+                    }) {
+                        Ok(Ok(())) => {
+                            screened_hangup_pending_for = None;
+                            ctx.agent_hung_up = true;
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("[aokie-plugin] screened-call hangup failed: {e}");
+                            screened_hangup_pending_for = None;
+                            // Preserve the old ghost-turn latch after an
+                            // attempted Aokie-owned CHUP.
+                            ctx.agent_hung_up = true;
+                        }
+                        Err(reason) => {
+                            eprintln!("[aokie-plugin] screened-call hangup deferred: {reason}");
+                            screened_hangup_pending_for = Some(corr.clone());
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[aokie-plugin] screened-call hangup deferred: exact Aokie caller ownership changed"
+                    );
+                    screened_hangup_pending_for = Some(corr.clone());
                 }
-                ctx.agent_hung_up = true;
                 let _ = &corr;
             } else {
                 // Build the echo canceller once we know the negotiated SCO
@@ -9842,42 +10137,53 @@ fn run_loop(
                             ctx.manager_gate.attempts = 0;
                             eprintln!("[aokie-plugin] manager PIN verified");
                             if let Some(req) = ctx.manager_gate.pending.take() {
-                                speak_manager_line(
-                                    bt,
-                                    &synth,
-                                    outbox,
-                                    sink,
-                                    &status,
-                                    &corr,
-                                    &mut ctx.turn_index,
-                                    &mut ctx.history,
-                                    MANAGER_ACTION_FILLER,
-                                );
-                                let mgr_from = tracker
-                                    .current()
-                                    .and_then(|s| s.caller_id.clone())
-                                    .unwrap_or_default();
-                                let outcome = manager_plan_and_execute(
-                                    &host_rpc,
-                                    sink,
-                                    outbox,
-                                    &mut screen_policy,
-                                    &status,
-                                    &corr,
-                                    &mgr_from,
-                                    &req,
-                                );
-                                speak_manager_line(
-                                    bt,
-                                    &synth,
-                                    outbox,
-                                    sink,
-                                    &status,
-                                    &corr,
-                                    &mut ctx.turn_index,
-                                    &mut ctx.history,
-                                    &outcome,
-                                );
+                                let manager_owner =
+                                    aokie_owner_for_call(&remote_media, &corr);
+                                if let Some(manager_owner) = manager_owner {
+                                    speak_manager_line(
+                                        bt,
+                                        &synth,
+                                        outbox,
+                                        sink,
+                                        &status,
+                                        &corr,
+                                        &mut ctx.turn_index,
+                                        &mut ctx.history,
+                                        MANAGER_ACTION_FILLER,
+                                    );
+                                    let mgr_from = tracker
+                                        .current()
+                                        .and_then(|s| s.caller_id.clone())
+                                        .unwrap_or_default();
+                                    if let Some(outcome) = manager_plan_and_execute(
+                                        &host_rpc,
+                                        sink,
+                                        outbox,
+                                        &mut screen_policy,
+                                        &status,
+                                        &remote_media,
+                                        &manager_owner,
+                                        &corr,
+                                        &mgr_from,
+                                        &req,
+                                    ) {
+                                        speak_manager_line(
+                                            bt,
+                                            &synth,
+                                            outbox,
+                                            sink,
+                                            &status,
+                                            &corr,
+                                            &mut ctx.turn_index,
+                                            &mut ctx.history,
+                                            &outcome,
+                                        );
+                                    }
+                                } else {
+                                    eprintln!(
+                                        "[aokie-plugin] manager action skipped: exact Aokie caller ownership changed"
+                                    );
+                                }
                             } else {
                                 speak_manager_line(
                                     bt,
@@ -10696,9 +11002,31 @@ fn run_loop(
                                 let reply_rx = stream.rx;
                                 let reply_cancel = stream.cancel;
                                 let reply_activity = stream.activity;
+                                // Bind this whole autonomous reply to the exact
+                                // Aokie owner that accepted the caller turn. A
+                                // Companion claim can arrive while the detached
+                                // model or synchronous TTS loop is running; the
+                                // global PCM chokepoint cuts audio immediately,
+                                // while this fence prevents the stale reply from
+                                // reaching any post-reply tool/hangup path.
+                                let reply_owner =
+                                    aokie_owner_for_call(&remote_media, &corr);
                                 let started = Instant::now();
                                 let mut stream_outcome: Option<Result<String, String>> = None;
                                 'pump: loop {
+                                    if !reply_owner_is_current(&remote_media, reply_owner.as_ref())
+                                    {
+                                        eprintln!(
+                                            "[aokie-plugin] Companion ownership changed mid-reply - yielding every autonomous AI action"
+                                        );
+                                        reply_cancel.store(true, Ordering::Relaxed);
+                                        // Existing downstream policy treats this
+                                        // as an operator-owned cut: no dead-air
+                                        // fallback, abuse termination, or agent
+                                        // hangup may fire from the stale reply.
+                                        operator_ended = true;
+                                        break 'pump;
+                                    }
                                     // The audio channel is gone (SCO teardown /
                                     // link loss): abandon the reply NOW — the
                                     // outer loop's event drain will run the real
@@ -11104,6 +11432,15 @@ fn run_loop(
                                 // Early exits (barge / operator) have no stream result;
                                 // their transcript comes from `spoken` via the cut path.
                                 let outcome = stream_outcome.unwrap_or_else(|| Ok(String::new()));
+                                // `ReplyMsg::Done` and the final ownership
+                                // change can cross between two pump polls.
+                                // Fence that narrow gap before any parsed
+                                // marker is allowed to drive deterministic
+                                // post-reply behaviour.
+                                if !reply_owner_is_current(&remote_media, reply_owner.as_ref()) {
+                                    operator_ended = true;
+                                    reply_cancel.store(true, Ordering::Relaxed);
+                                }
                                 if !barge_in {
                                     // Cover audio still queued after the last chunk synthesized.
                                     let plays_until = (t0 + reply_dur).max(Instant::now());
@@ -11496,7 +11833,14 @@ fn run_loop(
                                     } else {
                                         req
                                     };
-                                    if !line_dead && !operator_ended && bt.get_sample_rate() > 0 {
+                                    if !line_dead
+                                        && !operator_ended
+                                        && reply_owner_is_current(
+                                            &remote_media,
+                                            reply_owner.as_ref(),
+                                        )
+                                        && bt.get_sample_rate() > 0
+                                    {
                                         let is_mgr = tracker.current().is_some_and(|s| {
                                             !s.outbound
                                                 && screen_policy.is_manager(s.caller_id.as_deref())
@@ -11521,8 +11865,7 @@ fn run_loop(
                                                 &std::env::var("AOKIE_MANAGER_PIN")
                                                     .unwrap_or_default(),
                                             );
-                                            let inline =
-                                                crate::speech_plan::spoken_digits(&text);
+                                            let inline = crate::speech_plan::spoken_digits(&text);
                                             if !expected.is_empty()
                                                 && inline.len() == expected.len()
                                                 && crate::manager_auth::verify(
@@ -11574,20 +11917,39 @@ fn run_loop(
                                                 &mut ctx.history,
                                                 MANAGER_ACTION_FILLER,
                                             );
+                                            if !reply_owner_is_current(
+                                                &remote_media,
+                                                reply_owner.as_ref(),
+                                            ) {
+                                                eprintln!(
+                                                    "[aokie-plugin] manager action skipped: Companion ownership changed"
+                                                );
+                                                break 'reply_rounds;
+                                            }
                                             let mgr_from = tracker
                                                 .current()
                                                 .and_then(|s| s.caller_id.clone())
                                                 .unwrap_or_default();
-                                            let outcome = manager_plan_and_execute(
+                                            let expected_owner = reply_owner
+                                                .as_ref()
+                                                .expect("manager entry checked exact Aokie ownership");
+                                            let Some(outcome) = manager_plan_and_execute(
                                                 &host_rpc,
                                                 sink,
                                                 outbox,
                                                 &mut screen_policy,
                                                 &status,
+                                                &remote_media,
+                                                expected_owner,
                                                 &corr,
                                                 &mgr_from,
                                                 &req,
-                                            );
+                                            ) else {
+                                                eprintln!(
+                                                    "[aokie-plugin] manager action skipped: Companion ownership changed while planning"
+                                                );
+                                                break 'reply_rounds;
+                                            };
                                             speak_manager_line(
                                                 bt,
                                                 &synth,
@@ -11642,6 +12004,13 @@ fn run_loop(
                                 // latch. Never the LLM's job — and never spoken
                                 // prose from it either.
                                 if abuse_flagged && !line_dead && !operator_ended {
+                                    if !reply_owner_is_current(&remote_media, reply_owner.as_ref())
+                                    {
+                                        eprintln!(
+                                            "[aokie-plugin] abuse termination skipped: Companion ownership changed"
+                                        );
+                                        break 'reply_rounds;
+                                    }
                                     eprintln!(
                                     "[aokie-plugin] abusive caller flagged — speaking the notice and ending the call (Phase 1 policy)"
                                 );
@@ -11651,8 +12020,7 @@ fn run_loop(
                                     let ab_t0 = Instant::now();
                                     let out = tts_speak(
                                         bt, &synth, ABUSE_LINE, sr, None, None, None, 1.0, None,
-                                        None,
-                                        None,
+                                        None, None,
                                     );
                                     note_tts_outcome(&status, &out);
                                     if out.dur > Duration::ZERO {
@@ -11682,54 +12050,70 @@ fn run_loop(
                                         "[aokie-plugin] abuse notice produced no audio — ending the call without it"
                                     );
                                     }
-                                    // Persistent model-driven auto-blocking is
-                                    // disabled. Keep this explicit gate for a
-                                    // future operator-approved incident workflow.
-                                    if screen_policy.auto_block_abuse {
-                                        let num = tracker
-                                            .current()
-                                            .and_then(|s| s.caller_id.clone())
-                                            .unwrap_or_default();
-                                        if screen_policy.block_number(&num) {
-                                            let mut env_list =
-                                                std::env::var("AOKIE_BLOCKED_NUMBERS")
-                                                    .unwrap_or_default();
-                                            if !env_list.trim().is_empty() {
-                                                env_list.push(',');
-                                            }
-                                            env_list.push_str(num.trim());
-                                            std::env::set_var("AOKIE_BLOCKED_NUMBERS", env_list);
-                                            status
-                                                .pending_blocked_numbers
-                                                .lock()
-                                                .unwrap()
-                                                .push(num);
-                                            eprintln!(
-                                            "[aokie-plugin] abusive caller auto-blocked (live now; persisted at the next host poll) — unblock via the console's Call screening card"
+                                    if !reply_owner_is_current(&remote_media, reply_owner.as_ref())
+                                    {
+                                        eprintln!(
+                                            "[aokie-plugin] abuse policy side effects skipped: Companion ownership changed"
                                         );
-                                        } else if num.trim().is_empty() {
-                                            eprintln!(
-                                            "[aokie-plugin] abuse auto-block skipped — caller id withheld/unknown"
-                                        );
-                                        }
+                                        break 'reply_rounds;
                                     }
-                                    tracker.note_intent(
-                                        crate::call_session::TerminationIntent::AgentTerminateAbuse,
-                                    );
-                                    match bt.hangup() {
-                                        Ok(()) => {
+                                    let expected = reply_owner
+                                        .as_ref()
+                                        .expect("abuse entry checked the Aokie owner fence");
+                                    match remote_media.with_aokie_owner(expected, || {
+                                        // Keep the optional policy mutation and
+                                        // physical CHUP in one exact-owner
+                                        // transaction. A takeover either wins
+                                        // before both, or after both.
+                                        if screen_policy.auto_block_abuse {
+                                            let num = tracker
+                                                .current()
+                                                .and_then(|s| s.caller_id.clone())
+                                                .unwrap_or_default();
+                                            if screen_policy.block_number(&num) {
+                                                let mut env_list =
+                                                    std::env::var("AOKIE_BLOCKED_NUMBERS")
+                                                        .unwrap_or_default();
+                                                if !env_list.trim().is_empty() {
+                                                    env_list.push(',');
+                                                }
+                                                env_list.push_str(num.trim());
+                                                std::env::set_var(
+                                                    "AOKIE_BLOCKED_NUMBERS",
+                                                    env_list,
+                                                );
+                                                status
+                                                    .pending_blocked_numbers
+                                                    .lock()
+                                                    .unwrap()
+                                                    .push(num);
+                                                eprintln!(
+                                                    "[aokie-plugin] abusive caller auto-blocked (live now; persisted at the next host poll) — unblock via the console's Call screening card"
+                                                );
+                                            } else if num.trim().is_empty() {
+                                                eprintln!(
+                                                    "[aokie-plugin] abuse auto-block skipped — caller id withheld/unknown"
+                                                );
+                                            }
+                                        }
+                                        tracker.note_intent(
+                                            crate::call_session::TerminationIntent::AgentTerminateAbuse,
+                                        );
+                                        bt.hangup()
+                                    }) {
+                                        Ok(Ok(())) => {
                                             // Ghost-turn latch: words captured
                                             // during the notice must never mint an
                                             // answered post-hangup turn.
                                             ctx.agent_hung_up = true;
                                             eprintln!(
-                                            "[aokie-plugin] abuse termination complete (AT+CHUP)"
-                                        );
+                                                "[aokie-plugin] abuse termination complete (AT+CHUP)"
+                                            );
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
                                             eprintln!(
-                                            "[aokie-plugin] abuse-termination hangup failed: {e}"
-                                        );
+                                                "[aokie-plugin] abuse-termination hangup failed: {e}"
+                                            );
                                             emit_control_failed(
                                                 outbox,
                                                 sink,
@@ -11737,6 +12121,11 @@ fn run_loop(
                                                 "agent.abuse_hangup",
                                                 None,
                                                 &e,
+                                            );
+                                        }
+                                        Err(reason) => {
+                                            eprintln!(
+                                                "[aokie-plugin] abuse termination skipped: {reason}"
                                             );
                                         }
                                     }
@@ -11749,6 +12138,14 @@ fn run_loop(
                                 // call cleanly. The hangup happens EVEN IF the fallback
                                 // itself is silent: ending the call IS the safe outcome.
                                 let mut ended_by_failsafe = false;
+                                if dead_air_cause.is_some()
+                                    && !reply_owner_is_current(&remote_media, reply_owner.as_ref())
+                                {
+                                    eprintln!(
+                                        "[aokie-plugin] responder fail-safe skipped: Companion ownership changed"
+                                    );
+                                    dead_air_cause = None;
+                                }
                                 if let Some(cause) = dead_air_cause {
                                     eprintln!(
                                     "[aokie-plugin] responder failed mid-call ({cause}) — speaking the fallback line and ending the call (VOICE-001)"
@@ -11798,18 +12195,28 @@ fn run_loop(
                                         "[aokie-plugin] fallback line also produced no audio — hanging up without it"
                                     );
                                     }
-                                    tracker.note_intent(
-                                        crate::call_session::TerminationIntent::AgentHangup,
-                                    );
-                                    match bt.hangup() {
-                                        Ok(()) => {
+                                    let expected = reply_owner
+                                        .as_ref()
+                                        .expect("fail-safe entry checked the Aokie owner fence");
+                                    match remote_media.with_aokie_owner(expected, || {
+                                        tracker.note_intent(
+                                            crate::call_session::TerminationIntent::AgentHangup,
+                                        );
+                                        bt.hangup()
+                                    }) {
+                                        Ok(Ok(())) => {
                                             ctx.agent_hung_up = true;
                                             eprintln!(
-                                            "[aokie-plugin] fail-safe hangup complete (AT+CHUP)"
-                                        );
+                                                "[aokie-plugin] fail-safe hangup complete (AT+CHUP)"
+                                            );
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
                                             eprintln!("[aokie-plugin] fail-safe hangup failed: {e}")
+                                        }
+                                        Err(reason) => {
+                                            eprintln!(
+                                                "[aokie-plugin] fail-safe hangup skipped: {reason}"
+                                            );
                                         }
                                     }
                                     ended_by_failsafe = true;
@@ -11826,8 +12233,11 @@ fn run_loop(
                                     // event drain runs the real teardown.
                                     HangupVerdict::Skip("the call's audio link is gone")
                                 } else {
+                                    let aokie_owner_current =
+                                        reply_owner_is_current(&remote_media, reply_owner.as_ref());
                                     agent_hangup_verdict(
                                         hangup_requested,
+                                        aokie_owner_current,
                                         barged,
                                         operator_ended,
                                         ended_by_failsafe,
@@ -11846,17 +12256,25 @@ fn run_loop(
                                         if !wait.is_zero() {
                                             std::thread::sleep(wait);
                                         }
-                                        tracker.note_intent(
-                                            crate::call_session::TerminationIntent::AgentHangup,
-                                        );
-                                        match bt.hangup() {
-                                            Ok(()) => {
+                                        let Some(expected) = reply_owner.as_ref() else {
+                                            eprintln!(
+                                                "[aokie-plugin] agent hangup skipped: no Aokie caller-owner fence"
+                                            );
+                                            break 'reply_rounds;
+                                        };
+                                        match remote_media.with_aokie_owner(expected, || {
+                                            tracker.note_intent(
+                                                crate::call_session::TerminationIntent::AgentHangup,
+                                            );
+                                            bt.hangup()
+                                        }) {
+                                            Ok(Ok(())) => {
                                                 ctx.agent_hung_up = true;
                                                 eprintln!(
-                                                "[aokie-plugin] agent finalized the call — hung up (AT+CHUP)"
-                                            );
+                                                    "[aokie-plugin] agent finalized the call — hung up (AT+CHUP)"
+                                                );
                                             }
-                                            Err(e) => {
+                                            Ok(Err(e)) => {
                                                 eprintln!(
                                                     "[aokie-plugin] agent hangup failed: {e}"
                                                 );
@@ -11867,6 +12285,11 @@ fn run_loop(
                                                     "agent.hangup",
                                                     None,
                                                     &e,
+                                                );
+                                            }
+                                            Err(reason) => {
+                                                eprintln!(
+                                                    "[aokie-plugin] agent hangup skipped: {reason}"
                                                 );
                                             }
                                         }
@@ -11905,6 +12328,7 @@ fn run_loop(
                                     && !barged
                                     && !operator_ended
                                     && !line_dead
+                                    && reply_owner_is_current(&remote_media, reply_owner.as_ref())
                                     && ctx.consecutive_waits >= 1
                                     && !wait_regen_done
                                     && lookup_rounds == 0
@@ -11924,7 +12348,12 @@ fn run_loop(
                                     wait_regen_done = true;
                                     continue 'reply_rounds;
                                 }
-                                if wait_requested && !barged && !operator_ended && !line_dead {
+                                if wait_requested
+                                    && !barged
+                                    && !operator_ended
+                                    && !line_dead
+                                    && reply_owner_is_current(&remote_media, reply_owner.as_ref())
+                                {
                                     ctx.consecutive_waits += 1;
                                     eprintln!(
                                     "[aokie-plugin] agent chose to wait silently ([[WAIT]]) — the caller has the floor (streak {})",
@@ -11960,7 +12389,13 @@ fn run_loop(
                                     let mut line = ASSISTANCE_UNAVAILABLE_LINE;
                                     if ctx.pending_assistance.is_some() {
                                         line = ASSISTANCE_PENDING_LINE;
-                                    } else if allowed {
+                                    } else if allowed
+                                        && !operator_ended
+                                        && reply_owner_is_current(
+                                            &remote_media,
+                                            reply_owner.as_ref(),
+                                        )
+                                    {
                                         let fence = crate::assistance::AssistanceCallFence {
                                             call_id: current_call.unwrap_or_default(),
                                             call_epoch: remote.call_epoch,
@@ -11968,13 +12403,18 @@ fn run_loop(
                                             switchboard_revision,
                                             remote_revision: remote.remote_revision,
                                         };
-                                        match crate::assistance::global().request(
-                                        fence.clone(),
-                                        &question,
-                                        None,
-                                        60,
-                                    ) {
-                                        Ok(request_id) => {
+                                        let expected = reply_owner
+                                            .as_ref()
+                                            .expect("assistance entry checked the Aokie owner fence");
+                                        match remote_media.with_aokie_owner(expected, || {
+                                            crate::assistance::global().request(
+                                                fence.clone(),
+                                                &question,
+                                                None,
+                                                60,
+                                            )
+                                        }) {
+                                        Ok(Ok(request_id)) => {
                                             eprintln!(
                                                 "[aokie-plugin] typed assistance requested for the current call"
                                             );
@@ -11993,8 +12433,11 @@ fn run_loop(
                                             });
                                             line = ASSISTANCE_FILLER_LINE;
                                         }
-                                        Err(error) => eprintln!(
+                                        Ok(Err(error)) => eprintln!(
                                             "[aokie-plugin] typed assistance request refused: {error}"
+                                        ),
+                                        Err(reason) => eprintln!(
+                                            "[aokie-plugin] typed assistance request skipped: {reason}"
                                         ),
                                     }
                                     } else {
@@ -12006,6 +12449,10 @@ fn run_loop(
                                     if !line_dead
                                         && !operator_ended
                                         && !barged
+                                        && reply_owner_is_current(
+                                            &remote_media,
+                                            reply_owner.as_ref(),
+                                        )
                                         && bt.get_sample_rate() > 0
                                     {
                                         let sr_now = bt.get_sample_rate();
@@ -12081,6 +12528,7 @@ fn run_loop(
                                     && reply_dur == Duration::ZERO
                                     && !line_dead
                                     && !operator_ended
+                                    && reply_owner_is_current(&remote_media, reply_owner.as_ref())
                                     && !wait_requested
                                     && !barged
                                 {
@@ -12098,6 +12546,10 @@ fn run_loop(
                                     if lookup_rounds > 0
                                         && !line_dead
                                         && !operator_ended
+                                        && reply_owner_is_current(
+                                            &remote_media,
+                                            reply_owner.as_ref(),
+                                        )
                                         && bt.get_sample_rate() > 0
                                     {
                                         // The model wants a SECOND lookup after
@@ -12112,6 +12564,10 @@ fn run_loop(
                                     if lookup_rounds == 0
                                         && !line_dead
                                         && !operator_ended
+                                        && reply_owner_is_current(
+                                            &remote_media,
+                                            reply_owner.as_ref(),
+                                        )
                                         && !barged
                                         && bt.get_sample_rate() > 0
                                     {
@@ -12169,6 +12625,15 @@ fn run_loop(
                                         }
                                         let (result_text, lookup_spoken) =
                                             finish_business_lookup(&host_rpc, pending_lookup);
+                                        if !reply_owner_is_current(
+                                            &remote_media,
+                                            reply_owner.as_ref(),
+                                        ) {
+                                            eprintln!(
+                                                "[aokie-plugin] lookup result discarded: Companion ownership changed"
+                                            );
+                                            break 'reply_rounds;
+                                        }
                                         eprintln!(
                                             "[aokie-plugin] lookup result: [{} chars], spoken: {}",
                                             result_text.chars().count(),
@@ -12264,6 +12729,7 @@ fn run_loop(
                                 if speak_handoff
                                     && !line_dead
                                     && !operator_ended
+                                    && reply_owner_is_current(&remote_media, reply_owner.as_ref())
                                     && bt.get_sample_rate() > 0
                                 {
                                     let sr_now = bt.get_sample_rate();
@@ -12336,15 +12802,28 @@ fn run_loop(
             // the phone open indefinitely.
             if agent_enabled && tracker.current().is_some_and(|s| s.is_active()) {
                 let sr = bt.get_sample_rate();
-                let action = if sr > 0 {
-                    ctx.silence_timer
+                let now = Instant::now();
+                let aokie_owner = remote_media.aokie_owner_fence();
+                let action = match (sr > 0, aokie_owner) {
+                    (_, None) => {
+                        // Human takeover/consult owns the conversational
+                        // clock. Keep forgiving any earlier prompt on every
+                        // reserved pass, so Return to Aokie always receives a
+                        // complete fresh silence window.
+                        if let Some(timer) = ctx.silence_timer.as_mut() {
+                            timer.note_activity(now);
+                        }
+                        None
+                    }
+                    (true, Some(owner)) => ctx
+                        .silence_timer
                         .as_mut()
-                        .and_then(|t| t.check(Instant::now()))
-                } else {
-                    None
+                        .and_then(|timer| timer.check(now))
+                        .map(|action| (action, owner)),
+                    (false, Some(_)) => None,
                 };
                 match action {
-                    Some(SilenceAction::Prompt) => {
+                    Some((SilenceAction::Prompt, owner)) => {
                         idle = false;
                         eprintln!(
                             "[aokie-plugin] max-silence: no activity for {}s — checking in with the caller",
@@ -12428,8 +12907,17 @@ fn run_loop(
                         if let Some(action) = probe.action.take() {
                             perform_cancel_action(action, bt, &mut tracker, outbox, sink);
                         }
+                        if remote_media.aokie_owner_fence().as_ref() != Some(&owner) {
+                            // A claim raced the prompt. Its PCM was already
+                            // stopped at the TTS chunk gate; now forgive the
+                            // prompt so no stale second-window hangup survives
+                            // the eventual return.
+                            if let Some(timer) = ctx.silence_timer.as_mut() {
+                                timer.note_activity(Instant::now());
+                            }
+                        }
                     }
-                    Some(SilenceAction::HangUp) => {
+                    Some((SilenceAction::HangUp, owner)) => {
                         idle = false;
                         eprintln!(
                             "[aokie-plugin] max-silence: still nothing after the check-in — saying goodbye and ending the call"
@@ -12481,16 +12969,20 @@ fn run_loop(
                                     std::thread::sleep(wait);
                                 }
                             }
-                            tracker
-                                .note_intent(crate::call_session::TerminationIntent::AgentHangup);
-                            match bt.hangup() {
-                                Ok(()) => {
+                            match remote_media.with_aokie_owner(&owner, || {
+                                tracker.note_intent(
+                                    crate::call_session::TerminationIntent::AgentHangup,
+                                );
+                                bt.hangup()
+                            }) {
+                                Ok(Ok(())) => {
                                     ctx.agent_hung_up = true;
                                     eprintln!(
                                         "[aokie-plugin] max-silence hangup complete (AT+CHUP)"
                                     );
+                                    ctx.silence_timer = None;
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     eprintln!("[aokie-plugin] max-silence hangup failed: {e}");
                                     emit_control_failed(
                                         outbox,
@@ -12500,9 +12992,20 @@ fn run_loop(
                                         None,
                                         &e,
                                     );
+                                    ctx.silence_timer = None;
+                                }
+                                Err(reason) => {
+                                    eprintln!(
+                                        "[aokie-plugin] max-silence hangup skipped: {reason}"
+                                    );
+                                    // The claim/return transition consumed the
+                                    // old two-window decision. Begin a complete
+                                    // new window under the new Aokie owner.
+                                    if let Some(timer) = ctx.silence_timer.as_mut() {
+                                        timer.note_activity(Instant::now());
+                                    }
                                 }
                             }
-                            ctx.silence_timer = None;
                         }
                     }
                     None => {}
@@ -12696,6 +13199,9 @@ fn run_loop(
                     } else if waiting_leg.as_ref().is_some_and(|w| w.call_id == call_id) {
                         // ── accept the WAITING caller: park the foreground ──
                         let w = waiting_leg.expect("checked above");
+                        let waiting_switch = remote_media.aokie_switch_fence().filter(|fence| {
+                            tracker.call_id() == Some(fence.owner.call_id.as_str())
+                        });
                         if parked.is_some() {
                             emit_control_failed(
                                 outbox, sink, &tracker, "call.activate", op.as_deref(),
@@ -12710,10 +13216,34 @@ fn run_loop(
                                 op.as_deref(),
                                 "no ACTIVE foreground call to put on hold",
                             );
-                        } else if let Err(e) = {
-                            bt.flush_tx_audio();
-                            bt.hold_swap()
-                        } {
+                        } else if waiting_switch.is_none() {
+                            emit_control_failed(
+                                outbox,
+                                sink,
+                                &tracker,
+                                "call.activate",
+                                op.as_deref(),
+                                "a Companion media claim or physical call transition crossed this switch",
+                            );
+                        } else if let Err(e) = remote_media
+                            .with_aokie_switch_owner(
+                                waiting_switch
+                                    .as_ref()
+                                    .expect("waiting switch checked above"),
+                                || {
+                                    *status.switch_in_flight.lock().unwrap() = Some((
+                                        "accept_waiting".to_string(),
+                                        std::time::Instant::now(),
+                                    ));
+                                    status
+                                        .switchboard_revision
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    bt.flush_tx_audio();
+                                    bt.hold_swap()
+                                },
+                            )
+                            .and_then(|result| result)
+                        {
                             emit_control_failed(
                                 outbox,
                                 sink,
@@ -12735,8 +13265,6 @@ fn run_loop(
                                 since_iso: now_iso8601(),
                             });
                             parked = Some((sess_a, ctx_a));
-                            *status.switch_in_flight.lock().unwrap() =
-                                Some(("accept_waiting".to_string(), std::time::Instant::now()));
                             {
                                 // Id-guarded: only the accepted knock clears —
                                 // a newer knock stays tracked.
@@ -12794,8 +13322,51 @@ fn run_loop(
                                 "a waiting caller is knocking — CHLD=2 would accept THEM; handle the knock first",
                             );
                         } else if let Some((sess_a, ctx_a)) = parked.take() {
-                            bt.flush_tx_audio();
-                            if let Err(e) = bt.hold_swap() {
+                            let foreground_active = tracker
+                                .current()
+                                .is_some_and(|session| session.is_active());
+                            let swap_result = if foreground_active {
+                                remote_media
+                                    .aokie_switch_fence()
+                                    .filter(|fence| {
+                                        tracker.call_id()
+                                            == Some(fence.owner.call_id.as_str())
+                                    })
+                                    .ok_or_else(|| {
+                                        "a Companion media claim or physical call transition crossed this switch"
+                                            .to_string()
+                                    })
+                                    .and_then(|fence| {
+                                        remote_media
+                                            .with_aokie_switch_owner(&fence, || {
+                                                *status.switch_in_flight.lock().unwrap() = Some((
+                                                    "activate_parked".to_string(),
+                                                    std::time::Instant::now(),
+                                                ));
+                                                status
+                                                    .switchboard_revision
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                bt.flush_tx_audio();
+                                                bt.hold_swap()
+                                            })
+                                            .and_then(|result| result)
+                                    })
+                            } else {
+                                // With no foreground call there is no live
+                                // claimant to race. Publish the transition
+                                // fence before retrieving the held leg so a
+                                // stale deferred relay claim cannot arm.
+                                *status.switch_in_flight.lock().unwrap() = Some((
+                                    "activate_parked".to_string(),
+                                    std::time::Instant::now(),
+                                ));
+                                status
+                                    .switchboard_revision
+                                    .fetch_add(1, Ordering::Relaxed);
+                                bt.flush_tx_audio();
+                                bt.hold_swap()
+                            };
+                            if let Err(e) = swap_result {
                                 parked = Some((sess_a, ctx_a));
                                 emit_control_failed(
                                     outbox,
@@ -12827,10 +13398,6 @@ fn run_loop(
                                     );
                                     *status.parked_call.lock().unwrap() = None;
                                 }
-                                *status.switch_in_flight.lock().unwrap() = Some((
-                                    "activate_parked".to_string(),
-                                    std::time::Instant::now(),
-                                ));
                                 let resumed_id = sess_a.id.clone();
                                 let resumed_from = sess_a.caller_id.clone();
                                 let was_greeted = sess_a.greeted;
@@ -13910,6 +14477,237 @@ mod tests {
     #[cfg(feature = "voice")]
     use std::time::{Duration as D, Instant};
 
+    #[cfg(feature = "voice")]
+    #[test]
+    fn reply_side_effect_fence_rejects_an_actual_call_transition() {
+        let remote = crate::remote_media::RemoteMediaHandle::spawn().unwrap();
+        remote.observe_physical_call(Some("call_reply_a"), true);
+        let owner = remote
+            .aokie_owner_fence()
+            .expect("the active Aokie call has an owner fence");
+        assert!(aokie_owner_for_call(&remote, "call_reply_a").is_some());
+        assert!(
+            aokie_owner_for_call(&remote, "call_reply_b").is_none(),
+            "a reply can never borrow authority from a different foreground leg"
+        );
+        assert!(reply_owner_is_current(&remote, Some(&owner)));
+
+        // Drive the same public physical transition used by the radio loop.
+        remote.observe_physical_call(Some("call_reply_b"), true);
+        assert!(!reply_owner_is_current(&remote, Some(&owner)));
+        let next = remote
+            .aokie_owner_fence()
+            .expect("the replacement Aokie call has its own fence");
+        assert!(reply_owner_is_current(&remote, Some(&next)));
+        assert!(!reply_owner_is_current(&remote, None));
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn no_sco_watchdog_times_the_continuous_outage_not_total_call_age() {
+        let t0 = Instant::now();
+        let mut watchdog = NoScoWatchdog::default();
+
+        assert_eq!(
+            watchdog.check(Some("call_a"), false, false, true, false, t0),
+            None
+        );
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                true,
+                false,
+                t0 + D::from_millis(7_999),
+            ),
+            None
+        );
+
+        // Recovery erases the old outage. A later drop gets a full grace
+        // period even though the call itself is now much older than eight seconds.
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                true,
+                false,
+                true,
+                false,
+                t0 + D::from_secs(100),
+            ),
+            None
+        );
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                true,
+                false,
+                t0 + D::from_secs(200),
+            ),
+            None
+        );
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                true,
+                false,
+                t0 + D::from_secs(208),
+            ),
+            Some(NoScoAction::HangUp)
+        );
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                true,
+                false,
+                t0 + D::from_secs(220),
+            ),
+            None,
+            "one outage emits at most one CHUP request"
+        );
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn no_sco_owner_race_starts_a_fresh_aokie_grace_period() {
+        let t0 = Instant::now();
+        let mut watchdog = NoScoWatchdog::default();
+
+        assert_eq!(
+            watchdog.check(Some("call_a"), false, false, true, false, t0),
+            None
+        );
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                true,
+                false,
+                t0 + D::from_secs(8),
+            ),
+            Some(NoScoAction::HangUp)
+        );
+
+        // The physical action lost its exact-owner race because a complete
+        // Companion claim-and-return crossed it. The replacement Aokie owner
+        // must receive a whole new eight-second SCO recovery window.
+        let returned_at = t0 + D::from_millis(8_250);
+        watchdog.rearm_after_owner_race(returned_at);
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                true,
+                false,
+                returned_at + D::from_millis(7_999),
+            ),
+            None
+        );
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                true,
+                false,
+                returned_at + D::from_secs(8),
+            ),
+            Some(NoScoAction::HangUp)
+        );
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn no_sco_watchdog_returns_remote_owner_then_grants_fresh_aokie_grace() {
+        let t0 = Instant::now();
+        let mut watchdog = NoScoWatchdog::default();
+
+        assert_eq!(
+            watchdog.check(Some("call_a"), false, false, false, true, t0),
+            Some(NoScoAction::RequestRemoteReturn)
+        );
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                false,
+                true,
+                t0 + D::from_secs(30),
+            ),
+            None,
+            "remote ownership is never ended by the hardware watchdog"
+        );
+
+        // The authoritative return completed after a long outage. Its first
+        // Aokie-owned tick starts a new grace period instead of hanging up.
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                true,
+                false,
+                t0 + D::from_secs(31),
+            ),
+            None
+        );
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                true,
+                false,
+                t0 + D::from_secs(38),
+            ),
+            None
+        );
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                true,
+                false,
+                t0 + D::from_secs(39),
+            ),
+            Some(NoScoAction::HangUp)
+        );
+
+        // An expected CHLD bounce resets rather than merely pauses the clock.
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                true,
+                true,
+                false,
+                t0 + D::from_secs(40),
+            ),
+            None
+        );
+        assert_eq!(
+            watchdog.check(
+                Some("call_a"),
+                false,
+                false,
+                true,
+                false,
+                t0 + D::from_secs(100),
+            ),
+            None
+        );
+    }
+
     /// sendAudio and audioTranscript are INDEPENDENT (2026-07-17): either
     /// alone must arm the shared per-turn audio capture; the attach gate
     /// stays sendAudio-only and the correction gate audioTranscript-only.
@@ -14006,6 +14804,33 @@ mod tests {
         assert_eq!(off.check(t0 + D::from_secs(3600)), None);
     }
 
+    /// A human/consult route owns the conversational clock. Repeated reserved
+    /// passes reset both the elapsed window and an already-issued check-in, so
+    /// returning the caller to Aokie can never inherit a stale second-window
+    /// hangup.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn silence_timer_gets_a_full_new_window_after_remote_ownership() {
+        let t0 = Instant::now();
+        let mut timer = SilenceTimer::new(D::from_secs(30), t0);
+        assert_eq!(
+            timer.check(t0 + D::from_secs(30)),
+            Some(SilenceAction::Prompt)
+        );
+
+        // These note_activity calls model each main-loop pass while the radio
+        // is reserved. The final one is immediately before Return to Aokie.
+        timer.note_activity(t0 + D::from_secs(45));
+        timer.note_activity(t0 + D::from_secs(90));
+
+        assert_eq!(timer.check(t0 + D::from_secs(119)), None);
+        assert_eq!(
+            timer.check(t0 + D::from_secs(120)),
+            Some(SilenceAction::Prompt),
+            "return starts with a prompt window, never the stale hangup phase"
+        );
+    }
+
     /// The agent-hangup POLICY: the LLM's marker is only a request — barge,
     /// operator ownership, the fail-safe, an unproven farewell and a farewell
     /// that ASKS A QUESTION all veto it; a valid request waits out the
@@ -14018,9 +14843,16 @@ mod tests {
 
         // No request → skip.
         assert!(matches!(
-            agent_hangup_verdict(false, false, false, false, true, false, t0, dur, t0),
+            agent_hangup_verdict(false, true, false, false, false, true, false, t0, dur, t0),
             HangupVerdict::Skip(_)
         ));
+        // A stale/remote-owned route vetoes an otherwise valid request.
+        let HangupVerdict::Skip(reason) =
+            agent_hangup_verdict(true, false, false, false, false, true, false, t0, dur, t0)
+        else {
+            panic!("a stale Aokie owner fence must veto autonomous hangup");
+        };
+        assert!(reason.contains("owner fence"), "{reason}");
         // Barge / operator / fail-safe veto.
         for (barged, operator, failsafe) in [
             (true, false, false),
@@ -14028,19 +14860,33 @@ mod tests {
             (false, false, true),
         ] {
             assert!(matches!(
-                agent_hangup_verdict(true, barged, operator, failsafe, true, false, t0, dur, t0),
+                agent_hangup_verdict(
+                    true, true, barged, operator, failsafe, true, false, t0, dur, t0
+                ),
                 HangupVerdict::Skip(_)
             ));
         }
         // Farewell never played → the dead-air fail-safe owns the ending.
         assert!(matches!(
-            agent_hangup_verdict(true, false, false, false, false, false, t0, D::ZERO, t0),
+            agent_hangup_verdict(
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                t0,
+                D::ZERO,
+                t0
+            ),
             HangupVerdict::Skip(_)
         ));
         // Live report 2026-07-13: "Is there anything else I can help you
         // with? [[END_CALL]]" hung up on its own question — a farewell that
         // asks anything must WAIT for the answer instead.
-        let verdict = agent_hangup_verdict(true, false, false, false, true, true, t0, dur, t0);
+        let verdict =
+            agent_hangup_verdict(true, true, false, false, false, true, true, t0, dur, t0);
         let HangupVerdict::Skip(reason) = verdict else {
             panic!("a questioning farewell must not hang up");
         };
@@ -14051,6 +14897,7 @@ mod tests {
         // Valid: the wait is the REMAINING playout + margin (queued 2s, 1s
         // already elapsed → ~1.4s), bounded.
         let HangupVerdict::Proceed { wait } = agent_hangup_verdict(
+            true,
             true,
             false,
             false,
