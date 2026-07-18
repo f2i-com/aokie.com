@@ -377,6 +377,37 @@
   var laneSel = { llm: '', stt: '', tts: '' };
   var catalog = null;
   var customDir = false;
+  // Provenance watch (live report 2026-07-18: "I changed the greeting and it
+  // did not take"). A linked FormLogic app re-applies its Receptionist
+  // Settings record on EVERY incoming call (the configure-receptionist flow
+  // calls settings.set with persona/greeting/voice/model/endpoints), so an
+  // edit made here is genuinely saved and then genuinely replaced moments
+  // later. The plugin bumps configVersion on every write, so a bump this tab
+  // did not cause IS an external writer — we watch for it and say so plainly
+  // instead of letting the operator conclude the form is broken.
+  var configVersion = null;
+  var appManaged = false;
+
+  /** Keys the linked app's configure-receptionist flow re-applies per call. */
+  var APP_MANAGED_KEYS = [
+    'persona',
+    'greeting',
+    'ttsVoice',
+    'aiModel',
+    'aiEndpoint',
+    'sttEndpoint',
+    'ttsEndpoint',
+    'aiReceptionist',
+  ];
+
+  /** True once an external writer has been observed bumping configVersion. */
+  function noteConfigVersion(next, ours) {
+    if (typeof next !== 'number') return;
+    if (configVersion !== null && next !== configVersion && !ours) {
+      appManaged = true;
+    }
+    configVersion = next;
+  }
 
   function load() {
     loading = true;
@@ -402,6 +433,9 @@
         baseline = merged;
         settings = withAokieDefaults(merged);
         sources = results[1];
+        // A bump between polls that this tab did not cause = the linked app
+        // re-applied its record (see the provenance note above).
+        noteConfigVersion(data.configVersion, false);
         catalog = parseTtsVoiceCatalog(data.ttsVoiceCatalog);
         customDir = false;
         laneSel = {
@@ -450,6 +484,8 @@
           // Separate objects — see the aliasing note in load().
           baseline = merged;
           settings = withAokieDefaults(merged);
+          // OUR bump — never mistake a successful save for the linked app.
+          noteConfigVersion((data || {}).configVersion, true);
           // The set response may not carry the catalog side key — keep the
           // one from the last settings.get rather than dropping to fallback.
           var cat = parseTtsVoiceCatalog((data || {}).ttsVoiceCatalog);
@@ -813,11 +849,46 @@
       '<h3>Receptionist settings</h3>' +
       '</div>' +
       '</div>' +
+      appManagedNoticeHtml() +
       body +
       (loaded && error
         ? '<p class="rcp-error">' + esc(error) + '</p>'
         : '') +
       '</section>';
+  }
+
+  /**
+   * The honest answer to "I changed the greeting and it did not take".
+   *
+   * A linked FormLogic app re-applies its Receptionist Settings record on
+   * every incoming call, so edits to the app-managed keys here are saved and
+   * then replaced. Shown as a warning ONCE an external configVersion bump has
+   * actually been observed (so a standalone Aokie, where this form IS the
+   * source of truth, never nags); a quieter always-on line states the
+   * relationship up front.
+   */
+  function appManagedNoticeHtml() {
+    if (!loaded) return '';
+    if (appManaged) {
+      return (
+        '<p class="rcp-notice rcp-notice--warn" role="status">' +
+        '<strong>Your FormLogic app just re-applied these settings' +
+        (typeof configVersion === 'number' ? ' (config v' + configVersion + ')' : '') +
+        '.</strong> ' +
+        'It does that on every incoming call, so greeting, persona, voice, model and endpoints ' +
+        'edited here are replaced by the app&rsquo;s Receptionist Settings record. ' +
+        'Edit them in the app to make them stick — everything else on this page ' +
+        '(call handling, audio, screening, hardware) is owned here.' +
+        '</p>'
+      );
+    }
+    return (
+      '<p class="rcp-notice" role="note">' +
+      'If this receptionist is linked to a FormLogic app, that app re-applies ' +
+      'greeting, persona, voice, model and endpoints on every incoming call — ' +
+      'edit those in the app&rsquo;s Receptionist Settings. The rest of this page is owned here.' +
+      '</p>'
+    );
   }
 
   function rerenderVoiceZone() {
