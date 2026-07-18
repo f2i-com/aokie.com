@@ -37,6 +37,13 @@ pub const MAX_AUDIO_LEVELS: usize = 64;
 const HELLO_PROOF_DOMAIN: &str = "aokie/v2/hello-proof";
 const ENDPOINT_BINDING_DOMAIN: &str = "aokie/v2/endpoint-binding";
 const TRICKLE_CANDIDATE_DOMAIN: &str = "aokie/v2/trickle-candidate";
+/// Domain for the bearer token an authority attaches to a pending mobile offer.
+const MOBILE_OFFER_DOMAIN: &str = "aokie/v2/mobile-offer";
+/// Domain for the bearer token an authority attaches to a media lease.
+///
+/// Distinct from every other domain so a token minted for one purpose can never
+/// be replayed as another, even though both are signed by the same key.
+const LEASE_CLAIMS_DOMAIN: &str = "aokie/v2/lease-claims";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -429,6 +436,11 @@ impl PendingMobileOfferClaims {
         }
         Ok(())
     }
+
+    /// Bytes an authority signs to produce this offer's bearer token.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, V2ProtocolError> {
+        domain_separated_canonical(MOBILE_OFFER_DOMAIN, self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -766,6 +778,17 @@ pub struct AuthoritativeCallSnapshot {
     pub captions: Vec<Caption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_levels: Option<Vec<NormalizedAudioLevel>>,
+    /// Offers the authority is currently prepared to honour.
+    ///
+    /// Over the WebSocket carrier the gateway is the lease authority and mints
+    /// these itself, so a plugin-authored snapshot leaves this empty and
+    /// `skip_serializing_if` keeps that frame byte-identical to what every
+    /// deployed reader already parses. Over the hosted relay there is no
+    /// gateway, so the plugin mints and publishes its own — and a receiver that
+    /// could not decode the key would fail EVERY snapshot, because this struct
+    /// is `deny_unknown_fields`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_mobile_offers: Vec<SignedPendingMobileOffer>,
     pub occurred_at: String,
 }
 
@@ -806,6 +829,16 @@ impl AuthoritativeCallSnapshot {
             for level in audio_levels {
                 level.validate()?;
             }
+        }
+        if self.pending_mobile_offers.len() > MAX_PENDING_MOBILE_OFFERS {
+            return Err(V2ProtocolError::Invalid("pendingMobileOffers"));
+        }
+        for offer in &self.pending_mobile_offers {
+            // Shape and internal lifetime only, exactly as the projected twin
+            // does it: freshness belongs to the receiver's own clock, at the
+            // moment it presents or answers the offer.
+            offer.offer.validate(offer.offer.issued_at)?;
+            bounded_text("offerToken", &offer.offer_token, MAX_LEASE_TOKEN_BYTES)?;
         }
         if let Some(caller) = &self.caller {
             if let Some(label) = &caller.label {
@@ -991,6 +1024,11 @@ pub struct PluginSnapshotFrame {
     pub schema_version: u16,
     pub app_id: String,
     pub event_id: String,
+    /// Present only on the dumb-relay carrier, where the plugin must perform
+    /// the gateway's per-device projection before the frame leaves the trusted
+    /// Desktop boundary. Socket-gateway snapshots remain byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
     pub snapshot: AuthoritativeCallSnapshot,
 }
 
@@ -1000,6 +1038,19 @@ impl PluginSnapshotFrame {
         schema(self.schema_version)?;
         safe_id("appId", &self.app_id)?;
         safe_id("eventId", &self.event_id)?;
+        if let Some(device_id) = &self.device_id {
+            safe_id("deviceId", device_id)?;
+            if self
+                .snapshot
+                .pending_mobile_offers
+                .iter()
+                .any(|offer| offer.offer.target_device_id != *device_id)
+            {
+                return Err(V2ProtocolError::Unsafe(
+                    "targeted plugin snapshot contains another device's offer",
+                ));
+            }
+        }
         self.snapshot.validate()
     }
 }
@@ -2174,6 +2225,145 @@ impl PluginLeaseRevokeFrame {
     }
 }
 
+/// An authority's acknowledgement that a device may redeem the named offer.
+///
+/// Every frame in this family carries a top-level `deviceId` for one reason:
+/// the hosted relay addresses a frame by that field and BROADCASTS when it is
+/// absent. Their mobile-dialect twins have no such field because the WebSocket
+/// gateway addressed frames itself — emitting those twins over a relay would
+/// deliver one device's lease to every approved Companion on the line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginOfferAcceptedFrame {
+    pub kind: String,
+    pub schema_version: u16,
+    pub app_id: String,
+    pub device_id: String,
+    pub request_id: String,
+    pub offer_id: String,
+    pub offer_jti: String,
+    pub offered_mode: LeaseMode,
+    pub accepted: bool,
+}
+
+impl PluginOfferAcceptedFrame {
+    pub fn validate(&self) -> Result<(), V2ProtocolError> {
+        exact("kind", &self.kind, "plugin_offer_accepted")?;
+        schema(self.schema_version)?;
+        safe_id("appId", &self.app_id)?;
+        safe_id("deviceId", &self.device_id)?;
+        safe_id("requestId", &self.request_id)?;
+        safe_id("offerId", &self.offer_id)?;
+        safe_id("offerJti", &self.offer_jti)?;
+        // A refusal is `plugin_claim_rejected`, which carries a typed reason.
+        // Letting this frame say `false` would create a second, reasonless way
+        // to decline that the receiver would have to interpret.
+        if !self.accepted {
+            return Err(V2ProtocolError::Invalid("accepted"));
+        }
+        Ok(())
+    }
+}
+
+/// Where a plugin-minted lease has reached in its lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginLeaseStatus {
+    /// Monitor, live on arrival: it can never reach the caller.
+    Granted,
+    /// Consult or takeover, prepared but not yet bound to the radio.
+    Provisional,
+    /// Consult or takeover, physically prepared and now bound.
+    Active,
+    /// An existing active lease, extended.
+    Renewed,
+}
+
+/// A lease this plugin minted, carried to the device that asked for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginLeaseStatusFrame {
+    pub kind: String,
+    pub schema_version: u16,
+    pub app_id: String,
+    pub device_id: String,
+    pub request_id: String,
+    pub status: PluginLeaseStatus,
+    pub lease_token: String,
+    pub lease: LeaseClaims,
+}
+
+impl PluginLeaseStatusFrame {
+    pub fn validate(&self, now_unix: u64) -> Result<(), V2ProtocolError> {
+        exact("kind", &self.kind, "plugin_lease_status")?;
+        schema(self.schema_version)?;
+        safe_id("appId", &self.app_id)?;
+        safe_id("deviceId", &self.device_id)?;
+        safe_id("requestId", &self.request_id)?;
+        bounded_text("leaseToken", &self.lease_token, MAX_LEASE_TOKEN_BYTES)?;
+        self.lease.validate(now_unix)?;
+        if self.device_id != self.lease.device_id {
+            return Err(V2ProtocolError::Unsafe(
+                "lease status addresses a different device than its lease",
+            ));
+        }
+        // The status is what the receiver turns into a frame kind, so a status
+        // that disagrees with the lease it carries would let one kind deliver
+        // another kind's authority. Pinned here, once, rather than at each
+        // translation site.
+        let agrees = match self.status {
+            PluginLeaseStatus::Granted => {
+                matches!(self.lease.mode, LeaseMode::Monitor)
+                    && matches!(self.lease.phase, LeasePhase::Active)
+            }
+            PluginLeaseStatus::Provisional => {
+                matches!(self.lease.mode, LeaseMode::Consult | LeaseMode::Takeover)
+                    && matches!(self.lease.phase, LeasePhase::Prepared)
+            }
+            PluginLeaseStatus::Active => {
+                matches!(self.lease.mode, LeaseMode::Consult | LeaseMode::Takeover)
+                    && matches!(self.lease.phase, LeasePhase::Active)
+            }
+            PluginLeaseStatus::Renewed => matches!(self.lease.phase, LeasePhase::Active),
+        };
+        if !agrees {
+            return Err(V2ProtocolError::Unsafe(
+                "lease status disagrees with the mode and phase it carries",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A typed, in-band refusal.
+///
+/// Refusing this way rather than by erroring is the whole point: over the relay
+/// the sender is an approved-but-untrusted peer, so a refusal must cost the
+/// session nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginClaimRejectedFrame {
+    pub kind: String,
+    pub schema_version: u16,
+    pub app_id: String,
+    pub device_id: String,
+    pub request_id: String,
+    pub code: String,
+    pub message: String,
+}
+
+impl PluginClaimRejectedFrame {
+    pub fn validate(&self) -> Result<(), V2ProtocolError> {
+        exact("kind", &self.kind, "plugin_claim_rejected")?;
+        schema(self.schema_version)?;
+        safe_id("appId", &self.app_id)?;
+        safe_id("deviceId", &self.device_id)?;
+        safe_id("requestId", &self.request_id)?;
+        bounded_text("code", &self.code, 200)?;
+        bounded_text("message", &self.message, MAX_REASON_BYTES)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LeaseClaims {
@@ -2236,6 +2426,16 @@ impl LeaseClaims {
             ));
         }
         Ok(())
+    }
+
+    /// Bytes an authority signs to produce this lease's bearer token.
+    ///
+    /// The token is opaque to its holder: it proves nothing to the Companion
+    /// and is never verified there. It exists so the authority can recognise
+    /// its own lease when the holder presents it back — which is why every
+    /// field is covered, and why the domain differs from the offer's.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, V2ProtocolError> {
+        domain_separated_canonical(LEASE_CLAIMS_DOMAIN, self)
     }
 }
 
@@ -3189,6 +3389,7 @@ mod tests {
             caller: None,
             captions: vec![],
             audio_levels: None,
+            pending_mobile_offers: Vec::new(),
             occurred_at: "2026-07-16T00:00:00Z".into(),
         };
         snapshot.validate().unwrap();
@@ -3386,6 +3587,263 @@ mod tests {
         assert!(matches!(
             consent.validate(),
             Err(V2ProtocolError::Unsafe(_))
+        ));
+    }
+
+    fn relay_offer_claims(now: u64) -> PendingMobileOfferClaims {
+        PendingMobileOfferClaims {
+            offer_id: "offer_a".into(),
+            opportunity_id: "opportunity_a".into(),
+            target_device_id: "device_a".into(),
+            target_holder_key_thumbprint: "thumb_a".into(),
+            offered_mode: LeaseMode::Takeover,
+            surface: MobileOfferSurface::InApp,
+            app_id: "app_a".into(),
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            owner_epoch: 3,
+            switchboard_revision: 11,
+            remote_revision: 13,
+            required_consent_policy_id: "remote_policy".into(),
+            required_consent_policy_version: 3,
+            required_grants: vec![Grant::StateRead, Grant::RtcSignal, Grant::Takeover],
+            issued_at: now,
+            expires_at: now + 25,
+            jti: "offer_jti_a".into(),
+        }
+    }
+
+    fn authoritative_snapshot_with_offers(
+        offers: Vec<SignedPendingMobileOffer>,
+    ) -> AuthoritativeCallSnapshot {
+        AuthoritativeCallSnapshot {
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            owner_epoch: 3,
+            switchboard_revision: 11,
+            remote_revision: 13,
+            telephony_state: TelephonyState::Active,
+            service_mode: ServiceMode::AokieActive,
+            media_state: MediaState::Ready,
+            remote_capabilities: RemoteCapabilities {
+                software_hold: true,
+                carrier_hold_evidence: CarrierHoldEvidence::Unknown,
+                secondary_call_observation: SecondaryCallObservation::Unknown,
+                voice_consult: true,
+                takeover: true,
+            },
+            secondary_call_policy: SecondaryCallPolicy::Normal,
+            secondary_call: None,
+            remote_consent: RemoteConsentPolicy {
+                policy_id: "remote_policy".into(),
+                policy_version: 3,
+                enabled: true,
+                acknowledged: true,
+                acknowledged_at: Some("2026-07-16T00:00:00Z".into()),
+                expires_at: Some("2999-01-01T00:00:00Z".into()),
+                captions_enabled: true,
+                assistance_enabled: true,
+                monitor_enabled: true,
+                consult_enabled: true,
+                takeover_enabled: true,
+            },
+            caller: None,
+            captions: vec![],
+            audio_levels: None,
+            pending_mobile_offers: offers,
+            occurred_at: "2026-07-16T00:00:00Z".into(),
+        }
+    }
+
+    fn relay_lease_claims(now: u64, mode: LeaseMode, phase: LeasePhase) -> LeaseClaims {
+        LeaseClaims {
+            aud: LEASE_AUDIENCE.into(),
+            app_id: "app_a".into(),
+            plugin_id: "plugin_a".into(),
+            device_id: "device_a".into(),
+            plugin_key_thumbprint: "plugin_thumb".into(),
+            mobile_key_thumbprint: "thumb_a".into(),
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            owner_epoch: 3,
+            mode,
+            phase,
+            tracks: tracks_for(mode, phase),
+            expires_at: now + 45,
+            lease_id: "lease_a".into(),
+            jti: "lease_jti_a".into(),
+            fence: if matches!(mode, LeaseMode::Takeover) {
+                1
+            } else {
+                0
+            },
+            session_nonce: "mobile_nonce".into(),
+            rtc_session_id: "rtc_a".into(),
+        }
+    }
+
+    #[test]
+    fn a_socket_snapshot_is_byte_identical_to_a_build_without_offers() {
+        // The gateway carrier mints its own offers, so a plugin-authored
+        // snapshot leaves the vec empty. Were the key ever serialised there,
+        // every deployed reader would reject the whole frame: this struct is
+        // `deny_unknown_fields`, so omitting it is a compatibility contract
+        // rather than a size optimisation.
+        let snapshot = authoritative_snapshot_with_offers(Vec::new());
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+
+        assert!(!encoded.contains("pendingMobileOffers"));
+        let decoded: AuthoritativeCallSnapshot = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn a_relay_snapshot_carries_its_offers_and_bounds_them() {
+        let now = 1_800_000_000;
+        let signed = SignedPendingMobileOffer {
+            offer: relay_offer_claims(now),
+            offer_token: "token_a".into(),
+        };
+        let snapshot = authoritative_snapshot_with_offers(vec![signed.clone()]);
+        snapshot.validate().unwrap();
+
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(encoded.contains("pendingMobileOffers"));
+        assert_eq!(
+            serde_json::from_str::<AuthoritativeCallSnapshot>(&encoded).unwrap(),
+            snapshot
+        );
+
+        // These ride inside a frame the carrier already bounds, so the cap is
+        // what stops a snapshot becoming a payload.
+        let flooded =
+            authoritative_snapshot_with_offers(vec![signed; MAX_PENDING_MOBILE_OFFERS + 1]);
+        assert!(matches!(
+            flooded.validate(),
+            Err(V2ProtocolError::Invalid("pendingMobileOffers"))
+        ));
+    }
+
+    #[test]
+    fn a_targeted_plugin_snapshot_cannot_carry_another_devices_offer() {
+        let now = 1_800_000_000;
+        let signed = SignedPendingMobileOffer {
+            offer: relay_offer_claims(now),
+            offer_token: "token_a".into(),
+        };
+        let mut frame = PluginSnapshotFrame {
+            kind: "plugin_snapshot".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            event_id: "snapshot_a".into(),
+            device_id: Some("device_a".into()),
+            snapshot: authoritative_snapshot_with_offers(vec![signed]),
+        };
+        frame.validate().unwrap();
+
+        frame.device_id = Some("device_b".into());
+        assert!(matches!(
+            frame.validate(),
+            Err(V2ProtocolError::Unsafe(
+                "targeted plugin snapshot contains another device's offer"
+            ))
+        ));
+    }
+
+    #[test]
+    fn offer_and_lease_tokens_are_signed_over_different_domains() {
+        // One key mints both. Without domain separation a verifier that checked
+        // only the signature would accept an offer token where a lease token
+        // belongs.
+        let now = 1_800_000_000;
+        let offer = relay_offer_claims(now);
+        let lease = relay_lease_claims(now, LeaseMode::Takeover, LeasePhase::Prepared);
+
+        let offer_bytes = offer.signing_bytes().unwrap();
+        let lease_bytes = lease.signing_bytes().unwrap();
+        assert!(offer_bytes.starts_with(b"aokie/v2/mobile-offer\0"));
+        assert!(lease_bytes.starts_with(b"aokie/v2/lease-claims\0"));
+        assert_ne!(offer_bytes, lease_bytes);
+
+        // Determinism is what lets an authority re-derive its own token later
+        // instead of trusting one handed back to it.
+        assert_eq!(offer.signing_bytes().unwrap(), offer_bytes);
+        assert_eq!(lease.signing_bytes().unwrap(), lease_bytes);
+    }
+
+    #[test]
+    fn a_lease_status_frame_refuses_a_status_that_contradicts_its_lease() {
+        let now = 1_800_000_000;
+        let monitor = relay_lease_claims(now, LeaseMode::Monitor, LeasePhase::Active);
+        let frame = |status, lease: &LeaseClaims| PluginLeaseStatusFrame {
+            kind: "plugin_lease_status".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            device_id: lease.device_id.clone(),
+            request_id: "request_a".into(),
+            status,
+            lease_token: "token_a".into(),
+            lease: lease.clone(),
+        };
+
+        frame(PluginLeaseStatus::Granted, &monitor)
+            .validate(now)
+            .unwrap();
+        // The receiver turns `status` into a frame kind, so a monitor lease
+        // announced as `active` would arrive as `claim_active` and imply the
+        // caller had been taken over by a lease that can only ever listen.
+        assert!(matches!(
+            frame(PluginLeaseStatus::Active, &monitor).validate(now),
+            Err(V2ProtocolError::Unsafe(_))
+        ));
+
+        let prepared = relay_lease_claims(now, LeaseMode::Takeover, LeasePhase::Prepared);
+        frame(PluginLeaseStatus::Provisional, &prepared)
+            .validate(now)
+            .unwrap();
+        assert!(matches!(
+            frame(PluginLeaseStatus::Granted, &prepared).validate(now),
+            Err(V2ProtocolError::Unsafe(_))
+        ));
+
+        // Addressing one device with another device's lease would hand the
+        // carrier a lease for a party that never asked for it.
+        let mut crossed = frame(PluginLeaseStatus::Provisional, &prepared);
+        crossed.device_id = "device_b".into();
+        assert!(matches!(
+            crossed.validate(now),
+            Err(V2ProtocolError::Unsafe(_))
+        ));
+
+        // An expired lease is refused before it can be announced at all.
+        let mut stale = frame(PluginLeaseStatus::Provisional, &prepared);
+        stale.lease.expires_at = now;
+        assert!(matches!(stale.validate(now), Err(V2ProtocolError::Expired)));
+    }
+
+    #[test]
+    fn an_offer_acceptance_can_only_say_yes() {
+        // A refusal is `plugin_claim_rejected`, which carries a typed reason.
+        // Allowing `accepted: false` here would create a second, reasonless
+        // way to decline that the receiver would have to guess at.
+        let mut frame = PluginOfferAcceptedFrame {
+            kind: "plugin_offer_accepted".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            device_id: "device_a".into(),
+            request_id: "request_a".into(),
+            offer_id: "offer_a".into(),
+            offer_jti: "offer_jti_a".into(),
+            offered_mode: LeaseMode::Takeover,
+            accepted: true,
+        };
+        frame.validate().unwrap();
+
+        frame.accepted = false;
+        assert!(matches!(
+            frame.validate(),
+            Err(V2ProtocolError::Invalid("accepted"))
         ));
     }
 }

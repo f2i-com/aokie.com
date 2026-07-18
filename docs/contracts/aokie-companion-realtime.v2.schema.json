@@ -236,6 +236,7 @@
         "caller": { "$ref": "#/$defs/caller" },
         "captions": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/caption" } },
         "audioLevels": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/audioLevel" } },
+        "pendingMobileOffers": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/signedPendingMobileOffer" } },
         "occurredAt": { "type": "string", "minLength": 1, "maxLength": 64 }
       },
       "required": ["callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "telephonyState", "serviceMode", "mediaState", "remoteCapabilities", "secondaryCallPolicy", "remoteConsent", "occurredAt"],
@@ -273,7 +274,7 @@
       "type": "object",
       "properties": {
         "kind": { "const": "plugin_snapshot" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
-        "eventId": { "$ref": "#/$defs/safeId" }, "snapshot": { "allOf": [ { "$ref": "#/$defs/authoritativeSnapshot" }, { "required": ["captions"] } ] }
+        "eventId": { "$ref": "#/$defs/safeId" }, "deviceId": { "$ref": "#/$defs/safeId" }, "snapshot": { "allOf": [ { "$ref": "#/$defs/authoritativeSnapshot" }, { "required": ["captions"] } ] }
       },
       "required": ["kind", "schemaVersion", "appId", "eventId", "snapshot"],
       "additionalProperties": false
@@ -585,6 +586,45 @@
       "required": ["kind", "schemaVersion", "appId", "deviceId", "leaseId", "leaseJti", "callId", "callEpoch", "fence", "reason"],
       "additionalProperties": false
     },
+    "pluginOfferAcceptedFrame": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "plugin_offer_accepted" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "deviceId": { "$ref": "#/$defs/safeId" }, "requestId": { "$ref": "#/$defs/safeId" },
+        "offerId": { "$ref": "#/$defs/safeId" }, "offerJti": { "$ref": "#/$defs/safeId" },
+        "offeredMode": { "$ref": "#/$defs/leaseMode" }, "accepted": { "const": true }
+      },
+      "required": ["kind", "schemaVersion", "appId", "deviceId", "requestId", "offerId", "offerJti", "offeredMode", "accepted"],
+      "additionalProperties": false
+    },
+    "pluginLeaseStatusValue": { "enum": ["granted", "provisional", "active", "renewed"] },
+    "pluginLeaseStatusFrame": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "plugin_lease_status" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "deviceId": { "$ref": "#/$defs/safeId" }, "requestId": { "$ref": "#/$defs/safeId" },
+        "status": { "$ref": "#/$defs/pluginLeaseStatusValue" },
+        "leaseToken": { "type": "string", "minLength": 1, "maxLength": 16384 }, "lease": { "$ref": "#/$defs/leaseClaims" }
+      },
+      "required": ["kind", "schemaVersion", "appId", "deviceId", "requestId", "status", "leaseToken", "lease"],
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "properties": { "status": { "const": "granted" } }, "required": ["status"] }, "then": { "properties": { "lease": { "properties": { "mode": { "const": "monitor" }, "phase": { "const": "active" } }, "required": ["mode", "phase"] } } } },
+        { "if": { "properties": { "status": { "const": "provisional" } }, "required": ["status"] }, "then": { "properties": { "lease": { "properties": { "mode": { "enum": ["consult", "takeover"] }, "phase": { "const": "prepared" } }, "required": ["mode", "phase"] } } } },
+        { "if": { "properties": { "status": { "const": "active" } }, "required": ["status"] }, "then": { "properties": { "lease": { "properties": { "mode": { "enum": ["consult", "takeover"] }, "phase": { "const": "active" } }, "required": ["mode", "phase"] } } } },
+        { "if": { "properties": { "status": { "const": "renewed" } }, "required": ["status"] }, "then": { "properties": { "lease": { "properties": { "phase": { "const": "active" } }, "required": ["phase"] } } } }
+      ]
+    },
+    "pluginClaimRejectedFrame": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "plugin_claim_rejected" }, "schemaVersion": { "const": 2 }, "appId": { "$ref": "#/$defs/safeId" },
+        "deviceId": { "$ref": "#/$defs/safeId" }, "requestId": { "$ref": "#/$defs/safeId" },
+        "code": { "type": "string", "minLength": 1, "maxLength": 200 }, "message": { "type": "string", "minLength": 1, "maxLength": 500 }
+      },
+      "required": ["kind", "schemaVersion", "appId", "deviceId", "requestId", "code", "message"],
+      "additionalProperties": false
+    },
     "leaseClaims": {
       "type": "object",
       "properties": {
@@ -654,7 +694,7 @@
       "additionalProperties": false
     },
     "mobileToGateway": { "oneOf": [ { "$ref": "#/$defs/mobileHello" }, { "$ref": "#/$defs/mobileOfferAnswer" }, { "$ref": "#/$defs/leaseRequest" }, { "$ref": "#/$defs/leaseHeartbeat" }, { "$ref": "#/$defs/leaseRevoke" }, { "$ref": "#/$defs/mobileRtcSignal" }, { "$ref": "#/$defs/mobileAssistanceAnswer" }, { "$ref": "#/$defs/mobileEndCallerChallengeRequest" }, { "$ref": "#/$defs/mobileEndCallerConfirm" } ] },
-    "pluginToGateway": { "oneOf": [ { "$ref": "#/$defs/pluginHello" }, { "$ref": "#/$defs/pluginIdle" }, { "$ref": "#/$defs/pluginSnapshot" }, { "$ref": "#/$defs/claimDecision" }, { "$ref": "#/$defs/pluginRtcSignal" }, { "$ref": "#/$defs/pluginLeaseRevoke" }, { "$ref": "#/$defs/assistanceRequest" }, { "$ref": "#/$defs/endCallerResult" } ] },
+    "pluginToGateway": { "oneOf": [ { "$ref": "#/$defs/pluginHello" }, { "$ref": "#/$defs/pluginIdle" }, { "$ref": "#/$defs/pluginSnapshot" }, { "$ref": "#/$defs/claimDecision" }, { "$ref": "#/$defs/pluginRtcSignal" }, { "$ref": "#/$defs/pluginLeaseRevoke" }, { "$ref": "#/$defs/pluginOfferAcceptedFrame" }, { "$ref": "#/$defs/pluginLeaseStatusFrame" }, { "$ref": "#/$defs/pluginClaimRejectedFrame" }, { "$ref": "#/$defs/assistanceRequest" }, { "$ref": "#/$defs/endCallerResult" } ] },
     "gatewayToMobile": { "oneOf": [ { "$ref": "#/$defs/endpointChallenge" }, { "$ref": "#/$defs/mobileIdleSync" }, { "$ref": "#/$defs/mobileSnapshot" }, { "$ref": "#/$defs/mobileOfferAccepted" }, { "$ref": "#/$defs/leaseStatus" }, { "$ref": "#/$defs/genericGatewayFrame" }, { "$ref": "#/$defs/gatewayMobileRtcSignal" }, { "$ref": "#/$defs/assistanceRequest" }, { "$ref": "#/$defs/assistanceAnswerAccepted" }, { "$ref": "#/$defs/endCallerChallenge" }, { "$ref": "#/$defs/endCallerSubmitted" }, { "$ref": "#/$defs/endCallerResult" } ] },
     "gatewayToPlugin": { "oneOf": [ { "$ref": "#/$defs/endpointChallenge" }, { "$ref": "#/$defs/pluginLeaseStatus" }, { "$ref": "#/$defs/genericGatewayFrame" }, { "$ref": "#/$defs/pluginRtcSignal" }, { "$ref": "#/$defs/pluginAssistanceAnswer" }, { "$ref": "#/$defs/pluginEndCallerExecute" } ] }
   }

@@ -18,10 +18,11 @@ use aokie_protocol::v2::{
     MobileAssistanceAnswerFrame, MobileEndCallerChallengeRequestFrame, MobileEndCallerConfirmFrame,
     MobileHello, MobileIdleSyncFrame, MobileOfferAnswerFrame, MobileOfferSurface,
     MobileRtcSignalFrame, MobileSnapshotFrame, PluginAssistanceRequestFrame,
-    PluginEndCallerResultFrame, PluginHello, PluginIdleFrame, PluginSnapshotFrame,
-    ProjectedCallSnapshot, RtcSignal, ServiceMode, SignedPendingMobileOffer, TelephonyState,
-    TrickleCandidateClaims, V2ProtocolError, MAX_LEASE_TOKEN_BYTES, MAX_SAFE_INTEGER,
-    SCHEMA_VERSION,
+    PluginClaimRejectedFrame, PluginEndCallerResultFrame, PluginHello, PluginIdleFrame,
+    PluginLeaseRevokeFrame, PluginLeaseStatus, PluginLeaseStatusFrame, PluginOfferAcceptedFrame,
+    PluginRtcSignalFrame, PluginSnapshotFrame, ProjectedCallSnapshot, RemoteConsentPolicy,
+    RtcSignal, ServiceMode, SignedPendingMobileOffer, TelephonyState, TrickleCandidateClaims,
+    V2ProtocolError, MAX_LEASE_TOKEN_BYTES, MAX_SAFE_INTEGER, SCHEMA_VERSION,
 };
 use chrono::{DateTime, Utc};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -73,10 +74,22 @@ const LEASE_RENEWAL_WINDOW: Duration = Duration::from_secs(HEARTBEAT_INTERVAL.as
 const MAX_RECONNECT_DELAY: u64 = 20;
 const ADMISSION_REFRESH_MARGIN: Duration = Duration::from_secs(20);
 const NATIVE_ACTION_POLL: Duration = Duration::from_millis(200);
+const URGENT_CONTROL_POLL: Duration = Duration::from_millis(100);
 const NATIVE_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const LEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const REVOKE_ACK_TIMEOUT: Duration = Duration::from_secs(4);
+const REVOKE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_ANSWERED_ASSISTANCE_REQUESTS: usize = 64;
+const MAX_COMPLETED_REVOKES: usize = 256;
+// Native media activation failures must surrender the authority the Desktop
+// already minted, even when the receive loop is about to reconnect. Keep the
+// exact-token revoke in a tiny, bounded queue that survives transport resets.
+// There can be only one local lease transition in flight; the extra capacity
+// is defensive headroom for repeated transport failures, not a work queue.
+const MAX_URGENT_CONTROL_FRAMES: usize = 16;
+// Relay delivery is at-least-once. Retain only an identifier and digest for
+// recently APPLIED authority frames: enough to make exact redelivery a no-op
+// without keeping lease tokens, SDP, or ICE payloads alive in memory.
+const MAX_APPLIED_RELAY_FRAMES: usize = 256;
 
 type V2WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type V2Writer = SplitSink<V2WebSocket, Message>;
@@ -86,50 +99,55 @@ type V2Reader = SplitStream<V2WebSocket>;
 /// loop. Only a cadence: nothing is lost when it elapses.
 const TRANSPORT_READ_TICK: Duration = Duration::from_millis(200);
 
-/// Environment opt-in for POSTING ANYTHING AT ALL over the relay.
+/// Emergency kill switch for relay writes. Sending is ON after a normal app
+/// launch and only an exact `0` disables it.
 ///
-/// ⚠️ DEFAULT OFF, DELIBERATELY, AND IT COVERS EVERY OUTBOUND FRAME — not just
-/// the hello. The live plugin's frame dispatcher accepts exactly eight
-/// GATEWAY-dialect kinds (`claim_proposal`, `lease_granted`, `lease_renewed`,
-/// `lease_revoked`, `rtc_signal`, `assistance_answer`, `end_caller_execute`,
-/// `error`) and ends in `_ => Err(reconnect("unsupported frame"))`, which tears
-/// its session down. Over the socket a gateway process TRANSLATED the mobile
-/// dialect into that one; on the relay nothing does, so every frame this
-/// session emits is fatal to the peer:
-///
-/// * `mobile_hello`, `lease_request`, `end_caller_challenge_request` and
-///   `end_caller_confirm` have no arm at all — straight to the catch-all.
-/// * the two kind names that DO overlap still fail to parse, because the twins
-///   are `deny_unknown_fields` and differ: `MobileRtcSignalFrame` carries a
-///   `leaseToken` `PluginRtcSignalFrame` does not, and
-///   `MobileAssistanceAnswerFrame` carries an `idempotencyKey` while
-///   `PluginAssistanceAnswerFrame` wants a `deviceId`. A parse failure is a
-///   teardown too.
-///
-/// So once this Companion is on the plugin's approved roster, ONE tap in the
-/// Companion UI — answer, end-caller, assistance — would drop the session of a
-/// desktop answering a real phone line, and would do it again on every retry.
-/// Gating only the hello would have left every one of those paths open.
-///
-/// Turning this on is safe only after the plugin ships additive arms for the
-/// mobile dialect. Until then the carrier runs genuinely read-only: it
-/// authenticates, primes its cursor and reads the stream, and posts nothing.
-///
-/// ⚠️ Read-only also means SILENT, and roster approval does not change that.
-/// The plugin's relay routing is speak-first — it learns a party from an
-/// inbound frame and broadcasts only to parties it has learned — so a build
-/// that posts nothing is never a destination, approved or not. Expect
-/// `initial_sync` to time out on a loop until the plugin can accept a hello.
+/// Safety no longer depends on a positive deployment flag. `mobile_hello` is
+/// harmless capability discovery, while every lease action is reachable only
+/// after the Desktop has published a signed, device/mode/surface-bound offer.
+/// The exact outbound allowlist below remains the protocol boundary, so an old
+/// plugin that publishes no offer can receive a hello but can never be sent a
+/// claim. The switch remains solely as an operator rollback lever.
 const RELAY_SEND_ENV: &str = "AOKIE_COMPANION_RELAY_SEND_HELLO";
 
-fn relay_send_opt_in() -> bool {
-    relay_send_opt_in_from(std::env::var(RELAY_SEND_ENV).ok().as_deref())
+/// Mobile-dialect kinds the plugin's RELAY dispatcher actions directly.
+///
+/// This is also the outbound safety boundary for [`V2Transport::send_text`]:
+/// a newly-added mobile frame does not reach a live Desktop until the plugin
+/// has an explicit relay arm for it. The socket gateway remains unaffected and
+/// still receives every frame.
+const RELAY_PLUGIN_ADMITTED_KINDS: [&str; 6] = [
+    "mobile_hello",
+    "mobile_offer_answer",
+    "lease_request",
+    "rtc_signal",
+    "lease_heartbeat",
+    "lease_revoke",
+];
+
+// These grants describe actions that the signed admission may authorize in
+// general, but the relay dispatcher in this release cannot carry. Never
+// project them into relay UI authority: a disabled control is safer and more
+// truthful than a button whose frame would be silently withheld.
+const RELAY_UNSUPPORTED_PROJECTED_GRANTS: [Grant; 2] = [Grant::AssistanceRespond, Grant::EndCaller];
+const RELAY_ASSISTANCE_UNSUPPORTED: &str =
+    "text assistance answers are not supported by the managed relay; use Private consult";
+const RELAY_END_CALLER_UNSUPPORTED: &str =
+    "ending the caller call is not supported by the managed relay; return the call to Aokie instead";
+
+fn relay_send_enabled() -> bool {
+    relay_send_enabled_from(std::env::var(RELAY_SEND_ENV).ok().as_deref())
 }
 
-/// Exactly `"1"`, nothing else. Split out so the rule can be locked without a
-/// test mutating process-wide environment under a parallel runner.
-fn relay_send_opt_in_from(value: Option<&str>) -> bool {
-    value == Some("1")
+/// Exactly `"0"` disables relay writes; absence is the normal relaunch path.
+/// Split out so the rule can be locked without a test mutating process-wide
+/// environment under a parallel runner.
+fn relay_send_enabled_from(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+fn relay_plugin_admits(kind: &str) -> bool {
+    RELAY_PLUGIN_ADMITTED_KINDS.contains(&kind)
 }
 
 /// One session, two possible carriers.
@@ -191,26 +209,41 @@ impl V2Transport {
 
     /// Deliver one frame.
     ///
-    /// Over the socket every frame goes out unchanged. Over the relay ALL of
-    /// them are withheld unless [`RELAY_SEND_ENV`] opts in — see that constant
-    /// for why posting any frame in today's mobile dialect tears down the
-    /// session of a desktop on a live call.
+    /// Over the socket every frame goes out unchanged. Over the relay a frame is
+    /// posted when the emergency kill switch is not set and its kind is in
+    /// [`RELAY_PLUGIN_ADMITTED_KINDS`]. The plugin now actions that lease/RTC
+    /// family in the mobile dialect; assistance and caller-ending still have no
+    /// relay translation and are withheld here rather than sent into a silent
+    /// drop.
     ///
     /// A withheld frame reports success so the session survives: the caller's
     /// contract is "false breaks the session", and dropping the working READ
     /// path because a user tapped an action the peer cannot accept would be a
     /// worse outcome than the action quietly not happening. The cost is that a
-    /// queued user action resolves as delivered; that is bounded to the
-    /// opt-in-off relay path, which is exactly the path where no user action
-    /// can be honoured at all.
+    /// queued user action resolves as delivered. That is limited to an explicit
+    /// operator kill or an unsupported relay action; neither may destabilise a
+    /// Desktop that is handling a real call.
     async fn send_text(&mut self, encoded: String) -> bool {
         match self {
             Self::WebSocket { writer, .. } => send_text(writer, encoded).await,
             Self::Relay(relay) => {
-                if !relay_send_opt_in() {
-                    let kind = parse_kind(&encoded).unwrap_or_else(|_| "unparsed".into());
+                let kind = parse_kind(&encoded).ok();
+                if !relay_send_enabled() {
+                    let kind = kind.as_deref().unwrap_or("unparsed");
                     eprintln!(
-                        "[AokieCompanion][relay] holding outbound {kind}: the plugin has no handler for the mobile dialect yet (set {RELAY_SEND_ENV}=1 once it does)"
+                        "[AokieCompanion][relay] holding outbound {kind}: relay sending was disabled with {RELAY_SEND_ENV}=0"
+                    );
+                    return true;
+                }
+                let Some(kind) = kind else {
+                    eprintln!(
+                        "[AokieCompanion][relay] holding outbound unparsed frame: only admitted mobile frame kinds may reach the plugin"
+                    );
+                    return true;
+                };
+                if !relay_plugin_admits(&kind) {
+                    eprintln!(
+                        "[AokieCompanion][relay] holding outbound {kind}: the plugin's relay dispatcher does not admit this mobile frame kind"
                     );
                     return true;
                 }
@@ -269,6 +302,19 @@ impl V2Transport {
         matches!(self, Self::Relay(_))
     }
 
+    fn unsupported_user_frame(&self, encoded: &str) -> Option<&'static str> {
+        if !self.is_relay() {
+            return None;
+        }
+        match parse_kind(encoded).ok().as_deref() {
+            Some("assistance_answer") => Some(RELAY_ASSISTANCE_UNSUPPORTED),
+            Some("end_caller_challenge_request" | "end_caller_confirm") => {
+                Some(RELAY_END_CALLER_UNSUPPORTED)
+            }
+            _ => None,
+        }
+    }
+
     async fn recv(&mut self, tick: Duration) -> V2Inbound {
         match self {
             Self::WebSocket { writer, reader } => {
@@ -283,9 +329,9 @@ impl V2Transport {
                         }
                     }
                     Ok(Some(Ok(Message::Pong(_)))) => V2Inbound::Pong,
-                    Ok(Some(Ok(Message::Close(frame)))) => V2Inbound::Closed(format!(
-                        "gateway closed the active socket: {frame:?}"
-                    )),
+                    Ok(Some(Ok(Message::Close(frame)))) => {
+                        V2Inbound::Closed(format!("gateway closed the active socket: {frame:?}"))
+                    }
                     Ok(None) => V2Inbound::Closed("active socket reached EOF".into()),
                     Ok(Some(Err(error))) => {
                         V2Inbound::Closed(format!("active socket read failed: {error}"))
@@ -351,14 +397,17 @@ impl V2Transport {
 /// `grants` from the admission the server actually issued. A translation that
 /// merely copied fields across would fail `validate_snapshot` on every frame.
 ///
-/// Scope is the READ-ONLY subset. The lease path (`claim_decision`,
-/// `plugin_lease_revoke`) and RTC signalling are dropped rather than
-/// half-translated; when they land, note that `MobileRtcSignalFrame` carries a
-/// `leaseToken` its plugin twin does not, and both are `deny_unknown_fields`, so
-/// the shim must strip it exactly as `aokie-protocol`'s own comment (v2.rs, on
-/// `validate_routed_mobile`) records the gateway doing.
+/// Scope includes authoritative state plus the relay lease lifecycle: offer
+/// acceptance, lease status/refusal/revoke, and plugin-originated RTC signals.
+/// The opposite direction stays in the mobile dialect and is consumed by the
+/// plugin's relay-only dispatcher. In particular, that dispatcher authenticates
+/// `MobileRtcSignalFrame::leaseToken`, strips it, and hands the remaining
+/// plugin-shaped signal to the unchanged RTC handler. Assistance and caller
+/// ending are still outside this relay subset and are withheld at the transport
+/// boundary above.
 struct GatewayShim {
     app_id: String,
+    device_id: String,
     grants: Vec<Grant>,
     /// The Desktop endpoint key this admission pinned and the user confirmed.
     /// A `plugin_hello` that does not prove possession of it is not our peer.
@@ -369,34 +418,17 @@ struct GatewayShim {
     sequence: u64,
 }
 
-/// Desktop endpoints that have proved possession of their admission-pinned key
-/// during this process's lifetime, keyed `<app_id>/<thumbprint>`.
-///
-/// ⚠️ Peer proof MUST outlive one carrier. The plugin greets a party exactly
-/// once per PLUGIN session: its `greeted` set is cleared when the plugin arms a
-/// rotated hello, never when this Companion reconnects. So a Companion that
-/// verifies, loses its carrier and comes back is never greeted again — and with
-/// verification scoped to the carrier, `peer_gate` would then drop every
-/// snapshot for the rest of the plugin's session. That is not a slow recovery,
-/// it is a permanent read deadlock that only a plugin restart clears, and the
-/// same gap swallows an admission rotation whenever the line is quiet enough
-/// that no state change re-greets us inside the replacement's 15s sync window.
-///
-/// Caching cannot promote an impostor. An entry is written only after a real
-/// signature over the EXACT thumbprint the admission pinned and the user
-/// confirmed, and it is read back only for that same app and thumbprint — so
-/// the set can never say more than "this Desktop already proved itself to us".
-fn proven_peers() -> &'static Mutex<HashSet<String>> {
-    static PROVEN: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
-    PROVEN.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn proven_peer_key(app_id: &str, thumbprint: &str) -> String {
-    format!("{app_id}/{thumbprint}")
-}
-
+/// A shim begins unverified even when another connection previously proved the
+/// same long-term Desktop key. Relay mail can outlive a plugin session, so only
+/// this carrier's signed hello (or explicit same-key live rotation adoption)
+/// may authorize its queued state and lease frames.
 impl GatewayShim {
-    fn new(app_id: String, grants: Vec<Grant>, expected_peer_key_thumbprint: String) -> Self {
+    fn new(
+        app_id: String,
+        device_id: String,
+        grants: Vec<Grant>,
+        expected_peer_key_thumbprint: String,
+    ) -> Self {
         // A duplicate grant fails `validate_snapshot`/`validate_idle_sync` on
         // EVERY frame, so a server that ever repeats one must not silently
         // brick the relay path.
@@ -406,18 +438,16 @@ impl GatewayShim {
                 unique.push(grant);
             }
         }
-        // A Desktop that already proved this exact key to this process stays
-        // proven: the plugin will not greet us a second time, so re-demanding a
-        // hello here deadlocks the read path rather than securing anything.
-        let peer_verified = proven_peers()
-            .lock()
-            .map(|proven| proven.contains(&proven_peer_key(&app_id, &expected_peer_key_thumbprint)))
-            .unwrap_or(false);
         Self {
             app_id,
+            device_id,
             grants: unique,
             expected_peer_key_thumbprint,
-            peer_verified,
+            // Proof is scoped to this relay session. A plugin restart or a new
+            // connection with the same long-term key still has to present a
+            // fresh signed hello; only explicit live-carrier rotation below
+            // may transfer already-verified state.
+            peer_verified: false,
             sequence: 0,
         }
     }
@@ -442,13 +472,10 @@ impl GatewayShim {
     /// across an admission rotation, or the replacement's first snapshot is
     /// discarded as stale by `is_new_authoritative_sequence`.
     ///
-    /// ⚠️ `peer_verified` carries only while the admission still pins the SAME
-    /// Desktop endpoint key. [`proven_peers`] is deliberately keyed by
-    /// `<app_id>/<thumbprint>` so proof can never transfer to a different key;
-    /// ORing the predecessor's flag in unconditionally would launder it around
-    /// exactly that key. A rotation CAN re-pin — that is what happens when the
-    /// Desktop's endpoint identity changes — and the replacement must then see
-    /// the new key prove possession before any state is projected.
+    /// `peer_verified` carries only during this explicit live rotation and only
+    /// while the admission still pins the SAME Desktop endpoint key. A newly
+    /// constructed shim never inherits this bit; a re-pinned replacement must
+    /// prove its own signed hello before projecting state.
     fn adopt_sequence_from(&mut self, previous: &Self) {
         self.sequence = self.sequence.max(previous.sequence);
         if self.expected_peer_key_thumbprint == previous.expected_peer_key_thumbprint {
@@ -459,6 +486,14 @@ impl GatewayShim {
     fn next_sequence(&mut self) -> u64 {
         self.sequence = self.sequence.saturating_add(1);
         self.sequence
+    }
+
+    fn projected_grants(&self) -> Vec<Grant> {
+        self.grants
+            .iter()
+            .copied()
+            .filter(|grant| !RELAY_UNSUPPORTED_PROJECTED_GRANTS.contains(grant))
+            .collect()
     }
 
     /// `Ok(None)` means "carrier traffic, nothing for the session".
@@ -477,10 +512,16 @@ impl GatewayShim {
             }
             "plugin_snapshot" => {
                 let frame: PluginSnapshotFrame = strict_parse(encoded, "plugin snapshot")?;
-                frame.validate().map_err(|error| error.to_string())?;
                 let Some(()) = self.peer_gate("plugin_snapshot") else {
                     return Ok(None);
                 };
+                if frame.app_id != self.app_id {
+                    return Err("relay snapshot is bound to another app".into());
+                }
+                if frame.device_id.as_deref() != Some(self.device_id.as_str()) {
+                    return Ok(None);
+                }
+                frame.validate().map_err(|error| error.to_string())?;
                 self.project(frame)
             }
             "plugin_idle" => {
@@ -497,17 +538,187 @@ impl GatewayShim {
                     schema_version: SCHEMA_VERSION,
                     app_id: frame.app_id,
                     sequence: self.next_sequence(),
-                    grants: self.grants.clone(),
+                    grants: self.projected_grants(),
                 };
                 idle.validate().map_err(|error| error.to_string())?;
                 serde_json::to_string(&idle)
                     .map(Some)
                     .map_err(|_| "could not encode a translated idle sync".to_string())
             }
+            "plugin_offer_accepted" => {
+                let frame: PluginOfferAcceptedFrame =
+                    strict_parse(encoded, "plugin offer acceptance")?;
+                let Some(()) = self.peer_gate("plugin_offer_accepted") else {
+                    return Ok(None);
+                };
+                if frame.app_id != self.app_id {
+                    return Err("relay offer acceptance is bound to another app".into());
+                }
+                if !self.targets_this_device(&frame.device_id, "plugin_offer_accepted") {
+                    return Ok(None);
+                }
+                frame.validate().map_err(|error| error.to_string())?;
+                let accepted = MobileOfferAcceptedFrame {
+                    kind: "mobile_offer_accepted".into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: frame.app_id,
+                    request_id: frame.request_id,
+                    offer_id: frame.offer_id,
+                    offer_jti: frame.offer_jti,
+                    offered_mode: frame.offered_mode,
+                    accepted: frame.accepted,
+                };
+                serde_json::to_string(&accepted)
+                    .map(Some)
+                    .map_err(|_| "could not encode a translated offer acceptance".to_string())
+            }
+            "plugin_lease_status" => {
+                let frame: PluginLeaseStatusFrame = strict_parse(encoded, "plugin lease status")?;
+                let Some(()) = self.peer_gate("plugin_lease_status") else {
+                    return Ok(None);
+                };
+                if frame.app_id != self.app_id {
+                    return Err("relay lease status is bound to another app".into());
+                }
+                if !self.targets_this_device(&frame.device_id, "plugin_lease_status") {
+                    return Ok(None);
+                }
+                match frame.validate(unix_now()?) {
+                    Ok(()) => {}
+                    // Relay mail is queued. Expiry is an expected stale-mail
+                    // outcome, not a session fault that should reconnect a
+                    // healthy live state stream. Structural and authority
+                    // errors remain fatal below.
+                    Err(V2ProtocolError::Expired) => return Ok(None),
+                    Err(error) => return Err(error.to_string()),
+                }
+                if !grants_permit_lease_mode(&self.grants, frame.lease.mode) {
+                    eprintln!(
+                        "[AokieCompanion][relay] dropped plugin_lease_status: current admission no longer permits its mode"
+                    );
+                    return Ok(None);
+                }
+                let (kind, provisional) = mobile_lease_kind(frame.status);
+                let status = LeaseStatusFrame {
+                    kind: kind.into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: frame.app_id,
+                    request_id: frame.request_id,
+                    lease_token: frame.lease_token,
+                    lease: frame.lease,
+                    provisional,
+                };
+                serde_json::to_string(&status)
+                    .map(Some)
+                    .map_err(|_| "could not encode a translated lease status".to_string())
+            }
+            "plugin_claim_rejected" => {
+                let frame: PluginClaimRejectedFrame =
+                    strict_parse(encoded, "plugin claim rejection")?;
+                let Some(()) = self.peer_gate("plugin_claim_rejected") else {
+                    return Ok(None);
+                };
+                if frame.app_id != self.app_id {
+                    return Err("relay claim rejection is bound to another app".into());
+                }
+                if !self.targets_this_device(&frame.device_id, "plugin_claim_rejected") {
+                    return Ok(None);
+                }
+                frame.validate().map_err(|error| error.to_string())?;
+                let rejected = ClaimRejectedFrame {
+                    kind: "claim_rejected".into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: frame.app_id,
+                    request_id: frame.request_id,
+                    code: frame.code,
+                    message: frame.message,
+                };
+                serde_json::to_string(&rejected)
+                    .map(Some)
+                    .map_err(|_| "could not encode a translated claim rejection".to_string())
+            }
+            // ⚠️ CALLER SAFETY: this frame ALREADY arrives today and is dropped
+            // by the catch-all below. The plugin emits it whenever a media route
+            // fails, which is the same moment the caller is handed back to the
+            // AI receptionist — so a Companion that cannot read it holds a dead
+            // lease and keeps telling the operator they are on a call that has
+            // already moved on without them.
+            "plugin_lease_revoke" => {
+                let frame: PluginLeaseRevokeFrame = strict_parse(encoded, "plugin lease revoke")?;
+                let Some(()) = self.peer_gate("plugin_lease_revoke") else {
+                    return Ok(None);
+                };
+                if frame.app_id != self.app_id {
+                    return Err("relay lease revoke is bound to another app".into());
+                }
+                if !self.targets_this_device(&frame.device_id, "plugin_lease_revoke") {
+                    return Ok(None);
+                }
+                frame.validate().map_err(|error| error.to_string())?;
+                let revoked = LeaseRevokedFrame {
+                    kind: "lease_revoked".into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: frame.app_id,
+                    // The plugin revokes against a LEASE, not against a request
+                    // this session is waiting on, so there is no request to name
+                    // and `apply_revocation` matches on the lease identity.
+                    request_id: None,
+                    lease_id: frame.lease_id,
+                    lease_jti: frame.lease_jti,
+                    reason: frame.reason,
+                };
+                serde_json::to_string(&revoked)
+                    .map(Some)
+                    .map_err(|_| "could not encode a translated lease revoke".to_string())
+            }
+            // The one frame that needs no rename: `PluginRtcSignalFrame` and the
+            // session's own `GatewayRtcFrame` have identical members, so
+            // re-encoding could only introduce drift. Validated here as
+            // plugin-authored, then handed on byte-for-byte.
+            "rtc_signal" => {
+                let frame: PluginRtcSignalFrame = strict_parse(encoded, "plugin RTC signal")?;
+                let Some(()) = self.peer_gate("rtc_signal") else {
+                    return Ok(None);
+                };
+                if frame.app_id != self.app_id {
+                    return Err("relay RTC signal is bound to another app".into());
+                }
+                if !self.targets_this_device(&frame.device_id, "rtc_signal") {
+                    return Ok(None);
+                }
+                frame.validate().map_err(|error| error.to_string())?;
+                Ok(Some(encoded.to_owned()))
+            }
+            // This plugin frame already has the same shape the mobile session
+            // consumes. The relay outer envelope addressed it to this device;
+            // the inner contract binds app/call/revisions, and current
+            // admission (not a queued old snapshot) decides disclosure.
+            "assistance_request" => {
+                let frame: PluginAssistanceRequestFrame =
+                    strict_parse(encoded, "plugin assistance request")?;
+                let Some(()) = self.peer_gate("assistance_request") else {
+                    return Ok(None);
+                };
+                if frame.app_id != self.app_id {
+                    return Err("relay assistance request is bound to another app".into());
+                }
+                if !self.grants.contains(&Grant::StateRead)
+                    || !self.grants.contains(&Grant::AssistanceRead)
+                {
+                    eprintln!(
+                        "[AokieCompanion][relay] dropped assistance_request: current admission does not permit it"
+                    );
+                    return Ok(None);
+                }
+                match frame.validate(unix_now()?) {
+                    Ok(()) => {}
+                    Err(V2ProtocolError::Expired) => return Ok(None),
+                    Err(error) => return Err(error.to_string()),
+                }
+                Ok(Some(encoded.to_owned()))
+            }
             other => {
-                eprintln!(
-                    "[AokieCompanion][relay] dropped an untranslated plugin frame: {other}"
-                );
+                eprintln!("[AokieCompanion][relay] dropped an untranslated plugin frame: {other}");
                 Ok(None)
             }
         }
@@ -527,6 +738,14 @@ impl GatewayShim {
             "[AokieCompanion][relay] dropped {kind}: the Desktop peer has not proved its endpoint key yet"
         );
         None
+    }
+
+    fn targets_this_device(&self, device_id: &str, kind: &str) -> bool {
+        if device_id == self.device_id {
+            return true;
+        }
+        eprintln!("[AokieCompanion][relay] dropped {kind}: targeted to another Companion device");
+        false
     }
 
     fn accept_peer_hello(&mut self, encoded: &str) -> Result<(), String> {
@@ -550,20 +769,18 @@ impl GatewayShim {
             eprintln!("[AokieCompanion][relay] Desktop peer proved its endpoint key");
         }
         self.peer_verified = true;
-        // Remembered for the life of the process, because the plugin will not
-        // greet this party again until its own session rotates.
-        if let Ok(mut proven) = proven_peers().lock() {
-            proven.insert(proven_peer_key(
-                &self.app_id,
-                &self.expected_peer_key_thumbprint,
-            ));
-        }
         Ok(())
     }
 
     fn project(&mut self, frame: PluginSnapshotFrame) -> Result<Option<String>, String> {
         if frame.app_id != self.app_id {
             return Err("relay snapshot is bound to another app".into());
+        }
+        if frame.device_id.as_deref() != Some(self.device_id.as_str()) {
+            eprintln!(
+                "[AokieCompanion][relay] dropped plugin_snapshot: missing or targeted to another Companion device"
+            );
+            return Ok(None);
         }
         let source = frame.snapshot;
         // ⚠️ `Vec<Caption>` and `Option<Vec<Caption>>` are NOT the same
@@ -592,15 +809,47 @@ impl GatewayShim {
             secondary_call_policy: source.secondary_call_policy,
             secondary_call: source.secondary_call,
             remote_consent: source.remote_consent,
-            caller: source.caller,
+            caller: self
+                .grants
+                .contains(&Grant::CallerRead)
+                .then_some(source.caller)
+                .flatten(),
             captions: captions_permitted.then_some(source.captions),
-            // The plugin publishes neither, and inventing either would be the
-            // shim asserting state no endpoint authored: participant presence
-            // is a gateway-side roster, and a pending offer must carry the
-            // Desktop's own signature to be answerable at all.
+            // Participant presence is a gateway-side roster the plugin does not
+            // publish, and inventing it would be the shim asserting state no
+            // endpoint authored.
             participants: Vec::new(),
-            audio_levels: source.audio_levels,
-            pending_mobile_offers: Vec::new(),
+            audio_levels: self
+                .grants
+                .contains(&Grant::AudioLevelsRead)
+                .then_some(source.audio_levels)
+                .flatten(),
+            // Offers, by contrast, ARE authored — on this carrier the plugin is
+            // the lease authority and signs its own, so passing them through is
+            // relaying the Desktop's statement, not manufacturing one.
+            //
+            // ⚠️ Deliberately NOT verified here. `SignedPendingMobileOffer`
+            // treats `offerToken` as opaque, and offer integrity belongs at the
+            // minting authority: the plugin refuses a lease request naming an
+            // offer it did not issue. So a relay that fabricates one buys a
+            // single refused request and nothing else — whereas a check here
+            // would need a verification key the Companion has no way to pin.
+            // What stops a fabricated offer being ACTED on is `peer_gate`
+            // (already passed above) plus `select_mobile_offer`, which re-pins
+            // every field against the live snapshot and this device's identity.
+            pending_mobile_offers: source
+                .pending_mobile_offers
+                .into_iter()
+                .filter(|offer| {
+                    offer.offer.target_device_id == self.device_id
+                        && grants_permit_lease_mode(&self.grants, offer.offer.offered_mode)
+                        && offer
+                            .offer
+                            .required_grants
+                            .iter()
+                            .all(|grant| self.grants.contains(grant))
+                })
+                .collect(),
             occurred_at: source.occurred_at,
         };
         let snapshot = MobileSnapshotFrame {
@@ -608,7 +857,7 @@ impl GatewayShim {
             schema_version: SCHEMA_VERSION,
             app_id: frame.app_id,
             sequence: self.next_sequence(),
-            grants: self.grants.clone(),
+            grants: self.projected_grants(),
             snapshot: projected,
         };
         validate_snapshot(&snapshot, &self.app_id)?;
@@ -632,6 +881,26 @@ struct ManagedAdmissionStateEvent<'a> {
     message: &'a str,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AppliedRelayFrame {
+    key: String,
+    digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletedRevoke {
+    app_id: String,
+    request_id: Option<String>,
+    lease_id: String,
+    lease_jti: String,
+    // The gateway acknowledgement (Some requestId) and the plugin's
+    // de-escalating media-failure notice (no requestId) are two legitimate
+    // wire frames for the same returned lease. Fence each dialect separately
+    // so either ordering is replay-safe without accepting changed bytes.
+    frame_digest: Option<[u8; 32]>,
+    unsolicited_frame_digest: Option<[u8; 32]>,
+}
+
 #[derive(Default)]
 struct ClientState {
     generation: u64,
@@ -648,13 +917,249 @@ struct ClientState {
     pending_native_end: Option<PendingNativeEnd>,
     ice_servers: Vec<IceServerConfig>,
     relay_only: bool,
+    // Carrier capability, not ICE policy. The managed relay intentionally
+    // supports only the lease/RTC family in this release; user commands that
+    // have no relay dispatcher must fail explicitly before they mutate local
+    // pending state.
+    relay_transport: bool,
+    // Managed admission is fresher authority than a previously projected
+    // snapshot during an overlapping transport rotation. Custom WebSocket
+    // profiles have no local admission object and continue to use the
+    // gateway-projected snapshot grants.
+    admission_grants: Option<Vec<Grant>>,
     assistance: Option<PluginAssistanceRequestFrame>,
     pending_assistance_answer: Option<String>,
     // IDs only: keep answered help prompts replay-fenced without retaining the
     // private question, context, or answer across reconnects.
     answered_assistance_requests: VecDeque<(String, String)>,
+    // At-least-once relay replay fence. Entries survive a transport reconnect
+    // and are bounded; exact content is forgotten in favour of a SHA-256
+    // digest so SDP, ICE, and tokens are not retained here.
+    applied_relay_frames: VecDeque<AppliedRelayFrame>,
+    // A lease status is reserved before native media is touched. This prevents
+    // an exact at-least-once duplicate from starting a second peer operation
+    // while the first one is outside the client lock.
+    applying_lease_status: Option<AppliedRelayFrame>,
+    // Exact-token lease returns produced by failed native activation/renewal.
+    // These survive a carrier reconnect and are removed only after a transport
+    // accepted the exact queued bytes.
+    urgent_control_frames: VecDeque<UrgentControlFrame>,
+    // Completed lease returns/revocations remain replay-fenced across a
+    // transport reconnect. Only bounded identifiers and an optional wire hash
+    // survive; no lease token or revoke payload is retained.
+    completed_revokes: VecDeque<CompletedRevoke>,
     pending_end_caller: Option<PendingEndCaller>,
     seen_remote_endpoint_jtis: HashSet<String>,
+}
+
+fn offer_acceptance_replay_key(request_id: &str) -> String {
+    format!("offer-accepted:{request_id}")
+}
+
+fn lease_status_replay_key(kind: &str, request_id: &str) -> String {
+    // A provisional claim and its activation deliberately share requestId, so
+    // the authority transition kind is part of the identity.
+    format!("lease-status:{kind}:{request_id}")
+}
+
+fn rtc_signal_replay_key(signal_id: &str) -> String {
+    format!("rtc-signal:{signal_id}")
+}
+
+fn claim_rejection_replay_key(request_id: &str) -> String {
+    format!("claim-rejected:{request_id}")
+}
+
+fn relay_frame_digest(encoded: &str) -> [u8; 32] {
+    Sha256::digest(encoded.as_bytes()).into()
+}
+
+/// `true` means the exact frame was already applied and is now a no-op.
+/// Reusing an authority identifier with any different wire content fails
+/// closed, even when the decoded values might look semantically equivalent.
+fn applied_relay_frame_is_replay(
+    client: &ClientState,
+    key: &str,
+    encoded: &str,
+) -> Result<bool, String> {
+    let digest = relay_frame_digest(encoded);
+    let Some(applied) = client
+        .applied_relay_frames
+        .iter()
+        .find(|applied| applied.key == key)
+    else {
+        return Ok(false);
+    };
+    if applied.digest == digest {
+        Ok(true)
+    } else {
+        Err("relay authority frame identifier was reused with different content".into())
+    }
+}
+
+fn remember_applied_relay_frame(
+    client: &mut ClientState,
+    key: String,
+    encoded: &str,
+) -> Result<(), String> {
+    if applied_relay_frame_is_replay(client, &key, encoded)? {
+        return Ok(());
+    }
+    client.applied_relay_frames.push_back(AppliedRelayFrame {
+        key,
+        digest: relay_frame_digest(encoded),
+    });
+    while client.applied_relay_frames.len() > MAX_APPLIED_RELAY_FRAMES {
+        client.applied_relay_frames.pop_front();
+    }
+    Ok(())
+}
+
+fn relay_frame_was_applied(client: &ClientState, key: &str) -> bool {
+    client
+        .applied_relay_frames
+        .iter()
+        .any(|applied| applied.key == key)
+}
+
+fn completed_revoke_collides(current: &CompletedRevoke, candidate: &CompletedRevoke) -> bool {
+    current.app_id == candidate.app_id
+        && (candidate
+            .request_id
+            .as_ref()
+            .is_some_and(|request_id| current.request_id.as_deref() == Some(request_id.as_str()))
+            || (current.lease_id == candidate.lease_id && current.lease_jti == candidate.lease_jti))
+}
+
+fn merge_completed_revoke(
+    current: &mut CompletedRevoke,
+    candidate: &CompletedRevoke,
+) -> Result<(), String> {
+    if current.app_id != candidate.app_id
+        || current.lease_id != candidate.lease_id
+        || current.lease_jti != candidate.lease_jti
+    {
+        return Err(
+            "completed lease revoke identity was reused across a request or JTI fence".into(),
+        );
+    }
+    match (&current.request_id, &candidate.request_id) {
+        (Some(current), Some(candidate)) if current != candidate => {
+            return Err("completed lease revoke identity was reused across two request IDs".into());
+        }
+        (None, Some(request_id)) => current.request_id = Some(request_id.clone()),
+        _ => {}
+    }
+    for (current_digest, candidate_digest) in [
+        (&mut current.frame_digest, candidate.frame_digest),
+        (
+            &mut current.unsolicited_frame_digest,
+            candidate.unsolicited_frame_digest,
+        ),
+    ] {
+        match (*current_digest, candidate_digest) {
+            (Some(current), Some(candidate)) if current != candidate => {
+                return Err(
+                    "completed lease revoke was replayed with different wire content".into(),
+                );
+            }
+            (None, Some(digest)) => *current_digest = Some(digest),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn remember_completed_revoke(
+    client: &mut ClientState,
+    candidate: CompletedRevoke,
+) -> Result<(), String> {
+    if let Some(index) = client
+        .completed_revokes
+        .iter()
+        .position(|current| completed_revoke_collides(current, &candidate))
+    {
+        return merge_completed_revoke(
+            client
+                .completed_revokes
+                .get_mut(index)
+                .expect("completed revoke index came from this queue"),
+            &candidate,
+        );
+    }
+    client.completed_revokes.push_back(candidate);
+    while client.completed_revokes.len() > MAX_COMPLETED_REVOKES {
+        client.completed_revokes.pop_front();
+    }
+    Ok(())
+}
+
+fn completed_revoke_from_pending(pending: &PendingRevoke) -> CompletedRevoke {
+    CompletedRevoke {
+        app_id: pending.lease.claims.app_id.clone(),
+        request_id: Some(pending.request_id.clone()),
+        lease_id: pending.lease_id.clone(),
+        lease_jti: pending.lease_jti.clone(),
+        frame_digest: None,
+        unsolicited_frame_digest: None,
+    }
+}
+
+fn completed_revoke_from_frame(frame: &LeaseRevokedFrame, encoded: &str) -> CompletedRevoke {
+    CompletedRevoke {
+        app_id: frame.app_id.clone(),
+        request_id: frame.request_id.clone(),
+        lease_id: frame.lease_id.clone(),
+        lease_jti: frame.lease_jti.clone(),
+        frame_digest: frame
+            .request_id
+            .is_some()
+            .then(|| relay_frame_digest(encoded)),
+        unsolicited_frame_digest: frame
+            .request_id
+            .is_none()
+            .then(|| relay_frame_digest(encoded)),
+    }
+}
+
+/// Returns true when this revoke belongs to an already-completed fence. A
+/// first late acknowledgement fills the tombstone's digest; subsequent
+/// delivery must be byte-identical.
+fn completed_revoke_frame_is_replay(
+    client: &mut ClientState,
+    frame: &LeaseRevokedFrame,
+    encoded: &str,
+) -> Result<bool, String> {
+    let candidate = completed_revoke_from_frame(frame, encoded);
+    let Some(index) = client
+        .completed_revokes
+        .iter()
+        .position(|current| completed_revoke_collides(current, &candidate))
+    else {
+        return Ok(false);
+    };
+    merge_completed_revoke(
+        client
+            .completed_revokes
+            .get_mut(index)
+            .expect("completed revoke index came from this queue"),
+        &candidate,
+    )?;
+    Ok(true)
+}
+
+fn is_late_duplicate_offer_rejection(
+    client: &ClientState,
+    frame: &ClaimRejectedFrame,
+) -> Result<bool, String> {
+    if !relay_frame_was_applied(client, &offer_acceptance_replay_key(&frame.request_id)) {
+        return Ok(false);
+    }
+    if frame.code == "offer_replayed" {
+        Ok(true)
+    } else {
+        Err("an accepted mobile offer was contradicted by a later rejection".into())
+    }
 }
 
 fn assistance_was_answered(client: &ClientState, app_id: &str, request_id: &str) -> bool {
@@ -720,11 +1225,12 @@ fn apply_assistance_request(
 
 #[derive(Default)]
 struct IdleStateCleanup {
-    native_action_ids: Vec<String>,
+    failed_native_action_ids: Vec<String>,
+    confirmed_revoke_action_id: Option<String>,
     pending_call: Option<(String, u64)>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingLease {
     request_id: String,
     offer_request_id: String,
@@ -742,7 +1248,7 @@ struct PendingLease {
     native_deadline: Option<Instant>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingLeaseStage {
     AwaitingOfferAcceptance,
     ReadyForLeaseDelivery,
@@ -756,12 +1262,118 @@ fn pending_lease_timeout(pending: &PendingLease, now: Instant) -> Option<bool> {
     (native_timeout || pending.deadline <= now).then_some(native_timeout)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ClientLease {
     request_id: String,
     token: String,
     claims: LeaseClaims,
     session: MediaSession,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UrgentControlFrame {
+    app_id: String,
+    request_id: String,
+    lease_id: String,
+    lease_jti: String,
+    rtc_session_id: String,
+    fence: u64,
+    encoded: String,
+}
+
+#[derive(Default)]
+struct AdmissionGrantDeescalation {
+    pending: Option<PendingLease>,
+    lease: Option<ClientLease>,
+}
+
+fn apply_rotated_admission_grants(
+    client: &mut ClientState,
+    grants: &[Grant],
+) -> AdmissionGrantDeescalation {
+    client.admission_grants = Some(grants.to_vec());
+    let pending = client
+        .pending
+        .as_ref()
+        .is_some_and(|pending| !grants_permit_lease_mode(grants, pending.mode))
+        .then(|| client.pending.take())
+        .flatten();
+    let lease = client
+        .lease
+        .as_ref()
+        .is_some_and(|lease| !grants_permit_lease_mode(grants, lease.claims.mode))
+        .then(|| client.lease.take())
+        .flatten();
+    if lease.is_some() {
+        client.pending_end_caller = None;
+    }
+    AdmissionGrantDeescalation { pending, lease }
+}
+
+fn queue_exact_lease_revocation(
+    state: &V2State,
+    client: &mut ClientState,
+    lease: &ClientLease,
+    reason: &str,
+) -> Result<(), String> {
+    if client.pending_revoke.is_some() {
+        return Err("another lease return already fences admission de-escalation".into());
+    }
+    let request_id = state.next_id("request");
+    let frame = LeaseRevokeFrame {
+        kind: "lease_revoke".into(),
+        schema_version: SCHEMA_VERSION,
+        app_id: lease.claims.app_id.clone(),
+        request_id: request_id.clone(),
+        idempotency_key: format!(
+            "mobile:{}:{}",
+            lease.claims.device_id,
+            state.next_id("admission_revoke")
+        ),
+        lease_token: lease.token.clone(),
+        reason: reason.into(),
+    };
+    frame.validate().map_err(|error| error.to_string())?;
+    let encoded = serde_json::to_string(&frame)
+        .map_err(|_| "could not encode admission-revoked lease return".to_string())?;
+    let queue_error = if client.urgent_control_frames.len() >= MAX_URGENT_CONTROL_FRAMES {
+        Some("urgent lease-revoke queue reached its safety bound".to_string())
+    } else {
+        client.urgent_control_frames.push_back(UrgentControlFrame {
+            app_id: lease.claims.app_id.clone(),
+            request_id: request_id.clone(),
+            lease_id: lease.claims.lease_id.clone(),
+            lease_jti: lease.claims.jti.clone(),
+            rtc_session_id: lease.claims.rtc_session_id.clone(),
+            fence: lease.claims.fence,
+            encoded,
+        });
+        None
+    };
+    let authoritative_sequence = client.authoritative_sequence;
+    let authoritative_remote_revision = client
+        .snapshot
+        .as_ref()
+        .filter(|snapshot| {
+            snapshot.app_id == lease.claims.app_id
+                && snapshot.snapshot.call_id == lease.claims.call_id
+                && snapshot.snapshot.call_epoch == lease.claims.call_epoch
+        })
+        .map(|snapshot| snapshot.snapshot.remote_revision);
+    client.pending_revoke = Some(PendingRevoke {
+        request_id,
+        lease_id: lease.claims.lease_id.clone(),
+        lease_jti: lease.claims.jti.clone(),
+        lease: lease.clone(),
+        authoritative_sequence,
+        authoritative_remote_revision,
+        native_action_id: None,
+        deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+    });
+    match queue_error {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
 }
 
 #[derive(Clone)]
@@ -770,6 +1382,8 @@ struct PendingRevoke {
     lease_id: String,
     lease_jti: String,
     lease: ClientLease,
+    authoritative_sequence: u64,
+    authoritative_remote_revision: Option<u64>,
     native_action_id: Option<String>,
     deadline: Instant,
 }
@@ -853,8 +1467,14 @@ impl V2State {
     pub(crate) async fn reset(&self) {
         let mut state = self.inner.lock().await;
         let answered_assistance_requests = std::mem::take(&mut state.answered_assistance_requests);
+        let applied_relay_frames = std::mem::take(&mut state.applied_relay_frames);
+        let completed_revokes = std::mem::take(&mut state.completed_revokes);
+        let urgent_control_frames = std::mem::take(&mut state.urgent_control_frames);
         *state = ClientState {
             answered_assistance_requests,
+            applied_relay_frames,
+            completed_revokes,
+            urgent_control_frames,
             ..ClientState::default()
         };
     }
@@ -867,9 +1487,15 @@ impl V2State {
         endpoint_identity: &crate::endpoint_identity::EndpointIdentity,
         ice_servers: &[IceServerConfig],
         relay_only: bool,
+        relay_transport: bool,
+        admission_grants: Option<&[Grant]>,
     ) {
         let mut state = self.inner.lock().await;
         let answered_assistance_requests = std::mem::take(&mut state.answered_assistance_requests);
+        let applied_relay_frames = std::mem::take(&mut state.applied_relay_frames);
+        let completed_revokes = std::mem::take(&mut state.completed_revokes);
+        let mut urgent_control_frames = std::mem::take(&mut state.urgent_control_frames);
+        urgent_control_frames.retain(|frame| frame.app_id == app_id);
         *state = ClientState {
             app_id: Some(app_id.to_owned()),
             device_id: Some(device_id.to_owned()),
@@ -877,7 +1503,12 @@ impl V2State {
             endpoint_identity: Some(endpoint_identity.clone()),
             ice_servers: ice_servers.to_vec(),
             relay_only,
+            relay_transport,
+            admission_grants: admission_grants.map(<[Grant]>::to_vec),
             answered_assistance_requests,
+            applied_relay_frames,
+            completed_revokes,
+            urgent_control_frames,
             ..ClientState::default()
         };
     }
@@ -890,10 +1521,65 @@ impl V2State {
         self.inner.lock().await.peer_key_thumbprint = Some(thumbprint);
     }
 
-    async fn rotate_admission_policy(&self, ice_servers: &[IceServerConfig], relay_only: bool) {
-        let mut state = self.inner.lock().await;
-        state.ice_servers = ice_servers.to_vec();
-        state.relay_only = relay_only;
+    async fn rotate_admission_policy(
+        &self,
+        app: &AppHandle,
+        media_state: &NativeMediaState,
+        ice_servers: &[IceServerConfig],
+        relay_only: bool,
+        relay_transport: bool,
+        grants: &[Grant],
+    ) -> Result<(), String> {
+        let (deescalation, queue_error) = {
+            let mut client = self.inner.lock().await;
+            client.ice_servers = ice_servers.to_vec();
+            client.relay_only = relay_only;
+            client.relay_transport = relay_transport;
+            let deescalation = apply_rotated_admission_grants(&mut client, grants);
+            let queue_error = if let Some(lease) = deescalation.lease.as_ref() {
+                queue_exact_lease_revocation(self, &mut client, lease, "admission_grant_revoked")
+                    .err()
+            } else {
+                None
+            };
+            (deescalation, queue_error)
+        };
+
+        if let Some(pending) = deescalation.pending {
+            if let Some(action_id) = pending.native_action_id.as_deref() {
+                let _ = crate::android_runtime::complete_native_call_action(
+                    app,
+                    action_id,
+                    false,
+                    "admission_grant_revoked",
+                )
+                .await;
+            }
+            let _ = crate::android_runtime::reconcile_offer(
+                app,
+                &pending.call_id,
+                pending.call_epoch,
+                "cancel",
+                "admission_grant_revoked",
+            )
+            .await;
+        }
+        if let Some(lease) = deescalation.lease {
+            let _ = media::revoke(
+                app,
+                media_state,
+                RevokeRequest {
+                    session: lease.session,
+                    reason: Some("current admission revoked this media mode".into()),
+                },
+            )
+            .await;
+            emit_lease_reset(app);
+        }
+        match queue_error {
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
     }
 
     async fn reset_generation(&self, generation: u64) {
@@ -901,8 +1587,14 @@ impl V2State {
         if state.generation == generation {
             let answered_assistance_requests =
                 std::mem::take(&mut state.answered_assistance_requests);
+            let applied_relay_frames = std::mem::take(&mut state.applied_relay_frames);
+            let completed_revokes = std::mem::take(&mut state.completed_revokes);
+            let urgent_control_frames = std::mem::take(&mut state.urgent_control_frames);
             *state = ClientState {
                 answered_assistance_requests,
+                applied_relay_frames,
+                completed_revokes,
+                urgent_control_frames,
                 ..ClientState::default()
             };
         }
@@ -1026,7 +1718,12 @@ struct AssistanceAnswerAcceptedFrame {
     accepted: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+// ⚠️ The four frames below are `Serialize` as well as `Deserialize` ONLY so the
+// relay shim can mint them from their plugin-dialect twins. Nothing in this
+// module sends one to a peer — the session consumes its own translation — so
+// serialization here is an internal hand-off, not a wire surface, and the
+// WebSocket carrier still receives every one of them verbatim from the gateway.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LeaseStatusFrame {
     kind: String,
@@ -1035,7 +1732,7 @@ struct LeaseStatusFrame {
     request_id: String,
     lease_token: String,
     lease: LeaseClaims,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     provisional: Option<bool>,
 }
 
@@ -1059,20 +1756,20 @@ struct GatewayRtcFrame {
     signal: RtcSignal,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LeaseRevokedFrame {
     kind: String,
     schema_version: u16,
     app_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
     lease_id: String,
     lease_jti: String,
     reason: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MobileOfferAcceptedFrame {
     kind: String,
@@ -1085,7 +1782,7 @@ struct MobileOfferAcceptedFrame {
     accepted: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ClaimRejectedFrame {
     kind: String,
@@ -1094,6 +1791,27 @@ struct ClaimRejectedFrame {
     request_id: String,
     code: String,
     message: String,
+}
+
+/// The mobile frame KIND a plugin-dialect lease status becomes, and the
+/// `provisional` flag [`apply_lease_status`] expects beside it.
+///
+/// The plugin dialect names the transition in a `status` FIELD; the mobile
+/// dialect names it in the frame KIND. This rename is the shim's whole job for
+/// that frame, and the flag is not decorative — `apply_lease_status` branches
+/// on the kind and then cross-checks `provisional` against `lease.phase`,
+/// refusing the frame if they disagree.
+///
+/// Status-versus-claims agreement is enforced upstream by
+/// `PluginLeaseStatusFrame::validate`, so by the time a status reaches here it
+/// cannot name a transition its own lease contradicts.
+fn mobile_lease_kind(status: PluginLeaseStatus) -> (&'static str, Option<bool>) {
+    match status {
+        PluginLeaseStatus::Granted => ("lease_granted", None),
+        PluginLeaseStatus::Provisional => ("claim_provisional", Some(true)),
+        PluginLeaseStatus::Active => ("claim_active", Some(false)),
+        PluginLeaseStatus::Renewed => ("lease_renewed", None),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1133,6 +1851,59 @@ fn grant_for_requested_mode(mode: LeaseMode) -> Result<Grant, String> {
         LeaseMode::Takeover => Ok(Grant::Takeover),
         LeaseMode::Consult => Ok(Grant::Consult),
     }
+}
+
+fn grants_permit_lease_mode(grants: &[Grant], mode: LeaseMode) -> bool {
+    grants.contains(&Grant::StateRead)
+        && grants.contains(&Grant::RtcSignal)
+        && grant_for_requested_mode(mode)
+            .is_ok_and(|mode_grant| grants.contains(&mode_grant))
+        // Takeover can hand the caller back to Aokie. Without ResumeAokie the
+        // mobile must not accept or keep that authority, even if an old queued
+        // offer/status was minted under broader admission.
+        && (mode != LeaseMode::Takeover || grants.contains(&Grant::ResumeAokie))
+}
+
+fn current_client_grants(client: &ClientState) -> &[Grant] {
+    client
+        .admission_grants
+        .as_deref()
+        .or_else(|| {
+            client
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.grants.as_slice())
+        })
+        .unwrap_or_default()
+}
+
+fn current_consent_permits_mode(consent: &RemoteConsentPolicy, mode: LeaseMode, now: u64) -> bool {
+    consent.allows(mode)
+        && consent.expires_at.as_ref().is_none_or(|expires_at| {
+            DateTime::parse_from_rfc3339(expires_at)
+                .ok()
+                .and_then(|value| u64::try_from(value.timestamp()).ok())
+                .is_some_and(|expires_at| expires_at > now)
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelayUnsupportedAction {
+    AssistanceAnswer,
+    EndCaller,
+}
+
+fn require_supported_user_action(
+    client: &ClientState,
+    action: RelayUnsupportedAction,
+) -> Result<(), String> {
+    if !client.relay_transport {
+        return Ok(());
+    }
+    Err(match action {
+        RelayUnsupportedAction::AssistanceAnswer => RELAY_ASSISTANCE_UNSUPPORTED.into(),
+        RelayUnsupportedAction::EndCaller => RELAY_END_CALLER_UNSUPPORTED.into(),
+    })
 }
 
 #[tauri::command]
@@ -1179,14 +1950,13 @@ async fn prepare_offer_answer(
             unix_now()?,
         )?;
         let mode = selected.offer.offered_mode;
-        let required = grant_for_requested_mode(mode)?;
         if let Some(action) = native_action {
             validate_native_action(action, unix_now()?)?;
             if action.kind != NativeCallActionKind::Answer {
                 return Err("native Answer does not match authoritative call state".into());
             }
         }
-        if !snapshot.grants.contains(&required) || !snapshot.grants.contains(&Grant::RtcSignal) {
+        if !grants_permit_lease_mode(current_client_grants(&client), mode) {
             return Err("the admission does not grant this media mode and RTC signalling".into());
         }
         if !matches!(snapshot.snapshot.telephony_state, TelephonyState::Active) {
@@ -1198,7 +1968,7 @@ async fn prepare_offer_answer(
         ) {
             return Err("the Aokie endpoint has no usable media route".into());
         }
-        if !snapshot.snapshot.remote_consent.allows(mode) {
+        if !current_consent_permits_mode(&snapshot.snapshot.remote_consent, mode, unix_now()?) {
             return Err("current remote disclosure consent does not allow this media mode".into());
         }
         if matches!(mode, LeaseMode::Takeover)
@@ -1331,7 +2101,11 @@ fn select_mobile_offer(
                     .required_grants
                     .iter()
                     .all(|grant| snapshot.grants.contains(grant))
-                && snapshot.snapshot.remote_consent.allows(offer.offered_mode)
+                && current_consent_permits_mode(
+                    &snapshot.snapshot.remote_consent,
+                    offer.offered_mode,
+                    now,
+                )
                 && match native_action {
                     Some(action) => {
                         offer.offer_id == action.offer_id
@@ -1414,7 +2188,11 @@ fn validate_local_end_caller(client: &ClientState, now: u64) -> Result<(), Strin
         || snapshot.snapshot.owner_epoch != lease.claims.owner_epoch
         || snapshot.snapshot.telephony_state != TelephonyState::Active
         || snapshot.snapshot.service_mode != ServiceMode::HumanActive
-        || !snapshot.snapshot.remote_consent.allows(LeaseMode::Takeover)
+        || !current_consent_permits_mode(
+            &snapshot.snapshot.remote_consent,
+            LeaseMode::Takeover,
+            now,
+        )
     {
         return Err("the active takeover lease no longer matches authoritative call state".into());
     }
@@ -1430,6 +2208,7 @@ pub async fn realtime_v2_prepare_end_caller(
         if client.generation == 0 {
             return Err("protocol-v2 realtime is offline".into());
         }
+        require_supported_user_action(&client, RelayUnsupportedAction::EndCaller)?;
         if client.pending_end_caller.is_some() {
             return Err("a caller-ending confirmation is already pending".into());
         }
@@ -1487,6 +2266,7 @@ pub async fn realtime_v2_confirm_end_caller(
         if client.generation == 0 {
             return Err("protocol-v2 realtime is offline".into());
         }
+        require_supported_user_action(&client, RelayUnsupportedAction::EndCaller)?;
         validate_local_end_caller(&client, unix_now()?)?;
         let challenge = match client.pending_end_caller.as_ref() {
             Some(PendingEndCaller::AwaitingConfirmation { challenge })
@@ -1569,6 +2349,7 @@ pub async fn realtime_v2_answer_assistance(
         if client.generation == 0 {
             return Err("protocol-v2 realtime is offline".into());
         }
+        require_supported_user_action(&client, RelayUnsupportedAction::AssistanceAnswer)?;
         let now = unix_now()?;
         if discard_expired_assistance(&mut client, now, None) {
             return Err("the assistance request is stale or expired".into());
@@ -1669,7 +2450,9 @@ async fn prepare_revoke(
     let (frame, lease) = {
         let mut client = state.inner.lock().await;
         if client.pending_revoke.is_some() {
-            return Err("a media lease return is already awaiting acknowledgement".into());
+            return Err(
+                "a media lease return is already awaiting authoritative confirmation".into(),
+            );
         }
         match (
             native_action_id.as_deref(),
@@ -1704,13 +2487,25 @@ async fn prepare_revoke(
             reason,
         };
         frame.validate().map_err(|error| error.to_string())?;
+        let authoritative_sequence = client.authoritative_sequence;
+        let authoritative_remote_revision = client
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| {
+                snapshot.app_id == lease.claims.app_id
+                    && snapshot.snapshot.call_id == lease.claims.call_id
+                    && snapshot.snapshot.call_epoch == lease.claims.call_epoch
+            })
+            .map(|snapshot| snapshot.snapshot.remote_revision);
         client.pending_revoke = Some(PendingRevoke {
             request_id,
             lease_id: lease.claims.lease_id.clone(),
             lease_jti: lease.claims.jti.clone(),
             lease: lease.clone(),
+            authoritative_sequence,
+            authoritative_remote_revision,
             native_action_id,
-            deadline: Instant::now() + REVOKE_ACK_TIMEOUT,
+            deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
         });
         if is_native_return {
             client.pending_native_end = None;
@@ -1718,9 +2513,10 @@ async fn prepare_revoke(
         (frame, lease)
     };
 
-    // Local audio closes first. Until an exact gateway acknowledgement is
-    // observed the lease remains fenced in pending_revoke, but can no longer
-    // route microphone or caller audio locally.
+    // Local audio closes first. Until an exact gateway acknowledgement or a
+    // strictly newer authoritative return projection is observed, the lease
+    // remains fenced in pending_revoke but can no longer route microphone or
+    // caller audio locally.
     let _ = media::revoke(
         app,
         media_state,
@@ -2176,6 +2972,7 @@ async fn open_relay_transport(
     })?;
     let mut shim = GatewayShim::new(
         app_id.to_owned(),
+        device_id.to_owned(),
         plan.grants.clone(),
         plan.expected_peer_key_thumbprint.clone(),
     );
@@ -2374,6 +3171,7 @@ pub(crate) fn spawn(
                 attempt_authorization,
                 attempt_ice_servers,
                 attempt_relay_only,
+                attempt_admission_grants,
                 admission_expected_peer_key_thumbprint,
                 admission_refresh_deadline,
                 attempt_relay,
@@ -2423,6 +3221,7 @@ pub(crate) fn spawn(
                             bearer,
                             admission.ice_servers,
                             admission.relay_only,
+                            Some(admission.grants),
                             Some(admission.expected_peer_key_thumbprint),
                             Some(managed_admission_refresh_deadline(admission.expires_at)),
                             relay,
@@ -2446,6 +3245,7 @@ pub(crate) fn spawn(
                     config.relay_only,
                     None,
                     None,
+                    None,
                     // A custom profile has no managed admission, so it has no
                     // relay advertisement and no pinned Desktop peer key.
                     None,
@@ -2461,6 +3261,8 @@ pub(crate) fn spawn(
                     &endpoint_identity,
                     &attempt_ice_servers,
                     attempt_relay_only,
+                    attempt_relay.is_some(),
+                    attempt_admission_grants.as_deref(),
                 )
                 .await;
 
@@ -2538,9 +3340,14 @@ pub(crate) fn spawn(
                             emit_error(&app, &message);
                         }
                     } else {
-                        let synced =
-                            initial_sync(&app, &state, &media_state, &config.app_id, &mut transport)
-                                .await;
+                        let synced = initial_sync(
+                            &app,
+                            &state,
+                            &media_state,
+                            &config.app_id,
+                            &mut transport,
+                        )
+                        .await;
                         match synced {
                             Err(message) => {
                                 if config.managed_deployment_id.is_some()
@@ -2589,6 +3396,12 @@ pub(crate) fn spawn(
                                     tokio::time::MissedTickBehavior::Delay,
                                 );
                                 native_actions.tick().await;
+                                let mut urgent_controls =
+                                    tokio::time::interval(URGENT_CONTROL_POLL);
+                                urgent_controls.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Delay,
+                                );
+                                urgent_controls.tick().await;
                                 let admission_refresh = tokio::time::sleep_until(
                                     admission_refresh_deadline.unwrap_or_else(|| {
                                         Instant::now() + Duration::from_secs(24 * 60 * 60)
@@ -2600,8 +3413,7 @@ pub(crate) fn spawn(
                                 // transport while another arm takes it mutably —
                                 // and re-read after a rotation, which is the one
                                 // place the carrier can change under the loop.
-                                let mut websocket_heartbeat =
-                                    transport.uses_websocket_heartbeat();
+                                let mut websocket_heartbeat = transport.uses_websocket_heartbeat();
 
                                 loop {
                                     tokio::select! {
@@ -2625,12 +3437,21 @@ pub(crate) fn spawn(
                                                 &device_header,
                                             ).await {
                                                 Ok(rotation) => {
-                                                    state
+                                                    let replacement_is_relay =
+                                                        rotation.transport.is_relay();
+                                                    if let Err(message) = state
                                                         .rotate_admission_policy(
+                                                            &app,
+                                                            &media_state,
                                                             &rotation.admission.ice_servers,
                                                             rotation.admission.relay_only,
+                                                            replacement_is_relay,
+                                                            &rotation.admission.grants,
                                                         )
-                                                        .await;
+                                                        .await
+                                                    {
+                                                        emit_error(&app, &message);
+                                                    }
                                                     // The replacement inherits the
                                                     // predecessor's relay cursor and
                                                     // sequence before it reads anything,
@@ -2714,6 +3535,20 @@ pub(crate) fn spawn(
                                                 }
                                             }
                                         }
+                                        _ = urgent_controls.tick() => {
+                                            if let Some(urgent) = peek_urgent_control_frame(&state).await {
+                                                if !transport.send_text(urgent.encoded.clone()).await {
+                                                    break;
+                                                }
+                                                if let Err(message) = confirm_urgent_control_frame(
+                                                    &state,
+                                                    &urgent,
+                                                ).await {
+                                                    emit_error(&app, &message);
+                                                    break;
+                                                }
+                                            }
+                                        }
                                         _ = native_actions.tick() => {
                                             match poll_native_call_actions(&app, &state, &media_state).await {
                                                 Ok(Some(native)) => {
@@ -2764,16 +3599,29 @@ pub(crate) fn spawn(
                                         }
                                         local = local_signals.recv() => {
                                             match local {
-                                                Ok(signal) => match local_rtc_frame(&state, signal).await {
-                                                    Ok(Some(frame)) => {
-                                                        if !transport.send_text(frame).await { break; }
+                                                Ok(signal) => {
+                                                    if let LocalSignal::LeaseSafetyFailure { reason } = &signal.signal {
+                                                        if let Err(message) = surrender_failed_private_consult(
+                                                            &app,
+                                                            &state,
+                                                            &signal.session,
+                                                            reason,
+                                                        ).await {
+                                                            emit_error(&app, &message);
+                                                        }
+                                                    } else {
+                                                        match local_rtc_frame(&state, signal).await {
+                                                            Ok(Some(frame)) => {
+                                                                if !transport.send_text(frame).await { break; }
+                                                            }
+                                                            Ok(None) => {}
+                                                            Err(message) => {
+                                                                emit_error(&app, &message);
+                                                                break;
+                                                            }
+                                                        }
                                                     }
-                                                    Ok(None) => {}
-                                                    Err(message) => {
-                                                        emit_error(&app, &message);
-                                                        break;
-                                                    }
-                                                },
+                                                }
                                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                                     emit_error(&app, "native RTC signal capacity was exceeded");
                                                     break;
@@ -2786,6 +3634,15 @@ pub(crate) fn spawn(
                                             if queued.generation != generation || !session_is_current(&connection, generation) {
                                                 let _ = queued.completion.send(Err("realtime session changed before delivery".into()));
                                                 break;
+                                            }
+                                            // A command can be enqueued just before an admission
+                                            // rotates from the socket gateway onto the relay. Recheck
+                                            // the actual carrier at delivery time so that race returns
+                                            // an explicit unsupported result instead of the relay's
+                                            // tolerant send path reporting a silent success.
+                                            if let Some(message) = transport.unsupported_user_frame(&queued.encoded) {
+                                                let _ = queued.completion.send(Err(message.into()));
+                                                continue;
                                             }
                                             if transport.send_text(queued.encoded).await {
                                                 let _ = queued.completion.send(Ok(()));
@@ -2989,17 +3846,8 @@ async fn initial_sync(
     loop {
         if Instant::now() >= deadline {
             if transport.is_relay() {
-                // The expected outcome, and roster approval alone does NOT
-                // change it. The plugin's relay routing is speak-first: it
-                // learns a party only from an inbound frame (`learn_route`) and
-                // broadcasts only to parties it has learned, so a Companion
-                // that has posted nothing is not a destination at all — before
-                // OR after approval. With outbound frames withheld (see
-                // `RELAY_SEND_ENV`) silence is therefore the correct steady
-                // state, not a fault. Said plainly here so it does not get
-                // misread as a broken transport or a missing approval.
                 eprintln!(
-                    "[AokieCompanion][relay] no authoritative state arrived: the carrier is up, but the plugin only publishes to a party that has spoken to it, and this build posts nothing yet"
+                    "[AokieCompanion][relay] no authoritative state arrived after the authenticated mobile hello"
                 );
             }
             return Err("protocol-v2 authoritative sync timed out".into());
@@ -3046,12 +3894,21 @@ async fn handle_gateway_frame(
                 // Ignore it without reopening authority or churning transport.
                 return Ok(());
             };
-            for action_id in cleanup.native_action_ids {
+            for action_id in cleanup.failed_native_action_ids {
                 let _ = crate::android_runtime::complete_native_call_action(
                     app,
                     &action_id,
                     false,
                     "authoritative_call_idle",
+                )
+                .await;
+            }
+            if let Some(action_id) = cleanup.confirmed_revoke_action_id {
+                let _ = crate::android_runtime::complete_native_call_action(
+                    app,
+                    &action_id,
+                    true,
+                    "lease_return_confirmed",
                 )
                 .await;
             }
@@ -3074,7 +3931,13 @@ async fn handle_gateway_frame(
         "snapshot" => {
             let frame: MobileSnapshotFrame = strict_parse(encoded, "snapshot")?;
             validate_snapshot(&frame, expected_app_id)?;
-            let (assistance_cleared, stale_end_caller_request) = {
+            let now = unix_now()?;
+            let (
+                assistance_cleared,
+                stale_end_caller_request,
+                confirmed_revoke_action_id,
+                grant_revoked_lease,
+            ) = {
                 let mut client = state.inner.lock().await;
                 if !is_new_authoritative_sequence(&client, frame.sequence) {
                     // The idle and call projections share one monotonic high-
@@ -3089,6 +3952,26 @@ async fn handle_gateway_frame(
                         return Err("protocol-v2 snapshot regressed active media authority".into());
                     }
                 }
+                let grant_revoked_lease = client
+                    .lease
+                    .as_ref()
+                    .filter(|lease| {
+                        let effective_grants = client
+                            .admission_grants
+                            .as_deref()
+                            .unwrap_or(frame.grants.as_slice());
+                        !grants_permit_lease_mode(effective_grants, lease.claims.mode)
+                            || !current_consent_permits_mode(
+                                &frame.snapshot.remote_consent,
+                                lease.claims.mode,
+                                now,
+                            )
+                    })
+                    .cloned();
+                if grant_revoked_lease.is_some() {
+                    client.lease = None;
+                    client.pending_end_caller = None;
+                }
                 let assistance_cleared = client.assistance.as_ref().is_some_and(|assistance| {
                     frame.snapshot.call_id != assistance.call_id
                         || frame.snapshot.call_epoch != assistance.call_epoch
@@ -3101,6 +3984,12 @@ async fn handle_gateway_frame(
                 });
                 if assistance_cleared {
                     client.assistance = None;
+                    client.pending_assistance_answer = None;
+                } else if !frame.grants.contains(&Grant::AssistanceRespond) {
+                    // A socket-to-relay rotation can leave a text answer
+                    // pending from the old carrier. The relay projection
+                    // deliberately withholds this grant, so it cannot remain
+                    // represented as awaiting acknowledgement.
                     client.pending_assistance_answer = None;
                 }
                 let stale_end_caller_request =
@@ -3129,16 +4018,51 @@ async fn handle_gateway_frame(
                             || frame.snapshot.telephony_state != TelephonyState::Active
                             || frame.snapshot.service_mode != ServiceMode::HumanActive
                             || !frame.grants.contains(&Grant::EndCaller)
-                            || !frame.snapshot.remote_consent.allows(LeaseMode::Takeover))
+                            || !current_consent_permits_mode(
+                                &frame.snapshot.remote_consent,
+                                LeaseMode::Takeover,
+                                now,
+                            ))
                         .then(|| pending.request_id().to_owned())
                     });
                 if stale_end_caller_request.is_some() {
                     client.pending_end_caller = None;
                 }
+                let confirmed_revoke_action_id =
+                    take_snapshot_confirmed_pending_revoke(&mut client, &frame)?
+                        .and_then(|pending| pending.native_action_id);
                 client.authoritative_sequence = frame.sequence;
                 client.snapshot = Some(frame.clone());
-                (assistance_cleared, stale_end_caller_request)
+                (
+                    assistance_cleared,
+                    stale_end_caller_request,
+                    confirmed_revoke_action_id,
+                    grant_revoked_lease,
+                )
             };
+            if let Some(action_id) = confirmed_revoke_action_id {
+                let _ = crate::android_runtime::complete_native_call_action(
+                    app,
+                    &action_id,
+                    true,
+                    "lease_return_confirmed",
+                )
+                .await;
+            }
+            if let Some(lease) = grant_revoked_lease {
+                let _ = media::revoke(
+                    app,
+                    media_state,
+                    RevokeRequest {
+                        session: lease.session,
+                        reason: Some(
+                            "current admission or consent no longer permits this media mode".into(),
+                        ),
+                    },
+                )
+                .await;
+                emit_lease_reset(app);
+            }
             app.emit("aokie-companion://v2-snapshot", frame)
                 .map_err(|_| "could not deliver protocol-v2 snapshot".to_string())?;
             if assistance_cleared {
@@ -3189,7 +4113,7 @@ async fn handle_gateway_frame(
                         .snapshot
                         .as_ref()
                         .ok_or("assistance request arrived before authoritative state")?;
-                    if !snapshot.grants.contains(&Grant::AssistanceRead)
+                    if !current_client_grants(&client).contains(&Grant::AssistanceRead)
                         || !snapshot.snapshot.remote_consent.enabled
                         || !snapshot.snapshot.remote_consent.acknowledged
                         || !snapshot.snapshot.remote_consent.assistance_enabled
@@ -3390,23 +4314,23 @@ async fn handle_gateway_frame(
         "mobile_offer_accepted" => {
             let frame: MobileOfferAcceptedFrame =
                 strict_parse(encoded, "mobile offer acknowledgement")?;
-            apply_mobile_offer_accepted(state, expected_app_id, frame).await?;
+            apply_mobile_offer_accepted(state, expected_app_id, frame, encoded).await?;
         }
         "lease_granted" | "claim_provisional" | "claim_active" | "lease_renewed" => {
             let frame: LeaseStatusFrame = strict_parse(encoded, "lease status")?;
-            apply_lease_status(app, state, media_state, expected_app_id, frame).await?;
+            apply_lease_status(app, state, media_state, expected_app_id, frame, encoded).await?;
         }
         "rtc_signal" => {
             let frame: GatewayRtcFrame = strict_parse(encoded, "RTC signal")?;
-            apply_remote_rtc(app, state, media_state, expected_app_id, frame).await?;
+            apply_remote_rtc(app, state, media_state, expected_app_id, frame, encoded).await?;
         }
         "lease_revoked" => {
             let frame: LeaseRevokedFrame = strict_parse(encoded, "lease revoke")?;
-            apply_revocation(app, state, media_state, expected_app_id, frame).await?;
+            apply_revocation(app, state, media_state, expected_app_id, frame, encoded).await?;
         }
         "claim_rejected" => {
             let frame: ClaimRejectedFrame = strict_parse(encoded, "claim rejection")?;
-            apply_claim_rejection(app, state, media_state, expected_app_id, frame).await?;
+            apply_claim_rejection(app, state, media_state, expected_app_id, frame, encoded).await?;
         }
         "error" => {
             let frame: ErrorFrame = strict_parse(encoded, "gateway error")?;
@@ -3528,6 +4452,7 @@ async fn apply_mobile_offer_accepted(
     state: &V2State,
     expected_app_id: &str,
     frame: MobileOfferAcceptedFrame,
+    encoded: &str,
 ) -> Result<(), String> {
     validate_common(
         &frame.kind,
@@ -3545,7 +4470,11 @@ async fn apply_mobile_offer_accepted(
     ] {
         validate_id(value, label)?;
     }
+    let replay_key = offer_acceptance_replay_key(&frame.request_id);
     let mut client = state.inner.lock().await;
+    if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
+        return Ok(());
+    }
     let pending = client
         .pending
         .as_mut()
@@ -3559,6 +4488,7 @@ async fn apply_mobile_offer_accepted(
         return Err("mobile offer acknowledgement crossed its offer fence".into());
     }
     pending.stage = PendingLeaseStage::ReadyForLeaseDelivery;
+    remember_applied_relay_frame(&mut client, replay_key, encoded)?;
     Ok(())
 }
 
@@ -3568,7 +4498,211 @@ async fn apply_lease_status(
     media_state: &NativeMediaState,
     expected_app_id: &str,
     frame: LeaseStatusFrame,
+    encoded: &str,
 ) -> Result<(), String> {
+    let native_app = app.clone();
+    let native_media = media_state.clone();
+    let cleanup_app = app.clone();
+    let cleanup_media = media_state.clone();
+    let Some(applied) = apply_lease_status_transaction(
+        state,
+        expected_app_id,
+        frame,
+        encoded,
+        move |operation, session, ice_servers, relay_only| async move {
+            match operation {
+                LeaseOperation::Create => {
+                    media::create_offer(
+                        &native_app,
+                        &native_media,
+                        CreateOfferRequest {
+                            session: session.clone(),
+                            ice_servers,
+                            relay_only,
+                        },
+                    )
+                    .await?;
+                    if lease_operation_auto_arms_private_consult(operation, &session) {
+                        // Record the exact-session intent before committing
+                        // mobile authority. The media watcher waits for the
+                        // SDP answer, connectivity, and remote audio; any
+                        // scheduling failure therefore rolls back through the
+                        // same transaction as peer creation.
+                        media::request_private_consult_auto_arm(
+                            &native_media,
+                            SessionRequest { session },
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                }
+                LeaseOperation::Renew => {
+                    media::renew_lease(&native_app, &native_media, SessionRequest { session }).await
+                }
+            }
+        },
+        move |sessions| async move {
+            // Exact session matching makes this safe even if a command or a
+            // newer authority transition won the client-state race while the
+            // native operation was awaiting. Never use `media::close` here:
+            // it could tear down that newer peer.
+            for session in sessions {
+                let _ = media::revoke(
+                    &cleanup_app,
+                    &cleanup_media,
+                    RevokeRequest {
+                        session,
+                        reason: Some("lease status native operation aborted".into()),
+                    },
+                )
+                .await;
+            }
+            emit_lease_reset(&cleanup_app);
+        },
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // The state transition and its replay record are already committed as one
+    // lock transaction. Android reconciliation and renderer delivery happen
+    // afterwards, so neither can leave committed authority replayable as a
+    // second native create/renew operation.
+    if let Some((call_id, call_epoch)) = applied.reconcile_call {
+        if let Err(message) = crate::android_runtime::reconcile_offer(
+            app,
+            &call_id,
+            call_epoch,
+            "won",
+            "authoritative_talk_lease",
+        )
+        .await
+        {
+            emit_error(app, &message);
+        }
+    }
+    app.emit("aokie-companion://v2-lease", applied.lease_event)
+        .map_err(|_| "could not deliver protocol-v2 lease state".to_string())?;
+    Ok(())
+}
+
+#[derive(Clone)]
+enum LeaseStatusPredecessor {
+    Pending {
+        generation: u64,
+        pending: PendingLease,
+        native_end_action_id: Option<String>,
+    },
+    Lease {
+        generation: u64,
+        lease: ClientLease,
+        native_end_action_id: Option<String>,
+    },
+}
+
+impl LeaseStatusPredecessor {
+    fn matches_for_commit(&self, client: &ClientState) -> bool {
+        match self {
+            Self::Pending {
+                generation,
+                pending,
+                native_end_action_id,
+            } => {
+                client.generation == *generation
+                    && client.pending.as_ref() == Some(pending)
+                    && client.lease.is_none()
+                    && client.pending_revoke.is_none()
+                    && pending_native_end_action_id(client) == *native_end_action_id
+            }
+            Self::Lease {
+                generation,
+                lease,
+                native_end_action_id,
+            } => {
+                client.generation == *generation
+                    && client.pending.is_none()
+                    && client.lease.as_ref() == Some(lease)
+                    && client.pending_revoke.is_none()
+                    && pending_native_end_action_id(client) == *native_end_action_id
+            }
+        }
+    }
+
+    /// Narrower than the commit fence on purpose. If a native End arrived
+    /// during media setup, commit must fail, but the exact old authority still
+    /// has to be removed so the heartbeat loop cannot renew it.
+    fn matches_authority(&self, client: &ClientState) -> bool {
+        match self {
+            Self::Pending {
+                generation,
+                pending,
+                ..
+            } => client.generation == *generation && client.pending.as_ref() == Some(pending),
+            Self::Lease {
+                generation, lease, ..
+            } => client.generation == *generation && client.lease.as_ref() == Some(lease),
+        }
+    }
+
+    fn previous_session(&self) -> Option<MediaSession> {
+        match self {
+            Self::Pending { .. } => None,
+            Self::Lease { lease, .. } => Some(lease.session.clone()),
+        }
+    }
+}
+
+fn pending_native_end_action_id(client: &ClientState) -> Option<String> {
+    client
+        .pending_native_end
+        .as_ref()
+        .map(|pending| pending.action.action_id.clone())
+}
+
+struct LeaseStatusPlan {
+    replay_key: String,
+    predecessor: LeaseStatusPredecessor,
+    operation: LeaseOperation,
+    proposed: ClientLease,
+    lease_event: LeaseEvent,
+    reconcile_call: Option<(String, u64)>,
+    ice_servers: Vec<IceServerConfig>,
+    relay_only: bool,
+}
+
+impl LeaseStatusPlan {
+    fn cleanup_sessions(&self) -> Vec<MediaSession> {
+        let mut sessions = vec![self.proposed.session.clone()];
+        if let Some(previous) = self.predecessor.previous_session() {
+            if !sessions.contains(&previous) {
+                sessions.push(previous);
+            }
+        }
+        sessions
+    }
+}
+
+#[derive(Debug)]
+struct AppliedLeaseStatus {
+    lease_event: LeaseEvent,
+    reconcile_call: Option<(String, u64)>,
+}
+
+async fn apply_lease_status_transaction<Native, NativeFuture, Cleanup, CleanupFuture>(
+    state: &V2State,
+    expected_app_id: &str,
+    frame: LeaseStatusFrame,
+    encoded: &str,
+    native: Native,
+    cleanup: Cleanup,
+) -> Result<Option<AppliedLeaseStatus>, String>
+where
+    Native: FnOnce(LeaseOperation, MediaSession, Vec<IceServerConfig>, bool) -> NativeFuture,
+    NativeFuture: std::future::Future<Output = Result<(), String>>,
+    Cleanup: FnOnce(Vec<MediaSession>) -> CleanupFuture,
+    CleanupFuture: std::future::Future<Output = ()>,
+{
     validate_common(
         &frame.kind,
         frame.schema_version,
@@ -3579,16 +4713,39 @@ async fn apply_lease_status(
     if frame.lease_token.is_empty() || frame.lease_token.len() > MAX_LEASE_TOKEN_BYTES {
         return Err("lease token is invalid".into());
     }
+    let replay_key = lease_status_replay_key(&frame.kind, &frame.request_id);
+    {
+        let client = state.inner.lock().await;
+        if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
+            return Ok(None);
+        }
+    }
     let now = unix_now()?;
     frame
         .lease
         .validate(now)
         .map_err(|error| error.to_string())?;
 
-    let (operation, session, lease_event, reconcile_call) = {
+    let plan = {
         let mut client = state.inner.lock().await;
+        if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
+            return Ok(None);
+        }
         validate_claim_identity(&client, &frame.lease)?;
-        match frame.kind.as_str() {
+        let snapshot = client
+            .snapshot
+            .as_ref()
+            .ok_or("lease status arrived before current authoritative grants")?;
+        if !grants_permit_lease_mode(current_client_grants(&client), frame.lease.mode) {
+            return Err("lease status is not permitted by current admission grants".into());
+        }
+        if !current_consent_permits_mode(&snapshot.snapshot.remote_consent, frame.lease.mode, now) {
+            return Err("lease status is not permitted by current remote consent".into());
+        }
+        let (predecessor, operation, proposed, lease_event, reconcile_call) = match frame
+            .kind
+            .as_str()
+        {
             "lease_granted" | "claim_provisional" => {
                 let pending = client
                     .pending
@@ -3611,15 +4768,18 @@ async fn apply_lease_status(
                 let session = session_from_claims(&frame.lease, 1, 1)?;
                 let lease = ClientLease {
                     request_id: frame.request_id.clone(),
-                    token: frame.lease_token,
+                    token: frame.lease_token.clone(),
                     claims: frame.lease.clone(),
                     session: session.clone(),
                 };
-                client.pending = None;
-                client.lease = Some(lease);
                 (
+                    LeaseStatusPredecessor::Pending {
+                        generation: client.generation,
+                        pending: pending.clone(),
+                        native_end_action_id: pending_native_end_action_id(&client),
+                    },
                     LeaseOperation::Create,
-                    session.clone(),
+                    lease,
                     LeaseEvent {
                         session,
                         mode: frame.lease.mode,
@@ -3662,15 +4822,20 @@ async fn apply_lease_status(
                 let reconcile_call = (frame.lease.mode == LeaseMode::Takeover
                     && client.pending_native_end.is_none())
                 .then(|| (frame.lease.call_id.clone(), frame.lease.call_epoch));
-                client.lease = Some(ClientLease {
+                let lease = ClientLease {
                     request_id: frame.request_id.clone(),
-                    token: frame.lease_token,
+                    token: frame.lease_token.clone(),
                     claims: frame.lease.clone(),
                     session: session.clone(),
-                });
+                };
                 (
+                    LeaseStatusPredecessor::Lease {
+                        generation: client.generation,
+                        lease: current.clone(),
+                        native_end_action_id: pending_native_end_action_id(&client),
+                    },
                     LeaseOperation::Create,
-                    session.clone(),
+                    lease,
                     LeaseEvent {
                         session,
                         mode: frame.lease.mode,
@@ -3688,15 +4853,20 @@ async fn apply_lease_status(
                 validate_renewal(current, &frame.lease)?;
                 let mut session = current.session.clone();
                 session.expires_at = expiry_datetime(frame.lease.expires_at)?;
-                client.lease = Some(ClientLease {
+                let lease = ClientLease {
                     request_id: current.request_id.clone(),
-                    token: frame.lease_token,
+                    token: frame.lease_token.clone(),
                     claims: frame.lease.clone(),
                     session: session.clone(),
-                });
+                };
                 (
+                    LeaseStatusPredecessor::Lease {
+                        generation: client.generation,
+                        lease: current.clone(),
+                        native_end_action_id: pending_native_end_action_id(&client),
+                    },
                     LeaseOperation::Renew,
-                    session.clone(),
+                    lease,
                     LeaseEvent {
                         session,
                         mode: frame.lease.mode,
@@ -3707,60 +4877,189 @@ async fn apply_lease_status(
                 )
             }
             _ => return Err("unsupported lease status".into()),
+        };
+
+        let reservation = AppliedRelayFrame {
+            key: replay_key.clone(),
+            digest: relay_frame_digest(encoded),
+        };
+        if let Some(inflight) = client.applying_lease_status.as_ref() {
+            if inflight == &reservation {
+                // The first application owns the native transition. An exact
+                // duplicate must never start another peer operation.
+                return Ok(None);
+            }
+            return Err("another lease status is already applying native media".into());
+        }
+        client.applying_lease_status = Some(reservation);
+        LeaseStatusPlan {
+            replay_key,
+            predecessor,
+            operation,
+            proposed,
+            lease_event,
+            reconcile_call,
+            ice_servers: client.ice_servers.clone(),
+            relay_only: client.relay_only,
         }
     };
 
-    match operation {
-        LeaseOperation::Create => {
-            media::create_offer(
-                app,
-                media_state,
-                CreateOfferRequest {
-                    session: session.clone(),
-                    ice_servers: current_ice_servers(state).await,
-                    relay_only: current_relay_only(state).await,
-                },
-            )
-            .await?;
-        }
-        LeaseOperation::Renew => {
-            media::renew_lease(
-                app,
-                media_state,
-                SessionRequest {
-                    session: session.clone(),
-                },
-            )
-            .await?;
-        }
+    let native_result = native(
+        plan.operation,
+        plan.proposed.session.clone(),
+        plan.ice_servers.clone(),
+        plan.relay_only,
+    )
+    .await;
+    let failure = match native_result {
+        Err(message) => Some(message),
+        Ok(()) => match commit_lease_status(state, &plan, encoded).await {
+            Ok(applied) => return Ok(Some(applied)),
+            Err(message) => Some(message),
+        },
+    };
+
+    let message = failure.expect("one transaction failure branch was selected");
+    let abort_error = abort_lease_status(state, &plan, encoded).await.err();
+    cleanup(plan.cleanup_sessions()).await;
+    match abort_error {
+        Some(abort_error) => Err(format!("{message}; {abort_error}")),
+        None => Err(message),
     }
-    if let Some((call_id, call_epoch)) = reconcile_call {
-        crate::android_runtime::reconcile_offer(
-            app,
-            &call_id,
-            call_epoch,
-            "won",
-            "authoritative_talk_lease",
-        )
-        .await?;
-    }
-    app.emit("aokie-companion://v2-lease", lease_event)
-        .map_err(|_| "could not deliver protocol-v2 lease state".to_string())?;
-    Ok(())
 }
 
-#[derive(Clone, Copy)]
+async fn commit_lease_status(
+    state: &V2State,
+    plan: &LeaseStatusPlan,
+    encoded: &str,
+) -> Result<AppliedLeaseStatus, String> {
+    let mut client = state.inner.lock().await;
+    let reservation = AppliedRelayFrame {
+        key: plan.replay_key.clone(),
+        digest: relay_frame_digest(encoded),
+    };
+    if client.applying_lease_status.as_ref() != Some(&reservation) {
+        return Err("lease status lost its in-flight replay reservation".into());
+    }
+    if !plan.predecessor.matches_for_commit(&client) {
+        return Err("lease status predecessor changed while native media was opening".into());
+    }
+
+    // Record replay and install authority while the same lock is held. No
+    // external event can observe one without the other.
+    remember_applied_relay_frame(&mut client, plan.replay_key.clone(), encoded)?;
+    match &plan.predecessor {
+        LeaseStatusPredecessor::Pending { .. } => client.pending = None,
+        LeaseStatusPredecessor::Lease { .. } => {}
+    }
+    client.lease = Some(plan.proposed.clone());
+    client.applying_lease_status = None;
+    Ok(AppliedLeaseStatus {
+        lease_event: plan.lease_event.clone(),
+        reconcile_call: plan.reconcile_call.clone(),
+    })
+}
+
+async fn abort_lease_status(
+    state: &V2State,
+    plan: &LeaseStatusPlan,
+    encoded: &str,
+) -> Result<(), String> {
+    let request_id = state.next_id("request");
+    let revoke = LeaseRevokeFrame {
+        kind: "lease_revoke".into(),
+        schema_version: SCHEMA_VERSION,
+        app_id: plan.proposed.claims.app_id.clone(),
+        request_id: request_id.clone(),
+        idempotency_key: format!(
+            "mobile:{}:{}",
+            plan.proposed.claims.device_id,
+            state.next_id("native_failure_revoke")
+        ),
+        // The Desktop already accepted THIS token. Never synthesize authority
+        // from the predecessor or a later snapshot when giving it back.
+        lease_token: plan.proposed.token.clone(),
+        reason: "native_media_setup_failed".into(),
+    };
+    revoke.validate().map_err(|error| error.to_string())?;
+    let revoke_encoded = serde_json::to_string(&revoke)
+        .map_err(|_| "could not encode failed native-media lease revoke".to_string())?;
+
+    let mut client = state.inner.lock().await;
+    let reservation = AppliedRelayFrame {
+        key: plan.replay_key.clone(),
+        digest: relay_frame_digest(encoded),
+    };
+    if client.applying_lease_status.as_ref() != Some(&reservation) {
+        return Err("failed lease status lost its in-flight replay reservation".into());
+    }
+
+    let authority_was_current = plan.predecessor.matches_authority(&client);
+    if authority_was_current {
+        match &plan.predecessor {
+            LeaseStatusPredecessor::Pending { .. } => client.pending = None,
+            LeaseStatusPredecessor::Lease { .. } => client.lease = None,
+        }
+        client.pending_end_caller = None;
+    }
+
+    let queue_error = if client.urgent_control_frames.len() >= MAX_URGENT_CONTROL_FRAMES {
+        Some("urgent lease-revoke queue reached its safety bound".to_string())
+    } else {
+        client.urgent_control_frames.push_back(UrgentControlFrame {
+            app_id: plan.proposed.claims.app_id.clone(),
+            request_id: request_id.clone(),
+            lease_id: plan.proposed.claims.lease_id.clone(),
+            lease_jti: plan.proposed.claims.jti.clone(),
+            rtc_session_id: plan.proposed.claims.rtc_session_id.clone(),
+            fence: plan.proposed.claims.fence,
+            encoded: revoke_encoded,
+        });
+        None
+    };
+
+    if authority_was_current && client.pending_revoke.is_none() {
+        let authoritative_sequence = client.authoritative_sequence;
+        let authoritative_remote_revision = client
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| {
+                snapshot.app_id == plan.proposed.claims.app_id
+                    && snapshot.snapshot.call_id == plan.proposed.claims.call_id
+                    && snapshot.snapshot.call_epoch == plan.proposed.claims.call_epoch
+            })
+            .map(|snapshot| snapshot.snapshot.remote_revision);
+        client.pending_revoke = Some(PendingRevoke {
+            request_id,
+            lease_id: plan.proposed.claims.lease_id.clone(),
+            lease_jti: plan.proposed.claims.jti.clone(),
+            lease: plan.proposed.clone(),
+            authoritative_sequence,
+            authoritative_remote_revision,
+            native_action_id: None,
+            deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+        });
+    }
+
+    remember_applied_relay_frame(&mut client, plan.replay_key.clone(), encoded)?;
+    client.applying_lease_status = None;
+    match queue_error {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LeaseOperation {
     Create,
     Renew,
 }
 
-async fn current_ice_servers(state: &V2State) -> Vec<IceServerConfig> {
-    state.inner.lock().await.ice_servers.clone()
-}
-
-async fn current_relay_only(state: &V2State) -> bool {
-    state.inner.lock().await.relay_only
+fn lease_operation_auto_arms_private_consult(
+    operation: LeaseOperation,
+    session: &MediaSession,
+) -> bool {
+    operation == LeaseOperation::Create && session.binding.mode == MediaMode::Consult
 }
 
 async fn apply_remote_rtc(
@@ -3769,6 +5068,7 @@ async fn apply_remote_rtc(
     media_state: &NativeMediaState,
     expected_app_id: &str,
     frame: GatewayRtcFrame,
+    encoded: &str,
 ) -> Result<(), String> {
     validate_common(
         &frame.kind,
@@ -3777,7 +5077,41 @@ async fn apply_remote_rtc(
         expected_app_id,
     )?;
     validate_id(&frame.signal_id, "RTC signalId")?;
+    let replay_key = rtc_signal_replay_key(&frame.signal_id);
     let now = unix_now()?;
+    {
+        let mut client = state.inner.lock().await;
+        if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
+            return Ok(());
+        }
+        if client.device_id.as_deref() != Some(frame.device_id.as_str()) {
+            return Err("RTC signal targets another Companion device".into());
+        }
+        let current_grants = current_client_grants(&client);
+        let revoked_mode = client.pending_revoke.as_ref().and_then(|pending| {
+            (pending.lease_jti == frame.lease_jti).then_some(pending.lease.claims.mode)
+        });
+        let active_mode = client
+            .lease
+            .as_ref()
+            .and_then(|lease| (lease.claims.jti == frame.lease_jti).then_some(lease.claims.mode));
+        let routed_mode = active_mode.or(revoked_mode);
+        let consent_permits_routed_mode = routed_mode.is_none_or(|mode| {
+            client.snapshot.as_ref().is_some_and(|snapshot| {
+                current_consent_permits_mode(&snapshot.snapshot.remote_consent, mode, now)
+            })
+        });
+        if !current_grants.contains(&Grant::RtcSignal)
+            || routed_mode.is_some_and(|mode| !grants_permit_lease_mode(current_grants, mode))
+            || !consent_permits_routed_mode
+        {
+            // A queued old signal is not an error from the current session.
+            // Digest it so exact redelivery remains a no-op, then discard it
+            // before endpoint verification or native media can run.
+            remember_applied_relay_frame(&mut client, replay_key, encoded)?;
+            return Ok(());
+        }
+    }
     let authentication = frame
         .signal
         .verify_endpoint_authentication(now)
@@ -3792,12 +5126,25 @@ async fn apply_remote_rtc(
         });
     let lease = {
         let mut client = state.inner.lock().await;
+        if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
+            return Ok(());
+        }
         let lease = client
             .lease
             .as_ref()
             .ok_or("RTC signal arrived without a media lease")?
             .clone();
-        if frame.plugin_id != lease.claims.plugin_id
+        let current_grants = current_client_grants(&client);
+        if client.device_id.as_deref() != Some(frame.device_id.as_str())
+            || !grants_permit_lease_mode(current_grants, lease.claims.mode)
+            || client.snapshot.as_ref().is_none_or(|snapshot| {
+                !current_consent_permits_mode(
+                    &snapshot.snapshot.remote_consent,
+                    lease.claims.mode,
+                    now,
+                )
+            })
+            || frame.plugin_id != lease.claims.plugin_id
             || frame.device_id != lease.claims.device_id
             || frame.lease_jti != lease.claims.jti
             || frame.rtc_session_id != lease.claims.rtc_session_id
@@ -3828,7 +5175,7 @@ async fn apply_remote_rtc(
         lease
     };
 
-    match frame.signal {
+    let result = match frame.signal {
         RtcSignal::Answer { sdp, .. } => {
             media::accept_answer(
                 app,
@@ -3888,7 +5235,13 @@ async fn apply_remote_rtc(
             result
         }
         RtcSignal::Offer { .. } => Err("the Companion is the protocol-v2 offerer".into()),
+    };
+    result?;
+    {
+        let mut client = state.inner.lock().await;
+        remember_applied_relay_frame(&mut client, replay_key, encoded)?;
     }
+    Ok(())
 }
 
 fn validate_remote_signal_route(
@@ -3974,6 +5327,7 @@ async fn apply_revocation(
     media_state: &NativeMediaState,
     expected_app_id: &str,
     frame: LeaseRevokedFrame,
+    encoded: &str,
 ) -> Result<(), String> {
     validate_common(
         &frame.kind,
@@ -3989,8 +5343,18 @@ async fn apply_revocation(
     validate_text(&frame.reason, 500, "lease revoke reason")?;
     let (lease, local_media_already_closed, native_action_id) = {
         let mut client = state.inner.lock().await;
+        if completed_revoke_frame_is_replay(&mut client, &frame, encoded)? {
+            return Ok(());
+        }
         if let Some(pending) = client.pending_revoke.as_ref() {
             validate_pending_revoke_ack(pending, &frame)?;
+            // Preserve the locally-known request fence before merging a
+            // requestless plugin media-failure notice. Otherwise the first
+            // arbitrary Some(requestId) delivered later could claim this
+            // already-completed lease/JTI tombstone.
+            let completed_pending = completed_revoke_from_pending(pending);
+            remember_completed_revoke(&mut client, completed_pending)?;
+            remember_completed_revoke(&mut client, completed_revoke_from_frame(&frame, encoded))?;
             let pending = client
                 .pending_revoke
                 .take()
@@ -4005,6 +5369,7 @@ async fn apply_revocation(
             if lease.claims.lease_id != frame.lease_id || lease.claims.jti != frame.lease_jti {
                 return Err("stale lease revocation did not match the current JTI".into());
             }
+            remember_completed_revoke(&mut client, completed_revoke_from_frame(&frame, encoded))?;
             client.pending_end_caller = None;
             (client.lease.take().expect("checked lease"), false, None)
         }
@@ -4039,13 +5404,67 @@ fn validate_pending_revoke_ack(
     pending: &PendingRevoke,
     frame: &LeaseRevokedFrame,
 ) -> Result<(), String> {
-    if frame.request_id.as_deref() != Some(pending.request_id.as_str())
-        || frame.lease_id != pending.lease_id
+    if frame.lease_id != pending.lease_id
         || frame.lease_jti != pending.lease_jti
+        || frame
+            .request_id
+            .as_deref()
+            .is_some_and(|request_id| request_id != pending.request_id)
     {
         return Err("lease return acknowledgement crossed its request or JTI fence".into());
     }
     Ok(())
+}
+
+/// When the relay provides no exact revoke acknowledgement, a lease return is
+/// complete only once a later authoritative call projection proves that the
+/// revoked route can no longer own the caller.
+///
+/// The translated relay sequence alone is not source authority: a same-call
+/// projection must also advance Desktop's remote revision beyond the request
+/// baseline. Monitor additionally requires Aokie's media route to be ready;
+/// consult and takeover require the owner epoch to advance beyond the revoked
+/// lease. A different/ended call makes the old lease harmless regardless of
+/// mode. Until one of these transitions arrives the timeout remains armed.
+fn snapshot_confirms_pending_revoke(pending: &PendingRevoke, frame: &MobileSnapshotFrame) -> bool {
+    if frame.sequence <= pending.authoritative_sequence {
+        return false;
+    }
+
+    let revoked = &pending.lease.claims;
+    let current = &frame.snapshot;
+    if current.call_id != revoked.call_id
+        || current.call_epoch != revoked.call_epoch
+        || current.telephony_state == TelephonyState::Ended
+        || current.service_mode == ServiceMode::Ended
+    {
+        return true;
+    }
+
+    let remote_revision_advanced = pending
+        .authoritative_remote_revision
+        .is_some_and(|baseline| current.remote_revision > baseline);
+    current.service_mode == ServiceMode::AokieActive
+        && remote_revision_advanced
+        && match revoked.mode {
+            LeaseMode::Monitor => current.media_state == MediaState::Ready,
+            LeaseMode::Consult | LeaseMode::Takeover => current.owner_epoch > revoked.owner_epoch,
+        }
+}
+
+fn take_snapshot_confirmed_pending_revoke(
+    client: &mut ClientState,
+    frame: &MobileSnapshotFrame,
+) -> Result<Option<PendingRevoke>, String> {
+    let Some(pending) = client.pending_revoke.as_ref() else {
+        return Ok(None);
+    };
+    if !snapshot_confirms_pending_revoke(pending, frame) {
+        return Ok(None);
+    }
+    let completed = completed_revoke_from_pending(pending);
+    remember_completed_revoke(client, completed)?;
+    Ok(client.pending_revoke.take())
 }
 
 async fn apply_claim_rejection(
@@ -4054,6 +5473,7 @@ async fn apply_claim_rejection(
     media_state: &NativeMediaState,
     expected_app_id: &str,
     frame: ClaimRejectedFrame,
+    encoded: &str,
 ) -> Result<(), String> {
     validate_common(
         &frame.kind,
@@ -4064,13 +5484,23 @@ async fn apply_claim_rejection(
     validate_id(&frame.request_id, "claim requestId")?;
     validate_text(&frame.code, 200, "claim rejection code")?;
     validate_text(&frame.message, 500, "claim rejection message")?;
+    let replay_key = claim_rejection_replay_key(&frame.request_id);
     let (lease, rejected_call) = {
         let mut client = state.inner.lock().await;
-        if client
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.request_id == frame.request_id)
-        {
+        if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
+            return Ok(());
+        }
+        if is_late_duplicate_offer_rejection(&client, &frame)? {
+            // POST/SSE delivery is independently at-least-once. If the offer
+            // answer itself is retried after its acceptance, the plugin's
+            // idempotency fence reports `offer_replayed`; that must not tear
+            // down the lease which the first answer legitimately released.
+            remember_applied_relay_frame(&mut client, replay_key, encoded)?;
+            return Ok(());
+        }
+        if client.pending.as_ref().is_some_and(|pending| {
+            pending.request_id == frame.request_id || pending.offer_request_id == frame.request_id
+        }) {
             let pending = client.pending.take().expect("checked pending claim");
             (None, Some((pending.call_id, pending.call_epoch)))
         } else if client.lease.as_ref().is_some_and(|lease| {
@@ -4107,6 +5537,10 @@ async fn apply_claim_rejection(
         .await;
     }
     emit_error(app, &format!("{} — {}", frame.code, frame.message));
+    {
+        let mut client = state.inner.lock().await;
+        remember_applied_relay_frame(&mut client, replay_key, encoded)?;
+    }
     Ok(())
 }
 
@@ -4116,7 +5550,16 @@ async fn heartbeat_frame(state: &V2State, app_id: &str) -> Result<Option<String>
         let Some(lease) = &client.lease else {
             return Ok(None);
         };
+        let current_grants = current_client_grants(&client);
+        if !grants_permit_lease_mode(current_grants, lease.claims.mode) {
+            return Ok(None);
+        }
         let now = unix_now()?;
+        if client.snapshot.as_ref().is_none_or(|snapshot| {
+            !current_consent_permits_mode(&snapshot.snapshot.remote_consent, lease.claims.mode, now)
+        }) {
+            return Ok(None);
+        }
         if !lease_heartbeat_due(lease.claims.expires_at, now)? {
             return Ok(None);
         }
@@ -4143,6 +5586,32 @@ async fn heartbeat_frame(state: &V2State, app_id: &str) -> Result<Option<String>
         .map_err(|_| "could not encode protocol-v2 lease heartbeat".into())
 }
 
+async fn peek_urgent_control_frame(state: &V2State) -> Option<UrgentControlFrame> {
+    state
+        .inner
+        .lock()
+        .await
+        .urgent_control_frames
+        .front()
+        .cloned()
+}
+
+async fn confirm_urgent_control_frame(
+    state: &V2State,
+    delivered: &UrgentControlFrame,
+) -> Result<(), String> {
+    let mut client = state.inner.lock().await;
+    let current = client
+        .urgent_control_frames
+        .front()
+        .ok_or("urgent lease revoke disappeared before delivery confirmation")?;
+    if current != delivered {
+        return Err("urgent lease revoke changed before delivery confirmation".into());
+    }
+    client.urgent_control_frames.pop_front();
+    Ok(())
+}
+
 fn lease_heartbeat_due(expires_at: u64, now: u64) -> Result<bool, String> {
     if expires_at <= now {
         return Err("protocol-v2 media lease expired before renewal".into());
@@ -4150,21 +5619,70 @@ fn lease_heartbeat_due(expires_at: u64, now: u64) -> Result<bool, String> {
     Ok(expires_at.saturating_sub(now) <= LEASE_RENEWAL_WINDOW.as_secs())
 }
 
+async fn surrender_failed_private_consult(
+    app: &AppHandle,
+    state: &V2State,
+    failed_session: &MediaSession,
+    detail: &str,
+) -> Result<(), String> {
+    let queue_error = {
+        let mut client = state.inner.lock().await;
+        let Some(lease) = take_failed_private_consult(&mut client, failed_session) else {
+            return Ok(());
+        };
+        queue_exact_lease_revocation(state, &mut client, &lease, "native_media_setup_failed").err()
+    };
+    emit_lease_reset(app);
+    emit_error(
+        app,
+        &format!("Private consult returned to Aokie because its microphone route failed: {detail}"),
+    );
+    match queue_error {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+fn take_failed_private_consult(
+    client: &mut ClientState,
+    failed_session: &MediaSession,
+) -> Option<ClientLease> {
+    let exact = client.lease.as_ref().is_some_and(|lease| {
+        lease.claims.mode == LeaseMode::Consult && lease.session == *failed_session
+    });
+    if !exact {
+        // A late watcher event from a replaced peer can never revoke the newer
+        // lease that now owns the client state.
+        return None;
+    }
+    client.pending_end_caller = None;
+    client.lease.take()
+}
+
 async fn local_rtc_frame(
     state: &V2State,
     event: MediaSignalEvent,
 ) -> Result<Option<String>, String> {
+    let now = unix_now()?;
     let (lease, endpoint_identity, endpoint_session_nonce) = {
         let client = state.inner.lock().await;
         let Some(lease) = &client.lease else {
             return Ok(None);
         };
+        if !grants_permit_lease_mode(current_client_grants(&client), lease.claims.mode) {
+            return Ok(None);
+        }
+        if client.snapshot.as_ref().is_none_or(|snapshot| {
+            !current_consent_permits_mode(&snapshot.snapshot.remote_consent, lease.claims.mode, now)
+        }) {
+            return Ok(None);
+        }
         if event.session != lease.session {
             // Events from a replaced peer are stale and are deliberately
             // dropped rather than being rebound to newer authority.
             return Ok(None);
         }
-        if lease.claims.expires_at <= unix_now()? {
+        if lease.claims.expires_at <= now {
             return Err("native RTC signal was produced after lease expiry".into());
         }
         (
@@ -4179,7 +5697,6 @@ async fn local_rtc_frame(
                 .ok_or("native endpoint session nonce is unavailable")?,
         )
     };
-    let now = unix_now()?;
     let signature_expiry = lease.claims.expires_at.min(now.saturating_add(30));
     let signal = match event.signal {
         LocalSignal::Offer { description } => {
@@ -4277,6 +5794,9 @@ async fn local_rtc_frame(
                 expires_at: signature_expiry,
             })?;
             RtcSignal::IceComplete { envelope }
+        }
+        LocalSignal::LeaseSafetyFailure { .. } => {
+            return Err("native media safety failure entered the RTC encoder".into())
         }
     };
     let frame = MobileRtcSignalFrame {
@@ -4419,30 +5939,42 @@ fn transition_to_idle(
                 )
             })
         });
-    let mut native_action_ids = Vec::new();
+    let mut failed_native_action_ids = Vec::new();
     if let Some(action_id) = client
         .pending
         .take()
         .and_then(|pending| pending.native_action_id)
     {
-        native_action_ids.push(action_id);
+        failed_native_action_ids.push(action_id);
     }
-    if let Some(action_id) = client
+    let confirmed_revoke_action_id = if client
         .pending_revoke
-        .take()
-        .and_then(|pending| pending.native_action_id)
+        .as_ref()
+        .is_some_and(|pending| frame.sequence > pending.authoritative_sequence)
     {
-        native_action_ids.push(action_id);
-    }
+        let completed = completed_revoke_from_pending(
+            client
+                .pending_revoke
+                .as_ref()
+                .expect("checked pending revoke"),
+        );
+        remember_completed_revoke(client, completed)?;
+        client
+            .pending_revoke
+            .take()
+            .and_then(|pending| pending.native_action_id)
+    } else {
+        None
+    };
     if let Some(action_id) = client
         .pending_native_end
         .take()
         .map(|pending| pending.action.action_id)
     {
-        native_action_ids.push(action_id);
+        failed_native_action_ids.push(action_id);
     }
-    native_action_ids.sort();
-    native_action_ids.dedup();
+    failed_native_action_ids.sort();
+    failed_native_action_ids.dedup();
 
     client.authoritative_sequence = frame.sequence;
     client.snapshot = None;
@@ -4453,7 +5985,8 @@ fn transition_to_idle(
     client.seen_remote_endpoint_jtis.clear();
 
     Ok(Some(IdleStateCleanup {
-        native_action_ids,
+        failed_native_action_ids,
+        confirmed_revoke_action_id,
         pending_call,
     }))
 }
@@ -4811,6 +6344,49 @@ mod tests {
     }
 
     #[test]
+    fn newer_idle_confirms_revoke_separately_from_other_native_failures() {
+        let mut client = offered_client(LeaseMode::Takeover, MobileOfferSurface::InApp);
+        client.authoritative_sequence = 8;
+        client.pending_revoke = Some(pending_revoke_fixture(LeaseMode::Takeover, 8));
+        let mut native_end = native_answer_action();
+        native_end.action_id = "native_end_other".into();
+        native_end.kind = NativeCallActionKind::End;
+        client.pending_native_end = Some(PendingNativeEnd {
+            action: native_end,
+            deadline: Instant::now() + NATIVE_ACTION_TIMEOUT,
+        });
+        let stale = MobileIdleSyncFrame {
+            kind: "idle_sync".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            sequence: 8,
+            grants: vec![Grant::StateRead],
+        };
+
+        assert!(transition_to_idle(&mut client, &stale).unwrap().is_none());
+        assert!(client.pending_revoke.is_some());
+
+        let current = MobileIdleSyncFrame {
+            sequence: 9,
+            ..stale
+        };
+        let cleanup = transition_to_idle(&mut client, &current)
+            .unwrap()
+            .expect("new idle state applies");
+        assert_eq!(
+            cleanup.confirmed_revoke_action_id.as_deref(),
+            Some("native_return_a")
+        );
+        assert_eq!(
+            cleanup.failed_native_action_ids,
+            vec!["native_end_other".to_string()]
+        );
+        assert!(client.pending_revoke.is_none());
+        assert!(client.pending_native_end.is_none());
+        assert_eq!(client.completed_revokes.len(), 1);
+    }
+
+    #[test]
     fn identical_assistance_retry_preserves_pending_answer() {
         let mut client = offered_client(LeaseMode::Consult, MobileOfferSurface::InApp);
         let frame = client.assistance.clone().expect("consult help request");
@@ -4901,6 +6477,113 @@ mod tests {
     }
 
     #[test]
+    fn at_least_once_authority_frames_accept_only_exact_wire_replays() {
+        let mut client = ClientState::default();
+        let cases = [
+            (
+                offer_acceptance_replay_key("offer_answer_1"),
+                r#"{"kind":"mobile_offer_accepted","requestId":"offer_answer_1"}"#,
+            ),
+            (
+                lease_status_replay_key("claim_provisional", "claim_1"),
+                r#"{"kind":"claim_provisional","requestId":"claim_1"}"#,
+            ),
+            (
+                lease_status_replay_key("lease_granted", "claim_2"),
+                r#"{"kind":"lease_granted","requestId":"claim_2"}"#,
+            ),
+            (
+                lease_status_replay_key("claim_active", "claim_1"),
+                r#"{"kind":"claim_active","requestId":"claim_1"}"#,
+            ),
+            (
+                lease_status_replay_key("lease_renewed", "heartbeat_1"),
+                r#"{"kind":"lease_renewed","requestId":"heartbeat_1"}"#,
+            ),
+            (
+                rtc_signal_replay_key("rtc_signal_1"),
+                r#"{"kind":"rtc_signal","signalId":"rtc_signal_1","signal":"answer"}"#,
+            ),
+        ];
+
+        for (key, encoded) in cases {
+            assert!(!applied_relay_frame_is_replay(&client, &key, encoded).unwrap());
+            remember_applied_relay_frame(&mut client, key.clone(), encoded).unwrap();
+            assert!(applied_relay_frame_is_replay(&client, &key, encoded).unwrap());
+
+            let changed = format!("{encoded} ");
+            let error = applied_relay_frame_is_replay(&client, &key, &changed).unwrap_err();
+            assert_eq!(
+                error,
+                "relay authority frame identifier was reused with different content"
+            );
+        }
+    }
+
+    #[test]
+    fn applied_relay_replay_fence_is_bounded() {
+        let mut client = ClientState::default();
+        for index in 0..=MAX_APPLIED_RELAY_FRAMES {
+            remember_applied_relay_frame(
+                &mut client,
+                rtc_signal_replay_key(&format!("signal_{index}")),
+                &format!(r#"{{"signalId":"signal_{index}"}}"#),
+            )
+            .unwrap();
+        }
+        assert_eq!(client.applied_relay_frames.len(), MAX_APPLIED_RELAY_FRAMES);
+        assert!(!relay_frame_was_applied(
+            &client,
+            &rtc_signal_replay_key("signal_0")
+        ));
+        assert!(relay_frame_was_applied(
+            &client,
+            &rtc_signal_replay_key(&format!("signal_{MAX_APPLIED_RELAY_FRAMES}"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn applied_relay_replay_fence_survives_transport_reset() {
+        let state = V2State::default();
+        let key = lease_status_replay_key("claim_active", "claim_1");
+        let encoded = r#"{"kind":"claim_active","requestId":"claim_1"}"#;
+        {
+            let mut client = state.inner.lock().await;
+            remember_applied_relay_frame(&mut client, key.clone(), encoded).unwrap();
+        }
+
+        state.reset().await;
+
+        let client = state.inner.lock().await;
+        assert!(applied_relay_frame_is_replay(&client, &key, encoded).unwrap());
+    }
+
+    #[test]
+    fn late_offer_replayed_rejection_cannot_undo_an_accepted_offer() {
+        let mut client = ClientState::default();
+        let accepted_key = offer_acceptance_replay_key("offer_answer_1");
+        remember_applied_relay_frame(
+            &mut client,
+            accepted_key,
+            r#"{"kind":"mobile_offer_accepted","requestId":"offer_answer_1"}"#,
+        )
+        .unwrap();
+        let replayed = ClaimRejectedFrame {
+            kind: "claim_rejected".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: "offer_answer_1".into(),
+            code: "offer_replayed".into(),
+            message: "that offer was already answered".into(),
+        };
+        assert!(is_late_duplicate_offer_rejection(&client, &replayed).unwrap());
+
+        let mut contradiction = replayed;
+        contradiction.code = "offer_invalid".into();
+        assert!(is_late_duplicate_offer_rejection(&client, &contradiction).is_err());
+    }
+
+    #[test]
     fn peer_trust_profile_is_separate_from_managed_app_and_deployment() {
         let managed_a: RealtimeConfig = serde_json::from_value(serde_json::json!({
             "gatewayUrl": "wss://issuer-a.example/v2/realtime",
@@ -4987,6 +6670,523 @@ mod tests {
         }
     }
 
+    fn lease_status_client(mode: LeaseMode, phase: LeasePhase) -> (ClientState, LeaseClaims) {
+        let mut client = offered_client(mode, MobileOfferSurface::InApp);
+        client.peer_key_thumbprint = Some("plugin_key_a".into());
+        let mut lease_claims = claims(mode, phase);
+        lease_claims.mobile_key_thumbprint = client
+            .endpoint_identity
+            .as_ref()
+            .expect("fixture endpoint identity")
+            .thumbprint()
+            .into();
+        lease_claims.plugin_key_thumbprint = "plugin_key_a".into();
+        (client, lease_claims)
+    }
+
+    fn pending_lease_for(claims: &LeaseClaims) -> PendingLease {
+        let request_id = "request_a".to_string();
+        PendingLease {
+            request_id: request_id.clone(),
+            offer_request_id: "offer_answer_a".into(),
+            mode: claims.mode,
+            rtc_session_id: claims.rtc_session_id.clone(),
+            call_id: claims.call_id.clone(),
+            call_epoch: claims.call_epoch,
+            owner_epoch: claims.owner_epoch,
+            accepted_offer_id: "offer_exact_a".into(),
+            accepted_offer_jti: "offer_jti_exact_a".into(),
+            lease_frame: LeaseRequestFrame {
+                kind: "lease_request".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: claims.app_id.clone(),
+                request_id: request_id.clone(),
+                idempotency_key: "mobile:device_a:request_a".into(),
+                call_id: claims.call_id.clone(),
+                expected_call_epoch: claims.call_epoch,
+                expected_owner_epoch: claims.owner_epoch,
+                expected_switchboard_revision: 11,
+                expected_remote_revision: 13,
+                mode: claims.mode,
+                rtc_session_id: claims.rtc_session_id.clone(),
+                accepted_offer_id: "offer_exact_a".into(),
+                accepted_offer_jti: "offer_jti_exact_a".into(),
+            },
+            stage: PendingLeaseStage::LeaseRequested,
+            deadline: Instant::now() + LEASE_REQUEST_TIMEOUT,
+            native_action_id: None,
+            native_deadline: None,
+        }
+    }
+
+    fn lease_status_frame(kind: &str, token: &str, claims: LeaseClaims) -> LeaseStatusFrame {
+        LeaseStatusFrame {
+            kind: kind.into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: claims.app_id.clone(),
+            request_id: "request_a".into(),
+            lease_token: token.into(),
+            provisional: match kind {
+                "claim_provisional" => Some(true),
+                "claim_active" => Some(false),
+                _ => None,
+            },
+            lease: claims,
+        }
+    }
+
+    async fn failing_lease_status(
+        state: &V2State,
+        frame: LeaseStatusFrame,
+        native_calls: Arc<AtomicU64>,
+        cleaned: Arc<Mutex<Vec<MediaSession>>>,
+    ) -> Result<Option<AppliedLeaseStatus>, String> {
+        let encoded = serde_json::to_string(&frame).unwrap();
+        apply_lease_status_transaction(
+            state,
+            "app_a",
+            frame,
+            &encoded,
+            move |_, _, _, _| {
+                native_calls.fetch_add(1, Ordering::AcqRel);
+                async { Err("injected native media failure".to_string()) }
+            },
+            move |sessions| async move {
+                *cleaned.lock().unwrap() = sessions;
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn active_create_failure_surrenders_exact_token_and_replay_is_a_no_op() {
+        let state = V2State::default();
+        let (mut client, prepared) = lease_status_client(LeaseMode::Takeover, LeasePhase::Prepared);
+        client.lease = Some(ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.prepared.token".into(),
+            session: session_from_claims(&prepared, 1, 1).unwrap(),
+            claims: prepared.clone(),
+        });
+        *state.inner.lock().await = client;
+
+        let mut active = prepared;
+        active.phase = LeasePhase::Active;
+        active.tracks = tracks_for(LeaseMode::Takeover, LeasePhase::Active);
+        active.owner_epoch += 1;
+        active.expires_at += 1;
+        active.jti = "lease_active_a".into();
+        let frame = lease_status_frame("claim_active", "signed.active.token", active.clone());
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let native_calls = Arc::new(AtomicU64::new(0));
+        let cleaned = Arc::new(Mutex::new(Vec::new()));
+
+        assert_eq!(
+            failing_lease_status(&state, frame.clone(), native_calls.clone(), cleaned.clone(),)
+                .await
+                .unwrap_err(),
+            "injected native media failure"
+        );
+        assert_eq!(native_calls.load(Ordering::Acquire), 1);
+        assert_eq!(cleaned.lock().unwrap().len(), 2);
+
+        {
+            let client = state.inner.lock().await;
+            assert!(
+                client.lease.is_none(),
+                "failed active authority must not heartbeat"
+            );
+            assert!(client.pending.is_none());
+            assert!(client.applying_lease_status.is_none());
+            let pending_revoke = client.pending_revoke.as_ref().expect("return fence");
+            assert_eq!(pending_revoke.lease.token, "signed.active.token");
+            assert_eq!(pending_revoke.lease_jti, "lease_active_a");
+            let urgent = client.urgent_control_frames.front().expect("urgent revoke");
+            assert_eq!(urgent.lease_id, active.lease_id);
+            assert_eq!(urgent.lease_jti, active.jti);
+            assert_eq!(urgent.rtc_session_id, active.rtc_session_id);
+            assert_eq!(urgent.fence, active.fence);
+            let revoke: LeaseRevokeFrame = serde_json::from_str(&urgent.encoded).unwrap();
+            assert_eq!(revoke.lease_token, "signed.active.token");
+        }
+        assert!(heartbeat_frame(&state, "app_a").await.unwrap().is_none());
+        let stale_offer_session = cleaned.lock().unwrap()[0].clone();
+        assert!(local_rtc_frame(
+            &state,
+            MediaSignalEvent {
+                session: stale_offer_session,
+                signal: LocalSignal::Offer {
+                    description: SdpSignal {
+                        kind: SdpSignalType::Offer,
+                        sdp: "stale rolled-back offer".into(),
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .is_none());
+
+        let replay_calls = native_calls.clone();
+        let replay = apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame.clone(),
+            &encoded,
+            move |_, _, _, _| {
+                replay_calls.fetch_add(1, Ordering::AcqRel);
+                async { Ok(()) }
+            },
+            |_| async {},
+        )
+        .await
+        .unwrap();
+        assert!(replay.is_none());
+        assert_eq!(native_calls.load(Ordering::Acquire), 1);
+
+        let mut changed = frame;
+        changed.lease_token = "signed.changed.token".into();
+        let changed_encoded = serde_json::to_string(&changed).unwrap();
+        assert!(apply_lease_status_transaction(
+            &state,
+            "app_a",
+            changed,
+            &changed_encoded,
+            |_, _, _, _| async { Ok(()) },
+            |_| async {},
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn active_consult_status_runs_create_with_auto_arm_intent_before_commit() {
+        let state = V2State::default();
+        let (mut client, prepared) = lease_status_client(LeaseMode::Consult, LeasePhase::Prepared);
+        client.lease = Some(ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.consult.prepared".into(),
+            session: session_from_claims(&prepared, 1, 1).unwrap(),
+            claims: prepared.clone(),
+        });
+        *state.inner.lock().await = client;
+
+        let mut active = prepared;
+        active.phase = LeasePhase::Active;
+        active.tracks = tracks_for(LeaseMode::Consult, LeasePhase::Active);
+        active.owner_epoch += 1;
+        active.expires_at += 1;
+        active.jti = "lease_consult_active".into();
+        let frame = lease_status_frame("claim_active", "signed.consult.active", active);
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let native_calls = Arc::new(AtomicU64::new(0));
+        let counted = native_calls.clone();
+        let applied = apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            move |operation, session, _, _| {
+                counted.fetch_add(1, Ordering::AcqRel);
+                async move {
+                    assert_eq!(operation, LeaseOperation::Create);
+                    assert_eq!(session.binding.mode, MediaMode::Consult);
+                    assert!(lease_operation_auto_arms_private_consult(
+                        operation, &session
+                    ));
+                    Ok(())
+                }
+            },
+            |_| async {},
+        )
+        .await
+        .unwrap();
+        assert!(applied.is_some());
+        assert_eq!(native_calls.load(Ordering::Acquire), 1);
+        let client = state.inner.lock().await;
+        assert_eq!(
+            client.lease.as_ref().unwrap().session.binding.mode,
+            MediaMode::Consult
+        );
+    }
+
+    #[tokio::test]
+    async fn provisional_create_failure_aborts_prepared_authority_and_survives_reconnect() {
+        let state = V2State::default();
+        let (mut client, prepared) = lease_status_client(LeaseMode::Takeover, LeasePhase::Prepared);
+        client.pending = Some(pending_lease_for(&prepared));
+        *state.inner.lock().await = client;
+        let frame = lease_status_frame(
+            "claim_provisional",
+            "signed.prepared.received.token",
+            prepared,
+        );
+        let native_calls = Arc::new(AtomicU64::new(0));
+        let cleaned = Arc::new(Mutex::new(Vec::new()));
+
+        failing_lease_status(&state, frame, native_calls, cleaned.clone())
+            .await
+            .unwrap_err();
+        {
+            let client = state.inner.lock().await;
+            assert!(client.pending.is_none());
+            assert!(client.lease.is_none());
+            assert_eq!(cleaned.lock().unwrap().len(), 1);
+            assert_eq!(client.urgent_control_frames.len(), 1);
+            assert_eq!(
+                client.pending_revoke.as_ref().unwrap().lease.token,
+                "signed.prepared.received.token"
+            );
+        }
+
+        state.reset().await;
+        let urgent = peek_urgent_control_frame(&state)
+            .await
+            .expect("urgent revoke must survive reset/reconnect");
+        let revoke: LeaseRevokeFrame = serde_json::from_str(&urgent.encoded).unwrap();
+        assert_eq!(revoke.lease_token, "signed.prepared.received.token");
+        confirm_urgent_control_frame(&state, &urgent).await.unwrap();
+        assert!(peek_urgent_control_frame(&state).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn renewal_failure_closes_old_or_renewed_peer_and_cannot_renew_again() {
+        let state = V2State::default();
+        let (mut client, active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        client.lease = Some(ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.old.token".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active.clone(),
+        });
+        *state.inner.lock().await = client;
+
+        let mut renewed = active;
+        renewed.expires_at += 10;
+        renewed.jti = "lease_renewed_a".into();
+        let frame = lease_status_frame("lease_renewed", "signed.renewed.token", renewed);
+        let native_calls = Arc::new(AtomicU64::new(0));
+        let cleaned = Arc::new(Mutex::new(Vec::new()));
+        failing_lease_status(&state, frame, native_calls, cleaned.clone())
+            .await
+            .unwrap_err();
+
+        let client = state.inner.lock().await;
+        assert!(client.lease.is_none());
+        assert!(client.pending_revoke.is_some());
+        assert_eq!(
+            client.pending_revoke.as_ref().unwrap().lease.token,
+            "signed.renewed.token"
+        );
+        assert_eq!(cleaned.lock().unwrap().len(), 2);
+        drop(client);
+        assert!(heartbeat_frame(&state, "app_a").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_commit_never_erases_a_newer_concurrent_lease() {
+        let state = V2State::default();
+        let (mut client, active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        client.lease = Some(ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.old.token".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active.clone(),
+        });
+        *state.inner.lock().await = client;
+
+        let mut renewed = active.clone();
+        renewed.expires_at += 10;
+        renewed.jti = "lease_renewed_a".into();
+        let frame = lease_status_frame("lease_renewed", "signed.renewed.token", renewed);
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let racing_state = state.clone();
+        let mut concurrent_claims = active;
+        concurrent_claims.owner_epoch += 2;
+        concurrent_claims.expires_at += 12;
+        concurrent_claims.jti = "lease_concurrent_a".into();
+        let concurrent = ClientLease {
+            request_id: "request_concurrent".into(),
+            token: "signed.concurrent.token".into(),
+            session: session_from_claims(&concurrent_claims, 3, 3).unwrap(),
+            claims: concurrent_claims,
+        };
+        let expected = concurrent.clone();
+
+        assert!(apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            move |_, _, _, _| async move {
+                racing_state.inner.lock().await.lease = Some(concurrent);
+                Ok(())
+            },
+            |_| async {},
+        )
+        .await
+        .is_err());
+        let client = state.inner.lock().await;
+        assert_eq!(client.lease.as_ref(), Some(&expected));
+        assert!(client.pending_revoke.is_none());
+        assert_eq!(client.urgent_control_frames.len(), 1);
+        assert!(client.applying_lease_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn current_narrow_grants_block_queued_status_native_work_and_heartbeats() {
+        let pending_state = V2State::default();
+        let (mut pending_client, prepared) =
+            lease_status_client(LeaseMode::Takeover, LeasePhase::Prepared);
+        // The old projected snapshot deliberately remains broad. A rotated
+        // managed admission is independent, fresher authority.
+        pending_client.admission_grants = Some(vec![Grant::StateRead, Grant::RtcSignal]);
+        pending_client.pending = Some(pending_lease_for(&prepared));
+        *pending_state.inner.lock().await = pending_client;
+        let frame = lease_status_frame("claim_provisional", "signed.old.broad.token", prepared);
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let native_calls = Arc::new(AtomicU64::new(0));
+        let counted = native_calls.clone();
+        assert!(apply_lease_status_transaction(
+            &pending_state,
+            "app_a",
+            frame,
+            &encoded,
+            move |_, _, _, _| {
+                counted.fetch_add(1, Ordering::AcqRel);
+                async { Ok(()) }
+            },
+            |_| async {},
+        )
+        .await
+        .is_err());
+        assert_eq!(native_calls.load(Ordering::Acquire), 0);
+        let pending_client = pending_state.inner.lock().await;
+        assert!(pending_client.pending.is_some());
+        assert!(pending_client.lease.is_none());
+        assert!(pending_client.applying_lease_status.is_none());
+        drop(pending_client);
+
+        let active_state = V2State::default();
+        let (mut active_client, active) =
+            lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        active_client.admission_grants = Some(vec![Grant::StateRead]);
+        active_client.lease = Some(ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.old.active.token".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active,
+        });
+        *active_state.inner.lock().await = active_client;
+        assert!(heartbeat_frame(&active_state, "app_a")
+            .await
+            .unwrap()
+            .is_none());
+
+        let offer_state = V2State::default();
+        let mut offered = offered_client(LeaseMode::Takeover, MobileOfferSurface::InApp);
+        offered.admission_grants = Some(vec![Grant::StateRead, Grant::RtcSignal]);
+        *offer_state.inner.lock().await = offered;
+        assert!(
+            prepare_offer_answer(&offer_state, LeaseMode::Takeover, None)
+                .await
+                .is_err()
+        );
+        assert!(offer_state.inner.lock().await.pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_current_consent_blocks_active_consult_before_native_and_heartbeat() {
+        let state = V2State::default();
+        let (mut client, mut prepared) =
+            lease_status_client(LeaseMode::Consult, LeasePhase::Prepared);
+        prepared.expires_at = unix_now().unwrap() + 10;
+        client
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .remote_consent
+            .expires_at = Some("2000-01-01T00:00:00Z".into());
+        client.lease = Some(ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.consult.prepared".into(),
+            session: session_from_claims(&prepared, 1, 1).unwrap(),
+            claims: prepared.clone(),
+        });
+        *state.inner.lock().await = client;
+
+        let mut active = prepared;
+        active.phase = LeasePhase::Active;
+        active.tracks = tracks_for(LeaseMode::Consult, LeasePhase::Active);
+        active.owner_epoch += 1;
+        active.expires_at += 1;
+        active.jti = "lease_consult_expired_consent".into();
+        let frame = lease_status_frame("claim_active", "signed.consult.active", active);
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let native_calls = Arc::new(AtomicU64::new(0));
+        let counted = native_calls.clone();
+        assert!(apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            move |_, _, _, _| {
+                counted.fetch_add(1, Ordering::AcqRel);
+                async { Ok(()) }
+            },
+            |_| async {},
+        )
+        .await
+        .is_err());
+        assert_eq!(native_calls.load(Ordering::Acquire), 0);
+        assert!(heartbeat_frame(&state, "app_a").await.unwrap().is_none());
+        assert_eq!(
+            state
+                .inner
+                .lock()
+                .await
+                .lease
+                .as_ref()
+                .unwrap()
+                .session
+                .binding
+                .mode,
+            MediaMode::PreparedConsult,
+        );
+    }
+
+    #[test]
+    fn admission_rotation_immediately_extracts_takeover_and_consult_for_exact_return() {
+        for mode in [LeaseMode::Takeover, LeaseMode::Consult] {
+            let state = V2State::default();
+            let (mut client, active) = lease_status_client(mode, LeasePhase::Active);
+            let token = format!("signed.{mode:?}.token");
+            client.lease = Some(ClientLease {
+                request_id: "request_a".into(),
+                token: token.clone(),
+                session: session_from_claims(&active, 2, 2).unwrap(),
+                claims: active.clone(),
+            });
+            let deescalation = apply_rotated_admission_grants(
+                &mut client,
+                &[Grant::StateRead, Grant::RtcSignal, Grant::Monitor],
+            );
+            assert!(client.lease.is_none(), "{mode:?} must stop immediately");
+            let lease = deescalation.lease.expect("exact lease to close and return");
+            assert_eq!(lease.token, token);
+            assert_eq!(lease.claims.jti, active.jti);
+            queue_exact_lease_revocation(&state, &mut client, &lease, "admission_grant_revoked")
+                .unwrap();
+            let urgent = client.urgent_control_frames.front().unwrap();
+            assert_eq!(urgent.lease_jti, active.jti);
+            assert_eq!(urgent.rtc_session_id, active.rtc_session_id);
+            let revoke: LeaseRevokeFrame = serde_json::from_str(&urgent.encoded).unwrap();
+            assert_eq!(revoke.lease_token, token);
+            assert!(client.pending_revoke.is_some());
+        }
+    }
+
     #[test]
     fn prepared_takeover_has_no_armable_microphone() {
         let takeover =
@@ -5005,10 +7205,51 @@ mod tests {
             session_from_claims(&claims(LeaseMode::Consult, LeasePhase::Prepared), 1, 1).unwrap();
         assert_eq!(prepared.binding.mode, MediaMode::PreparedConsult);
         assert!(!prepared.binding.mode.needs_microphone());
+        assert!(!lease_operation_auto_arms_private_consult(
+            LeaseOperation::Create,
+            &prepared,
+        ));
         let active =
             session_from_claims(&claims(LeaseMode::Consult, LeasePhase::Active), 2, 2).unwrap();
         assert_eq!(active.binding.mode, MediaMode::Consult);
         assert!(active.binding.mode.needs_microphone());
+        assert!(lease_operation_auto_arms_private_consult(
+            LeaseOperation::Create,
+            &active,
+        ));
+        assert!(!lease_operation_auto_arms_private_consult(
+            LeaseOperation::Renew,
+            &active,
+        ));
+        let takeover =
+            session_from_claims(&claims(LeaseMode::Takeover, LeasePhase::Active), 2, 2).unwrap();
+        assert!(!lease_operation_auto_arms_private_consult(
+            LeaseOperation::Create,
+            &takeover,
+        ));
+    }
+
+    #[test]
+    fn failed_consult_surrender_is_exact_session_fenced() {
+        let (mut client, active_claims) =
+            lease_status_client(LeaseMode::Consult, LeasePhase::Active);
+        let exact = ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.consult.token".into(),
+            session: session_from_claims(&active_claims, 2, 2).unwrap(),
+            claims: active_claims,
+        };
+        client.lease = Some(exact.clone());
+
+        let mut stale_session = exact.session.clone();
+        stale_session.transport_generation += 1;
+        assert!(take_failed_private_consult(&mut client, &stale_session).is_none());
+        assert_eq!(client.lease.as_ref(), Some(&exact));
+
+        let returned = take_failed_private_consult(&mut client, &exact.session)
+            .expect("exact failed Consult is returned");
+        assert_eq!(returned, exact);
+        assert!(client.lease.is_none());
     }
 
     #[test]
@@ -5076,6 +7317,7 @@ mod tests {
             caller: None,
             captions: Vec::new(),
             audio_levels: None,
+            pending_mobile_offers: Vec::new(),
             occurred_at: Utc::now().to_rfc3339(),
         }
     }
@@ -5083,6 +7325,7 @@ mod tests {
     fn verified_shim() -> GatewayShim {
         let mut shim = GatewayShim::new(
             "app_a".into(),
+            "device_a".into(),
             vec![Grant::StateRead, Grant::Monitor],
             "desktop_key_thumbprint_1".into(),
         );
@@ -5102,6 +7345,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             app_id: app_id.into(),
             event_id: "event_1".into(),
+            device_id: Some("device_a".into()),
             snapshot: authoritative_snapshot(),
         })
         .expect("fixture encodes")
@@ -5131,106 +7375,1151 @@ mod tests {
             .validate()
             .expect("the projection passes the protocol's own validator");
         assert_eq!(frame.snapshot.call_id, "call_a");
-        // Neither is something the plugin publishes, and inventing either would
-        // assert state no endpoint authored.
+        // Participant presence is a gateway-side roster the plugin does not
+        // publish, and inventing it would assert state no endpoint authored.
         assert!(frame.snapshot.participants.is_empty());
+        // Offers ARE published on this carrier — this fixture simply carries
+        // none, and an absent offer must never become a present one.
         assert!(frame.snapshot.pending_mobile_offers.is_empty());
         assert_eq!(frame.grants, vec![Grant::StateRead, Grant::Monitor]);
     }
 
-    /// ⚠️ THE safety constraint of the relay carrier.
+    // ---- relay lease authority: plugin dialect in, mobile dialect out ----
+
+    fn offer_for(
+        thumbprint: &str,
+        mode: LeaseMode,
+        surface: MobileOfferSurface,
+        offer_id: &str,
+        jti: &str,
+    ) -> SignedPendingMobileOffer {
+        let now = unix_now().expect("clock");
+        SignedPendingMobileOffer {
+            offer: aokie_protocol::v2::PendingMobileOfferClaims {
+                offer_id: offer_id.into(),
+                opportunity_id: "opportunity_relay".into(),
+                target_device_id: "device_a".into(),
+                target_holder_key_thumbprint: thumbprint.into(),
+                offered_mode: mode,
+                surface,
+                app_id: "app_a".into(),
+                call_id: "call_a".into(),
+                call_epoch: 1,
+                owner_epoch: 0,
+                switchboard_revision: 1,
+                remote_revision: 1,
+                required_consent_policy_id: "aokie_remote_access".into(),
+                required_consent_policy_version: 3,
+                required_grants: vec![
+                    Grant::StateRead,
+                    Grant::RtcSignal,
+                    grant_for_requested_mode(mode).expect("mode grant"),
+                ],
+                issued_at: now,
+                // The authority mints inside `MOBILE_OFFER_MAX_LIFETIME` and
+                // republishes every snapshot, so an offer is always well clear
+                // of expiry by the time a device can answer it.
+                expires_at: now + 25,
+                jti: jti.into(),
+            },
+            offer_token: "signed.offer.token".into(),
+        }
+    }
+
+    /// An authoritative snapshot whose consent actually permits `mode`, so the
+    /// offers it carries are answerable rather than merely well-formed.
+    fn authoritative_snapshot_offering(
+        mode: LeaseMode,
+        offers: Vec<SignedPendingMobileOffer>,
+    ) -> aokie_protocol::v2::AuthoritativeCallSnapshot {
+        let mut snapshot = authoritative_snapshot();
+        snapshot.remote_capabilities = RemoteCapabilities {
+            software_hold: mode == LeaseMode::Consult,
+            carrier_hold_evidence: CarrierHoldEvidence::Unknown,
+            secondary_call_observation: SecondaryCallObservation::Unknown,
+            voice_consult: mode == LeaseMode::Consult,
+            takeover: mode == LeaseMode::Takeover,
+        };
+        snapshot.remote_consent = aokie_protocol::v2::RemoteConsentPolicy {
+            policy_id: "aokie_remote_access".into(),
+            policy_version: 3,
+            enabled: true,
+            acknowledged: true,
+            acknowledged_at: Some("2026-07-16T00:00:00Z".into()),
+            expires_at: None,
+            captions_enabled: false,
+            assistance_enabled: false,
+            monitor_enabled: mode == LeaseMode::Monitor,
+            consult_enabled: mode == LeaseMode::Consult,
+            takeover_enabled: mode == LeaseMode::Takeover,
+        };
+        snapshot.pending_mobile_offers = offers;
+        snapshot
+    }
+
+    fn shim_granting(grants: Vec<Grant>) -> GatewayShim {
+        let mut shim = GatewayShim::new(
+            "app_a".into(),
+            "device_a".into(),
+            grants,
+            "desktop_key_thumbprint_1".into(),
+        );
+        shim.peer_verified = true;
+        shim
+    }
+
+    fn plugin_frame(value: Value) -> String {
+        value.to_string()
+    }
+
+    /// A genuinely signed, plugin-role end-of-candidates envelope.
     ///
-    /// The live plugin's dispatcher accepts eight gateway-dialect kinds and
-    /// ends in `_ => Err(reconnect("unsupported frame"))`; its relay carrier
-    /// admits any frame from an approved roster member. Over the socket a
-    /// gateway translated the mobile dialect into that one, and on the relay
-    /// nothing does — so once this Companion is approved, ANY frame it posts
-    /// tears down the session of a desktop answering a real phone line, and
-    /// does it again on every retry. Nothing goes out until the plugin ships
-    /// handlers.
+    /// ⚠️ Hand-rolled JSON would be worthless here: `PluginRtcSignalFrame`
+    /// verifies the signature AND pins all twelve route fields against the
+    /// frame's own, so a fixture that skipped either would prove the
+    /// pass-through accepts things the real path never sees.
+    fn plugin_ice_complete_signal(app_id: &str) -> Value {
+        let plugin = crate::endpoint_identity::EndpointIdentity::from_secret([31; 32])
+            .expect("test plugin identity");
+        let now = unix_now().expect("clock");
+        let envelope = plugin
+            .sign_candidate(TrickleCandidateClaims {
+                app_id: app_id.into(),
+                plugin_id: "plugin_a".into(),
+                device_id: "device_a".into(),
+                rtc_session_id: "rtc_a".into(),
+                endpoint_session_nonce: "session_p".into(),
+                lease_jti: "lease_a".into(),
+                endpoint_role: AdmissionRole::Plugin,
+                holder_key_thumbprint: plugin.thumbprint().into(),
+                peer_key_thumbprint: "mobile_key_a".into(),
+                call_id: "call_a".into(),
+                call_epoch: 7,
+                owner_epoch: 4,
+                fence: 9,
+                sdp_revision: 1,
+                transport_generation: 1,
+                candidate: None,
+                sdp_mid: None,
+                sdp_m_line_index: None,
+                end_of_candidates: true,
+                nonce: "ice_nonce_p".into(),
+                jti: "ice_proof_p".into(),
+                issued_at: now,
+                expires_at: now + 20,
+            })
+            .expect("the candidate envelope signs");
+        serde_json::json!({ "type": "ice_complete", "envelope": envelope })
+    }
+
+    fn plugin_rtc_frame(app_id: &str) -> String {
+        plugin_frame(serde_json::json!({
+            "kind": "rtc_signal",
+            "schemaVersion": SCHEMA_VERSION,
+            "appId": app_id,
+            "signalId": "signal_a",
+            "pluginId": "plugin_a",
+            "deviceId": "device_a",
+            "leaseJti": "lease_a",
+            "rtcSessionId": "rtc_a",
+            "sdpRevision": 1,
+            "transportGeneration": 1,
+            "callId": "call_a",
+            "callEpoch": 7,
+            "ownerEpoch": 4,
+            "fence": 9,
+            "signal": plugin_ice_complete_signal(app_id),
+        }))
+    }
+
+    fn plugin_lease_status_frame(
+        status: PluginLeaseStatus,
+        mode: LeaseMode,
+        phase: LeasePhase,
+    ) -> String {
+        serde_json::to_string(&PluginLeaseStatusFrame {
+            kind: "plugin_lease_status".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            device_id: "device_a".into(),
+            request_id: "request_a".into(),
+            status,
+            lease_token: "signed.lease.token".into(),
+            lease: claims(mode, phase),
+        })
+        .expect("fixture encodes")
+    }
+
+    /// The gap the operator actually hit: the Desktop published offers and the
+    /// shim threw them away, so `select_mobile_offer` could never find one and
+    /// every takeover failed locally with "no current signed mobile offer
+    /// permits this lease".
     #[test]
-    fn the_relay_withholds_every_outbound_frame_unless_explicitly_opted_in() {
-        assert!(
-            !relay_send_opt_in(),
-            "posting to the plugin must never be the default"
+    fn the_shim_projects_offers_the_desktop_published() {
+        let mut shim = shim_granting(vec![
+            Grant::StateRead,
+            Grant::RtcSignal,
+            Grant::Takeover,
+            Grant::ResumeAokie,
+        ]);
+        let offers = vec![
+            offer_for(
+                "mobile_thumb_a",
+                LeaseMode::Takeover,
+                MobileOfferSurface::InApp,
+                "offer_in_app",
+                "offer_jti_in_app",
+            ),
+            offer_for(
+                "mobile_thumb_a",
+                LeaseMode::Takeover,
+                MobileOfferSurface::VoiceSystemUi,
+                "offer_voice_ui",
+                "offer_jti_voice_ui",
+            ),
+        ];
+        let encoded = serde_json::to_string(&PluginSnapshotFrame {
+            kind: "plugin_snapshot".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            event_id: "event_offers".into(),
+            device_id: Some("device_a".into()),
+            snapshot: authoritative_snapshot_offering(LeaseMode::Takeover, offers.clone()),
+        })
+        .expect("fixture encodes");
+
+        let translated = shim
+            .translate(&encoded)
+            .expect("a snapshot carrying offers translates")
+            .expect("a snapshot is a session frame");
+        let frame: MobileSnapshotFrame =
+            serde_json::from_str(&translated).expect("the translation is a mobile snapshot");
+
+        // Relayed verbatim: the offer is the Desktop's statement, and the shim
+        // is not entitled to edit one.
+        assert_eq!(frame.snapshot.pending_mobile_offers, offers);
+        validate_snapshot(&frame, "app_a").expect("the translation passes the session's own gate");
+    }
+
+    /// Relay mail can outlive the admission that caused the Desktop to publish
+    /// it. The CURRENT shim grants and exact device target are therefore the
+    /// disclosure boundary, never the breadth of the queued snapshot itself.
+    #[test]
+    fn queued_full_snapshot_is_redacted_by_current_narrow_grants_and_device() {
+        let mut full = authoritative_snapshot_offering(
+            LeaseMode::Takeover,
+            vec![offer_for(
+                "mobile_thumb_a",
+                LeaseMode::Takeover,
+                MobileOfferSurface::InApp,
+                "offer_old_full",
+                "offer_jti_old_full",
+            )],
+        );
+        full.caller = Some(aokie_protocol::v2::CallerProjection {
+            label: Some("Private caller".into()),
+            masked_number: Some("04•••123".into()),
+        });
+        full.audio_levels = Some(vec![aokie_protocol::v2::NormalizedAudioLevel {
+            source: aokie_protocol::v2::AudioLevelSource::Caller,
+            participant_id: None,
+            level_permille: 420,
+        }]);
+        let frame_for = |device_id: Option<&str>| {
+            serde_json::to_string(&PluginSnapshotFrame {
+                kind: "plugin_snapshot".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                event_id: "event_old_full".into(),
+                device_id: device_id.map(str::to_owned),
+                snapshot: full.clone(),
+            })
+            .unwrap()
+        };
+
+        let mut narrow = shim_granting(vec![Grant::StateRead]);
+        let translated = narrow
+            .translate(&frame_for(Some("device_a")))
+            .unwrap()
+            .expect("an exact-device snapshot still projects safe state");
+        let projected: MobileSnapshotFrame = serde_json::from_str(&translated).unwrap();
+        assert!(projected.snapshot.caller.is_none());
+        assert!(projected.snapshot.captions.is_none());
+        assert!(projected.snapshot.audio_levels.is_none());
+        assert!(projected.snapshot.pending_mobile_offers.is_empty());
+        assert_eq!(projected.grants, vec![Grant::StateRead]);
+
+        let mut missing_target = shim_granting(vec![Grant::StateRead]);
+        assert_eq!(missing_target.translate(&frame_for(None)), Ok(None));
+        let mut wrong_target = shim_granting(vec![Grant::StateRead]);
+        assert_eq!(
+            wrong_target.translate(&frame_for(Some("device_other"))),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn relay_projection_hides_unsupported_actions_but_keeps_voice_consult_inputs() {
+        let mut shim = shim_granting(vec![
+            Grant::StateRead,
+            Grant::RtcSignal,
+            Grant::AssistanceRead,
+            Grant::AssistanceRespond,
+            Grant::Consult,
+            Grant::EndCaller,
+        ]);
+        let translated = shim
+            .translate(&plugin_snapshot_frame())
+            .unwrap()
+            .expect("verified relay snapshot");
+        let snapshot: MobileSnapshotFrame = serde_json::from_str(&translated).unwrap();
+        assert!(snapshot.grants.contains(&Grant::AssistanceRead));
+        assert!(snapshot.grants.contains(&Grant::Consult));
+        assert!(!snapshot.grants.contains(&Grant::AssistanceRespond));
+        assert!(!snapshot.grants.contains(&Grant::EndCaller));
+
+        let relay_client = ClientState {
+            relay_transport: true,
+            ..ClientState::default()
+        };
+        assert_eq!(
+            require_supported_user_action(&relay_client, RelayUnsupportedAction::AssistanceAnswer,),
+            Err(RELAY_ASSISTANCE_UNSUPPORTED.into())
+        );
+        assert_eq!(
+            require_supported_user_action(&relay_client, RelayUnsupportedAction::EndCaller),
+            Err(RELAY_END_CALLER_UNSUPPORTED.into())
+        );
+        let socket_client = ClientState::default();
+        assert!(require_supported_user_action(
+            &socket_client,
+            RelayUnsupportedAction::AssistanceAnswer,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn queued_lease_status_is_dropped_when_current_admission_lacks_its_mode() {
+        let mut narrow = shim_granting(vec![Grant::StateRead, Grant::RtcSignal]);
+        assert_eq!(
+            narrow.translate(&plugin_lease_status_frame(
+                PluginLeaseStatus::Active,
+                LeaseMode::Takeover,
+                LeasePhase::Active,
+            )),
+            Ok(None)
         );
 
-        assert!(relay_send_opt_in_from(Some("1")));
-        for refused in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some(" 1")] {
+        let mut wrong_device: PluginLeaseStatusFrame =
+            serde_json::from_str(&plugin_lease_status_frame(
+                PluginLeaseStatus::Active,
+                LeaseMode::Takeover,
+                LeasePhase::Active,
+            ))
+            .unwrap();
+        wrong_device.device_id = "device_other".into();
+        // Keep the self-consistency validator meaningful by moving the lease
+        // with the target. The shim's own exact-device fence must still drop it.
+        wrong_device.lease.device_id = "device_other".into();
+        let mut broad = shim_granting(vec![
+            Grant::StateRead,
+            Grant::RtcSignal,
+            Grant::Takeover,
+            Grant::ResumeAokie,
+        ]);
+        assert_eq!(
+            broad.translate(&serde_json::to_string(&wrong_device).unwrap()),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn expired_queued_lease_status_is_stale_mail_but_malformed_status_still_fails() {
+        let mut expired: PluginLeaseStatusFrame = serde_json::from_str(&plugin_lease_status_frame(
+            PluginLeaseStatus::Active,
+            LeaseMode::Takeover,
+            LeasePhase::Active,
+        ))
+        .unwrap();
+        expired.lease.expires_at = unix_now().unwrap();
+        let mut shim = shim_granting(vec![
+            Grant::StateRead,
+            Grant::RtcSignal,
+            Grant::Takeover,
+            Grant::ResumeAokie,
+        ]);
+        assert_eq!(
+            shim.translate(&serde_json::to_string(&expired).unwrap()),
+            Ok(None)
+        );
+
+        let mut malformed = serde_json::to_value(expired).unwrap();
+        malformed.as_object_mut().unwrap().remove("leaseToken");
+        assert!(shim.translate(&malformed.to_string()).is_err());
+    }
+
+    /// Offers are authority, so they ride the same gate as every other piece of
+    /// authoritative state: a Desktop that has not proved its endpoint key
+    /// cannot put an answerable offer in front of the operator.
+    #[test]
+    fn offers_from_an_unproven_peer_are_dropped() {
+        let mut shim = GatewayShim::new(
+            "app_unproven_offers".into(),
+            "device_a".into(),
+            vec![Grant::StateRead, Grant::RtcSignal, Grant::Takeover],
+            "desktop_key_thumbprint_1".into(),
+        );
+        assert!(!shim.peer_verified);
+        let mut snapshot = authoritative_snapshot_offering(
+            LeaseMode::Takeover,
+            vec![offer_for(
+                "mobile_thumb_a",
+                LeaseMode::Takeover,
+                MobileOfferSurface::InApp,
+                "offer_in_app",
+                "offer_jti_in_app",
+            )],
+        );
+        snapshot.call_id = "call_a".into();
+        let encoded = serde_json::to_string(&PluginSnapshotFrame {
+            kind: "plugin_snapshot".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_unproven_offers".into(),
+            event_id: "event_offers".into(),
+            device_id: Some("device_a".into()),
+            snapshot,
+        })
+        .expect("fixture encodes");
+
+        assert_eq!(shim.translate(&encoded), Ok(None));
+    }
+
+    /// The plugin names a lease transition in a FIELD; the session branches on
+    /// the frame KIND, then cross-checks `provisional` against the phase. Get
+    /// the pairing wrong and a prepared claim would present as a live one.
+    #[test]
+    fn plugin_lease_status_maps_each_status_to_its_mobile_kind() {
+        let cases = [
+            (
+                PluginLeaseStatus::Granted,
+                LeaseMode::Monitor,
+                LeasePhase::Active,
+                "lease_granted",
+                None,
+            ),
+            (
+                PluginLeaseStatus::Provisional,
+                LeaseMode::Takeover,
+                LeasePhase::Prepared,
+                "claim_provisional",
+                Some(true),
+            ),
+            (
+                PluginLeaseStatus::Active,
+                LeaseMode::Takeover,
+                LeasePhase::Active,
+                "claim_active",
+                Some(false),
+            ),
+            (
+                PluginLeaseStatus::Renewed,
+                LeaseMode::Takeover,
+                LeasePhase::Active,
+                "lease_renewed",
+                None,
+            ),
+        ];
+
+        for (status, mode, phase, expected_kind, expected_provisional) in cases {
+            let mut grants = vec![
+                Grant::StateRead,
+                Grant::RtcSignal,
+                grant_for_requested_mode(mode).unwrap(),
+            ];
+            if mode == LeaseMode::Takeover {
+                grants.push(Grant::ResumeAokie);
+            }
+            let mut shim = shim_granting(grants);
+            let translated = shim
+                .translate(&plugin_lease_status_frame(status, mode, phase))
+                .expect("a well-formed lease status translates")
+                .expect("a lease status is a session frame");
+            let frame: LeaseStatusFrame =
+                serde_json::from_str(&translated).expect("the translation is a lease status");
+            assert_eq!(frame.kind, expected_kind);
+            assert_eq!(frame.provisional, expected_provisional);
+            assert_eq!(frame.request_id, "request_a");
+            assert_eq!(frame.lease_token, "signed.lease.token");
+            assert_eq!(frame.lease, claims(mode, phase));
+            // The routing field has done its job and must not survive into the
+            // mobile dialect, whose twin has no room for it.
+            assert!(!translated.contains("deviceId\":\"device_a\",\"requestId"));
+        }
+    }
+
+    /// ⚠️ CALLER SAFETY. A prepared lease has already silenced the AI
+    /// receptionist, so it is deliberately non-renewable: refusing this
+    /// translation is what stops a stuck prepare from heartbeating itself alive
+    /// and holding a live caller in soft hold past its short lifetime.
+    #[test]
+    fn a_prepared_lease_can_never_be_renewed() {
+        let mut shim = shim_granting(vec![
+            Grant::StateRead,
+            Grant::RtcSignal,
+            Grant::Takeover,
+            Grant::ResumeAokie,
+        ]);
+        assert!(shim
+            .translate(&plugin_lease_status_frame(
+                PluginLeaseStatus::Renewed,
+                LeaseMode::Takeover,
+                LeasePhase::Prepared,
+            ))
+            .is_err());
+    }
+
+    /// A status that contradicts the lease it carries would let one transition
+    /// deliver another transition's authority.
+    #[test]
+    fn a_lease_status_that_contradicts_its_own_claims_is_refused() {
+        for (status, mode, phase) in [
+            // "Granted" is the monitor-only wording: a takeover must never
+            // arrive already active without passing through prepare.
+            (
+                PluginLeaseStatus::Granted,
+                LeaseMode::Takeover,
+                LeasePhase::Active,
+            ),
+            // A monitor lease has no prepared phase to be provisional in.
+            (
+                PluginLeaseStatus::Provisional,
+                LeaseMode::Monitor,
+                LeasePhase::Active,
+            ),
+            (
+                PluginLeaseStatus::Active,
+                LeaseMode::Takeover,
+                LeasePhase::Prepared,
+            ),
+        ] {
+            let mut shim = shim_granting(vec![Grant::StateRead, Grant::Takeover]);
             assert!(
-                !relay_send_opt_in_from(refused),
-                "{refused:?} must not read as consent"
+                shim.translate(&plugin_lease_status_frame(status, mode, phase))
+                    .is_err(),
+                "{status:?} must not carry a {mode:?}/{phase:?} lease"
             );
         }
     }
 
-    /// Every kind this session can emit is fatal to today's plugin — by the
-    /// catch-all arm, or by a `deny_unknown_fields` twin that does not match.
-    /// Gating only `mobile_hello` would have left the rest of them live, which
-    /// is worse than the hello: a hello fires once per session, whereas
-    /// `end_caller_confirm` fires when a user taps a button mid-call.
     #[test]
-    fn no_frame_this_session_emits_is_one_the_plugin_can_accept() {
-        // The plugin's dispatcher arms, verbatim.
-        const PLUGIN_ACCEPTS: [&str; 8] = [
-            "claim_proposal",
-            "lease_granted",
-            "lease_renewed",
-            "lease_revoked",
-            "rtc_signal",
-            "assistance_answer",
-            "end_caller_execute",
-            "error",
-        ];
-        // Kinds this build posts, from the encode sites in this module.
-        const MOBILE_EMITS: [&str; 6] = [
-            "mobile_hello",
-            "lease_request",
-            "lease_heartbeat",
-            "end_caller_challenge_request",
-            "end_caller_confirm",
-            "assistance_answer",
-        ];
+    fn plugin_offer_accepted_translates_and_drops_the_device_id() {
+        let mut shim = shim_granting(vec![Grant::StateRead, Grant::Takeover]);
+        let encoded = serde_json::to_string(&PluginOfferAcceptedFrame {
+            kind: "plugin_offer_accepted".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            device_id: "device_a".into(),
+            request_id: "request_offer_a".into(),
+            offer_id: "offer_in_app".into(),
+            offer_jti: "offer_jti_in_app".into(),
+            offered_mode: LeaseMode::Takeover,
+            accepted: true,
+        })
+        .expect("fixture encodes");
 
-        for kind in MOBILE_EMITS {
-            if PLUGIN_ACCEPTS.contains(&kind) {
-                // The one overlapping name still fails: the twins are
-                // `deny_unknown_fields` and disagree on their members, so the
-                // plugin's parse — not its dispatch — is what tears down.
-                assert_eq!(kind, "assistance_answer");
-                let mobile = serde_json::to_string(&MobileAssistanceAnswerFrame {
-                    kind: kind.into(),
-                    schema_version: SCHEMA_VERSION,
-                    app_id: "app_a".into(),
-                    request_id: "request_a".into(),
-                    idempotency_key: "mobile:device_a:request_a".into(),
-                    answer_id: "answer_a".into(),
-                    call_id: "call_a".into(),
-                    call_epoch: 1,
-                    owner_epoch: 0,
-                    switchboard_revision: 1,
-                    remote_revision: 1,
-                    answer: "yes".into(),
-                })
-                .expect("fixture encodes");
-                assert!(
-                    serde_json::from_str::<aokie_protocol::v2::PluginAssistanceAnswerFrame>(
-                        &mobile
-                    )
-                    .is_err(),
-                    "the mobile assistance answer must not silently parse as the plugin's twin"
-                );
-            }
+        let translated = shim
+            .translate(&encoded)
+            .expect("a well-formed acceptance translates")
+            .expect("an acceptance is a session frame");
+        let frame: MobileOfferAcceptedFrame =
+            serde_json::from_str(&translated).expect("the translation is a mobile acceptance");
+        assert_eq!(frame.kind, "mobile_offer_accepted");
+        assert_eq!(frame.request_id, "request_offer_a");
+        assert_eq!(frame.offer_id, "offer_in_app");
+        assert_eq!(frame.offer_jti, "offer_jti_in_app");
+        assert_eq!(frame.offered_mode, LeaseMode::Takeover);
+        assert!(frame.accepted);
+        // `MobileOfferAcceptedFrame` is `deny_unknown_fields`, so a surviving
+        // routing field would fail the parse above — assert it plainly anyway.
+        assert!(!translated.contains("deviceId"));
+    }
+
+    /// ⚠️ CALLER SAFETY. This frame ALREADY arrives today and is dropped. The
+    /// plugin emits it when a media route fails, which is the same moment the
+    /// caller is handed back to the AI receptionist — so a Companion that
+    /// cannot read it goes on telling the operator they are on a call that has
+    /// already moved on without them.
+    ///
+    /// ⚠️ `requestId` is `None` DELIBERATELY, preserving the plugin's
+    /// media-failure dialect. It can race a local return: local WebRTC closes
+    /// before `lease_revoke` reaches Desktop, so the plugin may publish this
+    /// requestless notice while `pending_revoke` exists. The receiver accepts
+    /// `None` only on that sole pending return's exact `leaseId` + `leaseJti`
+    /// fence; otherwise it matches the active lease on the same pair. Inventing
+    /// a request id would falsely assert acknowledgement of a mobile request
+    /// the plugin never observed.
+    #[test]
+    fn plugin_lease_revoke_translates_to_lease_revoked_without_the_extra_fields() {
+        let mut shim = shim_granting(vec![Grant::StateRead, Grant::Takeover]);
+        let encoded = serde_json::to_string(&PluginLeaseRevokeFrame {
+            kind: "plugin_lease_revoke".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            device_id: "device_a".into(),
+            lease_id: "media_a".into(),
+            lease_jti: "lease_a".into(),
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            fence: 9,
+            reason: "peer_connection_failed".into(),
+        })
+        .expect("fixture encodes");
+
+        let translated = shim
+            .translate(&encoded)
+            .expect("a well-formed revoke translates")
+            .expect("a revoke is a session frame");
+        let frame: LeaseRevokedFrame =
+            serde_json::from_str(&translated).expect("the translation is a mobile revoke");
+        assert_eq!(frame.kind, "lease_revoked");
+        assert_eq!(frame.lease_id, "media_a");
+        assert_eq!(frame.lease_jti, "lease_a");
+        assert_eq!(frame.reason, "peer_connection_failed");
+        // The plugin revokes against a LEASE, not against a request this
+        // session is waiting on, so there is no request to name.
+        assert_eq!(frame.request_id, None);
+        for dropped in ["deviceId", "callId", "callEpoch", "fence", "requestId"] {
+            assert!(
+                !translated.contains(dropped),
+                "{dropped} has no home in the mobile twin"
+            );
+        }
+    }
+
+    /// Without this the operator watches a spinner until the local request
+    /// timeout expires, instead of being told why the claim was refused.
+    #[test]
+    fn plugin_claim_rejected_translates() {
+        let mut shim = shim_granting(vec![Grant::StateRead, Grant::Takeover]);
+        let encoded = serde_json::to_string(&PluginClaimRejectedFrame {
+            kind: "plugin_claim_rejected".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            device_id: "device_a".into(),
+            request_id: "request_a".into(),
+            code: "claimant_busy".into(),
+            message: "another device is already preparing a claim".into(),
+        })
+        .expect("fixture encodes");
+
+        let translated = shim
+            .translate(&encoded)
+            .expect("a well-formed rejection translates")
+            .expect("a rejection is a session frame");
+        let frame: ClaimRejectedFrame =
+            serde_json::from_str(&translated).expect("the translation is a mobile rejection");
+        assert_eq!(frame.kind, "claim_rejected");
+        assert_eq!(frame.request_id, "request_a");
+        assert_eq!(frame.code, "claimant_busy");
+        assert_eq!(frame.message, "another device is already preparing a claim");
+        assert!(!translated.contains("deviceId"));
+    }
+
+    #[test]
+    fn assistance_request_passes_only_under_current_read_grant() {
+        let frame = PluginAssistanceRequestFrame {
+            kind: "assistance_request".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            event_id: "assistance_event_a".into(),
+            request_id: "assistance_request_a".into(),
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            owner_epoch: 4,
+            switchboard_revision: 11,
+            remote_revision: 13,
+            question: "Can you advise?".into(),
+            context: None,
+            expires_at: unix_now().unwrap() + 20,
+        };
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let mut permitted = shim_granting(vec![
+            Grant::StateRead,
+            Grant::AssistanceRead,
+            Grant::Consult,
+        ]);
+        assert_eq!(permitted.translate(&encoded), Ok(Some(encoded.clone())));
+
+        let mut narrowed = shim_granting(vec![Grant::StateRead, Grant::Consult]);
+        assert_eq!(narrowed.translate(&encoded), Ok(None));
+    }
+
+    #[test]
+    fn expired_queued_assistance_is_stale_mail_but_malformed_request_still_fails() {
+        let mut frame = PluginAssistanceRequestFrame {
+            kind: "assistance_request".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            event_id: "assistance_event_expired".into(),
+            request_id: "assistance_request_expired".into(),
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            owner_epoch: 4,
+            switchboard_revision: 11,
+            remote_revision: 13,
+            question: "Can you advise?".into(),
+            context: None,
+            expires_at: unix_now().unwrap(),
+        };
+        let mut shim = shim_granting(vec![Grant::StateRead, Grant::AssistanceRead]);
+        assert_eq!(
+            shim.translate(&serde_json::to_string(&frame).unwrap()),
+            Ok(None)
+        );
+
+        frame.expires_at = unix_now().unwrap() + 20;
+        let mut malformed = serde_json::to_value(frame).unwrap();
+        malformed.as_object_mut().unwrap().remove("question");
+        assert!(shim.translate(&malformed.to_string()).is_err());
+    }
+
+    /// The one frame that needs no rename. Re-encoding it could only introduce
+    /// drift, and an SDP or ICE payload that drifts is a media path that never
+    /// connects.
+    #[test]
+    fn rtc_signal_passes_through_byte_identically() {
+        let mut shim = shim_granting(vec![
+            Grant::StateRead,
+            Grant::RtcSignal,
+            Grant::Takeover,
+            Grant::ResumeAokie,
+        ]);
+        let encoded = plugin_rtc_frame("app_a");
+
+        let translated = shim
+            .translate(&encoded)
+            .expect("a well-formed RTC signal translates")
+            .expect("an RTC signal is a session frame");
+        assert_eq!(translated, encoded, "an RTC signal must not be rewritten");
+        // And the session's own parser accepts what came back.
+        let frame: GatewayRtcFrame =
+            serde_json::from_str(&translated).expect("the pass-through is a session RTC frame");
+        assert_eq!(frame.signal_id, "signal_a");
+        assert_eq!(frame.lease_jti, "lease_a");
+    }
+
+    /// Widening the translated subset moved a boundary, so pin both sides of
+    /// it.
+    ///
+    /// A kind the shim does not translate is carrier traffic and drops quietly
+    /// — a future plugin must be able to say things this build has never heard
+    /// of without churning the read path. A kind it DOES translate, arriving
+    /// malformed, is refused loudly instead, exactly as `plugin_snapshot` has
+    /// always been: acting on half a lease frame is not an option, and a
+    /// silent drop would hide real drift between two halves that ship
+    /// independently.
+    #[test]
+    fn an_untranslated_plugin_kind_is_still_dropped_rather_than_erroring() {
+        let mut shim = shim_granting(vec![Grant::StateRead, Grant::Monitor]);
+        for kind in ["end_caller_challenge", "something_a_future_plugin_invents"] {
+            let encoded = plugin_frame(serde_json::json!({
+                "kind": kind,
+                "schemaVersion": SCHEMA_VERSION,
+                "appId": "app_a",
+            }));
+            assert_eq!(shim.translate(&encoded), Ok(None), "{kind} must be dropped");
         }
 
-        // And the rtc signal the local media path emits, for the same reason.
+        for translated in [
+            "plugin_offer_accepted",
+            "plugin_lease_status",
+            "plugin_claim_rejected",
+            "plugin_lease_revoke",
+            "rtc_signal",
+        ] {
+            let encoded = plugin_frame(serde_json::json!({
+                "kind": translated,
+                "schemaVersion": SCHEMA_VERSION,
+                "appId": "app_a",
+            }));
+            assert!(
+                shim.translate(&encoded).is_err(),
+                "a malformed {translated} must be refused, not swallowed"
+            );
+        }
+    }
+
+    /// One Desktop can hold admissions for several apps. Authority minted for
+    /// one of them must never be honoured under another.
+    #[test]
+    fn a_translated_frame_bound_to_another_app_is_refused() {
+        let foreign_status = serde_json::to_string(&PluginLeaseStatusFrame {
+            kind: "plugin_lease_status".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_other".into(),
+            device_id: "device_a".into(),
+            request_id: "request_a".into(),
+            status: PluginLeaseStatus::Granted,
+            lease_token: "signed.lease.token".into(),
+            lease: claims(LeaseMode::Monitor, LeasePhase::Active),
+        })
+        .expect("fixture encodes");
+        let foreign_rejection = serde_json::to_string(&PluginClaimRejectedFrame {
+            kind: "plugin_claim_rejected".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_other".into(),
+            device_id: "device_a".into(),
+            request_id: "request_a".into(),
+            code: "stale_call".into(),
+            message: "the call moved on".into(),
+        })
+        .expect("fixture encodes");
+        let foreign_revoke = serde_json::to_string(&PluginLeaseRevokeFrame {
+            kind: "plugin_lease_revoke".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_other".into(),
+            device_id: "device_a".into(),
+            lease_id: "media_a".into(),
+            lease_jti: "lease_a".into(),
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            fence: 9,
+            reason: "peer_connection_failed".into(),
+        })
+        .expect("fixture encodes");
+        let foreign_acceptance = serde_json::to_string(&PluginOfferAcceptedFrame {
+            kind: "plugin_offer_accepted".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_other".into(),
+            device_id: "device_a".into(),
+            request_id: "request_a".into(),
+            offer_id: "offer_in_app".into(),
+            offer_jti: "offer_jti_in_app".into(),
+            offered_mode: LeaseMode::Monitor,
+            accepted: true,
+        })
+        .expect("fixture encodes");
+        let foreign_rtc = plugin_rtc_frame("app_other");
+
+        for encoded in [
+            foreign_status,
+            foreign_rejection,
+            foreign_revoke,
+            foreign_acceptance,
+            foreign_rtc,
+        ] {
+            let mut shim = shim_granting(vec![Grant::StateRead, Grant::RtcSignal, Grant::Monitor]);
+            assert!(
+                shim.translate(&encoded).is_err(),
+                "a frame bound to another app must be refused: {encoded}"
+            );
+        }
+    }
+
+    /// Everything the operator's takeover press actually walks, end to end:
+    /// the Desktop publishes a signed offer inside an authoritative snapshot,
+    /// the shim projects it, the session stores it, and `select_mobile_offer`
+    /// finds it.
+    ///
+    /// ⚠️ THIS IS THE REGRESSION TEST FOR THE REPORTED BUG. Every link existed
+    /// already except the projection, which discarded the offers — so the
+    /// selector had nothing to match, every press failed locally with "no
+    /// current signed mobile offer permits this lease", and the relay never saw
+    /// a single frame. Driving the real snapshot through the real shim into the
+    /// real selector is the only arrangement that would have caught it; a test
+    /// that hand-built the projected snapshot passes with the bug present.
+    struct PreparedRelayTakeover {
+        shim: GatewayShim,
+        state: V2State,
+        answer: MobileOfferAnswerFrame,
+        lease_request_id: String,
+    }
+
+    async fn prepare_relay_takeover_after(
+        offers: Vec<SignedPendingMobileOffer>,
+    ) -> Result<PreparedRelayTakeover, String> {
+        let identity = crate::endpoint_identity::EndpointIdentity::from_secret([9; 32])
+            .expect("test endpoint identity");
+        let mut shim = shim_granting(vec![
+            Grant::StateRead,
+            Grant::RtcSignal,
+            Grant::Takeover,
+            Grant::ResumeAokie,
+        ]);
+        let encoded = serde_json::to_string(&PluginSnapshotFrame {
+            kind: "plugin_snapshot".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            event_id: "event_offers".into(),
+            device_id: Some("device_a".into()),
+            snapshot: authoritative_snapshot_offering(LeaseMode::Takeover, offers),
+        })
+        .expect("fixture encodes");
+        let translated = shim
+            .translate(&encoded)
+            .expect("the snapshot translates")
+            .expect("a snapshot is a session frame");
+        let snapshot: MobileSnapshotFrame =
+            serde_json::from_str(&translated).expect("the translation is a mobile snapshot");
+
+        let state = V2State::default();
+        *state.inner.lock().await = ClientState {
+            generation: 1,
+            app_id: Some("app_a".into()),
+            device_id: Some("device_a".into()),
+            session_nonce: Some("session_a".into()),
+            endpoint_identity: Some(identity),
+            snapshot: Some(snapshot),
+            ..ClientState::default()
+        };
+
+        let (answer, lease_request_id) =
+            prepare_offer_answer(&state, LeaseMode::Takeover, None).await?;
+        Ok(PreparedRelayTakeover {
+            shim,
+            state,
+            answer,
+            lease_request_id,
+        })
+    }
+
+    async fn takeover_press_after(offers: Vec<SignedPendingMobileOffer>) -> Result<String, String> {
+        let prepared = prepare_relay_takeover_after(offers).await?;
         assert!(
-            serde_json::from_str::<aokie_protocol::v2::PluginRtcSignalFrame>(
-                "{\"kind\":\"rtc_signal\",\"schemaVersion\":1,\"appId\":\"app_a\",\"signalId\":\"s\",\"pluginId\":\"aokie\",\"deviceId\":\"d\",\"leaseToken\":\"t\",\"leaseJti\":\"j\",\"rtcSessionId\":\"r\",\"sdpRevision\":1}"
-            )
-            .is_err(),
-            "leaseToken has no home in the plugin's twin"
+            prepared
+                .state
+                .inner
+                .lock()
+                .await
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.stage == PendingLeaseStage::AwaitingOfferAcceptance),
+            "the press must leave a pending lease awaiting the authority's acceptance"
         );
+        assert_eq!(prepared.answer.kind, "mobile_offer_answer");
+        assert_eq!(prepared.answer.offered_mode, LeaseMode::Takeover);
+        Ok(prepared.answer.offer_id)
+    }
+
+    #[tokio::test]
+    async fn pressing_takeover_enqueues_a_mobile_offer_answer_when_the_snapshot_carries_a_matching_offer(
+    ) {
+        let identity = crate::endpoint_identity::EndpointIdentity::from_secret([9; 32])
+            .expect("test endpoint identity");
+        let offer_id = takeover_press_after(vec![
+            offer_for(
+                identity.thumbprint(),
+                LeaseMode::Takeover,
+                MobileOfferSurface::InApp,
+                "offer_in_app",
+                "offer_jti_in_app",
+            ),
+            // A second offer for a DIFFERENT surface must not make the in-app
+            // press ambiguous: Android's system call UI is answered by its own
+            // path, with its own offer.
+            offer_for(
+                identity.thumbprint(),
+                LeaseMode::Takeover,
+                MobileOfferSurface::VoiceSystemUi,
+                "offer_voice_ui",
+                "offer_jti_voice_ui",
+            ),
+        ])
+        .await
+        .expect("a published, matching in-app offer makes takeover pressable");
+        assert_eq!(offer_id, "offer_in_app");
+    }
+
+    #[tokio::test]
+    async fn old_plugin_snapshot_without_a_signed_offer_cannot_emit_a_claim() {
+        let error = takeover_press_after(Vec::new())
+            .await
+            .expect_err("an old plugin publishes no offer to redeem");
+        assert_eq!(error, "no current signed mobile offer permits this lease");
+    }
+
+    /// The second half of the reported no-claim regression: once the plugin
+    /// accepts the answer, its relay-dialect acknowledgement must release the
+    /// exact prebuilt `lease_request` into the session's outbound loop.
+    ///
+    /// This deliberately starts with a plugin snapshot and routes the
+    /// acknowledgement back through the real shim. Hand-building either mobile
+    /// frame would miss a dialect drift between the two endpoints.
+    #[tokio::test]
+    async fn translated_offer_acceptance_releases_the_exact_in_app_lease_request() {
+        let identity = crate::endpoint_identity::EndpointIdentity::from_secret([9; 32])
+            .expect("test endpoint identity");
+        let mut prepared = prepare_relay_takeover_after(vec![offer_for(
+            identity.thumbprint(),
+            LeaseMode::Takeover,
+            MobileOfferSurface::InApp,
+            "offer_in_app",
+            "offer_jti_in_app",
+        )])
+        .await
+        .expect("a matching relay offer prepares an answer");
+
+        assert!(
+            take_ready_lease_request(&prepared.state)
+                .await
+                .expect("pending state is valid")
+                .is_none(),
+            "the lease request must wait for the authority's offer acknowledgement"
+        );
+        assert!(relay_send_enabled_from(None));
+        assert!(relay_plugin_admits(&prepared.answer.kind));
+
+        let plugin_acceptance = serde_json::to_string(&PluginOfferAcceptedFrame {
+            kind: "plugin_offer_accepted".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            device_id: "device_a".into(),
+            request_id: prepared.answer.request_id.clone(),
+            offer_id: prepared.answer.offer_id.clone(),
+            offer_jti: prepared.answer.offer_jti.clone(),
+            offered_mode: prepared.answer.offered_mode,
+            accepted: true,
+        })
+        .expect("plugin acceptance encodes");
+        let translated = prepared
+            .shim
+            .translate(&plugin_acceptance)
+            .expect("plugin acceptance translates")
+            .expect("offer acceptance is a mobile session frame");
+        let accepted: MobileOfferAcceptedFrame =
+            serde_json::from_str(&translated).expect("translation has the mobile shape");
+        apply_mobile_offer_accepted(&prepared.state, "app_a", accepted.clone(), &translated)
+            .await
+            .expect("the exact offer fence is accepted");
+        apply_mobile_offer_accepted(&prepared.state, "app_a", accepted.clone(), &translated)
+            .await
+            .expect("an exact at-least-once acceptance is a no-op");
+        let mut changed_acceptance = accepted;
+        changed_acceptance.offer_jti = "offer_jti_changed".into();
+        let changed_encoded = serde_json::to_string(&changed_acceptance).unwrap();
+        assert!(apply_mobile_offer_accepted(
+            &prepared.state,
+            "app_a",
+            changed_acceptance,
+            &changed_encoded,
+        )
+        .await
+        .is_err());
+
+        let outbound = take_ready_lease_request(&prepared.state)
+            .await
+            .expect("accepted pending state is valid")
+            .expect("acceptance releases the lease request");
+        let request: LeaseRequestFrame =
+            serde_json::from_str(&outbound.encoded).expect("lease request has its wire shape");
+        assert_eq!(request.kind, "lease_request");
+        assert_eq!(request.request_id, prepared.lease_request_id);
+        assert_eq!(request.mode, LeaseMode::Takeover);
+        assert_eq!(request.accepted_offer_id, "offer_in_app");
+        assert_eq!(request.accepted_offer_jti, "offer_jti_in_app");
+        assert!(
+            outbound.answer_action_id.is_none(),
+            "an in-app press is not an Android Core-Telecom action"
+        );
+        assert!(
+            take_ready_lease_request(&prepared.state)
+                .await
+                .expect("post-delivery pending state is valid")
+                .is_none(),
+            "the same acceptance cannot release the request twice"
+        );
+    }
+
+    /// The authority publishes exactly one offer per (device, mode, surface).
+    /// If two ever matched, the selector could not know which authorisation the
+    /// operator was redeeming — so it refuses rather than picking one, and this
+    /// locks that contract from the consuming side.
+    #[tokio::test]
+    async fn two_matching_offers_for_the_same_mode_are_refused() {
+        let identity = crate::endpoint_identity::EndpointIdentity::from_secret([9; 32])
+            .expect("test endpoint identity");
+        let error = takeover_press_after(vec![
+            offer_for(
+                identity.thumbprint(),
+                LeaseMode::Takeover,
+                MobileOfferSurface::InApp,
+                "offer_in_app",
+                "offer_jti_in_app",
+            ),
+            offer_for(
+                identity.thumbprint(),
+                LeaseMode::Takeover,
+                MobileOfferSurface::InApp,
+                "offer_in_app_duplicate",
+                "offer_jti_in_app_duplicate",
+            ),
+        ])
+        .await
+        .expect_err("two matching offers must not silently resolve to one");
+        assert_eq!(
+            error,
+            "multiple signed mobile offers require an explicit offer selection"
+        );
+    }
+
+    /// A normal relaunch has no inherited environment override. It must still
+    /// introduce itself and redeem a signed offer; only an explicit operator
+    /// rollback disables relay writes.
+    #[test]
+    fn relay_sending_defaults_on_after_relaunch_with_an_exact_zero_kill_switch() {
+        for enabled in [None, Some(""), Some("1"), Some("true"), Some("yes")] {
+            assert!(
+                relay_send_enabled_from(enabled),
+                "{enabled:?} must leave relay writes enabled"
+            );
+        }
+        assert!(!relay_send_enabled_from(Some("0")));
+        assert!(relay_plugin_admits("mobile_hello"));
+    }
+
+    /// Every mobile kind that can cross the relay boundary has a matching arm in
+    /// the plugin's relay-only dispatcher.
+    ///
+    /// This is stronger than documenting the current set: `send_text` consults
+    /// the same predicate immediately before the carrier POST, so a future
+    /// outbound kind is held by default until both ends explicitly add it.
+    /// Assistance and caller-ending remain valid on the WebSocket gateway path,
+    /// but are deliberately held on the relay until their translations land.
+    #[test]
+    fn only_plugin_admitted_mobile_kinds_can_cross_the_relay_boundary() {
+        // Verbatim arms in GatewaySession::handle_relay_peer_frame, plus the
+        // independently handled authenticated hello.
+        const PLUGIN_RELAY_ACCEPTS: [&str; 6] = [
+            "mobile_hello",
+            "mobile_offer_answer",
+            "lease_request",
+            "rtc_signal",
+            "lease_heartbeat",
+            "lease_revoke",
+        ];
+        assert_eq!(RELAY_PLUGIN_ADMITTED_KINDS, PLUGIN_RELAY_ACCEPTS);
+        for kind in PLUGIN_RELAY_ACCEPTS {
+            assert!(
+                relay_plugin_admits(kind),
+                "{kind} must reach its plugin arm"
+            );
+        }
+
+        for held in [
+            "assistance_answer",
+            "end_caller_challenge_request",
+            "end_caller_confirm",
+            // Gateway-dialect authority notices are never mobile requests.
+            "claim_proposal",
+            "lease_granted",
+            "lease_revoked",
+            "something_new",
+        ] {
+            assert!(
+                !relay_plugin_admits(held),
+                "{held} has no relay-mobile plugin arm and must be held"
+            );
+        }
     }
 
     fn signed_plugin_hello(
@@ -5285,15 +8574,11 @@ mod tests {
         let shim_for = |app_id: &str| {
             GatewayShim::new(
                 app_id.into(),
+                "device_a".into(),
                 vec![Grant::StateRead],
                 desktop.thumbprint().into(),
             )
         };
-
-        // ⚠️ Each case gets its OWN app id. Proof is remembered per
-        // `<app_id>/<thumbprint>` for the life of the process (see
-        // `proven_peers`), so sharing one id here would let the successful case
-        // pre-verify the refusal cases and assert nothing.
 
         // The real peer: consumed rather than forwarded, and it unlocks state.
         let mut shim = shim_for("app_proof_ok");
@@ -5328,20 +8613,17 @@ mod tests {
         assert!(!shim.peer_verified);
     }
 
-    /// ⚠️ The plugin greets a party exactly ONCE per plugin session — its
-    /// `greeted` set is cleared when it arms a rotated hello, never when this
-    /// Companion reconnects. So if peer proof were scoped to one carrier, a
-    /// Companion that verified and then lost its stream would never be greeted
-    /// again, and `peer_gate` would drop every snapshot for the rest of the
-    /// plugin's session: a permanent read deadlock, not a slow recovery. Proof
-    /// therefore survives the carrier.
+    /// Relay mail can survive a plugin restart. Process-global proof would let
+    /// a brand-new session consume that queued authority without its own signed
+    /// hello merely because the long-term key string matched.
     #[test]
-    fn a_proven_desktop_stays_proven_across_a_companion_reconnect() {
+    fn a_new_shim_never_inherits_another_sessions_peer_proof() {
         let desktop = crate::endpoint_identity::EndpointIdentity::from_secret([21; 32])
             .expect("test identity");
         let shim_for = || {
             GatewayShim::new(
                 "app_reconnect".into(),
+                "device_a".into(),
                 vec![Grant::StateRead],
                 desktop.thumbprint().into(),
             )
@@ -5353,29 +8635,31 @@ mod tests {
             .translate(&signed_plugin_hello(&desktop, "app_reconnect"))
             .expect("the real Desktop proves itself");
 
-        // A brand new carrier — the reconnect the plugin will not greet again.
+        // A brand-new carrier with the same app and long-term key is still a
+        // new proof boundary.
         let mut reconnected = shim_for();
-        assert!(
-            reconnected.peer_verified,
-            "a Desktop that already proved this key must not have to prove it again"
+        assert!(!reconnected.peer_verified);
+        assert_eq!(
+            reconnected.translate(&plugin_snapshot_frame_for("app_reconnect")),
+            Ok(None),
+            "queued state must wait for this session's signed hello",
         );
-        assert!(
-            reconnected
-                .translate(&plugin_snapshot_frame_for("app_reconnect"))
-                .expect("translates")
-                .is_some(),
-            "authoritative state must flow after a reconnect, or the read path is dead"
-        );
+        reconnected
+            .translate(&signed_plugin_hello(&desktop, "app_reconnect"))
+            .expect("the new session proves the same pinned key afresh");
+        assert!(reconnected.peer_verified);
 
         // The memory is bound to app AND key: it never vouches for anyone else.
         let other_app = GatewayShim::new(
             "app_reconnect_other".into(),
+            "device_a".into(),
             vec![Grant::StateRead],
             desktop.thumbprint().into(),
         );
         assert!(!other_app.peer_verified);
         let other_key = GatewayShim::new(
             "app_reconnect".into(),
+            "device_a".into(),
             vec![Grant::StateRead],
             "some_other_desktop_thumbprint".into(),
         );
@@ -5409,6 +8693,7 @@ mod tests {
                 schema_version: SCHEMA_VERSION,
                 app_id: "app_a".into(),
                 event_id: "event_1".into(),
+                device_id: Some("device_a".into()),
                 snapshot: snapshot.clone(),
             })
             .expect("fixture encodes")
@@ -5426,6 +8711,7 @@ mod tests {
         // Consent given AND the grant held: the captions come through.
         let mut with_grant = GatewayShim::new(
             "app_a".into(),
+            "device_a".into(),
             vec![Grant::StateRead, Grant::CaptionsRead],
             "desktop_key_thumbprint_1".into(),
         );
@@ -5522,16 +8808,14 @@ mod tests {
         assert_eq!(ahead.sequence, gateway_high_water + 10);
     }
 
-    /// [`proven_peers`] is keyed `<app_id>/<thumbprint>` precisely so proof can
-    /// never transfer to a different Desktop key. Carrying `peer_verified`
-    /// across a rotation unconditionally would launder it around that key: a
-    /// re-pinned admission would project authoritative state without the NEW
-    /// key ever proving possession.
+    /// Explicit live rotation may carry proof for the exact same pin, but doing
+    /// so across a re-pin would let the old Desktop vouch for the new key.
     #[test]
     fn a_rotation_that_repins_the_desktop_key_must_see_it_prove_itself_again() {
         let shim_with_pin = |pin: &str| {
             GatewayShim::new(
                 "app_rotation_pin".into(),
+                "device_a".into(),
                 vec![Grant::StateRead],
                 pin.into(),
             )
@@ -5591,13 +8875,17 @@ mod tests {
     /// Inbound tolerance is the whole point: the plugin's dispatcher errors on
     /// an unknown kind, and a shim that copied that would churn the session on
     /// every frame outside the translated subset.
+    ///
+    /// ⚠️ `plugin_lease_revoke` used to be one of these examples and is now
+    /// TRANSLATED — see `plugin_lease_revoke_translates_to_lease_revoked...`.
+    /// Anything listed here must be a kind the shim genuinely has no mobile
+    /// equivalent for, or the case proves nothing.
     #[test]
     fn frames_outside_the_translated_subset_are_dropped_rather_than_erroring() {
         let mut shim = verified_shim();
 
         for untranslated in [
             "{\"kind\":\"claim_decision\"}",
-            "{\"kind\":\"plugin_lease_revoke\"}",
             "{\"kind\":\"something_this_build_has_never_heard_of\"}",
         ] {
             assert_eq!(
@@ -5621,6 +8909,7 @@ mod tests {
     fn authoritative_state_is_not_projected_until_the_desktop_peer_proves_itself() {
         let mut shim = GatewayShim::new(
             "app_a".into(),
+            "device_a".into(),
             vec![Grant::StateRead],
             "desktop_key_thumbprint_1".into(),
         );
@@ -5644,6 +8933,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             app_id: "app_b".into(),
             event_id: "event_1".into(),
+            device_id: Some("device_a".into()),
             snapshot: authoritative_snapshot(),
         })
         .expect("fixture encodes");
@@ -5657,6 +8947,7 @@ mod tests {
     fn duplicate_admission_grants_cannot_brick_every_translated_frame() {
         let mut shim = GatewayShim::new(
             "app_a".into(),
+            "device_a".into(),
             vec![Grant::StateRead, Grant::StateRead, Grant::Monitor],
             "desktop_key_thumbprint_1".into(),
         );
@@ -5790,6 +9081,10 @@ mod tests {
         let endpoint_identity = crate::endpoint_identity::EndpointIdentity::from_secret([9; 32])
             .expect("test endpoint identity");
         let mode_grant = grant_for_requested_mode(mode).unwrap();
+        let mut admission_grants = vec![Grant::StateRead, Grant::RtcSignal, mode_grant];
+        if mode == LeaseMode::Takeover {
+            admission_grants.push(Grant::ResumeAokie);
+        }
         let offer = SignedPendingMobileOffer {
             offer: aokie_protocol::v2::PendingMobileOfferClaims {
                 offer_id: "offer_exact_a".into(),
@@ -5818,7 +9113,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             app_id: "app_a".into(),
             sequence: 8,
-            grants: vec![Grant::StateRead, Grant::RtcSignal, mode_grant],
+            grants: admission_grants,
             snapshot: ProjectedCallSnapshot {
                 call_id: "call_a".into(),
                 call_epoch: 7,
@@ -5951,22 +9246,20 @@ mod tests {
         assert_eq!(answer.offered_mode, LeaseMode::Consult);
         assert!(take_ready_lease_request(&state).await.unwrap().is_none());
 
-        apply_mobile_offer_accepted(
-            &state,
-            "app_a",
-            MobileOfferAcceptedFrame {
-                kind: "mobile_offer_accepted".into(),
-                schema_version: SCHEMA_VERSION,
-                app_id: "app_a".into(),
-                request_id: answer.request_id,
-                offer_id: answer.offer_id,
-                offer_jti: answer.offer_jti,
-                offered_mode: LeaseMode::Consult,
-                accepted: true,
-            },
-        )
-        .await
-        .unwrap();
+        let accepted = MobileOfferAcceptedFrame {
+            kind: "mobile_offer_accepted".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: answer.request_id,
+            offer_id: answer.offer_id,
+            offer_jti: answer.offer_jti,
+            offered_mode: LeaseMode::Consult,
+            accepted: true,
+        };
+        let encoded = serde_json::to_string(&accepted).unwrap();
+        apply_mobile_offer_accepted(&state, "app_a", accepted, &encoded)
+            .await
+            .unwrap();
         let outbound = take_ready_lease_request(&state)
             .await
             .unwrap()
@@ -6010,16 +9303,24 @@ mod tests {
             offered_mode: LeaseMode::Takeover,
             accepted: true,
         };
-        assert!(apply_mobile_offer_accepted(&state, "app_a", wrong)
-            .await
-            .is_err());
+        let encoded = serde_json::to_string(&wrong).unwrap();
+        assert!(
+            apply_mobile_offer_accepted(&state, "app_a", wrong, &encoded)
+                .await
+                .is_err()
+        );
         assert!(take_ready_lease_request(&state).await.unwrap().is_none());
     }
 
-    #[test]
-    fn lease_return_ack_requires_exact_request_lease_and_jti() {
+    fn pending_revoke_fixture(mode: LeaseMode, authoritative_sequence: u64) -> PendingRevoke {
         let lease_claims = claims(LeaseMode::Takeover, LeasePhase::Active);
-        let pending = PendingRevoke {
+        let lease_claims = LeaseClaims {
+            mode,
+            tracks: tracks_for(mode, LeasePhase::Active),
+            fence: if mode == LeaseMode::Takeover { 9 } else { 0 },
+            ..lease_claims
+        };
+        PendingRevoke {
             request_id: "return_request_a".into(),
             lease_id: lease_claims.lease_id.clone(),
             lease_jti: lease_claims.jti.clone(),
@@ -6029,9 +9330,25 @@ mod tests {
                 session: session_from_claims(&lease_claims, 1, 1).unwrap(),
                 claims: lease_claims,
             },
-            native_action_id: Some("native_end_a".into()),
-            deadline: Instant::now() + REVOKE_ACK_TIMEOUT,
-        };
+            authoritative_sequence,
+            authoritative_remote_revision: Some(13),
+            native_action_id: Some("native_return_a".into()),
+            deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+        }
+    }
+
+    fn return_snapshot(mode: LeaseMode, sequence: u64) -> MobileSnapshotFrame {
+        let mut frame = offered_client(mode, MobileOfferSurface::InApp)
+            .snapshot
+            .expect("fixture has authoritative state");
+        frame.sequence = sequence;
+        frame.snapshot.pending_mobile_offers.clear();
+        frame
+    }
+
+    #[test]
+    fn lease_return_ack_accepts_requestless_plugin_notice_only_on_exact_lease_fence() {
+        let pending = pending_revoke_fixture(LeaseMode::Takeover, 8);
         let exact = LeaseRevokedFrame {
             kind: "lease_revoked".into(),
             schema_version: SCHEMA_VERSION,
@@ -6044,10 +9361,304 @@ mod tests {
         validate_pending_revoke_ack(&pending, &exact).unwrap();
         let mut wrong = exact.clone();
         wrong.request_id = None;
+        validate_pending_revoke_ack(&pending, &wrong).unwrap();
+        wrong = exact.clone();
+        wrong.request_id = Some("return_request_other".into());
         assert!(validate_pending_revoke_ack(&pending, &wrong).is_err());
         wrong = exact.clone();
         wrong.lease_jti = "lease_other".into();
         assert!(validate_pending_revoke_ack(&pending, &wrong).is_err());
+    }
+
+    #[test]
+    fn plugin_failure_notice_can_complete_a_pending_return_before_gateway_ack() {
+        let pending = pending_revoke_fixture(LeaseMode::Takeover, 8);
+        let plugin_notice = LeaseRevokedFrame {
+            kind: "lease_revoked".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: None,
+            lease_id: pending.lease_id.clone(),
+            lease_jti: pending.lease_jti.clone(),
+            reason: "peer_connection_failed".into(),
+        };
+        validate_pending_revoke_ack(&pending, &plugin_notice).unwrap();
+        let plugin_encoded = serde_json::to_string(&plugin_notice).unwrap();
+        let pending_tombstone = completed_revoke_from_pending(&pending);
+        let mut client = ClientState {
+            pending_revoke: Some(pending),
+            ..ClientState::default()
+        };
+        remember_completed_revoke(&mut client, pending_tombstone).unwrap();
+        remember_completed_revoke(
+            &mut client,
+            completed_revoke_from_frame(&plugin_notice, &plugin_encoded),
+        )
+        .unwrap();
+        client.pending_revoke = None;
+
+        let gateway_ack = LeaseRevokedFrame {
+            request_id: Some("return_request_a".into()),
+            reason: "returned".into(),
+            ..plugin_notice
+        };
+        let gateway_encoded = serde_json::to_string(&gateway_ack).unwrap();
+        assert!(
+            completed_revoke_frame_is_replay(&mut client, &gateway_ack, &gateway_encoded,).unwrap()
+        );
+        let completed = client.completed_revokes.front().unwrap();
+        assert_eq!(completed.request_id.as_deref(), Some("return_request_a"));
+        assert!(completed.frame_digest.is_some());
+        assert!(completed.unsolicited_frame_digest.is_some());
+
+        let wrong_ack = LeaseRevokedFrame {
+            request_id: Some("return_request_other".into()),
+            ..gateway_ack
+        };
+        let wrong_encoded = serde_json::to_string(&wrong_ack).unwrap();
+        assert!(
+            completed_revoke_frame_is_replay(&mut client, &wrong_ack, &wrong_encoded,).is_err()
+        );
+    }
+
+    #[test]
+    fn snapshot_completion_tombstones_late_ack_and_changed_replay() {
+        let pending = pending_revoke_fixture(LeaseMode::Takeover, 8);
+        let mut snapshot = return_snapshot(LeaseMode::Takeover, 9);
+        snapshot.snapshot.owner_epoch = pending.lease.claims.owner_epoch + 1;
+        snapshot.snapshot.remote_revision = 14;
+        let mut client = ClientState {
+            pending_revoke: Some(pending),
+            ..ClientState::default()
+        };
+        assert!(
+            take_snapshot_confirmed_pending_revoke(&mut client, &snapshot)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(client.completed_revokes.len(), 1);
+        assert!(client.completed_revokes[0].frame_digest.is_none());
+
+        let ack = LeaseRevokedFrame {
+            kind: "lease_revoked".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: Some("return_request_a".into()),
+            lease_id: "media_a".into(),
+            lease_jti: "lease_a".into(),
+            reason: "returned".into(),
+        };
+        let encoded = serde_json::to_string(&ack).unwrap();
+        assert!(completed_revoke_frame_is_replay(&mut client, &ack, &encoded).unwrap());
+        assert!(client.completed_revokes[0].frame_digest.is_some());
+        assert!(completed_revoke_frame_is_replay(&mut client, &ack, &encoded).unwrap());
+
+        let mut changed = ack.clone();
+        changed.reason = "different_reason".into();
+        let changed_encoded = serde_json::to_string(&changed).unwrap();
+        assert!(completed_revoke_frame_is_replay(&mut client, &changed, &changed_encoded).is_err());
+
+        // Snapshot may confirm the local return before the plugin's media
+        // failure notice arrives. Its requestId=None dialect is compatible on
+        // the exact same lease/JTI and gets its own byte-for-byte replay fence.
+        let plugin_notice = LeaseRevokedFrame {
+            request_id: None,
+            reason: "peer_connection_failed".into(),
+            ..ack.clone()
+        };
+        let plugin_encoded = serde_json::to_string(&plugin_notice).unwrap();
+        assert!(
+            completed_revoke_frame_is_replay(&mut client, &plugin_notice, &plugin_encoded,)
+                .unwrap()
+        );
+        assert!(client.completed_revokes[0]
+            .unsolicited_frame_digest
+            .is_some());
+        assert!(
+            completed_revoke_frame_is_replay(&mut client, &plugin_notice, &plugin_encoded,)
+                .unwrap()
+        );
+        let mut changed_plugin = plugin_notice;
+        changed_plugin.reason = "rtc_closed".into();
+        let changed_plugin_encoded = serde_json::to_string(&changed_plugin).unwrap();
+        assert!(completed_revoke_frame_is_replay(
+            &mut client,
+            &changed_plugin,
+            &changed_plugin_encoded,
+        )
+        .is_err());
+
+        changed = ack;
+        changed.lease_jti = "lease_other".into();
+        let changed_encoded = serde_json::to_string(&changed).unwrap();
+        assert!(completed_revoke_frame_is_replay(&mut client, &changed, &changed_encoded).is_err());
+    }
+
+    #[test]
+    fn duplicate_plugin_revoke_is_a_noop_but_changed_content_fails_closed() {
+        let frame = LeaseRevokedFrame {
+            kind: "lease_revoked".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: None,
+            lease_id: "media_a".into(),
+            lease_jti: "lease_a".into(),
+            reason: "peer_connection_failed".into(),
+        };
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let mut client = ClientState::default();
+        remember_completed_revoke(&mut client, completed_revoke_from_frame(&frame, &encoded))
+            .unwrap();
+
+        assert!(completed_revoke_frame_is_replay(&mut client, &frame, &encoded).unwrap());
+        let mut changed = frame;
+        changed.reason = "rtc_closed".into();
+        let changed_encoded = serde_json::to_string(&changed).unwrap();
+        assert!(completed_revoke_frame_is_replay(&mut client, &changed, &changed_encoded).is_err());
+    }
+
+    #[tokio::test]
+    async fn completed_revoke_tombstones_are_bounded_and_survive_transport_reset() {
+        let state = V2State::default();
+        {
+            let mut client = state.inner.lock().await;
+            for index in 0..=MAX_COMPLETED_REVOKES {
+                remember_completed_revoke(
+                    &mut client,
+                    CompletedRevoke {
+                        app_id: "app_a".into(),
+                        request_id: Some(format!("return_request_{index}")),
+                        lease_id: format!("media_{index}"),
+                        lease_jti: format!("lease_{index}"),
+                        frame_digest: Some(relay_frame_digest(&format!("revoke_{index}"))),
+                        unsolicited_frame_digest: None,
+                    },
+                )
+                .unwrap();
+            }
+            assert_eq!(client.completed_revokes.len(), MAX_COMPLETED_REVOKES);
+            assert_eq!(
+                client
+                    .completed_revokes
+                    .front()
+                    .unwrap()
+                    .request_id
+                    .as_deref(),
+                Some("return_request_1")
+            );
+        }
+
+        state.reset().await;
+
+        let client = state.inner.lock().await;
+        assert_eq!(client.completed_revokes.len(), MAX_COMPLETED_REVOKES);
+        assert_eq!(
+            client
+                .completed_revokes
+                .back()
+                .unwrap()
+                .request_id
+                .as_deref(),
+            Some("return_request_256")
+        );
+    }
+
+    #[test]
+    fn newer_aokie_snapshot_confirms_each_relay_lease_return_mode() {
+        for mode in [LeaseMode::Monitor, LeaseMode::Consult, LeaseMode::Takeover] {
+            let pending = pending_revoke_fixture(mode, 8);
+            let mut frame = return_snapshot(mode, 9);
+            frame.snapshot.remote_revision = 14;
+            if mode != LeaseMode::Monitor {
+                frame.snapshot.owner_epoch = pending.lease.claims.owner_epoch + 1;
+            }
+
+            assert!(snapshot_confirms_pending_revoke(&pending, &frame));
+            let mut client = ClientState {
+                pending_revoke: Some(pending),
+                ..ClientState::default()
+            };
+            assert!(take_snapshot_confirmed_pending_revoke(&mut client, &frame)
+                .unwrap()
+                .is_some());
+            assert!(client.pending_revoke.is_none());
+            assert_eq!(client.completed_revokes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn translated_sequence_cannot_confirm_monitor_without_new_ready_source_state() {
+        let pending = pending_revoke_fixture(LeaseMode::Monitor, 8);
+        let queued_before_revoke = return_snapshot(LeaseMode::Monitor, 9);
+        assert_eq!(queued_before_revoke.snapshot.remote_revision, 13);
+        assert!(!snapshot_confirms_pending_revoke(
+            &pending,
+            &queued_before_revoke
+        ));
+
+        let mut advanced_but_not_ready = queued_before_revoke.clone();
+        advanced_but_not_ready.snapshot.remote_revision = 14;
+        advanced_but_not_ready.snapshot.media_state = MediaState::Active;
+        assert!(!snapshot_confirms_pending_revoke(
+            &pending,
+            &advanced_but_not_ready
+        ));
+
+        let mut proven = advanced_but_not_ready;
+        proven.snapshot.media_state = MediaState::Ready;
+        assert!(snapshot_confirms_pending_revoke(&pending, &proven));
+
+        let mut no_source_baseline = pending;
+        no_source_baseline.authoritative_remote_revision = None;
+        assert!(!snapshot_confirms_pending_revoke(
+            &no_source_baseline,
+            &proven
+        ));
+    }
+
+    #[test]
+    fn moved_or_ended_call_confirms_old_relay_lease_return() {
+        let pending = pending_revoke_fixture(LeaseMode::Takeover, 8);
+        let mut moved = return_snapshot(LeaseMode::Takeover, 9);
+        moved.snapshot.call_id = "call_b".into();
+        moved.snapshot.service_mode = ServiceMode::HumanActive;
+        assert!(snapshot_confirms_pending_revoke(&pending, &moved));
+
+        let mut ended = return_snapshot(LeaseMode::Takeover, 9);
+        ended.snapshot.telephony_state = TelephonyState::Ended;
+        ended.snapshot.service_mode = ServiceMode::Ended;
+        assert!(snapshot_confirms_pending_revoke(&pending, &ended));
+    }
+
+    #[test]
+    fn stale_human_or_unadvanced_snapshot_cannot_confirm_relay_lease_return() {
+        let monitor = pending_revoke_fixture(LeaseMode::Monitor, 8);
+        let stale = return_snapshot(LeaseMode::Monitor, 8);
+        assert!(!snapshot_confirms_pending_revoke(&monitor, &stale));
+
+        let takeover = pending_revoke_fixture(LeaseMode::Takeover, 8);
+        let mut human_active = return_snapshot(LeaseMode::Takeover, 9);
+        human_active.snapshot.remote_revision = 14;
+        human_active.snapshot.owner_epoch = takeover.lease.claims.owner_epoch + 1;
+        human_active.snapshot.service_mode = ServiceMode::HumanActive;
+        assert!(!snapshot_confirms_pending_revoke(&takeover, &human_active));
+
+        for mode in [LeaseMode::Consult, LeaseMode::Takeover] {
+            let pending = pending_revoke_fixture(mode, 8);
+            let mut queued_before_revoke = return_snapshot(mode, 9);
+            queued_before_revoke.snapshot.owner_epoch = pending.lease.claims.owner_epoch + 1;
+            assert!(!snapshot_confirms_pending_revoke(
+                &pending,
+                &queued_before_revoke
+            ));
+
+            let mut no_owner_advance = return_snapshot(mode, 9);
+            no_owner_advance.snapshot.remote_revision = 14;
+            assert!(!snapshot_confirms_pending_revoke(
+                &pending,
+                &no_owner_advance
+            ));
+        }
     }
 
     #[test]

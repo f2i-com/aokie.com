@@ -1267,6 +1267,33 @@ impl RadioHandle {
         )
     }
 
+    /// Test-only: [`Self::test_handle`] with a media endpoint attached, plus
+    /// the status the caller can drive to stage a live call.
+    ///
+    /// Anything that mints media authority reads physical truth back through
+    /// `remote_media()` and `current_call_id()`, so a handle without both can
+    /// only ever exercise the refusal paths.
+    #[cfg(test)]
+    pub fn test_handle_with_media(
+        media: crate::remote_media::RemoteMediaHandle,
+    ) -> (
+        RadioHandle,
+        std::sync::mpsc::Receiver<RadioControl>,
+        Arc<RadioStatus>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let status = Arc::new(RadioStatus::default());
+        (
+            RadioHandle {
+                control_tx: tx,
+                status: status.clone(),
+                remote_media: Some(media),
+            },
+            rx,
+            status,
+        )
+    }
+
     pub fn send(&self, c: RadioControl) -> Result<(), String> {
         self.control_tx
             .send(c)
@@ -6484,11 +6511,11 @@ fn run_loop(
                         binding.rtc_session_id
                     );
                     if same_call && sample_rate > 0 {
-                        // Receive-only preparation: flush Aokie's tail and
-                        // advance the ownership epoch, but do not install a
-                        // microphone RoutePermit. A fresh active offer is
-                        // required before caller-bound human TX can open.
-                        bt.flush_tx_audio();
+                        // Receive-only preparation advances the ownership
+                        // epoch but deliberately leaves Aokie speaking. A
+                        // fresh active peer must deliver binding-exact
+                        // microphone PCM before the final EnterHuman arm is
+                        // even requested; only that final arm flushes TX.
                         if let Err(error) = remote_media.ack_prepare_human(&binding) {
                             eprintln!(
                                 "[aokie-plugin] Companion soft-hold physical ACK refused: {error}"
@@ -6525,10 +6552,44 @@ fn run_loop(
                         crate::assistance::AssistanceCallFence,
                     > = None;
                     if same_call && bt.get_sample_rate() > 0 && assistance_fence.is_some() {
-                        // One radio-owned transaction: cancel old speech,
-                        // flush queued SCO TX, discard caller STT residuals and
-                        // rebuild AEC on return. The provisional consult peer
-                        // is receive-only, so no microphone exists yet.
+                        // This ACK only rotates the owner fence so an active
+                        // bidirectional lease can be minted. Aokie remains on
+                        // the caller until that exact peer proves microphone
+                        // PCM; no speech is cancelled or flushed here.
+                        if let Err(error) = remote_media.ack_prepare_consult(&binding) {
+                            eprintln!("[aokie-plugin] Companion consult prepare ACK refused: {error}");
+                            let _ = remote_media.revoke(&binding, "consult_prepare_failed");
+                        }
+                    } else {
+                        let _ = remote_media.revoke(
+                            &binding,
+                            if !same_call {
+                                "physical_call_changed"
+                            } else if bt.get_sample_rate() == 0 {
+                                "sco_unavailable"
+                            } else {
+                                "consult_has_no_assistance_request"
+                            },
+                        );
+                    }
+                }
+                crate::remote_media::RadioTransition::EnterConsult { binding } => {
+                    let same_call = tracker
+                        .current()
+                        .is_some_and(|call| call.is_active() && call.id == binding.call_id);
+                    #[cfg(feature = "voice")]
+                    let assistance_fence = ctx
+                        .pending_assistance
+                        .as_ref()
+                        .map(|pending| pending.fence.clone());
+                    #[cfg(not(feature = "voice"))]
+                    let assistance_fence: Option<
+                        crate::assistance::AssistanceCallFence,
+                    > = None;
+                    if same_call && bt.get_sample_rate() > 0 && assistance_fence.is_some() {
+                        // Final isolation is downstream of exact decoded app
+                        // microphone PCM. Flush the Aokie tail atomically on
+                        // the radio thread, then open only this consult fence.
                         bt.flush_tx_audio();
                         #[cfg(feature = "voice")]
                         {
@@ -6538,9 +6599,9 @@ fn run_loop(
                             stt_had_speech = false;
                             stt_silence = Duration::ZERO;
                         }
-                        if let Err(error) = remote_media.ack_prepare_consult(&binding) {
-                            eprintln!("[aokie-plugin] Companion consult hold ACK refused: {error}");
-                            let _ = remote_media.revoke(&binding, "consult_hold_failed");
+                        if let Err(error) = remote_media.ack_enter_consult(&binding) {
+                            eprintln!("[aokie-plugin] Companion consult enter ACK refused: {error}");
+                            let _ = remote_media.revoke(&binding, "consult_enter_failed");
                         } else {
                             #[cfg(feature = "voice")]
                             {

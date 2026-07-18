@@ -4762,6 +4762,10 @@ mod tests {
                 final_text: true,
             }],
             audio_levels: None,
+            // The gateway is the lease authority on this carrier and mints
+            // offers into the PROJECTED snapshot; a plugin-authored
+            // authoritative snapshot carries none.
+            pending_mobile_offers: Vec::new(),
             occurred_at: "2026-07-16T00:00:00Z".into(),
         }
     }
@@ -5278,6 +5282,7 @@ mod tests {
                     schema_version: SCHEMA_VERSION,
                     app_id: "app_a".into(),
                     event_id: format!("stale_{call_epoch}"),
+                    device_id: None,
                     snapshot: stale,
                 },
             )
@@ -5303,6 +5308,7 @@ mod tests {
                 schema_version: SCHEMA_VERSION,
                 app_id: "app_a".into(),
                 event_id: "snapshot_call_b".into(),
+                device_id: None,
                 snapshot: next_call,
             },
         )
@@ -5381,6 +5387,7 @@ mod tests {
                 schema_version: SCHEMA_VERSION,
                 app_id: "app_a".into(),
                 event_id: "snapshot_after_process_restart".into(),
+                device_id: None,
                 snapshot: restarted_snapshot,
             },
         )
@@ -5416,6 +5423,7 @@ mod tests {
                 schema_version: SCHEMA_VERSION,
                 app_id: "app_a".into(),
                 event_id: "replayed_snapshot_after_restart".into(),
+                device_id: None,
                 snapshot: replayed_snapshot,
             },
         )
@@ -5528,6 +5536,7 @@ mod tests {
                 schema_version: SCHEMA_VERSION,
                 app_id: "app_a".into(),
                 event_id: "snapshot_at_sequence_ceiling".into(),
+                device_id: None,
                 snapshot: snapshot(4),
             },
         )

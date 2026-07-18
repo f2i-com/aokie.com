@@ -1,12 +1,13 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use libwebrtc::audio_frame::AudioFrame;
 use libwebrtc::audio_source::{native::NativeAudioSource, AudioSourceOptions};
 use libwebrtc::audio_stream::native::{NativeAudioStream, NativeAudioStreamOptions};
+use libwebrtc::data_channel::{DataChannel, DataChannelInit, DataChannelState};
 use libwebrtc::ice_candidate::IceCandidate;
 use libwebrtc::media_stream_track::MediaStreamTrack;
 use libwebrtc::peer_connection::{
@@ -18,6 +19,7 @@ use libwebrtc::peer_connection_factory::{
 };
 use libwebrtc::rtp_transceiver::{RtpTransceiverDirection, RtpTransceiverInit};
 use libwebrtc::session_description::{SdpType, SessionDescription};
+use libwebrtc::stats::RtcStats;
 use libwebrtc::MediaType;
 use tokio::sync::{mpsc, Mutex};
 
@@ -29,6 +31,11 @@ use crate::{
 
 const EVENT_QUEUE_CAPACITY: usize = 64;
 const REMOTE_AUDIO_QUEUE_FRAMES: usize = 12;
+const MICROPHONE_AUTHORITY_CHANNEL: &str = "aokie-microphone-authority-v1";
+const MAX_MICROPHONE_AUTHORITY_BYTES: usize = 2_048;
+const MICROPHONE_STATS_POLL: Duration = Duration::from_millis(50);
+const MICROPHONE_PCM_PROGRESS_WINDOW: Duration = Duration::from_millis(125);
+const MICROPHONE_READY_PROGRESS_FLOOR: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerEvent {
@@ -36,6 +43,13 @@ pub enum PeerEvent {
     IceComplete,
     ConnectionState(&'static str),
     RemoteAudioReady,
+    /// Companion's exact-peer DTLS authority channel is open. Native capture
+    /// must not arm before this edge because its proof could not be delivered.
+    MicrophoneAuthorityReady,
+    /// The exact Desktop-side talk peer decoded its first microphone PCM
+    /// frame. The frame itself remains quarantined until the independent
+    /// caller-route permit opens; this event is readiness evidence only.
+    RemoteMicrophoneReady,
     ProtocolViolation(&'static str),
 }
 
@@ -174,8 +188,281 @@ pub fn enumerate_platform_audio_devices() -> Result<PlatformAudioDevices, MediaE
     devices_from_factory(&factory)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MicrophoneAuthorityAction {
+    Arm,
+    Disarm,
+}
+
+impl MicrophoneAuthorityAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Arm => "arm",
+            Self::Disarm => "disarm",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MicrophoneAuthorityProof {
+    action: MicrophoneAuthorityAction,
+    generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct RemoteMicrophoneAuthority {
+    generation: u64,
+    armed: bool,
+    protocol_failed: bool,
+}
+
+impl RemoteMicrophoneAuthority {
+    fn apply(&mut self, proof: MicrophoneAuthorityProof) -> Result<(), &'static str> {
+        if self.protocol_failed {
+            self.armed = false;
+            return Err("microphone authority protocol is permanently failed");
+        }
+        if proof.generation < self.generation {
+            return Ok(());
+        }
+        let armed = proof.action == MicrophoneAuthorityAction::Arm;
+        if proof.generation == self.generation {
+            return if self.armed == armed {
+                Ok(())
+            } else {
+                self.fail();
+                Err("conflicting microphone authority replay")
+            };
+        }
+        self.generation = proof.generation;
+        self.armed = armed;
+        Ok(())
+    }
+
+    fn fail(&mut self) {
+        self.armed = false;
+        self.protocol_failed = true;
+    }
+
+    fn snapshot(&self) -> (u64, bool) {
+        (self.generation, self.armed)
+    }
+}
+
+fn media_mode_label(mode: MediaMode) -> &'static str {
+    match mode {
+        MediaMode::Monitor => "monitor",
+        MediaMode::PreparedConsult => "prepared_consult",
+        MediaMode::PreparedTalk => "prepared_talk",
+        MediaMode::Consult => "consult",
+        MediaMode::Talk => "talk",
+    }
+}
+
+fn microphone_authority_payload(
+    binding: &SessionBinding,
+    action: MicrophoneAuthorityAction,
+    generation: u64,
+) -> Vec<u8> {
+    format!(
+        "{MICROPHONE_AUTHORITY_CHANNEL}|{}|{generation}|{}|{}|{}|{}|{}|{}|{}|{}",
+        action.label(),
+        binding.rtc_session_id,
+        binding.call_id,
+        binding.call_epoch,
+        binding.owner_epoch,
+        binding.device_id,
+        media_mode_label(binding.mode),
+        binding.lease_id.as_deref().unwrap_or_default(),
+        binding.fence,
+    )
+    .into_bytes()
+}
+
+fn parse_microphone_authority_payload(
+    data: &[u8],
+    binding: &SessionBinding,
+) -> Result<MicrophoneAuthorityProof, &'static str> {
+    if data.len() > MAX_MICROPHONE_AUTHORITY_BYTES {
+        return Err("microphone authority payload is too large");
+    }
+    let encoded = std::str::from_utf8(data).map_err(|_| "microphone authority is not UTF-8")?;
+    let mut fields = encoded.splitn(12, '|');
+    let protocol = fields
+        .next()
+        .ok_or("missing microphone authority protocol")?;
+    let action = fields.next().ok_or("missing microphone authority action")?;
+    let generation = fields
+        .next()
+        .ok_or("missing microphone authority generation")?;
+    let rtc_session_id = fields.next().ok_or("missing microphone RTC session")?;
+    let call_id = fields.next().ok_or("missing microphone call")?;
+    let call_epoch = fields
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or("invalid microphone call epoch")?;
+    let owner_epoch = fields
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or("invalid microphone owner epoch")?;
+    let device_id = fields.next().ok_or("missing microphone device")?;
+    let mode = fields.next().ok_or("missing microphone mode")?;
+    let lease_id = fields.next().ok_or("missing microphone lease")?;
+    let fence = fields
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or("invalid microphone fence")?;
+    if fields.next().is_some()
+        || protocol != MICROPHONE_AUTHORITY_CHANNEL
+        || rtc_session_id != binding.rtc_session_id
+        || call_id != binding.call_id
+        || call_epoch != binding.call_epoch
+        || owner_epoch != binding.owner_epoch
+        || device_id != binding.device_id
+        || mode != media_mode_label(binding.mode)
+        || lease_id != binding.lease_id.as_deref().unwrap_or_default()
+        || fence != binding.fence
+    {
+        return Err("microphone authority does not match this peer binding");
+    }
+    let action = match action {
+        "arm" => MicrophoneAuthorityAction::Arm,
+        "disarm" => MicrophoneAuthorityAction::Disarm,
+        _ => return Err("unknown microphone authority action"),
+    };
+    let generation = generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or("invalid microphone authority generation")?;
+    Ok(MicrophoneAuthorityProof { action, generation })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundAudioProgress {
+    report_id: String,
+    ssrc: u32,
+    mid: String,
+    packets: u64,
+    bytes: u64,
+    nonconcealed_samples: u64,
+}
+
+fn inbound_audio_progress(stats: &[RtcStats]) -> Option<InboundAudioProgress> {
+    let mut reports = stats.iter().filter_map(|stat| {
+        let RtcStats::InboundRtp(inbound) = stat else {
+            return None;
+        };
+        (inbound.stream.kind == "audio"
+            && !inbound.rtc.id.is_empty()
+            && inbound.stream.ssrc != 0
+            && !inbound.inbound.mid.is_empty())
+        .then(|| InboundAudioProgress {
+            report_id: inbound.rtc.id.clone(),
+            ssrc: inbound.stream.ssrc,
+            mid: inbound.inbound.mid.clone(),
+            packets: inbound.received.packets_received,
+            bytes: inbound.inbound.bytes_received,
+            nonconcealed_samples: inbound
+                .inbound
+                .total_samples_received
+                .saturating_sub(inbound.inbound.concealed_samples),
+        })
+    });
+    let report = reports.next()?;
+    reports.next().is_none().then_some(report)
+}
+
+#[derive(Debug, Default)]
+struct RtpProgressGate {
+    authority_generation: u64,
+    identity: Option<(String, u32, String)>,
+    last: Option<InboundAudioProgress>,
+    strict_advances: u8,
+    first_strict_at: Option<Instant>,
+    ready: bool,
+    live_until: Option<Instant>,
+}
+
+impl RtpProgressGate {
+    fn begin_authority(&mut self, generation: u64) {
+        *self = Self {
+            authority_generation: generation,
+            ..Self::default()
+        };
+    }
+
+    fn disarm(&mut self, generation: u64) {
+        self.begin_authority(generation);
+    }
+
+    fn authority_generation(&self) -> u64 {
+        self.authority_generation
+    }
+
+    fn observe(
+        &mut self,
+        progress: InboundAudioProgress,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        let identity = (
+            progress.report_id.clone(),
+            progress.ssrc,
+            progress.mid.clone(),
+        );
+        let Some(last) = self.last.as_ref() else {
+            self.identity = Some(identity);
+            self.last = Some(progress);
+            return Ok(());
+        };
+        if self.identity.as_ref() != Some(&identity) {
+            self.ready = false;
+            self.live_until = None;
+            return Err("microphone RTP receiver identity changed");
+        }
+        if progress.packets < last.packets
+            || progress.bytes < last.bytes
+            || progress.nonconcealed_samples < last.nonconcealed_samples
+        {
+            self.ready = false;
+            self.live_until = None;
+            return Err("microphone RTP progress counter reset");
+        }
+        if progress.packets > last.packets
+            && progress.bytes > last.bytes
+            && progress.nonconcealed_samples > last.nonconcealed_samples
+        {
+            self.last = Some(progress);
+            self.strict_advances = self.strict_advances.saturating_add(1);
+            let first_strict_at = *self.first_strict_at.get_or_insert(now);
+            if self.strict_advances >= 2
+                && now.duration_since(first_strict_at) >= MICROPHONE_READY_PROGRESS_FLOOR
+            {
+                self.ready = true;
+            }
+            if self.ready {
+                self.live_until = now.checked_add(MICROPHONE_PCM_PROGRESS_WINDOW);
+            }
+        }
+        Ok(())
+    }
+
+    fn miss(&mut self) {
+        self.live_until = None;
+    }
+
+    fn ready(&self) -> bool {
+        self.ready
+    }
+
+    fn allows_pcm(&self, now: Instant) -> bool {
+        self.ready && self.live_until.is_some_and(|deadline| now < deadline)
+    }
+}
+
 pub struct DesktopPeer {
     binding: SessionBinding,
+    microphone_authority_channel: Arc<StdMutex<Option<DataChannel>>>,
     peer: PeerConnection,
     _factory: PeerConnectionFactory,
     caller_source: NativeAudioSource,
@@ -221,6 +508,80 @@ impl DesktopPeer {
 
         let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         install_common_callbacks(&peer, event_tx.clone());
+        let microphone_authority = Arc::new(StdMutex::new(RemoteMicrophoneAuthority::default()));
+        let microphone_authority_channel = Arc::new(StdMutex::new(None));
+        let authority_channel_seen = Arc::new(AtomicBool::new(false));
+        let authority_binding = binding.clone();
+        let authority_state = microphone_authority.clone();
+        let authority_slot = microphone_authority_channel.clone();
+        let authority_event_tx = event_tx.clone();
+        peer.on_data_channel(Some(Box::new(move |channel| {
+            if !authority_binding.mode.needs_microphone()
+                || channel.label() != MICROPHONE_AUTHORITY_CHANNEL
+                || authority_channel_seen.swap(true, Ordering::AcqRel)
+            {
+                if let Ok(mut authority) = authority_state.lock() {
+                    authority.fail();
+                }
+                channel.close();
+                let _ = authority_event_tx.try_send(PeerEvent::ProtocolViolation(
+                    "unexpected microphone authority channel",
+                ));
+                return;
+            }
+            let message_binding = authority_binding.clone();
+            let message_state = authority_state.clone();
+            let message_tx = authority_event_tx.clone();
+            channel.on_message(Some(Box::new(move |buffer| {
+                let proof = buffer
+                    .binary
+                    .then(|| parse_microphone_authority_payload(buffer.data, &message_binding))
+                    .unwrap_or(Err("microphone authority must be binary"));
+                let result = proof.and_then(|proof| {
+                    message_state
+                        .lock()
+                        .map_err(|_| "microphone authority state poisoned")?
+                        .apply(proof)
+                });
+                if let Err(reason) = result {
+                    if let Ok(mut state) = message_state.lock() {
+                        state.fail();
+                    }
+                    let _ = message_tx.try_send(PeerEvent::ProtocolViolation(reason));
+                }
+            })));
+            let close_state = authority_state.clone();
+            let close_tx = authority_event_tx.clone();
+            channel.on_state_change(Some(Box::new(move |state| {
+                if matches!(state, DataChannelState::Closing | DataChannelState::Closed) {
+                    let was_armed = close_state
+                        .lock()
+                        .map(|mut authority| {
+                            let was_armed = authority.armed;
+                            authority.fail();
+                            was_armed
+                        })
+                        .unwrap_or(true);
+                    let _ = close_tx.try_send(PeerEvent::ProtocolViolation(if was_armed {
+                        "microphone authority channel closed while armed"
+                    } else {
+                        "microphone authority channel closed before arm"
+                    }));
+                }
+            })));
+            match authority_slot.lock() {
+                Ok(mut slot) => *slot = Some(channel),
+                Err(_) => {
+                    if let Ok(mut authority) = authority_state.lock() {
+                        authority.fail();
+                    }
+                    channel.close();
+                    let _ = authority_event_tx.try_send(PeerEvent::ProtocolViolation(
+                        "microphone authority channel state poisoned",
+                    ));
+                }
+            }
+        })));
         let (remote_audio_tx, remote_audio_rx) = mpsc::channel(REMOTE_AUDIO_QUEUE_FRAMES);
         let route_gate = RouteGate::default();
         let quarantined_frames = Arc::new(AtomicU64::new(0));
@@ -228,8 +589,10 @@ impl DesktopPeer {
         let runtime = tokio::runtime::Handle::current();
         let callback_binding = binding.clone();
         let callback_gate = route_gate.clone();
+        let callback_authority = microphone_authority.clone();
         let callback_quarantined = quarantined_frames.clone();
         peer.on_track(Some(Box::new(move |event| {
+            let receiver = event.receiver.clone();
             let MediaStreamTrack::Audio(track) = event.track else {
                 let _ = event_tx.try_send(PeerEvent::ProtocolViolation(
                     "non-audio media track was rejected",
@@ -253,10 +616,15 @@ impl DesktopPeer {
             }
             let _ = event_tx.try_send(PeerEvent::RemoteAudioReady);
             let tx = remote_audio_tx.clone();
+            let readiness_tx = event_tx.clone();
             let gate = callback_gate.clone();
+            let authority = callback_authority.clone();
             let binding = callback_binding.clone();
             let quarantined = callback_quarantined.clone();
             runtime.spawn(async move {
+                let mut microphone_rtp = RtpProgressGate::default();
+                let mut microphone_ready_emitted = false;
+                let mut next_stats_poll = Instant::now();
                 let mut stream = NativeAudioStream::with_options(
                     track,
                     options.sample_rate as i32,
@@ -266,6 +634,71 @@ impl DesktopPeer {
                     },
                 );
                 while let Some(frame) = stream.next().await {
+                    if matches!(binding.mode, MediaMode::Consult | MediaMode::Talk) {
+                        let (authority_generation, armed) = match authority.lock() {
+                            Ok(authority) => authority.snapshot(),
+                            Err(_) => {
+                                let _ = readiness_tx.try_send(PeerEvent::ProtocolViolation(
+                                    "microphone authority state poisoned",
+                                ));
+                                break;
+                            }
+                        };
+                        if !armed {
+                            if microphone_rtp.authority_generation() != authority_generation {
+                                microphone_rtp.disarm(authority_generation);
+                                microphone_ready_emitted = false;
+                            }
+                            quarantined.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        if microphone_rtp.authority_generation() != authority_generation {
+                            // The first pinned report after the exact post-arm
+                            // DTLS marker is only a baseline. Readiness needs
+                            // two later strict advances, so queued pre-marker
+                            // PCM and cross-stream SCTP/RTP ordering cannot arm.
+                            microphone_rtp.begin_authority(authority_generation);
+                            microphone_ready_emitted = false;
+                            next_stats_poll = Instant::now();
+                        }
+                        let now = Instant::now();
+                        if now >= next_stats_poll {
+                            next_stats_poll = now.checked_add(MICROPHONE_STATS_POLL).unwrap_or(now);
+                            match receiver
+                                .get_stats()
+                                .await
+                                .ok()
+                                .and_then(|stats| inbound_audio_progress(&stats))
+                            {
+                                Some(progress) => {
+                                    if let Err(reason) =
+                                        microphone_rtp.observe(progress, Instant::now())
+                                    {
+                                        let _ = readiness_tx
+                                            .try_send(PeerEvent::ProtocolViolation(reason));
+                                        break;
+                                    }
+                                }
+                                None => microphone_rtp.miss(),
+                            }
+                        }
+                        let allows_pcm = microphone_rtp.allows_pcm(Instant::now());
+                        if microphone_rtp.ready() && allows_pcm && !microphone_ready_emitted {
+                            // Retry on later decoded frames if the bounded
+                            // event queue is momentarily full; exactly one
+                            // successfully delivered readiness event is enough.
+                            // The current decoded frame follows two strict
+                            // advances of this receiver's pinned RTP identity;
+                            // concealed pre-arm playout cannot satisfy it.
+                            microphone_ready_emitted = readiness_tx
+                                .try_send(PeerEvent::RemoteMicrophoneReady)
+                                .is_ok();
+                        }
+                        if !allows_pcm {
+                            quarantined.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
                     // Consult audio is delivered only through the consult
                     // consumer. Talk audio is dropped until the Desktop's
                     // independently verified lease/fence gate is open.
@@ -312,6 +745,7 @@ impl DesktopPeer {
         Ok((
             Self {
                 binding,
+                microphone_authority_channel,
                 peer,
                 _factory: factory,
                 caller_source,
@@ -424,6 +858,11 @@ impl DesktopPeer {
         if !self.closed.swap(true, Ordering::AcqRel) {
             self.route_gate.revoke();
             self.caller_source.clear_buffer();
+            if let Ok(mut channel) = self.microphone_authority_channel.lock() {
+                if let Some(channel) = channel.take() {
+                    channel.close();
+                }
+            }
             self.peer.close();
         }
     }
@@ -458,11 +897,13 @@ impl Drop for PlatformAdmGuard {
 
 pub struct CompanionPeer {
     binding: SessionBinding,
+    microphone_authority_channel: Option<DataChannel>,
     peer: PeerConnection,
     factory: PeerConnectionFactory,
     microphone_track: Option<libwebrtc::audio_track::RtcAudioTrack>,
     microphone_active: Arc<AtomicBool>,
     microphone_generation: Arc<AtomicU64>,
+    microphone_authority_generation: Arc<AtomicU64>,
     event_rx: mpsc::Receiver<PeerEvent>,
     closed: Arc<AtomicBool>,
     _platform_audio: PlatformAdmGuard,
@@ -514,6 +955,24 @@ impl CompanionPeer {
         };
         let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         install_common_callbacks(&peer, event_tx.clone());
+        let microphone_authority_channel = if binding.mode.needs_microphone() {
+            let channel = peer.create_data_channel(
+                MICROPHONE_AUTHORITY_CHANNEL,
+                DataChannelInit {
+                    protocol: MICROPHONE_AUTHORITY_CHANNEL.into(),
+                    ..DataChannelInit::default()
+                },
+            )?;
+            let authority_tx = event_tx.clone();
+            channel.on_state_change(Some(Box::new(move |state| {
+                if state == DataChannelState::Open {
+                    let _ = authority_tx.try_send(PeerEvent::MicrophoneAuthorityReady);
+                }
+            })));
+            Some(channel)
+        } else {
+            None
+        };
         let remote_track_seen = Arc::new(AtomicBool::new(false));
         peer.on_track(Some(Box::new(move |event| {
             if !matches!(event.track, MediaStreamTrack::Audio(_)) {
@@ -541,7 +1000,11 @@ impl CompanionPeer {
                     unreachable!()
                 }
             });
-            track.set_enabled(false);
+            if !track.set_enabled(false) {
+                return Err(MediaError::AudioUnavailable(
+                    "microphone track could not be fenced before negotiation".into(),
+                ));
+            }
             peer.add_transceiver(
                 track.clone().into(),
                 RtpTransceiverInit {
@@ -580,11 +1043,13 @@ impl CompanionPeer {
         Ok((
             Self {
                 binding,
+                microphone_authority_channel,
                 peer,
                 factory,
                 microphone_track,
                 microphone_active: Arc::new(AtomicBool::new(false)),
                 microphone_generation: Arc::new(AtomicU64::new(0)),
+                microphone_authority_generation: Arc::new(AtomicU64::new(0)),
                 event_rx,
                 closed: Arc::new(AtomicBool::new(false)),
                 _platform_audio: platform_audio,
@@ -650,6 +1115,11 @@ impl CompanionPeer {
                 "microphone cannot open before WebRTC is connected",
             ));
         }
+        if !self.microphone_authority_ready() {
+            return Err(MediaError::UnsafeTransition(
+                "microphone authority channel is not open",
+            ));
+        }
         let track = self
             .microphone_track
             .as_ref()
@@ -673,6 +1143,13 @@ impl CompanionPeer {
             return Err(MediaError::AudioUnavailable(
                 "microphone track could not be enabled".into(),
             ));
+        }
+        if let Err(error) = self.send_microphone_authority(MicrophoneAuthorityAction::Arm) {
+            track.set_enabled(false);
+            let _ = self.factory.stop_recording();
+            self.factory.set_adm_recording_enabled(false);
+            self.microphone_active.store(false, Ordering::Release);
+            return Err(error);
         }
         self.microphone_active.store(true, Ordering::Release);
         self.schedule_microphone_expiry(lease_lifetime);
@@ -721,10 +1198,28 @@ impl CompanionPeer {
             .saturating_add(1);
         let active = self.microphone_active.clone();
         let current_generation = self.microphone_generation.clone();
+        let authority_generation = self.microphone_authority_generation.clone();
+        let authority_channel = self
+            .microphone_authority_channel
+            .as_ref()
+            .expect("microphone watchdog requires an authority channel")
+            .clone();
+        let binding = self.binding.clone();
         let factory = self.factory.clone();
         tokio::runtime::Handle::current().spawn(async move {
             tokio::time::sleep(lease_lifetime).await;
             if current_generation.load(Ordering::Acquire) == generation {
+                let authority_generation = authority_generation
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1);
+                let _ = authority_channel.send(
+                    &microphone_authority_payload(
+                        &binding,
+                        MicrophoneAuthorityAction::Disarm,
+                        authority_generation,
+                    ),
+                    true,
+                );
                 track.set_enabled(false);
                 let _ = factory.stop_recording();
                 factory.set_adm_recording_enabled(false);
@@ -735,6 +1230,7 @@ impl CompanionPeer {
 
     pub fn disarm_microphone(&self) {
         self.microphone_generation.fetch_add(1, Ordering::AcqRel);
+        let _ = self.send_microphone_authority(MicrophoneAuthorityAction::Disarm);
         if let Some(track) = &self.microphone_track {
             track.set_enabled(false);
         }
@@ -745,6 +1241,12 @@ impl CompanionPeer {
 
     pub fn microphone_active(&self) -> bool {
         self.microphone_active.load(Ordering::Acquire)
+    }
+
+    pub fn microphone_authority_ready(&self) -> bool {
+        self.microphone_authority_channel
+            .as_ref()
+            .is_some_and(|channel| channel.state() == DataChannelState::Open)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -758,8 +1260,38 @@ impl CompanionPeer {
     pub fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
             self.disarm_microphone();
+            if let Some(channel) = &self.microphone_authority_channel {
+                channel.close();
+            }
             self.peer.close();
         }
+    }
+
+    fn send_microphone_authority(
+        &self,
+        action: MicrophoneAuthorityAction,
+    ) -> Result<(), MediaError> {
+        let channel =
+            self.microphone_authority_channel
+                .as_ref()
+                .ok_or(MediaError::UnsafeTransition(
+                    "peer has no microphone authority channel",
+                ))?;
+        if channel.state() != DataChannelState::Open {
+            return Err(MediaError::UnsafeTransition(
+                "microphone authority channel is not open",
+            ));
+        }
+        let generation = self
+            .microphone_authority_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        channel
+            .send(
+                &microphone_authority_payload(&self.binding, action, generation),
+                true,
+            )
+            .map_err(|error| MediaError::WebRtc(error.to_string()))
     }
 
     fn ensure_open(&self) -> Result<(), MediaError> {
@@ -816,7 +1348,7 @@ fn connection_state_label(state: PeerConnectionState) -> &'static str {
 }
 
 fn validate_offer_media_policy(sdp: &str, mode: MediaMode) -> Result<(), MediaError> {
-    validate_media_policy(sdp, offer_direction_for_mode(mode))
+    validate_media_policy(sdp, offer_direction_for_mode(mode), mode.needs_microphone())
 }
 
 fn validate_answer_media_policy(sdp: &str, mode: MediaMode) -> Result<(), MediaError> {
@@ -825,7 +1357,7 @@ fn validate_answer_media_policy(sdp: &str, mode: MediaMode) -> Result<(), MediaE
     } else {
         "sendonly"
     };
-    validate_media_policy(sdp, expected)
+    validate_media_policy(sdp, expected, mode.needs_microphone())
 }
 
 fn offer_direction_for_mode(mode: MediaMode) -> &'static str {
@@ -839,10 +1371,15 @@ fn offer_direction_for_mode(mode: MediaMode) -> &'static str {
     }
 }
 
-fn validate_media_policy(sdp: &str, expected_direction: &str) -> Result<(), MediaError> {
+fn validate_media_policy(
+    sdp: &str,
+    expected_direction: &str,
+    expect_microphone_authority: bool,
+) -> Result<(), MediaError> {
     let normalized = sdp.replace("\r\n", "\n");
     let mut audio_sections = Vec::new();
     let mut current: Option<Vec<&str>> = None;
+    let mut active_authority_sections = 0_usize;
     for line in normalized.lines() {
         if line.starts_with("m=") {
             if let Some(section) = current.take() {
@@ -850,7 +1387,16 @@ fn validate_media_policy(sdp: &str, expected_direction: &str) -> Result<(), Medi
             }
             if line.starts_with("m=audio ") {
                 current = Some(vec![line]);
-            } else if !line.contains(" 0 ") && !line.ends_with(" 0") {
+            } else if line.starts_with("m=application ") {
+                let active = line.split_ascii_whitespace().nth(1) != Some("0");
+                if !active || !line.contains("DTLS/SCTP") || !line.ends_with(" webrtc-datachannel")
+                {
+                    return Err(MediaError::InvalidSignal(
+                        "invalid microphone authority media section",
+                    ));
+                }
+                active_authority_sections += 1;
+            } else if line.split_ascii_whitespace().nth(1) != Some("0") {
                 return Err(MediaError::InvalidSignal(
                     "only one active audio media section is permitted",
                 ));
@@ -865,6 +1411,11 @@ fn validate_media_policy(sdp: &str, expected_direction: &str) -> Result<(), Medi
     if audio_sections.len() != 1 {
         return Err(MediaError::InvalidSignal(
             "exactly one audio media section is required",
+        ));
+    }
+    if active_authority_sections != usize::from(expect_microphone_authority) {
+        return Err(MediaError::InvalidSignal(
+            "microphone authority media section does not match the lease mode",
         ));
     }
     let section = &audio_sections[0];
@@ -898,29 +1449,198 @@ mod tests {
     fn receive_only_modes_require_recvonly_and_talk_requires_sendrecv() {
         let recvonly = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=recvonly\r\n";
         let sendrecv = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendrecv\r\n";
+        let sendrecv_authority = format!(
+            "{sendrecv}m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n"
+        );
         assert!(validate_offer_media_policy(recvonly, MediaMode::Monitor).is_ok());
         assert!(validate_offer_media_policy(sendrecv, MediaMode::Monitor).is_err());
         assert!(validate_offer_media_policy(recvonly, MediaMode::PreparedTalk).is_ok());
         assert!(validate_offer_media_policy(sendrecv, MediaMode::PreparedTalk).is_err());
         assert!(validate_offer_media_policy(recvonly, MediaMode::PreparedConsult).is_ok());
         assert!(validate_offer_media_policy(sendrecv, MediaMode::PreparedConsult).is_err());
-        assert!(validate_offer_media_policy(sendrecv, MediaMode::Consult).is_ok());
+        assert!(validate_offer_media_policy(&sendrecv_authority, MediaMode::Consult).is_ok());
         assert!(validate_offer_media_policy(recvonly, MediaMode::Consult).is_err());
-        assert!(validate_offer_media_policy(sendrecv, MediaMode::Talk).is_ok());
+        assert!(validate_offer_media_policy(&sendrecv_authority, MediaMode::Talk).is_ok());
         assert!(validate_offer_media_policy(recvonly, MediaMode::Talk).is_err());
+        assert!(validate_offer_media_policy(sendrecv, MediaMode::Talk).is_err());
+        assert!(validate_offer_media_policy(&sendrecv_authority, MediaMode::Monitor).is_err());
     }
 
     #[test]
     fn desktop_answers_send_caller_audio_for_every_mode() {
         let sendonly = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\n";
         let sendrecv = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendrecv\r\n";
+        let sendrecv_authority = format!(
+            "{sendrecv}m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n"
+        );
         assert!(validate_answer_media_policy(sendonly, MediaMode::Monitor).is_ok());
         assert!(validate_answer_media_policy(sendonly, MediaMode::PreparedTalk).is_ok());
         assert!(validate_answer_media_policy(sendonly, MediaMode::PreparedConsult).is_ok());
-        assert!(validate_answer_media_policy(sendrecv, MediaMode::Consult).is_ok());
-        assert!(validate_answer_media_policy(sendrecv, MediaMode::Talk).is_ok());
+        assert!(validate_answer_media_policy(&sendrecv_authority, MediaMode::Consult).is_ok());
+        assert!(validate_answer_media_policy(&sendrecv_authority, MediaMode::Talk).is_ok());
         assert!(validate_answer_media_policy(sendrecv, MediaMode::Monitor).is_err());
         assert!(validate_answer_media_policy(sendonly, MediaMode::Talk).is_err());
+    }
+
+    #[test]
+    fn microphone_authority_media_section_is_exactly_one_active_sctp_channel() {
+        let audio = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendrecv\r\n";
+        let authority = "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n";
+        let valid = format!("{audio}{authority}");
+        let duplicate = format!("{audio}{authority}{authority}");
+        let inactive = format!(
+            "{audio}m=application 0 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n"
+        );
+        let wrong_protocol =
+            format!("{audio}m=application 9 TCP/BAD webrtc-datachannel\r\na=sctp-port:5000\r\n");
+        assert!(validate_offer_media_policy(&valid, MediaMode::Talk).is_ok());
+        assert!(validate_offer_media_policy(&duplicate, MediaMode::Talk).is_err());
+        assert!(validate_offer_media_policy(&inactive, MediaMode::Talk).is_err());
+        assert!(validate_offer_media_policy(&wrong_protocol, MediaMode::Talk).is_err());
+        assert!(validate_offer_media_policy(&valid, MediaMode::PreparedTalk).is_err());
+    }
+
+    fn test_talk_binding() -> SessionBinding {
+        SessionBinding {
+            rtc_session_id: "rtc_authority".into(),
+            call_id: "call_authority".into(),
+            call_epoch: 3,
+            owner_epoch: 4,
+            device_id: "device_authority".into(),
+            mode: MediaMode::Talk,
+            lease_id: Some("lease_authority".into()),
+            fence: 5,
+        }
+    }
+
+    #[test]
+    fn microphone_authority_is_binding_exact_bounded_and_replay_safe() {
+        let binding = test_talk_binding();
+        let arm = microphone_authority_payload(&binding, MicrophoneAuthorityAction::Arm, 1);
+        assert!(arm.len() < MAX_MICROPHONE_AUTHORITY_BYTES);
+        assert_eq!(
+            parse_microphone_authority_payload(&arm, &binding).unwrap(),
+            MicrophoneAuthorityProof {
+                action: MicrophoneAuthorityAction::Arm,
+                generation: 1,
+            }
+        );
+        let mut wrong = binding.clone();
+        wrong.owner_epoch += 1;
+        assert!(parse_microphone_authority_payload(&arm, &wrong).is_err());
+        assert!(parse_microphone_authority_payload(
+            &vec![b'x'; MAX_MICROPHONE_AUTHORITY_BYTES + 1],
+            &binding,
+        )
+        .is_err());
+
+        let mut authority = RemoteMicrophoneAuthority::default();
+        authority
+            .apply(MicrophoneAuthorityProof {
+                action: MicrophoneAuthorityAction::Arm,
+                generation: 1,
+            })
+            .unwrap();
+        authority
+            .apply(MicrophoneAuthorityProof {
+                action: MicrophoneAuthorityAction::Disarm,
+                generation: 2,
+            })
+            .unwrap();
+        authority
+            .apply(MicrophoneAuthorityProof {
+                action: MicrophoneAuthorityAction::Arm,
+                generation: 1,
+            })
+            .unwrap();
+        assert_eq!(authority.snapshot(), (2, false));
+        assert!(authority
+            .apply(MicrophoneAuthorityProof {
+                action: MicrophoneAuthorityAction::Arm,
+                generation: 2,
+            })
+            .is_err());
+        assert_eq!(authority.snapshot(), (2, false));
+        assert!(authority
+            .apply(MicrophoneAuthorityProof {
+                action: MicrophoneAuthorityAction::Arm,
+                generation: 3,
+            })
+            .is_err());
+
+        // Safety is independent of delivery on the bounded PeerEvent lane:
+        // even if ProtocolViolation is dropped because that queue is full, a
+        // later syntactically valid higher generation can never re-arm.
+        let mut event_lost = RemoteMicrophoneAuthority::default();
+        event_lost
+            .apply(MicrophoneAuthorityProof {
+                action: MicrophoneAuthorityAction::Arm,
+                generation: 1,
+            })
+            .unwrap();
+        event_lost.fail();
+        assert!(event_lost
+            .apply(MicrophoneAuthorityProof {
+                action: MicrophoneAuthorityAction::Arm,
+                generation: 99,
+            })
+            .is_err());
+        assert_eq!(event_lost.snapshot(), (1, false));
+    }
+
+    fn progress(packets: u64, bytes: u64, samples: u64) -> InboundAudioProgress {
+        InboundAudioProgress {
+            report_id: "inbound_audio".into(),
+            ssrc: 42,
+            mid: "0".into(),
+            packets,
+            bytes,
+            nonconcealed_samples: samples,
+        }
+    }
+
+    #[test]
+    fn rtp_progress_requires_sustained_post_authority_advances_and_stalls_closed() {
+        let start = Instant::now();
+        let mut gate = RtpProgressGate::default();
+        gate.begin_authority(7);
+        gate.observe(progress(10, 100, 160), start).unwrap();
+        gate.observe(progress(11, 120, 320), start + Duration::from_millis(50))
+            .unwrap();
+        gate.observe(progress(12, 140, 480), start + Duration::from_millis(100))
+            .unwrap();
+        assert!(!gate.ready());
+        gate.observe(progress(13, 160, 640), start + Duration::from_millis(150))
+            .unwrap();
+        assert!(gate.ready());
+        assert!(gate.allows_pcm(start + Duration::from_millis(200)));
+        assert!(!gate.allows_pcm(start + Duration::from_millis(276)));
+        gate.observe(progress(14, 180, 800), start + Duration::from_millis(300))
+            .unwrap();
+        assert!(gate.allows_pcm(start + Duration::from_millis(350)));
+        gate.miss();
+        assert!(!gate.allows_pcm(start + Duration::from_millis(351)));
+    }
+
+    #[test]
+    fn rtp_progress_identity_or_counter_reset_fails_closed() {
+        let start = Instant::now();
+        let mut gate = RtpProgressGate::default();
+        gate.begin_authority(1);
+        gate.observe(progress(10, 100, 160), start).unwrap();
+        let mut changed = progress(11, 120, 320);
+        changed.ssrc = 99;
+        assert!(gate
+            .observe(changed, start + Duration::from_millis(50))
+            .is_err());
+
+        let mut gate = RtpProgressGate::default();
+        gate.begin_authority(1);
+        gate.observe(progress(10, 100, 160), start).unwrap();
+        assert!(gate
+            .observe(progress(9, 120, 320), start + Duration::from_millis(50))
+            .is_err());
+        assert!(!gate.allows_pcm(start + Duration::from_millis(50)));
     }
 
     #[test]
