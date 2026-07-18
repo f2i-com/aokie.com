@@ -125,8 +125,15 @@
   function copyPayload() {
     if (!offer) return;
     var payload = offer.encodedPayload;
-    var clip = navigator.clipboard;
-    var write = clip && clip.writeText ? clip.writeText(payload) : Promise.reject(new Error('Clipboard unavailable'));
+    var write;
+    try {
+      var clip = navigator.clipboard;
+      write = clip && clip.writeText ? clip.writeText(payload) : Promise.reject(new Error('Clipboard unavailable'));
+    } catch (e) {
+      // Some engines THROW (not reject) on clipboard access from an
+      // opaque-origin iframe — route it into the same fallback.
+      write = Promise.reject(e);
+    }
     write.then(
       function () {
         HOST.toast('success', 'Pairing payload copied');

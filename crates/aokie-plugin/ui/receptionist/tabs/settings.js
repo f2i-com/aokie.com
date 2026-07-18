@@ -396,8 +396,11 @@
       function (results) {
         var data = results[0] || {};
         var merged = withAokieDefaults(data.settings);
+        // ⚠️ baseline and settings must be SEPARATE objects: the form edits
+        // MUTATE `settings` in place (plain DOM, not React state-replace),
+        // and an aliased baseline would make every dirty-diff empty.
         baseline = merged;
-        settings = merged;
+        settings = withAokieDefaults(merged);
         sources = results[1];
         catalog = parseTtsVoiceCatalog(data.ttsVoiceCatalog);
         customDir = false;
@@ -444,8 +447,9 @@
       .then(
         function (data) {
           var merged = withAokieDefaults((data || {}).settings);
+          // Separate objects — see the aliasing note in load().
           baseline = merged;
-          settings = merged;
+          settings = withAokieDefaults(merged);
           // The set response may not carry the catalog side key — keep the
           // one from the last settings.get rather than dropping to fallback.
           var cat = parseTtsVoiceCatalog((data || {}).ttsVoiceCatalog);
@@ -524,7 +528,6 @@
   }
 
   function voiceZoneHtml() {
-    var ttsEngines = catalog && catalog.length > 0 ? catalog : DEFAULT_ENGINES;
     var isSherpa = settings.ttsEngine === 'sherpa';
     var bundles = [];
     if (catalog) {
@@ -775,8 +778,12 @@
       ) +
       '</div>' +
       // ---- Actions ---------------------------------------------------------
+      // ⚠️ NOT type="submit": the sandboxed iframe (allow-scripts only, CSP
+      // form-action 'none') BLOCKS native form submission BEFORE the submit
+      // event fires — a submit button would be dead. Save rides the click
+      // delegate; Enter-to-save rides the keydown handler in wire().
       '<div class="rcp-actions">' +
-      '<button type="submit" class="rcp-button is-primary" id="set-save"' + (saving ? ' disabled' : '') + '>' +
+      '<button type="button" class="rcp-button is-primary" id="set-save" data-act="set-save"' + (saving ? ' disabled' : '') + '>' +
       (saving ? 'Saving…' : 'Save') +
       '</button>' +
       '<button type="button" class="rcp-button" data-act="set-reload"' + (loading || saving ? ' disabled' : '') + '>Reload</button>' +
@@ -881,6 +888,9 @@
     el.addEventListener('input', onInputOrChange);
     el.addEventListener('change', onInputOrChange);
     el.addEventListener('focusout', onInputOrChange);
+    // Defensive only: in the production sandbox (allow-scripts, CSP
+    // form-action 'none') a native submission is blocked BEFORE this event
+    // would fire — Save is driven by the click/keydown handlers below.
     el.addEventListener('submit', function (e) {
       var form = e.target;
       if (form && form.id === 'set-form') {
@@ -888,11 +898,22 @@
         save();
       }
     });
+    // Enter in a form input = save (the implicit-submission affordance the
+    // compiled form had; the sandbox blocks the native path silently).
+    el.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter') return;
+      var t = e.target;
+      if (!t || t.tagName !== 'INPUT') return;
+      if (!t.closest || !t.closest('#set-form')) return;
+      e.preventDefault();
+      if (!saving && !loading) save();
+    });
     el.addEventListener('click', function (e) {
       var btn = e.target && e.target.closest ? e.target.closest('[data-act]') : null;
       if (!btn || btn.disabled) return;
       var act = btn.getAttribute('data-act');
-      if (act === 'set-reload' || act === 'set-retry') load();
+      if (act === 'set-save') save();
+      else if (act === 'set-reload' || act === 'set-retry') load();
     });
   }
 
