@@ -5693,7 +5693,7 @@ fn run_loop(
                             if !stt_disabled && engine.is_none() {
                                 match crate::voice::SttEngine::load() {
                                     Ok(e) => {
-                                        eprintln!("[aokie-plugin] STT engine pre-warmed (ring)");
+                                        eprintln!("[aokie-plugin] STT engine pre-warmed");
                                         *worker_status.stt_error.lock().unwrap() = None;
                                         engine = Some(e);
                                     }
@@ -6180,6 +6180,27 @@ fn run_loop(
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+
+    // Warm the speech engines NOW, at radio start — not at the first ring.
+    //
+    // ⚠️ Loading a sherpa/VITS voice bundle takes ~1.8s, but the ring window
+    // is only ~1.3-1.7s (auto-answer holds for the caller id + the
+    // personalization overlay, then answers). Warming on CallIncoming
+    // therefore finished AFTER the call was already answered and the caller
+    // sat in silence waiting for it — measured live 2026-07-18: answered at
+    // 11:06:43.765, "TTS engine pre-warmed (ring)" at 11:06:45.615. The ring
+    // warm below stays as a cheap idempotent safety net (the workers no-op
+    // when an engine is already loaded); this makes the FIRST call as fast as
+    // every later one. Both sends are to worker threads, so the radio loop
+    // never blocks on the load.
+    #[cfg(all(target_os = "windows", feature = "voice"))]
+    {
+        let _ = stt_tx.send(SttWork::Warm);
+        synth.warm();
+        eprintln!(
+            "[aokie-plugin] warming the speech engines at radio start (the first call must not wait for a model load)"
+        );
+    }
 
     loop {
         let mut idle = true;
