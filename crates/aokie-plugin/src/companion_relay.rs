@@ -17,21 +17,21 @@
 //!   five minutes.
 //! * **There is no gateway process in the middle.** A POST names a single
 //!   destination party, so the carrier has to know which Companion a frame
-//!   belongs to. Peer-directed frames carry `deviceId` and are routed to the
-//!   party that device speaks from; the broadcast frames (snapshot, idle,
-//!   assistance) go to every party currently talking to us.
+//!   belongs to. Peer-directed frames and projected snapshots carry
+//!   `deviceId` and are routed to the party that device proved in its signed
+//!   hello; non-sensitive session-wide notices such as idle may be broadcast.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use aokie_protocol::v2::EndpointChallengeFrame;
+use aokie_protocol::v2::{EndpointChallengeFrame, Grant};
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
 
-use crate::companion_gateway::{RelayEndpoints, WorkerError};
+use crate::companion_gateway::{RelayEndpoints, TransportDelivery, WorkerError};
 
 /// The challenge is a small document on an already-authenticated route.
 const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -71,6 +71,10 @@ const TAIL_PRIME_PAGES: u32 = 8;
 const STREAM_PROVEN_AFTER: Duration = Duration::from_secs(5);
 /// Device→party routes are bounded so a chatty peer cannot grow the map.
 const MAX_TRACKED_DEVICES: usize = 64;
+/// Admission currently defines fewer scopes than this. Keep a hard ceiling so
+/// a malformed relay envelope cannot turn one queued frame into unbounded
+/// authenticated metadata.
+const MAX_AUTHENTICATED_GRANTS: usize = 16;
 /// Throttle for the "nobody is listening" note.
 const UNDELIVERABLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -79,6 +83,8 @@ const UNDELIVERABLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// routing peek, and the session remains the strict decoder.
 #[derive(Deserialize)]
 struct FrameRouting {
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default, rename = "deviceId")]
     device_id: Option<String>,
 }
@@ -90,6 +96,12 @@ pub(crate) enum RelayStreamEvent {
     Frame {
         seq: u64,
         from: String,
+        /// Admission subject authenticated by FormLogic for this exact frame.
+        /// Missing or malformed legacy metadata is retained as `None`, which
+        /// the session treats as no device identity rather than trusting the
+        /// inner frame's self-asserted `deviceId`.
+        subject_id: Option<String>,
+        grants: HashSet<Grant>,
         frame: String,
     },
     /// The relay's hard-lifetime marker: resume from `seq` on a fresh stream.
@@ -165,14 +177,50 @@ fn parse_sse_block(block: &str) -> Option<RelayStreamEvent> {
             let payload: Value = serde_json::from_str(&data).ok()?;
             let seq = payload.get("seq")?.as_u64()?;
             let from = payload.get("from")?.as_str()?.to_string();
+            let subject_id = payload
+                .get("subjectId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let grants = parse_authenticated_grants(&payload);
             // The stored document is re-serialised rather than passed through
             // verbatim; every signature the session checks is recomputed from
             // parsed claims, so member order carries no meaning.
             let frame = serde_json::to_string(payload.get("frame")?).ok()?;
-            Some(RelayStreamEvent::Frame { seq, from, frame })
+            Some(RelayStreamEvent::Frame {
+                seq,
+                from,
+                subject_id,
+                grants,
+                frame,
+            })
         }
         _ => None,
     }
+}
+
+/// Decode the relay's server-authenticated admission scopes fail-closed.
+///
+/// The frame itself is still queued when metadata is malformed, but it carries
+/// an EMPTY authority set. That lets the session tolerate peer traffic without
+/// letting missing, unknown, duplicate, or oversized metadata become ambient
+/// permission.
+fn parse_authenticated_grants(payload: &Value) -> HashSet<Grant> {
+    let Some(values) = payload.get("grants").and_then(Value::as_array) else {
+        return HashSet::new();
+    };
+    if values.len() > MAX_AUTHENTICATED_GRANTS {
+        return HashSet::new();
+    }
+    let mut grants = HashSet::with_capacity(values.len());
+    for value in values {
+        let Ok(grant) = serde_json::from_value::<Grant>(value.clone()) else {
+            return HashSet::new();
+        };
+        if !grants.insert(grant) {
+            return HashSet::new();
+        }
+    }
+    grants
 }
 
 pub(crate) struct RelayChannel {
@@ -189,9 +237,21 @@ pub(crate) struct RelayChannel {
     /// our endpoint proof.
     hello: Option<String>,
     greeted: HashSet<String>,
-    routes: HashMap<String, String>,
+    routes: HashMap<String, VerifiedRoute>,
     parties: Vec<String>,
-    inbound: VecDeque<String>,
+    /// Each queued frame with the roster party that actually posted it.
+    ///
+    /// The socket gateway routed by authenticated connection identity, so the
+    /// session never had to ask who a frame came from. Here the sender is the
+    /// only thing distinguishing one approved Companion from another, and
+    /// dropping it would let any roster member act as any other.
+    inbound: VecDeque<(String, Option<String>, HashSet<Grant>, String)>,
+    /// The party that posted the frame [`Self::recv_text`] last returned.
+    last_inbound_party: Option<String>,
+    /// The server-authenticated admission subject attached to that same frame.
+    last_inbound_subject: Option<String>,
+    /// The server-authenticated admission grants attached to that same frame.
+    last_inbound_grants: HashSet<Grant>,
     stream: Option<Response>,
     parser: SseParser,
     last_seq: u64,
@@ -202,6 +262,14 @@ pub(crate) struct RelayChannel {
     reopen_not_before: Instant,
     stream_failures: u32,
     undeliverable: Option<(Instant, u64)>,
+}
+
+#[derive(Clone)]
+struct VerifiedRoute {
+    party: String,
+    /// Server-authenticated admission grants from the signed hello frame that
+    /// installed or refreshed this route. Never populated from inner JSON.
+    grants: HashSet<Grant>,
 }
 
 impl RelayChannel {
@@ -230,10 +298,13 @@ impl RelayChannel {
             app_id: app_id.to_string(),
             plugin_id: plugin_id.to_string(),
             approved_parties: approved_thumbprints
-                .into_iter()
-                .map(|thumbprint| format!("mobile:{thumbprint}"))
+                .iter()
+                .map(|thumbprint| crate::companion_gateway::relay_party(thumbprint))
                 .collect(),
             hello: None,
+            last_inbound_party: None,
+            last_inbound_subject: None,
+            last_inbound_grants: HashSet::new(),
             greeted: HashSet::new(),
             routes: HashMap::new(),
             parties: Vec::new(),
@@ -328,12 +399,45 @@ impl RelayChannel {
         self.routes = std::mem::take(&mut previous.routes);
         self.parties = std::mem::take(&mut previous.parties);
         self.inbound = std::mem::take(&mut previous.inbound);
+        self.last_inbound_party = previous.last_inbound_party.take();
+        self.last_inbound_subject = previous.last_inbound_subject.take();
+        self.last_inbound_grants = std::mem::take(&mut previous.last_inbound_grants);
+    }
+
+    /// Who posted the frame the session is handling right now.
+    ///
+    /// `None` before any frame has been read. The value is only meaningful
+    /// immediately after [`Self::recv_text`] returned `Some`, which is exactly
+    /// how the session uses it.
+    pub(crate) fn last_inbound_party(&self) -> Option<&str> {
+        self.last_inbound_party.as_deref()
+    }
+
+    /// Admission subject authenticated by FormLogic for the frame just popped.
+    pub(crate) fn last_inbound_subject(&self) -> Option<&str> {
+        self.last_inbound_subject.as_deref()
+    }
+
+    /// Admission grants authenticated by FormLogic for the frame just popped.
+    pub(crate) fn last_inbound_grants(&self) -> &HashSet<Grant> {
+        &self.last_inbound_grants
     }
 
     /// Hand the carrier the signed hello for this session.
     pub(crate) fn arm(&mut self, hello: String) {
         self.hello = Some(hello);
         self.greeted.clear();
+    }
+
+    /// Owe one party the hello again.
+    ///
+    /// [`Self::arm`] is the whole-session version, for a rotation that mints a
+    /// new session nonce. This is the per-party one, for a Companion that
+    /// re-introduced itself: the session calls it only after that Companion's
+    /// endpoint signature verified, because a party that never proved itself
+    /// must not be able to make us reissue anything.
+    pub(crate) fn forget_greeting(&mut self, party: &str) {
+        self.greeted.remove(party);
     }
 
     async fn fetch_challenge(&self) -> Result<EndpointChallengeFrame, WorkerError> {
@@ -355,13 +459,17 @@ impl RelayChannel {
             .map_err(|_| WorkerError::reconnect("Companion endpoint challenge is malformed"))
     }
 
-    pub(crate) async fn send_text(&mut self, encoded: &str) -> Result<(), WorkerError> {
+    pub(crate) async fn send_text(
+        &mut self,
+        encoded: &str,
+    ) -> Result<TransportDelivery, WorkerError> {
         let targets = self.route_targets(encoded);
         if targets.is_empty() {
             self.note_undeliverable();
-            return Ok(());
+            return Ok(TransportDelivery::Dropped);
         }
         self.undeliverable = None;
+        let mut delivery = TransportDelivery::Delivered;
         for party in targets {
             // Nothing else in the relay carries the endpoint proof, so a party
             // hears our hello before it hears anything else from us.
@@ -372,16 +480,26 @@ impl RelayChannel {
             };
             batch.extend(greet);
             batch.push(encoded);
+            let mut party_delivered = true;
             for chunk in batch.chunks(MAX_FRAMES_PER_POST) {
-                self.post_frames(&party, chunk).await?;
+                if self.post_frames(&party, chunk).await? == TransportDelivery::Dropped {
+                    party_delivered = false;
+                    delivery = TransportDelivery::Dropped;
+                    break;
+                }
             }
-            self.greeted.insert(party);
+            if party_delivered {
+                self.greeted.insert(party);
+            }
         }
-        Ok(())
+        Ok(delivery)
     }
 
-    pub(crate) async fn recv_text(&mut self, tick: Duration) -> Result<Option<String>, WorkerError> {
-        if let Some(frame) = self.inbound.pop_front() {
+    pub(crate) async fn recv_text(
+        &mut self,
+        tick: Duration,
+    ) -> Result<Option<String>, WorkerError> {
+        if let Some(frame) = self.take_inbound() {
             return Ok(Some(frame));
         }
         if self.stream.is_none() {
@@ -417,7 +535,7 @@ impl RelayChannel {
                 let events = self.parser.push(&text);
                 self.note_stream_progress(!events.is_empty());
                 self.absorb(events);
-                Ok(self.inbound.pop_front())
+                Ok(self.take_inbound())
             }
             Ok(Ok(None)) => {
                 // The relay signs off with `event: end`; a body that just stops
@@ -482,7 +600,13 @@ impl RelayChannel {
     fn absorb(&mut self, events: Vec<RelayStreamEvent>) {
         for event in events {
             match event {
-                RelayStreamEvent::Frame { seq, from, frame } => {
+                RelayStreamEvent::Frame {
+                    seq,
+                    from,
+                    subject_id,
+                    grants,
+                    frame,
+                } => {
                     self.last_seq = self.last_seq.max(seq);
                     if !self.approved_parties.contains(&from) {
                         eprintln!(
@@ -490,8 +614,7 @@ impl RelayChannel {
                         );
                         continue;
                     }
-                    self.learn_route(&from, &frame);
-                    self.inbound.push_back(frame);
+                    self.inbound.push_back((from, subject_id, grants, frame));
                 }
                 RelayStreamEvent::End { seq } => {
                     if let Some(seq) = seq {
@@ -506,52 +629,112 @@ impl RelayChannel {
         }
     }
 
-    fn learn_route(&mut self, from: &str, frame: &str) {
+    /// Pop the next frame, remembering who posted it.
+    fn take_inbound(&mut self) -> Option<String> {
+        let (from, subject_id, grants, frame) = self.inbound.pop_front()?;
+        self.last_inbound_party = Some(from);
+        self.last_inbound_subject = subject_id;
+        self.last_inbound_grants = grants;
+        Some(frame)
+    }
+
+    /// Remember a roster party for authoritative broadcasts.
+    ///
+    /// This deliberately does NOT inspect `deviceId`. Every inbound frame is
+    /// peer-controlled until the session verifies its signed `mobile_hello`.
+    fn learn_party(&mut self, from: &str) {
         if !self.parties.iter().any(|party| party == from) {
             self.parties.push(from.to_string());
         }
-        let Ok(routing) = serde_json::from_str::<FrameRouting>(frame) else {
-            return;
-        };
-        let Some(device_id) = routing.device_id else {
-            return;
-        };
-        // A device's party is bound on first sight and never re-pointed. The
-        // `deviceId` here is SELF-ASSERTED by whichever Companion sent the
-        // frame — the socket gateway routed by authenticated connection
-        // identity and never took a destination from frame content, so
-        // honouring a later claim would let one approved Companion redirect
-        // another device's peer-directed frames (rtc_signal, lease_revoke,
-        // claim_decision, end_caller_result) into its own mailbox. The session
-        // already treats a device→peer binding as immutable; the carrier holds
-        // the same line.
-        match self.routes.get(&device_id) {
-            Some(bound) if bound == from => {}
-            Some(_) => {
-                eprintln!(
-                    "[aokie-plugin][companion] stage=relay_route_conflict detail=A Companion claimed a device already bound to another party and the claim was refused"
-                );
-            }
-            None => {
-                if self.routes.len() >= MAX_TRACKED_DEVICES {
-                    return;
-                }
-                self.routes.insert(device_id, from.to_string());
-            }
-        }
     }
 
-    /// Peer-directed frames name their device; everything else is authoritative
-    /// state every listening Companion needs.
+    /// Install the route proved by a verified mobile hello.
+    ///
+    /// Rebinding is intentional. The session calls this only after the
+    /// endpoint signature, owner-approved roster membership, app/plugin
+    /// addressing and sender party all agree. A restarted/re-approved device
+    /// therefore repairs a stale route instead of losing grants to an older
+    /// mailbox.
+    pub(crate) fn authorize_route(
+        &mut self,
+        device_id: &str,
+        party: &str,
+        authenticated_grants: &HashSet<Grant>,
+    ) {
+        if !self.approved_parties.contains(party) {
+            return;
+        }
+        self.learn_party(party);
+        if self.routes.len() >= MAX_TRACKED_DEVICES && !self.routes.contains_key(device_id) {
+            return;
+        }
+        self.routes.insert(
+            device_id.to_string(),
+            VerifiedRoute {
+                party: party.to_string(),
+                grants: authenticated_grants.clone(),
+            },
+        );
+    }
+
+    /// Apply grant narrowing observed on a later server-authenticated frame.
+    /// Ordinary actions may remove authority immediately, but only a newly
+    /// verified signed hello may broaden it again through `authorize_route`.
+    pub(crate) fn narrow_route_grants(
+        &mut self,
+        device_id: &str,
+        party: &str,
+        authenticated_grants: &HashSet<Grant>,
+    ) {
+        let Some(route) = self.routes.get_mut(device_id) else {
+            return;
+        };
+        if route.party != party {
+            return;
+        }
+        route
+            .grants
+            .retain(|grant| authenticated_grants.contains(grant));
+    }
+
+    /// Peer-directed frames name their device. An untargeted snapshot is a
+    /// projection bug and fails closed here rather than broadcasting its raw
+    /// caller/caption/offer state; only non-sensitive session-wide notices are
+    /// eligible for fan-out.
     fn route_targets(&self, encoded: &str) -> Vec<String> {
-        let device_id = serde_json::from_str::<FrameRouting>(encoded)
-            .ok()
-            .and_then(|routing| routing.device_id);
-        match device_id {
+        let Ok(routing) = serde_json::from_str::<FrameRouting>(encoded) else {
+            return Vec::new();
+        };
+        match routing.device_id {
             // An unknown device is never broadcast: a peer-directed frame must
             // not reach a Companion it was not addressed to.
-            Some(device_id) => self.routes.get(&device_id).cloned().into_iter().collect(),
-            None => self.parties.clone(),
+            Some(device_id) => self
+                .routes
+                .get(&device_id)
+                .map(|route| route.party.clone())
+                .into_iter()
+                .collect(),
+            // Assistance can contain the caller's question and conversational
+            // context. It is untargeted in the socket dialect, so the relay
+            // performs the missing trusted projection using only grants that
+            // FormLogic authenticated on each verified route.
+            None if routing.kind.as_deref() == Some("assistance_request") => self
+                .parties
+                .iter()
+                .filter(|party| {
+                    self.routes.values().any(|route| {
+                        route.party.as_str() == party.as_str()
+                            && route.grants.contains(&Grant::StateRead)
+                            && route.grants.contains(&Grant::AssistanceRead)
+                    })
+                })
+                .cloned()
+                .collect(),
+            // The only truly session-wide, non-sensitive frame. Everything
+            // else must be explicitly targeted or deliberately projected
+            // above; unknown untargeted kinds fail closed.
+            None if routing.kind.as_deref() == Some("plugin_idle") => self.parties.clone(),
+            None => Vec::new(),
         }
     }
 
@@ -608,9 +791,13 @@ impl RelayChannel {
         Ok(())
     }
 
-    async fn post_frames(&self, party: &str, frames: &[&str]) -> Result<(), WorkerError> {
+    async fn post_frames(
+        &self,
+        party: &str,
+        frames: &[&str],
+    ) -> Result<TransportDelivery, WorkerError> {
         if frames.is_empty() {
-            return Ok(());
+            return Ok(TransportDelivery::Delivered);
         }
         let body = relay_post_body(party, frames);
         let mut attempt = 0;
@@ -624,7 +811,9 @@ impl RelayChannel {
                 .send()
                 .await;
             let error = match outcome {
-                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) if response.status().is_success() => {
+                    return Ok(TransportDelivery::Delivered)
+                }
                 Ok(response) => {
                     let status = response.status();
                     if status == StatusCode::TOO_MANY_REQUESTS && attempt < POST_ATTEMPTS {
@@ -641,13 +830,15 @@ impl RelayChannel {
                             "[aokie-plugin][companion] stage=relay_backpressure frames={} detail=The relay mailbox is full and the frames were dropped",
                             frames.len()
                         );
-                        return Ok(());
+                        return Ok(TransportDelivery::Dropped);
                     }
                     relay_status_error("frames", status)
                 }
                 Err(error) => relay_transport_error("frames", &error),
             };
-            if attempt >= POST_ATTEMPTS || error.kind != crate::companion_gateway::WorkerErrorKind::Reconnect {
+            if attempt >= POST_ATTEMPTS
+                || error.kind != crate::companion_gateway::WorkerErrorKind::Reconnect
+            {
                 return Err(error);
             }
             tokio::time::sleep(POST_RETRY_DELAY).await;
@@ -734,8 +925,12 @@ fn relay_status_error(stage: &str, status: StatusCode) -> WorkerError {
 mod tests {
     use super::*;
 
+    fn test_grants() -> HashSet<Grant> {
+        HashSet::from([Grant::StateRead, Grant::RtcSignal, Grant::Monitor])
+    }
+
     fn frame_event(seq: u64, from: &str, frame: &str) -> String {
-        format!("id: {seq}\nevent: frame\ndata: {{\"seq\":{seq},\"from\":\"{from}\",\"frame\":{frame}}}\n\n")
+        format!("id: {seq}\nevent: frame\ndata: {{\"seq\":{seq},\"from\":\"{from}\",\"subjectId\":\"device_a\",\"grants\":[\"state_read\",\"rtc_signal\",\"monitor\"],\"frame\":{frame}}}\n\n")
     }
 
     #[test]
@@ -752,11 +947,20 @@ mod tests {
         assert!(parser.push(head).is_empty());
         let events = parser.push(tail);
 
-        let [RelayStreamEvent::Frame { seq, from, frame }] = events.as_slice() else {
+        let [RelayStreamEvent::Frame {
+            seq,
+            from,
+            subject_id,
+            grants,
+            frame,
+        }] = events.as_slice()
+        else {
             panic!("the split event decodes to exactly one frame, got {events:?}");
         };
         assert_eq!(*seq, 7);
         assert_eq!(from, "mobile:abc");
+        assert_eq!(subject_id.as_deref(), Some("device_a"));
+        assert_eq!(grants, &test_grants());
         // The frame is handed on SEMANTICALLY, not byte for byte: re-serialising
         // through serde_json::Value sorts members. That is safe in this
         // direction because every signature the protocol checks is recomputed
@@ -770,10 +974,108 @@ mod tests {
     }
 
     #[test]
+    fn malformed_authenticated_grants_fail_closed_to_empty_authority() {
+        let malformed = [
+            None,
+            Some(serde_json::json!("state_read")),
+            Some(serde_json::json!(["state_read", "unknown_scope"])),
+            Some(serde_json::json!(["state_read", "state_read"])),
+            Some(Value::Array(
+                (0..=MAX_AUTHENTICATED_GRANTS)
+                    .map(|_| serde_json::json!("state_read"))
+                    .collect(),
+            )),
+        ];
+
+        for (index, grants) in malformed.into_iter().enumerate() {
+            let mut payload = serde_json::json!({
+                "seq": index + 1,
+                "from": "mobile:abc",
+                "frame": {"kind": "mobile_hello"}
+            });
+            if let Some(grants) = grants {
+                payload["grants"] = grants;
+            }
+            let encoded = format!("id: {}\nevent: frame\ndata: {}\n\n", index + 1, payload);
+            let events = SseParser::default().push(&encoded);
+            let [RelayStreamEvent::Frame { grants, .. }] = events.as_slice() else {
+                panic!("malformed grant metadata still carries a harmless frame");
+            };
+            assert!(grants.is_empty(), "case {index} must fail closed");
+        }
+    }
+
+    #[test]
+    fn missing_or_non_string_authenticated_subject_carries_no_device_identity() {
+        for (index, subject) in [
+            None,
+            Some(Value::Null),
+            Some(serde_json::json!({"id": "device_a"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut payload = serde_json::json!({
+                "seq": index + 1,
+                "from": "mobile:abc",
+                "grants": ["state_read"],
+                "frame": {"kind": "mobile_hello"}
+            });
+            if let Some(subject) = subject {
+                payload["subjectId"] = subject;
+            }
+            let encoded = format!("id: {}\nevent: frame\ndata: {}\n\n", index + 1, payload);
+            let events = SseParser::default().push(&encoded);
+            let [RelayStreamEvent::Frame { subject_id, .. }] = events.as_slice() else {
+                panic!("legacy subject metadata still carries a harmless frame");
+            };
+            assert!(subject_id.is_none(), "case {index} must fail closed");
+        }
+    }
+
+    #[test]
+    fn queued_frames_keep_their_own_authenticated_party_and_grants() {
+        let mut channel = test_channel();
+        channel.absorb(vec![
+            RelayStreamEvent::Frame {
+                seq: 1,
+                from: "mobile:abc".into(),
+                subject_id: Some("device_a".into()),
+                grants: HashSet::from([Grant::StateRead]),
+                frame: "{\"kind\":\"mobile_hello\"}".into(),
+            },
+            RelayStreamEvent::Frame {
+                seq: 2,
+                from: "mobile:def".into(),
+                subject_id: Some("device_b".into()),
+                grants: HashSet::from([Grant::StateRead, Grant::RtcSignal, Grant::Takeover]),
+                frame: "{\"kind\":\"lease_request\"}".into(),
+            },
+        ]);
+
+        assert!(channel.take_inbound().is_some());
+        assert_eq!(channel.last_inbound_party(), Some("mobile:abc"));
+        assert_eq!(channel.last_inbound_subject(), Some("device_a"));
+        assert_eq!(
+            channel.last_inbound_grants(),
+            &HashSet::from([Grant::StateRead])
+        );
+        assert!(channel.take_inbound().is_some());
+        assert_eq!(channel.last_inbound_party(), Some("mobile:def"));
+        assert_eq!(channel.last_inbound_subject(), Some("device_b"));
+        assert_eq!(
+            channel.last_inbound_grants(),
+            &HashSet::from([Grant::StateRead, Grant::RtcSignal, Grant::Takeover])
+        );
+    }
+
+    #[test]
     fn heartbeat_comments_and_retry_hints_carry_no_session_frame() {
         let mut parser = SseParser::default();
 
-        assert!(parser.push("retry: 2000\n\n: connected\n\n: keepalive\n\n").is_empty());
+        assert!(parser
+            .push("retry: 2000\n\n: connected\n\n: keepalive\n\n")
+            .is_empty());
 
         // The stream stays usable: a real event after the comments still lands.
         let events = parser.push(&frame_event(3, "mobile:abc", "{\"kind\":\"rtc_signal\"}"));
@@ -796,13 +1098,15 @@ mod tests {
     fn crlf_streams_and_multi_line_data_decode_identically() {
         let mut parser = SseParser::default();
 
-        let events = parser.push("id: 9\r\nevent: frame\r\ndata: {\"seq\":9,\"from\":\"mobile:abc\",\r\ndata: \"frame\":{\"kind\":\"lease_renewed\"}}\r\n\r\n");
+        let events = parser.push("id: 9\r\nevent: frame\r\ndata: {\"seq\":9,\"from\":\"mobile:abc\",\"subjectId\":\"device_a\",\"grants\":[\"state_read\",\"rtc_signal\",\"monitor\"],\r\ndata: \"frame\":{\"kind\":\"lease_renewed\"}}\r\n\r\n");
 
         assert_eq!(
             events,
             vec![RelayStreamEvent::Frame {
                 seq: 9,
                 from: "mobile:abc".into(),
+                subject_id: Some("device_a".into()),
+                grants: test_grants(),
                 frame: "{\"kind\":\"lease_renewed\"}".into(),
             }]
         );
@@ -812,7 +1116,10 @@ mod tests {
     fn post_body_embeds_frames_verbatim_and_quotes_the_party() {
         let body = relay_post_body(
             "mobile:abc",
-            &["{\"kind\":\"plugin_hello\"}", "{\"kind\":\"plugin_snapshot\"}"],
+            &[
+                "{\"kind\":\"plugin_hello\"}",
+                "{\"kind\":\"plugin_snapshot\"}",
+            ],
         );
 
         assert_eq!(
@@ -826,51 +1133,117 @@ mod tests {
     #[test]
     fn peer_directed_frames_never_reach_a_companion_they_were_not_addressed_to() {
         let mut channel = test_channel();
-        channel.learn_route("mobile:abc", "{\"kind\":\"claim_proposal\",\"deviceId\":\"device_a\"}");
-        channel.learn_route("mobile:def", "{\"kind\":\"claim_proposal\",\"deviceId\":\"device_b\"}");
+        channel.learn_party("mobile:abc");
+        channel.learn_party("mobile:def");
+        channel.authorize_route("device_a", "mobile:abc", &test_grants());
+        channel.authorize_route("device_b", "mobile:def", &test_grants());
 
         assert_eq!(
             channel.route_targets("{\"kind\":\"plugin_rtc_signal\",\"deviceId\":\"device_a\"}"),
             vec!["mobile:abc".to_string()]
         );
-        // Broadcast state reaches every party that has spoken to us.
+        // A projected snapshot follows its verified device route. A raw
+        // snapshot is a security-boundary regression and fails closed instead
+        // of exposing one device's caller/captions/offers to another.
         assert_eq!(
-            channel.route_targets("{\"kind\":\"plugin_snapshot\"}"),
+            channel.route_targets("{\"kind\":\"plugin_snapshot\",\"deviceId\":\"device_a\"}"),
+            vec!["mobile:abc".to_string()]
+        );
+        assert!(channel
+            .route_targets("{\"kind\":\"plugin_snapshot\"}")
+            .is_empty());
+        // The idle notice carries no call data and remains session-wide.
+        assert_eq!(
+            channel.route_targets("{\"kind\":\"plugin_idle\"}"),
             vec!["mobile:abc".to_string(), "mobile:def".to_string()]
         );
         // An unrecognised device is dropped rather than fanned out.
         assert!(channel
             .route_targets("{\"kind\":\"plugin_rtc_signal\",\"deviceId\":\"device_z\"}")
             .is_empty());
+        assert!(
+            channel.route_targets("not json").is_empty(),
+            "malformed internal output is never broadcast"
+        );
     }
 
     #[test]
-    fn an_approved_companion_cannot_re_point_another_devices_route_at_itself() {
+    fn untargeted_assistance_reaches_only_verified_assistance_read_routes() {
         let mut channel = test_channel();
-        channel.learn_route(
-            "mobile:abc",
-            "{\"kind\":\"claim_proposal\",\"deviceId\":\"device_a\"}",
-        );
-
-        // `deviceId` is self-asserted frame content, so a second approved
-        // Companion claiming a bound device must not capture its signalling.
-        // The socket gateway routed by authenticated identity and could never
-        // be steered this way.
-        channel.learn_route(
-            "mobile:def",
-            "{\"kind\":\"claim_proposal\",\"deviceId\":\"device_a\"}",
-        );
-
+        let allowed = HashSet::from([Grant::StateRead, Grant::AssistanceRead]);
+        let denied = HashSet::from([Grant::StateRead]);
+        let assistance_without_state = HashSet::from([Grant::AssistanceRead]);
+        channel.authorize_route("device_a", "mobile:abc", &allowed);
+        channel.learn_party("mobile:def");
+        channel.authorize_route("device_c", "mobile:ghi", &assistance_without_state);
+        let assistance =
+            "{\"kind\":\"assistance_request\",\"question\":\"private\",\"context\":\"caller context\"}";
         assert_eq!(
-            channel.route_targets("{\"kind\":\"plugin_rtc_signal\",\"deviceId\":\"device_a\"}"),
+            channel.route_targets(assistance),
             vec!["mobile:abc".to_string()],
-            "the established binding survives a conflicting claim"
+            "a party needs both StateRead and AssistanceRead before receiving caller context"
         );
-        // The claimant is still a party, so broadcast state still reaches it.
+        channel.authorize_route("device_b", "mobile:def", &denied);
+
         assert_eq!(
-            channel.route_targets("{\"kind\":\"plugin_snapshot\"}"),
-            vec!["mobile:abc".to_string(), "mobile:def".to_string()]
+            channel.route_targets(assistance),
+            vec!["mobile:abc".to_string()],
+            "a verified route without AssistanceRead still receives no caller context"
         );
+        channel.narrow_route_grants("device_a", "mobile:abc", &HashSet::from([Grant::StateRead]));
+        assert!(
+            channel.route_targets(assistance).is_empty(),
+            "a later authenticated frame that omits AssistanceRead narrows the verified route immediately"
+        );
+        assert!(
+            channel
+                .route_targets(
+                    "{\"kind\":\"future_sensitive_notice\",\"context\":\"must not fan out\"}"
+                )
+                .is_empty(),
+            "unknown untargeted kinds fail closed instead of becoming ambient broadcasts"
+        );
+    }
+
+    #[test]
+    fn a_pre_hello_squatter_cannot_capture_a_grant_and_verified_hello_repairs_the_route() {
+        let mut channel = test_channel();
+        channel.absorb(vec![RelayStreamEvent::Frame {
+            seq: 1,
+            from: "mobile:abc".into(),
+            subject_id: Some("device_a".into()),
+            grants: test_grants(),
+            // Arbitrary pre-hello traffic may name another device, but that
+            // field is self-asserted and therefore creates no targeted route.
+            frame: "{\"kind\":\"lease_request\",\"deviceId\":\"device_a\"}".into(),
+        }]);
+
+        let grant = "{\"kind\":\"plugin_lease_status\",\"deviceId\":\"device_a\"}";
+        assert!(
+            channel.route_targets(grant).is_empty(),
+            "unverified traffic cannot capture a targeted grant"
+        );
+
+        // GatewaySession calls this only after device_a's signed hello proves
+        // that mobile:def is its endpoint party. The verified route wins even
+        // if untrusted traffic tried to squat first.
+        channel.authorize_route("device_a", "mobile:def", &test_grants());
+
+        assert_eq!(
+            channel.route_targets(grant),
+            vec!["mobile:def".to_string()],
+            "the verified hello owns the grant route"
+        );
+        // Garbage from a roster member does not subscribe it to raw snapshots.
+        // Projected state follows only the route installed by the verified
+        // hello; raw state is never broadcast at all.
+        assert_eq!(
+            channel.route_targets("{\"kind\":\"plugin_snapshot\",\"deviceId\":\"device_a\"}"),
+            vec!["mobile:def".to_string()]
+        );
+        assert!(channel
+            .route_targets("{\"kind\":\"plugin_snapshot\"}")
+            .is_empty());
     }
 
     #[test]
@@ -878,7 +1251,9 @@ mod tests {
         let mut channel = test_channel();
 
         channel.note_undeliverable();
-        let (window, _) = channel.undeliverable.expect("the first drop opens a window");
+        let (window, _) = channel
+            .undeliverable
+            .expect("the first drop opens a window");
 
         for _ in 0..5 {
             channel.note_undeliverable();
@@ -899,18 +1274,26 @@ mod tests {
             RelayStreamEvent::Frame {
                 seq: 4,
                 from: "mobile:intruder".into(),
+                subject_id: Some("device_x".into()),
+                grants: test_grants(),
                 frame: "{\"kind\":\"claim_proposal\",\"deviceId\":\"device_x\"}".into(),
             },
             RelayStreamEvent::Frame {
                 seq: 5,
                 from: "mobile:abc".into(),
+                subject_id: Some("device_a".into()),
+                grants: test_grants(),
                 frame: "{\"kind\":\"claim_proposal\",\"deviceId\":\"device_a\"}".into(),
             },
         ]);
 
         assert_eq!(channel.inbound.len(), 1);
         assert!(channel.routes.get("device_x").is_none());
-        assert_eq!(channel.routes.get("device_a").map(String::as_str), Some("mobile:abc"));
+        assert!(channel.routes.get("device_a").is_none());
+        assert!(
+            channel.parties.is_empty(),
+            "an approved sender is not a broadcast subscriber before verified hello"
+        );
         // The cursor still advances past a skipped row so it is never re-read.
         assert_eq!(channel.last_seq, 5);
     }
@@ -985,12 +1368,16 @@ mod tests {
         let router = axum::Router::new().route(
             "/frames",
             axum::routing::get(
-                move |axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>| {
+                move |axum::extract::Query(query): axum::extract::Query<
+                    HashMap<String, String>,
+                >| {
                     let seen = seen.clone();
                     async move {
                         seen.fetch_add(1, Ordering::SeqCst);
-                        let since: u64 =
-                            query.get("since").and_then(|raw| raw.parse().ok()).unwrap_or(0);
+                        let since: u64 = query
+                            .get("since")
+                            .and_then(|raw| raw.parse().ok())
+                            .unwrap_or(0);
                         // `lastSeq` is the tail of ONE page: the relay caps a
                         // fetch at 128 rows while an app mailbox holds up to
                         // 512, so a backlog of 300 takes three fetches to walk.
@@ -1010,7 +1397,10 @@ mod tests {
 
         let mut channel = test_channel();
         channel.endpoints.frames_url = format!("http://{address}/frames");
-        let cursor = channel.tail_cursor().await.expect("priming reaches the tail");
+        let cursor = channel
+            .tail_cursor()
+            .await
+            .expect("priming reaches the tail");
 
         // Stopping at the first page would start the session 172 frames short
         // of the tail, handing it the rest of a previous session's backlog —
@@ -1019,6 +1409,37 @@ mod tests {
         assert_eq!(cursor, 300);
         // Three advancing pages plus the one that reports no movement.
         assert_eq!(requests.load(Ordering::SeqCst), 4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_backpressure_is_a_nonfatal_drop_not_a_delivery() {
+        let router = axum::Router::new().route(
+            "/frames",
+            axum::routing::post(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut channel = test_channel();
+        channel.endpoints.frames_url = format!("http://{address}/frames");
+        channel.arm("{\"kind\":\"plugin_hello\"}".into());
+        channel.authorize_route("device_a", "mobile:abc", &test_grants());
+        let delivery = channel
+            .send_text("{\"kind\":\"plugin_lease_status\",\"deviceId\":\"device_a\"}")
+            .await
+            .expect("backpressure is nonfatal to the live session");
+
+        assert_eq!(delivery, TransportDelivery::Dropped);
+        assert!(
+            !channel.greeted.contains("mobile:abc"),
+            "a dropped hello/grant batch must be retried as a greeting later"
+        );
         server.abort();
     }
 
@@ -1041,6 +1462,8 @@ mod tests {
             vec![RelayStreamEvent::Frame {
                 seq: 11,
                 from: "mobile:abc".into(),
+                subject_id: Some("device_a".into()),
+                grants: test_grants(),
                 frame: "{\"kind\":\"lease_granted\"}".into(),
             }],
             "the finished frame survives the oversized one behind it"
@@ -1056,8 +1479,11 @@ mod tests {
         previous.absorb(vec![RelayStreamEvent::Frame {
             seq: 118,
             from: "mobile:abc".into(),
+            subject_id: Some("device_a".into()),
+            grants: test_grants(),
             frame: "{\"kind\":\"lease_granted\",\"deviceId\":\"device_a\"}".into(),
         }]);
+        previous.authorize_route("device_a", "mobile:abc", &test_grants());
         previous.greeted.insert("mobile:abc".into());
 
         let mut next = test_channel();
@@ -1079,11 +1505,43 @@ mod tests {
         assert!(!next.greeted.contains("mobile:abc"));
     }
 
+    #[test]
+    fn a_re_introduced_companion_is_owed_the_hello_again_without_disturbing_the_others() {
+        let mut channel = test_channel();
+        channel.arm("{\"kind\":\"plugin_hello\",\"sessionNonce\":\"a\"}".into());
+        channel.greeted.insert("mobile:abc".into());
+        channel.greeted.insert("mobile:def".into());
+
+        channel.forget_greeting("mobile:abc");
+
+        // The party that re-introduced itself hears the hello again: a
+        // restarted Companion holds no memory of the first one, and it DROPS
+        // authoritative state from a peer it cannot verify — so without this it
+        // would receive every frame and use none of them.
+        assert!(!channel.greeted.contains("mobile:abc"));
+        // ...and nobody else is disturbed. Re-greeting the whole session is
+        // `arm`'s job, on a rotation that actually changed the session nonce.
+        assert!(channel.greeted.contains("mobile:def"));
+    }
+
+    #[test]
+    fn the_party_the_session_retires_is_the_one_the_carrier_approved() {
+        // The greeting book, the approved set and the session's re-greet signal
+        // must agree on how a party is spelled, or the retirement silently
+        // targets a party that does not exist and the deadlock is unchanged.
+        let channel = test_channel();
+        let party = crate::companion_gateway::relay_party("abc");
+
+        assert!(channel.approved_parties.contains(&party));
+        assert_eq!(party, "mobile:abc");
+    }
+
     fn test_channel() -> RelayChannel {
         RelayChannel {
             client: Client::builder().build().expect("test client builds"),
             endpoints: RelayEndpoints {
-                challenge_url: "https://api.example.test/api/aokie-companion/relay/challenge".into(),
+                challenge_url: "https://api.example.test/api/aokie-companion/relay/challenge"
+                    .into(),
                 frames_url: "https://api.example.test/api/aokie-companion/relay/frames".into(),
                 stream_url: "https://api.example.test/api/aokie-companion/relay/stream".into(),
             },
@@ -1092,6 +1550,9 @@ mod tests {
             plugin_id: "aokie".into(),
             approved_parties: HashSet::from(["mobile:abc".to_string(), "mobile:def".to_string()]),
             hello: None,
+            last_inbound_party: None,
+            last_inbound_subject: None,
+            last_inbound_grants: HashSet::new(),
             greeted: HashSet::new(),
             routes: HashMap::new(),
             parties: Vec::new(),

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aokie_media::{
     CompanionPeer, DesktopPeer, IceServerConfig, MediaMode, PeerEvent, PeerOptions, RoutePermit,
@@ -64,6 +64,9 @@ async fn connect(
                 event = desktop.next_event() => match event.expect("Desktop event lane") {
                     PeerEvent::LocalIce(candidate) => companion.add_remote_candidate(candidate).await.expect("Companion ICE"),
                     PeerEvent::ConnectionState("connected") => desktop_connected = true,
+                    PeerEvent::RemoteMicrophoneReady => panic!(
+                        "Desktop observed microphone PCM before Companion arm_microphone"
+                    ),
                     PeerEvent::ProtocolViolation(reason) => panic!("Desktop protocol violation: {reason}"),
                     _ => {}
                 },
@@ -73,6 +76,55 @@ async fn connect(
     })
     .await
     .map_err(|_| "native peers did not connect before timeout")
+}
+
+async fn wait_for_desktop_remote_microphone(desktop: &mut DesktopPeer) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match desktop.next_event().await.expect("Desktop event lane") {
+                PeerEvent::RemoteMicrophoneReady => return,
+                PeerEvent::ProtocolViolation(reason) => {
+                    panic!("Desktop protocol violation: {reason}")
+                }
+                PeerEvent::ConnectionState("failed" | "disconnected" | "closed") => {
+                    panic!("Desktop connection failed before microphone PCM proof")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("Desktop did not observe decoded microphone PCM after arm_microphone");
+}
+
+async fn wait_for_companion_microphone_authority(companion: &CompanionPeer) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !companion.microphone_authority_ready() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Companion microphone authority channel did not open");
+}
+
+async fn assert_no_desktop_microphone_before_arm(desktop: &mut DesktopPeer) {
+    let _ = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            match desktop.next_event().await.expect("Desktop event lane") {
+                PeerEvent::RemoteMicrophoneReady => panic!(
+                    "Desktop observed disabled-track or synthetic microphone PCM before arm_microphone"
+                ),
+                PeerEvent::ProtocolViolation(reason) => {
+                    panic!("Desktop protocol violation: {reason}")
+                }
+                PeerEvent::ConnectionState("failed" | "disconnected" | "closed") => {
+                    panic!("Desktop connection failed during the pre-arm quiet window")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
 }
 
 async fn wait_for_companion_remote_audio(companion: &mut CompanionPeer) {
@@ -126,6 +178,9 @@ async fn connect_over_forced_relay(
                     }
                     PeerEvent::ConnectionState("connected") => desktop_connected = true,
                     PeerEvent::ConnectionState("failed") => panic!("Desktop forced-relay ICE failed"),
+                    PeerEvent::RemoteMicrophoneReady => panic!(
+                        "Desktop observed microphone PCM before Companion arm_microphone"
+                    ),
                     PeerEvent::ProtocolViolation(reason) => panic!("Desktop protocol violation: {reason}"),
                     _ => {}
                 },
@@ -269,6 +324,30 @@ async fn native_prepared_takeover_is_receive_only_despite_positive_fence() {
     desktop.close();
 }
 
+/// Closing an active-mode peer before any microphone authority was granted
+/// must not leak native data-channel/track handles or emit a false readiness
+/// edge during teardown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a local microphone and speaker endpoint"]
+async fn native_talk_peer_closes_cleanly_before_microphone_arm() {
+    let binding = talk_binding();
+    let (mut companion, offer) = CompanionPeer::offer(binding.clone(), PeerOptions::default())
+        .await
+        .expect("Companion talk offer");
+    let (mut desktop, answer) = DesktopPeer::answer(binding, offer, PeerOptions::default())
+        .await
+        .expect("Desktop answer");
+    companion
+        .accept_answer(answer)
+        .await
+        .expect("Companion accepts answer");
+    let _ = connect(&mut companion, &mut desktop).await.unwrap();
+    wait_for_companion_microphone_authority(&companion).await;
+    assert_no_desktop_microphone_before_arm(&mut desktop).await;
+    companion.close();
+    desktop.close();
+}
+
 /// Verifies the real operating-system microphone path and, critically, that
 /// decoded PCM is unavailable until both the native endpoint and Desktop's
 /// independent caller-route gate hold the exact current lease/fence binding.
@@ -287,22 +366,28 @@ async fn native_talk_peer_releases_microphone_pcm_only_under_current_lease() {
         .await
         .expect("Companion accepts answer");
     let _ = connect(&mut companion, &mut desktop).await.unwrap();
+    wait_for_companion_microphone_authority(&companion).await;
 
     assert!(!companion.microphone_active());
+    assert_no_desktop_microphone_before_arm(&mut desktop).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(150), desktop.recv_caller_microphone())
             .await
             .is_err()
     );
 
+    companion
+        .arm_microphone(&binding, Duration::from_secs(3))
+        .expect("current talk lease opens native microphone");
+    // Readiness is proven by a decoded frame on the direct Talk peer while
+    // Desktop's route is still closed. The proof frame remains quarantined;
+    // only after this event may the caller-bound route be authorized.
+    wait_for_desktop_remote_microphone(&mut desktop).await;
     desktop
         .authorize_caller_transmit(
             RoutePermit::new(binding.clone(), Duration::from_secs(3)).unwrap(),
         )
         .unwrap();
-    companion
-        .arm_microphone(&binding, Duration::from_secs(3))
-        .expect("current talk lease opens native microphone");
     let frame = tokio::time::timeout(Duration::from_secs(3), desktop.recv_caller_microphone())
         .await
         .expect("microphone frame timeout")
@@ -310,9 +395,23 @@ async fn native_talk_peer_releases_microphone_pcm_only_under_current_lease() {
     assert!(frame.is_ten_milliseconds());
     assert!(companion.microphone_active());
 
-    desktop.revoke_caller_transmit();
+    // Keep the independently authorized Desktop route open while native
+    // capture disarms. The exact disarm marker must close PCM delivery even
+    // though libwebrtc continues producing concealed/synthetic playout.
     companion.disarm_microphone();
     assert!(!companion.microphone_active());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while matches!(
+        tokio::time::timeout(Duration::from_millis(10), desktop.recv_caller_microphone()).await,
+        Ok(Ok(_))
+    ) {}
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), desktop.recv_caller_microphone())
+            .await
+            .is_err(),
+        "concealed PCM escaped after exact native disarm"
+    );
+    desktop.revoke_caller_transmit();
     companion.close();
     desktop.close();
 }
@@ -335,24 +434,33 @@ async fn native_talk_lease_renewal_keeps_microphone_capture_continuous() {
         .await
         .expect("Companion accepts answer");
     let _ = connect(&mut companion, &mut desktop).await.unwrap();
+    wait_for_companion_microphone_authority(&companion).await;
 
+    let armed_at = Instant::now();
+    companion
+        .arm_microphone(&binding, Duration::from_secs(3))
+        .expect("current talk lease opens native microphone");
+    wait_for_desktop_remote_microphone(&mut desktop).await;
     desktop
         .authorize_caller_transmit(
             RoutePermit::new(binding.clone(), Duration::from_secs(3)).unwrap(),
         )
         .unwrap();
-    companion
-        .arm_microphone(&binding, Duration::from_millis(350))
-        .expect("current talk lease opens native microphone");
     tokio::time::timeout(Duration::from_secs(2), desktop.recv_caller_microphone())
         .await
         .expect("initial microphone frame timeout")
         .expect("initial authorized microphone frame");
 
     companion
-        .renew_microphone_lease(&binding, Duration::from_secs(2))
+        .renew_microphone_lease(&binding, Duration::from_secs(6))
         .expect("renewal extends the active native microphone");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    desktop
+        .renew_caller_transmit(Duration::from_secs(6))
+        .expect("renewal extends the exact Desktop route");
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        armed_at + Duration::from_millis(3_200),
+    ))
+    .await;
     assert!(
         companion.microphone_active(),
         "the original watchdog must not stop a renewed microphone"

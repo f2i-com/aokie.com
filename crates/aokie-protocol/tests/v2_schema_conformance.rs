@@ -1,6 +1,7 @@
 use aokie_protocol::v2::{
     parse_mobile_frame, parse_plugin_frame, AdmissionClaims, MobileIdleSyncFrame, MobileInbound,
-    PluginInbound,
+    PluginClaimRejectedFrame, PluginInbound, PluginLeaseStatus, PluginLeaseStatusFrame,
+    PluginOfferAcceptedFrame,
 };
 use serde_json::{json, Value};
 
@@ -35,6 +36,16 @@ fn validator() -> jsonschema::Validator {
     jsonschema::validator_for(&schema).expect("v2 schema compiles")
 }
 
+fn direction_validator(direction: &str) -> jsonschema::Validator {
+    let mut schema: Value = serde_json::from_str(SCHEMA).expect("v2 schema is JSON");
+    schema
+        .as_object_mut()
+        .expect("v2 schema is an object")
+        .remove("anyOf");
+    schema["$ref"] = json!(format!("#/$defs/{direction}"));
+    jsonschema::validator_for(&schema).expect("v2 direction schema compiles")
+}
+
 fn assert_valid(encoded: &str) -> Value {
     let value: Value = serde_json::from_str(encoded).expect("fixture is JSON");
     let errors: Vec<_> = validator()
@@ -47,6 +58,76 @@ fn assert_valid(encoded: &str) -> Value {
         errors.join("\n")
     );
     value
+}
+
+fn pending_mobile_offer() -> Value {
+    json!({
+        "offer": {
+            "offerId": "offer_a",
+            "opportunityId": "opportunity_a",
+            "targetDeviceId": "device_a",
+            "targetHolderKeyThumbprint": "mobile_thumbprint_a",
+            "offeredMode": "takeover",
+            "surface": "in_app",
+            "appId": "app_coastal_auto",
+            "callId": "call_42",
+            "callEpoch": 7,
+            "ownerEpoch": 3,
+            "switchboardRevision": 11,
+            "remoteRevision": 13,
+            "requiredConsentPolicyId": "aokie_remote_access",
+            "requiredConsentPolicyVersion": 3,
+            "requiredGrants": ["state_read", "rtc_signal", "takeover"],
+            "issuedAt": 1_800_000_000_u64,
+            "expiresAt": 1_800_000_025_u64,
+            "jti": "offer_jti_a"
+        },
+        "offerToken": "signed.offer.token"
+    })
+}
+
+fn lease_claims(mode: &str, phase: &str) -> Value {
+    let (tracks, fence) = match (mode, phase) {
+        ("monitor", "active") => (json!(["pstn_in", "pstn_out"]), 0),
+        ("consult", "prepared") => (json!(["consult_rx"]), 0),
+        ("consult", "active") => (json!(["consult_rx", "consult_tx"]), 0),
+        ("takeover", "prepared") => (json!(["pstn_in"]), 1),
+        ("takeover", "active") => (json!(["pstn_in", "pstn_out"]), 1),
+        _ => panic!("test requested an invalid lease shape"),
+    };
+    json!({
+        "aud": "aokie-companion-media",
+        "appId": "app_coastal_auto",
+        "pluginId": "plugin_a",
+        "deviceId": "device_a",
+        "pluginKeyThumbprint": "plugin_thumbprint_a",
+        "mobileKeyThumbprint": "mobile_thumbprint_a",
+        "callId": "call_42",
+        "callEpoch": 7,
+        "ownerEpoch": 3,
+        "mode": mode,
+        "phase": phase,
+        "tracks": tracks,
+        "expiresAt": 1_800_000_060_u64,
+        "leaseId": "lease_a",
+        "jti": "lease_jti_a",
+        "fence": fence,
+        "sessionNonce": "mobile_nonce_a",
+        "rtcSessionId": "rtc_a"
+    })
+}
+
+fn plugin_lease_status(status: &str, mode: &str, phase: &str) -> Value {
+    json!({
+        "kind": "plugin_lease_status",
+        "schemaVersion": 2,
+        "appId": "app_coastal_auto",
+        "deviceId": "device_a",
+        "requestId": "request_a",
+        "status": status,
+        "leaseToken": "signed.lease.token",
+        "lease": lease_claims(mode, phase)
+    })
 }
 
 #[test]
@@ -128,6 +209,175 @@ fn canonical_directional_fixtures_match_schema_and_rust_models() {
         parse_plugin_frame(END_CALLER_RESULT).unwrap(),
         PluginInbound::EndCallerResult(_)
     ));
+}
+
+#[test]
+fn authoritative_snapshots_keep_socket_omission_and_accept_relay_offers() {
+    let root = validator();
+    let plugin_outbound = direction_validator("pluginToGateway");
+    let socket_snapshot: Value = serde_json::from_str(PLUGIN_SNAPSHOT).unwrap();
+
+    assert!(
+        socket_snapshot["snapshot"]
+            .get("pendingMobileOffers")
+            .is_none(),
+        "the canonical socket fixture must remain byte-compatible"
+    );
+    assert!(root.is_valid(&socket_snapshot));
+    assert!(plugin_outbound.is_valid(&socket_snapshot));
+    let socket_frame = match parse_plugin_frame(PLUGIN_SNAPSHOT).unwrap() {
+        PluginInbound::Snapshot(frame) => frame,
+        other => panic!("expected plugin snapshot, got {other:?}"),
+    };
+    assert!(socket_frame.snapshot.pending_mobile_offers.is_empty());
+    assert!(
+        serde_json::to_value(socket_frame).unwrap()["snapshot"]
+            .get("pendingMobileOffers")
+            .is_none(),
+        "an empty authoritative offer list must be omitted on the socket carrier"
+    );
+
+    let mut relay_snapshot = socket_snapshot.clone();
+    relay_snapshot["snapshot"]["pendingMobileOffers"] = json!([pending_mobile_offer()]);
+    assert!(root.is_valid(&relay_snapshot));
+    assert!(plugin_outbound.is_valid(&relay_snapshot));
+    let relay_frame = match parse_plugin_frame(&relay_snapshot.to_string()).unwrap() {
+        PluginInbound::Snapshot(frame) => frame,
+        other => panic!("expected plugin snapshot, got {other:?}"),
+    };
+    assert_eq!(relay_frame.snapshot.pending_mobile_offers.len(), 1);
+
+    let mut flooded = socket_snapshot;
+    flooded["snapshot"]["pendingMobileOffers"] = Value::Array(vec![pending_mobile_offer(); 9]);
+    assert!(!root.is_valid(&flooded));
+    assert!(!plugin_outbound.is_valid(&flooded));
+    assert!(parse_plugin_frame(&flooded.to_string()).is_err());
+}
+
+#[test]
+fn relay_authority_frames_are_valid_plugin_outbound_contracts() {
+    let root = validator();
+    let plugin_outbound = direction_validator("pluginToGateway");
+    let mobile_outbound = direction_validator("mobileToGateway");
+    let gateway_to_plugin = direction_validator("gatewayToPlugin");
+
+    let accepted = json!({
+        "kind": "plugin_offer_accepted",
+        "schemaVersion": 2,
+        "appId": "app_coastal_auto",
+        "deviceId": "device_a",
+        "requestId": "request_a",
+        "offerId": "offer_a",
+        "offerJti": "offer_jti_a",
+        "offeredMode": "takeover",
+        "accepted": true
+    });
+    assert!(root.is_valid(&accepted));
+    assert!(plugin_outbound.is_valid(&accepted));
+    assert!(!mobile_outbound.is_valid(&accepted));
+    assert!(!gateway_to_plugin.is_valid(&accepted));
+    serde_json::from_value::<PluginOfferAcceptedFrame>(accepted)
+        .unwrap()
+        .validate()
+        .unwrap();
+
+    let rejected = json!({
+        "kind": "plugin_claim_rejected",
+        "schemaVersion": 2,
+        "appId": "app_coastal_auto",
+        "deviceId": "device_a",
+        "requestId": "request_a",
+        "code": "consent_required",
+        "message": "Remote takeover consent is not current"
+    });
+    assert!(root.is_valid(&rejected));
+    assert!(plugin_outbound.is_valid(&rejected));
+    assert!(!mobile_outbound.is_valid(&rejected));
+    assert!(!gateway_to_plugin.is_valid(&rejected));
+    serde_json::from_value::<PluginClaimRejectedFrame>(rejected)
+        .unwrap()
+        .validate()
+        .unwrap();
+
+    for (status, mode, phase, expected) in [
+        ("granted", "monitor", "active", PluginLeaseStatus::Granted),
+        (
+            "provisional",
+            "takeover",
+            "prepared",
+            PluginLeaseStatus::Provisional,
+        ),
+        ("active", "takeover", "active", PluginLeaseStatus::Active),
+        ("renewed", "takeover", "active", PluginLeaseStatus::Renewed),
+    ] {
+        let value = plugin_lease_status(status, mode, phase);
+        assert!(root.is_valid(&value), "root rejected {status}: {value:#}");
+        assert!(
+            plugin_outbound.is_valid(&value),
+            "plugin direction rejected {status}: {value:#}"
+        );
+        assert!(!mobile_outbound.is_valid(&value));
+        assert!(!gateway_to_plugin.is_valid(&value));
+        let frame: PluginLeaseStatusFrame = serde_json::from_value(value).unwrap();
+        assert_eq!(frame.status, expected);
+        frame.validate(1_800_000_000).unwrap();
+    }
+}
+
+#[test]
+fn relay_authority_schema_rejects_ambiguous_or_unsafe_frames() {
+    let root = validator();
+    let plugin_outbound = direction_validator("pluginToGateway");
+
+    let mut refusal_disguised_as_acceptance = json!({
+        "kind": "plugin_offer_accepted",
+        "schemaVersion": 2,
+        "appId": "app_coastal_auto",
+        "deviceId": "device_a",
+        "requestId": "request_a",
+        "offerId": "offer_a",
+        "offerJti": "offer_jti_a",
+        "offeredMode": "takeover",
+        "accepted": true
+    });
+    refusal_disguised_as_acceptance["accepted"] = json!(false);
+    assert!(!root.is_valid(&refusal_disguised_as_acceptance));
+    assert!(!plugin_outbound.is_valid(&refusal_disguised_as_acceptance));
+    let frame: PluginOfferAcceptedFrame =
+        serde_json::from_value(refusal_disguised_as_acceptance).unwrap();
+    assert!(frame.validate().is_err());
+
+    let unknown_status = plugin_lease_status("prepared", "takeover", "prepared");
+    assert!(!root.is_valid(&unknown_status));
+    assert!(!plugin_outbound.is_valid(&unknown_status));
+    assert!(serde_json::from_value::<PluginLeaseStatusFrame>(unknown_status).is_err());
+
+    let contradictory_status = plugin_lease_status("granted", "takeover", "prepared");
+    assert!(!root.is_valid(&contradictory_status));
+    assert!(!plugin_outbound.is_valid(&contradictory_status));
+    let frame: PluginLeaseStatusFrame = serde_json::from_value(contradictory_status).unwrap();
+    assert!(frame.validate(1_800_000_000).is_err());
+
+    let mut empty_rejection = json!({
+        "kind": "plugin_claim_rejected",
+        "schemaVersion": 2,
+        "appId": "app_coastal_auto",
+        "deviceId": "device_a",
+        "requestId": "request_a",
+        "code": "consent_required",
+        "message": "Remote takeover consent is not current"
+    });
+    empty_rejection["message"] = json!("");
+    assert!(!root.is_valid(&empty_rejection));
+    assert!(!plugin_outbound.is_valid(&empty_rejection));
+    let frame: PluginClaimRejectedFrame = serde_json::from_value(empty_rejection).unwrap();
+    assert!(frame.validate().is_err());
+
+    let mut unaddressed = plugin_lease_status("active", "takeover", "active");
+    unaddressed.as_object_mut().unwrap().remove("deviceId");
+    assert!(!root.is_valid(&unaddressed));
+    assert!(!plugin_outbound.is_valid(&unaddressed));
+    assert!(serde_json::from_value::<PluginLeaseStatusFrame>(unaddressed).is_err());
 }
 
 #[test]

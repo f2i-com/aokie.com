@@ -159,9 +159,19 @@ pub(crate) struct MediaStatusEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum LocalSignal {
-    Offer { description: SdpSignal },
-    Ice { candidate: IceCandidateSignal },
+    Offer {
+        description: SdpSignal,
+    },
+    Ice {
+        candidate: IceCandidateSignal,
+    },
     IceComplete,
+    /// Internal fail-closed notification. Unlike SDP/ICE this is sent only on
+    /// the native broadcast channel (never to the WebView) so protocol v2 can
+    /// return the exact lease whose automatic Consult microphone failed.
+    LeaseSafetyFailure {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -201,7 +211,13 @@ struct LiveTransitionEvent {
 struct ConnectionEvidence {
     connected: AtomicBool,
     remote_audio_ready: AtomicBool,
+    microphone_authority_ready: AtomicBool,
     microphone_active: AtomicBool,
+    // Set only by the native v2 transaction after an explicit active Private
+    // consult status has opened this exact peer. The watcher consumes it once
+    // WebRTC and remote audio are ready; peer replacement/revoke/terminal
+    // disconnect clears it with the peer so stale authority cannot arm a mic.
+    auto_arm_microphone: AtomicBool,
     proof_active: AtomicBool,
     live_active: AtomicBool,
 }
@@ -678,6 +694,14 @@ pub async fn media_arm_microphone(
     state: State<'_, NativeMediaState>,
     request: SessionRequest,
 ) -> Result<(), String> {
+    arm_microphone(&app, state.inner(), request).await
+}
+
+pub(crate) async fn arm_microphone(
+    app: &AppHandle,
+    state: &NativeMediaState,
+    request: SessionRequest,
+) -> Result<(), String> {
     // This check deliberately precedes every Android permission operation.
     // A receive-only monitor can never create a mic track or open a prompt.
     if !request.session.binding.mode.needs_microphone() {
@@ -707,6 +731,20 @@ pub async fn media_arm_microphone(
         )
         .await;
         return Err("native WebRTC is still connecting; retry microphone arm".into());
+    }
+    if !active
+        .evidence
+        .microphone_authority_ready
+        .load(Ordering::Acquire)
+    {
+        emit_status(
+            &app,
+            &active,
+            "connecting",
+            Some("Secure microphone authority is still connecting; arm will be retried".into()),
+        )
+        .await;
+        return Err("native microphone authority is still connecting; retry microphone arm".into());
     }
     if let Err(message) = ensure_microphone_permission(&app).await {
         state
@@ -763,7 +801,31 @@ pub async fn media_arm_microphone(
         .evidence
         .microphone_active
         .store(true, Ordering::Release);
+    active
+        .evidence
+        .auto_arm_microphone
+        .store(false, Ordering::Release);
     emit_status(&app, &active, "microphone_armed", None).await;
+    Ok(())
+}
+
+/// Schedule microphone arming for the exact native peer created by an active
+/// Private consult lease. This records intent only: SDP/ICE must finish first,
+/// and [`watch_peer`] performs the arm after both connection and remote-audio
+/// evidence are current. A synchronous arm here would always race the answer,
+/// because the v2 receive loop is still applying the lease status.
+pub(crate) async fn request_private_consult_auto_arm(
+    state: &NativeMediaState,
+    request: SessionRequest,
+) -> Result<(), String> {
+    if request.session.binding.mode != MediaMode::Consult {
+        return Err("automatic microphone arming requires an active private consult".into());
+    }
+    let active = state.active_for(&request.session).await?;
+    active
+        .evidence
+        .auto_arm_microphone
+        .store(true, Ordering::Release);
     Ok(())
 }
 
@@ -774,6 +836,10 @@ pub async fn media_disarm_microphone(
     request: SessionRequest,
 ) -> Result<(), String> {
     let active = state.active_for(&request.session).await?;
+    active
+        .evidence
+        .auto_arm_microphone
+        .store(false, Ordering::Release);
     active.peer.lock().await.disarm_microphone();
     active
         .evidence
@@ -939,30 +1005,84 @@ async fn watch_peer(state: NativeMediaState, app: AppHandle, active: ActiveMedia
                 )
                 .await;
             }
+            Ok(Some(PeerEvent::MicrophoneAuthorityReady)) => {
+                active
+                    .evidence
+                    .microphone_authority_ready
+                    .store(true, Ordering::Release);
+                let connected = active.evidence.connected.load(Ordering::Acquire);
+                let phase = if active.evidence.remote_audio_ready.load(Ordering::Acquire) {
+                    remote_audio_status_phase(connected)
+                } else if connected {
+                    "connected"
+                } else {
+                    "connecting"
+                };
+                // This later exact-session revision releases a Talk arm retry
+                // that may have raced PeerConnection Connected before SCTP
+                // reached Open. Without it React can remain fenced forever.
+                emit_status(&app, &active, phase, None).await;
+            }
+            Ok(Some(PeerEvent::RemoteMicrophoneReady)) => {
+                // This evidence is emitted only by the Desktop-side peer. A
+                // Companion endpoint receiving it means the native media
+                // implementation crossed endpoint roles, so fail closed.
+                state
+                    .close_if_current(
+                        &app,
+                        active.generation,
+                        "failed",
+                        "unexpected Desktop microphone readiness event",
+                    )
+                    .await;
+                if session.binding.mode == MediaMode::Consult {
+                    emit_lease_safety_failure(
+                        &active,
+                        "unexpected Desktop microphone readiness event".into(),
+                    )
+                    .await;
+                }
+                return;
+            }
             Ok(Some(PeerEvent::ConnectionState(connection))) => {
                 let connected = connection == "connected";
+                let consult_route_lost = session.binding.mode == MediaMode::Consult
+                    && matches!(connection, "disconnected" | "failed" | "closed");
                 active
                     .evidence
                     .connected
                     .store(connected, Ordering::Release);
                 if !connected {
+                    active
+                        .evidence
+                        .microphone_authority_ready
+                        .store(false, Ordering::Release);
                     active.peer.lock().await.disarm_microphone();
                     active
                         .evidence
                         .microphone_active
                         .store(false, Ordering::Release);
+                    if matches!(connection, "disconnected" | "failed" | "closed") {
+                        active
+                            .evidence
+                            .auto_arm_microphone
+                            .store(false, Ordering::Release);
+                    }
                     reset_proof_if_active(&app, &active.evidence);
                 }
                 emit_status(&app, &active, connection, None).await;
-                if matches!(connection, "failed" | "closed") {
+                if matches!(connection, "failed" | "closed") || consult_route_lost {
+                    let reason = if consult_route_lost {
+                        "private consult media disconnected"
+                    } else {
+                        "native WebRTC connection failed"
+                    };
                     state
-                        .close_if_current(
-                            &app,
-                            active.generation,
-                            "failed",
-                            "native WebRTC connection failed",
-                        )
+                        .close_if_current(&app, active.generation, "failed", reason)
                         .await;
+                    if session.binding.mode == MediaMode::Consult {
+                        emit_lease_safety_failure(&active, reason.into()).await;
+                    }
                     return;
                 }
             }
@@ -970,6 +1090,9 @@ async fn watch_peer(state: NativeMediaState, app: AppHandle, active: ActiveMedia
                 state
                     .close_if_current(&app, active.generation, "failed", reason)
                     .await;
+                if session.binding.mode == MediaMode::Consult {
+                    emit_lease_safety_failure(&active, reason.into()).await;
+                }
                 return;
             }
             Ok(None) => {
@@ -981,9 +1104,62 @@ async fn watch_peer(state: NativeMediaState, app: AppHandle, active: ActiveMedia
                         "native WebRTC event stream ended",
                     )
                     .await;
+                if session.binding.mode == MediaMode::Consult {
+                    emit_lease_safety_failure(&active, "native WebRTC event stream ended".into())
+                        .await;
+                }
                 return;
             }
             Err(_) => {}
+        }
+
+        if active.evidence.auto_arm_microphone.load(Ordering::Acquire)
+            && active.evidence.connected.load(Ordering::Acquire)
+            && active.evidence.remote_audio_ready.load(Ordering::Acquire)
+            && active
+                .evidence
+                .microphone_authority_ready
+                .load(Ordering::Acquire)
+            && !active.evidence.microphone_active.load(Ordering::Acquire)
+        {
+            // Renewal can update only the exact peer's expiry while this
+            // watcher is waiting on an event. Re-read immediately before the
+            // arm so an otherwise-valid renewal cannot make the scheduled
+            // Consult intent look stale and strand it without a microphone.
+            let arm_session = active.session.read().await.clone();
+            match arm_microphone(
+                &app,
+                &state,
+                SessionRequest {
+                    session: arm_session,
+                },
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(message)
+                    if message.contains("WebRTC is still connecting")
+                        || message.contains("before WebRTC is connected")
+                        || message.contains("microphone authority is still connecting")
+                        || message.contains("authority channel is not open") =>
+                {
+                    // A connection-state callback can race the peer's own
+                    // readiness edge. Keep the exact-session intent for the
+                    // next bounded watcher tick.
+                }
+                Err(message) => {
+                    // Permission/native failures close the exact peer inside
+                    // `arm_microphone`. Do not leave a consult represented as
+                    // pending microphone authority after that fail-closed
+                    // transition.
+                    active
+                        .evidence
+                        .auto_arm_microphone
+                        .store(false, Ordering::Release);
+                    emit_lease_safety_failure(&active, message).await;
+                    return;
+                }
+            }
         }
 
         if active.evidence.microphone_active.load(Ordering::Acquire)
@@ -1009,6 +1185,13 @@ async fn watch_peer(state: NativeMediaState, app: AppHandle, active: ActiveMedia
                             "microphone permission was revoked",
                         )
                         .await;
+                    if session.binding.mode == MediaMode::Consult {
+                        emit_lease_safety_failure(
+                            &active,
+                            "microphone permission was revoked".into(),
+                        )
+                        .await;
+                    }
                     return;
                 }
             }
@@ -1071,6 +1254,10 @@ async fn close_peer(
     reason: &str,
 ) {
     let session = active.session.read().await.clone();
+    active
+        .evidence
+        .auto_arm_microphone
+        .store(false, Ordering::Release);
     active.peer.lock().await.close();
     if let Some(app) = app {
         let _ = crate::android_runtime::end_communication_audio(app).await;
@@ -1148,6 +1335,13 @@ async fn emit_signal(app: &AppHandle, active: &ActiveMedia, signal: LocalSignal)
     // through an untrusted WebView before being fenced by the lease token.
     let _ = active.signal_tx.send(event.clone());
     let _ = app.emit("aokie-companion://media-signal", event);
+}
+
+async fn emit_lease_safety_failure(active: &ActiveMedia, reason: String) {
+    let _ = active.signal_tx.send(MediaSignalEvent {
+        session: active.session.read().await.clone(),
+        signal: LocalSignal::LeaseSafetyFailure { reason },
+    });
 }
 
 fn emit_local_proof(app: &AppHandle, session: &MediaSession) {
