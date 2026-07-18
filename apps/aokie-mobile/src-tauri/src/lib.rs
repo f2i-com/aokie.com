@@ -1,4 +1,5 @@
 mod android_runtime;
+mod companion_relay;
 mod desktop_pairing;
 mod discovery;
 mod endpoint_identity;
