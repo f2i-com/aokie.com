@@ -38,6 +38,7 @@ const V2_PAYLOAD_KEYS: &[&str] = &[
     "media",
     "appId",
     "appSlug",
+    "companionRelay",
 ];
 
 const V2_TRUST_KEYS: &[&str] = &[
@@ -570,6 +571,24 @@ fn validate_v2_payload(
             payload.schema_version
         ));
     }
+    // Pack-services wave 1: a relay-disabled document deliberately withholds
+    // the whole gateway/ICE bootstrap, so the consistency checks over those
+    // withheld fields describe the withholding rather than the deployment. A
+    // relayOnly deployment is the case that bites: `media.relayOnly` stays
+    // true while the top-level alias is gone, which reads as "relayOnly
+    // fields disagree" instead of naming the toggle. Settle the toggle first
+    // — the disabled branch of `select_v2_gateway` always returns an error,
+    // so this can only change which error, never accept a document.
+    if payload.companion_relay.is_some_and(|relay| !relay.enabled) {
+        select_v2_gateway(payload)?;
+        // Unreachable while that disabled branch refuses unconditionally, and
+        // deliberately fail-closed if it ever stops: this early return skips
+        // everything below, including the issuer/apiBaseUrl/oauthTokenUrl/
+        // admissionEndpoint/signingKeyUrl origin binding. An `Ok` escaping
+        // here would hand `fetch_discovery` a document whose credential
+        // endpoints were never checked against the trusted issuer origin.
+        return Err("disabled companion relay must not yield a usable gateway".into());
+    }
     safe_text(&payload.issuer, 500, "issuer")?;
     safe_id(&payload.deployment_id, "deploymentId")?;
     safe_id(&payload.client_id, "clientId")?;
@@ -945,7 +964,11 @@ mod tests {
             "iceServers":[],
             "relayOnly":false,
             "turnCredentialExpiresAt":null,
-            "media":{"transport":"webrtc","gatewayRelaysMedia":false,"companionUsesBluetoothDongle":false,"relayOnly":false}
+            "media":{"transport":"webrtc","gatewayRelaysMedia":false,"companionUsesBluetoothDongle":false,"relayOnly":false},
+            // The backend signs `companionRelay`, so the split must route it
+            // into the PAYLOAD half: parked in the trust half it would fall
+            // outside the envelope the signature covers.
+            "companionRelay":{"enabled":false}
         });
         let mut document = payload.as_object().unwrap().clone();
         document.insert("trustStatus".into(), json!("signed"));
@@ -1024,12 +1047,187 @@ mod tests {
         unknown_media["media"]["futureTransport"] = json!(false);
         assert!(serde_json::from_value::<V2SignedPayload>(unknown_media).is_err());
 
-        let mut missing_required_nullable = split;
-        missing_required_nullable
+        // Pack-services wave 1 deliberately made the ICE bootstrap optional so
+        // a relay-disabled document may withhold it (see V2SignedPayload). This
+        // assertion predates that change and required the field; it only
+        // surfaced as stale once the harness could launch again.
+        let mut withheld_ice_bootstrap = split;
+        withheld_ice_bootstrap
             .as_object_mut()
             .unwrap()
             .remove("turnCredentialExpiresAt");
-        assert!(serde_json::from_value::<V2SignedPayload>(missing_required_nullable).is_err());
+        let withheld: V2SignedPayload = serde_json::from_value(withheld_ice_bootstrap).unwrap();
+        assert_eq!(withheld.turn_credential_expires_at.value(), None);
+    }
+
+    /// The enabled-path payload every shipped Companion was built against.
+    fn schema_v2_payload() -> Map<String, Value> {
+        json!({
+            "schemaVersion":2,
+            "issuer":"https://formlogic.example",
+            "apiBaseUrl":"https://formlogic.example/api",
+            "gatewayUrl":"wss://gateway.example/v2/realtime",
+            "realtimeUrl":"wss://gateway.example/v2/realtime",
+            "oauthAuthorizationUrl":"https://formlogic.example/oauth/authorize",
+            "oauthTokenUrl":"https://formlogic.example/api/oauth/token",
+            "oauthResource":"https://formlogic.example/api/aokie-companion",
+            "admissionEndpoint":"https://formlogic.example/api/aokie-companion/admission",
+            "clientId":"aokie-companion",
+            "deploymentId":"formlogic-local",
+            "available":true,
+            "scopesSupported":["aokie:state","offline_access"],
+            "features":["state"],
+            "remoteConsent":{"configured":false,"remoteMonitoring":false,"remoteConsult":false,"remoteTakeover":false,"remoteCaptions":false,"remoteAssistance":false},
+            "iceServers":[],
+            "relayOnly":false,
+            "turnCredentialExpiresAt":null,
+            "media":{"transport":"webrtc","gatewayRelaysMedia":false,"companionUsesBluetoothDongle":false,"relayOnly":false},
+            "appId":"e2e19da6-dbb4-47e0-9250-7280f8f60ed2",
+            "appSlug":"aokie-receptionist-78a80a"
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    /// The exact shape the backend emits once the owner switches the app's
+    /// Companion relay service OFF: the toggle is stated and the gateway
+    /// (plus the ICE bootstrap that only exists to reach it) is withheld.
+    fn disabled_relay_payload() -> Map<String, Value> {
+        let mut payload = schema_v2_payload();
+        payload.insert("companionRelay".into(), json!({"enabled": false}));
+        for withheld in [
+            "gatewayUrl",
+            "realtimeUrl",
+            "iceServers",
+            "relayOnly",
+            "turnCredentialExpiresAt",
+        ] {
+            payload.remove(withheld);
+        }
+        payload
+    }
+
+    fn signed_document(payload: Map<String, Value>) -> Value {
+        let mut document = payload;
+        document.insert("trustStatus".into(), json!("signed"));
+        document.insert("signingKeyId".into(), json!("formlogic-ed25519-1"));
+        document.insert("signatureAlgorithm".into(), json!("Ed25519"));
+        document.insert("signature".into(), json!("signature"));
+        document.insert(
+            "signingKeyUrl".into(),
+            json!("https://formlogic.example/api/public/signing-key"),
+        );
+        Value::Object(document)
+    }
+
+    /// Drives the whole reader the way `fetch_discovery` does: top-level
+    /// allowlist, then the strict payload struct, then validation.
+    fn read_v2_document(document: Value) -> Result<Option<String>, String> {
+        let (split, trust) = split_v2_document(document)?;
+        let decoded: V2SignedPayload =
+            serde_json::from_value(split).map_err(|error| error.to_string())?;
+        let discovery_url = Url::parse(
+            "https://formlogic.example/api/app/aokie-receptionist-78a80a/aokie-discovery",
+        )
+        .unwrap();
+        validate_v2_payload(&decoded, &discovery_url, &trust.signing_key_url)
+    }
+
+    #[test]
+    fn disabled_companion_relay_document_reaches_its_own_honest_error() {
+        // `companionRelay` rides in the signed payload, so it must be in
+        // V2_PAYLOAD_KEYS: without it the split rejected the whole document
+        // and the owner-disabled message below was unreachable.
+        let error = read_v2_document(signed_document(disabled_relay_payload()))
+            .expect_err("a withheld gateway must still be an error");
+        assert!(
+            error.contains("disabled the Companion relay service"),
+            "expected the owner-disabled explanation, got: {error}"
+        );
+        assert!(!error.contains("unknown field"), "got: {error}");
+        // The honest message must also beat the generic missing-gateway
+        // complaint that an available deployment would otherwise produce.
+        assert!(!error.contains("omitted gatewayUrl"), "got: {error}");
+    }
+
+    #[test]
+    fn disabled_companion_relay_may_not_also_advertise_a_gateway() {
+        let mut payload = disabled_relay_payload();
+        payload.insert(
+            "gatewayUrl".into(),
+            json!("wss://gateway.example/v2/realtime"),
+        );
+        let error = read_v2_document(signed_document(payload))
+            .expect_err("a disabled relay with a live gateway is contradictory");
+        assert!(
+            error.contains("disabled companion relay unexpectedly advertises gatewayUrl"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn disabled_companion_relay_stays_honest_on_a_relay_only_deployment() {
+        // A deployment configured with AOKIE_COMPANION_RELAY_ONLY=true still
+        // reports `media.relayOnly: true` on the disabled document: the
+        // backend withholds the ICE bootstrap and the TOP-LEVEL `relayOnly`
+        // alias, but `media` is a required block and keeps its copy. The
+        // reader must still name the toggle rather than the withheld alias.
+        let mut payload = disabled_relay_payload();
+        payload.insert(
+            "media".into(),
+            json!({
+                "transport":"webrtc",
+                "gatewayRelaysMedia":false,
+                "companionUsesBluetoothDongle":false,
+                "relayOnly":true
+            }),
+        );
+        let error = read_v2_document(signed_document(payload))
+            .expect_err("a withheld gateway must still be an error");
+        assert!(
+            error.contains("disabled the Companion relay service"),
+            "expected the owner-disabled explanation, got: {error}"
+        );
+    }
+
+    #[test]
+    fn allowing_companion_relay_did_not_loosen_the_schema() {
+        let mut unknown_top_level = disabled_relay_payload();
+        unknown_top_level.insert("futureService".into(), json!({"enabled": true}));
+        assert_eq!(
+            read_v2_document(signed_document(unknown_top_level)).unwrap_err(),
+            "schema-v2 discovery contains an unknown field"
+        );
+
+        // A bare `is_err()` would be vacuous here — a disabled document is
+        // refused either way — so pin the strict-parse rejection itself,
+        // which is the invariant `deny_unknown_fields` actually buys.
+        let mut unknown_relay_field = disabled_relay_payload();
+        unknown_relay_field.insert(
+            "companionRelay".into(),
+            json!({"enabled": false, "futureReason": "quota"}),
+        );
+        let error = read_v2_document(signed_document(unknown_relay_field))
+            .expect_err("CompanionRelayDiscovery must deny unknown fields");
+        assert!(
+            error.contains("unknown field `futureReason`"),
+            "expected the strict-parse rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn enabled_path_document_is_untouched_by_the_companion_relay_entry() {
+        // Absence means enabled — the exact document earlier builds were
+        // built against must keep parsing to a usable gateway.
+        let document = signed_document(schema_v2_payload());
+        let (split, _) = split_v2_document(document.clone()).unwrap();
+        let decoded: V2SignedPayload = serde_json::from_value(split).unwrap();
+        assert!(decoded.companion_relay.is_none());
+        assert_eq!(
+            read_v2_document(document).unwrap().as_deref(),
+            Some("wss://gateway.example/v2/realtime")
+        );
     }
 
     #[test]
