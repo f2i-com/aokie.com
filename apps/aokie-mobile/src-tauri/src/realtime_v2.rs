@@ -1793,6 +1793,14 @@ struct ClaimRejectedFrame {
     message: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimRejectionAction {
+    AlreadyApplied,
+    RejectPending { call_id: String, call_epoch: u64 },
+    RejectPrepared { lease: ClientLease },
+    ContainedUnmatched,
+}
+
 /// The mobile frame KIND a plugin-dialect lease status becomes, and the
 /// `provisional` flag [`apply_lease_status`] expects beside it.
 ///
@@ -5484,34 +5492,32 @@ async fn apply_claim_rejection(
     validate_id(&frame.request_id, "claim requestId")?;
     validate_text(&frame.code, 200, "claim rejection code")?;
     validate_text(&frame.message, 500, "claim rejection message")?;
-    let replay_key = claim_rejection_replay_key(&frame.request_id);
-    let (lease, rejected_call) = {
+    let action = {
         let mut client = state.inner.lock().await;
-        if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
-            return Ok(());
-        }
-        if is_late_duplicate_offer_rejection(&client, &frame)? {
-            // POST/SSE delivery is independently at-least-once. If the offer
-            // answer itself is retried after its acceptance, the plugin's
-            // idempotency fence reports `offer_replayed`; that must not tear
-            // down the lease which the first answer legitimately released.
-            remember_applied_relay_frame(&mut client, replay_key, encoded)?;
-            return Ok(());
-        }
-        if client.pending.as_ref().is_some_and(|pending| {
-            pending.request_id == frame.request_id || pending.offer_request_id == frame.request_id
-        }) {
-            let pending = client.pending.take().expect("checked pending claim");
-            (None, Some((pending.call_id, pending.call_epoch)))
-        } else if client.lease.as_ref().is_some_and(|lease| {
-            lease.request_id == frame.request_id
-                && matches!(lease.claims.phase, LeasePhase::Prepared)
-        }) {
-            let lease = client.lease.take().expect("checked provisional lease");
+        prepare_claim_rejection(&mut client, &frame, encoded)?
+    };
+    let (lease, rejected_call) = match action {
+        ClaimRejectionAction::AlreadyApplied => return Ok(()),
+        ClaimRejectionAction::RejectPending {
+            call_id,
+            call_epoch,
+        } => (None, Some((call_id, call_epoch))),
+        ClaimRejectionAction::RejectPrepared { lease } => {
             let rejected_call = Some((lease.claims.call_id.clone(), lease.claims.call_epoch));
             (Some(lease), rejected_call)
-        } else {
-            return Err("claim rejection did not match pending authority".into());
+        }
+        ClaimRejectionAction::ContainedUnmatched => {
+            // RTC signals and scheduled heartbeats share the plugin's generic
+            // rejection dialect, but unlike a pending offer/claim they are not
+            // authority transactions. A late or signal-local refusal must not
+            // become a one-frame authenticated-session kill switch. Ordinary
+            // snapshots, media watchdogs, and explicit revocation still own
+            // any subsequent lease/media de-escalation.
+            eprintln!(
+                "[AokieCompanion][relay] contained unmatched claim rejection request={} code={}; current authority is unchanged",
+                frame.request_id, frame.code
+            );
+            return Ok(());
         }
     };
     if let Some(lease) = lease {
@@ -5539,9 +5545,55 @@ async fn apply_claim_rejection(
     emit_error(app, &format!("{} — {}", frame.code, frame.message));
     {
         let mut client = state.inner.lock().await;
-        remember_applied_relay_frame(&mut client, replay_key, encoded)?;
+        remember_applied_relay_frame(
+            &mut client,
+            claim_rejection_replay_key(&frame.request_id),
+            encoded,
+        )?;
     }
     Ok(())
+}
+
+fn prepare_claim_rejection(
+    client: &mut ClientState,
+    frame: &ClaimRejectedFrame,
+    encoded: &str,
+) -> Result<ClaimRejectionAction, String> {
+    let replay_key = claim_rejection_replay_key(&frame.request_id);
+    if applied_relay_frame_is_replay(client, &replay_key, encoded)? {
+        return Ok(ClaimRejectionAction::AlreadyApplied);
+    }
+    if is_late_duplicate_offer_rejection(client, frame)? {
+        // POST/SSE delivery is independently at-least-once. If the offer
+        // answer itself is retried after its acceptance, the plugin's
+        // idempotency fence reports `offer_replayed`; that must not tear down
+        // the lease which the first answer legitimately released.
+        remember_applied_relay_frame(client, replay_key, encoded)?;
+        return Ok(ClaimRejectionAction::AlreadyApplied);
+    }
+    if client.pending.as_ref().is_some_and(|pending| {
+        pending.request_id == frame.request_id || pending.offer_request_id == frame.request_id
+    }) {
+        let pending = client.pending.take().expect("checked pending claim");
+        return Ok(ClaimRejectionAction::RejectPending {
+            call_id: pending.call_id,
+            call_epoch: pending.call_epoch,
+        });
+    }
+    if client.lease.as_ref().is_some_and(|lease| {
+        lease.request_id == frame.request_id && matches!(lease.claims.phase, LeasePhase::Prepared)
+    }) {
+        let lease = client.lease.take().expect("checked provisional lease");
+        return Ok(ClaimRejectionAction::RejectPrepared { lease });
+    }
+
+    // There is deliberately no broad "current lease" match here. The mobile
+    // does not retain outbound RTC/heartbeat operation metadata, so a generic
+    // rejection cannot prove that it revokes authority. Remembering the exact
+    // wire frame makes retries converge while preserving every existing
+    // endpoint, app, replay, and lease-validation fence.
+    remember_applied_relay_frame(client, replay_key, encoded)?;
+    Ok(ClaimRejectionAction::ContainedUnmatched)
 }
 
 async fn heartbeat_frame(state: &V2State, app_id: &str) -> Result<Option<String>, String> {
@@ -5550,6 +5602,12 @@ async fn heartbeat_frame(state: &V2State, app_id: &str) -> Result<Option<String>
         let Some(lease) = &client.lease else {
             return Ok(None);
         };
+        // Prepared is a short, non-renewable proof window. Heartbeating it can
+        // race the authority's Prepared -> Active token rotation and turn an
+        // otherwise healthy media negotiation into a stale-token refusal.
+        if matches!(lease.claims.phase, LeasePhase::Prepared) {
+            return Ok(None);
+        }
         let current_grants = current_client_grants(&client);
         if !grants_permit_lease_mode(current_grants, lease.claims.mode) {
             return Ok(None);
@@ -6584,6 +6642,53 @@ mod tests {
     }
 
     #[test]
+    fn unmatched_signal_rejection_is_contained_replay_fenced_and_preserves_authority() {
+        for request_id in ["rtc_signal_11", "heartbeat_7"] {
+            let (mut client, active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+            let current = ClientLease {
+                request_id: "request_a".into(),
+                token: "signed.active.token".into(),
+                session: session_from_claims(&active, 2, 2).unwrap(),
+                claims: active,
+            };
+            client.lease = Some(current.clone());
+            let frame = ClaimRejectedFrame {
+                kind: "claim_rejected".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                request_id: request_id.into(),
+                code: "rate_limited".into(),
+                message: "too many requests".into(),
+            };
+            let encoded = serde_json::to_string(&frame).unwrap();
+
+            assert_eq!(
+                prepare_claim_rejection(&mut client, &frame, &encoded).unwrap(),
+                ClaimRejectionAction::ContainedUnmatched
+            );
+            assert_eq!(client.lease.as_ref(), Some(&current));
+            assert!(client.pending.is_none());
+            assert_eq!(client.applied_relay_frames.len(), 1);
+
+            assert_eq!(
+                prepare_claim_rejection(&mut client, &frame, &encoded).unwrap(),
+                ClaimRejectionAction::AlreadyApplied
+            );
+            assert_eq!(client.lease.as_ref(), Some(&current));
+            assert_eq!(client.applied_relay_frames.len(), 1);
+
+            let mut changed = frame;
+            changed.message = "changed refusal".into();
+            let changed_encoded = serde_json::to_string(&changed).unwrap();
+            assert_eq!(
+                prepare_claim_rejection(&mut client, &changed, &changed_encoded).unwrap_err(),
+                "relay authority frame identifier was reused with different content"
+            );
+            assert_eq!(client.lease.as_ref(), Some(&current));
+        }
+    }
+
+    #[test]
     fn peer_trust_profile_is_separate_from_managed_app_and_deployment() {
         let managed_a: RealtimeConfig = serde_json::from_value(serde_json::json!({
             "gatewayUrl": "wss://issuer-a.example/v2/realtime",
@@ -7280,6 +7385,27 @@ mod tests {
         assert!(lease_heartbeat_due(now + 14, now).unwrap());
         assert!(lease_heartbeat_due(now + 1, now).unwrap());
         assert!(lease_heartbeat_due(now, now).is_err());
+    }
+
+    #[tokio::test]
+    async fn prepared_lease_never_emits_a_heartbeat_even_when_renewal_is_due() {
+        let state = V2State::default();
+        let (mut client, mut prepared) =
+            lease_status_client(LeaseMode::Takeover, LeasePhase::Prepared);
+        let now = unix_now().unwrap();
+        prepared.expires_at = now + 10;
+        assert!(lease_heartbeat_due(prepared.expires_at, now).unwrap());
+        let current = ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.prepared.token".into(),
+            session: session_from_claims(&prepared, 1, 1).unwrap(),
+            claims: prepared,
+        };
+        client.lease = Some(current.clone());
+        *state.inner.lock().await = client;
+
+        assert!(heartbeat_frame(&state, "app_a").await.unwrap().is_none());
+        assert_eq!(state.inner.lock().await.lease.as_ref(), Some(&current));
     }
 
     fn authoritative_snapshot() -> aokie_protocol::v2::AuthoritativeCallSnapshot {
