@@ -248,6 +248,29 @@ impl RelayChannel {
         app_id: &str,
         device_id: &str,
     ) -> Result<(Self, EndpointChallengeFrame), RelayConnectError> {
+        Self::connect_with_cursor(endpoints, token, app_id, device_id, true).await
+    }
+
+    /// Build only the credential/challenge side of an admission refresh.
+    /// The live channel already owns the sole ordered SSE reader and cursor;
+    /// priming or opening a second reader here would create an unmergeable
+    /// delivery race for renewals and ICE.
+    pub(crate) async fn connect_for_refresh(
+        endpoints: &RelayEndpoints,
+        token: &str,
+        app_id: &str,
+        device_id: &str,
+    ) -> Result<(Self, EndpointChallengeFrame), RelayConnectError> {
+        Self::connect_with_cursor(endpoints, token, app_id, device_id, false).await
+    }
+
+    async fn connect_with_cursor(
+        endpoints: &RelayEndpoints,
+        token: &str,
+        app_id: &str,
+        device_id: &str,
+        prime_tail: bool,
+    ) -> Result<(Self, EndpointChallengeFrame), RelayConnectError> {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -273,7 +296,9 @@ impl RelayChannel {
             stream_failures: 0,
         };
         let challenge = channel.fetch_challenge().await?;
-        channel.last_seq = channel.tail_cursor().await?;
+        if prime_tail {
+            channel.last_seq = channel.tail_cursor().await?;
+        }
         eprintln!(
             "[AokieCompanion][relay] challenge accepted; app={} device={} resume_from={}",
             channel.app_id, channel.device_id, channel.last_seq
@@ -362,6 +387,26 @@ impl RelayChannel {
     pub(crate) fn adopt_routing_from(&mut self, previous: &mut Self) {
         self.last_seq = previous.last_seq;
         self.inbound = std::mem::take(&mut previous.inbound);
+        // `self` may already have opened a stream at a later cursor. Replacing
+        // only the integer cannot rewind that HTTP response; resume immediately
+        // so the mailbox replays every complete event after the predecessor's
+        // cursor. Already-decoded predecessor frames drain first.
+        self.restart_stream(Duration::ZERO);
+    }
+
+    /// Rotate bearer/endpoints on the existing ordered reader. Its decoded
+    /// inbound queue and cursor stay intact; any partial event belongs to the
+    /// old response and is safely replayed after an immediate cursor resume.
+    pub(crate) fn refresh_credentials_from(&mut self, replacement: &Self) -> Result<(), String> {
+        if self.app_id != replacement.app_id || self.device_id != replacement.device_id {
+            return Err("relay credential refresh crossed its app or device fence".into());
+        }
+        self.client = replacement.client.clone();
+        self.endpoints = replacement.endpoints.clone();
+        self.token = replacement.token.clone();
+        self.stream_failures = 0;
+        self.restart_stream(Duration::ZERO);
+        Ok(())
     }
 
     async fn fetch_challenge(&self) -> Result<EndpointChallengeFrame, RelayConnectError> {
@@ -412,9 +457,7 @@ impl RelayChannel {
             }
             if let Err(error) = self.open_stream().await {
                 self.reopen_not_before = Instant::now() + STREAM_REOPEN_DELAY;
-                return self
-                    .note_stream_failure(error)
-                    .map(|()| RelayReceive::Idle);
+                return self.note_stream_failure(error).map(|()| RelayReceive::Idle);
             }
         }
         let Some(stream) = self.stream.as_mut() else {
@@ -644,9 +687,7 @@ impl RelayChannel {
                             "[AokieCompanion][relay] mailbox is full; {} frame(s) were not delivered",
                             frames.len()
                         );
-                        return Err(format!(
-                            "Companion relay mailbox is full ({status})"
-                        ));
+                        return Err(format!("Companion relay mailbox is full ({status})"));
                     }
                     relay_status_error("frames", status)
                 }
@@ -767,7 +808,11 @@ mod tests {
     #[test]
     fn stream_events_survive_chunks_that_split_mid_event() {
         let mut parser = SseParser::default();
-        let encoded = frame_event(7, "plugin", "{\"kind\":\"plugin_idle\",\"appId\":\"app_a\"}");
+        let encoded = frame_event(
+            7,
+            "plugin",
+            "{\"kind\":\"plugin_idle\",\"appId\":\"app_a\"}",
+        );
         let (head, tail) = encoded.split_at(encoded.len() / 2);
 
         // A chunk boundary inside an event yields nothing until the event ends.
@@ -1032,6 +1077,42 @@ mod tests {
         assert!(previous.inbound.is_empty());
     }
 
+    #[test]
+    fn credential_refresh_preserves_decoded_inbound_and_restarts_at_the_same_cursor() {
+        let mut current = test_channel();
+        current.last_seq = 118;
+        current.inbound.push_back("renewal-before-refresh".into());
+        current.inbound.push_back("ice-before-refresh".into());
+        current.pending_bytes.extend_from_slice(&[0xE2, 0x82]);
+        current.parser.push("event: frame\ndata: partial");
+
+        let mut replacement = test_channel();
+        replacement.token = "aokie-adm-v2.refreshed".into();
+        replacement.endpoints.stream_url = "https://api.example.test/refreshed/stream".into();
+        replacement.last_seq = 900;
+        replacement
+            .inbound
+            .push_back("must-not-replace-live-queue".into());
+
+        current
+            .refresh_credentials_from(&replacement)
+            .expect("same app/device credentials rotate");
+
+        assert_eq!(current.last_seq, 118, "the live reader owns continuity");
+        assert_eq!(
+            current.inbound.iter().cloned().collect::<Vec<_>>(),
+            vec!["renewal-before-refresh", "ice-before-refresh"]
+        );
+        assert_eq!(current.token, "aokie-adm-v2.refreshed");
+        assert_eq!(
+            current.endpoints.stream_url,
+            "https://api.example.test/refreshed/stream"
+        );
+        assert!(current.stream.is_none());
+        assert!(current.pending_bytes.is_empty());
+        assert!(current.reopen_not_before <= Instant::now());
+    }
+
     /// The one test that actually executes relay HTTP requests.
     #[tokio::test]
     async fn priming_pages_past_the_relays_fetch_limit_before_a_session_starts() {
@@ -1039,7 +1120,10 @@ mod tests {
 
         let mut channel = test_channel();
         channel.endpoints.frames_url = format!("http://{address}/frames");
-        let cursor = channel.tail_cursor().await.expect("priming reaches the tail");
+        let cursor = channel
+            .tail_cursor()
+            .await
+            .expect("priming reaches the tail");
 
         // Stopping at the first page would start the session 172 frames short of
         // the tail, handing it the rest of a previous session's backlog — stale
@@ -1144,10 +1228,7 @@ mod tests {
                                 .and_then(|digits| digits.parse().ok())
                         })
                         .unwrap_or(0);
-                    let body = format!(
-                        "{{\"frames\":[],\"lastSeq\":{}}}",
-                        (since + 128).min(300)
-                    );
+                    let body = format!("{{\"frames\":[],\"lastSeq\":{}}}", (since + 128).min(300));
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()

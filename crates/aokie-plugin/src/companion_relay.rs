@@ -22,6 +22,7 @@
 //!   hello; non-sensitive session-wide notices such as idle may be broadcast.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aokie_protocol::v2::{EndpointChallengeFrame, Grant};
@@ -77,6 +78,9 @@ const MAX_TRACKED_DEVICES: usize = 64;
 const MAX_AUTHENTICATED_GRANTS: usize = 16;
 /// Throttle for the "nobody is listening" note.
 const UNDELIVERABLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Process-local identity for one relay carrier. A completed asynchronous
+/// greeting refresh may only install into the exact channel that launched it.
+static NEXT_RELAY_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Frames addressed to the desktop party carry `from`; the addressing member
 /// the plugin reads back is `deviceId`. Deliberately permissive — this is a
@@ -223,7 +227,40 @@ fn parse_authenticated_grants(payload: &Value) -> HashSet<Grant> {
     grants
 }
 
+/// Identity of one relay cursor namespace.
+///
+/// Sequence numbers have meaning only inside the exact mailbox resources for
+/// one app/plugin party. Admission rotation may reuse a cursor and learned
+/// routes only when every normalized endpoint and both addressing identities
+/// remain equal. Bearer tokens are intentionally absent: they rotate while
+/// the mailbox stays the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RelayCursorDomain {
+    challenge_url: Url,
+    frames_url: Url,
+    stream_url: Url,
+    app_id: String,
+    plugin_id: String,
+}
+
+impl RelayCursorDomain {
+    pub(crate) fn from_endpoints(
+        endpoints: &RelayEndpoints,
+        app_id: &str,
+        plugin_id: &str,
+    ) -> Option<Self> {
+        Some(Self {
+            challenge_url: Url::parse(&endpoints.challenge_url).ok()?,
+            frames_url: Url::parse(&endpoints.frames_url).ok()?,
+            stream_url: Url::parse(&endpoints.stream_url).ok()?,
+            app_id: app_id.to_owned(),
+            plugin_id: plugin_id.to_owned(),
+        })
+    }
+}
+
 pub(crate) struct RelayChannel {
+    channel_id: u64,
     client: Client,
     endpoints: RelayEndpoints,
     token: String,
@@ -264,6 +301,62 @@ pub(crate) struct RelayChannel {
     undeliverable: Option<(Instant, u64)>,
 }
 
+/// Clone-only input for one asynchronous per-party greeting refresh.
+///
+/// It deliberately owns no mutable [`RelayChannel`] state. Challenge latency
+/// therefore never borrows or stalls the authority loop, and completion is
+/// installed only through the launch channel's `channel_id` fence.
+#[derive(Clone)]
+pub(crate) struct RelayGreetingRequest {
+    channel_id: u64,
+    client: Client,
+    challenge_url: String,
+    token: String,
+    app_id: String,
+    plugin_id: String,
+}
+
+impl RelayGreetingRequest {
+    pub(crate) fn channel_id(&self) -> u64 {
+        self.channel_id
+    }
+
+    pub(crate) async fn fetch_challenge(&self) -> Result<EndpointChallengeFrame, WorkerError> {
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {}", self.token))
+            .map_err(|_| WorkerError::rebootstrap("Companion admission token is invalid"))?;
+        authorization.set_sensitive(true);
+        let response = self
+            .client
+            .get(&self.challenge_url)
+            .header(AUTHORIZATION, authorization)
+            .header(
+                "x-aokie-app-id",
+                HeaderValue::from_str(&self.app_id)
+                    .map_err(|_| WorkerError::rebootstrap("Companion app identity is invalid"))?,
+            )
+            .header(
+                "x-aokie-plugin-id",
+                HeaderValue::from_str(&self.plugin_id).map_err(|_| {
+                    WorkerError::rebootstrap("Companion plugin identity is invalid")
+                })?,
+            )
+            .timeout(CHALLENGE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| relay_transport_error("challenge", &error))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(relay_status_error("challenge", status));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|error| relay_transport_error("challenge", &error))?;
+        serde_json::from_str(&body)
+            .map_err(|_| WorkerError::reconnect("Companion endpoint challenge is malformed"))
+    }
+}
+
 #[derive(Clone)]
 struct VerifiedRoute {
     party: String,
@@ -284,6 +377,52 @@ impl RelayChannel {
         plugin_id: &str,
         approved_thumbprints: Vec<String>,
     ) -> Result<(Self, EndpointChallengeFrame), WorkerError> {
+        Self::connect_inner(
+            endpoints,
+            token,
+            app_id,
+            plugin_id,
+            approved_thumbprints,
+            true,
+        )
+        .await
+    }
+
+    /// Prepare a relay that will immediately inherit an existing relay's
+    /// cursor and routes during admission rotation.
+    ///
+    /// A normal new channel walks the mailbox tail before it starts, because
+    /// reading from zero would replay an earlier session. A same-carrier
+    /// replacement must not do that walk: [`Self::adopt_routing_from`] copies
+    /// the exact live cursor after the endpoint challenge succeeds. Skipping
+    /// the redundant walk both avoids missing frames that arrive mid-open and
+    /// bounds the background rotation to the one challenge request.
+    pub(crate) async fn connect_replacement(
+        endpoints: &RelayEndpoints,
+        token: &str,
+        app_id: &str,
+        plugin_id: &str,
+        approved_thumbprints: Vec<String>,
+    ) -> Result<(Self, EndpointChallengeFrame), WorkerError> {
+        Self::connect_inner(
+            endpoints,
+            token,
+            app_id,
+            plugin_id,
+            approved_thumbprints,
+            false,
+        )
+        .await
+    }
+
+    async fn connect_inner(
+        endpoints: &RelayEndpoints,
+        token: &str,
+        app_id: &str,
+        plugin_id: &str,
+        approved_thumbprints: Vec<String>,
+        prime_tail: bool,
+    ) -> Result<(Self, EndpointChallengeFrame), WorkerError> {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -292,6 +431,7 @@ impl RelayChannel {
                 WorkerError::rebootstrap("Companion relay HTTP client could not be created")
             })?;
         let mut channel = Self {
+            channel_id: NEXT_RELAY_CHANNEL_ID.fetch_add(1, Ordering::Relaxed),
             client,
             endpoints: endpoints.clone(),
             token: token.to_string(),
@@ -319,10 +459,15 @@ impl RelayChannel {
             undeliverable: None,
         };
         let challenge = channel.fetch_challenge().await?;
-        channel.last_seq = channel.tail_cursor().await?;
+        if prime_tail {
+            channel.last_seq = channel.tail_cursor().await?;
+        }
         eprintln!(
-            "[aokie-plugin][companion] stage=relay_challenge transport=relay app={} plugin={} resume_from={}",
-            channel.app_id, channel.plugin_id, channel.last_seq
+            "[aokie-plugin][companion] stage=relay_challenge transport=relay app={} plugin={} resume_from={} continuity={}",
+            channel.app_id,
+            channel.plugin_id,
+            channel.last_seq,
+            if prime_tail { "tail" } else { "predecessor" }
         );
         Ok((channel, challenge))
     }
@@ -336,8 +481,10 @@ impl RelayChannel {
     /// ends when the TTL does. Starting at the current tail is what the socket
     /// gateway does implicitly by having no backlog at all.
     ///
-    /// A rotation must NOT re-prime: [`Self::adopt_routing_from`] restores the
-    /// predecessor's cursor so nothing that arrived mid-handshake is skipped.
+    /// A rotation inside the SAME [`RelayCursorDomain`] must not re-prime:
+    /// [`Self::adopt_routing_from`] restores the predecessor's cursor so
+    /// nothing that arrived mid-handshake is skipped. A different domain does
+    /// prime normally and cannot adopt that unrelated numeric cursor.
     ///
     /// The reported `lastSeq` is the tail of ONE page — the relay caps a fetch
     /// at 128 rows while an app mailbox holds up to 512 — so priming has to
@@ -394,7 +541,14 @@ impl RelayChannel {
     ///
     /// `greeted` is deliberately not inherited: a rotated session carries a new
     /// session nonce, so every party has to receive the new hello.
-    pub(crate) fn adopt_routing_from(&mut self, previous: &mut Self) {
+    pub(crate) fn cursor_domain(&self) -> Option<RelayCursorDomain> {
+        RelayCursorDomain::from_endpoints(&self.endpoints, &self.app_id, &self.plugin_id)
+    }
+
+    pub(crate) fn adopt_routing_from(&mut self, previous: &mut Self) -> bool {
+        if self.cursor_domain().is_none() || self.cursor_domain() != previous.cursor_domain() {
+            return false;
+        }
         self.last_seq = previous.last_seq;
         self.routes = std::mem::take(&mut previous.routes);
         self.parties = std::mem::take(&mut previous.parties);
@@ -402,6 +556,7 @@ impl RelayChannel {
         self.last_inbound_party = previous.last_inbound_party.take();
         self.last_inbound_subject = previous.last_inbound_subject.take();
         self.last_inbound_grants = std::mem::take(&mut previous.last_inbound_grants);
+        true
     }
 
     /// Who posted the frame the session is handling right now.
@@ -429,34 +584,42 @@ impl RelayChannel {
         self.greeted.clear();
     }
 
-    /// Owe one party the hello again.
+    /// Install a newly signed hello and owe it to one party again.
     ///
     /// [`Self::arm`] is the whole-session version, for a rotation that mints a
     /// new session nonce. This is the per-party one, for a Companion that
-    /// re-introduced itself: the session calls it only after that Companion's
-    /// endpoint signature verified, because a party that never proved itself
-    /// must not be able to make us reissue anything.
-    pub(crate) fn forget_greeting(&mut self, party: &str) {
+    /// re-introduced itself. The caller first fetches a fresh relay challenge
+    /// and signs a fresh proof for the EXISTING logical session; only then are
+    /// the cached hello and greeting book changed together. Replaying the
+    /// original cached hello here is unsafe because endpoint proofs live for
+    /// at most 30 seconds while a logical session can live much longer.
+    pub(crate) fn install_regreeting(
+        &mut self,
+        expected_channel_id: u64,
+        party: &str,
+        hello: String,
+    ) -> bool {
+        if self.channel_id != expected_channel_id {
+            return false;
+        }
+        self.hello = Some(hello);
         self.greeted.remove(party);
+        true
     }
 
-    async fn fetch_challenge(&self) -> Result<EndpointChallengeFrame, WorkerError> {
-        let response = self
-            .request(reqwest::Method::GET, &self.endpoints.challenge_url)?
-            .timeout(CHALLENGE_TIMEOUT)
-            .send()
-            .await
-            .map_err(|error| relay_transport_error("challenge", &error))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(relay_status_error("challenge", status));
+    pub(crate) async fn fetch_challenge(&self) -> Result<EndpointChallengeFrame, WorkerError> {
+        self.regreeting_request().fetch_challenge().await
+    }
+
+    pub(crate) fn regreeting_request(&self) -> RelayGreetingRequest {
+        RelayGreetingRequest {
+            channel_id: self.channel_id,
+            client: self.client.clone(),
+            challenge_url: self.endpoints.challenge_url.clone(),
+            token: self.token.clone(),
+            app_id: self.app_id.clone(),
+            plugin_id: self.plugin_id.clone(),
         }
-        let body = response
-            .text()
-            .await
-            .map_err(|error| relay_transport_error("challenge", &error))?;
-        serde_json::from_str(&body)
-            .map_err(|_| WorkerError::reconnect("Companion endpoint challenge is malformed"))
     }
 
     pub(crate) async fn send_text(
@@ -1488,7 +1651,7 @@ mod tests {
 
         let mut next = test_channel();
         next.arm("{\"kind\":\"plugin_hello\",\"sessionNonce\":\"b\"}".into());
-        next.adopt_routing_from(&mut previous);
+        assert!(next.adopt_routing_from(&mut previous));
 
         // Without the cursor the replacement re-reads everything still inside
         // the 120s mailbox TTL — replaying stale leases at the session, which
@@ -1506,13 +1669,72 @@ mod tests {
     }
 
     #[test]
+    fn a_cursor_is_never_adopted_across_relay_domain_or_party_changes() {
+        fn primed_previous() -> RelayChannel {
+            let mut previous = test_channel();
+            previous.absorb(vec![RelayStreamEvent::Frame {
+                seq: 118,
+                from: "mobile:abc".into(),
+                subject_id: Some("device_a".into()),
+                grants: test_grants(),
+                frame: "{\"kind\":\"lease_heartbeat\"}".into(),
+            }]);
+            previous.authorize_route("device_a", "mobile:abc", &test_grants());
+            previous
+        }
+
+        let mutations: [fn(&mut RelayChannel); 3] = [
+            |channel| {
+                channel.endpoints.challenge_url =
+                    "https://other.example.test/api/aokie-companion/relay/challenge".into();
+                channel.endpoints.frames_url =
+                    "https://other.example.test/api/aokie-companion/relay/frames".into();
+                channel.endpoints.stream_url =
+                    "https://other.example.test/api/aokie-companion/relay/stream".into();
+            },
+            |channel| channel.app_id = "app_b".into(),
+            |channel| channel.plugin_id = "another_plugin".into(),
+        ];
+        for mutate in mutations {
+            let mut previous = primed_previous();
+            let mut next = test_channel();
+            next.last_seq = 7;
+            mutate(&mut next);
+
+            assert!(!next.adopt_routing_from(&mut previous));
+            assert_eq!(next.last_seq, 7, "the new mailbox keeps its own cursor");
+            assert!(next.routes.is_empty(), "old routes cannot cross domains");
+            assert_eq!(previous.last_seq, 118, "the predecessor is untouched");
+            assert!(previous.routes.contains_key("device_a"));
+            assert_eq!(previous.inbound.len(), 1);
+        }
+
+        // URL parsing canonicalizes host case and the default HTTPS port, so
+        // spelling-only differences do not manufacture a false domain change.
+        let mut previous = primed_previous();
+        let mut normalized_equivalent = test_channel();
+        normalized_equivalent.endpoints.challenge_url =
+            "https://API.EXAMPLE.TEST:443/api/aokie-companion/relay/challenge".into();
+        normalized_equivalent.endpoints.frames_url =
+            "https://API.EXAMPLE.TEST:443/api/aokie-companion/relay/frames".into();
+        normalized_equivalent.endpoints.stream_url =
+            "https://API.EXAMPLE.TEST:443/api/aokie-companion/relay/stream".into();
+        assert!(normalized_equivalent.adopt_routing_from(&mut previous));
+        assert_eq!(normalized_equivalent.last_seq, 118);
+    }
+
+    #[test]
     fn a_re_introduced_companion_is_owed_the_hello_again_without_disturbing_the_others() {
         let mut channel = test_channel();
         channel.arm("{\"kind\":\"plugin_hello\",\"sessionNonce\":\"a\"}".into());
         channel.greeted.insert("mobile:abc".into());
         channel.greeted.insert("mobile:def".into());
 
-        channel.forget_greeting("mobile:abc");
+        assert!(channel.install_regreeting(
+            channel.channel_id,
+            "mobile:abc",
+            "{\"kind\":\"plugin_hello\",\"sessionNonce\":\"a\",\"proof\":\"fresh\"}".into(),
+        ));
 
         // The party that re-introduced itself hears the hello again: a
         // restarted Companion holds no memory of the first one, and it DROPS
@@ -1522,6 +1744,32 @@ mod tests {
         // ...and nobody else is disturbed. Re-greeting the whole session is
         // `arm`'s job, on a rotation that actually changed the session nonce.
         assert!(channel.greeted.contains("mobile:def"));
+        assert_eq!(
+            channel.hello.as_deref(),
+            Some("{\"kind\":\"plugin_hello\",\"sessionNonce\":\"a\",\"proof\":\"fresh\"}")
+        );
+    }
+
+    #[test]
+    fn a_late_regreeting_cannot_install_into_a_rotated_channel() {
+        let previous = test_channel();
+        let mut replacement = test_channel();
+        replacement.arm("{\"kind\":\"plugin_hello\",\"sessionNonce\":\"new\"}".into());
+        replacement.greeted.insert("mobile:abc".into());
+
+        assert!(!replacement.install_regreeting(
+            previous.channel_id,
+            "mobile:abc",
+            "{\"kind\":\"plugin_hello\",\"sessionNonce\":\"old\"}".into(),
+        ));
+        assert_eq!(
+            replacement.hello.as_deref(),
+            Some("{\"kind\":\"plugin_hello\",\"sessionNonce\":\"new\"}")
+        );
+        assert!(
+            replacement.greeted.contains("mobile:abc"),
+            "late work must not disturb the replacement channel's greeting book"
+        );
     }
 
     #[test]
@@ -1538,6 +1786,7 @@ mod tests {
 
     fn test_channel() -> RelayChannel {
         RelayChannel {
+            channel_id: NEXT_RELAY_CHANNEL_ID.fetch_add(1, Ordering::Relaxed),
             client: Client::builder().build().expect("test client builds"),
             endpoints: RelayEndpoints {
                 challenge_url: "https://api.example.test/api/aokie-companion/relay/challenge"

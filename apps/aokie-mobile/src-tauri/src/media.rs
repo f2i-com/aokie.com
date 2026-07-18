@@ -1254,6 +1254,26 @@ async fn close_peer(
     reason: &str,
 ) {
     let session = active.session.read().await.clone();
+    let logged_reason = single_line_log_reason(reason);
+    // Log the authority fence before touching the peer. The post-close status
+    // event is useful to the UI, but it cannot distinguish which native
+    // generation was actually destroyed if a replacement raced the close.
+    // Never include the lease token or endpoint session nonce here.
+    eprintln!(
+        "[AokieCompanion][media_close] stage=before_close generation={} phase={} call={} rtc={} lease={} fence={} mode={:?} expires_at={} now={} reason={}",
+        active.generation,
+        phase,
+        session.binding.call_id,
+        session.binding.rtc_session_id,
+        session.binding.lease_id.as_deref().unwrap_or("none"),
+        session.binding.fence,
+        session.binding.mode,
+        session
+            .expires_at
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        logged_reason,
+    );
     active
         .evidence
         .auto_arm_microphone
@@ -1530,6 +1550,25 @@ fn validate_reason(reason: Option<&str>) -> Result<(), String> {
     }
 }
 
+fn single_line_log_reason(reason: &str) -> String {
+    let sanitized: String = reason
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(200)
+        .collect();
+    if sanitized.trim().is_empty() {
+        "unspecified".into()
+    } else {
+        sanitized
+    }
+}
+
 fn safe_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 200
@@ -1748,6 +1787,15 @@ mod tests {
     fn early_remote_track_does_not_claim_microphone_arm_readiness() {
         assert_eq!(remote_audio_status_phase(false), "connecting");
         assert_eq!(remote_audio_status_phase(true), "remote_audio_ready");
+    }
+
+    #[test]
+    fn close_reason_logging_is_bounded_and_single_line() {
+        let reason = format!("remote\nclose\rreason\t{}", "x".repeat(400));
+        let logged = single_line_log_reason(&reason);
+        assert!(logged.chars().all(|character| !character.is_control()));
+        assert!(logged.chars().count() <= 200);
+        assert_eq!(single_line_log_reason("\n\r\t"), "unspecified");
     }
 
     #[cfg(target_os = "windows")]
