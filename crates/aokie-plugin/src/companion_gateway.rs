@@ -1307,6 +1307,9 @@ enum OutboundRtcSignal {
 struct PreparedTakeover {
     request_id: String,
     provisional: LeaseClaims,
+    /// Relay offers are minted against the physical switchboard revision.
+    /// Socket leases predate that dialect and leave this unset.
+    expected_switchboard_revision: Option<u64>,
     confirmed_owner_epoch: Option<u64>,
     provisional_sdp_revision: u64,
     provisional_transport_generation: u64,
@@ -1386,6 +1389,7 @@ struct RetiredPreparedRtcBinding {
 struct DeferredPrepare {
     encoded: String,
     notice: LeaseNotice,
+    expected_switchboard_revision: u64,
     lease_id: String,
     device_id: String,
     request_id: String,
@@ -2135,6 +2139,7 @@ mod tests {
         session.prepared = Some(PreparedTakeover {
             request_id: "request_a".into(),
             provisional,
+            expected_switchboard_revision: None,
             confirmed_owner_epoch: (phase == LeasePhase::Active).then_some(claims.owner_epoch),
             provisional_sdp_revision: 1,
             provisional_transport_generation: 1,
@@ -3364,6 +3369,33 @@ mod tests {
             "the claim arms once the device has actually been told"
         );
         assert_eq!(harness.session.leases.len(), 1);
+    }
+
+    #[test]
+    fn a_deferred_prepare_cannot_arm_after_the_switchboard_revision_moves() {
+        let mut harness = RelayHarness::new();
+        let granted = harness.claim(LeaseMode::Takeover, "request_defer_switch");
+        let expected = harness
+            .session
+            .deferred_prepare
+            .as_ref()
+            .expect("the provisional grant is delivery-gated")
+            .expected_switchboard_revision;
+        harness.status.switchboard_revision.store(
+            expected.saturating_add(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        harness.session.finish_relay_delivery(
+            &granted[0],
+            TransportDelivery::Delivered,
+            &harness.media,
+            &harness.radio,
+        );
+        assert!(harness.session.deferred_prepare.is_none());
+        assert!(harness.session.prepared.is_none());
+        assert!(harness.session.leases.is_empty());
+        assert!(harness.session.relay_leases.is_empty());
     }
 
     #[test]
@@ -4625,6 +4657,23 @@ mod tests {
         // carrying ours there would be a second authority.
         harness.session.relay_carrier = false;
         assert!(harness.publish_offers().is_empty());
+    }
+
+    #[test]
+    fn switchboard_transition_publishes_state_without_media_offers_then_reopens() {
+        let mut harness = RelayHarness::new();
+        *harness.status.switch_in_flight.lock().unwrap() =
+            Some(("test_switch".into(), Instant::now()));
+        assert!(
+            harness.publish_offers().is_empty(),
+            "no caller-seizing invitation exists while CHLD topology is unsettled"
+        );
+
+        *harness.status.switch_in_flight.lock().unwrap() = None;
+        assert!(
+            !harness.publish_offers().is_empty(),
+            "settling the switch triggers a fresh offer-bearing projection"
+        );
     }
 
     #[test]
@@ -8189,6 +8238,7 @@ impl GatewaySession {
             return Ok(None);
         }
         let active = radio.is_call_active();
+        let switch_in_flight = radio.switch_in_flight();
         let service_mode = map_service_mode(remote.service_mode);
         let media_state = authoritative_media_state(&remote, active);
         let caller = radio.current_caller().map(|number| CallerProjection {
@@ -8268,6 +8318,7 @@ impl GatewaySession {
             "remoteConsent": snapshot.remote_consent,
             "captions": snapshot.captions,
             "audioLevels": snapshot.audio_levels,
+            "switchInFlight": switch_in_flight,
         }))
         .map_err(|_| WorkerError::reconnect("Call snapshot fingerprint failed"))?;
         let unchanged = self.last_snapshot_fingerprint.as_deref() == Some(fingerprint.as_str());
@@ -8285,7 +8336,15 @@ impl GatewaySession {
         // The Companion filters an offer against the snapshot it arrived in, so
         // these are stamped with the fences of THIS frame rather than a re-read
         // of live state that may already have moved on.
-        let snapshot = self.attach_pending_offers(snapshot, &remote)?;
+        let snapshot = if switch_in_flight {
+            // Publish state so the Companion can lock controls, but never mint
+            // or re-publish a caller-seizing offer while CHLD topology is in
+            // flight. Including this flag in the fingerprint above forces a
+            // fresh offer-bearing snapshot as soon as the switch settles.
+            snapshot
+        } else {
+            self.attach_pending_offers(snapshot, &remote)?
+        };
         snapshot
             .validate()
             .map_err(|_| WorkerError::reconnect("Authoritative call snapshot is invalid"))?;
@@ -8742,7 +8801,7 @@ impl GatewaySession {
         match envelope.kind.as_str() {
             "claim_proposal" => {
                 let notice: LeaseNotice = parse_gateway_frame(encoded)?;
-                self.handle_claim_proposal(notice, media, radio)
+                self.handle_claim_proposal(notice, media, radio, None)
             }
             "lease_granted" => {
                 let notice: LeaseNotice = parse_gateway_frame(encoded)?;
@@ -9747,6 +9806,7 @@ impl GatewaySession {
                     kind: "claim_proposal".into(),
                     ..notice
                 },
+                expected_switchboard_revision: spent_offer.claims.switchboard_revision,
                 lease_id: lease.lease_id.clone(),
                 device_id: device_id.clone(),
                 request_id: request_id.clone(),
@@ -11008,7 +11068,12 @@ impl GatewaySession {
             let lease_id = deferred.lease_id.clone();
             let device_id = deferred.device_id.clone();
             let request_id = deferred.request_id.clone();
-            if let Err(error) = self.handle_claim_proposal(deferred.notice, media, radio) {
+            if let Err(error) = self.handle_claim_proposal(
+                deferred.notice,
+                media,
+                radio,
+                Some(deferred.expected_switchboard_revision),
+            ) {
                 self.leases.retain(|_, claims| claims.lease_id != lease_id);
                 self.prepared = None;
                 self.relay_replays.remove(&deferred.replay_key);
@@ -11729,8 +11794,17 @@ impl GatewaySession {
         notice: LeaseNotice,
         _media: &RemoteMediaHandle,
         radio: &RadioHandle,
+        expected_switchboard_revision: Option<u64>,
     ) -> Result<Vec<String>, WorkerError> {
         self.validate_notice(&notice, radio)?;
+        if radio.switch_in_flight()
+            || expected_switchboard_revision
+                .is_some_and(|revision| revision != radio.switchboard_revision())
+        {
+            return Err(WorkerError::reconnect(
+                "Companion claim proposal crossed a physical switchboard transition",
+            ));
+        }
         let request_id = notice
             .request_id
             .clone()
@@ -11777,6 +11851,7 @@ impl GatewaySession {
         self.prepared = Some(PreparedTakeover {
             request_id,
             provisional: notice.lease,
+            expected_switchboard_revision,
             confirmed_owner_epoch: None,
             provisional_sdp_revision: 0,
             provisional_transport_generation: 0,
@@ -12149,6 +12224,30 @@ impl GatewaySession {
         media: &RemoteMediaHandle,
         radio: &RadioHandle,
     ) -> Result<(), WorkerError> {
+        // Capture this BEFORE reading the public switch marker/revision. If a
+        // CHLD wins after either read but before the media manager dequeues the
+        // open, its dedicated epoch changes and the queued peer fails closed.
+        // Capturing after admission would bless the already-started switch.
+        let admitted_switch_epoch = media.capture_aokie_switch_epoch().map_err(|_| {
+            WorkerError::reconnect("Companion media switchboard proof is unavailable")
+        })?;
+        if radio.switch_in_flight() {
+            return Err(WorkerError::reconnect(
+                "Companion media offer arrived while the physical switchboard was moving",
+            ));
+        }
+        if let Some((lease_id, expected_revision)) = self.prepared.as_ref().and_then(|prepared| {
+            prepared
+                .expected_switchboard_revision
+                .map(|revision| (prepared.provisional.lease_id.clone(), revision))
+        }) {
+            if radio.switchboard_revision() != expected_revision {
+                self.revoke_relay_lease_by_id(&lease_id, "switchboard_changed_before_media", media);
+                return Err(WorkerError::reconnect(
+                    "Companion media offer crossed a physical switchboard transition",
+                ));
+            }
+        }
         if let Some(lease_id) = self.prepared.as_ref().and_then(|prepared| {
             prepared
                 .active_rebind_deadline
@@ -12271,6 +12370,8 @@ impl GatewaySession {
                 lease_ttl_ms: ttl,
                 ice_servers: self.ice_servers.clone(),
                 relay_only: self.relay_only,
+                expected_switch_epoch: (binding.mode != MediaMode::Monitor)
+                    .then_some(admitted_switch_epoch),
             })
             .map_err(|error| {
                 eprintln!(
@@ -12430,12 +12531,31 @@ impl GatewaySession {
     ) -> Result<Vec<String>, WorkerError> {
         let mut outbound = Vec::new();
         for event in media.drain_events(64) {
+            let event_detail = match &event.kind {
+                RemoteMediaEventKind::ProtocolViolation { message } => {
+                    sanitize_status_message(message)
+                }
+                RemoteMediaEventKind::Error { operation, message } => format!(
+                    "operation={} message={}",
+                    sanitize_gateway_code(operation),
+                    sanitize_status_message(message)
+                ),
+                RemoteMediaEventKind::ConnectionState { state } => {
+                    format!("state={}", sanitize_gateway_code(state))
+                }
+                RemoteMediaEventKind::Closed { reason }
+                | RemoteMediaEventKind::ReturningToAokie { reason } => {
+                    format!("reason={}", sanitize_status_message(reason))
+                }
+                _ => "none".to_string(),
+            };
             eprintln!(
-                "[aokie-plugin][takeover] stage=media_event call={} owner_epoch={} rtc={} event={}",
+                "[aokie-plugin][takeover] stage=media_event call={} owner_epoch={} rtc={} event={} detail={}",
                 event.call_id,
                 event.owner_epoch,
                 event.rtc_session_id,
-                remote_media_event_kind(&event.kind)
+                remote_media_event_kind(&event.kind),
+                event_detail,
             );
             match event.kind.clone() {
                 RemoteMediaEventKind::TakeoverPrepared {

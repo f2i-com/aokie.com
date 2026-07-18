@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -36,6 +37,13 @@ const MAX_MICROPHONE_AUTHORITY_BYTES: usize = 2_048;
 const MICROPHONE_STATS_POLL: Duration = Duration::from_millis(50);
 const MICROPHONE_PCM_PROGRESS_WINDOW: Duration = Duration::from_millis(125);
 const MICROPHONE_READY_PROGRESS_FLOOR: Duration = Duration::from_millis(100);
+// A fresh baseline normally re-proves in three 50 ms polls. Keep enough room
+// for scheduling/stats jitter without borrowing any extra PCM authority.
+const MICROPHONE_REPROOF_TIMEOUT: Duration = Duration::from_millis(500);
+// Two isolated native-stats discontinuities may recover; a third within this
+// peer-local window is no longer a transient and fails the exact route.
+const MICROPHONE_DISCONTINUITY_WINDOW: Duration = Duration::from_secs(10);
+const MICROPHONE_DISCONTINUITY_BUDGET: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerEvent {
@@ -381,15 +389,26 @@ struct RtpProgressGate {
     strict_advances: u8,
     first_strict_at: Option<Instant>,
     ready: bool,
+    reproof_pending: bool,
+    reproof_deadline: Option<Instant>,
+    discontinuities: VecDeque<Instant>,
     live_until: Option<Instant>,
 }
 
 impl RtpProgressGate {
     fn begin_authority(&mut self, generation: u64) {
-        *self = Self {
-            authority_generation: generation,
-            ..Self::default()
-        };
+        // Proof state is authority-generation local. Discontinuity history is
+        // peer local and deliberately survives disarm/re-arm so cycling the
+        // DTLS marker cannot reset the sliding churn budget.
+        self.authority_generation = generation;
+        self.identity = None;
+        self.last = None;
+        self.strict_advances = 0;
+        self.first_strict_at = None;
+        self.ready = false;
+        self.reproof_pending = false;
+        self.reproof_deadline = None;
+        self.live_until = None;
     }
 
     fn disarm(&mut self, generation: u64) {
@@ -416,17 +435,13 @@ impl RtpProgressGate {
             return Ok(());
         };
         if self.identity.as_ref() != Some(&identity) {
-            self.ready = false;
-            self.live_until = None;
-            return Err("microphone RTP receiver identity changed");
+            return self.rebaseline(identity, progress, now);
         }
         if progress.packets < last.packets
             || progress.bytes < last.bytes
             || progress.nonconcealed_samples < last.nonconcealed_samples
         {
-            self.ready = false;
-            self.live_until = None;
-            return Err("microphone RTP progress counter reset");
+            return self.rebaseline(identity, progress, now);
         }
         if progress.packets > last.packets
             && progress.bytes > last.bytes
@@ -439,12 +454,81 @@ impl RtpProgressGate {
                 && now.duration_since(first_strict_at) >= MICROPHONE_READY_PROGRESS_FLOOR
             {
                 self.ready = true;
+                self.reproof_pending = false;
+                self.reproof_deadline = None;
             }
             if self.ready {
                 self.live_until = now.checked_add(MICROPHONE_PCM_PROGRESS_WINDOW);
             }
         }
         Ok(())
+    }
+
+    fn rebaseline(
+        &mut self,
+        identity: (String, u32, String),
+        progress: InboundAudioProgress,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        if self.reproof_pending {
+            return self.fail("microphone RTP proof remained discontinuous");
+        }
+        while self.discontinuities.front().is_some_and(|seen| {
+            now.checked_duration_since(*seen)
+                .is_some_and(|age| age >= MICROPHONE_DISCONTINUITY_WINDOW)
+        }) {
+            self.discontinuities.pop_front();
+        }
+        if self.discontinuities.len() >= MICROPHONE_DISCONTINUITY_BUDGET {
+            return self.fail("microphone RTP discontinuity budget exceeded");
+        }
+        self.discontinuities.push_back(now);
+
+        // A native stats report can be replaced or restart its cumulative
+        // counters while the underlying receiver and decoded PCM remain
+        // healthy. Treat one such edge as a new baseline, never as fresh
+        // proof. The previously earned PCM window is deliberately left
+        // untouched: it may run to its original deadline, but this baseline
+        // cannot extend it. A second edge before full re-proof is churn and
+        // fails the exact peer above.
+        self.identity = Some(identity);
+        self.last = Some(progress);
+        self.strict_advances = 0;
+        self.first_strict_at = None;
+        self.ready = false;
+        self.reproof_pending = true;
+        let Some(deadline) = now.checked_add(MICROPHONE_REPROOF_TIMEOUT) else {
+            return self.fail("microphone RTP reproof deadline unavailable");
+        };
+        self.reproof_deadline = Some(deadline);
+        Ok(())
+    }
+
+    fn reproof_deadline(&self) -> Option<Instant> {
+        if self.reproof_pending {
+            self.reproof_deadline
+        } else {
+            None
+        }
+    }
+
+    fn fail_if_reproof_expired(&mut self, now: Instant) -> Result<(), &'static str> {
+        if self.reproof_pending {
+            return match self.reproof_deadline {
+                Some(deadline) if now < deadline => Ok(()),
+                Some(_) => self.fail("microphone RTP reproof timed out"),
+                None => self.fail("microphone RTP reproof deadline unavailable"),
+            };
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, reason: &'static str) -> Result<(), &'static str> {
+        self.ready = false;
+        self.reproof_pending = false;
+        self.reproof_deadline = None;
+        self.live_until = None;
+        Err(reason)
     }
 
     fn miss(&mut self) {
@@ -456,8 +540,28 @@ impl RtpProgressGate {
     }
 
     fn allows_pcm(&self, now: Instant) -> bool {
-        self.ready && self.live_until.is_some_and(|deadline| now < deadline)
+        self.live_until.is_some_and(|deadline| now < deadline)
     }
+}
+
+fn reconcile_reproof_wait(
+    microphone_rtp: &mut RtpProgressGate,
+    authority: &StdMutex<RemoteMicrophoneAuthority>,
+    failure_reason: &'static str,
+) -> Result<(), &'static str> {
+    let (authority_generation, armed) = authority
+        .lock()
+        .map_err(|_| "microphone authority state poisoned")?
+        .snapshot();
+    if !armed {
+        microphone_rtp.disarm(authority_generation);
+        return Ok(());
+    }
+    if microphone_rtp.authority_generation() != authority_generation {
+        microphone_rtp.begin_authority(authority_generation);
+        return Ok(());
+    }
+    microphone_rtp.fail(failure_reason)
 }
 
 pub struct DesktopPeer {
@@ -633,7 +737,49 @@ impl DesktopPeer {
                         queue_size_frames: Some(REMOTE_AUDIO_QUEUE_FRAMES),
                     },
                 );
-                while let Some(frame) = stream.next().await {
+                'media: loop {
+                    let next_frame = if let Some(deadline) = microphone_rtp.reproof_deadline() {
+                        match tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(deadline),
+                            stream.next(),
+                        )
+                        .await
+                        {
+                            Ok(frame) => frame,
+                            Err(_) => {
+                                match reconcile_reproof_wait(
+                                    &mut microphone_rtp,
+                                    &authority,
+                                    "microphone RTP reproof timed out",
+                                ) {
+                                    Ok(()) => {
+                                        microphone_ready_emitted = false;
+                                        next_stats_poll = Instant::now();
+                                        continue 'media;
+                                    }
+                                    Err(reason) => {
+                                        let _ = readiness_tx
+                                            .try_send(PeerEvent::ProtocolViolation(reason));
+                                        break 'media;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        stream.next().await
+                    };
+                    let Some(frame) = next_frame else {
+                        if microphone_rtp.reproof_deadline().is_some() {
+                            if let Err(reason) = reconcile_reproof_wait(
+                                &mut microphone_rtp,
+                                &authority,
+                                "microphone RTP stream ended during reproof",
+                            ) {
+                                let _ = readiness_tx.try_send(PeerEvent::ProtocolViolation(reason));
+                            }
+                        }
+                        break;
+                    };
                     if matches!(binding.mode, MediaMode::Consult | MediaMode::Talk) {
                         let (authority_generation, armed) = match authority.lock() {
                             Ok(authority) => authority.snapshot(),
@@ -662,14 +808,43 @@ impl DesktopPeer {
                             next_stats_poll = Instant::now();
                         }
                         let now = Instant::now();
+                        if let Err(reason) = microphone_rtp.fail_if_reproof_expired(now) {
+                            let _ = readiness_tx.try_send(PeerEvent::ProtocolViolation(reason));
+                            break;
+                        }
                         if now >= next_stats_poll {
                             next_stats_poll = now.checked_add(MICROPHONE_STATS_POLL).unwrap_or(now);
-                            match receiver
-                                .get_stats()
+                            let stats = if let Some(deadline) = microphone_rtp.reproof_deadline() {
+                                match tokio::time::timeout_at(
+                                    tokio::time::Instant::from_std(deadline),
+                                    receiver.get_stats(),
+                                )
                                 .await
-                                .ok()
-                                .and_then(|stats| inbound_audio_progress(&stats))
-                            {
+                                {
+                                    Ok(stats) => stats.ok(),
+                                    Err(_) => {
+                                        match reconcile_reproof_wait(
+                                            &mut microphone_rtp,
+                                            &authority,
+                                            "microphone RTP reproof timed out",
+                                        ) {
+                                            Ok(()) => {
+                                                microphone_ready_emitted = false;
+                                                next_stats_poll = Instant::now();
+                                                continue 'media;
+                                            }
+                                            Err(reason) => {
+                                                let _ = readiness_tx
+                                                    .try_send(PeerEvent::ProtocolViolation(reason));
+                                                break 'media;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                receiver.get_stats().await.ok()
+                            };
+                            match stats.and_then(|stats| inbound_audio_progress(&stats)) {
                                 Some(progress) => {
                                     if let Err(reason) =
                                         microphone_rtp.observe(progress, Instant::now())
@@ -1623,24 +1798,175 @@ mod tests {
     }
 
     #[test]
-    fn rtp_progress_identity_or_counter_reset_fails_closed() {
+    fn rtp_progress_identity_change_rebaselines_and_reproves() {
         let start = Instant::now();
         let mut gate = RtpProgressGate::default();
         gate.begin_authority(1);
         gate.observe(progress(10, 100, 160), start).unwrap();
-        let mut changed = progress(11, 120, 320);
-        changed.ssrc = 99;
-        assert!(gate
-            .observe(changed, start + Duration::from_millis(50))
-            .is_err());
+        gate.observe(progress(11, 120, 320), start + Duration::from_millis(50))
+            .unwrap();
+        gate.observe(progress(12, 140, 480), start + Duration::from_millis(100))
+            .unwrap();
+        gate.observe(progress(13, 160, 640), start + Duration::from_millis(150))
+            .unwrap();
+        assert!(gate.ready());
 
+        let mut changed = progress(20, 200, 800);
+        changed.ssrc = 99;
+        gate.observe(changed, start + Duration::from_millis(200))
+            .unwrap();
+        assert!(!gate.ready());
+        assert!(gate.allows_pcm(start + Duration::from_millis(274)));
+        assert!(!gate.allows_pcm(start + Duration::from_millis(275)));
+
+        for (elapsed_ms, packets, bytes, samples) in [
+            (250, 21, 220, 960),
+            (300, 22, 240, 1_120),
+            (350, 23, 260, 1_280),
+        ] {
+            let mut reproved = progress(packets, bytes, samples);
+            reproved.ssrc = 99;
+            gate.observe(reproved, start + Duration::from_millis(elapsed_ms))
+                .unwrap();
+        }
+        assert!(gate.ready());
+        assert!(gate.allows_pcm(start + Duration::from_millis(400)));
+    }
+
+    #[test]
+    fn rtp_progress_counter_reset_rebaselines_and_reproves() {
+        let start = Instant::now();
         let mut gate = RtpProgressGate::default();
         gate.begin_authority(1);
         gate.observe(progress(10, 100, 160), start).unwrap();
-        assert!(gate
-            .observe(progress(9, 120, 320), start + Duration::from_millis(50))
-            .is_err());
-        assert!(!gate.allows_pcm(start + Duration::from_millis(50)));
+        gate.observe(progress(11, 120, 320), start + Duration::from_millis(50))
+            .unwrap();
+        gate.observe(progress(12, 140, 480), start + Duration::from_millis(100))
+            .unwrap();
+        gate.observe(progress(13, 160, 640), start + Duration::from_millis(150))
+            .unwrap();
+        assert!(gate.ready());
+
+        gate.observe(progress(1, 20, 160), start + Duration::from_millis(200))
+            .unwrap();
+        assert!(!gate.ready());
+        assert!(gate.allows_pcm(start + Duration::from_millis(274)));
+        assert!(!gate.allows_pcm(start + Duration::from_millis(275)));
+
+        gate.observe(progress(2, 40, 320), start + Duration::from_millis(250))
+            .unwrap();
+        gate.observe(progress(3, 60, 480), start + Duration::from_millis(300))
+            .unwrap();
+        gate.observe(progress(4, 80, 640), start + Duration::from_millis(350))
+            .unwrap();
+        assert!(gate.ready());
+        assert!(gate.allows_pcm(start + Duration::from_millis(400)));
+    }
+
+    #[test]
+    fn rtp_progress_persistent_identity_churn_fails_closed() {
+        let start = Instant::now();
+        let mut gate = RtpProgressGate::default();
+        gate.begin_authority(1);
+        gate.observe(progress(10, 100, 160), start).unwrap();
+        gate.observe(progress(11, 120, 320), start + Duration::from_millis(50))
+            .unwrap();
+        gate.observe(progress(12, 140, 480), start + Duration::from_millis(100))
+            .unwrap();
+        gate.observe(progress(13, 160, 640), start + Duration::from_millis(150))
+            .unwrap();
+
+        let mut first_replacement = progress(20, 200, 800);
+        first_replacement.ssrc = 99;
+        gate.observe(first_replacement, start + Duration::from_millis(200))
+            .unwrap();
+        assert!(gate.allows_pcm(start + Duration::from_millis(225)));
+
+        let mut second_replacement = progress(30, 300, 960);
+        second_replacement.ssrc = 100;
+        assert_eq!(
+            gate.observe(second_replacement, start + Duration::from_millis(250)),
+            Err("microphone RTP proof remained discontinuous")
+        );
+        assert!(!gate.allows_pcm(start + Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn rtp_progress_stalled_reproof_times_out_after_old_pcm_proof_expires() {
+        let start = Instant::now();
+        let mut gate = RtpProgressGate::default();
+        gate.begin_authority(1);
+        gate.observe(progress(10, 100, 160), start).unwrap();
+        gate.observe(progress(11, 120, 320), start + Duration::from_millis(50))
+            .unwrap();
+        gate.observe(progress(12, 140, 480), start + Duration::from_millis(100))
+            .unwrap();
+        gate.observe(progress(13, 160, 640), start + Duration::from_millis(150))
+            .unwrap();
+
+        let mut replacement = progress(20, 200, 800);
+        replacement.ssrc = 99;
+        gate.observe(replacement, start + Duration::from_millis(200))
+            .unwrap();
+        assert!(gate.allows_pcm(start + Duration::from_millis(274)));
+        assert!(!gate.allows_pcm(start + Duration::from_millis(275)));
+
+        // Missing stats close PCM immediately but leave the bounded re-proof
+        // timer armed so the exact peer cannot remain silently quarantined.
+        gate.miss();
+        assert!(!gate.allows_pcm(start + Duration::from_millis(300)));
+        assert_eq!(
+            gate.fail_if_reproof_expired(start + Duration::from_millis(699)),
+            Ok(())
+        );
+        assert_eq!(
+            gate.fail_if_reproof_expired(start + Duration::from_millis(700)),
+            Err("microphone RTP reproof timed out")
+        );
+    }
+
+    #[test]
+    fn rtp_progress_repeated_successful_reproof_cycles_exhaust_budget() {
+        let start = Instant::now();
+        let mut gate = RtpProgressGate::default();
+        gate.begin_authority(1);
+        gate.observe(progress(10, 100, 160), start).unwrap();
+        gate.observe(progress(11, 120, 320), start + Duration::from_millis(50))
+            .unwrap();
+        gate.observe(progress(12, 140, 480), start + Duration::from_millis(100))
+            .unwrap();
+        gate.observe(progress(13, 160, 640), start + Duration::from_millis(150))
+            .unwrap();
+
+        for (cycle, ssrc) in [(0_u64, 99_u32), (1, 100)] {
+            let baseline_ms = 200 + cycle * 200;
+            let mut replacement = progress(20 + cycle * 10, 200 + cycle * 100, 800);
+            replacement.ssrc = ssrc;
+            gate.observe(replacement, start + Duration::from_millis(baseline_ms))
+                .unwrap();
+            for (offset_ms, increment) in [(50, 1_u64), (100, 2), (150, 3)] {
+                let mut reproved = progress(
+                    20 + cycle * 10 + increment,
+                    200 + cycle * 100 + increment * 20,
+                    800 + increment * 160,
+                );
+                reproved.ssrc = ssrc;
+                gate.observe(
+                    reproved,
+                    start + Duration::from_millis(baseline_ms + offset_ms),
+                )
+                .unwrap();
+            }
+            assert!(gate.ready());
+        }
+
+        let mut third_replacement = progress(50, 500, 1_600);
+        third_replacement.ssrc = 101;
+        assert_eq!(
+            gate.observe(third_replacement, start + Duration::from_millis(600)),
+            Err("microphone RTP discontinuity budget exceeded")
+        );
+        assert!(!gate.allows_pcm(start + Duration::from_millis(600)));
     }
 
     #[test]

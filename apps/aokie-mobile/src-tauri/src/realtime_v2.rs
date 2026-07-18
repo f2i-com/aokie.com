@@ -112,6 +112,12 @@ const LOCAL_EXPIRY_TOMBSTONE_TTL: Duration = Duration::from_secs(30);
 const MAX_LOCAL_EXPIRY_TOMBSTONES: usize = 16;
 const MAX_ANSWERED_ASSISTANCE_REQUESTS: usize = 64;
 const MAX_COMPLETED_REVOKES: usize = 256;
+// A published offer is a one-shot invitation. Once this process has built an
+// answer for it, a later claim failure may clear `pending` but must not make
+// the cached snapshot answerable again. Keep only the immutable offer/JTI
+// identity; the prebuilt outbound frame continues to own exact at-least-once
+// delivery of the original attempt.
+const MAX_SPENT_MOBILE_OFFERS: usize = 64;
 // Native media activation failures must surrender the authority the Desktop
 // already minted, even when the receive loop is about to reconnect. Keep the
 // exact-token revoke in a tiny, bounded queue that survives transport resets.
@@ -997,6 +1003,16 @@ struct AppliedRelayFrame {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct SpentMobileOffer {
+    app_id: String,
+    device_id: String,
+    call_id: String,
+    call_epoch: u64,
+    offer_id: String,
+    offer_jti: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CompletedRevoke {
     app_id: String,
     request_id: Option<String>,
@@ -1020,6 +1036,7 @@ struct ClientState {
     peer_key_thumbprint: Option<String>,
     authoritative_sequence: u64,
     snapshot: Option<MobileSnapshotFrame>,
+    spent_mobile_offers: VecDeque<SpentMobileOffer>,
     pending: Option<PendingLease>,
     lease: Option<ClientLease>,
     pending_revoke: Option<PendingRevoke>,
@@ -1746,11 +1763,13 @@ impl V2State {
         let applied_relay_frames = std::mem::take(&mut state.applied_relay_frames);
         let completed_revokes = std::mem::take(&mut state.completed_revokes);
         let urgent_control_frames = std::mem::take(&mut state.urgent_control_frames);
+        let spent_mobile_offers = std::mem::take(&mut state.spent_mobile_offers);
         *state = ClientState {
             answered_assistance_requests,
             applied_relay_frames,
             completed_revokes,
             urgent_control_frames,
+            spent_mobile_offers,
             ..ClientState::default()
         };
     }
@@ -1772,6 +1791,8 @@ impl V2State {
         let completed_revokes = std::mem::take(&mut state.completed_revokes);
         let mut urgent_control_frames = std::mem::take(&mut state.urgent_control_frames);
         urgent_control_frames.retain(|frame| frame.app_id == app_id);
+        let mut spent_mobile_offers = std::mem::take(&mut state.spent_mobile_offers);
+        spent_mobile_offers.retain(|spent| spent.app_id == app_id && spent.device_id == device_id);
         *state = ClientState {
             app_id: Some(app_id.to_owned()),
             device_id: Some(device_id.to_owned()),
@@ -1785,6 +1806,7 @@ impl V2State {
             applied_relay_frames,
             completed_revokes,
             urgent_control_frames,
+            spent_mobile_offers,
             ..ClientState::default()
         };
     }
@@ -1933,11 +1955,13 @@ impl V2State {
             let applied_relay_frames = std::mem::take(&mut state.applied_relay_frames);
             let completed_revokes = std::mem::take(&mut state.completed_revokes);
             let urgent_control_frames = std::mem::take(&mut state.urgent_control_frames);
+            let spent_mobile_offers = std::mem::take(&mut state.spent_mobile_offers);
             *state = ClientState {
                 answered_assistance_requests,
                 applied_relay_frames,
                 completed_revokes,
                 urgent_control_frames,
+                spent_mobile_offers,
                 ..ClientState::default()
             };
         }
@@ -2393,6 +2417,12 @@ async fn prepare_offer_answer(
             owner_epoch: selected.offer.owner_epoch,
         };
         answer.validate().map_err(|error| error.to_string())?;
+        // The authority spends an offer when it accepts this answer. Mirror
+        // that one-shot boundary locally before exposing the pending attempt:
+        // clearing a failed claim must never reveal the same cached offer to a
+        // second button press. The exact `answer` value remains available to
+        // the outbound transport for its normal at-least-once retry.
+        tombstone_mobile_offer(&mut client, &selected);
         client.pending = Some(PendingLease {
             request_id: request_id.clone(),
             offer_request_id,
@@ -2436,7 +2466,8 @@ fn select_mobile_offer(
         .iter()
         .filter(|signed| {
             let offer = &signed.offer;
-            signed.validate(now).is_ok()
+            !mobile_offer_was_spent(client, signed)
+                && signed.validate(now).is_ok()
                 && offer.target_device_id == device_id
                 && offer.target_holder_key_thumbprint == holder_key_thumbprint
                 && offer.app_id == snapshot.app_id
@@ -2479,6 +2510,71 @@ fn select_mobile_offer(
         return Err("multiple signed mobile offers require an explicit offer selection".into());
     }
     Ok(selected.clone())
+}
+
+fn mobile_offer_was_spent(client: &ClientState, signed: &SignedPendingMobileOffer) -> bool {
+    client
+        .spent_mobile_offers
+        .iter()
+        .any(|spent| spent_mobile_offer_matches(spent, signed))
+}
+
+fn spent_mobile_offer_matches(spent: &SpentMobileOffer, signed: &SignedPendingMobileOffer) -> bool {
+    let offer = &signed.offer;
+    spent.app_id == offer.app_id
+        && spent.device_id == offer.target_device_id
+        && spent.call_id == offer.call_id
+        && spent.call_epoch == offer.call_epoch
+        // Either identifier being reused inside the same app/device/call is
+        // not a fresh invitation. A legitimate replacement rotates both.
+        && (spent.offer_id == offer.offer_id || spent.offer_jti == offer.jti)
+}
+
+fn retain_spent_mobile_offers_for_snapshot(client: &mut ClientState, frame: &MobileSnapshotFrame) {
+    let device_id = client.device_id.as_deref();
+    client.spent_mobile_offers.retain(|spent| {
+        spent.app_id == frame.app_id
+            && Some(spent.device_id.as_str()) == device_id
+            && spent.call_id == frame.snapshot.call_id
+            && spent.call_epoch == frame.snapshot.call_epoch
+    });
+}
+
+fn suppress_spent_mobile_offers(client: &ClientState, frame: &mut MobileSnapshotFrame) {
+    frame
+        .snapshot
+        .pending_mobile_offers
+        .retain(|offer| !mobile_offer_was_spent(client, offer));
+}
+
+fn tombstone_mobile_offer(client: &mut ClientState, selected: &SignedPendingMobileOffer) {
+    if !mobile_offer_was_spent(client, selected) {
+        if client.spent_mobile_offers.len() >= MAX_SPENT_MOBILE_OFFERS {
+            client.spent_mobile_offers.pop_front();
+        }
+        client.spent_mobile_offers.push_back(SpentMobileOffer {
+            app_id: selected.offer.app_id.clone(),
+            device_id: selected.offer.target_device_id.clone(),
+            call_id: selected.offer.call_id.clone(),
+            call_epoch: selected.offer.call_epoch,
+            offer_id: selected.offer.offer_id.clone(),
+            offer_jti: selected.offer.jti.clone(),
+        });
+    }
+    if let Some(snapshot) = client.snapshot.as_mut() {
+        let spent = SpentMobileOffer {
+            app_id: selected.offer.app_id.clone(),
+            device_id: selected.offer.target_device_id.clone(),
+            call_id: selected.offer.call_id.clone(),
+            call_epoch: selected.offer.call_epoch,
+            offer_id: selected.offer.offer_id.clone(),
+            offer_jti: selected.offer.jti.clone(),
+        };
+        snapshot
+            .snapshot
+            .pending_mobile_offers
+            .retain(|offer| !spent_mobile_offer_matches(&spent, offer));
+    }
 }
 
 async fn clear_pending_lease(state: &V2State, request_id: &str) -> Option<String> {
@@ -4796,7 +4892,7 @@ async fn handle_gateway_frame(
                 .map_err(|_| "could not deliver protocol-v2 idle sync".to_string())?;
         }
         "snapshot" => {
-            let frame: MobileSnapshotFrame = strict_parse(encoded, "snapshot")?;
+            let mut frame: MobileSnapshotFrame = strict_parse(encoded, "snapshot")?;
             validate_snapshot(&frame, expected_app_id)?;
             let now = unix_now()?;
             let (
@@ -4898,6 +4994,12 @@ async fn handle_gateway_frame(
                 let confirmed_revoke_action_id =
                     take_snapshot_confirmed_pending_revoke(&mut client, &frame)?
                         .and_then(|pending| pending.native_action_id);
+                // Commit the call boundary before filtering its offers. A
+                // reconnect can replay the spent call's cached projection,
+                // while an authoritative idle/new app/new call must retire
+                // that lineage. Genuinely fresh offerId/JTI pairs survive.
+                retain_spent_mobile_offers_for_snapshot(&mut client, &frame);
+                suppress_spent_mobile_offers(&client, &mut frame);
                 client.authoritative_sequence = frame.sequence;
                 client.snapshot = Some(frame.clone());
                 (
@@ -7209,6 +7311,7 @@ fn transition_to_idle(
 
     client.authoritative_sequence = frame.sequence;
     client.snapshot = None;
+    client.spent_mobile_offers.clear();
     client.lease = None;
     client.local_expiry_tombstones.clear();
     client.assistance = None;
@@ -7833,6 +7936,14 @@ mod tests {
         client.authoritative_sequence = 5;
         client.pending_assistance_answer = Some("assistance_answer_a".into());
         client.seen_remote_endpoint_jtis.insert("rtc_jti_a".into());
+        let spent = client
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .pending_mobile_offers[0]
+            .clone();
+        tombstone_mobile_offer(&mut client, &spent);
         let frame = MobileIdleSyncFrame {
             kind: "idle_sync".into(),
             schema_version: SCHEMA_VERSION,
@@ -7855,6 +7966,7 @@ mod tests {
         assert!(client.pending_assistance_answer.is_none());
         assert!(client.pending_end_caller.is_none());
         assert!(client.seen_remote_endpoint_jtis.is_empty());
+        assert!(client.spent_mobile_offers.is_empty());
         assert_eq!(cleanup.pending_call, Some(("call_a".into(), 7)));
 
         // A late snapshot at or below the idle sequence can never resurrect
@@ -11432,6 +11544,257 @@ mod tests {
         let mut expired = pending;
         expired.deadline = Instant::now() - Duration::from_millis(1);
         assert_eq!(pending_lease_timeout(&expired, Instant::now()), Some(false));
+    }
+
+    #[tokio::test]
+    async fn rejected_offer_or_lease_attempt_cannot_reuse_the_spent_snapshot_offer() {
+        for reject_after_offer_acceptance in [false, true] {
+            let state = V2State::default();
+            *state.inner.lock().await =
+                offered_client(LeaseMode::Takeover, MobileOfferSurface::InApp);
+            let (answer, lease_request_id) =
+                prepare_offer_answer(&state, LeaseMode::Takeover, None)
+                    .await
+                    .expect("the first press selects the published offer");
+
+            let rejected_request_id = if reject_after_offer_acceptance {
+                let accepted = MobileOfferAcceptedFrame {
+                    kind: "mobile_offer_accepted".into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: "app_a".into(),
+                    request_id: answer.request_id.clone(),
+                    offer_id: answer.offer_id.clone(),
+                    offer_jti: answer.offer_jti.clone(),
+                    offered_mode: answer.offered_mode,
+                    accepted: true,
+                };
+                let encoded = serde_json::to_string(&accepted).unwrap();
+                apply_mobile_offer_accepted(&state, "app_a", accepted, &encoded)
+                    .await
+                    .expect("the offer acceptance releases its lease request");
+                take_ready_lease_request(&state)
+                    .await
+                    .expect("the pending lease remains valid")
+                    .expect("the lease request is delivered exactly once");
+                lease_request_id
+            } else {
+                answer.request_id
+            };
+            let rejection = ClaimRejectedFrame {
+                kind: "claim_rejected".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                request_id: rejected_request_id,
+                code: "stale_call".into(),
+                message: "the one-shot offer was not redeemed".into(),
+            };
+            let encoded = serde_json::to_string(&rejection).unwrap();
+            let action = {
+                let mut client = state.inner.lock().await;
+                prepare_claim_rejection(&mut client, &rejection, &encoded)
+                    .expect("the matching failure is transactional")
+            };
+            assert!(matches!(action, ClaimRejectionAction::RejectPending { .. }));
+
+            let client = state.inner.lock().await;
+            assert!(client.pending.is_none());
+            assert_eq!(client.spent_mobile_offers.len(), 1);
+            assert!(client
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.snapshot.pending_mobile_offers.is_empty()));
+            drop(client);
+            assert_eq!(
+                prepare_offer_answer(&state, LeaseMode::Takeover, None)
+                    .await
+                    .expect_err("an immediate retry cannot answer the spent cached offer"),
+                "no current signed mobile offer permits this lease"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_snapshot_can_replace_a_spent_offer_with_a_fresh_one() {
+        let state = V2State::default();
+        *state.inner.lock().await = offered_client(LeaseMode::Takeover, MobileOfferSurface::InApp);
+        let original_offer = state
+            .inner
+            .lock()
+            .await
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .pending_mobile_offers[0]
+            .clone();
+        let (answer, _) = prepare_offer_answer(&state, LeaseMode::Takeover, None)
+            .await
+            .expect("the first offer is selected");
+        let rejection = ClaimRejectedFrame {
+            kind: "claim_rejected".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: answer.request_id,
+            code: "stale_call".into(),
+            message: "the first offer is spent".into(),
+        };
+        let encoded = serde_json::to_string(&rejection).unwrap();
+        {
+            let mut client = state.inner.lock().await;
+            assert!(matches!(
+                prepare_claim_rejection(&mut client, &rejection, &encoded).unwrap(),
+                ClaimRejectionAction::RejectPending { .. }
+            ));
+
+            let mut fresh_offer = original_offer.clone();
+            fresh_offer.offer.offer_id = "offer_exact_b".into();
+            fresh_offer.offer.opportunity_id = "opportunity_b".into();
+            fresh_offer.offer.jti = "offer_jti_exact_b".into();
+            fresh_offer.offer_token = "signed.offer.token.b".into();
+            let mut next = client
+                .snapshot
+                .clone()
+                .expect("call snapshot remains current");
+            next.sequence += 1;
+            next.snapshot.pending_mobile_offers = vec![original_offer, fresh_offer];
+            suppress_spent_mobile_offers(&client, &mut next);
+            assert_eq!(next.snapshot.pending_mobile_offers.len(), 1);
+            client.snapshot = Some(next);
+        }
+
+        let (fresh_answer, _) = prepare_offer_answer(&state, LeaseMode::Takeover, None)
+            .await
+            .expect("a genuinely fresh offer remains answerable");
+        assert_eq!(fresh_answer.offer_id, "offer_exact_b");
+        assert_eq!(fresh_answer.offer_jti, "offer_jti_exact_b");
+    }
+
+    #[tokio::test]
+    async fn spent_offer_survives_transport_reset_generation_and_begin() {
+        for reset_generation_only in [false, true] {
+            let state = V2State::default();
+            *state.inner.lock().await =
+                offered_client(LeaseMode::Takeover, MobileOfferSurface::InApp);
+            let (identity, cached_snapshot) = {
+                let client = state.inner.lock().await;
+                (
+                    client.endpoint_identity.clone().unwrap(),
+                    client.snapshot.clone().unwrap(),
+                )
+            };
+            let (answer, lease_request_id) =
+                prepare_offer_answer(&state, LeaseMode::Takeover, None)
+                    .await
+                    .expect("the first session spends the published offer");
+            let original_answer = serde_json::to_string(&answer).unwrap();
+            clear_pending_lease(&state, &lease_request_id).await;
+
+            if reset_generation_only {
+                state.reset_generation(1).await;
+            } else {
+                state.reset().await;
+            }
+            assert_eq!(state.inner.lock().await.spent_mobile_offers.len(), 1);
+            state
+                .begin(
+                    "app_a",
+                    "device_a",
+                    "session_after_reconnect",
+                    &identity,
+                    &[],
+                    false,
+                    true,
+                    None,
+                )
+                .await;
+            state.set_generation(2).await;
+            {
+                let mut client = state.inner.lock().await;
+                assert_eq!(client.spent_mobile_offers.len(), 1);
+                // Recreate the exact cached snapshot a reconnect can replay.
+                // Leave its offer present to prove the selector's tombstone,
+                // not merely snapshot filtering, owns this safety boundary.
+                client.snapshot = Some(cached_snapshot);
+            }
+
+            assert_eq!(
+                prepare_offer_answer(&state, LeaseMode::Takeover, None)
+                    .await
+                    .expect_err("reconnect must not answer the spent cached offer"),
+                "no current signed mobile offer permits this lease"
+            );
+            assert_eq!(
+                serde_json::to_string(&answer).unwrap(),
+                original_answer,
+                "the original prebuilt frame remains byte-identical for exact delivery retry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spent_offer_scope_ends_at_new_call_and_new_app_boundaries() {
+        let state = V2State::default();
+        *state.inner.lock().await = offered_client(LeaseMode::Takeover, MobileOfferSurface::InApp);
+        let (identity, original_snapshot) = {
+            let client = state.inner.lock().await;
+            (
+                client.endpoint_identity.clone().unwrap(),
+                client.snapshot.clone().unwrap(),
+            )
+        };
+        let (_, request_id) = prepare_offer_answer(&state, LeaseMode::Takeover, None)
+            .await
+            .expect("the old call spends its offer");
+        clear_pending_lease(&state, &request_id).await;
+
+        let mut new_call = original_snapshot.clone();
+        new_call.sequence += 1;
+        new_call.snapshot.call_id = "call_b".into();
+        new_call.snapshot.call_epoch += 1;
+        for offer in &mut new_call.snapshot.pending_mobile_offers {
+            offer.offer.call_id = new_call.snapshot.call_id.clone();
+            offer.offer.call_epoch = new_call.snapshot.call_epoch;
+        }
+        {
+            let mut client = state.inner.lock().await;
+            retain_spent_mobile_offers_for_snapshot(&mut client, &new_call);
+            assert!(client.spent_mobile_offers.is_empty());
+            suppress_spent_mobile_offers(&client, &mut new_call);
+            assert_eq!(new_call.snapshot.pending_mobile_offers.len(), 1);
+            client.snapshot = Some(new_call);
+        }
+        let (new_call_answer, new_call_request_id) =
+            prepare_offer_answer(&state, LeaseMode::Takeover, None)
+                .await
+                .expect("another call may use coincident offer identifiers");
+        assert_eq!(new_call_answer.offer_id, "offer_exact_a");
+        clear_pending_lease(&state, &new_call_request_id).await;
+
+        state.reset().await;
+        state
+            .begin(
+                "app_b",
+                "device_a",
+                "session_app_b",
+                &identity,
+                &[],
+                false,
+                true,
+                None,
+            )
+            .await;
+        state.set_generation(3).await;
+        assert!(state.inner.lock().await.spent_mobile_offers.is_empty());
+        let mut new_app = original_snapshot;
+        new_app.app_id = "app_b".into();
+        for offer in &mut new_app.snapshot.pending_mobile_offers {
+            offer.offer.app_id = "app_b".into();
+        }
+        state.inner.lock().await.snapshot = Some(new_app);
+        let (new_app_answer, _) = prepare_offer_answer(&state, LeaseMode::Takeover, None)
+            .await
+            .expect("another app may use coincident offer identifiers");
+        assert_eq!(new_app_answer.offer_id, "offer_exact_a");
     }
 
     #[tokio::test]
