@@ -43,6 +43,7 @@ import {
   type V2EndCallerEvent,
   type V2IdleSyncEvent,
   type V2LeaseEvent,
+  type V2Grant,
   type V2LeaseMode,
   type V2PendingMobileOffer,
 } from "./bridge";
@@ -132,6 +133,7 @@ export function formatAssistanceCountdown(remainingSeconds: number): string {
 
 const V2_OFFER_CLOCK_SKEW_SECONDS = 5;
 const ARMABLE_MEDIA_PHASES = ["connected", "remote_audio_ready", "microphone_armed", "microphone_disarmed", "answer_applied"];
+const CONNECTED_MEDIA_PHASES = ["connected", "remote_audio_ready", "microphone_armed", "microphone_disarmed"];
 
 export type V2RuntimeFailureOperation = "realtime" | "request" | "takeover" | "microphone" | "end_caller";
 
@@ -166,6 +168,10 @@ export function v2LeaseExitLabel(mode: V2LeaseMode): string {
   if (mode === "monitor") return "Stop listening";
   if (mode === "consult") return "Finish private consult";
   return "Return to Aokie";
+}
+
+export function v2LeaseRevokeAllowed(connected: boolean, lease: V2LeaseEvent | null): boolean {
+  return connected && lease !== null;
 }
 
 export interface V2CurrentAccessPolicyPresentation {
@@ -217,12 +223,21 @@ export interface ConfirmedTakeoverTarget {
   callId: string;
   callEpoch: number;
   ownerEpoch: number;
+  switchboardRevision: number;
+  remoteRevision: number;
+  targetDeviceId: string;
+  requiredConsentPolicyId: string;
+  requiredConsentPolicyVersion: number;
+  requiredGrants: V2Grant[];
 }
 
 export interface V2TakeoverAttemptState {
   generation: number;
   target: ConfirmedTakeoverTarget | null;
   requestPending: boolean;
+  autoArmRequiresConnected: boolean;
+  autoArmRetryCount: number;
+  autoArmRetryAfterMediaRevision: number | null;
 }
 
 export type V2TakeoverAttemptAction =
@@ -232,12 +247,16 @@ export type V2TakeoverAttemptAction =
   | { type: "lease_published" }
   | { type: "failed_or_idle" }
   | { type: "auto_arm_started" }
+  | { type: "auto_arm_retryable"; generation: number; target: ConfirmedTakeoverTarget; armStartMediaRevision: number }
   | { type: "workspace_navigation" };
 
 export const INITIAL_V2_TAKEOVER_ATTEMPT: V2TakeoverAttemptState = {
   generation: 0,
   target: null,
   requestPending: false,
+  autoArmRequiresConnected: false,
+  autoArmRetryCount: 0,
+  autoArmRetryAfterMediaRevision: null,
 };
 
 export function v2TakeoverAttemptReducer(
@@ -246,7 +265,7 @@ export function v2TakeoverAttemptReducer(
 ): V2TakeoverAttemptState {
   if (action.type === "workspace_navigation") return state;
   if (action.type === "begin") {
-    return { generation: state.generation + 1, target: null, requestPending: false };
+    return { ...INITIAL_V2_TAKEOVER_ATTEMPT, generation: state.generation + 1 };
   }
   if (action.type === "target_confirmed") {
     return action.generation === state.generation ? { ...state, target: action.target } : state;
@@ -256,12 +275,139 @@ export function v2TakeoverAttemptReducer(
   }
   if (action.type === "lease_published") {
     if (!state.target && !state.requestPending) return state;
-    return { generation: state.generation + 1, target: state.target, requestPending: false };
+    return { ...state, generation: state.generation + 1, requestPending: false };
   }
   if (action.type === "auto_arm_started") {
-    return { ...state, target: null, requestPending: false };
+    return {
+      ...state,
+      target: null,
+      requestPending: false,
+      autoArmRequiresConnected: false,
+      autoArmRetryAfterMediaRevision: null,
+    };
   }
-  return { generation: state.generation + 1, target: null, requestPending: false };
+  if (action.type === "auto_arm_retryable") {
+    if (
+      action.generation !== state.generation || state.target || state.autoArmRetryCount >= 1 ||
+      !Number.isSafeInteger(action.armStartMediaRevision) || action.armStartMediaRevision < 0
+    ) return state;
+    return {
+      ...state,
+      target: action.target,
+      requestPending: false,
+      autoArmRequiresConnected: true,
+      autoArmRetryCount: state.autoArmRetryCount + 1,
+      autoArmRetryAfterMediaRevision: action.armStartMediaRevision,
+    };
+  }
+  return { ...INITIAL_V2_TAKEOVER_ATTEMPT, generation: state.generation + 1 };
+}
+
+function confirmedTakeoverTargetsEqual(
+  left: ConfirmedTakeoverTarget | null,
+  right: ConfirmedTakeoverTarget | null,
+): boolean {
+  return left === right || Boolean(
+    left && right &&
+    left.appId === right.appId &&
+    left.callId === right.callId &&
+    left.callEpoch === right.callEpoch &&
+    left.ownerEpoch === right.ownerEpoch &&
+    left.switchboardRevision === right.switchboardRevision &&
+    left.remoteRevision === right.remoteRevision &&
+    left.targetDeviceId === right.targetDeviceId &&
+    left.requiredConsentPolicyId === right.requiredConsentPolicyId &&
+    left.requiredConsentPolicyVersion === right.requiredConsentPolicyVersion &&
+    left.requiredGrants.length === right.requiredGrants.length &&
+    left.requiredGrants.every((grant) => right.requiredGrants.includes(grant)),
+  );
+}
+
+/**
+ * Re-check the mutable attempt immediately before an effect consumes the
+ * rendered confirmation. Native events can advance the ref between render and
+ * effect; only the same generation and exact call fence may still authorize an
+ * automatic microphone arm.
+ */
+export function currentV2AutoArmAttempt(
+  rendered: V2TakeoverAttemptState,
+  current: V2TakeoverAttemptState,
+): V2TakeoverAttemptState | null {
+  return current.generation === rendered.generation
+    && confirmedTakeoverTargetsEqual(current.target, rendered.target)
+    ? current
+    : null;
+}
+
+/**
+ * React state may still describe the preceding authoritative snapshot when an
+ * effect is about to run. Only the exact latest accepted sequence is allowed
+ * to authorize a microphone transition.
+ */
+export function currentV2AutoArmSnapshot(
+  rendered: V2CallSnapshotEvent | null,
+  current: V2CallSnapshotEvent | null,
+): V2CallSnapshotEvent | null {
+  return rendered && current && rendered.appId === current.appId
+    && rendered.sequence === current.sequence
+    ? current
+    : null;
+}
+
+function consentExpiryIsCurrent(expiresAt: string | undefined, nowMilliseconds: number): boolean {
+  if (!expiresAt) return true;
+  const parsed = Date.parse(expiresAt);
+  return Number.isFinite(parsed) && parsed > nowMilliseconds;
+}
+
+/**
+ * Keeps the local confirmation bound to the exact remote-access policy and
+ * admission authority that were current when the operator confirmed it.
+ * Claim processing may advance owner/switchboard/remote revisions, but may
+ * never weaken or replace those consent and grant facts.
+ */
+export function v2SnapshotMaintainsConfirmedTakeoverAuthority(
+  target: ConfirmedTakeoverTarget | null,
+  snapshot: V2CallSnapshotEvent | null,
+  nowMilliseconds = Date.now(),
+): boolean {
+  if (!target || !snapshot) return false;
+  const call = snapshot.snapshot;
+  const grants = new Set(snapshot.grants);
+  return snapshot.appId === target.appId
+    && call.callId === target.callId
+    && call.callEpoch === target.callEpoch
+    && call.ownerEpoch >= target.ownerEpoch
+    && call.switchboardRevision >= target.switchboardRevision
+    && call.remoteRevision >= target.remoteRevision
+    && call.telephonyState === "active"
+    && !["returning_to_aokie", "recovering", "ended"].includes(call.serviceMode)
+    && call.mediaState !== "none"
+    && call.mediaState !== "failed"
+    && call.remoteCapabilities.takeover
+    && call.remoteConsent.enabled
+    && call.remoteConsent.acknowledged
+    && call.remoteConsent.takeoverEnabled
+    && call.remoteConsent.policyId === target.requiredConsentPolicyId
+    && call.remoteConsent.policyVersion === target.requiredConsentPolicyVersion
+    && consentExpiryIsCurrent(call.remoteConsent.expiresAt, nowMilliseconds)
+    && grants.has("state_read")
+    && grants.has("rtc_signal")
+    && grants.has("takeover")
+    && grants.has("resume_aokie")
+    && target.requiredGrants.every((grant) => grants.has(grant));
+}
+
+export function v2SnapshotAuthorizesConfirmedTakeoverArm(
+  target: ConfirmedTakeoverTarget | null,
+  snapshot: V2CallSnapshotEvent | null,
+  nowMilliseconds = Date.now(),
+): boolean {
+  if (!target || !snapshot || !v2SnapshotMaintainsConfirmedTakeoverAuthority(target, snapshot, nowMilliseconds)) {
+    return false;
+  }
+  return snapshot.snapshot.ownerEpoch > target.ownerEpoch
+    && ["aokie_active", "human_pending", "human_active"].includes(snapshot.snapshot.serviceMode);
 }
 
 function confirmedTakeoverMatchesLease(
@@ -273,6 +419,7 @@ function confirmedTakeoverMatchesLease(
     lease.session.appId === target.appId &&
     lease.session.callId === target.callId &&
     lease.session.callEpoch === target.callEpoch &&
+    lease.session.deviceId === target.targetDeviceId &&
     // A successful claim advances ownership. Equality describes the
     // pre-claim/prepared fence and must never authorize microphone arming.
     lease.session.ownerEpoch > target.ownerEpoch,
@@ -285,19 +432,24 @@ export function shouldAutoArmConfirmedTakeover(
   nativeMediaState: NativeMediaStateEvent | null,
   exactActiveTakeoverSession: boolean,
   alreadyAttempted: boolean,
+  requiresConnectedPhase = false,
+  nativeMediaRevision = 0,
+  retryAfterMediaRevision: number | null = null,
 ): boolean {
   return Boolean(
     !alreadyAttempted && exactActiveTakeoverSession &&
     confirmedTakeoverMatchesLease(target, lease) &&
     lease?.mode === "takeover" && lease.phase === "active" && lease.session.mode === "talk" &&
     nativeMediaState?.remoteAudioReady && !nativeMediaState.microphoneActive &&
-    ARMABLE_MEDIA_PHASES.includes(nativeMediaState.phase),
+    ARMABLE_MEDIA_PHASES.includes(nativeMediaState.phase) &&
+    (!requiresConnectedPhase || CONNECTED_MEDIA_PHASES.includes(nativeMediaState.phase)) &&
+    (retryAfterMediaRevision === null || nativeMediaRevision > retryAfterMediaRevision),
   );
 }
 
 export function isRetryableMediaArmFailure(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return /WebRTC is still connecting|before WebRTC is connected/i.test(message);
+  return /WebRTC is still connecting|before WebRTC is connected|microphone authority is still connecting|authority channel is not open/i.test(message);
 }
 
 function nativeMediaSessionAttemptKey(session: NativeMediaSession): string {
@@ -409,6 +561,7 @@ function App() {
   const [protocolVersion, setProtocolVersion] = useState<1 | 2>(1);
   const protocolVersionRef = useRef<1 | 2>(1);
   const [v2Snapshot, setV2Snapshot] = useState<V2CallSnapshotEvent | null>(null);
+  const v2SnapshotRef = useRef<V2CallSnapshotEvent | null>(null);
   const [v2IdleSync, setV2IdleSync] = useState<V2IdleSyncEvent | null>(null);
   const [v2Lease, setV2Lease] = useState<V2LeaseEvent | null>(null);
   const v2LeaseRef = useRef<V2LeaseEvent | null>(null);
@@ -423,7 +576,10 @@ function App() {
   const [v2TakeoverAttempt, setV2TakeoverAttempt] = useState(INITIAL_V2_TAKEOVER_ATTEMPT);
   const [v2AutoArmInFlight, setV2AutoArmInFlight] = useState(false);
   const v2TakeoverAttemptRef = useRef(INITIAL_V2_TAKEOVER_ATTEMPT);
+  const v2AutoArmAuthorityTargetRef = useRef<ConfirmedTakeoverTarget | null>(null);
   const v2AutoArmAttemptedSessions = useRef(new Set<string>());
+  const [v2NativeMediaRevision, setV2NativeMediaRevision] = useState(0);
+  const v2NativeMediaRevisionRef = useRef(0);
   const [connecting, setConnecting] = useState(false);
   const connectInFlight = useRef(false);
   const currentConnectConfig = useRef<RealtimeConfig | null>(null);
@@ -434,7 +590,13 @@ function App() {
   const mutationSubmissionLocked = useRef(false);
   const commandWaiters = useRef(new Map<string, CommandWaiter>());
   const transitionV2TakeoverAttempt = useCallback((action: V2TakeoverAttemptAction) => {
-    const next = v2TakeoverAttemptReducer(v2TakeoverAttemptRef.current, action);
+    const current = v2TakeoverAttemptRef.current;
+    const next = v2TakeoverAttemptReducer(current, action);
+    if (action.type === "begin" || action.type === "failed_or_idle") {
+      v2AutoArmAuthorityTargetRef.current = null;
+    } else if (action.type === "target_confirmed" && next !== current) {
+      v2AutoArmAuthorityTargetRef.current = action.target;
+    }
     v2TakeoverAttemptRef.current = next;
     setV2TakeoverAttempt(next);
     return next;
@@ -462,6 +624,9 @@ function App() {
       }
       else if (event.type === "local_media") setLocalMediaProof(event.value);
       else if (event.type === "media_state") {
+        const nextMediaRevision = v2NativeMediaRevisionRef.current + 1;
+        v2NativeMediaRevisionRef.current = nextMediaRevision;
+        setV2NativeMediaRevision(nextMediaRevision);
         setNativeMediaState(event.value);
         const terminalMedia = ["closed", "expired", "failed", "revoked", "replaced"].includes(event.value.phase);
         const expectedTakeoverUpgrade = isExpectedPreparedTakeoverReplacement(
@@ -481,6 +646,10 @@ function App() {
       else if (event.type === "v2_snapshot") {
         if (!shouldAcceptV2AuthoritativeSequence(v2LastSequence.current, event.value.sequence)) return;
         v2LastSequence.current = event.value.sequence;
+        // Publish the authority ref before scheduling React state. A pending
+        // effect from the prior render must observe this newer sequence and
+        // refuse to arm from stale consent or grant facts.
+        v2SnapshotRef.current = event.value;
         const nextCallId = event.value.snapshot.callId;
         if (v2CallId.current && v2CallId.current !== nextCallId) {
           transitionV2TakeoverAttempt({ type: "failed_or_idle" });
@@ -493,6 +662,18 @@ function App() {
           setV2EndCaller(null);
           setLocalMediaProof(null);
           setNativeMediaState(null);
+        } else if (
+          v2AutoArmAuthorityTargetRef.current &&
+          !v2SnapshotMaintainsConfirmedTakeoverAuthority(
+            v2AutoArmAuthorityTargetRef.current,
+            event.value,
+          )
+        ) {
+          // Consent, policy, grants, capability, or a safe call route changed
+          // while the claim was settling. The old confirmation is spent.
+          transitionV2TakeoverAttempt({ type: "failed_or_idle" });
+          v2AutoArmAttemptedSessions.current.clear();
+          setV2AutoArmInFlight(false);
         }
         v2CallId.current = nextCallId;
         setV2IdleSync(null);
@@ -502,6 +683,7 @@ function App() {
         if (!shouldAcceptV2AuthoritativeSequence(v2LastSequence.current, event.value.sequence)) return;
         v2LastSequence.current = event.value.sequence;
         v2CallId.current = null;
+        v2SnapshotRef.current = null;
         setV2Snapshot(null);
         setV2IdleSync(event.value);
         v2LeaseRef.current = null;
@@ -584,6 +766,7 @@ function App() {
           v2AutoArmAttemptedSessions.current.clear();
           setV2AutoArmInFlight(false);
           v2LastSequence.current = 0;
+          v2SnapshotRef.current = null;
           setLocalMediaProof(null);
           setNativeMediaState(null);
           v2LeaseRef.current = null;
@@ -643,19 +826,27 @@ function App() {
   }, [v2Assistance]);
 
   useEffect(() => {
-    const target = v2TakeoverAttempt.target;
+    // The subscription mutates its ref synchronously, while React may still be
+    // about to run an effect from the preceding render. Re-fence that rendered
+    // attempt before reading any consent from it.
+    const fencedAttempt = currentV2AutoArmAttempt(
+      v2TakeoverAttempt,
+      v2TakeoverAttemptRef.current,
+    );
+    const target = fencedAttempt?.target ?? null;
     const lease = v2Lease;
     const media = nativeMediaState;
-    const snapshot = v2Snapshot;
-    if (!target || !lease || !media || !snapshot) return;
+    const snapshot = currentV2AutoArmSnapshot(v2Snapshot, v2SnapshotRef.current);
+    if (!fencedAttempt || !target || !lease || !media || !snapshot) return;
 
     const call = snapshot.snapshot;
     const exactNativeSession = isExactCurrentV2NativeMediaSession(lease, media);
     const exactActiveTakeoverSession = Boolean(
       v2Transport === "connected" && lease.mode === "takeover" && lease.phase === "active" &&
+      v2SnapshotAuthorizesConfirmedTakeoverArm(target, snapshot) &&
       exactNativeSession && snapshot.appId === lease.session.appId &&
       call.callId === lease.session.callId && call.callEpoch === lease.session.callEpoch &&
-      call.ownerEpoch === lease.session.ownerEpoch && call.serviceMode === "human_active" &&
+      call.ownerEpoch === lease.session.ownerEpoch &&
       call.telephonyState === "active",
     );
     const confirmedSessionIsActive = confirmedTakeoverMatchesLease(target, lease)
@@ -672,11 +863,16 @@ function App() {
       media,
       exactActiveTakeoverSession,
       v2AutoArmAttemptedSessions.current.has(attemptKey),
+      fencedAttempt.autoArmRequiresConnected,
+      v2NativeMediaRevision,
+      fencedAttempt.autoArmRetryAfterMediaRevision,
     )) return;
 
     // Consume consent and record the exact fenced session before calling the
-    // native bridge. Neither screen navigation nor effect replay may retry it.
-    const armGeneration = v2TakeoverAttemptRef.current.generation;
+    // native bridge. Only a retryable pre-connect failure below may restore
+    // this exact target, and then only behind the connected-phase gate.
+    const armGeneration = fencedAttempt.generation;
+    const armStartMediaRevision = v2NativeMediaRevision;
     v2AutoArmAttemptedSessions.current.add(attemptKey);
     transitionV2TakeoverAttempt({ type: "auto_arm_started" });
     setV2AutoArmInFlight(true);
@@ -684,7 +880,18 @@ function App() {
       .catch((caught) => {
         if (v2TakeoverAttemptRef.current.generation !== armGeneration) return;
         v2AutoArmAttemptedSessions.current.delete(attemptKey);
-        if (isRetryableMediaArmFailure(caught)) return;
+        if (isRetryableMediaArmFailure(caught) && fencedAttempt.autoArmRetryCount < 1) {
+          transitionV2TakeoverAttempt({
+            type: "auto_arm_retryable",
+            generation: armGeneration,
+            target,
+            // The rendered revision was current when the first arm began and
+            // cannot prove recovery. A later exact connected transition may
+            // prove recovery even when it races ahead of this rejection.
+            armStartMediaRevision,
+          });
+          return;
+        }
         reportV2Failure(
           displayError(caught, "Takeover was accepted, but the microphone could not be armed. You can retry with Unmute microphone."),
           "microphone",
@@ -693,7 +900,7 @@ function App() {
       .finally(() => {
         if (v2TakeoverAttemptRef.current.generation === armGeneration) setV2AutoArmInFlight(false);
       });
-  }, [bridge, nativeMediaState, reportV2Failure, transitionV2TakeoverAttempt, v2Lease, v2Snapshot, v2TakeoverAttempt.target, v2Transport]);
+  }, [bridge, nativeMediaState, reportV2Failure, transitionV2TakeoverAttempt, v2Lease, v2NativeMediaRevision, v2Snapshot, v2TakeoverAttempt, v2Transport]);
 
   const connect = useCallback(async (config: RealtimeConfig) => {
     if (connectInFlight.current) return;
@@ -716,6 +923,7 @@ function App() {
     protocolVersionRef.current = selectedProtocol;
     setProtocolVersion(selectedProtocol);
     v2LastSequence.current = 0;
+    v2SnapshotRef.current = null;
     setV2Snapshot(null);
     setV2IdleSync(null);
     v2CallId.current = null;
@@ -756,6 +964,7 @@ function App() {
       v2AutoArmAttemptedSessions.current.clear();
       setV2AutoArmInFlight(false);
       v2LastSequence.current = 0;
+      v2SnapshotRef.current = null;
       setV2Snapshot(null);
       setV2IdleSync(null);
       v2CallId.current = null;
@@ -978,7 +1187,15 @@ function App() {
                 onOpenCalls={onCalls}
                 callRecordId={callRecordId}
                 onRequestLease={(leaseMode) => bridge.requestV2Lease(leaseMode)}
-                onRevokeLease={(reason) => bridge.revokeV2Lease(reason)}
+                onRevokeLease={(reason) => {
+                  // A local Return/Stop action immediately consumes any saved
+                  // automatic-arm consent. Do not leave a retry window open
+                  // while its relay acknowledgement is in flight.
+                  transitionV2TakeoverAttempt({ type: "failed_or_idle" });
+                  v2AutoArmAttemptedSessions.current.clear();
+                  setV2AutoArmInFlight(false);
+                  return bridge.revokeV2Lease(reason);
+                }}
                 onAnswerAssistance={(requestId, answer) => bridge.answerV2Assistance(requestId, answer)}
                 onPrepareEndCaller={async () => {
                   setV2EndCaller(null);
@@ -1565,6 +1782,28 @@ export function assistanceMatchesV2Call(
   );
 }
 
+export function v2AssistanceGrantAccess(grants: Iterable<V2Grant>): {
+  readable: boolean;
+  answerable: boolean;
+} {
+  const current = new Set(grants);
+  const readable = current.has("assistance_read");
+  return {
+    readable,
+    answerable: readable && current.has("assistance_respond"),
+  };
+}
+
+export function v2RemoteAudioProofLabel(
+  mode: NativeMediaSession["mode"],
+  ready: boolean,
+): string {
+  if (mode === "consult" || mode === "prepared_consult") {
+    return ready ? "Private Aokie audio ready" : "Waiting for private Aokie audio";
+  }
+  return ready ? "Caller audio ready" : "Waiting for caller audio";
+}
+
 function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistance, endCaller, nativeMediaState, localMediaProof, autoArmInFlight, audioEndpointControls, onOpenCalls, callRecordId, onRequestLease, onRevokeLease, onAnswerAssistance, onPrepareEndCaller, onConfirmEndCaller, onToggleMediaMicrophone, onReportFailure, onBeginTakeover, onConfirmTakeoverTarget, onTakeoverEnqueued, onBack }: V2LiveRuntimeProps) {
   const [busy, setBusy] = useState(false);
   const [assistanceAnswer, setAssistanceAnswer] = useState("");
@@ -1590,12 +1829,14 @@ function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistan
   const monitorAllowed = Boolean(monitorOffer && mediaUsable && currentConsent && call?.remoteConsent.monitorEnabled && grants.has("monitor"));
   const takeoverAllowed = Boolean(takeoverOffer && mediaUsable && currentConsent && call?.remoteCapabilities.takeover && call.remoteConsent.takeoverEnabled && grants.has("takeover") && grants.has("resume_aokie"));
   const assistanceMatchesCall = assistanceMatchesV2Call(assistance, call);
-  const assistanceAllowed = Boolean(connected && assistanceMatchesCall && currentConsent && call?.remoteConsent.assistanceEnabled && grants.has("assistance_read") && grants.has("assistance_respond"));
+  const assistanceAccess = v2AssistanceGrantAccess(grants);
+  const assistanceReadable = Boolean(connected && assistanceMatchesCall && currentConsent && call?.remoteConsent.assistanceEnabled && assistanceAccess.readable);
+  const assistanceAllowed = assistanceReadable && assistanceAccess.answerable;
   const assistanceRemaining = assistanceMatchesCall && assistance ? Math.max(0, assistance.expiresAt - nowSeconds) : 0;
   const consultAllowed = Boolean(
     consultOffer && mediaUsable && currentConsent && call?.remoteCapabilities.softwareHold && call.remoteCapabilities.voiceConsult &&
     call.remoteConsent.consultEnabled && grants.has("consult") &&
-    assistanceAllowed && assistance && assistanceRemaining > 0 && call?.serviceMode === "aokie_active",
+    assistanceReadable && assistance && assistanceRemaining > 0 && call?.serviceMode === "aokie_active",
   );
 
   useEffect(() => {
@@ -1653,9 +1894,7 @@ function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistan
     call.callEpoch === lease.session.callEpoch && call.ownerEpoch === lease.session.ownerEpoch &&
     call.serviceMode === "human_active" && call.telephonyState === "active",
   );
-  const leaseRevokeAllowed = Boolean(
-    connected && lease && (lease.mode !== "takeover" || grants.has("resume_aokie")),
-  );
+  const leaseRevokeAllowed = v2LeaseRevokeAllowed(connected, lease);
   const currentEndChallenge = isCurrentEndCallerChallenge(endCaller, snapshot, lease, nowSeconds)
     ? endCaller
     : null;
@@ -1754,7 +1993,7 @@ function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistan
           <section className="runtime-proof"><span><ShieldCheck size={14} /> Call epoch {call?.callEpoch}</span><span><LockKeyhole size={14} /> Owner epoch {call?.ownerEpoch}</span><span><RefreshCw size={14} /> Sequence {snapshot.sequence}</span></section>
           <section className="runtime-proof" aria-label="Remote consent policy"><span><ShieldCheck size={14} /> Policy {call?.remoteConsent.policyId} v{call?.remoteConsent.policyVersion}</span><span><LockKeyhole size={14} /> {currentConsent ? "Disclosure acknowledged" : "Remote access not acknowledged"}</span></section>
           {currentAccessPolicy && <aside className="media-gate" aria-label="Current access policy"><LockKeyhole size={19} /><div><strong>{currentAccessPolicy.title}</strong><p>{currentAccessPolicy.detail}</p></div></aside>}
-          {nativeMediaState && <section className="runtime-proof" aria-label="Native media state"><span><Radio size={14} /> {nativeMediaState.session.mode} · {nativeMediaState.phase}</span><span><Headphones size={14} /> {nativeMediaState.remoteAudioReady ? "Caller audio ready" : "Waiting for caller audio"}</span><span><Mic size={14} /> {nativeMediaState.microphoneActive ? "Microphone armed" : "Microphone blocked"}</span></section>}
+          {nativeMediaState && <section className="runtime-proof" aria-label="Native media state"><span><Radio size={14} /> {nativeMediaState.session.mode} · {nativeMediaState.phase}</span><span><Headphones size={14} /> {v2RemoteAudioProofLabel(nativeMediaState.session.mode, nativeMediaState.remoteAudioReady)}</span><span><Mic size={14} /> {nativeMediaState.microphoneActive ? "Microphone armed" : "Microphone blocked"}</span></section>}
           {call?.telephonyState !== "ended" && audioEndpointControls}
           {assistance && <V2AssistanceRequestCard
             assistance={assistance}
@@ -1805,15 +2044,21 @@ function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistan
               onConfirm={async () => {
                 setTakeoverConfirmationOpen(false);
                 const generation = onBeginTakeover();
-                if (!takeoverAllowed) {
+                if (!takeoverAllowed || !takeoverOffer) {
                   onReportFailure("The signed takeover offer expired or was replaced. Wait for refreshed call state and try again.", "takeover");
                   return;
                 }
                 const target: ConfirmedTakeoverTarget = {
-                  appId: snapshot.appId,
-                  callId: snapshot.snapshot.callId,
-                  callEpoch: snapshot.snapshot.callEpoch,
-                  ownerEpoch: snapshot.snapshot.ownerEpoch,
+                  appId: takeoverOffer.offer.appId,
+                  callId: takeoverOffer.offer.callId,
+                  callEpoch: takeoverOffer.offer.callEpoch,
+                  ownerEpoch: takeoverOffer.offer.ownerEpoch,
+                  switchboardRevision: takeoverOffer.offer.switchboardRevision,
+                  remoteRevision: takeoverOffer.offer.remoteRevision,
+                  targetDeviceId: takeoverOffer.offer.targetDeviceId,
+                  requiredConsentPolicyId: takeoverOffer.offer.requiredConsentPolicyId,
+                  requiredConsentPolicyVersion: takeoverOffer.offer.requiredConsentPolicyVersion,
+                  requiredGrants: [...takeoverOffer.offer.requiredGrants],
                 };
                 onConfirmTakeoverTarget(generation, target);
                 const accepted = await run(

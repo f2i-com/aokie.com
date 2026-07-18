@@ -3,6 +3,8 @@ import {
   assistanceMatchesV2Call,
   assistanceExpiryDelayMs,
   currentV2InAppOffer,
+  currentV2AutoArmAttempt,
+  currentV2AutoArmSnapshot,
   desktopPairingOpenAfterAdmission,
   formatAssistanceCountdown,
   INITIAL_V2_TAKEOVER_ATTEMPT,
@@ -12,11 +14,17 @@ import {
   shouldAcceptV2AuthoritativeSequence,
   takeoverConfirmationMode,
   v2CurrentAccessPolicyPresentation,
+  v2AssistanceGrantAccess,
   v2LeaseExitLabel,
+  v2LeaseRevokeAllowed,
   v2RecoveryProgressStages,
+  v2RemoteAudioProofLabel,
   v2RouteProgressStages,
   v2RuntimeFailureReducer,
+  v2SnapshotAuthorizesConfirmedTakeoverArm,
+  v2SnapshotMaintainsConfirmedTakeoverAuthority,
   v2TakeoverAttemptReducer,
+  type ConfirmedTakeoverTarget,
 } from "./App";
 import type { NativeMediaSession, NativeMediaStateEvent, V2AssistanceRequestEvent, V2CallSnapshotEvent, V2LeaseEvent } from "./bridge";
 
@@ -28,6 +36,26 @@ describe("formatAssistanceCountdown", () => {
     expect(formatAssistanceCountdown(9)).toBe("0:09");
     expect(formatAssistanceCountdown(-1)).toBe("0:00");
     expect(formatAssistanceCountdown(Number.NaN)).toBe("0:00");
+  });
+});
+
+describe("relay assistance controls", () => {
+  it("keeps a readable help request eligible for voice Consult while text reply is withheld", () => {
+    expect(v2AssistanceGrantAccess(["state_read", "assistance_read", "consult"]))
+      .toEqual({ readable: true, answerable: false });
+    expect(v2AssistanceGrantAccess([
+      "state_read", "assistance_read", "assistance_respond", "consult",
+    ])).toEqual({ readable: true, answerable: true });
+  });
+});
+
+describe("native remote-audio proof labels", () => {
+  it("does not describe the private Aokie Consult track as caller audio", () => {
+    expect(v2RemoteAudioProofLabel("consult", true)).toBe("Private Aokie audio ready");
+    expect(v2RemoteAudioProofLabel("consult", false)).toBe("Waiting for private Aokie audio");
+    expect(v2RemoteAudioProofLabel("prepared_consult", false)).toBe("Waiting for private Aokie audio");
+    expect(v2RemoteAudioProofLabel("talk", true)).toBe("Caller audio ready");
+    expect(v2RemoteAudioProofLabel("monitor", false)).toBe("Waiting for caller audio");
   });
 });
 
@@ -95,6 +123,32 @@ function takeoverSnapshot(offerOverrides: Partial<OfferClaims> = {}): V2CallSnap
       occurredAt: "2027-01-15T08:00:00Z",
     },
   };
+}
+
+function confirmedTakeoverTarget(): ConfirmedTakeoverTarget {
+  const offer = takeoverSnapshot().snapshot.pendingMobileOffers[0].offer;
+  return {
+    appId: offer.appId,
+    callId: offer.callId,
+    callEpoch: offer.callEpoch,
+    ownerEpoch: offer.ownerEpoch,
+    switchboardRevision: offer.switchboardRevision,
+    remoteRevision: offer.remoteRevision,
+    targetDeviceId: offer.targetDeviceId,
+    requiredConsentPolicyId: offer.requiredConsentPolicyId,
+    requiredConsentPolicyVersion: offer.requiredConsentPolicyVersion,
+    requiredGrants: [...offer.requiredGrants],
+  };
+}
+
+function activeTakeoverSnapshot(): V2CallSnapshotEvent {
+  const snapshot = takeoverSnapshot();
+  snapshot.sequence += 1;
+  snapshot.snapshot.ownerEpoch += 1;
+  snapshot.snapshot.serviceMode = "human_active";
+  snapshot.snapshot.mediaState = "active";
+  snapshot.snapshot.pendingMobileOffers = [];
+  return snapshot;
 }
 
 function takeoverMedia(ownerEpoch = 5): { lease: V2LeaseEvent; media: NativeMediaStateEvent } {
@@ -219,27 +273,197 @@ describe("takeover confirmation and automatic microphone arm", () => {
   });
 
   it("arms once only after the active claim advances ownerEpoch", () => {
-    const target = { appId: "app_a", callId: "call_a", callEpoch: 7, ownerEpoch: 4 };
+    const target = confirmedTakeoverTarget();
     const advanced = takeoverMedia(5);
     expect(shouldAutoArmConfirmedTakeover(target, advanced.lease, advanced.media, true, false)).toBe(true);
     expect(shouldAutoArmConfirmedTakeover(target, advanced.lease, advanced.media, true, true)).toBe(false);
 
     const preClaim = takeoverMedia(4);
     expect(shouldAutoArmConfirmedTakeover(target, preClaim.lease, preClaim.media, true, false)).toBe(false);
+
+    const otherDevice = takeoverMedia(5);
+    otherDevice.lease.session.deviceId = "device_other";
+    otherDevice.media.session = otherDevice.lease.session;
+    expect(shouldAutoArmConfirmedTakeover(target, otherDevice.lease, otherDevice.media, true, false)).toBe(false);
   });
 
   it("waits when a remote track arrives before the peer is connected", () => {
-    const target = { appId: "app_a", callId: "call_a", callEpoch: 7, ownerEpoch: 4 };
+    const target = confirmedTakeoverTarget();
     const advanced = takeoverMedia(5);
     advanced.media.phase = "connecting";
 
     expect(shouldAutoArmConfirmedTakeover(target, advanced.lease, advanced.media, true, false)).toBe(false);
     expect(isRetryableMediaArmFailure(new Error("native WebRTC is still connecting; retry microphone arm"))).toBe(true);
+    expect(isRetryableMediaArmFailure(new Error("native microphone authority is still connecting; retry microphone arm"))).toBe(true);
+    expect(isRetryableMediaArmFailure(new Error("microphone authority channel is not open"))).toBe(true);
     expect(isRetryableMediaArmFailure(new Error("microphone permission was denied"))).toBe(false);
   });
 
+  it("retries once when the authority channel opens after peer connected", () => {
+    const target = confirmedTakeoverTarget();
+    const advanced = takeoverMedia(5);
+    // PeerConnection Connected may precede the ordered DTLS channel Open.
+    // The first native arm returns retryable; authority-ready emits the later
+    // exact-session revision that releases this attempt fence.
+    advanced.media.phase = "connected";
+
+    let attempt = v2TakeoverAttemptReducer(INITIAL_V2_TAKEOVER_ATTEMPT, { type: "begin" });
+    const generation = attempt.generation;
+    attempt = v2TakeoverAttemptReducer(attempt, { type: "target_confirmed", generation, target });
+    let alreadyAttempted = false;
+    let armAttempts = 0;
+    let nativeMediaRevision = 4;
+    const runAutoArmEffect = () => {
+      if (!shouldAutoArmConfirmedTakeover(
+        attempt.target,
+        advanced.lease,
+        advanced.media,
+        true,
+        alreadyAttempted,
+        attempt.autoArmRequiresConnected,
+        nativeMediaRevision,
+        attempt.autoArmRetryAfterMediaRevision,
+      )) return;
+      alreadyAttempted = true;
+      armAttempts += 1;
+      attempt = v2TakeoverAttemptReducer(attempt, { type: "auto_arm_started" });
+    };
+
+    runAutoArmEffect();
+    expect(armAttempts).toBe(1);
+    expect(attempt.target).toBeNull();
+    expect(isRetryableMediaArmFailure(
+      new Error("native microphone authority is still connecting; retry microphone arm"),
+    )).toBe(true);
+    alreadyAttempted = false;
+    attempt = v2TakeoverAttemptReducer(attempt, {
+      type: "auto_arm_retryable",
+      generation,
+      target,
+      armStartMediaRevision: nativeMediaRevision,
+    });
+
+    runAutoArmEffect();
+    expect(armAttempts).toBe(1);
+
+    runAutoArmEffect();
+    expect(armAttempts).toBe(1);
+
+    nativeMediaRevision += 1;
+    runAutoArmEffect();
+    expect(armAttempts).toBe(2);
+    expect(attempt.target).toBeNull();
+
+    // A second retryable rejection cannot restore the consumed target, even
+    // if native media keeps publishing connected revisions.
+    alreadyAttempted = false;
+    attempt = v2TakeoverAttemptReducer(attempt, {
+      type: "auto_arm_retryable",
+      generation,
+      target,
+      armStartMediaRevision: nativeMediaRevision,
+    });
+    nativeMediaRevision += 1;
+    runAutoArmEffect();
+    expect(armAttempts).toBe(2);
+    expect(attempt.target).toBeNull();
+    expect(attempt.autoArmRetryCount).toBe(1);
+  });
+
+  it("does not lose a connected recovery event that beats the rejection callback", () => {
+    const target = confirmedTakeoverTarget();
+    const advanced = takeoverMedia(5);
+    advanced.media.phase = "connected";
+    let attempt = v2TakeoverAttemptReducer(INITIAL_V2_TAKEOVER_ATTEMPT, { type: "begin" });
+    const generation = attempt.generation;
+    attempt = v2TakeoverAttemptReducer(attempt, { type: "target_confirmed", generation, target });
+    attempt = v2TakeoverAttemptReducer(attempt, { type: "auto_arm_started" });
+
+    // Revision 4 qualified the first attempt. Revision 5 published connected
+    // before its promise rejection reached JavaScript, so it must remain valid
+    // recovery evidence when the retry target is restored.
+    attempt = v2TakeoverAttemptReducer(attempt, {
+      type: "auto_arm_retryable",
+      generation,
+      target,
+      armStartMediaRevision: 4,
+    });
+    expect(shouldAutoArmConfirmedTakeover(
+      attempt.target,
+      advanced.lease,
+      advanced.media,
+      true,
+      false,
+      attempt.autoArmRequiresConnected,
+      5,
+      attempt.autoArmRetryAfterMediaRevision,
+    )).toBe(true);
+  });
+
+  it("fences a pending effect against a newer authoritative sequence", () => {
+    const rendered = activeTakeoverSnapshot();
+    expect(currentV2AutoArmSnapshot(rendered, rendered)).toBe(rendered);
+
+    const revoked = structuredClone(rendered);
+    revoked.sequence += 1;
+    revoked.snapshot.remoteConsent.acknowledged = false;
+    expect(currentV2AutoArmSnapshot(rendered, revoked)).toBeNull();
+  });
+
+  it("requires current exact consent, grants, capability, and a safe handoff state", () => {
+    const target = confirmedTakeoverTarget();
+    const active = activeTakeoverSnapshot();
+    const now = OFFER_NOW * 1_000;
+    expect(v2SnapshotMaintainsConfirmedTakeoverAuthority(target, active, now)).toBe(true);
+    expect(v2SnapshotAuthorizesConfirmedTakeoverArm(target, active, now)).toBe(true);
+    for (const serviceMode of ["aokie_active", "human_pending", "human_active"] as const) {
+      const safeHandoff = structuredClone(active);
+      safeHandoff.snapshot.serviceMode = serviceMode;
+      expect(v2SnapshotAuthorizesConfirmedTakeoverArm(target, safeHandoff, now)).toBe(true);
+    }
+    expect(v2SnapshotMaintainsConfirmedTakeoverAuthority(
+      { ...target, requiredGrants: [...target.requiredGrants, "captions_read"] },
+      active,
+      now,
+    )).toBe(false);
+    const awaitingFirstMicrophonePcm = structuredClone(active);
+    awaitingFirstMicrophonePcm.snapshot.mediaState = "connecting";
+    expect(v2SnapshotAuthorizesConfirmedTakeoverArm(target, awaitingFirstMicrophonePcm, now)).toBe(true);
+
+    const mutations: Array<(snapshot: V2CallSnapshotEvent) => void> = [
+      (snapshot) => { snapshot.snapshot.remoteConsent.acknowledged = false; },
+      (snapshot) => { snapshot.snapshot.remoteConsent.takeoverEnabled = false; },
+      (snapshot) => { snapshot.snapshot.remoteConsent.policyVersion += 1; },
+      (snapshot) => { snapshot.snapshot.remoteConsent.expiresAt = new Date(now - 1).toISOString(); },
+      (snapshot) => { snapshot.grants = snapshot.grants.filter((grant) => grant !== "rtc_signal"); },
+      (snapshot) => { snapshot.grants = snapshot.grants.filter((grant) => grant !== "takeover"); },
+      (snapshot) => { snapshot.grants = snapshot.grants.filter((grant) => grant !== "resume_aokie"); },
+      (snapshot) => { snapshot.snapshot.remoteCapabilities.takeover = false; },
+      (snapshot) => { snapshot.snapshot.serviceMode = "recovering"; },
+    ];
+    for (const mutate of mutations) {
+      const revoked = structuredClone(active);
+      mutate(revoked);
+      expect(v2SnapshotMaintainsConfirmedTakeoverAuthority(target, revoked, now)).toBe(false);
+      expect(v2SnapshotAuthorizesConfirmedTakeoverArm(target, revoked, now)).toBe(false);
+    }
+  });
+
+  it("refuses a rendered confirmation reset before its effect can arm", () => {
+    const target = confirmedTakeoverTarget();
+    let rendered = v2TakeoverAttemptReducer(INITIAL_V2_TAKEOVER_ATTEMPT, { type: "begin" });
+    rendered = v2TakeoverAttemptReducer(rendered, {
+      type: "target_confirmed",
+      generation: rendered.generation,
+      target,
+    });
+    const current = v2TakeoverAttemptReducer(rendered, { type: "failed_or_idle" });
+
+    expect(currentV2AutoArmAttempt(rendered, current)).toBeNull();
+  });
+
   it("keeps explicit consent across the expected prepared-to-active peer replacement only", () => {
-    const target = { appId: "app_a", callId: "call_a", callEpoch: 7, ownerEpoch: 4 };
+    const target = confirmedTakeoverTarget();
     const prepared = takeoverMedia(4);
     prepared.lease.phase = "prepared";
     prepared.lease.provisional = true;
@@ -266,6 +490,13 @@ describe("lease exit presentation", () => {
     expect(v2LeaseExitLabel("monitor")).toBe("Stop listening");
     expect(v2LeaseExitLabel("consult")).toBe("Finish private consult");
     expect(v2LeaseExitLabel("takeover")).toBe("Return to Aokie");
+  });
+
+  it("keeps an exact live lease revocable after takeover grants narrow", () => {
+    const { lease } = takeoverMedia();
+    expect(v2LeaseRevokeAllowed(true, lease)).toBe(true);
+    expect(v2LeaseRevokeAllowed(false, lease)).toBe(false);
+    expect(v2LeaseRevokeAllowed(true, null)).toBe(false);
   });
 });
 
@@ -352,7 +583,7 @@ describe("assistance call fencing", () => {
 });
 
 describe("v2TakeoverAttemptReducer", () => {
-  const target = { appId: "app_a", callId: "call_a", callEpoch: 7, ownerEpoch: 4 };
+  const target = confirmedTakeoverTarget();
 
   it("does not resurrect pending status when an error beats the enqueue receipt", () => {
     let state = v2TakeoverAttemptReducer(INITIAL_V2_TAKEOVER_ATTEMPT, { type: "begin" });
@@ -389,5 +620,41 @@ describe("v2TakeoverAttemptReducer", () => {
     expect(state.target).toBeNull();
     expect(state.requestPending).toBe(false);
     expect(state.generation).toBeGreaterThan(confirmedGeneration);
+  });
+
+  it("does not restore a retryable auto-arm after the attempt fence advances", () => {
+    let state = v2TakeoverAttemptReducer(INITIAL_V2_TAKEOVER_ATTEMPT, { type: "begin" });
+    const staleGeneration = state.generation;
+    state = v2TakeoverAttemptReducer(state, { type: "target_confirmed", generation: staleGeneration, target });
+    state = v2TakeoverAttemptReducer(state, { type: "auto_arm_started" });
+    state = v2TakeoverAttemptReducer(state, { type: "failed_or_idle" });
+    state = v2TakeoverAttemptReducer(state, {
+      type: "auto_arm_retryable",
+      generation: staleGeneration,
+      target,
+      armStartMediaRevision: 3,
+    });
+
+    expect(state.target).toBeNull();
+    expect(state.autoArmRequiresConnected).toBe(false);
+  });
+
+  it("spends a restored retry target synchronously when Return to Aokie clears it", () => {
+    let state = v2TakeoverAttemptReducer(INITIAL_V2_TAKEOVER_ATTEMPT, { type: "begin" });
+    const generation = state.generation;
+    state = v2TakeoverAttemptReducer(state, { type: "target_confirmed", generation, target });
+    state = v2TakeoverAttemptReducer(state, { type: "auto_arm_started" });
+    state = v2TakeoverAttemptReducer(state, {
+      type: "auto_arm_retryable",
+      generation,
+      target,
+      armStartMediaRevision: 3,
+    });
+    expect(state.target).toEqual(target);
+
+    state = v2TakeoverAttemptReducer(state, { type: "failed_or_idle" });
+    expect(state.target).toBeNull();
+    expect(state.autoArmRetryCount).toBe(0);
+    expect(state.generation).toBeGreaterThan(generation);
   });
 });

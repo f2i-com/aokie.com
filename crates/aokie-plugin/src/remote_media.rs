@@ -35,6 +35,20 @@ const ROUTED_AUDIO_FRAMES: usize = 16;
 const EVENT_QUEUE_CAPACITY: usize = 128;
 const MAX_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+/// An active Talk peer gets only this bounded window to prove real microphone
+/// PCM. Lease heartbeats deliberately cannot extend this preflight deadline.
+const TALK_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Once the radio opens the exact caller route, real PCM must reach SCO very
+/// quickly. Negotiation and permission prompts happen before this point.
+const FIRST_TALK_PCM_TIMEOUT: Duration = Duration::from_secs(1);
+/// An enabled WebRTC microphone produces frames even during silence. Losing
+/// them for this long means the human path is no longer live, so Aokie resumes.
+const ONGOING_TALK_PCM_TIMEOUT: Duration = Duration::from_secs(2);
+/// Private consultation is isolated only after exact microphone PCM has been
+/// proven. Once isolated, silence still produces WebRTC frames; losing them
+/// must return the caller to Aokie just as aggressively as takeover.
+const FIRST_CONSULT_PCM_TIMEOUT: Duration = Duration::from_secs(1);
+const ONGOING_CONSULT_PCM_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The radio-owned service state.  `HumanActive` is entered only after the
 /// radio thread has flushed caller TX and acknowledged the pending permit.
@@ -205,6 +219,10 @@ pub enum RemoteMediaEventKind {
         state: String,
     },
     RemoteAudioReady,
+    /// First decoded microphone PCM from the exact active Talk peer. The frame
+    /// is still quarantined; GatewaySession uses this only to allow the final
+    /// radio-owned handoff to begin.
+    RemoteMicrophoneReady,
     ProtocolViolation {
         message: String,
     },
@@ -240,6 +258,7 @@ pub enum RemoteMediaEventKind {
 pub enum RadioTransition {
     PrepareHuman { binding: SessionBinding },
     PrepareConsult { binding: SessionBinding },
+    EnterConsult { binding: SessionBinding },
     EnterHuman { binding: SessionBinding },
     ReturnToAokie { reason: String },
 }
@@ -300,16 +319,31 @@ struct PreparedClaim {
     provisional_binding: SessionBinding,
     confirmed_owner_epoch: u64,
     expires_at: Instant,
+    media_ready_deadline: Option<Instant>,
+    active_media_binding: Option<SessionBinding>,
+    last_media_received_at: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct PendingConsult {
+    binding: SessionBinding,
+    expires_at: Instant,
+    transition_dispatched: bool,
+    last_received_at: Option<Instant>,
 }
 
 #[derive(Clone)]
 struct ActiveConsult {
     binding: SessionBinding,
     expires_at: Instant,
+    activated_at: Instant,
+    last_received_at: Option<Instant>,
 }
 
 struct ActiveRoute {
     permit: RoutePermit,
+    activated_at: Instant,
+    last_forwarded_at: Option<Instant>,
 }
 
 struct RemoteMediaState {
@@ -323,6 +357,7 @@ struct RemoteMediaState {
     peers: HashMap<String, PeerSlot>,
     pending_prepare: Option<PendingPrepare>,
     prepared_claim: Option<PreparedClaim>,
+    pending_consult: Option<PendingConsult>,
     active_consult: Option<ActiveConsult>,
     pending_route: Option<PendingRoute>,
     active_route: Option<ActiveRoute>,
@@ -347,6 +382,7 @@ impl Default for RemoteMediaState {
             peers: HashMap::new(),
             pending_prepare: None,
             prepared_claim: None,
+            pending_consult: None,
             active_consult: None,
             pending_route: None,
             active_route: None,
@@ -495,6 +531,12 @@ impl RemoteMediaHandle {
                     })
                     .or_else(|| {
                         state
+                            .pending_consult
+                            .as_ref()
+                            .map(|pending| &pending.binding)
+                    })
+                    .or_else(|| {
+                        state
                             .pending_prepare
                             .as_ref()
                             .map(|pending| &pending.binding)
@@ -613,6 +655,52 @@ impl RemoteMediaHandle {
                 return;
             };
             state.consent = gate;
+            // Decide whether caller audio was ever physically reserved before
+            // removing the now-disallowed peer slots. Prepared Talk and its
+            // active-Talk WebRTC preflight deliberately leave Aokie in charge;
+            // revoking consent there must close/fence in place, not fabricate
+            // a ReturnToAokie transition that suppresses the receptionist.
+            let revoked_route = state
+                .active_route
+                .as_ref()
+                .filter(|route| !state.consent.allows(route.permit.binding.mode))
+                .map(|route| (route.permit.binding.clone(), true))
+                .or_else(|| {
+                    state
+                        .active_consult
+                        .as_ref()
+                        .filter(|route| !state.consent.allows(route.binding.mode))
+                        .map(|route| (route.binding.clone(), true))
+                })
+                .or_else(|| {
+                    state
+                        .pending_consult
+                        .as_ref()
+                        .filter(|pending| !state.consent.allows(pending.binding.mode))
+                        .map(|pending| (pending.binding.clone(), false))
+                })
+                .or_else(|| {
+                    state
+                        .pending_route
+                        .as_ref()
+                        .filter(|route| !state.consent.allows(route.permit.binding.mode))
+                        .map(|route| (route.permit.binding.clone(), true))
+                })
+                .or_else(|| {
+                    state.pending_prepare.as_ref().and_then(|pending| {
+                        (!state.consent.allows(pending.binding.mode))
+                            .then(|| (pending.binding.clone(), false))
+                    })
+                })
+                .or_else(|| {
+                    state.prepared_claim.as_ref().and_then(|prepared| {
+                        let binding = prepared
+                            .active_media_binding
+                            .as_ref()
+                            .unwrap_or(&prepared.provisional_binding);
+                        (!state.consent.allows(binding.mode)).then(|| (binding.clone(), false))
+                    })
+                });
             let revoked = state
                 .peers
                 .iter()
@@ -625,28 +713,25 @@ impl RemoteMediaHandle {
                     slots.push(slot);
                 }
             }
-            if let Some(binding) = slots
-                .iter()
-                .find(|slot| {
-                    matches!(
-                        slot.binding.mode,
-                        MediaMode::PreparedConsult
-                            | MediaMode::Consult
-                            | MediaMode::PreparedTalk
-                            | MediaMode::Talk
-                    )
-                })
-                .map(|slot| slot.binding.clone())
-            {
+            if let Some((binding, needs_return)) = revoked_route {
                 state.active_route = None;
                 state.active_consult = None;
+                state.pending_consult = None;
                 state.pending_route = None;
                 state.pending_prepare = None;
                 state.prepared_claim = None;
-                state.return_binding = Some(binding);
-                state.return_reason = Some("remote_consent_revoked".into());
+                state.talk_audio_binding = None;
                 state.return_dispatched = false;
-                state.service_mode = ServiceMode::ReturningToAokie;
+                if needs_return {
+                    state.return_binding = Some(binding);
+                    state.return_reason = Some("remote_consent_revoked".into());
+                    state.service_mode = ServiceMode::ReturningToAokie;
+                } else {
+                    state.return_binding = None;
+                    state.return_reason = None;
+                    state.fence_cancelled_binding(&binding);
+                    state.service_mode = ServiceMode::AokieActive;
+                }
                 state.bump_revision();
             }
             slots
@@ -728,10 +813,9 @@ impl RemoteMediaHandle {
         Ok(())
     }
 
-    /// Reserve the radio for a provisional, receive-only consultation.  The
-    /// Companion microphone does not exist in this phase.  The radio thread
-    /// must flush caller TX and ACK the software hold before an active consult
-    /// lease can be minted.
+    /// Verify a provisional, receive-only consultation without reserving the
+    /// caller. The active lease and exact microphone PCM must both exist before
+    /// the radio may isolate the receptionist from the caller.
     pub fn request_consult_hold(
         &self,
         binding: SessionBinding,
@@ -754,8 +838,9 @@ impl RemoteMediaHandle {
         Ok(())
     }
 
-    /// Activate the isolated consult lane after the rotated lease has created
-    /// a fresh bidirectional peer.  This never installs a caller RoutePermit.
+    /// Queue final consult isolation after the rotated lease has created a
+    /// fresh bidirectional peer and exact microphone PCM has been observed.
+    /// This never installs a caller RoutePermit.
     pub fn request_consult(
         &self,
         binding: SessionBinding,
@@ -774,7 +859,6 @@ impl RemoteMediaHandle {
             state.request_consult(binding.clone(), ttl)?;
         }
         self.refresh_reserved();
-        self.emit(binding, RemoteMediaEventKind::ConsultActive);
         Ok(())
     }
 
@@ -808,9 +892,17 @@ impl RemoteMediaHandle {
             let Ok(mut state) = self.inner.state.lock() else {
                 return false;
             };
-            if !state.allows_talk(binding, Instant::now()) {
+            let now = Instant::now();
+            if !state.allows_talk(binding, now) {
                 return false;
             }
+            let Some(route) = state.active_route.as_mut() else {
+                return false;
+            };
+            if route.permit.binding != *binding {
+                return false;
+            }
+            route.last_forwarded_at = Some(now);
             if state.talk_audio_binding.as_ref() == Some(binding) {
                 false
             } else {
@@ -890,7 +982,7 @@ impl RemoteMediaHandle {
     }
 
     pub fn revoke(&self, binding: &SessionBinding, reason: &str) -> Result<(), String> {
-        let (actor, event_binding) = {
+        let (actor, event_binding, needs_return, close_peer) = {
             let mut state = self
                 .inner
                 .state
@@ -900,14 +992,26 @@ impl RemoteMediaHandle {
         };
         if let Some(actor) = actor {
             let _ = actor.try_send(ActorCommand::Revoke);
+            if close_peer {
+                let _ = actor.try_send(ActorCommand::Close);
+            }
         }
         self.refresh_reserved();
-        self.emit(
-            event_binding,
-            RemoteMediaEventKind::ReturningToAokie {
-                reason: sanitize_reason(reason),
-            },
-        );
+        if needs_return {
+            self.emit(
+                event_binding,
+                RemoteMediaEventKind::ReturningToAokie {
+                    reason: sanitize_reason(reason),
+                },
+            );
+        } else {
+            self.emit(
+                event_binding,
+                RemoteMediaEventKind::Closed {
+                    reason: sanitize_reason(reason),
+                },
+            );
+        }
         Ok(())
     }
 
@@ -940,10 +1044,11 @@ impl RemoteMediaHandle {
         Ok(())
     }
 
-    /// Revoke every peer and caller route immediately.  Used whenever the
-    /// authenticated signalling socket is lost: the radio stays reserved
-    /// until its physical return flush ACK, so Aokie and a stale remote can
-    /// never overlap on caller TX.
+    /// Revoke every peer and caller route immediately. Used whenever the
+    /// authenticated signalling carrier is lost. A route that actually held
+    /// caller audio stays reserved until its physical return flush ACK;
+    /// receive-only prepared Talk is cancelled in place because Aokie never
+    /// yielded the caller in that phase.
     pub fn fail_closed_all(&self, reason: &str) {
         let (slots, returning) = {
             let Ok(mut state) = self.inner.state.lock() else {
@@ -1005,12 +1110,16 @@ impl RemoteMediaHandle {
                 .try_lock()
                 .ok()
                 .and_then(|receiver| receiver.try_recv().ok())?;
-            let allowed = self
-                .inner
-                .state
-                .lock()
-                .ok()
-                .is_some_and(|state| state.allows_consult(&routed.binding, Instant::now()));
+            let allowed = self.inner.state.lock().ok().is_some_and(|mut state| {
+                let now = Instant::now();
+                if !state.allows_consult(&routed.binding, now) {
+                    return false;
+                }
+                if let Some(active) = state.active_consult.as_mut() {
+                    active.last_received_at = Some(now);
+                }
+                true
+            });
             self.refresh_reserved();
             if allowed {
                 return Some(routed.frame);
@@ -1074,13 +1183,31 @@ impl RemoteMediaHandle {
         }
     }
 
+    /// Consent expiry is a wall-clock transition, not a settings mutation, so
+    /// no external config sync is guaranteed to call set_remote_consent at the
+    /// instant it occurs. Re-run the same state-aware revocation at the radio
+    /// tick seam: prepared Talk cancels in place, while consult/owned caller
+    /// routes retain their physical ReturnToAokie handshake.
+    fn reconcile_remote_consent_expiry(&self) {
+        let expired_gate = self
+            .inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| (!state.consent.is_current()).then(|| state.consent.clone()));
+        if let Some(gate) = expired_gate {
+            self.set_remote_consent(gate);
+        }
+    }
+
     pub fn next_radio_transition(&self) -> Option<RadioTransition> {
-        let (transition, revoked, expired) = {
+        self.reconcile_remote_consent_expiry();
+        let (transition, revoked, expired, return_notice, cancelled) = {
             let mut state = self.inner.state.lock().ok()?;
             let now = Instant::now();
             let expired = state.expire_peers(now);
-            let (transition, revoked) = state.next_transition(now);
-            (transition, revoked, expired)
+            let (transition, revoked, return_notice, cancelled) = state.next_transition(now);
+            (transition, revoked, expired, return_notice, cancelled)
         };
         for slot in expired {
             let _ = slot.actor_tx.try_send(ActorCommand::Revoke);
@@ -1094,6 +1221,14 @@ impl RemoteMediaHandle {
         }
         if let Some(actor) = revoked {
             let _ = actor.try_send(ActorCommand::Revoke);
+        }
+        if let Some((slot, reason)) = cancelled {
+            let _ = slot.actor_tx.try_send(ActorCommand::Revoke);
+            let _ = slot.actor_tx.try_send(ActorCommand::Close);
+            self.emit(slot.binding, RemoteMediaEventKind::Closed { reason });
+        }
+        if let Some((binding, reason)) = return_notice {
+            self.emit(binding, RemoteMediaEventKind::ReturningToAokie { reason });
         }
         self.refresh_reserved();
         transition
@@ -1159,6 +1294,22 @@ impl RemoteMediaHandle {
         Ok(())
     }
 
+    /// Physical ACK after the radio has flushed the last Aokie sample and
+    /// isolated the caller. Only this operation makes private consult active.
+    pub fn ack_enter_consult(&self, binding: &SessionBinding) -> Result<(), String> {
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| "remote media state poisoned".to_string())?;
+            state.ack_enter_consult(binding, Instant::now())?;
+        }
+        self.refresh_reserved();
+        self.emit(binding.clone(), RemoteMediaEventKind::ConsultActive);
+        Ok(())
+    }
+
     /// Physical ACK after flushing the human tail.  This advances ownerEpoch
     /// again before Aokie may speak, permanently fencing delayed talk frames.
     pub fn ack_return_to_aokie(&self) -> Result<(), String> {
@@ -1177,6 +1328,30 @@ impl RemoteMediaHandle {
 
     pub fn radio_reserved(&self) -> bool {
         self.inner.radio_reserved.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_prepared_peer(
+        &self,
+        binding: SessionBinding,
+        lease_ttl_ms: u64,
+    ) -> Result<(), String> {
+        let ttl = validate_ttl(lease_ttl_ms)?;
+        let (actor_tx, _actor_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| "remote media state poisoned".to_string())?;
+        state.insert_peer(PeerSlot {
+            binding: binding.clone(),
+            lease_expires_at: Instant::now() + ttl,
+            actor_tx,
+        })?;
+        state.request_soft_hold(binding, ttl)?;
+        drop(state);
+        self.refresh_reserved();
+        Ok(())
     }
 
     fn actor_for(&self, rtc_session_id: &str) -> Result<mpsc::Sender<ActorCommand>, String> {
@@ -1249,7 +1424,10 @@ fn routes_caller_ingress(
         current_call_id,
         call_epoch,
         owner_epoch,
-    ) && slot.binding.mode != MediaMode::Consult
+    ) && !matches!(
+        slot.binding.mode,
+        MediaMode::PreparedConsult | MediaMode::Consult
+    )
 }
 
 fn routes_caller_output(
@@ -1491,6 +1669,7 @@ impl RemoteMediaState {
             .take()
             .map(|route| route.permit.binding)
             .or_else(|| self.active_consult.take().map(|route| route.binding))
+            .or_else(|| self.pending_consult.take().map(|pending| pending.binding))
             .or_else(|| self.pending_route.take().map(|route| route.permit.binding))
             .or_else(|| self.pending_prepare.take().map(|pending| pending.binding))
             .or_else(|| {
@@ -1565,6 +1744,7 @@ impl RemoteMediaState {
                     MediaMode::PreparedTalk | MediaMode::PreparedConsult
                 ) && (self.pending_prepare.is_some()
                     || self.prepared_claim.is_some()
+                    || self.pending_consult.is_some()
                     || self.active_consult.is_some()
                     || self.pending_route.is_some()
                     || self.active_route.is_some()
@@ -1598,6 +1778,7 @@ impl RemoteMediaState {
                     );
                 }
                 if self.active_consult.is_some()
+                    || self.pending_consult.is_some()
                     || self.pending_route.is_some()
                     || self.active_route.is_some()
                     || self
@@ -1653,6 +1834,22 @@ impl RemoteMediaState {
         // Revalidate after the asynchronous SDP operation.  A call/owner
         // transition that raced answer creation makes the answer unusable.
         self.validate_open(&slot.binding)?;
+        if matches!(slot.binding.mode, MediaMode::Consult | MediaMode::Talk) {
+            let prepared = self
+                .prepared_claim
+                .as_mut()
+                .ok_or_else(|| "active media peer has no prepared claim".to_string())?;
+            // Separate from the renewable lease/peer expiry: a client cannot
+            // heartbeat forever while declining permission or never sending
+            // microphone PCM.
+            prepared.media_ready_deadline = Some(Instant::now() + TALK_PREFLIGHT_TIMEOUT);
+            // Timeout/revocation events must carry the exact post-rotation
+            // Talk binding.  The provisional binding has the prior owner
+            // epoch and is intentionally rejected by the gateway's route
+            // fence.
+            prepared.active_media_binding = Some(slot.binding.clone());
+            prepared.last_media_received_at = None;
+        }
         self.peers.insert(slot.binding.rtc_session_id.clone(), slot);
         self.bump_revision();
         Ok(())
@@ -1668,6 +1865,9 @@ impl RemoteMediaState {
             MediaMode::PreparedConsult | MediaMode::PreparedTalk
         ) {
             return Err("only a prepared consult/talk peer may request a soft hold".into());
+        }
+        if !self.consent.allows(binding.mode) {
+            return Err("current remote consent no longer permits this preparation".into());
         }
         self.validate_live_binding(&binding)?;
         let record = self
@@ -1695,11 +1895,15 @@ impl RemoteMediaState {
             .checked_duration_since(Instant::now())
             .ok_or_else(|| "prepared lease is expired".to_string())?;
         self.pending_prepare = Some(PendingPrepare {
-            binding,
+            binding: binding.clone(),
             expires_at: Instant::now() + requested_ttl.min(remaining),
             transition_dispatched: false,
         });
-        self.service_mode = ServiceMode::SoftHold;
+        // Preparation is negotiation, not caller ownership. Keep the
+        // receptionist live while the active lease and exact microphone path
+        // are established. Only the final PCM-proven transition may reserve
+        // the radio for either Talk or private Consult.
+        self.service_mode = ServiceMode::AokieActive;
         self.bump_revision();
         Ok(())
     }
@@ -1712,6 +1916,9 @@ impl RemoteMediaState {
         if binding.mode != MediaMode::Consult {
             return Err("only an active consult peer may enter private consultation".into());
         }
+        if !self.consent.allows(MediaMode::Consult) {
+            return Err("current remote consent no longer permits consultation".into());
+        }
         self.validate_live_binding(&binding)?;
         let record = self
             .current_record()
@@ -1719,7 +1926,8 @@ impl RemoteMediaState {
         if binding.owner_epoch != record.owner_epoch {
             return Err("consult ownerEpoch is not the prepared hold epoch".into());
         }
-        if self.active_consult.is_some()
+        if self.pending_consult.is_some()
+            || self.active_consult.is_some()
             || self.pending_route.is_some()
             || self.active_route.is_some()
         {
@@ -1732,10 +1940,16 @@ impl RemoteMediaState {
         if slot.binding != binding {
             return Err("consult binding differs from the immutable peer binding".into());
         }
-        let prepared = self.prepared_claim.as_ref().ok_or_else(|| {
-            "consultation has not completed software-hold preparation".to_string()
-        })?;
+        let prepared = self
+            .prepared_claim
+            .as_ref()
+            .ok_or_else(|| "consultation has not completed receive-only preparation".to_string())?;
         if prepared.expires_at <= Instant::now()
+            || prepared
+                .media_ready_deadline
+                .is_none_or(|deadline| deadline <= Instant::now())
+            || prepared.active_media_binding.as_ref() != Some(&binding)
+            || prepared.last_media_received_at.is_none()
             || prepared.provisional_binding.mode != MediaMode::PreparedConsult
             || prepared.confirmed_owner_epoch != binding.owner_epoch
             || prepared.provisional_binding.call_id != binding.call_id
@@ -1751,12 +1965,16 @@ impl RemoteMediaState {
             .lease_expires_at
             .checked_duration_since(Instant::now())
             .ok_or_else(|| "consult lease is expired".to_string())?;
-        self.active_consult = Some(ActiveConsult {
+        self.pending_consult = Some(PendingConsult {
             binding,
             expires_at: Instant::now() + requested_ttl.min(remaining),
+            transition_dispatched: false,
+            last_received_at: prepared.last_media_received_at,
         });
         self.prepared_claim = None;
-        self.service_mode = ServiceMode::ConsultActive;
+        // Exact decoded microphone PCM is now proven. Reserve new Aokie TX
+        // while the radio performs the final flush/ACK on its next tick.
+        self.service_mode = ServiceMode::ConsultPending;
         self.bump_revision();
         Ok(())
     }
@@ -1768,6 +1986,9 @@ impl RemoteMediaState {
     ) -> Result<(), String> {
         if binding.mode != MediaMode::Talk {
             return Err("only a talk peer may request caller ownership".into());
+        }
+        if !self.consent.allows(MediaMode::Talk) {
+            return Err("current remote consent no longer permits takeover".into());
         }
         self.validate_live_binding(&binding)?;
         let record = self
@@ -1791,6 +2012,10 @@ impl RemoteMediaState {
             .as_ref()
             .ok_or_else(|| "takeover has not completed its receive-only preparation".to_string())?;
         if prepared.expires_at <= Instant::now()
+            || prepared
+                .media_ready_deadline
+                .is_none_or(|deadline| deadline <= Instant::now())
+            || prepared.active_media_binding.as_ref() != Some(&binding)
             || prepared.confirmed_owner_epoch != binding.owner_epoch
             || prepared.provisional_binding.call_id != binding.call_id
             || prepared.provisional_binding.call_epoch != binding.call_epoch
@@ -1856,9 +2081,11 @@ impl RemoteMediaState {
         {
             let permit =
                 RoutePermit::new(binding.clone(), ttl).map_err(|error| error.to_string())?;
-            self.active_route = Some(ActiveRoute {
-                permit: permit.clone(),
-            });
+            if let Some(route) = self.active_route.as_mut() {
+                // Renewal extends authority but cannot erase the Desktop-owned
+                // no-first/ongoing-PCM watchdog evidence.
+                route.permit = permit.clone();
+            }
             Some(permit)
         } else if let Some(pending) = self.pending_route.as_mut() {
             if pending.permit.binding == *binding {
@@ -1874,6 +2101,11 @@ impl RemoteMediaState {
                 active.expires_at = Instant::now() + ttl;
             }
         }
+        if let Some(pending) = self.pending_consult.as_mut() {
+            if pending.binding == *binding {
+                pending.expires_at = Instant::now() + ttl;
+            }
+        }
         self.bump_revision();
         Ok((actor, permit))
     }
@@ -1882,13 +2114,17 @@ impl RemoteMediaState {
         &mut self,
         binding: &SessionBinding,
         reason: &str,
-    ) -> Result<(Option<mpsc::Sender<ActorCommand>>, SessionBinding), String> {
+    ) -> Result<
+        (
+            Option<mpsc::Sender<ActorCommand>>,
+            SessionBinding,
+            bool,
+            bool,
+        ),
+        String,
+    > {
         self.validate_live_binding(binding)?;
-        let actor = self
-            .peers
-            .get(&binding.rtc_session_id)
-            .map(|slot| slot.actor_tx.clone());
-        let matches_route = self
+        let active_or_pending_route = self
             .active_consult
             .as_ref()
             .is_some_and(|route| route.binding == *binding)
@@ -1899,35 +2135,70 @@ impl RemoteMediaState {
             || self
                 .pending_route
                 .as_ref()
-                .is_some_and(|route| route.permit.binding == *binding)
-            || self
-                .pending_prepare
-                .as_ref()
-                .is_some_and(|pending| pending.binding == *binding)
-            || self.prepared_claim.as_ref().is_some_and(|prepared| {
-                let original = &prepared.provisional_binding;
-                original == binding
-                    || (original.call_id == binding.call_id
-                        && original.call_epoch == binding.call_epoch
-                        && original.device_id == binding.device_id
-                        && original.rtc_session_id == binding.rtc_session_id
-                        && original.lease_id == binding.lease_id
-                        && original.fence == binding.fence)
-            });
+                .is_some_and(|route| route.permit.binding == *binding);
+        let pending_consult = self
+            .pending_consult
+            .as_ref()
+            .is_some_and(|pending| pending.binding == *binding);
+        let pending_prepare_mode = self
+            .pending_prepare
+            .as_ref()
+            .filter(|pending| pending.binding == *binding)
+            .map(|pending| pending.binding.mode);
+        let prepared_mode = self.prepared_claim.as_ref().and_then(|prepared| {
+            let original = &prepared.provisional_binding;
+            let stable_match = original == binding
+                || (original.call_id == binding.call_id
+                    && original.call_epoch == binding.call_epoch
+                    && original.device_id == binding.device_id
+                    && original.rtc_session_id == binding.rtc_session_id
+                    && original.lease_id == binding.lease_id
+                    && original.fence == binding.fence);
+            stable_match.then_some(original.mode)
+        });
+        let matches_route = active_or_pending_route
+            || pending_consult
+            || pending_prepare_mode.is_some()
+            || prepared_mode.is_some();
         if !matches_route {
             return Err("binding does not own or await the caller route".into());
         }
+        let needs_return = active_or_pending_route;
+        let peer_binding = self
+            .peers
+            .get(&binding.rtc_session_id)
+            .map(|slot| slot.binding.clone())
+            .unwrap_or_else(|| binding.clone());
+        let actor = if needs_return {
+            self.peers
+                .get(&binding.rtc_session_id)
+                .map(|slot| slot.actor_tx.clone())
+        } else {
+            self.peers
+                .remove(&binding.rtc_session_id)
+                .map(|slot| slot.actor_tx)
+        };
         self.pending_prepare = None;
         self.prepared_claim = None;
+        self.pending_consult = None;
         self.active_consult = None;
         self.pending_route = None;
         self.active_route = None;
-        self.return_binding = Some(binding.clone());
-        self.return_reason = Some(sanitize_reason(reason));
-        self.return_dispatched = false;
-        self.service_mode = ServiceMode::ReturningToAokie;
+        self.talk_audio_binding = None;
+        if needs_return {
+            self.return_binding = Some(binding.clone());
+            self.return_reason = Some(sanitize_reason(reason));
+            self.return_dispatched = false;
+            self.service_mode = ServiceMode::ReturningToAokie;
+        } else {
+            // Prepared/PCM-proven preflight never owned or muted the caller
+            // route. Cancelling it must be an in-place peer retirement, not a
+            // fabricated radio return/flush that interrupts the receptionist.
+            self.fence_cancelled_binding(&peer_binding);
+            self.service_mode = ServiceMode::AokieActive;
+        }
         self.bump_revision();
-        Ok((actor, binding.clone()))
+        Ok((actor, peer_binding, needs_return, !needs_return))
     }
 
     fn close_peer(
@@ -1939,7 +2210,7 @@ impl RemoteMediaState {
             .peers
             .remove(rtc_session_id)
             .ok_or_else(|| format!("unknown or closed rtcSessionId {rtc_session_id:?}"))?;
-        let needs_return = self
+        let active_route_needs_return = self
             .active_consult
             .as_ref()
             .is_some_and(|route| route.binding == slot.binding)
@@ -1951,6 +2222,34 @@ impl RemoteMediaState {
                 .pending_route
                 .as_ref()
                 .is_some_and(|route| route.permit.binding == slot.binding);
+        let pending_prepare_mode = self.pending_prepare.as_ref().and_then(|pending| {
+            (pending.binding.rtc_session_id == rtc_session_id).then_some(pending.binding.mode)
+        });
+        let pending_consult = self
+            .pending_consult
+            .as_ref()
+            .is_some_and(|pending| pending.binding.rtc_session_id == rtc_session_id);
+        let preserves_prepared_claim = matches!(reason, "active_rebind" | "awaiting_active_rebind");
+        let prepared_mode = (!preserves_prepared_claim)
+            .then(|| {
+                self.prepared_claim.as_ref().and_then(|prepared| {
+                    (prepared.provisional_binding.rtc_session_id == rtc_session_id)
+                        .then_some(prepared.provisional_binding.mode)
+                })
+            })
+            .flatten();
+        let needs_return = active_route_needs_return;
+        let cancels_preflight =
+            pending_consult || pending_prepare_mode.is_some() || prepared_mode.is_some();
+        if pending_prepare_mode.is_some() {
+            self.pending_prepare = None;
+        }
+        if prepared_mode.is_some() {
+            self.prepared_claim = None;
+        }
+        if pending_consult {
+            self.pending_consult = None;
+        }
         if needs_return {
             self.pending_route = None;
             self.active_route = None;
@@ -1959,6 +2258,9 @@ impl RemoteMediaState {
             self.return_reason = Some(sanitize_reason(reason));
             self.return_dispatched = false;
             self.service_mode = ServiceMode::ReturningToAokie;
+        } else if cancels_preflight {
+            self.fence_cancelled_binding(&slot.binding);
+            self.service_mode = ServiceMode::AokieActive;
         }
         self.bump_revision();
         Ok((slot, needs_return))
@@ -1966,26 +2268,55 @@ impl RemoteMediaState {
 
     fn fail_closed_all(&mut self, reason: &str) -> (Vec<PeerSlot>, Option<SessionBinding>) {
         let slots = self.peers.drain().map(|(_, slot)| slot).collect::<Vec<_>>();
+        let pending_prepare = self.pending_prepare.take();
+        let prepared_claim = self.prepared_claim.take();
+        let pending_consult = self.pending_consult.take();
+        let cancelled_binding = pending_consult
+            .as_ref()
+            .map(|pending| pending.binding.clone())
+            .or_else(|| {
+                prepared_claim.as_ref().and_then(|prepared| {
+                    prepared
+                        .active_media_binding
+                        .clone()
+                        .or_else(|| Some(prepared.provisional_binding.clone()))
+                })
+            })
+            .or_else(|| {
+                pending_prepare
+                    .as_ref()
+                    .map(|pending| pending.binding.clone())
+            });
         let returning = self
             .active_route
             .take()
             .map(|route| route.permit.binding)
             .or_else(|| self.active_consult.take().map(|route| route.binding))
-            .or_else(|| self.pending_route.take().map(|route| route.permit.binding))
-            .or_else(|| self.pending_prepare.take().map(|pending| pending.binding))
-            .or_else(|| {
-                self.prepared_claim
-                    .take()
-                    .map(|prepared| prepared.provisional_binding)
-            });
+            .or_else(|| self.pending_route.take().map(|route| route.permit.binding));
         if let Some(binding) = returning.clone() {
             self.return_binding = Some(binding);
             self.return_reason = Some(sanitize_reason(reason));
             self.return_dispatched = false;
             self.service_mode = ServiceMode::ReturningToAokie;
+        } else if let Some(binding) = cancelled_binding {
+            self.fence_cancelled_binding(&binding);
+            self.service_mode = ServiceMode::AokieActive;
         }
         self.bump_revision();
         (slots, returning)
+    }
+
+    fn fence_cancelled_binding(&mut self, binding: &SessionBinding) {
+        if self.current_call_id.as_deref() == Some(binding.call_id.as_str()) {
+            if let Some(record) = self.current_record_mut() {
+                if record.call_epoch == binding.call_epoch {
+                    record.owner_epoch = record
+                        .owner_epoch
+                        .max(binding.owner_epoch)
+                        .saturating_add(1);
+                }
+            }
+        }
     }
 
     fn validate_live_binding(&self, binding: &SessionBinding) -> Result<(), String> {
@@ -2004,22 +2335,44 @@ impl RemoteMediaState {
     fn next_transition(
         &mut self,
         now: Instant,
-    ) -> (Option<RadioTransition>, Option<mpsc::Sender<ActorCommand>>) {
+    ) -> (
+        Option<RadioTransition>,
+        Option<mpsc::Sender<ActorCommand>>,
+        Option<(SessionBinding, String)>,
+        Option<(PeerSlot, String)>,
+    ) {
         let mut revoked = None;
+        let mut return_notice = None;
+        let mut cancelled = None;
         if let Some(active) = self.active_consult.as_ref() {
             let peer_expired = self
                 .peers
                 .get(&active.binding.rtc_session_id)
                 .is_none_or(|slot| slot.lease_expires_at <= now);
-            if active.expires_at <= now || peer_expired {
+            let timeout_reason = if active.expires_at <= now || peer_expired {
+                Some("consult_lease_expired")
+            } else if active.last_received_at.is_none()
+                && now.saturating_duration_since(active.activated_at) >= FIRST_CONSULT_PCM_TIMEOUT
+            {
+                Some("consult_audio_never_arrived")
+            } else if active.last_received_at.is_some_and(|last| {
+                now.saturating_duration_since(last) >= ONGOING_CONSULT_PCM_TIMEOUT
+            }) {
+                Some("consult_audio_stalled")
+            } else {
+                None
+            };
+            if let Some(reason) = timeout_reason {
                 let binding = active.binding.clone();
                 revoked = self
                     .peers
                     .get(&binding.rtc_session_id)
                     .map(|slot| slot.actor_tx.clone());
                 self.active_consult = None;
-                self.return_binding = Some(binding);
-                self.return_reason = Some("consult_lease_expired".into());
+                let reason = reason.to_string();
+                self.return_binding = Some(binding.clone());
+                self.return_reason = Some(reason.clone());
+                return_notice = Some((binding, reason));
                 self.return_dispatched = false;
                 self.service_mode = ServiceMode::ReturningToAokie;
                 self.bump_revision();
@@ -2030,15 +2383,31 @@ impl RemoteMediaState {
                 .peers
                 .get(&active.permit.binding.rtc_session_id)
                 .is_none_or(|slot| slot.lease_expires_at <= now);
-            if !active.permit.is_current_for(&active.permit.binding, now) || peer_expired {
+            let timeout_reason =
+                if !active.permit.is_current_for(&active.permit.binding, now) || peer_expired {
+                    Some("lease_expired")
+                } else if active.last_forwarded_at.is_none()
+                    && now.saturating_duration_since(active.activated_at) >= FIRST_TALK_PCM_TIMEOUT
+                {
+                    Some("talk_audio_never_arrived")
+                } else if active.last_forwarded_at.is_some_and(|last| {
+                    now.saturating_duration_since(last) >= ONGOING_TALK_PCM_TIMEOUT
+                }) {
+                    Some("talk_audio_stalled")
+                } else {
+                    None
+                };
+            if let Some(reason) = timeout_reason {
                 let binding = active.permit.binding.clone();
                 revoked = self
                     .peers
                     .get(&binding.rtc_session_id)
                     .map(|slot| slot.actor_tx.clone());
                 self.active_route = None;
-                self.return_binding = Some(binding);
-                self.return_reason = Some("lease_expired".into());
+                let reason = reason.to_string();
+                self.return_binding = Some(binding.clone());
+                self.return_reason = Some(reason.clone());
+                return_notice = Some((binding, reason));
                 self.return_dispatched = false;
                 self.service_mode = ServiceMode::ReturningToAokie;
                 self.bump_revision();
@@ -2056,10 +2425,29 @@ impl RemoteMediaState {
                     .get(&binding.rtc_session_id)
                     .map(|slot| slot.actor_tx.clone());
                 self.pending_route = None;
-                self.return_binding = Some(binding);
-                self.return_reason = Some("lease_expired_before_physical_ack".into());
+                let reason = "lease_expired_before_physical_ack".to_string();
+                self.return_binding = Some(binding.clone());
+                self.return_reason = Some(reason.clone());
+                return_notice = Some((binding, reason));
                 self.return_dispatched = false;
                 self.service_mode = ServiceMode::ReturningToAokie;
+                self.bump_revision();
+            }
+        }
+        if let Some(pending) = self.pending_consult.as_ref() {
+            let peer_expired = self
+                .peers
+                .get(&pending.binding.rtc_session_id)
+                .is_none_or(|slot| slot.lease_expires_at <= now);
+            if pending.expires_at <= now || peer_expired {
+                let binding = pending.binding.clone();
+                self.pending_consult = None;
+                let reason = "consult_expired_before_physical_ack".to_string();
+                if let Some(slot) = self.peers.remove(&binding.rtc_session_id) {
+                    cancelled = Some((slot, reason));
+                }
+                self.fence_cancelled_binding(&binding);
+                self.service_mode = ServiceMode::AokieActive;
                 self.bump_revision();
             }
         }
@@ -2070,30 +2458,41 @@ impl RemoteMediaState {
                 .is_none_or(|slot| slot.lease_expires_at <= now);
             if pending.expires_at <= now || peer_expired {
                 let binding = pending.binding.clone();
-                revoked = self
-                    .peers
-                    .get(&binding.rtc_session_id)
-                    .map(|slot| slot.actor_tx.clone());
                 self.pending_prepare = None;
-                self.return_binding = Some(binding);
-                self.return_reason = Some("prepared_lease_expired".into());
-                self.return_dispatched = false;
-                self.service_mode = ServiceMode::ReturningToAokie;
+                let reason = "prepared_lease_expired".to_string();
+                if let Some(slot) = self.peers.remove(&binding.rtc_session_id) {
+                    cancelled = Some((slot, reason));
+                }
+                self.fence_cancelled_binding(&binding);
+                self.service_mode = ServiceMode::AokieActive;
                 self.bump_revision();
             }
         }
         if let Some(prepared) = self.prepared_claim.as_ref() {
-            if prepared.expires_at <= now {
-                let binding = prepared.provisional_binding.clone();
-                revoked = self
-                    .peers
-                    .get(&binding.rtc_session_id)
-                    .map(|slot| slot.actor_tx.clone());
+            let reason = if prepared
+                .media_ready_deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                Some("talk_readiness_timeout")
+            } else if prepared.expires_at <= now {
+                Some("prepared_lease_expired")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                let provisional_mode = prepared.provisional_binding.mode;
+                let binding = prepared
+                    .active_media_binding
+                    .clone()
+                    .unwrap_or_else(|| prepared.provisional_binding.clone());
                 self.prepared_claim = None;
-                self.return_binding = Some(binding);
-                self.return_reason = Some("prepared_lease_expired".into());
-                self.return_dispatched = false;
-                self.service_mode = ServiceMode::ReturningToAokie;
+                let reason = reason.to_string();
+                if let Some(slot) = self.peers.remove(&binding.rtc_session_id) {
+                    cancelled = Some((slot, reason));
+                }
+                let _ = provisional_mode;
+                self.fence_cancelled_binding(&binding);
+                self.service_mode = ServiceMode::AokieActive;
                 self.bump_revision();
             }
         }
@@ -2108,10 +2507,12 @@ impl RemoteMediaState {
                             .unwrap_or_else(|| "route_revoked".into()),
                     }),
                     revoked,
+                    return_notice,
+                    cancelled,
                 );
             }
             let _ = binding;
-            return (None, revoked);
+            return (None, revoked, return_notice, cancelled);
         }
         if let Some(pending) = self.pending_route.as_mut() {
             if !pending.transition_dispatched {
@@ -2121,6 +2522,21 @@ impl RemoteMediaState {
                         binding: pending.permit.binding.clone(),
                     }),
                     revoked,
+                    return_notice,
+                    cancelled,
+                );
+            }
+        }
+        if let Some(pending) = self.pending_consult.as_mut() {
+            if !pending.transition_dispatched {
+                pending.transition_dispatched = true;
+                return (
+                    Some(RadioTransition::EnterConsult {
+                        binding: pending.binding.clone(),
+                    }),
+                    revoked,
+                    return_notice,
+                    cancelled,
                 );
             }
         }
@@ -2136,10 +2552,10 @@ impl RemoteMediaState {
                         binding: pending.binding.clone(),
                     }
                 };
-                return (Some(transition), revoked);
+                return (Some(transition), revoked, return_notice, cancelled);
             }
         }
-        (None, revoked)
+        (None, revoked, return_notice, cancelled)
     }
 
     fn expire_peers(&mut self, now: Instant) -> Vec<PeerSlot> {
@@ -2160,6 +2576,9 @@ impl RemoteMediaState {
 
     fn ack_prepare(&mut self, binding: &SessionBinding, now: Instant) -> Result<u64, String> {
         self.validate_live_binding(binding)?;
+        if !self.consent.allows(binding.mode) {
+            return Err("remote consent expired before soft-hold ACK".into());
+        }
         if !self.current_call_active {
             return Err("physical call ended before soft-hold ACK".into());
         }
@@ -2184,14 +2603,57 @@ impl RemoteMediaState {
             provisional_binding: binding.clone(),
             confirmed_owner_epoch,
             expires_at: pending.expires_at,
+            media_ready_deadline: None,
+            active_media_binding: None,
+            last_media_received_at: None,
         });
-        self.service_mode = if binding.mode == MediaMode::PreparedConsult {
-            ServiceMode::ConsultPending
-        } else {
-            ServiceMode::HumanPending
-        };
+        // Owner epoch advances to fence the active lease, but caller audio
+        // remains with Aokie until exact Consult/Talk PCM has been decoded.
+        self.service_mode = ServiceMode::AokieActive;
         self.bump_revision();
         Ok(confirmed_owner_epoch)
+    }
+
+    fn ack_enter_consult(&mut self, binding: &SessionBinding, now: Instant) -> Result<(), String> {
+        self.validate_live_binding(binding)?;
+        if !self.consent.allows(MediaMode::Consult) {
+            return Err("remote consent expired before consult ACK".into());
+        }
+        if !self.current_call_active {
+            return Err("physical call ended before consult ACK".into());
+        }
+        let pending = self
+            .pending_consult
+            .take()
+            .ok_or_else(|| "there is no pending private consultation".to_string())?;
+        if pending.binding != *binding || pending.expires_at <= now {
+            self.pending_consult = Some(pending);
+            return Err("pending consult binding is stale or expired".into());
+        }
+        let record = self
+            .current_record()
+            .ok_or_else(|| "physical call epoch is unavailable".to_string())?;
+        if binding.owner_epoch != record.owner_epoch {
+            self.pending_consult = Some(pending);
+            return Err("ownerEpoch changed before consult ACK".into());
+        }
+        let slot = self
+            .peers
+            .get(&binding.rtc_session_id)
+            .ok_or_else(|| "consult peer closed before physical ACK".to_string())?;
+        if slot.binding != *binding || slot.lease_expires_at <= now {
+            self.pending_consult = Some(pending);
+            return Err("consult peer changed or expired before physical ACK".into());
+        }
+        self.active_consult = Some(ActiveConsult {
+            binding: binding.clone(),
+            expires_at: pending.expires_at.min(slot.lease_expires_at),
+            activated_at: now,
+            last_received_at: pending.last_received_at,
+        });
+        self.service_mode = ServiceMode::ConsultActive;
+        self.bump_revision();
+        Ok(())
     }
 
     fn ack_enter(
@@ -2200,6 +2662,9 @@ impl RemoteMediaState {
         now: Instant,
     ) -> Result<(mpsc::Sender<ActorCommand>, RoutePermit), String> {
         self.validate_live_binding(binding)?;
+        if !self.consent.allows(MediaMode::Talk) {
+            return Err("remote consent expired before takeover ACK".into());
+        }
         if !self.current_call_active {
             return Err("physical call ended before takeover ACK".into());
         }
@@ -2226,6 +2691,8 @@ impl RemoteMediaState {
         let permit = pending.permit.clone();
         self.active_route = Some(ActiveRoute {
             permit: pending.permit,
+            activated_at: now,
+            last_forwarded_at: None,
         });
         self.service_mode = ServiceMode::HumanActive;
         self.bump_revision();
@@ -2248,6 +2715,7 @@ impl RemoteMediaState {
         self.pending_route = None;
         self.active_route = None;
         self.active_consult = None;
+        self.pending_consult = None;
         self.pending_prepare = None;
         self.prepared_claim = None;
         self.return_reason = None;
@@ -2261,7 +2729,8 @@ impl RemoteMediaState {
         let Some(route) = self.active_route.as_ref() else {
             return false;
         };
-        let allowed = self.current_call_active
+        let allowed = self.consent.allows(MediaMode::Talk)
+            && self.current_call_active
             && self.current_call_id.as_deref() == Some(binding.call_id.as_str())
             && self.current_record().is_some_and(|record| {
                 record.call_epoch == binding.call_epoch && record.owner_epoch == binding.owner_epoch
@@ -2300,6 +2769,27 @@ impl RemoteMediaState {
                 .peers
                 .get(&binding.rtc_session_id)
                 .is_some_and(|slot| slot.binding == *binding && slot.lease_expires_at > now)
+    }
+
+    fn note_consult_pcm_received(&mut self, binding: &SessionBinding, now: Instant) {
+        if binding.mode != MediaMode::Consult {
+            return;
+        }
+        if let Some(prepared) = self.prepared_claim.as_mut() {
+            if prepared.active_media_binding.as_ref() == Some(binding) {
+                prepared.last_media_received_at = Some(now);
+            }
+        }
+        if let Some(pending) = self.pending_consult.as_mut() {
+            if pending.binding == *binding {
+                pending.last_received_at = Some(now);
+            }
+        }
+        if let Some(active) = self.active_consult.as_mut() {
+            if active.binding == *binding {
+                active.last_received_at = Some(now);
+            }
+        }
     }
 
     fn radio_reserved(&self) -> bool {
@@ -2398,6 +2888,7 @@ async fn manager_loop(
                         tokio::spawn(peer_actor(
                             peer,
                             actor_rx,
+                            state.clone(),
                             talk_tx.clone(),
                             consult_tx.clone(),
                             events.clone(),
@@ -2424,6 +2915,7 @@ async fn manager_loop(
 async fn peer_actor(
     mut peer: DesktopPeer,
     mut commands: mpsc::Receiver<ActorCommand>,
+    state: Arc<Mutex<RemoteMediaState>>,
     talk_tx: std_mpsc::SyncSender<RoutedAudio>,
     consult_tx: std_mpsc::SyncSender<RoutedAudio>,
     events: EventEmitter,
@@ -2500,6 +2992,11 @@ async fn peer_actor(
         };
         if let Some((frame, destination)) = received {
             worked = true;
+            if binding.mode == MediaMode::Consult && !frame.samples.is_empty() {
+                if let Ok(mut state) = state.lock() {
+                    state.note_consult_pcm_received(&binding, Instant::now());
+                }
+            }
             if !microphone_pcm_observed {
                 microphone_pcm_observed = true;
                 let (peak, level_permille) = pcm_level_summary(&frame.samples);
@@ -2536,6 +3033,11 @@ async fn peer_actor(
                     state: state.to_string(),
                 },
                 PeerEvent::RemoteAudioReady => RemoteMediaEventKind::RemoteAudioReady,
+                PeerEvent::MicrophoneAuthorityReady => RemoteMediaEventKind::ProtocolViolation {
+                    message: "Desktop received a Companion-only microphone authority event"
+                        .to_string(),
+                },
+                PeerEvent::RemoteMicrophoneReady => RemoteMediaEventKind::RemoteMicrophoneReady,
                 PeerEvent::ProtocolViolation(message) => RemoteMediaEventKind::ProtocolViolation {
                     message: message.to_string(),
                 },
@@ -2679,6 +3181,12 @@ mod tests {
             Some(RadioTransition::PrepareHuman { .. })
         ));
         assert_eq!(state.ack_prepare(&prepared, Instant::now()).unwrap(), 1);
+        assert_eq!(
+            state.service_mode,
+            ServiceMode::AokieActive,
+            "prepared takeover negotiation never mutes the receptionist"
+        );
+        assert!(!state.radio_reserved());
         state
             .close_peer(&prepared.rtc_session_id, "active_rebind")
             .unwrap();
@@ -2700,12 +3208,21 @@ mod tests {
             Some(RadioTransition::PrepareConsult { .. })
         ));
         assert_eq!(state.ack_prepare(&prepared, Instant::now()).unwrap(), 1);
+        assert_eq!(state.service_mode, ServiceMode::AokieActive);
+        assert!(!state.radio_reserved());
         state
             .close_peer(&prepared.rtc_session_id, "active_rebind")
             .unwrap();
         let consult = binding(MediaMode::Consult, 1, 0, suffix);
         insert(state, consult.clone(), ttl);
+        state.note_consult_pcm_received(&consult, Instant::now());
         state.request_consult(consult.clone(), ttl).unwrap();
+        assert_eq!(state.service_mode, ServiceMode::ConsultPending);
+        assert!(matches!(
+            state.next_transition(Instant::now()).0,
+            Some(RadioTransition::EnterConsult { .. })
+        ));
+        state.ack_enter_consult(&consult, Instant::now()).unwrap();
         consult
     }
 
@@ -2787,6 +3304,211 @@ mod tests {
         assert_eq!(state.current_record().unwrap().owner_epoch, 2);
         assert_eq!(state.service_mode, ServiceMode::AokieActive);
         assert!(!state.radio_reserved());
+    }
+
+    #[test]
+    fn active_talk_preflight_deadline_is_not_extended_by_heartbeats() {
+        let mut state = active_state();
+        let talk = prepare_active_talk(&mut state, "preflight", 9, Duration::from_secs(30));
+        let deadline = state
+            .prepared_claim
+            .as_ref()
+            .and_then(|prepared| prepared.media_ready_deadline)
+            .expect("opening the active Talk peer starts a readiness deadline");
+
+        state
+            .renew(&talk, Duration::from_secs(30))
+            .expect("the lease itself can renew");
+        assert_eq!(
+            state
+                .prepared_claim
+                .as_ref()
+                .and_then(|prepared| prepared.media_ready_deadline),
+            Some(deadline),
+            "heartbeats cannot prolong a peer that never proves microphone PCM"
+        );
+        let (transition, _, notice, cancelled) =
+            state.next_transition(deadline + Duration::from_millis(1));
+        assert!(transition.is_none());
+        assert!(notice.is_none());
+        assert!(cancelled.is_some_and(|(slot, reason)| {
+            slot.binding == talk && reason == "talk_readiness_timeout"
+        }));
+        assert_eq!(state.service_mode, ServiceMode::AokieActive);
+        assert_eq!(state.current_record().unwrap().owner_epoch, 2);
+        assert!(!state.radio_reserved());
+    }
+
+    #[test]
+    fn every_pre_route_talk_abort_cancels_in_place_and_fences_the_owner_epoch() {
+        let mut pending = active_state();
+        let prepared = binding(MediaMode::PreparedTalk, 0, 9, "pending-expiry");
+        insert(&mut pending, prepared.clone(), Duration::from_secs(30));
+        pending
+            .request_soft_hold(prepared.clone(), Duration::from_secs(5))
+            .unwrap();
+        let deadline = pending.pending_prepare.as_ref().unwrap().expires_at;
+        let (transition, _, notice, cancelled) =
+            pending.next_transition(deadline + Duration::from_millis(1));
+        assert!(transition.is_none());
+        assert!(notice.is_none());
+        assert!(cancelled.is_some_and(|(slot, reason)| {
+            slot.binding == prepared && reason == "prepared_lease_expired"
+        }));
+        assert_eq!(pending.service_mode, ServiceMode::AokieActive);
+        assert_eq!(pending.current_record().unwrap().owner_epoch, 1);
+        assert!(!pending.radio_reserved());
+
+        let mut revoked = active_state();
+        let talk = prepare_active_talk(&mut revoked, "explicit-abort", 10, Duration::from_secs(30));
+        let (_, event_binding, needs_return, close_peer) =
+            revoked.request_revoke(&talk, "permission_denied").unwrap();
+        assert_eq!(event_binding, talk);
+        assert!(!needs_return);
+        assert!(close_peer);
+        assert_eq!(revoked.service_mode, ServiceMode::AokieActive);
+        assert_eq!(revoked.current_record().unwrap().owner_epoch, 2);
+        assert!(!revoked.radio_reserved());
+
+        let mut disconnected = active_state();
+        let talk = prepare_active_talk(
+            &mut disconnected,
+            "transport-abort",
+            11,
+            Duration::from_secs(30),
+        );
+        let (closed, returning) = disconnected.fail_closed_all("relay_disconnected");
+        assert!(returning.is_none());
+        assert!(closed.iter().any(|slot| slot.binding == talk));
+        assert_eq!(disconnected.service_mode, ServiceMode::AokieActive);
+        assert_eq!(disconnected.current_record().unwrap().owner_epoch, 2);
+        assert!(!disconnected.radio_reserved());
+    }
+
+    #[test]
+    fn consent_revocation_cancels_talk_preflight_in_place_but_returns_an_active_route() {
+        let pending = RemoteMediaHandle::spawn().unwrap();
+        let gate = {
+            let mut state = pending.inner.state.lock().unwrap();
+            *state = active_state();
+            let prepared = binding(MediaMode::PreparedTalk, 0, 11, "consent-pending");
+            insert(&mut state, prepared.clone(), Duration::from_secs(30));
+            state
+                .request_soft_hold(prepared, Duration::from_secs(20))
+                .unwrap();
+            let mut gate = state.consent.clone();
+            gate.takeover_enabled = false;
+            gate
+        };
+        pending.refresh_reserved();
+        pending.set_remote_consent(gate);
+        let snapshot = pending.snapshot();
+        assert_eq!(snapshot.service_mode, ServiceMode::AokieActive);
+        assert!(!snapshot.radio_reserved);
+        assert_eq!(snapshot.owner_epoch, 1, "the pending claimant is fenced");
+        assert!(pending.next_radio_transition().is_none());
+
+        let preflight = RemoteMediaHandle::spawn().unwrap();
+        let mut gate = {
+            let mut state = preflight.inner.state.lock().unwrap();
+            *state = active_state();
+            prepare_active_talk(&mut state, "consent-preflight", 12, Duration::from_secs(30));
+            let mut gate = state.consent.clone();
+            gate.takeover_enabled = false;
+            gate
+        };
+        preflight.refresh_reserved();
+        assert_eq!(preflight.snapshot().service_mode, ServiceMode::AokieActive);
+        assert!(!preflight.snapshot().radio_reserved);
+
+        preflight.set_remote_consent(gate.clone());
+        let snapshot = preflight.snapshot();
+        assert_eq!(snapshot.service_mode, ServiceMode::AokieActive);
+        assert!(!snapshot.radio_reserved);
+        assert_eq!(snapshot.owner_epoch, 2, "the cancelled claimant is fenced");
+        assert!(preflight.next_radio_transition().is_none());
+
+        let active = RemoteMediaHandle::spawn().unwrap();
+        {
+            let mut state = active.inner.state.lock().unwrap();
+            *state = active_state();
+            let talk =
+                prepare_active_talk(&mut state, "consent-active", 13, Duration::from_secs(30));
+            state
+                .request_takeover(talk.clone(), Duration::from_secs(20))
+                .unwrap();
+            assert!(matches!(
+                state.next_transition(Instant::now()).0,
+                Some(RadioTransition::EnterHuman { .. })
+            ));
+            state.ack_enter(&talk, Instant::now()).unwrap();
+        }
+        active.refresh_reserved();
+        assert_eq!(active.snapshot().service_mode, ServiceMode::HumanActive);
+
+        // Once the route actually owned the caller, the same policy change
+        // must retain the physical ReturnToAokie handshake.
+        gate.takeover_enabled = false;
+        active.set_remote_consent(gate);
+        assert_eq!(
+            active.snapshot().service_mode,
+            ServiceMode::ReturningToAokie
+        );
+        assert!(active.snapshot().radio_reserved);
+        assert!(matches!(
+            active.next_radio_transition(),
+            Some(RadioTransition::ReturnToAokie { .. })
+        ));
+    }
+
+    #[test]
+    fn active_talk_route_fails_back_on_missing_or_stalled_forwarded_pcm() {
+        let start = Instant::now();
+        let mut no_first = active_state();
+        let talk = prepare_active_talk(&mut no_first, "no-first", 9, Duration::from_secs(30));
+        no_first
+            .request_takeover(talk.clone(), Duration::from_secs(20))
+            .unwrap();
+        no_first.next_transition(start);
+        no_first.ack_enter(&talk, start).unwrap();
+        let (transition, _, notice, _) = no_first.next_transition(start + FIRST_TALK_PCM_TIMEOUT);
+        assert!(matches!(
+            transition,
+            Some(RadioTransition::ReturnToAokie { .. })
+        ));
+        assert!(notice.is_some_and(|(_, reason)| reason == "talk_audio_never_arrived"));
+
+        let start = Instant::now();
+        let mut stalled = active_state();
+        let talk = prepare_active_talk(&mut stalled, "stalled", 11, Duration::from_secs(30));
+        stalled
+            .request_takeover(talk.clone(), Duration::from_secs(20))
+            .unwrap();
+        stalled.next_transition(start);
+        stalled.ack_enter(&talk, start).unwrap();
+        let last = start + Duration::from_millis(100);
+        stalled
+            .active_route
+            .as_mut()
+            .expect("active route")
+            .last_forwarded_at = Some(last);
+        stalled
+            .renew(&talk, Duration::from_secs(30))
+            .expect("heartbeat renews authority");
+        assert_eq!(
+            stalled
+                .active_route
+                .as_ref()
+                .and_then(|route| route.last_forwarded_at),
+            Some(last),
+            "renewal cannot reset liveness evidence"
+        );
+        let (transition, _, notice, _) = stalled.next_transition(last + ONGOING_TALK_PCM_TIMEOUT);
+        assert!(matches!(
+            transition,
+            Some(RadioTransition::ReturnToAokie { .. })
+        ));
+        assert!(notice.is_some_and(|(_, reason)| reason == "talk_audio_stalled"));
     }
 
     #[test]
@@ -2950,7 +3672,7 @@ mod tests {
     }
 
     #[test]
-    fn monitor_gets_both_caller_directions_but_talker_never_gets_its_output() {
+    fn monitor_and_talk_get_caller_ingress_but_private_consult_never_does() {
         let state = active_state();
         let now = Instant::now();
         let expires_at = now + Duration::from_secs(30);
@@ -2961,6 +3683,7 @@ mod tests {
         };
         let monitor = slot(MediaMode::Monitor, "monitor");
         let prepared = slot(MediaMode::PreparedTalk, "prepared");
+        let prepared_consult = slot(MediaMode::PreparedConsult, "prepared-consult");
         let talk = slot(MediaMode::Talk, "talk");
         let consult = slot(MediaMode::Consult, "consult");
 
@@ -2974,6 +3697,14 @@ mod tests {
                 0
             ));
         }
+        assert!(!routes_caller_ingress(
+            &state.consent,
+            &prepared_consult,
+            now,
+            "call_a",
+            1,
+            0
+        ));
         assert!(routes_caller_output(
             &state.consent,
             &monitor,
@@ -3046,6 +3777,59 @@ mod tests {
     }
 
     #[test]
+    fn consult_requires_pcm_before_isolation_and_returns_when_pcm_stalls() {
+        let mut state = active_state();
+        let prepared = binding(MediaMode::PreparedConsult, 0, 0, "consult-proof");
+        insert(&mut state, prepared.clone(), Duration::from_secs(30));
+        state
+            .request_soft_hold(prepared.clone(), Duration::from_secs(30))
+            .unwrap();
+        assert!(matches!(
+            state.next_transition(Instant::now()).0,
+            Some(RadioTransition::PrepareConsult { .. })
+        ));
+        state.ack_prepare(&prepared, Instant::now()).unwrap();
+        state
+            .close_peer(&prepared.rtc_session_id, "active_rebind")
+            .unwrap();
+
+        let consult = binding(MediaMode::Consult, 1, 0, "consult-proof");
+        insert(&mut state, consult.clone(), Duration::from_secs(30));
+        assert!(state
+            .request_consult(consult.clone(), Duration::from_secs(30))
+            .is_err());
+        assert_eq!(state.service_mode, ServiceMode::AokieActive);
+        assert!(!state.radio_reserved());
+
+        let first_pcm = Instant::now();
+        state.note_consult_pcm_received(&consult, first_pcm);
+        state
+            .request_consult(consult.clone(), Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(state.service_mode, ServiceMode::ConsultPending);
+        assert!(state.radio_reserved());
+        assert!(matches!(
+            state.next_transition(first_pcm).0,
+            Some(RadioTransition::EnterConsult { .. })
+        ));
+        state.ack_enter_consult(&consult, first_pcm).unwrap();
+
+        let still_streaming = first_pcm + Duration::from_millis(1_500);
+        state.note_consult_pcm_received(&consult, still_streaming);
+        assert!(state.next_transition(still_streaming).0.is_none());
+        state
+            .renew(&consult, Duration::from_secs(30))
+            .expect("lease heartbeat may renew authority");
+        assert!(matches!(
+            state
+                .next_transition(still_streaming + ONGOING_CONSULT_PCM_TIMEOUT)
+                .0,
+            Some(RadioTransition::ReturnToAokie { .. })
+        ));
+        assert_eq!(state.service_mode, ServiceMode::ReturningToAokie);
+    }
+
+    #[test]
     fn consult_revoke_returns_to_aokie_without_a_talk_promotion() {
         let mut state = active_state();
         let consult = prepare_active_consult(&mut state, "consult", Duration::from_secs(30));
@@ -3068,8 +3852,12 @@ mod tests {
     #[test]
     fn consult_expiry_and_consent_revocation_fail_closed() {
         let mut expired = active_state();
-        let consult = prepare_active_consult(&mut expired, "expired", Duration::from_millis(2));
-        std::thread::sleep(Duration::from_millis(4));
+        let consult = prepare_active_consult(&mut expired, "expired", Duration::from_secs(30));
+        expired
+            .active_consult
+            .as_mut()
+            .expect("active consult")
+            .expires_at = Instant::now() - Duration::from_millis(1);
         assert!(!expired.allows_consult(&consult, Instant::now()));
         assert!(matches!(
             expired.next_transition(Instant::now()).0,
@@ -3101,6 +3889,55 @@ mod tests {
     }
 
     #[test]
+    fn wall_clock_consent_expiry_cancels_preflight_and_returns_an_active_talker() {
+        let pending = RemoteMediaHandle::spawn().unwrap();
+        {
+            let mut state = pending.inner.state.lock().unwrap();
+            *state = active_state();
+            let prepared = binding(MediaMode::PreparedTalk, 0, 15, "expiry-pending");
+            insert(&mut state, prepared.clone(), Duration::from_secs(30));
+            state
+                .request_soft_hold(prepared, Duration::from_secs(20))
+                .unwrap();
+            state.consent.expires_at = Some("2000-01-01T00:00:00Z".into());
+        }
+        pending.refresh_reserved();
+        assert!(pending.next_radio_transition().is_none());
+        let snapshot = pending.snapshot();
+        assert_eq!(snapshot.service_mode, ServiceMode::AokieActive);
+        assert!(!snapshot.radio_reserved);
+        assert_eq!(snapshot.owner_epoch, 1);
+
+        let active = RemoteMediaHandle::spawn().unwrap();
+        let talk = {
+            let mut state = active.inner.state.lock().unwrap();
+            *state = active_state();
+            let talk =
+                prepare_active_talk(&mut state, "expiry-active", 16, Duration::from_secs(30));
+            state
+                .request_takeover(talk.clone(), Duration::from_secs(20))
+                .unwrap();
+            state.next_transition(Instant::now());
+            state.ack_enter(&talk, Instant::now()).unwrap();
+            state.consent.expires_at = Some("2000-01-01T00:00:00Z".into());
+            assert!(
+                !state.allows_talk(&talk, Instant::now()),
+                "expired consent blocks caller TX before the radio tick"
+            );
+            talk
+        };
+        active.refresh_reserved();
+        assert!(matches!(
+            active.next_radio_transition(),
+            Some(RadioTransition::ReturnToAokie { .. })
+        ));
+        let snapshot = active.snapshot();
+        assert_eq!(snapshot.service_mode, ServiceMode::ReturningToAokie);
+        assert!(snapshot.radio_reserved);
+        assert_ne!(snapshot.talk_lease_id.as_deref(), talk.lease_id.as_deref());
+    }
+
+    #[test]
     fn provisional_takeover_advances_epoch_without_ever_opening_caller_tx() {
         let mut state = active_state();
         let prepared = binding(MediaMode::PreparedTalk, 0, 11, "prepared");
@@ -3113,7 +3950,8 @@ mod tests {
             Some(RadioTransition::PrepareHuman { .. })
         ));
         assert_eq!(state.ack_prepare(&prepared, Instant::now()).unwrap(), 1);
-        assert_eq!(state.service_mode, ServiceMode::HumanPending);
+        assert_eq!(state.service_mode, ServiceMode::AokieActive);
+        assert!(!state.radio_reserved());
         assert!(state.pending_route.is_none());
         assert!(state.active_route.is_none());
         assert!(!state.allows_talk(&prepared, Instant::now()));
