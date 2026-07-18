@@ -4,7 +4,7 @@
 //! the physical radio truth.  Only SDP/ICE and epoch-bound lease transitions
 //! cross the WebSocket; PCM remains inside native WebRTC tracks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,10 +16,11 @@ use aokie_protocol::v2::{
     peer_roster_hash, sdp_dtls_fingerprint, sdp_sha256, AdmissionRole, AuthoritativeCallSnapshot,
     CallerProjection, Caption, CarrierHoldEvidence, EndCallerOutcome, EndpointBindingClaims,
     EndpointChallengeFrame, EndpointKeyAlgorithm, EndpointPublicKey, HelloProofClaims, LeaseClaims,
-    LeaseMode, LeasePhase, MediaState, PluginAssistanceAnswerFrame, PluginClaimDecisionFrame,
-    PluginEndCallerExecuteFrame, PluginEndCallerResultFrame, PluginHello, PluginIdleFrame,
-    PluginLeaseRevokeFrame, PluginRtcSignalFrame, PluginSnapshotFrame, RemoteCapabilities,
-    RemoteConsentPolicy, RtcSignal, SecondaryCallObservation, SecondaryCallPolicy,
+    LeaseMode, LeasePhase, MediaState, MobileHello, PluginAssistanceAnswerFrame,
+    PluginClaimDecisionFrame, PluginEndCallerExecuteFrame, PluginEndCallerResultFrame, PluginHello,
+    PluginIdleFrame, PluginLeaseRevokeFrame, PluginRtcSignalFrame, PluginSnapshotFrame,
+    RemoteCapabilities, RemoteConsentPolicy, RtcSignal, SecondaryCallObservation,
+    SecondaryCallPolicy,
     ServiceMode as ProtocolServiceMode, SignedEndpointBinding, SignedHelloProof,
     SignedTrickleCandidateEnvelope, TelephonyState, TrickleCandidateClaims, MAX_LEASE_TOKEN_BYTES,
     SCHEMA_VERSION,
@@ -1186,6 +1187,17 @@ fn unix_now() -> Result<u64, WorkerError> {
         .map_err(|_| WorkerError::rebootstrap("System clock is before the Unix epoch"))
 }
 
+/// The relay's party identifier for a Companion endpoint key.
+///
+/// Lives here rather than in the voice-gated carrier so the session (which
+/// compiles unconditionally) and [`crate::companion_relay`] cannot drift: the
+/// carrier's approved-party set, its greeting book and the session's re-greet
+/// signal must all name a party the same way or the greeting is retired for a
+/// party that does not exist.
+pub(crate) fn relay_party(endpoint_key_thumbprint: &str) -> String {
+    format!("mobile:{endpoint_key_thumbprint}")
+}
+
 type GatewaySocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -1237,7 +1249,30 @@ struct GatewaySession {
     next_snapshot_poll: Instant,
     last_assistance_request_sent: Option<String>,
     pending_end_caller: HashMap<String, PendingEndCaller>,
+    /// Unhandled relay frame kinds already reported, so a Companion emitting one
+    /// on a timer cannot wrap the bounded log ring during a call. Bounded, and
+    /// keyed by kind so a genuinely NEW kind is still surfaced once.
+    dropped_relay_kinds: HashSet<String>,
+    /// When a refused relay hello was last reported, and how many refusals were
+    /// held back since. Every refusal is a security event worth recording, and
+    /// an approved-yet-misbehaving device retries on a timer, so refusals are
+    /// RATE-limited rather than capped: bounded tightly enough that they cannot
+    /// wrap the log ring during a call, but never permanently silent.
+    relay_hello_rejection_logged_at: Option<Instant>,
+    relay_hello_rejections_suppressed: u32,
+    /// A relay party that must be greeted again before the next publish,
+    /// carried from [`Self::accept_mobile_hello`] out to the carrier that owns
+    /// the greeting book. Set only for a hello whose proof VERIFIED, so an
+    /// unauthenticated frame can never provoke an extra hello.
+    relay_regreet_party: Option<String>,
 }
+
+/// Distinct unhandled relay kinds reported per session.
+const MAX_REPORTED_RELAY_KINDS: usize = 16;
+/// Shortest gap between two reported relay-hello refusals. Long enough that a
+/// device retrying on a timer cannot crowd the log ring during a call, short
+/// enough that a systematic refusal stays visible for as long as it persists.
+const RELAY_HELLO_REJECTION_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 struct PendingEndCaller {
     execute: PluginEndCallerExecuteFrame,
@@ -1263,7 +1298,16 @@ impl GatewaySession {
             next_snapshot_poll: Instant::now(),
             last_assistance_request_sent: None,
             pending_end_caller: HashMap::new(),
+            dropped_relay_kinds: HashSet::new(),
+            relay_hello_rejection_logged_at: None,
+            relay_hello_rejections_suppressed: 0,
+            relay_regreet_party: None,
         }
+    }
+
+    /// The relay party owed a fresh greeting, consumed once.
+    fn take_relay_regreet_party(&mut self) -> Option<String> {
+        self.relay_regreet_party.take()
     }
 
     fn rotate_credentials(
@@ -1606,6 +1650,322 @@ mod tests {
         session.authoritative_idle = false;
         assert!(session.idle_transition_frame().unwrap().is_some());
         assert!(session.idle_transition_frame().unwrap().is_none());
+    }
+
+    /// A real `mobile_hello`: signed by `signing_key` over the same
+    /// domain-separated claims the Companion signs, in the mobile peer-policy
+    /// shape (an expected peer, and no roster members at all).
+    fn mobile_hello(
+        session: &GatewaySession,
+        signing_key: &SigningKey,
+        device_id: &str,
+        jti: &str,
+        expected_peer_thumbprint: &str,
+    ) -> String {
+        let endpoint_key =
+            EndpointPublicKey::from_ed25519_bytes(&signing_key.verifying_key().to_bytes());
+        let now = unix_now().unwrap();
+        let session_nonce = format!("mobile_session_{device_id}");
+        let claims = HelloProofClaims {
+            app_id: session.app_id.clone(),
+            subject_id: device_id.to_owned(),
+            role: AdmissionRole::Mobile,
+            connection_id: "relay_c0ffee".into(),
+            challenge_nonce: "challenge_abc123".into(),
+            admission_jti: "jti_abc123".into(),
+            session_nonce: session_nonce.clone(),
+            holder_key_thumbprint: endpoint_key.thumbprint.clone(),
+            expected_peer_key_thumbprint: Some(expected_peer_thumbprint.to_owned()),
+            approved_peer_key_thumbprints: Vec::new(),
+            peer_roster_revision: None,
+            peer_roster_hash: None,
+            nonce: format!("hello_nonce_{jti}"),
+            jti: jti.to_owned(),
+            issued_at: now,
+            expires_at: now + 30,
+        };
+        let signature = URL_SAFE_NO_PAD.encode(
+            signing_key
+                .sign(&claims.signing_bytes().expect("claims canonicalize"))
+                .to_bytes(),
+        );
+        let hello = MobileHello {
+            kind: "mobile_hello".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: session.app_id.clone(),
+            device_id: device_id.to_owned(),
+            session_nonce,
+            endpoint_proof: SignedHelloProof {
+                endpoint_key,
+                claims,
+                signature,
+            },
+        };
+        // Internal consistency only; whether the SIGNER is approved is exactly
+        // what the plugin decides.
+        hello.validate().expect("test mobile hello is well formed");
+        serde_json::to_string(&hello).expect("test mobile hello encodes")
+    }
+
+    /// The approved Companion's key, as `test_authority` minted it.
+    fn approved_mobile_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[10; 32])
+    }
+
+    fn plugin_thumbprint(session: &GatewaySession) -> String {
+        session.endpoint_authority.endpoint_key.thumbprint.clone()
+    }
+
+    /// Leave publication in the state a quiet, already-running session reaches:
+    /// idle asserted once, nothing due for a minute.
+    fn quiesce_publication(session: &mut GatewaySession) {
+        session.authoritative_idle = true;
+        session.last_snapshot_fingerprint = Some("stale-fingerprint".into());
+        session.last_snapshot_sent = Some(Instant::now());
+        session.next_snapshot_poll = Instant::now() + Duration::from_secs(60);
+    }
+
+    fn publication_is_quiesced(session: &GatewaySession) -> bool {
+        session.authoritative_idle
+            && session.last_snapshot_fingerprint.is_some()
+            && session.last_snapshot_sent.is_some()
+            && session.next_snapshot_poll > Instant::now()
+    }
+
+    #[test]
+    fn approved_relay_hello_rearms_authoritative_publication_for_the_party_that_joined() {
+        let mut session = test_gateway_session();
+        let peer = plugin_thumbprint(&session);
+        let encoded = mobile_hello(
+            &session,
+            &approved_mobile_signing_key(),
+            "device_a",
+            "hello_jti_1",
+            &peer,
+        );
+        quiesce_publication(&mut session);
+
+        session
+            .accept_mobile_hello(&encoded)
+            .expect("an approved Companion hello is admitted");
+
+        // The carrier already registered the sender as a destination; this is
+        // the half that makes the plugin actually speak to it.
+        assert!(!session.authoritative_idle);
+        assert!(session.last_snapshot_fingerprint.is_none());
+        assert!(session.last_snapshot_sent.is_none());
+        assert!(session.next_snapshot_poll <= Instant::now());
+
+        // The behaviour that matters on a quiet line: authoritative state is
+        // published again rather than waiting for the next call.
+        assert!(session.idle_transition_frame().unwrap().is_some());
+
+        // Deliberately preserved, unlike rotate_credentials: clearing it would
+        // let assistance_frame fall into a consent re-check that can tear down
+        // a live call.
+        assert!(session.last_assistance_request_sent.is_none());
+    }
+
+    #[test]
+    fn an_admitted_relay_hello_makes_the_carrier_greet_that_party_again() {
+        let mut session = test_gateway_session();
+        let peer = plugin_thumbprint(&session);
+        let signing_key = approved_mobile_signing_key();
+        let thumbprint =
+            EndpointPublicKey::from_ed25519_bytes(&signing_key.verifying_key().to_bytes())
+                .thumbprint;
+
+        session
+            .accept_mobile_hello(&mobile_hello(
+                &session,
+                &signing_key,
+                "device_a",
+                "hello_jti_greet",
+                &peer,
+            ))
+            .expect("an approved Companion hello is admitted");
+
+        // Re-arming publication alone is not enough to go live. The Companion
+        // DROPS authoritative state from a peer whose endpoint key it has not
+        // seen proved, and it learns that proof only from our `plugin_hello` —
+        // which the carrier prepends once per party per plugin session. A
+        // Companion that restarts as a fresh process is the SAME party (its
+        // endpoint key is on disk) but has lost the proof, so without retiring
+        // its greeting it would receive every re-armed frame and drop all of
+        // them until this plugin session ends.
+        assert_eq!(
+            session.take_relay_regreet_party().as_deref(),
+            Some(relay_party(&thumbprint).as_str())
+        );
+        // Consumed once: the carrier re-greets on the next send, and a stale
+        // signal would make every later publish carry a redundant hello.
+        assert!(session.take_relay_regreet_party().is_none());
+    }
+
+    #[test]
+    fn a_refused_relay_hello_never_makes_the_plugin_reissue_its_hello() {
+        let mut session = test_gateway_session();
+        let peer = plugin_thumbprint(&session);
+
+        // Correctly signed, just not by a key the owner approved.
+        session
+            .handle_relay_peer_frame(&mobile_hello(
+                &session,
+                &SigningKey::from_bytes(&[11; 32]),
+                "device_intruder",
+                "hello_jti_greet_intruder",
+                &peer,
+            ))
+            .expect("a forged hello never terminates the session");
+
+        // The re-greet is driven by a proof that VERIFIED, so an unapproved
+        // party cannot make the plugin reissue anything on demand.
+        assert!(session.take_relay_regreet_party().is_none());
+    }
+
+    #[test]
+    fn a_replayed_relay_hello_is_refused_and_republishes_nothing() {
+        let mut session = test_gateway_session();
+        let peer = plugin_thumbprint(&session);
+        let encoded = mobile_hello(
+            &session,
+            &approved_mobile_signing_key(),
+            "device_a",
+            "hello_jti_replay",
+            &peer,
+        );
+        session.accept_mobile_hello(&encoded).unwrap();
+
+        quiesce_publication(&mut session);
+        let refusal = session.accept_mobile_hello(&encoded).unwrap_err();
+        // Pin WHICH gate refused it: a replay must be caught by the jti cache,
+        // not incidentally by an expired signature window.
+        assert!(refusal.message.contains("replayed"), "{refusal:?}");
+        assert!(publication_is_quiesced(&session));
+    }
+
+    #[test]
+    fn a_relay_hello_signed_outside_the_owner_approved_roster_is_refused() {
+        let mut session = test_gateway_session();
+        let peer = plugin_thumbprint(&session);
+        // Internally consistent and correctly signed — just not by a key the
+        // owner approved.
+        let encoded = mobile_hello(
+            &session,
+            &SigningKey::from_bytes(&[11; 32]),
+            "device_intruder",
+            "hello_jti_2",
+            &peer,
+        );
+        quiesce_publication(&mut session);
+
+        let refusal = session.accept_mobile_hello(&encoded).unwrap_err();
+        // The proof itself is valid; it is the ROSTER that refuses it. Pinning
+        // the reason keeps this from passing on a malformed-signature accident.
+        assert!(
+            refusal.message.contains("owner-approved roster"),
+            "{refusal:?}"
+        );
+        assert!(publication_is_quiesced(&session));
+    }
+
+    #[test]
+    fn a_relay_hello_addressed_to_another_plugin_endpoint_is_refused() {
+        let mut session = test_gateway_session();
+        let elsewhere =
+            EndpointPublicKey::from_ed25519_bytes(&SigningKey::from_bytes(&[12; 32]).verifying_key().to_bytes());
+        let encoded = mobile_hello(
+            &session,
+            &approved_mobile_signing_key(),
+            "device_a",
+            "hello_jti_3",
+            &elsewhere.thumbprint,
+        );
+        quiesce_publication(&mut session);
+
+        let refusal = session.accept_mobile_hello(&encoded).unwrap_err();
+        // This signer IS on the roster, so only the peer-binding check can
+        // refuse it — which is the point of the check.
+        assert!(
+            refusal.message.contains("different plugin endpoint"),
+            "{refusal:?}"
+        );
+        assert!(publication_is_quiesced(&session));
+    }
+
+    #[test]
+    fn unhandled_relay_frames_are_dropped_without_touching_the_session() {
+        let mut session = test_gateway_session();
+        quiesce_publication(&mut session);
+
+        for encoded in [
+            json!({"kind": "lease_request", "schemaVersion": SCHEMA_VERSION}).to_string(),
+            json!({"kind": "lease_heartbeat", "schemaVersion": SCHEMA_VERSION}).to_string(),
+            "{ this is not json".to_string(),
+        ] {
+            assert!(session
+                .handle_relay_peer_frame(&encoded)
+                .expect("relay peer traffic never terminates the session")
+                .is_empty());
+        }
+        assert!(publication_is_quiesced(&session));
+
+        // Reported once per distinct kind, so a Companion emitting one on a
+        // timer cannot wrap the log ring during a call.
+        assert!(session.handle_relay_peer_frame(&"{ this is not json".to_string()).is_ok());
+        assert_eq!(session.dropped_relay_kinds.len(), 3);
+    }
+
+    #[test]
+    fn the_relay_carrier_never_lets_peer_traffic_terminate_a_session_the_socket_still_refuses() {
+        let media = RemoteMediaHandle::spawn().unwrap();
+        let (radio, _control_rx) = crate::radio::RadioHandle::test_handle();
+        let peer = plugin_thumbprint(&test_gateway_session());
+        let hostile = [
+            json!({"kind": "lease_request", "schemaVersion": SCHEMA_VERSION}).to_string(),
+            json!({"kind": "error", "schemaVersion": SCHEMA_VERSION, "code": "boom", "message": "x"})
+                .to_string(),
+            json!({"kind": "claim_proposal", "schemaVersion": 9999}).to_string(),
+            "{ this is not json".to_string(),
+        ];
+
+        for encoded in &hostile {
+            // The carrier that carries untrusted peers: refuse the frame, keep
+            // the session.
+            let mut relay_session = test_gateway_session();
+            assert!(relay_session
+                .handle_inbound(encoded, &media, &radio, true)
+                .is_ok());
+
+            // The carrier that carries trusted gateway infrastructure: a
+            // violation still means the session is broken. Unchanged.
+            let mut socket_session = test_gateway_session();
+            assert!(socket_session
+                .handle_inbound(encoded, &media, &radio, false)
+                .is_err());
+        }
+
+        // The one actionable kind, on each carrier: admitted over the relay,
+        // and still an unsupported frame on the socket, where a real gateway
+        // never sends it.
+        let mut relay_session = test_gateway_session();
+        let hello = mobile_hello(
+            &relay_session,
+            &approved_mobile_signing_key(),
+            "device_a",
+            "hello_jti_4",
+            &peer,
+        );
+        quiesce_publication(&mut relay_session);
+        assert!(relay_session
+            .handle_inbound(&hello, &media, &radio, true)
+            .is_ok());
+        assert!(!publication_is_quiesced(&relay_session));
+
+        let mut socket_session = test_gateway_session();
+        assert!(socket_session
+            .handle_inbound(&hello, &media, &radio, false)
+            .is_err());
     }
 
     #[test]
@@ -2324,6 +2684,36 @@ impl GatewayTransport {
         }
     }
 
+    /// Which carrier this session actually opened.
+    ///
+    /// Derived from the transport that was opened, never from
+    /// `credentials.relay.is_some()`: the non-voice build advertises a relay in
+    /// its admission request and still runs the socket, so the advertisement
+    /// does not tell you which carrier is live.
+    fn is_relay(&self) -> bool {
+        match self {
+            Self::WebSocket(_) => false,
+            #[cfg(feature = "voice")]
+            Self::Relay(_) => true,
+        }
+    }
+
+    /// Retire a relay party's greeting so the next frame it receives is again
+    /// preceded by this session's signed `plugin_hello`.
+    ///
+    /// The socket has no greeting book — the gateway delivered the hello to
+    /// each connection itself — so this is a no-op there and the WebSocket path
+    /// stays byte-identical.
+    fn forget_greeting(&mut self, party: &str) {
+        match self {
+            Self::WebSocket(_) => {}
+            #[cfg(feature = "voice")]
+            Self::Relay(channel) => channel.forget_greeting(party),
+        }
+        // `party` is unused on a non-voice build, where no relay exists.
+        let _ = party;
+    }
+
     /// Preserve carrier-level continuity across an admission rotation.
     ///
     /// The socket needs nothing here — the gateway holds the routing and the
@@ -2607,11 +2997,12 @@ async fn run_socket(
         let Some(encoded) = transport.recv_text(READ_TICK).await? else {
             continue;
         };
+        let from_relay_peer = transport.is_relay();
         let inbound_kind = serde_json::from_str::<Envelope>(&encoded)
             .map(|frame| frame.kind)
             .unwrap_or_else(|_| "malformed".into());
         let outbound = session
-            .handle_inbound(&encoded, media, radio)
+            .handle_inbound(&encoded, media, radio, from_relay_peer)
             .map_err(|error| {
                 eprintln!(
                     "[aokie-plugin][companion] stage=inbound_rejected frame={} kind={} detail={}",
@@ -2621,6 +3012,15 @@ async fn run_socket(
                 );
                 error
             })?;
+        // Before anything else goes out: a Companion that just proved itself
+        // may have lost the proof WE gave it (a restarted process keeps its
+        // on-disk endpoint key, so it is the same party, but its memory of our
+        // hello is gone). Retire its greeting mark here, while the re-armed
+        // publish is still one loop turn away, so the state it is about to
+        // receive arrives behind a hello it can verify.
+        if let Some(party) = session.take_relay_regreet_party() {
+            transport.forget_greeting(&party);
+        }
         for encoded in outbound {
             transport.send_text(&encoded).await?;
         }
@@ -2976,7 +3376,25 @@ impl GatewaySession {
         encoded: &str,
         media: &RemoteMediaHandle,
         radio: &RadioHandle,
+        from_relay_peer: bool,
     ) -> Result<Vec<String>, WorkerError> {
+        // A relay peer is not the gateway.
+        //
+        // On the socket every frame was minted by trusted gateway
+        // infrastructure, so a protocol violation means this session is
+        // genuinely broken and tearing it down is the correct fail-closed
+        // response. On the relay the frame was posted by an
+        // approved-but-untrusted Companion; honouring its content as a
+        // lifecycle signal hands any roster member a one-frame kill switch.
+        //
+        // Over the relay the plugin therefore acts on exactly one inbound kind
+        // and drops everything else BEFORE any handler can mutate session
+        // state, which also makes partial-mutation-then-error structurally
+        // impossible on that carrier. Everything below this guard is reached
+        // only from the socket and is unchanged.
+        if from_relay_peer {
+            return self.handle_relay_peer_frame(encoded);
+        }
         let envelope: Envelope = serde_json::from_str(encoded)
             .map_err(|_| WorkerError::reconnect("Companion gateway frame is malformed"))?;
         if envelope.schema_version != SCHEMA_VERSION {
@@ -3075,6 +3493,173 @@ impl GatewaySession {
                 "Companion gateway sent an unsupported frame",
             )),
         }
+    }
+
+    /// Everything a Companion posts directly to this plugin over the relay.
+    ///
+    /// Returns `Ok` on every path — including malformed JSON, unknown kinds,
+    /// forged proofs and replays — so peer traffic can never terminate the
+    /// session. `WorkerError` is used inside only as a typed reason for the
+    /// log; it never escapes.
+    fn handle_relay_peer_frame(&mut self, encoded: &str) -> Result<Vec<String>, WorkerError> {
+        let kind = serde_json::from_str::<Envelope>(encoded)
+            .map(|frame| frame.kind)
+            .unwrap_or_else(|_| "malformed".into());
+        if kind == "mobile_hello" {
+            if let Err(error) = self.accept_mobile_hello(encoded) {
+                // Rate-limited, never capped. A lifetime cap would go silent
+                // after a handful of lines, and a SYSTEMATICALLY refused
+                // Companion (clock skew past the signature window, a roster
+                // that has not propagated, an assignment naming another
+                // Desktop) retries on a timer — so the cap would be spent in
+                // the first minute and every later refusal, including a
+                // genuinely new one, would vanish. The plugin log would then
+                // show nothing but `relay_no_destination`, which is exactly
+                // what a Companion that never spoke at all looks like: the
+                // undiagnosable deadlock this whole path exists to escape.
+                let due = self
+                    .relay_hello_rejection_logged_at
+                    .is_none_or(|at| at.elapsed() >= RELAY_HELLO_REJECTION_LOG_INTERVAL);
+                if due {
+                    eprintln!(
+                        "[aokie-plugin][companion] stage=relay_hello_rejected suppressed={} detail={}",
+                        self.relay_hello_rejections_suppressed,
+                        sanitize_status_message(&error.message)
+                    );
+                    self.relay_hello_rejection_logged_at = Some(Instant::now());
+                    self.relay_hello_rejections_suppressed = 0;
+                } else {
+                    self.relay_hello_rejections_suppressed =
+                        self.relay_hello_rejections_suppressed.saturating_add(1);
+                }
+            }
+            return Ok(Vec::new());
+        }
+        // Nothing is lost by dropping the rest. Every other arm parses a
+        // plugin-dialect twin only the gateway produces, so a Companion could
+        // not satisfy one anyway: MobileRtcSignalFrame carries leaseToken where
+        // PluginRtcSignalFrame does not, and MobileAssistanceAnswerFrame
+        // carries idempotencyKey where the plugin twin wants deviceId. Both
+        // twins are deny_unknown_fields, so the mobile shape cannot decode into
+        // the plugin one even by accident.
+        // Keyed on the SANITIZED code, never the raw kind. A relay frame may be
+        // just under the carrier's 1 MiB SSE ceiling and `kind` is peer-supplied
+        // string content, so retaining raw kinds would hold up to
+        // `MAX_REPORTED_RELAY_KINDS` megabyte-scale strings for the life of the
+        // session inside the process that also runs the radio. Keying on what is
+        // actually printed bounds retention to the 80-char sanitized form and
+        // closes the matching throttle bypass, where distinct raw kinds sharing a
+        // sanitized prefix each earned an identical log line.
+        let code = sanitize_gateway_code(&kind);
+        if self.dropped_relay_kinds.len() < MAX_REPORTED_RELAY_KINDS
+            && self.dropped_relay_kinds.insert(code.clone())
+        {
+            eprintln!(
+                "[aokie-plugin][companion] stage=relay_frame_dropped kind={code} detail=Only an authenticated mobile hello is actionable over the relay"
+            );
+        }
+        Ok(Vec::new())
+    }
+
+    /// Admit an owner-approved Companion onto this relay session.
+    ///
+    /// The carrier already registered the sender as a publish destination when
+    /// the frame arrived ([`crate::companion_relay::RelayChannel::learn_route`]),
+    /// so this proves the hello and then RE-ARMS authoritative publication.
+    /// The re-arm is the load-bearing half: publication is edge-triggered, so a
+    /// Companion joining a quiet line would otherwise register successfully and
+    /// then receive nothing until the next call.
+    fn accept_mobile_hello(&mut self, encoded: &str) -> Result<(), WorkerError> {
+        let hello: MobileHello = parse_gateway_frame(encoded)?;
+        // Pins kind, schemaVersion, and that role/appId/subjectId/sessionNonce
+        // agree with the proof's own claims.
+        hello
+            .validate()
+            .map_err(|_| WorkerError::reconnect("Companion hello failed contract validation"))?;
+        if hello.app_id != self.app_id {
+            return Err(WorkerError::rebootstrap(
+                "Companion hello crossed application identity",
+            ));
+        }
+        let now = unix_now()?;
+        // Signature over the domain-separated canonical claims, plus the
+        // bounded signature window.
+        hello.endpoint_proof.verify(now).map_err(|_| {
+            WorkerError::reconnect("Companion hello endpoint signature is invalid")
+        })?;
+        let claims = &hello.endpoint_proof.claims;
+        let approved = self
+            .endpoint_authority
+            .approved_mobile_keys
+            .get(&claims.holder_key_thumbprint)
+            .ok_or_else(|| {
+                WorkerError::reconnect(
+                    "Companion hello signer is absent from the owner-approved roster",
+                )
+            })?;
+        if *approved != hello.endpoint_proof.endpoint_key {
+            return Err(WorkerError::reconnect(
+                "Companion hello key does not match the owner-approved roster entry",
+            ));
+        }
+        // The mobile role always carries this (the protocol's peer policy makes
+        // it mandatory), and the identity service sets it to the assigned
+        // plugin's endpoint thumbprint — so it proves the hello was addressed to
+        // THIS plugin rather than replayed from a session with another Desktop.
+        if claims.expected_peer_key_thumbprint.as_deref()
+            != Some(self.endpoint_authority.endpoint_key.thumbprint.as_str())
+        {
+            return Err(WorkerError::reconnect(
+                "Companion hello addresses a different plugin endpoint",
+            ));
+        }
+        self.used_endpoint_jtis
+            .retain(|_, expires_at| *expires_at > now);
+        if self.used_endpoint_jtis.contains_key(&claims.jti) {
+            return Err(WorkerError::reconnect("Companion hello was replayed"));
+        }
+        if self.used_endpoint_jtis.len() >= MAX_USED_ENDPOINT_JTIS {
+            return Err(WorkerError::reconnect(
+                "Companion hello replay cache is exhausted",
+            ));
+        }
+        self.used_endpoint_jtis
+            .insert(claims.jti.clone(), claims.expires_at);
+
+        // Re-arm authoritative publication for the party that just joined:
+        // clear the idle latch, clear the snapshot fingerprint and its refresh
+        // clock, and mark the poll due so the next loop turn publishes.
+        //
+        // `last_assistance_request_sent` is DELIBERATELY left alone, unlike
+        // `rotate_credentials`. `assistance_frame` short-circuits on that field
+        // BEFORE its consent re-check, and that re-check returns an error when
+        // consent has degraded mid-call — clearing it here would open a new
+        // session-teardown path during an active call.
+        self.authoritative_idle = false;
+        self.last_snapshot_fingerprint = None;
+        self.last_snapshot_sent = None;
+        self.next_snapshot_poll = Instant::now();
+
+        // Re-arming publication is only half of going live. The Companion
+        // DROPS authoritative state from a peer that has not proved its
+        // endpoint key, and it learns that proof from our `plugin_hello`, which
+        // the carrier prepends exactly ONCE per party per plugin session. A
+        // Companion that already greeted, then restarted as a fresh process,
+        // has lost its in-memory proof while our greeting book still records it
+        // as greeted — so it would receive every re-armed frame and drop every
+        // one of them, for the rest of this plugin session.
+        //
+        // A verified `mobile_hello` IS the signal that a Companion has started
+        // a session with us, so it retires that party's greeting mark. The
+        // party is derived from the thumbprint the signature just proved, never
+        // from the carrier's routing header or the frame's self-asserted
+        // `deviceId`.
+        self.relay_regreet_party = Some(relay_party(&claims.holder_key_thumbprint));
+        eprintln!(
+            "[aokie-plugin][companion] stage=relay_peer_hello device={} detail=An approved Companion joined this relay session and authoritative state was re-armed",
+            sanitize_gateway_code(&hello.device_id)
+        );
+        Ok(())
     }
 
     fn handle_end_caller_execute(
