@@ -29,7 +29,13 @@ use tokio::sync::mpsc;
 
 pub const MAX_REMOTE_PEERS: usize = 6;
 pub const REMOTE_CONSENT_POLICY_ID: &str = "aokie_remote_access";
+// Lifecycle commands must remain available while negotiation and caller audio
+// are busy. ICE gets its own admitted-burst-sized lane; PCM is deliberately
+// small and lossy because stale audio is less useful than the current frame.
 const ACTOR_QUEUE_CAPACITY: usize = 12;
+const REMOTE_ICE_QUEUE_CAPACITY: usize = 128;
+const CALLER_PCM_QUEUE_CAPACITY: usize = 4;
+const REMOTE_ICE_BATCH_SIZE: usize = 8;
 const MANAGER_QUEUE_CAPACITY: usize = 32;
 const ROUTED_AUDIO_FRAMES: usize = 16;
 const EVENT_QUEUE_CAPACITY: usize = 128;
@@ -293,6 +299,8 @@ struct PeerSlot {
     binding: SessionBinding,
     lease_expires_at: Instant,
     actor_tx: mpsc::Sender<ActorCommand>,
+    remote_ice_tx: mpsc::Sender<IceCandidateSignal>,
+    caller_pcm_tx: mpsc::Sender<Arc<Vec<i16>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -405,8 +413,6 @@ enum ManagerCommand {
 }
 
 enum ActorCommand {
-    CallerPcm(Arc<Vec<i16>>),
-    AddIce(IceCandidateSignal),
     Authorize(RoutePermit),
     Revoke,
     Close,
@@ -781,9 +787,9 @@ impl RemoteMediaHandle {
         candidate: IceCandidateSignal,
     ) -> Result<(), String> {
         candidate.validate().map_err(|error| error.to_string())?;
-        let actor = self.actor_for(rtc_session_id)?;
-        actor
-            .try_send(ActorCommand::AddIce(candidate))
+        let remote_ice = self.remote_ice_for(rtc_session_id)?;
+        remote_ice
+            .try_send(candidate)
             .map_err(|error| format!("peer signalling queue unavailable: {error}"))
     }
 
@@ -1140,7 +1146,7 @@ impl RemoteMediaHandle {
         if normalized.is_empty() {
             return false;
         }
-        let actor = {
+        let caller_pcm = {
             let Ok(state) = self.inner.state.try_lock() else {
                 return false;
             };
@@ -1153,9 +1159,9 @@ impl RemoteMediaHandle {
             state
                 .peers
                 .get(&active.binding.rtc_session_id)
-                .map(|slot| slot.actor_tx.clone())
+                .map(|slot| slot.caller_pcm_tx.clone())
         };
-        actor.is_some_and(|actor| actor.try_send(ActorCommand::CallerPcm(normalized)).is_ok())
+        caller_pcm.is_some_and(|caller_pcm| caller_pcm.try_send(normalized).is_ok())
     }
 
     /// Pop one independently revalidated talk frame for the radio thread.
@@ -1338,6 +1344,8 @@ impl RemoteMediaHandle {
     ) -> Result<(), String> {
         let ttl = validate_ttl(lease_ttl_ms)?;
         let (actor_tx, _actor_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
+        let (remote_ice_tx, _remote_ice_rx) = mpsc::channel(REMOTE_ICE_QUEUE_CAPACITY);
+        let (caller_pcm_tx, _caller_pcm_rx) = mpsc::channel(CALLER_PCM_QUEUE_CAPACITY);
         let mut state = self
             .inner
             .state
@@ -1347,6 +1355,8 @@ impl RemoteMediaHandle {
             binding: binding.clone(),
             lease_expires_at: Instant::now() + ttl,
             actor_tx,
+            remote_ice_tx,
+            caller_pcm_tx,
         })?;
         state.request_soft_hold(binding, ttl)?;
         drop(state);
@@ -1354,14 +1364,17 @@ impl RemoteMediaHandle {
         Ok(())
     }
 
-    fn actor_for(&self, rtc_session_id: &str) -> Result<mpsc::Sender<ActorCommand>, String> {
+    fn remote_ice_for(
+        &self,
+        rtc_session_id: &str,
+    ) -> Result<mpsc::Sender<IceCandidateSignal>, String> {
         self.inner
             .state
             .lock()
             .map_err(|_| "remote media state poisoned".to_string())?
             .peers
             .get(rtc_session_id)
-            .map(|slot| slot.actor_tx.clone())
+            .map(|slot| slot.remote_ice_tx.clone())
             .ok_or_else(|| format!("unknown or closed rtcSessionId {rtc_session_id:?}"))
     }
 
@@ -1480,11 +1493,7 @@ impl RemoteMediaInner {
             ) {
                 continue;
             }
-            if slot
-                .actor_tx
-                .try_send(ActorCommand::CallerPcm(normalized.clone()))
-                .is_err()
-            {
+            if slot.caller_pcm_tx.try_send(normalized.clone()).is_err() {
                 self.dropped_sco_frames.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1520,11 +1529,7 @@ impl RemoteMediaInner {
             ) {
                 continue;
             }
-            if slot
-                .actor_tx
-                .try_send(ActorCommand::CallerPcm(normalized.clone()))
-                .is_err()
-            {
+            if slot.caller_pcm_tx.try_send(normalized.clone()).is_err() {
                 self.dropped_sco_frames.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -2857,11 +2862,17 @@ async fn manager_loop(
                 match DesktopPeer::answer(binding.clone(), request.offer, options).await {
                     Ok((peer, answer)) => {
                         let (actor_tx, actor_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
+                        let (remote_ice_tx, remote_ice_rx) =
+                            mpsc::channel(REMOTE_ICE_QUEUE_CAPACITY);
+                        let (caller_pcm_tx, caller_pcm_rx) =
+                            mpsc::channel(CALLER_PCM_QUEUE_CAPACITY);
                         let slot = PeerSlot {
                             binding: binding.clone(),
                             lease_expires_at: Instant::now()
                                 + Duration::from_millis(request.lease_ttl_ms),
                             actor_tx: actor_tx.clone(),
+                            remote_ice_tx,
+                            caller_pcm_tx,
                         };
                         let inserted = state
                             .lock()
@@ -2888,6 +2899,8 @@ async fn manager_loop(
                         tokio::spawn(peer_actor(
                             peer,
                             actor_rx,
+                            remote_ice_rx,
+                            caller_pcm_rx,
                             state.clone(),
                             talk_tx.clone(),
                             consult_tx.clone(),
@@ -2912,9 +2925,58 @@ async fn manager_loop(
     }
 }
 
+fn handle_actor_command(
+    peer: &mut DesktopPeer,
+    command: ActorCommand,
+    binding: &SessionBinding,
+    events: &EventEmitter,
+) -> bool {
+    match command {
+        ActorCommand::Authorize(permit) => {
+            if let Err(error) = peer.authorize_caller_transmit(permit) {
+                events.emit(
+                    binding,
+                    RemoteMediaEventKind::Error {
+                        operation: "authorize".into(),
+                        message: error.to_string(),
+                    },
+                );
+            }
+        }
+        ActorCommand::Revoke => peer.revoke_caller_transmit(),
+        ActorCommand::Close => {
+            peer.close();
+            return true;
+        }
+    }
+    false
+}
+
+fn drain_actor_commands(
+    peer: &mut DesktopPeer,
+    commands: &mut mpsc::Receiver<ActorCommand>,
+    binding: &SessionBinding,
+    events: &EventEmitter,
+) -> (bool, bool) {
+    let mut worked = false;
+    while let Ok(command) = commands.try_recv() {
+        worked = true;
+        if handle_actor_command(peer, command, binding, events) {
+            return (worked, true);
+        }
+    }
+    if commands.is_closed() {
+        peer.close();
+        return (worked, true);
+    }
+    (worked, false)
+}
+
 async fn peer_actor(
     mut peer: DesktopPeer,
     mut commands: mpsc::Receiver<ActorCommand>,
+    mut remote_ice: mpsc::Receiver<IceCandidateSignal>,
+    mut caller_pcm: mpsc::Receiver<Arc<Vec<i16>>>,
     state: Arc<Mutex<RemoteMediaState>>,
     talk_tx: std_mpsc::SyncSender<RoutedAudio>,
     consult_tx: std_mpsc::SyncSender<RoutedAudio>,
@@ -2924,52 +2986,57 @@ async fn peer_actor(
     let binding = peer.binding().clone();
     let mut microphone_pcm_observed = false;
     loop {
-        let mut worked = false;
-        while let Ok(command) = commands.try_recv() {
+        let (mut worked, should_close) =
+            drain_actor_commands(&mut peer, &mut commands, &binding, &events);
+        if should_close {
+            return;
+        }
+
+        for _ in 0..REMOTE_ICE_BATCH_SIZE {
+            let (control_worked, should_close) =
+                drain_actor_commands(&mut peer, &mut commands, &binding, &events);
+            worked |= control_worked;
+            if should_close {
+                return;
+            }
+            let Ok(candidate) = remote_ice.try_recv() else {
+                break;
+            };
             worked = true;
-            match command {
-                ActorCommand::CallerPcm(samples) => {
-                    if let Err(error) = peer.push_caller_pcm(samples.as_slice()).await {
-                        events.emit(
-                            &binding,
-                            RemoteMediaEventKind::Error {
-                                operation: "caller_pcm".into(),
-                                message: error.to_string(),
-                            },
-                        );
-                    }
-                }
-                ActorCommand::AddIce(candidate) => {
-                    if let Err(error) = peer.add_remote_candidate(candidate).await {
-                        events.emit(
-                            &binding,
-                            RemoteMediaEventKind::Error {
-                                operation: "remote_ice".into(),
-                                message: error.to_string(),
-                            },
-                        );
-                    }
-                }
-                ActorCommand::Authorize(permit) => {
-                    if let Err(error) = peer.authorize_caller_transmit(permit) {
-                        events.emit(
-                            &binding,
-                            RemoteMediaEventKind::Error {
-                                operation: "authorize".into(),
-                                message: error.to_string(),
-                            },
-                        );
-                    }
-                }
-                ActorCommand::Revoke => peer.revoke_caller_transmit(),
-                ActorCommand::Close => {
-                    peer.close();
-                    return;
-                }
+            if let Err(error) = peer.add_remote_candidate(candidate).await {
+                events.emit(
+                    &binding,
+                    RemoteMediaEventKind::Error {
+                        operation: "remote_ice".into(),
+                        message: error.to_string(),
+                    },
+                );
             }
         }
-        if commands.is_closed() {
-            peer.close();
+
+        let (control_worked, should_close) =
+            drain_actor_commands(&mut peer, &mut commands, &binding, &events);
+        worked |= control_worked;
+        if should_close {
+            return;
+        }
+        if let Ok(samples) = caller_pcm.try_recv() {
+            worked = true;
+            if let Err(error) = peer.push_caller_pcm(samples.as_slice()).await {
+                events.emit(
+                    &binding,
+                    RemoteMediaEventKind::Error {
+                        operation: "caller_pcm".into(),
+                        message: error.to_string(),
+                    },
+                );
+            }
+        }
+
+        let (control_worked, should_close) =
+            drain_actor_commands(&mut peer, &mut commands, &binding, &events);
+        worked |= control_worked;
+        if should_close {
             return;
         }
 
@@ -3138,12 +3205,24 @@ mod tests {
         tx
     }
 
+    fn remote_ice() -> mpsc::Sender<IceCandidateSignal> {
+        let (tx, _rx) = mpsc::channel(2);
+        tx
+    }
+
+    fn caller_pcm() -> mpsc::Sender<Arc<Vec<i16>>> {
+        let (tx, _rx) = mpsc::channel(2);
+        tx
+    }
+
     fn insert(state: &mut RemoteMediaState, binding: SessionBinding, ttl: Duration) {
         state
             .insert_peer(PeerSlot {
                 binding,
                 lease_expires_at: Instant::now() + ttl,
                 actor_tx: actor(),
+                remote_ice_tx: remote_ice(),
+                caller_pcm_tx: caller_pcm(),
             })
             .unwrap();
     }
@@ -3672,6 +3751,86 @@ mod tests {
     }
 
     #[test]
+    fn saturated_audio_and_ice_lanes_do_not_starve_lifecycle_control() {
+        let handle = RemoteMediaHandle::spawn().unwrap();
+        let talk = binding(MediaMode::Talk, 0, 7, "lane-isolation");
+        let (actor_tx, mut actor_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
+        let (remote_ice_tx, mut remote_ice_rx) = mpsc::channel(REMOTE_ICE_QUEUE_CAPACITY);
+        let (caller_pcm_tx, mut caller_pcm_rx) = mpsc::channel(CALLER_PCM_QUEUE_CAPACITY);
+        {
+            let mut state = handle.inner.state.lock().unwrap();
+            *state = active_state();
+            state.peers.insert(
+                talk.rtc_session_id.clone(),
+                PeerSlot {
+                    binding: talk.clone(),
+                    lease_expires_at: Instant::now() + Duration::from_secs(30),
+                    actor_tx: actor_tx.clone(),
+                    remote_ice_tx,
+                    caller_pcm_tx,
+                },
+            );
+        }
+
+        for _ in 0..CALLER_PCM_QUEUE_CAPACITY {
+            handle.inner.try_push_sco(&[1; 320], MEDIA_SAMPLE_RATE_HZ);
+        }
+        assert_eq!(caller_pcm_rx.len(), CALLER_PCM_QUEUE_CAPACITY);
+        handle.inner.try_push_sco(&[1; 320], MEDIA_SAMPLE_RATE_HZ);
+        assert_eq!(handle.inner.dropped_sco_frames.load(Ordering::Relaxed), 1);
+
+        for index in 0..REMOTE_ICE_QUEUE_CAPACITY {
+            handle
+                .add_remote_ice(
+                    &talk.rtc_session_id,
+                    IceCandidateSignal {
+                        sdp_mid: "audio".into(),
+                        sdp_mline_index: 0,
+                        candidate: format!(
+                            "candidate:{index} 1 udp 2122260223 192.0.2.1 {} typ host",
+                            10_000 + index
+                        ),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(remote_ice_rx.len(), REMOTE_ICE_QUEUE_CAPACITY);
+        assert!(handle
+            .add_remote_ice(
+                &talk.rtc_session_id,
+                IceCandidateSignal {
+                    sdp_mid: "audio".into(),
+                    sdp_mline_index: 0,
+                    candidate: "candidate:full 1 udp 1 192.0.2.1 9 typ host".into(),
+                },
+            )
+            .unwrap_err()
+            .contains("no available capacity"));
+
+        actor_tx
+            .try_send(ActorCommand::Authorize(
+                RoutePermit::new(talk.clone(), Duration::from_secs(5)).unwrap(),
+            ))
+            .unwrap();
+        actor_tx.try_send(ActorCommand::Revoke).unwrap();
+        actor_tx.try_send(ActorCommand::Close).unwrap();
+
+        assert!(matches!(
+            actor_rx.try_recv(),
+            Ok(ActorCommand::Authorize(permit)) if permit.binding == talk
+        ));
+        assert!(matches!(actor_rx.try_recv(), Ok(ActorCommand::Revoke)));
+        assert!(matches!(actor_rx.try_recv(), Ok(ActorCommand::Close)));
+        assert_eq!(caller_pcm_rx.len(), CALLER_PCM_QUEUE_CAPACITY);
+        assert_eq!(remote_ice_rx.len(), REMOTE_ICE_QUEUE_CAPACITY);
+
+        // Keep both receivers observably alive until all assertions above;
+        // dropping either one would turn isolation into a false closed-channel pass.
+        assert!(caller_pcm_rx.try_recv().is_ok());
+        assert!(remote_ice_rx.try_recv().is_ok());
+    }
+
+    #[test]
     fn monitor_and_talk_get_caller_ingress_but_private_consult_never_does() {
         let state = active_state();
         let now = Instant::now();
@@ -3680,6 +3839,8 @@ mod tests {
             binding: binding(mode, 0, 0, suffix),
             lease_expires_at: expires_at,
             actor_tx: actor(),
+            remote_ice_tx: remote_ice(),
+            caller_pcm_tx: caller_pcm(),
         };
         let monitor = slot(MediaMode::Monitor, "monitor");
         let prepared = slot(MediaMode::PreparedTalk, "prepared");
