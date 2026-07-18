@@ -4,7 +4,9 @@
 //! frame to the current, short-lived lease and drives `aokie-media` directly.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::future::{pending, Future};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,7 +56,7 @@ use crate::media::{
 use crate::peer_trust::PeerTrustState;
 use crate::realtime::{
     activate_session, emit_transport, enqueue_encoded, invalidate_session, session_is_current,
-    ConnectionSlot, RealtimeConfig, RealtimeState, TransportEvent,
+    ConnectionSlot, OutboundCommand, RealtimeConfig, RealtimeState, TransportEvent,
 };
 
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
@@ -72,12 +74,42 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(7);
 // expiry without churning authority immediately after a claim transition.
 const LEASE_RENEWAL_WINDOW: Duration = Duration::from_secs(HEARTBEAT_INTERVAL.as_secs() * 2);
 const MAX_RECONNECT_DELAY: u64 = 20;
-const ADMISSION_REFRESH_MARGIN: Duration = Duration::from_secs(20);
+// The live signer issues 90-second admissions. Starting a full worst-case
+// OAuth/401 recovery path 83 seconds early would therefore re-admit/re-greet
+// every seven seconds forever. Normal overlap budgets one admission request,
+// socket connect, challenge, the bounded hello, and retry headroom. Lease
+// continuity is independent of the remaining sync time: the predecessor keeps
+// renewing until the hello fence, then the replacement applies its exact
+// renewal immediately while authoritative state is still arriving. An unusual
+// OAuth recovery that exceeds this overlap fails safe and reconnects rather
+// than turning every healthy session into continuous rotation traffic.
+const MANAGED_ADMISSION_PRIMARY_HTTP_BUDGET: Duration = Duration::from_secs(10);
+const MANAGED_HANDOFF_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+const MANAGED_HANDOFF_RETRY_HEADROOM: Duration = Duration::from_secs(12);
+const ADMISSION_REFRESH_MARGIN: Duration = Duration::from_secs(
+    MANAGED_ADMISSION_PRIMARY_HTTP_BUDGET.as_secs()
+        + CONNECT_TIMEOUT.as_secs()
+        + CONNECT_TIMEOUT.as_secs()
+        + MANAGED_HANDOFF_SEND_TIMEOUT.as_secs()
+        + MANAGED_HANDOFF_RETRY_HEADROOM.as_secs(),
+);
+// The old socket becomes unwritable as soon as the gateway accepts the
+// replacement hello. Never begin that bounded hello + heartbeat pair with a
+// token that cannot remain valid through both writes. A due renewal continues
+// on the replacement while it waits for authoritative sync.
+const MANAGED_HANDOFF_MIN_LEASE_REMAINING: Duration =
+    Duration::from_secs(MANAGED_HANDOFF_SEND_TIMEOUT.as_secs() * 2 + 2);
 const NATIVE_ACTION_POLL: Duration = Duration::from_millis(200);
 const URGENT_CONTROL_POLL: Duration = Duration::from_millis(100);
 const NATIVE_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const LEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const REVOKE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(4);
+// UI confirmation times out quickly, but relay/status delivery can lag across
+// the full 20-second plugin lease. Retain only the exact locally-closed lineage
+// long enough to contain and return a late renewal/RTC frame without reviving
+// native media or failing the authenticated carrier.
+const LOCAL_EXPIRY_TOMBSTONE_TTL: Duration = Duration::from_secs(30);
+const MAX_LOCAL_EXPIRY_TOMBSTONES: usize = 16;
 const MAX_ANSWERED_ASSISTANCE_REQUESTS: usize = 64;
 const MAX_COMPLETED_REVOKES: usize = 256;
 // Native media activation failures must surrender the authority the Desktop
@@ -252,6 +284,29 @@ impl V2Transport {
         }
     }
 
+    /// The replacement socket has a much smaller safety budget than ordinary
+    /// traffic: once its hello is accepted the predecessor is fenced, so a
+    /// stalled write must fail closed before the current 20-second lease can
+    /// age out silently. Relay HTTP retains its own request timeout and never
+    /// fences the live reader during refresh.
+    async fn send_managed_handoff_text(&mut self, encoded: String) -> bool {
+        if self.is_relay() {
+            return self.send_text(encoded).await;
+        }
+        let Self::WebSocket { writer, .. } = self else {
+            unreachable!("relay handoff returned above")
+        };
+        if encoded.len() > MAX_MESSAGE_BYTES {
+            return false;
+        }
+        send_message_with_timeout(
+            writer,
+            Message::Text(encoded.into()),
+            MANAGED_HANDOFF_SEND_TIMEOUT,
+        )
+        .await
+    }
+
     async fn send_ping(&mut self) -> bool {
         match self {
             Self::WebSocket { writer, .. } => {
@@ -300,6 +355,10 @@ impl V2Transport {
 
     fn is_relay(&self) -> bool {
         matches!(self, Self::Relay(_))
+    }
+
+    fn same_carrier_as(&self, other: &Self) -> bool {
+        managed_carrier_continuity(self.is_relay(), other.is_relay())
     }
 
     fn unsupported_user_frame(&self, encoded: &str) -> Option<&'static str> {
@@ -361,18 +420,29 @@ impl V2Transport {
         }
     }
 
-    /// Preserve carrier-level continuity across an admission rotation.
-    ///
-    /// The socket needs nothing here — the gateway holds the routing and the
-    /// predecessor stays live during the overlap. The relay has no such
-    /// middleman: its replacement must inherit the read cursor and any frame
-    /// already read but not yet handled, or it re-reads what the session has
-    /// already processed. The shim's sequence must carry too, because the
-    /// session tracks authoritative state on a monotonic high-water mark.
-    fn adopt_routing_from(&mut self, previous: &mut Self) {
-        if let (Self::Relay(next), Self::Relay(previous)) = (self, previous) {
-            next.channel.adopt_routing_from(&mut previous.channel);
-            next.shim.adopt_sequence_from(&previous.shim);
+    /// Install a same-carrier managed refresh. Relay keeps its one ordered SSE
+    /// reader/cursor and rotates credentials in place; WebSocket moves to the
+    /// already-synchronised replacement whose hello fenced the old socket.
+    fn install_managed_replacement(&mut self, replacement: Self) -> Result<(), String> {
+        match replacement {
+            Self::Relay(mut next) => match self {
+                Self::Relay(current) => {
+                    current.channel.refresh_credentials_from(&next.channel)?;
+                    next.shim.adopt_sequence_from(&current.shim);
+                    current.shim = next.shim;
+                    Ok(())
+                }
+                Self::WebSocket { .. } => {
+                    Err("managed carrier changed during relay refresh".into())
+                }
+            },
+            Self::WebSocket { writer, reader } => match self {
+                Self::WebSocket { .. } => {
+                    *self = Self::WebSocket { writer, reader };
+                    Ok(())
+                }
+                Self::Relay(_) => Err("managed carrier changed during socket refresh".into()),
+            },
         }
     }
 
@@ -381,6 +451,18 @@ impl V2Transport {
     // per-connection state and already-posted frames stay readable until their
     // TTL expires. Sending a socket close frame here would be new behaviour on
     // a path a live call depends on.
+}
+
+fn managed_carrier_continuity(current_is_relay: bool, replacement_is_relay: bool) -> bool {
+    current_is_relay == replacement_is_relay
+}
+
+fn predecessor_receive_enabled(predecessor_failed: bool, fence_started: bool) -> bool {
+    !predecessor_failed && !fence_started
+}
+
+fn predecessor_arm_still_current(fence_started: &AtomicBool) -> bool {
+    !fence_started.load(Ordering::Acquire)
 }
 
 /// The gateway's translation job, done client-side on the relay path.
@@ -507,7 +589,13 @@ impl GatewayShim {
     fn translate(&mut self, encoded: &str) -> Result<Option<String>, String> {
         match parse_kind(encoded)?.as_str() {
             "plugin_hello" => {
-                self.accept_peer_hello(encoded)?;
+                // Relay mail can outlive the short proof carried by a hello.
+                // A stale re-greeting is carrier traffic: it must neither
+                // authorize an unverified replacement nor tear down an
+                // already-verified predecessor (and its live media route).
+                // Structural, signature, app and pinned-key failures remain
+                // fatal in `accept_peer_hello`.
+                let _ = self.accept_peer_hello(encoded)?;
                 Ok(None)
             }
             "plugin_snapshot" => {
@@ -748,13 +836,15 @@ impl GatewayShim {
         false
     }
 
-    fn accept_peer_hello(&mut self, encoded: &str) -> Result<(), String> {
+    /// Returns `true` only when this frame freshly verifies the pinned peer.
+    /// An expired proof is a non-authorizing no-op because relay delivery can
+    /// legitimately lag past the proof window. It deliberately leaves the
+    /// current verification bit unchanged: false stays fail-closed, while a
+    /// live carrier that already proved this exact pinned key is not de-
+    /// authenticated by a redundant stale re-greeting.
+    fn accept_peer_hello(&mut self, encoded: &str) -> Result<bool, String> {
         let hello: PluginHello = strict_parse(encoded, "plugin hello")?;
         hello.validate().map_err(|error| error.to_string())?;
-        hello
-            .endpoint_proof
-            .verify(unix_now()?)
-            .map_err(|error| error.to_string())?;
         if hello.app_id != self.app_id {
             return Err("relay peer hello is bound to another app".into());
         }
@@ -765,11 +855,30 @@ impl GatewayShim {
         if hello.endpoint_proof.claims.holder_key_thumbprint != self.expected_peer_key_thumbprint {
             return Err("relay peer hello presented an unexpected Desktop endpoint key".into());
         }
+        let now = unix_now()?;
+        match hello.endpoint_proof.verify(now) {
+            Ok(()) => {}
+            Err(V2ProtocolError::Expired) if hello.endpoint_proof.claims.expires_at <= now => {
+                // `verify(now)` checks the clock before the signature. Re-run
+                // the complete proof verification at its original issue time
+                // so an expired frame with a forged signature is still fatal;
+                // only a once-valid, correctly signed proof is stale traffic.
+                hello
+                    .endpoint_proof
+                    .verify(hello.endpoint_proof.claims.issued_at)
+                    .map_err(|error| error.to_string())?;
+                eprintln!(
+                    "[AokieCompanion][relay] dropped stale plugin_hello without changing peer authority"
+                );
+                return Ok(false);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
         if !self.peer_verified {
             eprintln!("[AokieCompanion][relay] Desktop peer proved its endpoint key");
         }
         self.peer_verified = true;
-        Ok(())
+        Ok(true)
     }
 
     fn project(&mut self, frame: PluginSnapshotFrame) -> Result<Option<String>, String> {
@@ -914,6 +1023,7 @@ struct ClientState {
     pending: Option<PendingLease>,
     lease: Option<ClientLease>,
     pending_revoke: Option<PendingRevoke>,
+    local_expiry_tombstones: VecDeque<LocalExpiryTombstone>,
     pending_native_end: Option<PendingNativeEnd>,
     ice_servers: Vec<IceServerConfig>,
     relay_only: bool,
@@ -1319,35 +1429,12 @@ fn queue_exact_lease_revocation(
     if client.pending_revoke.is_some() {
         return Err("another lease return already fences admission de-escalation".into());
     }
-    let request_id = state.next_id("request");
-    let frame = LeaseRevokeFrame {
-        kind: "lease_revoke".into(),
-        schema_version: SCHEMA_VERSION,
-        app_id: lease.claims.app_id.clone(),
-        request_id: request_id.clone(),
-        idempotency_key: format!(
-            "mobile:{}:{}",
-            lease.claims.device_id,
-            state.next_id("admission_revoke")
-        ),
-        lease_token: lease.token.clone(),
-        reason: reason.into(),
-    };
-    frame.validate().map_err(|error| error.to_string())?;
-    let encoded = serde_json::to_string(&frame)
-        .map_err(|_| "could not encode admission-revoked lease return".to_string())?;
+    let queued = exact_lease_revocation_frame(state, lease, reason)?;
+    let request_id = queued.request_id.clone();
     let queue_error = if client.urgent_control_frames.len() >= MAX_URGENT_CONTROL_FRAMES {
         Some("urgent lease-revoke queue reached its safety bound".to_string())
     } else {
-        client.urgent_control_frames.push_back(UrgentControlFrame {
-            app_id: lease.claims.app_id.clone(),
-            request_id: request_id.clone(),
-            lease_id: lease.claims.lease_id.clone(),
-            lease_jti: lease.claims.jti.clone(),
-            rtc_session_id: lease.claims.rtc_session_id.clone(),
-            fence: lease.claims.fence,
-            encoded,
-        });
+        client.urgent_control_frames.push_back(queued);
         None
     };
     let authoritative_sequence = client.authoritative_sequence;
@@ -1376,6 +1463,39 @@ fn queue_exact_lease_revocation(
     }
 }
 
+fn exact_lease_revocation_frame(
+    state: &V2State,
+    lease: &ClientLease,
+    reason: &str,
+) -> Result<UrgentControlFrame, String> {
+    let request_id = state.next_id("request");
+    let frame = LeaseRevokeFrame {
+        kind: "lease_revoke".into(),
+        schema_version: SCHEMA_VERSION,
+        app_id: lease.claims.app_id.clone(),
+        request_id: request_id.clone(),
+        idempotency_key: format!(
+            "mobile:{}:{}",
+            lease.claims.device_id,
+            state.next_id("admission_revoke")
+        ),
+        lease_token: lease.token.clone(),
+        reason: reason.into(),
+    };
+    frame.validate().map_err(|error| error.to_string())?;
+    let encoded = serde_json::to_string(&frame)
+        .map_err(|_| "could not encode admission-revoked lease return".to_string())?;
+    Ok(UrgentControlFrame {
+        app_id: lease.claims.app_id.clone(),
+        request_id,
+        lease_id: lease.claims.lease_id.clone(),
+        lease_jti: lease.claims.jti.clone(),
+        rtc_session_id: lease.claims.rtc_session_id.clone(),
+        fence: lease.claims.fence,
+        encoded,
+    })
+}
+
 #[derive(Clone)]
 struct PendingRevoke {
     request_id: String,
@@ -1386,6 +1506,162 @@ struct PendingRevoke {
     authoritative_remote_revision: Option<u64>,
     native_action_id: Option<String>,
     deadline: Instant,
+}
+
+#[derive(Clone)]
+struct LocalExpiryTombstone {
+    lease: ClientLease,
+    retain_until: Instant,
+    /// Only the newest locally-returnable descendant retains its opaque bearer
+    /// token. Ancestors keep claims/session routing solely to authenticate and
+    /// discard late RTC/revoke traffic.
+    returnable: bool,
+}
+
+fn purge_local_expiry_tombstones(client: &mut ClientState, now: Instant) {
+    client
+        .local_expiry_tombstones
+        .retain(|tombstone| tombstone.retain_until > now);
+}
+
+fn push_local_expiry_tombstone(
+    client: &mut ClientState,
+    mut lease: ClientLease,
+    retain_until: Instant,
+    returnable: bool,
+) -> Result<(), String> {
+    purge_local_expiry_tombstones(client, Instant::now());
+    if let Some(existing) = client
+        .local_expiry_tombstones
+        .iter_mut()
+        .find(|existing| existing.lease.claims.jti == lease.claims.jti)
+    {
+        if returnable {
+            existing.lease = lease;
+            existing.returnable = true;
+        }
+        existing.retain_until = existing.retain_until.min(retain_until);
+        return Ok(());
+    }
+    if client.local_expiry_tombstones.len() >= MAX_LOCAL_EXPIRY_TOMBSTONES {
+        return Err("local media safety-fence capacity is exhausted".into());
+    }
+    if !returnable {
+        lease.token.clear();
+    }
+    client
+        .local_expiry_tombstones
+        .push_back(LocalExpiryTombstone {
+            lease,
+            retain_until,
+            returnable,
+        });
+    Ok(())
+}
+
+fn demote_local_expiry_tombstone(client: &mut ClientState, lease_jti: &str) {
+    if let Some(tombstone) = client
+        .local_expiry_tombstones
+        .iter_mut()
+        .find(|tombstone| tombstone.lease.claims.jti == lease_jti)
+    {
+        tombstone.lease.token.clear();
+        tombstone.returnable = false;
+    }
+}
+
+fn contain_late_local_expiry_renewal(
+    state: &V2State,
+    client: &mut ClientState,
+    frame: &LeaseStatusFrame,
+    replay_key: &str,
+    encoded: &str,
+    now: u64,
+) -> Result<bool, String> {
+    if frame.kind != "lease_renewed" {
+        return Ok(false);
+    }
+    purge_local_expiry_tombstones(client, Instant::now());
+    let tombstone = client
+        .local_expiry_tombstones
+        .iter()
+        .filter(|tombstone| tombstone.returnable)
+        .filter(|tombstone| validate_renewal(&tombstone.lease, &frame.lease).is_ok())
+        .max_by_key(|tombstone| tombstone.lease.claims.expires_at)
+        .cloned();
+    let Some(tombstone) = tombstone else {
+        return Ok(false);
+    };
+
+    // A relay-delayed renewal may itself have crossed its short validity
+    // window. Revalidate it inside its original window so malformed/future
+    // claims stay fatal while an exact, once-valid descendant can still be
+    // returned. Lease status is carried by the authenticated channel; the
+    // immutable authority comparison below is the lineage proof.
+    match frame.lease.validate(now) {
+        Ok(()) => {}
+        Err(V2ProtocolError::Expired) if frame.lease.expires_at <= now => frame
+            .lease
+            .validate(frame.lease.expires_at.saturating_sub(1))
+            .map_err(|error| error.to_string())?,
+        Err(error) => return Err(error.to_string()),
+    }
+    validate_claim_identity(client, &frame.lease)?;
+    validate_renewal(&tombstone.lease, &frame.lease)?;
+    let mut session = tombstone.lease.session.clone();
+    session.expires_at = expiry_datetime(frame.lease.expires_at)?;
+    let renewed = ClientLease {
+        request_id: tombstone.lease.request_id.clone(),
+        token: frame.lease_token.clone(),
+        claims: frame.lease.clone(),
+        session,
+    };
+
+    // Remove only the superseded return for this exact old JTI. A newer
+    // authority (or its own return transaction) may coexist while this stale
+    // relay lineage is still inside the bounded tombstone window.
+    if client.pending_revoke.as_ref().is_some_and(|pending| {
+        pending.lease_id == tombstone.lease.claims.lease_id
+            && pending.lease_jti == tombstone.lease.claims.jti
+    }) {
+        client.pending_revoke = None;
+    }
+    client.urgent_control_frames.retain(|queued| {
+        queued.lease_id != tombstone.lease.claims.lease_id
+            || queued.lease_jti != tombstone.lease.claims.jti
+    });
+    let newer_authority_exists = client.lease.is_some()
+        || client.pending.is_some()
+        || client.pending_revoke.is_some()
+        || client.applying_lease_status.is_some();
+    let queue_error = if newer_authority_exists {
+        match exact_lease_revocation_frame(state, &renewed, "lease_expired") {
+            Ok(queued) if client.urgent_control_frames.len() < MAX_URGENT_CONTROL_FRAMES => {
+                client.urgent_control_frames.push_back(queued);
+                None
+            }
+            Ok(_) => Some("urgent lease-revoke queue reached its safety bound".to_string()),
+            Err(message) => Some(message),
+        }
+    } else {
+        queue_exact_lease_revocation(state, client, &renewed, "lease_expired").err()
+    };
+    demote_local_expiry_tombstone(client, &tombstone.lease.claims.jti);
+    push_local_expiry_tombstone(
+        client,
+        renewed,
+        // Bound retention to the original fail-closed event. Delayed statuses
+        // cannot keep token material alive indefinitely.
+        tombstone.retain_until,
+        true,
+    )?;
+    remember_applied_relay_frame(client, replay_key.to_owned(), encoded)?;
+    if let Some(message) = queue_error {
+        eprintln!(
+            "[AokieCompanion][realtime] renewed local-expiry return could not enter the urgent queue: {message}"
+        );
+    }
+    Ok(true)
 }
 
 #[derive(Clone)]
@@ -1519,6 +1795,73 @@ impl V2State {
 
     async fn set_peer_key_thumbprint(&self, thumbprint: String) {
         self.inner.lock().await.peer_key_thumbprint = Some(thumbprint);
+    }
+
+    async fn managed_continuity_matches(&self, peer_key: &str, grants: &[Grant]) -> bool {
+        let client = self.inner.lock().await;
+        client.peer_key_thumbprint.as_deref() == Some(peer_key)
+            && client.admission_grants.as_deref() == Some(grants)
+    }
+
+    async fn break_managed_continuity(
+        &self,
+        app: &AppHandle,
+        media_state: &NativeMediaState,
+        reason: &str,
+    ) -> Result<(), String> {
+        let (pending, lease, queue_error) = {
+            let mut client = self.inner.lock().await;
+            let pending = client.pending.take();
+            let lease = client.lease.take();
+            client.pending_end_caller = None;
+            let queue_error = if let Some(lease) = lease.as_ref() {
+                let retain_until = Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL;
+                let tombstone_error =
+                    push_local_expiry_tombstone(&mut client, lease.clone(), retain_until, true)
+                        .err();
+                queue_exact_lease_revocation(self, &mut client, lease, reason)
+                    .err()
+                    .or(tombstone_error)
+            } else {
+                None
+            };
+            (pending, lease, queue_error)
+        };
+        if let Some(pending) = pending {
+            if let Some(action_id) = pending.native_action_id.as_deref() {
+                let _ = crate::android_runtime::complete_native_call_action(
+                    app,
+                    action_id,
+                    false,
+                    "managed_admission_continuity_changed",
+                )
+                .await;
+            }
+            let _ = crate::android_runtime::reconcile_offer(
+                app,
+                &pending.call_id,
+                pending.call_epoch,
+                "cancel",
+                "managed_admission_continuity_changed",
+            )
+            .await;
+        }
+        if let Some(lease) = lease {
+            let _ = media::revoke(
+                app,
+                media_state,
+                RevokeRequest {
+                    session: lease.session,
+                    reason: Some("managed admission authority changed".into()),
+                },
+            )
+            .await;
+            emit_lease_reset(app);
+        }
+        match queue_error {
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
     }
 
     async fn rotate_admission_policy(
@@ -2788,6 +3131,7 @@ async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
     let (native_end, pending_revoke, pending_lease) = {
         let mut client = state.inner.lock().await;
         let now = Instant::now();
+        purge_local_expiry_tombstones(&mut client, now);
         let native_end = if client
             .pending_native_end
             .as_ref()
@@ -2920,6 +3264,28 @@ async fn fail_native_call_actions_on_disconnect(app: &AppHandle, state: &V2State
 struct ManagedTransportRotation {
     transport: V2Transport,
     admission: ManagedAdmission,
+    peer_key_thumbprint: String,
+    // WebSocket gateway replacement is authoritative only after its first
+    // state frame. Relay refresh keeps the existing sole SSE reader, so fresh
+    // plugin state arrives there in normal mailbox order after credential swap.
+    initial_frames: Vec<String>,
+}
+
+type ManagedTransportRotationFuture = Pin<
+    Box<
+        dyn Future<Output = Result<ManagedTransportRotation, ManagedTransportRotationError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+async fn await_managed_transport_rotation(
+    rotation: &mut Option<ManagedTransportRotationFuture>,
+) -> Result<ManagedTransportRotation, ManagedTransportRotationError> {
+    match rotation.as_mut() {
+        Some(rotation) => rotation.await,
+        None => pending().await,
+    }
 }
 
 /// Everything the relay carrier needs, gathered while the admission is still in
@@ -2963,15 +3329,26 @@ async fn open_relay_transport(
     state: &V2State,
     app_id: &str,
     device_id: &str,
+    for_refresh: bool,
 ) -> Result<V2Transport, TransportOpenFailure> {
-    let (channel, challenge) = crate::companion_relay::RelayChannel::connect(
-        &plan.endpoints,
-        &plan.access_token,
-        app_id,
-        device_id,
-    )
-    .await
-    .map_err(|error| {
+    let connected = if for_refresh {
+        crate::companion_relay::RelayChannel::connect_for_refresh(
+            &plan.endpoints,
+            &plan.access_token,
+            app_id,
+            device_id,
+        )
+        .await
+    } else {
+        crate::companion_relay::RelayChannel::connect(
+            &plan.endpoints,
+            &plan.access_token,
+            app_id,
+            device_id,
+        )
+        .await
+    };
+    let (channel, challenge) = connected.map_err(|error| {
         if error.admission_rejected {
             TransportOpenFailure::AdmissionRejected
         } else {
@@ -3015,6 +3392,7 @@ async fn open_overlapping_managed_transport(
     session_nonce: &str,
     app_header: &HeaderValue,
     device_header: &HeaderValue,
+    predecessor_fence_started: Arc<AtomicBool>,
 ) -> Result<ManagedTransportRotation, ManagedTransportRotationError> {
     let admission = managed_auth
         .admission(
@@ -3029,7 +3407,7 @@ async fn open_overlapping_managed_transport(
     // A rotation stays on the carrier the refreshed admission calls for: the
     // relay when it advertises one, the signed gateway otherwise.
     if let Some(plan) = RelayCarrierPlan::from_admission(&admission) {
-        let mut transport = open_relay_transport(&plan, state, app_id, device_id)
+        let mut transport = open_relay_transport(&plan, state, app_id, device_id, true)
             .await
             .map_err(|failure| {
                 ManagedTransportRotationError::Transport(match failure {
@@ -3042,7 +3420,7 @@ async fn open_overlapping_managed_transport(
                     }
                 })
             })?;
-        endpoint_handshake(
+        let peer_key_thumbprint = endpoint_handshake(
             app,
             state,
             endpoint_identity,
@@ -3052,16 +3430,16 @@ async fn open_overlapping_managed_transport(
             device_id,
             session_nonce,
             Some(&admission.expected_peer_key_thumbprint),
+            Some(predecessor_fence_started.as_ref()),
             &mut transport,
         )
         .await
         .map_err(ManagedTransportRotationError::Transport)?;
-        initial_sync(app, state, media_state, app_id, &mut transport)
-            .await
-            .map_err(ManagedTransportRotationError::Transport)?;
         return Ok(ManagedTransportRotation {
             transport,
             admission,
+            peer_key_thumbprint,
+            initial_frames: Vec::new(),
         });
     }
     let gateway_url = managed_gateway_url(&admission.gateway_url)
@@ -3112,7 +3490,7 @@ async fn open_overlapping_managed_transport(
         }
     };
     let mut transport = V2Transport::websocket(socket);
-    endpoint_handshake(
+    let peer_key_thumbprint = endpoint_handshake(
         app,
         state,
         endpoint_identity,
@@ -3122,16 +3500,19 @@ async fn open_overlapping_managed_transport(
         device_id,
         session_nonce,
         Some(&admission.expected_peer_key_thumbprint),
+        Some(predecessor_fence_started.as_ref()),
         &mut transport,
     )
     .await
     .map_err(ManagedTransportRotationError::Transport)?;
-    initial_sync(app, state, media_state, app_id, &mut transport)
+    let initial_frames = receive_replacement_sync(&mut transport, app, state, media_state, app_id)
         .await
         .map_err(ManagedTransportRotationError::Transport)?;
     Ok(ManagedTransportRotation {
         transport,
         admission,
+        peer_key_thumbprint,
+        initial_frames,
     })
 }
 
@@ -3275,7 +3656,7 @@ pub(crate) fn spawn(
                 .await;
 
             let opened = if let Some(plan) = attempt_relay.as_ref() {
-                open_relay_transport(plan, &state, &config.app_id, &config.device_id).await
+                open_relay_transport(plan, &state, &config.app_id, &config.device_id, false).await
             } else {
                 let mut request = match attempt_url.as_str().into_client_request() {
                     Ok(request) => request,
@@ -3334,20 +3715,24 @@ pub(crate) fn spawn(
                         &config.device_id,
                         &session_nonce,
                         admission_expected_peer_key_thumbprint.as_deref(),
+                        None,
                         &mut transport,
                     )
                     .await;
-                    if let Err(message) = handshake {
+                    if let Err(message) = handshake.as_ref() {
                         if config.managed_deployment_id.is_some()
-                            && transient_managed_sync_failure(&message)
+                            && transient_managed_sync_failure(message)
                         {
                             eprintln!(
                                 "[AokieCompanion][realtime] managed session rotated during endpoint proof; retrying"
                             );
                         } else {
-                            emit_error(&app, &message);
+                            emit_error(&app, message);
                         }
                     } else {
+                        let peer_key_thumbprint =
+                            handshake.expect("successful endpoint handshake was checked");
+                        state.set_peer_key_thumbprint(peer_key_thumbprint).await;
                         let synced = initial_sync(
                             &app,
                             &state,
@@ -3422,82 +3807,240 @@ pub(crate) fn spawn(
                                 // and re-read after a rotation, which is the one
                                 // place the carrier can change under the loop.
                                 let mut websocket_heartbeat = transport.uses_websocket_heartbeat();
+                                let mut managed_rotation: Option<ManagedTransportRotationFuture> =
+                                    None;
+                                let managed_predecessor_fence_started =
+                                    Arc::new(AtomicBool::new(false));
+                                let mut predecessor_failure_during_rotation: Option<String> = None;
+                                let mut deferred_native: Option<NativeOutbound> = None;
+                                let mut deferred_local_frames: VecDeque<String> = VecDeque::new();
+                                let mut deferred_command: Option<OutboundCommand> = None;
 
-                                loop {
+                                let session_end_reason = 'active_session: loop {
                                     tokio::select! {
-                                        _ = &mut admission_refresh, if managed_deployment_id.is_some() => {
+                                        _ = &mut admission_refresh, if managed_deployment_id.is_some() && managed_rotation.is_none() => {
                                             eprintln!(
                                                 "[AokieCompanion][realtime] opening overlapping managed admission before expiry"
                                             );
-                                            match open_overlapping_managed_transport(
-                                                &app,
-                                                &state,
-                                                &media_state,
-                                                &managed_auth,
-                                                &endpoint_identity,
-                                                &peer_trust,
-                                                &profile_id,
-                                                managed_deployment_id.expect("managed rotation checked"),
-                                                &config.app_id,
-                                                &config.device_id,
-                                                &session_nonce,
-                                                &app_header,
-                                                &device_header,
-                                            ).await {
-                                                Ok(rotation) => {
-                                                    let replacement_is_relay =
-                                                        rotation.transport.is_relay();
-                                                    if let Err(message) = state
+                                            let rotation_app = app.clone();
+                                            let rotation_state = state.clone();
+                                            let rotation_media_state = media_state.clone();
+                                            let rotation_managed_auth = managed_auth.clone();
+                                            let rotation_endpoint_identity = endpoint_identity.clone();
+                                            let rotation_peer_trust = peer_trust.clone();
+                                            let rotation_profile_id = profile_id.clone();
+                                            let rotation_deployment_id = managed_deployment_id
+                                                .expect("managed rotation checked")
+                                                .to_owned();
+                                            let rotation_app_id = config.app_id.clone();
+                                            let rotation_device_id = config.device_id.clone();
+                                            let rotation_session_nonce = session_nonce.clone();
+                                            let rotation_app_header = app_header.clone();
+                                            let rotation_device_header = device_header.clone();
+                                            managed_predecessor_fence_started
+                                                .store(false, Ordering::Release);
+                                            let rotation_predecessor_fence_started =
+                                                managed_predecessor_fence_started.clone();
+                                            managed_rotation = Some(Box::pin(async move {
+                                                open_overlapping_managed_transport(
+                                                    &rotation_app,
+                                                    &rotation_state,
+                                                    &rotation_media_state,
+                                                    &rotation_managed_auth,
+                                                    &rotation_endpoint_identity,
+                                                    &rotation_peer_trust,
+                                                    &rotation_profile_id,
+                                                    &rotation_deployment_id,
+                                                    &rotation_app_id,
+                                                    &rotation_device_id,
+                                                    &rotation_session_nonce,
+                                                    &rotation_app_header,
+                                                    &rotation_device_header,
+                                                    rotation_predecessor_fence_started,
+                                                )
+                                                .await
+                                            }));
+                                        }
+                                        rotation_result = await_managed_transport_rotation(&mut managed_rotation), if managed_rotation.is_some() => {
+                                            // The completed future is removed before any retry is
+                                            // scheduled, so one slow refresh cannot multiply into
+                                            // parallel admissions. Dropping the slot also cancels it
+                                            // automatically when this active session ends.
+                                            managed_rotation = None;
+                                            if !session_is_current(&connection, generation) {
+                                                break 'active_session "managed rotation completed after realtime generation changed".to_string();
+                                            }
+                                            match rotation_result {
+                                                 Ok(rotation) => {
+                                                     let ManagedTransportRotation {
+                                                        transport: replacement,
+                                                         admission,
+                                                         peer_key_thumbprint,
+                                                         initial_frames,
+                                                     } = rotation;
+                                                     let replacement_is_relay = replacement.is_relay();
+                                                     if !transport.same_carrier_as(&replacement) {
+                                                         let _ = state
+                                                             .break_managed_continuity(
+                                                                 &app,
+                                                                 &media_state,
+                                                                 "managed_carrier_changed",
+                                                             )
+                                                             .await;
+                                                         break 'active_session "managed carrier changed; starting a fresh sequence baseline".to_string();
+                                                     }
+                                                     let continuity = state
+                                                         .managed_continuity_matches(
+                                                             &peer_key_thumbprint,
+                                                             &admission.grants,
+                                                         )
+                                                         .await;
+                                                     if !continuity {
+                                                         if let Err(message) = state
+                                                             .break_managed_continuity(
+                                                                 &app,
+                                                                 &media_state,
+                                                                 "managed_admission_continuity_changed",
+                                                             )
+                                                             .await
+                                                         {
+                                                             emit_error(&app, &message);
+                                                         }
+                                                     }
+                                                     for initial_frame in &initial_frames {
+                                                         if let Err(message) = handle_gateway_frame(
+                                                             &app,
+                                                             &state,
+                                                             &media_state,
+                                                             &config.app_id,
+                                                             initial_frame,
+                                                         )
+                                                         .await
+                                                         {
+                                                             if managed_predecessor_fence_started
+                                                                 .load(Ordering::Acquire)
+                                                             {
+                                                                 break 'active_session format!(
+                                                                     "fenced replacement authoritative frame was rejected: {message}"
+                                                                 );
+                                                             }
+                                                             admission_refresh.as_mut().reset(
+                                                                 Instant::now() + Duration::from_secs(1),
+                                                             );
+                                                             continue 'active_session;
+                                                         }
+                                                     }
+                                                     if let Err(message) = transport
+                                                         .install_managed_replacement(replacement)
+                                                     {
+                                                         break 'active_session message;
+                                                     }
+                                                     while let Some(frame) = deferred_local_frames.pop_front() {
+                                                         if !transport.send_text(frame).await {
+                                                             break 'active_session "deferred native RTC signal failed on managed replacement".to_string();
+                                                         }
+                                                     }
+                                                     if let Some(native) = deferred_native.take() {
+                                                         let NativeOutbound {
+                                                             encoded,
+                                                             answer_action_id,
+                                                             answer_request_id,
+                                                             ..
+                                                         } = native;
+                                                         if !transport.send_text(encoded).await {
+                                                             break 'active_session "deferred native action failed on managed replacement".to_string();
+                                                         }
+                                                         if let Some(action_id) = answer_action_id {
+                                                             if let Err(message) = crate::android_runtime::complete_native_call_action(
+                                                                 &app,
+                                                                 &action_id,
+                                                                 true,
+                                                                 "lease_request_sent",
+                                                             ).await {
+                                                                 emit_error(&app, &message);
+                                                             } else if let Some(request_id) = answer_request_id.as_deref() {
+                                                                 mark_native_answer_delivered(&state, request_id, &action_id).await;
+                                                             }
+                                                         }
+                                                     }
+                                                     if let Some(queued) = deferred_command.take() {
+                                                         if let Some(message) = transport.unsupported_user_frame(&queued.encoded) {
+                                                             let _ = queued.completion.send(Err(message.into()));
+                                                         } else if transport.send_text(queued.encoded).await {
+                                                             let _ = queued.completion.send(Ok(()));
+                                                         } else {
+                                                             let _ = queued.completion.send(Err("protocol-v2 frame could not be delivered".into()));
+                                                             break 'active_session "deferred command failed on managed replacement".to_string();
+                                                         }
+                                                     }
+                                                     managed_predecessor_fence_started
+                                                         .store(false, Ordering::Release);
+                                                     predecessor_failure_during_rotation = None;
+                                                     state
+                                                         .set_peer_key_thumbprint(peer_key_thumbprint)
+                                                         .await;
+                                                     if let Err(message) = state
                                                         .rotate_admission_policy(
                                                             &app,
                                                             &media_state,
-                                                            &rotation.admission.ice_servers,
-                                                            rotation.admission.relay_only,
+                                                            &admission.ice_servers,
+                                                            admission.relay_only,
                                                             replacement_is_relay,
-                                                            &rotation.admission.grants,
+                                                            &admission.grants,
                                                         )
                                                         .await
                                                     {
-                                                        emit_error(&app, &message);
-                                                    }
-                                                    // The replacement inherits the
-                                                    // predecessor's relay cursor and
-                                                    // sequence before it reads anything,
-                                                    // or it replays state the session
-                                                    // has already handled.
-                                                    let mut predecessor = std::mem::replace(
-                                                        &mut transport,
-                                                        rotation.transport,
-                                                    );
-                                                    transport.adopt_routing_from(&mut predecessor);
-                                                    // A refreshed admission can
-                                                    // change carrier. Left stale,
-                                                    // a relay replacement would
-                                                    // be pinged, never ponged,
-                                                    // and time itself out.
-                                                    websocket_heartbeat =
-                                                        transport.uses_websocket_heartbeat();
-                                                    // Dropped rather than closed, exactly
-                                                    // as before: an explicit close frame
-                                                    // here would be new behaviour on the
-                                                    // rotation path a live call depends on.
-                                                    drop(predecessor);
+                                                         emit_error(&app, &message);
+                                                     }
+                                                     websocket_heartbeat =
+                                                         transport.uses_websocket_heartbeat();
                                                     admission_refresh.as_mut().reset(
                                                         managed_admission_refresh_deadline(
-                                                            rotation.admission.expires_at,
+                                                            admission.expires_at,
                                                         ),
                                                     );
                                                     freshness.as_mut().reset(
                                                         Instant::now() + INBOUND_FRESHNESS,
                                                     );
-                                                    awaiting_pong = false;
-                                                    ping.reset();
-                                                    heartbeat.reset();
-                                                    eprintln!(
-                                                        "[AokieCompanion][realtime] managed admission rotated with media continuity preserved"
-                                                    );
-                                                }
-                                                Err(ManagedTransportRotationError::Admission(error)) => {
+                                                     awaiting_pong = false;
+                                                     ping.reset();
+                                                     // Service the media clock immediately after a WS
+                                                     // handoff: its predecessor could not be written
+                                                     // once the replacement hello fenced it.
+                                                     match heartbeat_frame(&state, &config.app_id).await {
+                                                         Ok(Some(frame)) => {
+                                                             if !transport.send_text(frame).await {
+                                                                 break 'active_session "lease heartbeat failed on managed replacement".to_string();
+                                                             }
+                                                         }
+                                                         Ok(None) => {
+                                                             if let Some((expired, queue_error)) = take_expired_lease(&state).await {
+                                                                 let _ = media::revoke(
+                                                                     &app,
+                                                                     &media_state,
+                                                                     RevokeRequest {
+                                                                         session: expired.session,
+                                                                         reason: Some("media lease expired during admission refresh".into()),
+                                                                     },
+                                                                 ).await;
+                                                                 emit_lease_reset(&app);
+                                                                 if let Some(message) = queue_error {
+                                                                     emit_error(&app, &message);
+                                                                 }
+                                                             }
+                                                         }
+                                                         Err(message) => {
+                                                             break 'active_session format!("lease heartbeat failed after managed rotation: {message}");
+                                                         }
+                                                     }
+                                                     eprintln!(
+                                                         "[AokieCompanion][realtime] managed admission rotated; media_continuity={continuity}"
+                                                     );
+                                                 }
+                                                 Err(ManagedTransportRotationError::Admission(error)) => {
+                                                     if let Some(message) = predecessor_failure_during_rotation.take() {
+                                                         break 'active_session format!("managed predecessor failed before admission replacement: {message}");
+                                                     }
                                                     emit_managed_admission_state(&app, &error);
                                                     eprintln!(
                                                         "[AokieCompanion][realtime] managed admission rotation retry: {error}"
@@ -3506,8 +4049,20 @@ pub(crate) fn spawn(
                                                         Instant::now() + Duration::from_secs(1),
                                                     );
                                                 }
-                                                Err(ManagedTransportRotationError::Transport(message)) => {
-                                                    eprintln!(
+                                                 Err(ManagedTransportRotationError::Transport(message)) => {
+                                                     if managed_predecessor_fence_started
+                                                         .swap(false, Ordering::AcqRel)
+                                                     {
+                                                         break 'active_session format!(
+                                                             "fenced managed replacement failed: {message}"
+                                                         );
+                                                     }
+                                                     if let Some(predecessor) = predecessor_failure_during_rotation.take() {
+                                                         break 'active_session format!(
+                                                             "managed replacement failed after predecessor became unavailable: {message}; predecessor={predecessor}"
+                                                         );
+                                                     }
+                                                     eprintln!(
                                                         "[AokieCompanion][realtime] managed transport rotation retry: {message}"
                                                     );
                                                     admission_refresh.as_mut().reset(
@@ -3516,57 +4071,126 @@ pub(crate) fn spawn(
                                                 }
                                             }
                                         }
-                                        _ = &mut freshness => {
+                                        _ = &mut freshness, if predecessor_receive_enabled(
+                                            predecessor_failure_during_rotation.is_some(),
+                                            managed_predecessor_fence_started.load(Ordering::Acquire),
+                                        ) => {
+                                            if !predecessor_arm_still_current(&managed_predecessor_fence_started) {
+                                                continue 'active_session;
+                                            }
                                             emit_error(&app, "protocol-v2 inbound heartbeat timed out");
-                                            break;
+                                            break 'active_session "inbound heartbeat timed out".to_string();
                                         }
-                                        _ = &mut pong_deadline, if awaiting_pong => {
+                                        _ = &mut pong_deadline, if predecessor_failure_during_rotation.is_none() && awaiting_pong && !managed_predecessor_fence_started.load(Ordering::Acquire) => {
+                                            if !predecessor_arm_still_current(&managed_predecessor_fence_started) {
+                                                continue 'active_session;
+                                            }
                                             emit_error(&app, "protocol-v2 pong timed out");
-                                            break;
+                                            break 'active_session "websocket pong timed out".to_string();
                                         }
-                                        _ = ping.tick(), if !awaiting_pong && websocket_heartbeat => {
+                                        _ = ping.tick(), if predecessor_failure_during_rotation.is_none() && !awaiting_pong && websocket_heartbeat && !managed_predecessor_fence_started.load(Ordering::Acquire) => {
+                                            if !predecessor_arm_still_current(&managed_predecessor_fence_started) {
+                                                continue 'active_session;
+                                            }
                                             if !transport.send_ping().await {
-                                                break;
+                                                if managed_rotation.is_some() {
+                                                    predecessor_failure_during_rotation = Some("websocket ping delivery failed".into());
+                                                    continue 'active_session;
+                                                }
+                                                break 'active_session "websocket ping delivery failed".to_string();
                                             }
                                             awaiting_pong = true;
                                             pong_deadline.as_mut().reset(Instant::now() + PONG_TIMEOUT);
                                         }
-                                        _ = heartbeat.tick() => {
+                                        _ = heartbeat.tick(), if predecessor_failure_during_rotation.is_none() && !managed_predecessor_fence_started.load(Ordering::Acquire) => {
+                                            if !predecessor_arm_still_current(&managed_predecessor_fence_started) {
+                                                continue 'active_session;
+                                            }
                                             match heartbeat_frame(&state, &config.app_id).await {
                                                 Ok(Some(frame)) => {
-                                                    if !transport.send_text(frame).await { break; }
+                                                    if !transport.send_text(frame).await {
+                                                        if managed_rotation.is_some() {
+                                                            predecessor_failure_during_rotation = Some("lease heartbeat delivery failed".into());
+                                                            continue 'active_session;
+                                                        }
+                                                        break 'active_session "lease heartbeat delivery failed".to_string();
+                                                    }
                                                 }
-                                                Ok(None) => {}
+                                                Ok(None) => {
+                                                    // A local expiry is an authority boundary, not a
+                                                    // signalling failure.  Tear down only the exact
+                                                    // expired media route and best-effort return its
+                                                    // token, while keeping the authenticated transport
+                                                    // alive.  Breaking this loop used to reconnect,
+                                                    // send a fresh mobile_hello, and turn one expected
+                                                    // lease failback into a second session-wide media
+                                                    // failure.
+                                                    if let Some((expired, queue_error)) =
+                                                        take_expired_lease(&state).await
+                                                    {
+                                                        let _ = media::revoke(
+                                                            &app,
+                                                            &media_state,
+                                                            RevokeRequest {
+                                                                session: expired.session,
+                                                                reason: Some("media lease expired locally".into()),
+                                                            },
+                                                        ).await;
+                                                        emit_lease_reset(&app);
+                                                        if let Some(message) = queue_error {
+                                                            emit_error(&app, &message);
+                                                        }
+                                                    }
+                                                }
                                                 Err(message) => {
                                                     emit_error(&app, &message);
-                                                    break;
+                                                    break 'active_session format!("lease heartbeat failed: {message}");
                                                 }
                                             }
                                         }
-                                        _ = urgent_controls.tick() => {
-                                            if let Some(urgent) = peek_urgent_control_frame(&state).await {
-                                                if !transport.send_text(urgent.encoded.clone()).await {
-                                                    break;
+                                        _ = urgent_controls.tick(), if predecessor_failure_during_rotation.is_none() && !managed_predecessor_fence_started.load(Ordering::Acquire) => {
+                                                if !predecessor_arm_still_current(&managed_predecessor_fence_started) {
+                                                    continue 'active_session;
+                                                }
+                                                if let Some(urgent) = peek_urgent_control_frame(&state).await {
+                                                    if !transport.send_text(urgent.encoded.clone()).await {
+                                                        if managed_rotation.is_some() {
+                                                            predecessor_failure_during_rotation = Some("urgent control delivery failed".into());
+                                                            continue 'active_session;
+                                                        }
+                                                        break 'active_session "urgent control delivery failed".to_string();
                                                 }
                                                 if let Err(message) = confirm_urgent_control_frame(
                                                     &state,
                                                     &urgent,
                                                 ).await {
                                                     emit_error(&app, &message);
-                                                    break;
+                                                    break 'active_session format!("urgent control confirmation failed: {message}");
                                                 }
                                             }
                                         }
-                                        _ = native_actions.tick() => {
+                                        _ = native_actions.tick(), if predecessor_failure_during_rotation.is_none() && !managed_predecessor_fence_started.load(Ordering::Acquire) => {
+                                            if !predecessor_arm_still_current(&managed_predecessor_fence_started) {
+                                                continue 'active_session;
+                                            }
                                             match poll_native_call_actions(&app, &state, &media_state).await {
                                                 Ok(Some(native)) => {
+                                                    let delivered = transport
+                                                        .send_text(native.encoded.clone())
+                                                        .await;
+                                                    if !delivered && managed_rotation.is_some() {
+                                                        deferred_native = Some(native);
+                                                        predecessor_failure_during_rotation =
+                                                            Some("native call action delivery failed".into());
+                                                        continue 'active_session;
+                                                    }
                                                     let NativeOutbound {
-                                                        encoded,
+                                                        encoded: _,
                                                         answer_action_id,
                                                         answer_request_id,
                                                         revoke_request_id,
                                                     } = native;
-                                                    if transport.send_text(encoded).await {
+                                                    if delivered {
                                                         if let Some(action_id) = answer_action_id {
                                                             if let Err(message) = crate::android_runtime::complete_native_call_action(
                                                                 &app,
@@ -3598,14 +4222,17 @@ pub(crate) fn spawn(
                                                                 "native_action_delivery_failed",
                                                             ).await;
                                                         }
-                                                        break;
+                                                        break 'active_session "native call action delivery failed".to_string();
                                                     }
                                                 }
                                                 Ok(None) => {}
                                                 Err(message) => emit_error(&app, &message),
                                             }
                                         }
-                                        local = local_signals.recv() => {
+                                        local = local_signals.recv(), if predecessor_failure_during_rotation.is_none() && !managed_predecessor_fence_started.load(Ordering::Acquire) => {
+                                            let predecessor_fenced = !predecessor_arm_still_current(
+                                                &managed_predecessor_fence_started,
+                                            );
                                             match local {
                                                 Ok(signal) => {
                                                     if let LocalSignal::LeaseSafetyFailure { reason } = &signal.signal {
@@ -3620,28 +4247,50 @@ pub(crate) fn spawn(
                                                     } else {
                                                         match local_rtc_frame(&state, signal).await {
                                                             Ok(Some(frame)) => {
-                                                                if !transport.send_text(frame).await { break; }
+                                                                if predecessor_fenced {
+                                                                    deferred_local_frames.push_back(frame);
+                                                                    continue 'active_session;
+                                                                }
+                                                                if !transport.send_text(frame.clone()).await {
+                                                                    if managed_rotation.is_some() {
+                                                                        deferred_local_frames.push_back(frame);
+                                                                        predecessor_failure_during_rotation =
+                                                                            Some("native RTC signal delivery failed".into());
+                                                                        continue 'active_session;
+                                                                    }
+                                                                    break 'active_session "native RTC signal delivery failed".to_string();
+                                                                }
                                                             }
                                                             Ok(None) => {}
                                                             Err(message) => {
                                                                 emit_error(&app, &message);
-                                                                break;
+                                                                break 'active_session format!("native RTC signal rejected: {message}");
                                                             }
                                                         }
                                                     }
                                                 }
                                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                                     emit_error(&app, "native RTC signal capacity was exceeded");
-                                                    break;
+                                                    break 'active_session "native RTC signal capacity exceeded".to_string();
                                                 }
-                                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                                    break 'active_session "native RTC signal channel closed".to_string();
+                                                }
                                             }
                                         }
-                                        queued = outbound.recv() => {
-                                            let Some(queued) = queued else { break; };
+                                        queued = outbound.recv(), if predecessor_failure_during_rotation.is_none() && !managed_predecessor_fence_started.load(Ordering::Acquire) => {
+                                            let Some(queued) = queued else {
+                                                break 'active_session "outbound command channel closed".to_string();
+                                            };
                                             if queued.generation != generation || !session_is_current(&connection, generation) {
                                                 let _ = queued.completion.send(Err("realtime session changed before delivery".into()));
-                                                break;
+                                                break 'active_session "realtime generation changed before delivery".to_string();
+                                            }
+                                            if !predecessor_arm_still_current(&managed_predecessor_fence_started) {
+                                                if deferred_command.replace(queued).is_some() {
+                                                    break 'active_session "multiple user commands crossed the managed handoff fence".to_string();
+                                                }
+                                                continue 'active_session;
                                             }
                                             // A command can be enqueued just before an admission
                                             // rotates from the socket gateway onto the relay. Recheck
@@ -3652,14 +4301,31 @@ pub(crate) fn spawn(
                                                 let _ = queued.completion.send(Err(message.into()));
                                                 continue;
                                             }
-                                            if transport.send_text(queued.encoded).await {
+                                            if transport.send_text(queued.encoded.clone()).await {
                                                 let _ = queued.completion.send(Ok(()));
                                             } else {
+                                                if managed_rotation.is_some() {
+                                                    deferred_command = Some(queued);
+                                                    predecessor_failure_during_rotation =
+                                                        Some("queued frame delivery failed".into());
+                                                    continue 'active_session;
+                                                }
                                                 let _ = queued.completion.send(Err("protocol-v2 frame could not be delivered".into()));
-                                                break;
+                                                break 'active_session "queued frame delivery failed".to_string();
                                             }
                                         }
-                                        incoming = transport.recv(TRANSPORT_READ_TICK) => {
+                                        incoming = transport.recv(TRANSPORT_READ_TICK), if predecessor_receive_enabled(
+                                            predecessor_failure_during_rotation.is_some(),
+                                            managed_predecessor_fence_started.load(Ordering::Acquire),
+                                        ) => {
+                                            if !predecessor_arm_still_current(&managed_predecessor_fence_started) {
+                                                // This frame completed after the replacement hello
+                                                // crossed the gateway fence. It belongs to the old
+                                                // socket generation and must not mutate replacement
+                                                // authority; its due renewal is sent through the new
+                                                // reader by receive_replacement_sync.
+                                                continue 'active_session;
+                                            }
                                             match incoming {
                                                 V2Inbound::Text(text) => {
                                                     freshness.as_mut().reset(Instant::now() + INBOUND_FRESHNESS);
@@ -3671,7 +4337,7 @@ pub(crate) fn spawn(
                                                         &text,
                                                     ).await {
                                                         emit_error(&app, &message);
-                                                        break;
+                                                        break 'active_session format!("gateway frame rejected: {message}");
                                                     }
                                                 }
                                                 // Carrier liveness without a protocol
@@ -3691,16 +4357,28 @@ pub(crate) fn spawn(
                                                 V2Inbound::Idle => {}
                                                 V2Inbound::Closed(detail) => {
                                                     eprintln!("[AokieCompanion][realtime] {detail}");
-                                                    break;
+                                                    if managed_rotation.is_some() {
+                                                        predecessor_failure_during_rotation = Some(detail);
+                                                        continue 'active_session;
+                                                    }
+                                                    break 'active_session format!("transport closed: {detail}");
                                                 }
                                                 V2Inbound::Failed(message) => {
+                                                    if managed_rotation.is_some() {
+                                                        predecessor_failure_during_rotation = Some(message);
+                                                        continue 'active_session;
+                                                    }
                                                     emit_error(&app, &message);
-                                                    break;
+                                                    break 'active_session format!("transport failed: {message}");
                                                 }
                                             }
                                         }
                                     }
-                                }
+                                };
+                                eprintln!(
+                                    "[AokieCompanion][realtime] stage=session_end generation={} reason={}",
+                                    generation, session_end_reason
+                                );
                                 let _ = invalidate_session(&connection, Some(generation));
                                 fail_native_call_actions_on_disconnect(&app, &state).await;
                                 state.reset_generation(generation).await;
@@ -3759,6 +4437,26 @@ fn realtime_profile_id(config: &RealtimeConfig) -> Result<String, String> {
     }
 }
 
+fn managed_ws_handoff_lease_ready(client: &ClientState, now: u64) -> Result<(), String> {
+    let Some(lease) = client.lease.as_ref() else {
+        return Ok(());
+    };
+    if matches!(lease.claims.phase, LeasePhase::Prepared) {
+        return Err("managed socket handoff is waiting for provisional media to settle".into());
+    }
+    if lease.claims.expires_at.saturating_sub(now) <= MANAGED_HANDOFF_MIN_LEASE_REMAINING.as_secs()
+    {
+        return Err("managed socket handoff is waiting for the active media lease to renew".into());
+    }
+    Ok(())
+}
+
+async fn require_managed_ws_handoff_lease_ready(state: &V2State) -> Result<(), String> {
+    let now = unix_now()?;
+    let client = state.inner.lock().await;
+    managed_ws_handoff_lease_ready(&client, now)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn endpoint_handshake(
     app: &AppHandle,
@@ -3770,8 +4468,9 @@ async fn endpoint_handshake(
     device_id: &str,
     session_nonce: &str,
     admission_expected_peer_key_thumbprint: Option<&str>,
+    predecessor_fence_started: Option<&AtomicBool>,
     transport: &mut V2Transport,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     // Both carriers hand back the same document; only where it comes from
     // differs (the socket's first frame, or an authenticated relay route).
@@ -3834,22 +4533,39 @@ async fn endpoint_handshake(
     hello.validate().map_err(|error| error.to_string())?;
     let encoded = serde_json::to_string(&hello)
         .map_err(|_| "could not encode endpoint-authenticated mobile hello".to_string())?;
-    if !transport.send_text(encoded).await {
+    if !transport.is_relay() {
+        // The gateway replaces/fences the prior device peer as soon as this
+        // hello may be accepted. Set before the write so predecessor closure
+        // cannot race this marker by one scheduler turn.
+        if let Some(started) = predecessor_fence_started {
+            // Admission/connect/challenge preparation happens while the old
+            // socket continues to read and renew. At the exact irreversible
+            // handoff boundary, require enough token life for the bounded
+            // replacement hello + heartbeat pair. A short token aborts before
+            // fencing and the active loop retries after consuming its renewal.
+            require_managed_ws_handoff_lease_ready(state).await?;
+            started.store(true, Ordering::Release);
+        }
+    }
+    let delivered = if predecessor_fence_started.is_some() && !transport.is_relay() {
+        transport.send_managed_handoff_text(encoded).await
+    } else {
+        transport.send_text(encoded).await
+    };
+    if !delivered {
         return Err("endpoint-authenticated mobile hello could not be delivered".into());
     }
-    state
-        .set_peer_key_thumbprint(peer_key_thumbprint.to_owned())
-        .await;
-    Ok(())
+    Ok(peer_key_thumbprint.to_owned())
 }
 
-async fn initial_sync(
-    app: &AppHandle,
-    state: &V2State,
-    media_state: &NativeMediaState,
-    expected_app_id: &str,
+/// Wait for the replacement's first authenticated authoritative projection
+/// without applying it. Managed admission overlap runs concurrently with the
+/// active predecessor, so applying state or media changes inside that future
+/// would let a not-yet-adopted carrier race the live session.
+async fn receive_initial_sync(
     transport: &mut V2Transport,
-) -> Result<(), String> {
+    tolerate_pre_snapshot_frames: bool,
+) -> Result<String, String> {
     let deadline = Instant::now() + INITIAL_SYNC_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
@@ -3862,14 +4578,9 @@ async fn initial_sync(
         }
         match transport.recv(TRANSPORT_READ_TICK).await {
             V2Inbound::Text(text) => {
-                let kind = parse_kind(&text)?;
-                if kind != "snapshot" && kind != "idle_sync" {
-                    return Err(
-                        "protocol-v2 first gateway frame was not authoritative call state".into(),
-                    );
+                if initial_sync_frame_ready(&text, tolerate_pre_snapshot_frames)? {
+                    return Ok(text);
                 }
-                handle_gateway_frame(app, state, media_state, expected_app_id, &text).await?;
-                return Ok(());
             }
             V2Inbound::Idle | V2Inbound::Alive | V2Inbound::Pong => {}
             V2Inbound::Closed(_) => {
@@ -3878,6 +4589,154 @@ async fn initial_sync(
             V2Inbound::Failed(message) => return Err(message),
         }
     }
+}
+
+fn encoded_request_id(encoded: &str, label: &str) -> Result<String, String> {
+    let value: Value =
+        serde_json::from_str(encoded).map_err(|_| format!("{label} was not valid JSON"))?;
+    value
+        .get("requestId")
+        .and_then(Value::as_str)
+        .filter(|request_id| !request_id.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{label} omitted requestId"))
+}
+
+fn replacement_renewal_confirmed(encoded: &str, request_id: &str) -> Result<bool, String> {
+    let kind = parse_kind(encoded)?;
+    if !matches!(kind.as_str(), "lease_renewed" | "error") {
+        return Ok(false);
+    }
+    let value: Value = serde_json::from_str(encoded)
+        .map_err(|_| "replacement lease response was not valid JSON".to_string())?;
+    if value.get("requestId").and_then(Value::as_str) != Some(request_id) {
+        return Ok(false);
+    }
+    if kind == "lease_renewed" {
+        return Ok(true);
+    }
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_error");
+    Err(format!(
+        "replacement rejected its handoff lease heartbeat: {code}"
+    ))
+}
+
+async fn receive_replacement_sync(
+    transport: &mut V2Transport,
+    app: &AppHandle,
+    state: &V2State,
+    media_state: &NativeMediaState,
+    app_id: &str,
+) -> Result<Vec<String>, String> {
+    let renewal_app = app.clone();
+    let renewal_state = state.clone();
+    let renewal_media_state = media_state.clone();
+    let renewal_app_id = app_id.to_owned();
+    receive_replacement_sync_with_renewal(transport, state, app_id, move |encoded: String| {
+        let app = renewal_app.clone();
+        let state = renewal_state.clone();
+        let media_state = renewal_media_state.clone();
+        let app_id = renewal_app_id.clone();
+        async move { handle_gateway_frame(&app, &state, &media_state, &app_id, &encoded).await }
+    })
+    .await
+}
+
+async fn receive_replacement_sync_with_renewal<ApplyRenewal, ApplyRenewalFuture>(
+    transport: &mut V2Transport,
+    state: &V2State,
+    app_id: &str,
+    mut apply_renewal: ApplyRenewal,
+) -> Result<Vec<String>, String>
+where
+    ApplyRenewal: FnMut(String) -> ApplyRenewalFuture,
+    ApplyRenewalFuture: Future<Output = Result<(), String>>,
+{
+    let deadline = Instant::now() + INITIAL_SYNC_TIMEOUT;
+    let mut buffered = Vec::new();
+    let mut authoritative = false;
+    let mut renewal_request_id: Option<String> = None;
+    let mut renewal_confirmed = false;
+    loop {
+        if Instant::now() >= deadline {
+            return Err("protocol-v2 replacement authoritative sync timed out".into());
+        }
+        // The old socket is now fenced. If sync is slow enough for the active
+        // token to enter its renewal window, renew on the replacement and do
+        // not expose the buffered snapshot until the matching reply is also
+        // buffered. This prevents the install path from observing an expired
+        // old token while its renewal is still queued on the new reader.
+        if renewal_request_id.is_none() {
+            if let Some(encoded) = heartbeat_frame(state, app_id).await? {
+                let request_id = encoded_request_id(&encoded, "handoff lease heartbeat")?;
+                if !transport.send_managed_handoff_text(encoded).await {
+                    return Err("handoff lease heartbeat could not be delivered".into());
+                }
+                renewal_request_id = Some(request_id);
+            }
+        }
+        if authoritative && (renewal_request_id.is_none() || renewal_confirmed) {
+            return Ok(buffered);
+        }
+        match transport.recv(TRANSPORT_READ_TICK).await {
+            V2Inbound::Text(text) => {
+                let frame_is_authoritative = initial_sync_frame_ready(&text, true)?;
+                if let Some(request_id) = renewal_request_id.as_deref() {
+                    if replacement_renewal_confirmed(&text, request_id)? {
+                        // Native expiry is driven by the old MediaSession, not
+                        // by this receive loop. Buffering a valid renewal until
+                        // a delayed snapshot would therefore still let the
+                        // watcher close the live peer. Apply this one exact,
+                        // request-bound renewal immediately; it remains in the
+                        // ordered buffer and is a replay no-op after install.
+                        apply_renewal(text.clone()).await?;
+                        renewal_confirmed = true;
+                    }
+                }
+                if buffered.len() >= MAX_APPLIED_RELAY_FRAMES {
+                    return Err("replacement pre-sync frame buffer reached its safety bound".into());
+                }
+                buffered.push(text);
+                authoritative |= frame_is_authoritative;
+            }
+            V2Inbound::Idle | V2Inbound::Alive | V2Inbound::Pong => {}
+            V2Inbound::Closed(_) => {
+                return Err("protocol-v2 replacement closed before authoritative sync".into())
+            }
+            V2Inbound::Failed(message) => return Err(message),
+        }
+    }
+}
+
+fn initial_sync_frame_ready(
+    encoded: &str,
+    tolerate_pre_snapshot_frames: bool,
+) -> Result<bool, String> {
+    let kind = parse_kind(encoded)?;
+    if kind == "snapshot" || kind == "idle_sync" {
+        return Ok(true);
+    }
+    if tolerate_pre_snapshot_frames {
+        eprintln!(
+            "[AokieCompanion][realtime] buffered authenticated {kind} while replacement awaited authoritative sync"
+        );
+        return Ok(false);
+    }
+    Err("protocol-v2 first gateway frame was not authoritative call state".into())
+}
+
+async fn initial_sync(
+    app: &AppHandle,
+    state: &V2State,
+    media_state: &NativeMediaState,
+    expected_app_id: &str,
+    transport: &mut V2Transport,
+) -> Result<(), String> {
+    let frame = receive_initial_sync(transport, false).await?;
+    handle_gateway_frame(app, state, media_state, expected_app_id, &frame).await
 }
 
 async fn handle_gateway_frame(
@@ -4729,6 +5588,40 @@ where
         }
     }
     let now = unix_now()?;
+    let expired_before_status = {
+        let mut client = state.inner.lock().await;
+        take_expired_lease_locked(state, &mut client, now)
+    };
+    if let Some((expired, queue_error)) = expired_before_status {
+        let containment = {
+            let mut client = state.inner.lock().await;
+            contain_late_local_expiry_renewal(state, &mut client, &frame, &replay_key, encoded, now)
+        };
+        cleanup(vec![expired.session]).await;
+        if let Some(message) = queue_error {
+            eprintln!(
+                "[AokieCompanion][realtime] local-expiry return could not be queued: {message}"
+            );
+        }
+        return match containment {
+            Ok(true) => Ok(None),
+            Ok(false) => Err("lease status arrived after the current media lease expired".into()),
+            Err(message) => Err(message),
+        };
+    }
+    {
+        let mut client = state.inner.lock().await;
+        if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
+            return Ok(None);
+        }
+        if contain_late_local_expiry_renewal(state, &mut client, &frame, &replay_key, encoded, now)?
+        {
+            // Local media has already failed closed. Authenticate and advance
+            // only the tombstoned token lineage before considering current
+            // grants/consent, then return it without touching any newer peer.
+            return Ok(None);
+        }
+    }
     frame
         .lease
         .validate(now)
@@ -4738,6 +5631,18 @@ where
         let mut client = state.inner.lock().await;
         if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
             return Ok(None);
+        }
+        if contain_late_local_expiry_renewal(state, &mut client, &frame, &replay_key, encoded, now)?
+        {
+            // A local expiry could win while current-time validation was
+            // outside the lock; preserve the same exact no-native outcome.
+            return Ok(None);
+        }
+        purge_local_expiry_tombstones(&mut client, Instant::now());
+        if matches!(frame.kind.as_str(), "lease_granted" | "claim_provisional")
+            && client.local_expiry_tombstones.len() >= MAX_LOCAL_EXPIRY_TOMBSTONES.saturating_sub(1)
+        {
+            return Err("new media authority is waiting for old safety fences to expire".into());
         }
         validate_claim_identity(&client, &frame.lease)?;
         let snapshot = client
@@ -4928,8 +5833,21 @@ where
     };
 
     let message = failure.expect("one transaction failure branch was selected");
-    let abort_error = abort_lease_status(state, &plan, encoded).await.err();
+    let abort_result = abort_lease_status(state, &plan, encoded).await;
+    let contained_current_authority = matches!(&abort_result, Ok(true));
+    let abort_error = abort_result.err();
     cleanup(plan.cleanup_sessions()).await;
+    if plan.operation == LeaseOperation::Renew && contained_current_authority {
+        // The native watcher can close exactly at MediaSession::expires_at
+        // before this task receives a still-valid authoritative renewal. The
+        // renewed token has already been returned and replay-fenced by the
+        // abort transaction, so this is a contained fail-closed outcome rather
+        // than a signalling failure. Never recreate the expired peer here.
+        eprintln!(
+            "[AokieCompanion][realtime] contained lease renewal after native media had already closed: {message}"
+        );
+        return Ok(None);
+    }
     match abort_error {
         Some(abort_error) => Err(format!("{message}; {abort_error}")),
         None => Err(message),
@@ -4972,7 +5890,7 @@ async fn abort_lease_status(
     state: &V2State,
     plan: &LeaseStatusPlan,
     encoded: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let request_id = state.next_id("request");
     let revoke = LeaseRevokeFrame {
         kind: "lease_revoke".into(),
@@ -5048,12 +5966,31 @@ async fn abort_lease_status(
             deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
         });
     }
+    let tombstone_error = if authority_was_current && plan.operation == LeaseOperation::Renew {
+        let retain_until = Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL;
+        let ancestor_error =
+            plan.predecessor
+                .previous_session()
+                .and_then(|_| match &plan.predecessor {
+                    LeaseStatusPredecessor::Lease { lease, .. } => {
+                        push_local_expiry_tombstone(&mut client, lease.clone(), retain_until, false)
+                            .err()
+                    }
+                    LeaseStatusPredecessor::Pending { .. } => None,
+                });
+        ancestor_error.or_else(|| {
+            push_local_expiry_tombstone(&mut client, plan.proposed.clone(), retain_until, true)
+                .err()
+        })
+    } else {
+        None
+    };
 
     remember_applied_relay_frame(&mut client, plan.replay_key.clone(), encoded)?;
     client.applying_lease_status = None;
-    match queue_error {
+    match queue_error.or(tombstone_error) {
         Some(message) => Err(message),
-        None => Ok(()),
+        None => Ok(authority_was_current),
     }
 }
 
@@ -5068,6 +6005,119 @@ fn lease_operation_auto_arms_private_consult(
     session: &MediaSession,
 ) -> bool {
     operation == LeaseOperation::Create && session.binding.mode == MediaMode::Consult
+}
+
+type RemoteRtcAuthentication = (AdmissionRole, String, String, String);
+
+fn remote_rtc_authentication(
+    signal: &RtcSignal,
+    now: u64,
+) -> Result<Option<RemoteRtcAuthentication>, V2ProtocolError> {
+    signal
+        .verify_endpoint_authentication(now)
+        .map(|authentication| {
+            authentication.map(|authentication| {
+                (
+                    authentication.endpoint_role(),
+                    authentication.holder_key_thumbprint().to_owned(),
+                    authentication.peer_key_thumbprint().to_owned(),
+                    authentication.jti().to_owned(),
+                )
+            })
+        })
+}
+
+fn rtc_signal_authentication_window(signal: &RtcSignal) -> Option<(u64, u64)> {
+    match signal {
+        RtcSignal::Offer { binding, .. } | RtcSignal::Answer { binding, .. } => {
+            Some((binding.claims.issued_at, binding.claims.expires_at))
+        }
+        RtcSignal::Ice { envelope, .. } | RtcSignal::IceComplete { envelope } => {
+            Some((envelope.claims.issued_at, envelope.claims.expires_at))
+        }
+        RtcSignal::Close { .. } => None,
+    }
+}
+
+fn rtc_outer_matches_lease(frame: &GatewayRtcFrame, lease: &ClientLease) -> bool {
+    frame.app_id == lease.claims.app_id
+        && frame.plugin_id == lease.claims.plugin_id
+        && frame.device_id == lease.claims.device_id
+        && frame.lease_jti == lease.claims.jti
+        && frame.rtc_session_id == lease.claims.rtc_session_id
+        && frame.call_id == lease.claims.call_id
+        && frame.call_epoch == lease.claims.call_epoch
+        && frame.owner_epoch == lease.claims.owner_epoch
+        && frame.fence == lease.claims.fence
+        && frame.sdp_revision == lease.session.sdp_revision
+        && frame.transport_generation == lease.session.transport_generation
+}
+
+/// Digest an exact SDP/ICE/Close frame for a lease whose native peer already
+/// crossed a local fail-closed boundary. Signed media proofs normally expire
+/// with the lease, so an actually-expired proof is rechecked inside its
+/// original validity window before being dropped. This never creates, renews,
+/// closes, or otherwise calls native media.
+fn contain_locally_closed_rtc(
+    client: &mut ClientState,
+    frame: &GatewayRtcFrame,
+    replay_key: &str,
+    encoded: &str,
+    now: u64,
+) -> Result<bool, String> {
+    purge_local_expiry_tombstones(client, Instant::now());
+    let lease = client
+        .pending_revoke
+        .as_ref()
+        .filter(|pending| pending.lease_jti == frame.lease_jti)
+        .map(|pending| pending.lease.clone())
+        .or_else(|| {
+            client
+                .local_expiry_tombstones
+                .iter()
+                .find(|tombstone| tombstone.lease.claims.jti == frame.lease_jti)
+                .map(|tombstone| tombstone.lease.clone())
+        });
+    let Some(lease) = lease else {
+        return Ok(false);
+    };
+    if !rtc_outer_matches_lease(frame, &lease) {
+        return Err("RTC signal crossed the locally-closed lease fence".into());
+    }
+
+    let authentication = match remote_rtc_authentication(&frame.signal, now) {
+        Ok(authentication) => authentication,
+        Err(V2ProtocolError::Expired) => {
+            let Some((_issued_at, expires_at)) = rtc_signal_authentication_window(&frame.signal)
+            else {
+                return Err("Desktop RTC endpoint signature is invalid or stale".into());
+            };
+            if expires_at > now {
+                // `Expired` with a future expiry is a future-issued or
+                // malformed proof, never delayed relay mail.
+                return Err("Desktop RTC endpoint signature is invalid or stale".into());
+            }
+            remote_rtc_authentication(&frame.signal, expires_at.saturating_sub(1))
+                .map_err(|_| "Desktop RTC endpoint signature is invalid or stale".to_string())?
+        }
+        Err(_) => return Err("Desktop RTC endpoint signature is invalid or stale".into()),
+    };
+    if !validate_remote_signal_route(&frame.signal, &lease, frame) {
+        return Err("signed Desktop RTC route crossed the locally-closed lease fence".into());
+    }
+    if let Some((role, holder, peer, jti)) = authentication {
+        if role != AdmissionRole::Plugin
+            || holder != lease.claims.plugin_key_thumbprint
+            || peer != lease.claims.mobile_key_thumbprint
+            || !client.seen_remote_endpoint_jtis.insert(jti)
+        {
+            return Err("Desktop RTC endpoint identity was substituted or replayed".into());
+        }
+    } else if !matches!(frame.signal, RtcSignal::Close { .. }) {
+        return Err("Desktop RTC media signal omitted endpoint authentication".into());
+    }
+    remember_applied_relay_frame(client, replay_key.to_owned(), encoded)?;
+    Ok(true)
 }
 
 async fn apply_remote_rtc(
@@ -5085,8 +6135,30 @@ async fn apply_remote_rtc(
         expected_app_id,
     )?;
     validate_id(&frame.signal_id, "RTC signalId")?;
+    frame.signal.validate().map_err(|error| error.to_string())?;
     let replay_key = rtc_signal_replay_key(&frame.signal_id);
     let now = unix_now()?;
+    let expired_before_rtc = {
+        let mut client = state.inner.lock().await;
+        take_expired_lease_locked(state, &mut client, now)
+    };
+    if let Some((expired, queue_error)) = expired_before_rtc {
+        let _ = media::revoke(
+            app,
+            media_state,
+            RevokeRequest {
+                session: expired.session,
+                reason: Some("media lease expired before inbound RTC signalling".into()),
+            },
+        )
+        .await;
+        emit_lease_reset(app);
+        if let Some(message) = queue_error {
+            eprintln!(
+                "[AokieCompanion][realtime] local-expiry return could not be queued: {message}"
+            );
+        }
+    }
     {
         let mut client = state.inner.lock().await;
         if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
@@ -5095,22 +6167,21 @@ async fn apply_remote_rtc(
         if client.device_id.as_deref() != Some(frame.device_id.as_str()) {
             return Err("RTC signal targets another Companion device".into());
         }
+        if contain_locally_closed_rtc(&mut client, &frame, &replay_key, encoded, now)? {
+            return Ok(());
+        }
         let current_grants = current_client_grants(&client);
-        let revoked_mode = client.pending_revoke.as_ref().and_then(|pending| {
-            (pending.lease_jti == frame.lease_jti).then_some(pending.lease.claims.mode)
-        });
         let active_mode = client
             .lease
             .as_ref()
             .and_then(|lease| (lease.claims.jti == frame.lease_jti).then_some(lease.claims.mode));
-        let routed_mode = active_mode.or(revoked_mode);
-        let consent_permits_routed_mode = routed_mode.is_none_or(|mode| {
+        let consent_permits_routed_mode = active_mode.is_none_or(|mode| {
             client.snapshot.as_ref().is_some_and(|snapshot| {
                 current_consent_permits_mode(&snapshot.snapshot.remote_consent, mode, now)
             })
         });
         if !current_grants.contains(&Grant::RtcSignal)
-            || routed_mode.is_some_and(|mode| !grants_permit_lease_mode(current_grants, mode))
+            || active_mode.is_some_and(|mode| !grants_permit_lease_mode(current_grants, mode))
             || !consent_permits_routed_mode
         {
             // A queued old signal is not an error from the current session.
@@ -5120,28 +6191,22 @@ async fn apply_remote_rtc(
             return Ok(());
         }
     }
-    let authentication = frame
-        .signal
-        .verify_endpoint_authentication(now)
-        .map_err(|_| "Desktop RTC endpoint signature is invalid or stale".to_string())?
-        .map(|authentication| {
-            (
-                authentication.endpoint_role(),
-                authentication.holder_key_thumbprint().to_owned(),
-                authentication.peer_key_thumbprint().to_owned(),
-                authentication.jti().to_owned(),
-            )
-        });
+    let authentication = remote_rtc_authentication(&frame.signal, now)
+        .map_err(|_| "Desktop RTC endpoint signature is invalid or stale".to_string())?;
     let lease = {
         let mut client = state.inner.lock().await;
         if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
             return Ok(());
         }
+        if contain_locally_closed_rtc(&mut client, &frame, &replay_key, encoded, now)? {
+            return Ok(());
+        }
         let lease = client
             .lease
             .as_ref()
-            .ok_or("RTC signal arrived without a media lease")?
-            .clone();
+            .filter(|lease| lease.claims.jti == frame.lease_jti)
+            .cloned()
+            .ok_or("RTC signal arrived without a matching media lease fence")?;
         let current_grants = current_client_grants(&client);
         if client.device_id.as_deref() != Some(frame.device_id.as_str())
             || !grants_permit_lease_mode(current_grants, lease.claims.mode)
@@ -5152,16 +6217,7 @@ async fn apply_remote_rtc(
                     now,
                 )
             })
-            || frame.plugin_id != lease.claims.plugin_id
-            || frame.device_id != lease.claims.device_id
-            || frame.lease_jti != lease.claims.jti
-            || frame.rtc_session_id != lease.claims.rtc_session_id
-            || frame.call_id != lease.claims.call_id
-            || frame.call_epoch != lease.claims.call_epoch
-            || frame.owner_epoch != lease.claims.owner_epoch
-            || frame.fence != lease.claims.fence
-            || frame.sdp_revision != lease.session.sdp_revision
-            || frame.transport_generation != lease.session.transport_generation
+            || !rtc_outer_matches_lease(&frame, &lease)
             || lease.claims.expires_at <= now
         {
             return Err("RTC signal does not match the current lease fence".into());
@@ -5349,13 +6405,28 @@ async fn apply_revocation(
     validate_id(&frame.lease_id, "leaseId")?;
     validate_id(&frame.lease_jti, "leaseJti")?;
     validate_text(&frame.reason, 500, "lease revoke reason")?;
-    let (lease, local_media_already_closed, native_action_id) = {
+    let (lease, local_media_already_closed, native_action_id, emit_reset) = {
         let mut client = state.inner.lock().await;
         if completed_revoke_frame_is_replay(&mut client, &frame, encoded)? {
             return Ok(());
         }
-        if let Some(pending) = client.pending_revoke.as_ref() {
-            validate_pending_revoke_ack(pending, &frame)?;
+        purge_local_expiry_tombstones(&mut client, Instant::now());
+
+        let pending_matches = pending_revoke_identity_matches(&client, &frame)?;
+        let tombstone_index = client.local_expiry_tombstones.iter().position(|tombstone| {
+            tombstone.lease.claims.lease_id == frame.lease_id
+                && tombstone.lease.claims.jti == frame.lease_jti
+        });
+        let tombstone_matches = tombstone_index.is_some();
+        let current_matches = client.lease.as_ref().is_some_and(|lease| {
+            lease.claims.lease_id == frame.lease_id && lease.claims.jti == frame.lease_jti
+        });
+
+        if pending_matches {
+            let pending = client
+                .pending_revoke
+                .as_ref()
+                .expect("matching pending revoke was checked");
             // Preserve the locally-known request fence before merging a
             // requestless plugin media-failure notice. Otherwise the first
             // arbitrary Some(requestId) delivered later could claim this
@@ -5367,19 +6438,64 @@ async fn apply_revocation(
                 .pending_revoke
                 .take()
                 .expect("checked pending revoke");
-            client.pending_end_caller = None;
-            (pending.lease, true, pending.native_action_id)
-        } else {
-            let lease = client
-                .lease
-                .as_ref()
-                .ok_or("lease revocation did not match a local lease")?;
-            if lease.claims.lease_id != frame.lease_id || lease.claims.jti != frame.lease_jti {
-                return Err("stale lease revocation did not match the current JTI".into());
+            if tombstone_matches {
+                demote_local_expiry_tombstone(&mut client, &pending.lease_jti);
             }
+            client.urgent_control_frames.retain(|queued| {
+                queued.lease_id != pending.lease_id || queued.lease_jti != pending.lease_jti
+            });
+            let newer_authority_exists = client.lease.as_ref().is_some_and(|lease| {
+                lease.claims.lease_id != pending.lease_id || lease.claims.jti != pending.lease_jti
+            });
+            if !newer_authority_exists {
+                client.pending_end_caller = None;
+            }
+            (
+                pending.lease,
+                true,
+                pending.native_action_id,
+                !newer_authority_exists,
+            )
+        } else if tombstone_matches {
+            // A locally-expired acknowledgement belongs to the tombstone
+            // before it belongs to any newer active lease. Digest it without
+            // clearing current commands or emitting a renderer lease reset.
+            remember_completed_revoke(&mut client, completed_revoke_from_frame(&frame, encoded))?;
+            let tombstone = client
+                .local_expiry_tombstones
+                .get(tombstone_index.expect("matching tombstone index was checked"))
+                .expect("matching local expiry tombstone was checked")
+                .clone();
+            demote_local_expiry_tombstone(&mut client, &tombstone.lease.claims.jti);
+            client.urgent_control_frames.retain(|queued| {
+                queued.lease_id != tombstone.lease.claims.lease_id
+                    || queued.lease_jti != tombstone.lease.claims.jti
+            });
+            let newer_authority_exists = client.lease.is_some() || client.pending.is_some();
+            (tombstone.lease, true, None, !newer_authority_exists)
+        } else if current_matches {
             remember_completed_revoke(&mut client, completed_revoke_from_frame(&frame, encoded))?;
             client.pending_end_caller = None;
-            (client.lease.take().expect("checked lease"), false, None)
+            (
+                client
+                    .lease
+                    .take()
+                    .expect("matching current lease was checked"),
+                false,
+                None,
+                true,
+            )
+        } else {
+            if let Some(pending) = client.pending_revoke.as_ref() {
+                validate_pending_revoke_ack(pending, &frame)?;
+                unreachable!("a successfully validated pending acknowledgement matched above");
+            } else if client.lease.is_some() {
+                return Err("stale lease revocation did not match the current JTI".into());
+            } else if !client.local_expiry_tombstones.is_empty() {
+                return Err("stale lease revocation did not match the local expiry fence".into());
+            } else {
+                return Err("lease revocation did not match a local lease".into());
+            }
         }
     };
     let result = if local_media_already_closed {
@@ -5395,7 +6511,9 @@ async fn apply_revocation(
         )
         .await
     };
-    emit_lease_reset(app);
+    if emit_reset {
+        emit_lease_reset(app);
+    }
     if let Some(action_id) = native_action_id {
         crate::android_runtime::complete_native_call_action(
             app,
@@ -5422,6 +6540,24 @@ fn validate_pending_revoke_ack(
         return Err("lease return acknowledgement crossed its request or JTI fence".into());
     }
     Ok(())
+}
+
+fn pending_revoke_identity_matches(
+    client: &ClientState,
+    frame: &LeaseRevokedFrame,
+) -> Result<bool, String> {
+    let Some(pending) = client.pending_revoke.as_ref() else {
+        return Ok(false);
+    };
+    let identity_matches =
+        frame.lease_id == pending.lease_id && frame.lease_jti == pending.lease_jti;
+    if identity_matches {
+        // Do this before tombstone routing: the tombstone names the same
+        // locally-closed lease but deliberately does not retain the outbound
+        // request ID, so it must never weaken that live request fence.
+        validate_pending_revoke_ack(pending, frame)?;
+    }
+    Ok(identity_matches)
 }
 
 /// When the relay provides no exact revoke acknowledgement, a lease return is
@@ -5618,7 +6754,7 @@ async fn heartbeat_frame(state: &V2State, app_id: &str) -> Result<Option<String>
         }) {
             return Ok(None);
         }
-        if !lease_heartbeat_due(lease.claims.expires_at, now)? {
+        if !lease_heartbeat_due(lease.claims.expires_at, now) {
             return Ok(None);
         }
         (
@@ -5670,11 +6806,48 @@ async fn confirm_urgent_control_frame(
     Ok(())
 }
 
-fn lease_heartbeat_due(expires_at: u64, now: u64) -> Result<bool, String> {
-    if expires_at <= now {
-        return Err("protocol-v2 media lease expired before renewal".into());
+fn lease_heartbeat_due(expires_at: u64, now: u64) -> bool {
+    expires_at > now && expires_at.saturating_sub(now) <= LEASE_RENEWAL_WINDOW.as_secs()
+}
+
+/// Remove only authority whose exact current claims have crossed their local
+/// expiry boundary.  The caller closes the matching native peer afterwards;
+/// keeping that I/O outside the client lock lets an already-delivered renewal
+/// win normally before this check runs.
+///
+/// The token return is best-effort but is queued before the caller touches
+/// native media, so a live transport can promptly converge Desktop's lease
+/// book even when its own expiry timer has not fired yet.  Crucially, none of
+/// this invalidates the authenticated realtime session.
+async fn take_expired_lease(state: &V2State) -> Option<(ClientLease, Option<String>)> {
+    let now = unix_now().ok()?;
+    let mut client = state.inner.lock().await;
+    take_expired_lease_locked(state, &mut client, now)
+}
+
+fn take_expired_lease_locked(
+    state: &V2State,
+    client: &mut ClientState,
+    now: u64,
+) -> Option<(ClientLease, Option<String>)> {
+    let expired = client
+        .lease
+        .as_ref()
+        .is_some_and(|lease| lease.claims.expires_at <= now);
+    if !expired {
+        return None;
     }
-    Ok(expires_at.saturating_sub(now) <= LEASE_RENEWAL_WINDOW.as_secs())
+    let lease = client.lease.take().expect("expired lease was present");
+    client.pending_end_caller = None;
+    let queue_error = queue_exact_lease_revocation(state, client, &lease, "lease_expired").err();
+    let tombstone_error = push_local_expiry_tombstone(
+        client,
+        lease.clone(),
+        Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL,
+        true,
+    )
+    .err();
+    Some((lease, queue_error.or(tombstone_error)))
 }
 
 async fn surrender_failed_private_consult(
@@ -6037,6 +7210,7 @@ fn transition_to_idle(
     client.authoritative_sequence = frame.sequence;
     client.snapshot = None;
     client.lease = None;
+    client.local_expiry_tombstones.clear();
     client.assistance = None;
     client.pending_assistance_answer = None;
     client.pending_end_caller = None;
@@ -6258,8 +7432,15 @@ async fn send_message<S>(writer: &mut S, message: Message) -> bool
 where
     S: SinkExt<Message> + Unpin,
 {
+    send_message_with_timeout(writer, message, SEND_TIMEOUT).await
+}
+
+async fn send_message_with_timeout<S>(writer: &mut S, message: Message, timeout: Duration) -> bool
+where
+    S: SinkExt<Message> + Unpin,
+{
     matches!(
-        tokio::time::timeout(SEND_TIMEOUT, writer.send(message)).await,
+        tokio::time::timeout(timeout, writer.send(message)).await,
         Ok(Ok(()))
     )
 }
@@ -6318,6 +7499,305 @@ mod tests {
         });
         assert!(tracks_gateway_request(&client, "end_prepare_1"));
         assert!(!tracks_gateway_request(&client, "heartbeat_1"));
+    }
+
+    #[tokio::test]
+    async fn predecessor_arm_enabled_before_fence_rechecks_before_acting() {
+        let fence = Arc::new(AtomicBool::new(false));
+        assert!(predecessor_receive_enabled(
+            false,
+            fence.load(Ordering::Acquire)
+        ));
+        let acted = Arc::new(AtomicU64::new(0));
+        let arm_fence = fence.clone();
+        let arm_acted = acted.clone();
+        let (complete, ready) = tokio::sync::oneshot::channel::<()>();
+        let arm = tokio::spawn(async move {
+            ready.await.unwrap();
+            if predecessor_arm_still_current(&arm_fence) {
+                arm_acted.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+
+        // Models a select guard evaluated before the rotation future writes
+        // mobile_hello, followed by this predecessor arm becoming ready only
+        // after that irreversible gateway fence.
+        fence.store(true, Ordering::Release);
+        complete.send(()).unwrap();
+        arm.await.unwrap();
+        assert_eq!(acted.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn delayed_managed_rotation_does_not_starve_active_lease_heartbeats() {
+        let mut rotation: Option<ManagedTransportRotationFuture> = Some(Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(45)).await;
+            Err(ManagedTransportRotationError::Transport(
+                "delayed replacement".into(),
+            ))
+        }));
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(5));
+        heartbeat.tick().await;
+        let mut serviced = 0_u32;
+
+        let result = loop {
+            tokio::select! {
+                result = await_managed_transport_rotation(&mut rotation), if rotation.is_some() => {
+                    break result;
+                }
+                _ = heartbeat.tick() => {
+                    serviced += 1;
+                }
+            }
+        };
+
+        assert!(matches!(
+            result,
+            Err(ManagedTransportRotationError::Transport(message))
+                if message == "delayed replacement"
+        ));
+        assert!(
+            serviced >= 4,
+            "the predecessor must keep renewing while replacement auth/handshake/sync is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_relay_refresh_applies_inbound_renewal_before_rotation_finishes() {
+        let state = V2State::default();
+        let (mut client, mut active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        let now = unix_now().unwrap();
+        active.expires_at = now + 10;
+        client.lease = Some(ClientLease {
+            request_id: "claim_request_a".into(),
+            token: "signed.old.relay.token".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active.clone(),
+        });
+        *state.inner.lock().await = client;
+        let mut renewed = active;
+        renewed.expires_at = now + 30;
+        renewed.jti = "lease_relay_refresh_renewed".into();
+        let frame = lease_status_frame("lease_renewed", "signed.new.relay.token", renewed.clone());
+        let encoded = serde_json::to_string(&frame).unwrap();
+
+        let mut rotation: Option<ManagedTransportRotationFuture> = Some(Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(45)).await;
+            Err(ManagedTransportRotationError::Transport(
+                "delayed relay refresh".into(),
+            ))
+        }));
+        let inbound = async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            (frame, encoded)
+        };
+        tokio::pin!(inbound);
+        let mut inbound_applied = false;
+
+        let result = loop {
+            tokio::select! {
+                result = await_managed_transport_rotation(&mut rotation), if rotation.is_some() => {
+                    break result;
+                }
+                inbound = &mut inbound, if !inbound_applied && predecessor_receive_enabled(false, false) => {
+                    let (frame, encoded) = inbound;
+                    apply_lease_status_transaction(
+                        &state,
+                        "app_a",
+                        frame,
+                        &encoded,
+                        |_, _, _, _| async { Ok(()) },
+                        |_| async {},
+                    )
+                    .await
+                    .expect("the sole live relay reader applies the queued renewal");
+                    inbound_applied = true;
+                }
+            }
+        };
+
+        assert!(matches!(
+            result,
+            Err(ManagedTransportRotationError::Transport(message))
+                if message == "delayed relay refresh"
+        ));
+        assert!(inbound_applied);
+        let client = state.inner.lock().await;
+        assert_eq!(
+            client.lease.as_ref().unwrap().claims.jti,
+            renewed.jti,
+            "relay admission/challenge work cannot pause lease_renewed consumption"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_ws_snapshot_cannot_hold_a_valid_renewal_past_native_expiry() {
+        let state = V2State::default();
+        let (mut client, mut active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        let now = unix_now().unwrap();
+        active.expires_at = now + 10;
+        let previous = ClientLease {
+            request_id: "claim_request_a".into(),
+            token: "signed.old.ws.token".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active.clone(),
+        };
+        client.lease = Some(previous);
+        managed_ws_handoff_lease_ready(&client, now)
+            .expect("ten seconds is enough for the bounded handoff write pair");
+        let mut too_late = ClientState {
+            lease: client.lease.clone(),
+            ..ClientState::default()
+        };
+        too_late.lease.as_mut().unwrap().claims.expires_at =
+            now + MANAGED_HANDOFF_MIN_LEASE_REMAINING.as_secs();
+        assert!(managed_ws_handoff_lease_ready(&too_late, now).is_err());
+        *state.inner.lock().await = client;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut renewed = active;
+        renewed.expires_at = now + 30;
+        renewed.jti = "lease_ws_handoff_renewed".into();
+        let server_renewed = renewed.clone();
+        let renewal_applied = Arc::new(AtomicBool::new(false));
+        let expiry_observer = renewal_applied.clone();
+        let old_native_expiry = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                expiry_observer.load(Ordering::Acquire),
+                "the replacement renewal must update native authority before the old watcher expires"
+            );
+        });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let heartbeat = socket
+                .next()
+                .await
+                .expect("client sends handoff heartbeat")
+                .expect("heartbeat websocket frame");
+            let Message::Text(heartbeat) = heartbeat else {
+                panic!("replacement expected a text heartbeat");
+            };
+            let heartbeat = heartbeat.as_str().to_owned();
+            assert_eq!(parse_kind(&heartbeat).unwrap(), "lease_heartbeat");
+            let request_id = encoded_request_id(&heartbeat, "test heartbeat").unwrap();
+
+            let mut frame =
+                lease_status_frame("lease_renewed", "signed.new.ws.token", server_renewed);
+            frame.request_id = request_id;
+            let encoded = serde_json::to_string(&frame).unwrap();
+            socket
+                .send(Message::Text(encoded.clone().into()))
+                .await
+                .unwrap();
+            // Hold authoritative state beyond the synthetic old-native expiry.
+            // A buffer-only implementation loses the peer at 50ms; immediate
+            // exact renewal application keeps it alive while sync continues.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "kind": "snapshot",
+                        "schemaVersion": SCHEMA_VERSION,
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            encoded
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut transport = V2Transport::websocket(socket);
+
+        let apply_state = state.clone();
+        let applied_signal = renewal_applied.clone();
+        let buffered = receive_replacement_sync_with_renewal(
+            &mut transport,
+            &state,
+            "app_a",
+            move |encoded| {
+                let state = apply_state.clone();
+                let applied = applied_signal.clone();
+                async move {
+                    let frame: LeaseStatusFrame = serde_json::from_str(&encoded)
+                        .map_err(|_| "test renewal did not decode".to_string())?;
+                    apply_lease_status_transaction(
+                        &state,
+                        "app_a",
+                        frame,
+                        &encoded,
+                        |_, _, _, _| async { Ok(()) },
+                        |_| async {},
+                    )
+                    .await?
+                    .ok_or("test renewal was not applied")?;
+                    applied.store(true, Ordering::Release);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("near-expiry replacement sync includes its renewal");
+        old_native_expiry.await.unwrap();
+        let renewed_encoded = server.await.unwrap();
+        assert_eq!(buffered.len(), 2);
+        assert_eq!(buffered[0], renewed_encoded);
+        assert!(renewal_applied.load(Ordering::Acquire));
+        let client = state.inner.lock().await;
+        assert_eq!(client.lease.as_ref().unwrap().claims.jti, renewed.jti);
+        assert_eq!(client.lease.as_ref().unwrap().token, "signed.new.ws.token");
+    }
+
+    #[test]
+    fn managed_refresh_has_one_overlap_path_without_continuous_ninety_second_churn() {
+        let overlap_to_fence = MANAGED_ADMISSION_PRIMARY_HTTP_BUDGET
+            + CONNECT_TIMEOUT
+            + CONNECT_TIMEOUT
+            + MANAGED_HANDOFF_SEND_TIMEOUT;
+        assert_eq!(ADMISSION_REFRESH_MARGIN, Duration::from_secs(45));
+        assert_eq!(
+            ADMISSION_REFRESH_MARGIN,
+            overlap_to_fence + MANAGED_HANDOFF_RETRY_HEADROOM
+        );
+        let before = Instant::now();
+        let deadline = managed_admission_refresh_deadline(unix_now().unwrap() + 90);
+        let remaining = deadline.saturating_duration_since(before);
+        assert!(remaining >= Duration::from_secs(44));
+        assert!(remaining <= Duration::from_secs(46));
+        assert!(
+            remaining >= ADMISSION_REFRESH_MARGIN.saturating_sub(Duration::from_secs(1)),
+            "a 90-second admission must not trigger another hello every few seconds"
+        );
+    }
+
+    #[test]
+    fn cross_carrier_refresh_requires_a_fresh_sequence_generation() {
+        assert!(managed_carrier_continuity(false, false));
+        assert!(managed_carrier_continuity(true, true));
+        assert!(!managed_carrier_continuity(false, true));
+        assert!(!managed_carrier_continuity(true, false));
+    }
+
+    #[test]
+    fn overlapping_sync_skips_authenticated_control_until_authoritative_state() {
+        let control = serde_json::json!({
+            "kind": "rtc_signal",
+            "schemaVersion": SCHEMA_VERSION,
+        })
+        .to_string();
+        let snapshot = serde_json::json!({
+            "kind": "snapshot",
+            "schemaVersion": SCHEMA_VERSION,
+        })
+        .to_string();
+        assert_eq!(initial_sync_frame_ready(&control, true), Ok(false));
+        assert_eq!(initial_sync_frame_ready(&snapshot, true), Ok(true));
+        assert!(initial_sync_frame_ready(&control, false).is_err());
     }
 
     #[test]
@@ -6789,6 +8269,76 @@ mod tests {
         (client, lease_claims)
     }
 
+    fn plugin_bound_lease_status_client(
+        mode: LeaseMode,
+        phase: LeasePhase,
+    ) -> (
+        ClientState,
+        LeaseClaims,
+        crate::endpoint_identity::EndpointIdentity,
+    ) {
+        let (mut client, mut lease_claims) = lease_status_client(mode, phase);
+        let plugin = crate::endpoint_identity::EndpointIdentity::from_secret([31; 32])
+            .expect("test plugin identity");
+        lease_claims.plugin_key_thumbprint = plugin.thumbprint().into();
+        client.peer_key_thumbprint = Some(plugin.thumbprint().into());
+        (client, lease_claims, plugin)
+    }
+
+    fn signed_plugin_rtc_for_lease(
+        plugin: &crate::endpoint_identity::EndpointIdentity,
+        lease: &ClientLease,
+        signal_id: &str,
+        proof_jti: &str,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> GatewayRtcFrame {
+        let envelope = plugin
+            .sign_candidate(TrickleCandidateClaims {
+                app_id: lease.claims.app_id.clone(),
+                plugin_id: lease.claims.plugin_id.clone(),
+                device_id: lease.claims.device_id.clone(),
+                rtc_session_id: lease.claims.rtc_session_id.clone(),
+                endpoint_session_nonce: "plugin_session_a".into(),
+                lease_jti: lease.claims.jti.clone(),
+                endpoint_role: AdmissionRole::Plugin,
+                holder_key_thumbprint: plugin.thumbprint().into(),
+                peer_key_thumbprint: lease.claims.mobile_key_thumbprint.clone(),
+                call_id: lease.claims.call_id.clone(),
+                call_epoch: lease.claims.call_epoch,
+                owner_epoch: lease.claims.owner_epoch,
+                fence: lease.claims.fence,
+                sdp_revision: lease.session.sdp_revision,
+                transport_generation: lease.session.transport_generation,
+                candidate: None,
+                sdp_mid: None,
+                sdp_m_line_index: None,
+                end_of_candidates: true,
+                nonce: format!("nonce_{proof_jti}"),
+                jti: proof_jti.into(),
+                issued_at,
+                expires_at,
+            })
+            .expect("test RTC proof signs");
+        GatewayRtcFrame {
+            kind: "rtc_signal".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: lease.claims.app_id.clone(),
+            signal_id: signal_id.into(),
+            plugin_id: lease.claims.plugin_id.clone(),
+            device_id: lease.claims.device_id.clone(),
+            lease_jti: lease.claims.jti.clone(),
+            rtc_session_id: lease.claims.rtc_session_id.clone(),
+            sdp_revision: lease.session.sdp_revision,
+            transport_generation: lease.session.transport_generation,
+            call_id: lease.claims.call_id.clone(),
+            call_epoch: lease.claims.call_epoch,
+            owner_epoch: lease.claims.owner_epoch,
+            fence: lease.claims.fence,
+            signal: RtcSignal::IceComplete { envelope },
+        }
+    }
+
     fn pending_lease_for(claims: &LeaseClaims) -> PendingLease {
         let request_id = "request_a".to_string();
         PendingLease {
@@ -7055,7 +8605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn renewal_failure_closes_old_or_renewed_peer_and_cannot_renew_again() {
+    async fn native_expiry_before_renewal_is_contained_and_returns_renewed_token() {
         let state = V2State::default();
         let (mut client, active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
         client.lease = Some(ClientLease {
@@ -7072,9 +8622,10 @@ mod tests {
         let frame = lease_status_frame("lease_renewed", "signed.renewed.token", renewed);
         let native_calls = Arc::new(AtomicU64::new(0));
         let cleaned = Arc::new(Mutex::new(Vec::new()));
-        failing_lease_status(&state, frame, native_calls, cleaned.clone())
+        let applied = failing_lease_status(&state, frame, native_calls, cleaned.clone())
             .await
-            .unwrap_err();
+            .expect("native-expired renewal is contained");
+        assert!(applied.is_none());
 
         let client = state.inner.lock().await;
         assert!(client.lease.is_none());
@@ -7084,8 +8635,76 @@ mod tests {
             "signed.renewed.token"
         );
         assert_eq!(cleaned.lock().unwrap().len(), 2);
+        assert_eq!(
+            client
+                .local_expiry_tombstones
+                .iter()
+                .find(|tombstone| tombstone.returnable)
+                .expect("renewed local-expiry lineage")
+                .lease
+                .token,
+            "signed.renewed.token"
+        );
         drop(client);
         assert!(heartbeat_frame(&state, "app_a").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn renewal_updates_the_exact_native_and_authoritative_session_before_next_tick() {
+        let state = V2State::default();
+        let (mut client, active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        let previous = ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.old.token".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active.clone(),
+        };
+        client.lease = Some(previous.clone());
+        *state.inner.lock().await = client;
+
+        let mut renewed = active;
+        renewed.expires_at += 10;
+        renewed.jti = "lease_renewed_a".into();
+        let expected_session = {
+            let mut session = previous.session.clone();
+            session.expires_at = expiry_datetime(renewed.expires_at).unwrap();
+            session
+        };
+        let frame = lease_status_frame("lease_renewed", "signed.renewed.token", renewed.clone());
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let native_session = Arc::new(Mutex::new(None));
+        let observed = native_session.clone();
+
+        let applied = apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            move |operation, session, _, _| {
+                *observed.lock().unwrap() = Some((operation, session));
+                async { Ok(()) }
+            },
+            |_| async {},
+        )
+        .await
+        .unwrap()
+        .expect("renewal applies");
+
+        assert_eq!(
+            native_session.lock().unwrap().as_ref(),
+            Some(&(LeaseOperation::Renew, expected_session.clone()))
+        );
+        assert_eq!(applied.lease_event.session, expected_session);
+        let client = state.inner.lock().await;
+        let current = client.lease.as_ref().expect("renewed authority");
+        assert_eq!(current.token, "signed.renewed.token");
+        assert_eq!(current.claims.jti, renewed.jti);
+        assert_eq!(current.claims.expires_at, renewed.expires_at);
+        assert_eq!(
+            current.session.expires_at,
+            expiry_datetime(renewed.expires_at).unwrap()
+        );
+        assert!(client.pending_revoke.is_none());
     }
 
     #[tokio::test]
@@ -7380,11 +8999,369 @@ mod tests {
     #[test]
     fn fresh_lease_waits_for_the_real_renewal_window() {
         let now = 1_700_000_000;
-        assert!(!lease_heartbeat_due(now + 20, now).unwrap());
-        assert!(!lease_heartbeat_due(now + 15, now).unwrap());
-        assert!(lease_heartbeat_due(now + 14, now).unwrap());
-        assert!(lease_heartbeat_due(now + 1, now).unwrap());
-        assert!(lease_heartbeat_due(now, now).is_err());
+        assert!(!lease_heartbeat_due(now + 20, now));
+        assert!(!lease_heartbeat_due(now + 15, now));
+        assert!(lease_heartbeat_due(now + 14, now));
+        assert!(lease_heartbeat_due(now + 1, now));
+        assert!(!lease_heartbeat_due(now, now));
+    }
+
+    #[tokio::test]
+    async fn expired_lease_is_contained_without_failing_the_realtime_session() {
+        let state = V2State::default();
+        let (mut client, mut active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        active.expires_at = unix_now().unwrap();
+        let expired = ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.expired.token".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active.clone(),
+        };
+        client.lease = Some(expired.clone());
+        *state.inner.lock().await = client;
+
+        // Expiry is deliberately no frame, not an Err: the session loop must
+        // remain connected and must not emit another mobile_hello.
+        assert!(heartbeat_frame(&state, "app_a").await.unwrap().is_none());
+        let (returned, queue_error) = take_expired_lease(&state)
+            .await
+            .expect("exact expired authority is extracted");
+        assert_eq!(returned, expired);
+        assert!(queue_error.is_none());
+
+        let client = state.inner.lock().await;
+        assert!(client.lease.is_none());
+        let pending = client.pending_revoke.as_ref().expect("return fence");
+        assert_eq!(pending.lease_jti, active.jti);
+        assert_eq!(pending.lease.token, "signed.expired.token");
+        let queued = client.urgent_control_frames.front().expect("exact return");
+        let frame: LeaseRevokeFrame = serde_json::from_str(&queued.encoded).unwrap();
+        assert_eq!(frame.lease_token, "signed.expired.token");
+        drop(client);
+        assert!(take_expired_lease(&state).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn late_renewal_advances_expired_lineage_and_queues_the_renewed_token() {
+        let state = V2State::default();
+        let (mut client, mut active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        active.expires_at = unix_now().unwrap();
+        let expired = ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.expired.token".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active.clone(),
+        };
+        client.lease = Some(expired);
+        *state.inner.lock().await = client;
+        take_expired_lease(&state)
+            .await
+            .expect("local expiry extracts authority");
+
+        // Model the short UI confirmation timeout and an already-sent old
+        // revoke. The longer security tombstone must still contain a status
+        // delayed within the plugin's lease window and enqueue a fresh return.
+        {
+            let mut client = state.inner.lock().await;
+            client.pending_revoke = None;
+            client.urgent_control_frames.clear();
+        }
+        let mut renewed = active;
+        renewed.expires_at = unix_now().unwrap() + 20;
+        renewed.jti = "lease_renewed_after_expiry".into();
+        let frame = lease_status_frame(
+            "lease_renewed",
+            "signed.renewed.after.expiry",
+            renewed.clone(),
+        );
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let native_calls = Arc::new(AtomicU64::new(0));
+        let counted = native_calls.clone();
+
+        let applied = apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            move |_, _, _, _| {
+                counted.fetch_add(1, Ordering::AcqRel);
+                async { Ok(()) }
+            },
+            |_| async {},
+        )
+        .await
+        .expect("exact late renewal is contained");
+        assert!(applied.is_none());
+        assert_eq!(native_calls.load(Ordering::Acquire), 0);
+
+        let client = state.inner.lock().await;
+        assert!(client.lease.is_none());
+        let pending = client
+            .pending_revoke
+            .as_ref()
+            .expect("renewed return fence");
+        assert_eq!(pending.lease_jti, renewed.jti);
+        assert_eq!(pending.lease.token, "signed.renewed.after.expiry");
+        let queued = client
+            .urgent_control_frames
+            .back()
+            .expect("renewed return is always queued");
+        let revoke: LeaseRevokeFrame = serde_json::from_str(&queued.encoded).unwrap();
+        assert_eq!(revoke.lease_token, "signed.renewed.after.expiry");
+        assert_eq!(client.urgent_control_frames.len(), 1);
+        assert_eq!(
+            client
+                .local_expiry_tombstones
+                .iter()
+                .find(|tombstone| tombstone.returnable)
+                .expect("advanced expiry lineage")
+                .lease
+                .claims
+                .jti,
+            renewed.jti
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_inbound_renewal_is_returned_before_tick_despite_revoked_permissions() {
+        let state = V2State::default();
+        let (mut client, mut expired_claims, _) =
+            plugin_bound_lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        let now = unix_now().unwrap();
+        expired_claims.expires_at = now - 20;
+        let expired = ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.expired.before.tick".into(),
+            session: session_from_claims(&expired_claims, 2, 2).unwrap(),
+            claims: expired_claims.clone(),
+        };
+        client.lease = Some(expired);
+        client.admission_grants = Some(vec![Grant::StateRead]);
+        let consent = &mut client.snapshot.as_mut().unwrap().snapshot.remote_consent;
+        consent.enabled = false;
+        consent.acknowledged = false;
+        *state.inner.lock().await = client;
+
+        let mut renewed = expired_claims;
+        renewed.expires_at = now - 1;
+        renewed.jti = "lease_expired_renewal_before_tick".into();
+        let frame = lease_status_frame(
+            "lease_renewed",
+            "signed.expired.renewal.before.tick",
+            renewed.clone(),
+        );
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let native_calls = Arc::new(AtomicU64::new(0));
+        let cleanup_calls = Arc::new(AtomicU64::new(0));
+        let counted_native = native_calls.clone();
+        let counted_cleanup = cleanup_calls.clone();
+        let applied = apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            move |_, _, _, _| {
+                counted_native.fetch_add(1, Ordering::AcqRel);
+                async { Ok(()) }
+            },
+            move |sessions| {
+                counted_cleanup.fetch_add(sessions.len() as u64, Ordering::AcqRel);
+                async {}
+            },
+        )
+        .await
+        .expect("expired exact lineage is contained");
+
+        assert!(applied.is_none());
+        assert_eq!(native_calls.load(Ordering::Acquire), 0);
+        assert_eq!(cleanup_calls.load(Ordering::Acquire), 1);
+        let client = state.inner.lock().await;
+        assert!(client.lease.is_none());
+        assert_eq!(
+            client.pending_revoke.as_ref().unwrap().lease_jti,
+            renewed.jti
+        );
+        assert!(client.local_expiry_tombstones.iter().any(|tombstone| {
+            tombstone.returnable && tombstone.lease.claims.jti == renewed.jti
+        }));
+        assert!(client
+            .local_expiry_tombstones
+            .iter()
+            .any(|tombstone| { !tombstone.returnable && tombstone.lease.token.is_empty() }));
+    }
+
+    #[tokio::test]
+    async fn expired_signed_rtc_is_authenticated_and_dropped_while_tampering_stays_fatal() {
+        let state = V2State::default();
+        let (mut client, mut claims, plugin) =
+            plugin_bound_lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        let now = unix_now().unwrap();
+        claims.expires_at = now - 1;
+        let lease = ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.expired.rtc".into(),
+            session: session_from_claims(&claims, 2, 2).unwrap(),
+            claims,
+        };
+        client.lease = Some(lease.clone());
+        *state.inner.lock().await = client;
+        {
+            let mut client = state.inner.lock().await;
+            take_expired_lease_locked(&state, &mut client, now)
+                .expect("inbound path tombstones the expired peer");
+        }
+
+        let exact = signed_plugin_rtc_for_lease(
+            &plugin,
+            &lease,
+            "late_signal_exact",
+            "late_proof_exact",
+            now - 20,
+            now - 1,
+        );
+        {
+            let mut client = state.inner.lock().await;
+            assert!(contain_locally_closed_rtc(
+                &mut client,
+                &exact,
+                "rtc:late_signal_exact",
+                "exact-late-wire",
+                now,
+            )
+            .expect("once-valid exact RTC is contained"));
+        }
+
+        let mut forged = signed_plugin_rtc_for_lease(
+            &plugin,
+            &lease,
+            "late_signal_forged",
+            "late_proof_forged",
+            now - 20,
+            now - 1,
+        );
+        if let RtcSignal::IceComplete { envelope } = &mut forged.signal {
+            envelope.signature = "AAAA".into();
+        }
+        let mut altered = signed_plugin_rtc_for_lease(
+            &plugin,
+            &lease,
+            "late_signal_altered",
+            "late_proof_altered",
+            now - 20,
+            now - 1,
+        );
+        altered.fence += 1;
+        let future = signed_plugin_rtc_for_lease(
+            &plugin,
+            &lease,
+            "late_signal_future",
+            "late_proof_future",
+            now + 20,
+            now + 40,
+        );
+        let mut client = state.inner.lock().await;
+        for (frame, key) in [
+            (forged, "rtc:late_signal_forged"),
+            (altered, "rtc:late_signal_altered"),
+            (future, "rtc:late_signal_future"),
+        ] {
+            assert!(contain_locally_closed_rtc(&mut client, &frame, key, key, now).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn old_expiry_lineage_coexists_with_new_authority_and_a_second_expiry() {
+        let state = V2State::default();
+        let (mut client, mut old_claims, plugin) =
+            plugin_bound_lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        let now = unix_now().unwrap();
+        old_claims.expires_at = now;
+        let old = ClientLease {
+            request_id: "request_old".into(),
+            token: "signed.old".into(),
+            session: session_from_claims(&old_claims, 2, 2).unwrap(),
+            claims: old_claims.clone(),
+        };
+        client.lease = Some(old.clone());
+        *state.inner.lock().await = client;
+        take_expired_lease(&state)
+            .await
+            .expect("old authority expires");
+        {
+            let mut client = state.inner.lock().await;
+            client.pending_revoke = None;
+            client.urgent_control_frames.clear();
+            let mut newer_claims = old_claims.clone();
+            newer_claims.lease_id = "media_new".into();
+            newer_claims.jti = "lease_new".into();
+            newer_claims.rtc_session_id = "rtc_new".into();
+            newer_claims.expires_at = now + 20;
+            newer_claims.fence += 1;
+            client.lease = Some(ClientLease {
+                request_id: "request_new".into(),
+                token: "signed.new".into(),
+                session: session_from_claims(&newer_claims, 1, 1).unwrap(),
+                claims: newer_claims,
+            });
+        }
+
+        let mut renewed_old = old_claims;
+        renewed_old.expires_at = now + 10;
+        renewed_old.jti = "lease_old_renewed".into();
+        let frame = lease_status_frame("lease_renewed", "signed.old.renewed", renewed_old.clone());
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let applied = apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            |_, _, _, _| async { panic!("old renewal must never touch the new native peer") },
+            |_| async {},
+        )
+        .await
+        .expect("old renewal is contained beside new authority");
+        assert!(applied.is_none());
+
+        let old_rtc = signed_plugin_rtc_for_lease(
+            &plugin,
+            &old,
+            "old_route_after_renewal",
+            "old_route_proof",
+            now - 10,
+            now,
+        );
+        let mut client = state.inner.lock().await;
+        assert!(contain_locally_closed_rtc(
+            &mut client,
+            &old_rtc,
+            "rtc:old_route_after_renewal",
+            "old-route-wire",
+            now,
+        )
+        .expect("tokenless ancestor still contains queued RTC"));
+        assert_eq!(client.lease.as_ref().unwrap().claims.jti, "lease_new");
+        assert!(client.pending_revoke.is_none());
+        assert_eq!(client.local_expiry_tombstones.len(), 2);
+
+        client.lease.as_mut().unwrap().claims.expires_at = now;
+        client.lease.as_mut().unwrap().session.expires_at = expiry_datetime(now).unwrap();
+        let second = take_expired_lease_locked(&state, &mut client, now)
+            .expect("new authority can expire without overwriting old fences")
+            .0;
+        assert_eq!(second.claims.jti, "lease_new");
+        assert_eq!(client.local_expiry_tombstones.len(), 3);
+        assert!(client
+            .local_expiry_tombstones
+            .iter()
+            .any(|tombstone| tombstone.lease.claims.jti == "lease_a"));
+        assert!(client
+            .local_expiry_tombstones
+            .iter()
+            .any(|tombstone| tombstone.lease.claims.jti == renewed_old.jti));
+        assert!(client
+            .local_expiry_tombstones
+            .iter()
+            .any(|tombstone| tombstone.lease.claims.jti == "lease_new"));
     }
 
     #[tokio::test]
@@ -7394,7 +9371,7 @@ mod tests {
             lease_status_client(LeaseMode::Takeover, LeasePhase::Prepared);
         let now = unix_now().unwrap();
         prepared.expires_at = now + 10;
-        assert!(lease_heartbeat_due(prepared.expires_at, now).unwrap());
+        assert!(lease_heartbeat_due(prepared.expires_at, now));
         let current = ClientLease {
             request_id: "request_a".into(),
             token: "signed.prepared.token".into(),
@@ -8739,6 +10716,109 @@ mod tests {
         assert!(!shim.peer_verified);
     }
 
+    /// The relay keeps frames longer than the endpoint proof window. During a
+    /// managed-admission overlap the plugin can therefore re-send a cached
+    /// hello whose otherwise-correct 30-second proof expired 40 seconds ago.
+    /// That stale carrier frame must not fail the predecessor (which would
+    /// close a live Talk peer), and it must not authorize the unverified
+    /// replacement.
+    #[test]
+    fn expired_plugin_regreeting_is_non_authorizing_carrier_traffic() {
+        let desktop = crate::endpoint_identity::EndpointIdentity::from_secret([23; 32])
+            .expect("test identity");
+        let shim_for = || {
+            GatewayShim::new(
+                "app_overlap".into(),
+                "device_a".into(),
+                vec![Grant::StateRead],
+                desktop.thumbprint().into(),
+            )
+        };
+        let now = unix_now().expect("clock");
+        let mut stale: PluginHello =
+            serde_json::from_str(&signed_plugin_hello(&desktop, "app_overlap"))
+                .expect("fixture decodes");
+        stale.endpoint_proof.claims.issued_at = now - 70;
+        stale.endpoint_proof.claims.expires_at = now - 40;
+        // `EndpointIdentity::sign_hello` intentionally refuses to mint an
+        // already-expired proof, so reproduce the historically valid cached
+        // wire frame with the test's known key after moving its clock window.
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
+        stale.endpoint_proof.signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            signing_key
+                .sign(
+                    &stale
+                        .endpoint_proof
+                        .claims
+                        .signing_bytes()
+                        .expect("claims canonicalize"),
+                )
+                .to_bytes(),
+        );
+        let stale_frame = stale.clone();
+        let stale = serde_json::to_string(&stale).expect("stale fixture encodes");
+
+        let mut predecessor = shim_for();
+        predecessor
+            .translate(&signed_plugin_hello(&desktop, "app_overlap"))
+            .expect("predecessor proves the pinned Desktop key");
+        let sequence_before = predecessor.sequence;
+        assert_eq!(predecessor.translate(&stale), Ok(None));
+        assert!(
+            predecessor.peer_verified,
+            "a redundant stale hello cannot de-authenticate live proven transport"
+        );
+        assert_eq!(predecessor.sequence, sequence_before);
+
+        let mut replacement = shim_for();
+        assert_eq!(replacement.translate(&stale), Ok(None));
+        assert!(
+            !replacement.peer_verified,
+            "an expired proof never grants replacement authority"
+        );
+        assert_eq!(
+            replacement.translate(&plugin_snapshot_frame_for("app_overlap")),
+            Ok(None),
+            "unverified replacement state remains fail-closed"
+        );
+        assert_eq!(replacement.sequence, 0);
+
+        let mut forged = stale_frame.clone();
+        forged.endpoint_proof.signature =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 64]);
+        let forged = serde_json::to_string(&forged).expect("forged fixture encodes");
+        let mut fail_closed = shim_for();
+        assert!(
+            fail_closed.translate(&forged).is_err(),
+            "expiration cannot hide a forged Desktop signature"
+        );
+        assert!(!fail_closed.peer_verified);
+
+        let mut future = stale_frame;
+        future.endpoint_proof.claims.issued_at = now + 70;
+        future.endpoint_proof.claims.expires_at = now + 90;
+        future.endpoint_proof.signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            signing_key
+                .sign(
+                    &future
+                        .endpoint_proof
+                        .claims
+                        .signing_bytes()
+                        .expect("future claims canonicalize"),
+                )
+                .to_bytes(),
+        );
+        let future = serde_json::to_string(&future).expect("future fixture encodes");
+        let mut temporal_fail_closed = shim_for();
+        assert!(
+            temporal_fail_closed.translate(&future).is_err(),
+            "a future-issued proof is not stale relay mail"
+        );
+        assert!(!temporal_fail_closed.peer_verified);
+    }
+
     /// Relay mail can survive a plugin restart. Process-global proof would let
     /// a brand-new session consume that queued authority without its own signed
     /// hello merely because the long-term key string matched.
@@ -9494,6 +11574,98 @@ mod tests {
         wrong = exact.clone();
         wrong.lease_jti = "lease_other".into();
         assert!(validate_pending_revoke_ack(&pending, &wrong).is_err());
+    }
+
+    #[test]
+    fn matching_expiry_tombstone_cannot_bypass_the_pending_revoke_request_fence() {
+        let pending = pending_revoke_fixture(LeaseMode::Takeover, 8);
+        let mut client = ClientState {
+            pending_revoke: Some(pending.clone()),
+            ..ClientState::default()
+        };
+        push_local_expiry_tombstone(
+            &mut client,
+            pending.lease.clone(),
+            Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL,
+            true,
+        )
+        .unwrap();
+        let wrong_request = LeaseRevokedFrame {
+            kind: "lease_revoked".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: Some("return_request_attacker".into()),
+            lease_id: pending.lease_id,
+            lease_jti: pending.lease_jti,
+            reason: "returned".into(),
+        };
+
+        assert!(pending_revoke_identity_matches(&client, &wrong_request).is_err());
+        assert!(client.pending_revoke.is_some());
+        assert_eq!(client.local_expiry_tombstones.len(), 1);
+    }
+
+    #[test]
+    fn acknowledged_expiry_route_still_contains_late_exact_signed_rtc() {
+        let (mut client, claims, plugin) =
+            plugin_bound_lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        let lease = ClientLease {
+            request_id: "claim_request_a".into(),
+            token: "signed.returnable.token".into(),
+            session: session_from_claims(&claims, 2, 2).unwrap(),
+            claims,
+        };
+        let pending = PendingRevoke {
+            request_id: "return_request_a".into(),
+            lease_id: lease.claims.lease_id.clone(),
+            lease_jti: lease.claims.jti.clone(),
+            lease: lease.clone(),
+            authoritative_sequence: 8,
+            authoritative_remote_revision: Some(13),
+            native_action_id: None,
+            deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+        };
+        push_local_expiry_tombstone(
+            &mut client,
+            lease.clone(),
+            Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL,
+            true,
+        )
+        .unwrap();
+        client.pending_revoke = Some(pending);
+        let ack = LeaseRevokedFrame {
+            kind: "lease_revoked".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: Some("return_request_a".into()),
+            lease_id: lease.claims.lease_id.clone(),
+            lease_jti: lease.claims.jti.clone(),
+            reason: "returned".into(),
+        };
+        assert!(pending_revoke_identity_matches(&client, &ack).unwrap());
+        client.pending_revoke = None;
+        demote_local_expiry_tombstone(&mut client, &lease.claims.jti);
+        let retained = client.local_expiry_tombstones.front().unwrap();
+        assert!(!retained.returnable);
+        assert!(retained.lease.token.is_empty());
+
+        let now = unix_now().unwrap();
+        let late = signed_plugin_rtc_for_lease(
+            &plugin,
+            &lease,
+            "rtc_after_ack",
+            "rtc_after_ack_proof",
+            now.saturating_sub(1),
+            now + 5,
+        );
+        assert!(contain_locally_closed_rtc(
+            &mut client,
+            &late,
+            "rtc:rtc_after_ack",
+            "late-rtc-after-ack-wire",
+            now,
+        )
+        .expect("acknowledgement retains an exact route-only RTC fence"));
     }
 
     #[test]
