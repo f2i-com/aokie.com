@@ -57,6 +57,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(20);
 const ACTIVE_LEASE_FALLBACK_TTL: u64 = 20;
 const MAX_USED_ENDPOINT_JTIS: usize = 4_096;
 const ADMISSION_SAFETY_MARGIN_SECONDS: u64 = 10;
+/// Desktop's token for the hosted-relay carrier in `supportedTransports`.
+/// It compares the string exactly, so this is a shared wire constant.
+const RELAY_TRANSPORT: &str = "relay";
 const MIN_TURN_CREDENTIAL_TTL_SECONDS: u64 = 30;
 const MAX_TURN_CREDENTIAL_TTL_SECONDS: u64 = 24 * 60 * 60;
 
@@ -405,6 +408,10 @@ struct SessionCredentials {
     relay_only: bool,
     turn_credential_expires_at: Option<u64>,
     endpoint_authority: Arc<EndpointAuthority>,
+    /// Present only when the admission advertised the hosted relay AND every
+    /// advertised URL passed [`normalize_relay_url`]. `None` selects the
+    /// WebSocket gateway, which stays the default transport.
+    relay: Option<RelayEndpoints>,
 }
 
 impl fmt::Debug for SessionCredentials {
@@ -430,6 +437,7 @@ impl fmt::Debug for SessionCredentials {
                 "peer_roster_revision",
                 &self.endpoint_authority.roster_revision,
             )
+            .field("transport", &self.transport_label())
             .finish()
     }
 }
@@ -456,7 +464,18 @@ impl SessionCredentials {
             relay_only: bootstrap.relay_only,
             turn_credential_expires_at: None,
             endpoint_authority,
+            // plugin.init's compact bootstrap carries no transport
+            // advertisement; the first brokered admission refresh decides.
+            relay: None,
         }))
+    }
+
+    fn transport_label(&self) -> &'static str {
+        if self.relay.is_some() {
+            "relay"
+        } else {
+            "websocket"
+        }
     }
 }
 
@@ -531,6 +550,24 @@ impl NullableUnixTimestamp {
     }
 }
 
+/// FormLogic-hosted relay transport advertised alongside the WebSocket
+/// gateway. Absent (the default) keeps the untouched WebSocket path, so
+/// withdrawing the member server-side reverts the transport with no rebuild.
+///
+/// ⚠️ Deliberately NOT `deny_unknown_fields`, unlike every security-bearing
+/// document around it. This is an additive transport hint: a server that later
+/// advertises another member (the long-poll fallback the relay controller
+/// already serves is the obvious next one) must leave this build using the
+/// three URLs it does understand, not lose the whole admission over a member
+/// it was never taught.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RelayEndpoints {
+    pub(crate) challenge_url: String,
+    pub(crate) frames_url: String,
+    pub(crate) stream_url: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AdmissionResponse {
@@ -552,6 +589,18 @@ struct AdmissionResponse {
     approved_peer_key_thumbprints: Vec<String>,
     peer_roster_revision: u64,
     peer_roster_hash: String,
+    /// Tolerated ahead of the Desktop projection that forwards it: this
+    /// decoder is `deny_unknown_fields`, so the member has to be accepted
+    /// before it can ever arrive.
+    ///
+    /// Held as a raw value rather than a typed member ON PURPOSE. Decoding it
+    /// inline would make a malformed or reshaped advertisement fail the whole
+    /// admission — a `rebootstrap` that takes the entire Companion surface
+    /// down — when the transport is additive and the correct answer is to keep
+    /// using the WebSocket gateway. [`usable_relay_endpoints`] owns that
+    /// decision, so every rejection lands on the same degrade path.
+    #[serde(default)]
+    relay: Option<Value>,
 }
 
 impl AdmissionResponse {
@@ -621,8 +670,52 @@ impl AdmissionResponse {
             relay_only: self.relay_only,
             turn_credential_expires_at,
             endpoint_authority,
+            relay: self.relay.and_then(usable_relay_endpoints),
         })
     }
+}
+
+/// Accept an advertised relay only when it decodes to the shape this build
+/// understands, every URL is safe, AND all three share one origin. A rejected
+/// advertisement degrades to the WebSocket gateway rather than failing the
+/// admission: the transport is additive, and refusing the whole admission over
+/// it would take the Companion surface down harder than simply not adopting
+/// the new path.
+fn usable_relay_endpoints(advertisement: Value) -> Option<RelayEndpoints> {
+    let relay: RelayEndpoints = match serde_json::from_value(advertisement) {
+        Ok(relay) => relay,
+        Err(_) => {
+            eprintln!(
+                "[aokie-plugin][companion] stage=relay_advertisement_rejected transport=websocket detail=The relay advertisement is not the shape this build understands"
+            );
+            return None;
+        }
+    };
+    let checked = [
+        normalize_relay_url(&relay.challenge_url, "challengeUrl"),
+        normalize_relay_url(&relay.frames_url, "framesUrl"),
+        normalize_relay_url(&relay.stream_url, "streamUrl"),
+    ];
+    let mut origins = Vec::with_capacity(checked.len());
+    for outcome in &checked {
+        match outcome {
+            Ok(url) => origins.push(url.origin()),
+            Err(error) => {
+                eprintln!(
+                    "[aokie-plugin][companion] stage=relay_advertisement_rejected transport=websocket detail={}",
+                    sanitize_status_message(&error.message)
+                );
+                return None;
+            }
+        }
+    }
+    if origins.windows(2).any(|pair| pair[0] != pair[1]) {
+        eprintln!(
+            "[aokie-plugin][companion] stage=relay_advertisement_rejected transport=websocket detail=Companion relay URLs span more than one origin"
+        );
+        return None;
+    }
+    Some(relay)
 }
 
 fn validate_admission_ice_configuration(
@@ -672,7 +765,7 @@ fn validate_admission_ice_configuration(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkerErrorKind {
+pub(crate) enum WorkerErrorKind {
     Reconnect,
     Expired,
     AdmissionRefresh,
@@ -691,13 +784,13 @@ impl WorkerErrorKind {
 }
 
 #[derive(Debug)]
-struct WorkerError {
-    kind: WorkerErrorKind,
-    message: String,
+pub(crate) struct WorkerError {
+    pub(crate) kind: WorkerErrorKind,
+    pub(crate) message: String,
 }
 
 impl WorkerError {
-    fn reconnect(message: impl Into<String>) -> Self {
+    pub(crate) fn reconnect(message: impl Into<String>) -> Self {
         Self {
             kind: WorkerErrorKind::Reconnect,
             message: message.into(),
@@ -711,7 +804,7 @@ impl WorkerError {
         }
     }
 
-    fn rebootstrap(message: impl Into<String>) -> Self {
+    pub(crate) fn rebootstrap(message: impl Into<String>) -> Self {
         Self {
             kind: WorkerErrorKind::Rebootstrap,
             message: message.into(),
@@ -868,6 +961,44 @@ fn refresh_admission(
     plugin_id: &str,
     endpoint_authority: Arc<EndpointAuthority>,
 ) -> Result<SessionCredentials, WorkerError> {
+    let params = admission_request_params(app_id, plugin_id, &endpoint_authority)?;
+    let (request_id, line, receiver) = host_rpc.begin("companion.admission", Value::Object(params));
+    let mut sink = StdoutSink::new();
+    if sink.send_line(&line).is_err() {
+        host_rpc.forget(request_id);
+        return Err(WorkerError::rebootstrap(
+            "Desktop admission broker is unavailable",
+        ));
+    }
+    let value = match receiver.recv_timeout(ADMISSION_RPC_TIMEOUT) {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) => {
+            return Err(WorkerError::rebootstrap(
+                "Desktop rejected Companion admission refresh",
+            ))
+        }
+        Err(_) => {
+            host_rpc.forget(request_id);
+            return Err(WorkerError::rebootstrap(
+                "Desktop admission refresh timed out",
+            ));
+        }
+    };
+    let response: AdmissionResponse = serde_json::from_value(value).map_err(|_| {
+        WorkerError::rebootstrap("Desktop returned an invalid Companion admission response")
+    })?;
+    response.into_credentials(app_id, plugin_id, endpoint_authority)
+}
+
+/// The `companion.admission` RPC request. Pure so the transport negotiation
+/// below can be locked in a test — Desktop strips the relay advertisement from
+/// every admission until the plugin asks for it, so this request IS the switch
+/// that activates the hosted carrier.
+fn admission_request_params(
+    app_id: Option<&str>,
+    plugin_id: &str,
+    endpoint_authority: &EndpointAuthority,
+) -> Result<serde_json::Map<String, Value>, WorkerError> {
     let mut params = serde_json::Map::new();
     if let Some(app_id) = app_id {
         params.insert("appId".into(), Value::String(app_id.into()));
@@ -896,32 +1027,21 @@ fn refresh_admission(
         "peerRosterHash".into(),
         Value::String(endpoint_authority.roster_hash.clone()),
     );
-    let (request_id, line, receiver) = host_rpc.begin("companion.admission", Value::Object(params));
-    let mut sink = StdoutSink::new();
-    if sink.send_line(&line).is_err() {
-        host_rpc.forget(request_id);
-        return Err(WorkerError::rebootstrap(
-            "Desktop admission broker is unavailable",
-        ));
+    // Desktop NEGOTIATES the optional `relay` member rather than deploy-ordering
+    // it: it forwards the advertisement only to a build that asks, so a plugin
+    // that predates the transport keeps the exact pre-relay wire shape whichever
+    // side upgrades first. Asking is therefore what activates the carrier — the
+    // member is stripped from every admission until this is sent.
+    //
+    // Gated with the carrier itself: a non-voice build cannot open a relay
+    // channel, so it must not ask for endpoints it would only log and ignore.
+    if cfg!(feature = "voice") {
+        params.insert(
+            "supportedTransports".into(),
+            Value::Array(vec![Value::String(RELAY_TRANSPORT.into())]),
+        );
     }
-    let value = match receiver.recv_timeout(ADMISSION_RPC_TIMEOUT) {
-        Ok(Ok(value)) => value,
-        Ok(Err(_)) => {
-            return Err(WorkerError::rebootstrap(
-                "Desktop rejected Companion admission refresh",
-            ))
-        }
-        Err(_) => {
-            host_rpc.forget(request_id);
-            return Err(WorkerError::rebootstrap(
-                "Desktop admission refresh timed out",
-            ));
-        }
-    };
-    let response: AdmissionResponse = serde_json::from_value(value).map_err(|_| {
-        WorkerError::rebootstrap("Desktop returned an invalid Companion admission response")
-    })?;
-    response.into_credentials(app_id, plugin_id, endpoint_authority)
+    Ok(params)
 }
 
 fn set_status(
@@ -991,6 +1111,45 @@ fn normalize_gateway_url(raw: &str) -> Result<Url, String> {
         url.set_path(&joined);
     }
     Ok(url)
+}
+
+/// Relay endpoints are ordinary HTTP resources, so they cannot share
+/// [`normalize_gateway_url`]: that one forces `wss` and rewrites the path to
+/// `/v2/realtime`, which would destroy a mailbox URL. The path here is
+/// authoritative and preserved exactly as advertised.
+///
+/// ⚠️ The `http` exception exists because the current deployment serves
+/// `http://formlogic.local` with its API on `http://api.formlogic.local`:
+/// neither presents a certificate, so requiring `https` would make the hosted
+/// relay unreachable on the very install it was built for. It means the
+/// admission bearer rides plaintext over the LAN, which is why the exception
+/// is confined to loopback / `.local` hosts on managed-beta builds.
+fn normalize_relay_url(raw: &str, label: &str) -> Result<Url, WorkerError> {
+    let invalid = |detail: &str| {
+        WorkerError::rebootstrap(format!("Companion relay {label} {detail}"))
+    };
+    let url = Url::parse(raw).map_err(|_| invalid("is not an absolute URL"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid("must not contain credentials"));
+    }
+    if url.fragment().is_some() {
+        return Err(invalid("must not contain a fragment"));
+    }
+    let secure = url.scheme() == "https";
+    let local_plaintext = cfg!(feature = "managed-beta-driver")
+        && url.scheme() == "http"
+        && url.host_str().is_some_and(is_local_network_host);
+    if !secure && !local_plaintext {
+        return Err(invalid(
+            "must use https (managed-beta builds may use http on a loopback or .local host)",
+        ));
+    }
+    Ok(url)
+}
+
+/// Loopback plus the mDNS `.local` names the desktop install actually serves.
+fn is_local_network_host(host: &str) -> bool {
+    is_loopback_host(host) || host.to_ascii_lowercase().ends_with(".local")
 }
 
 fn is_numeric_loopback_host(host: &str) -> bool {
@@ -1841,6 +2000,211 @@ mod tests {
     }
 
     #[test]
+    fn relay_urls_keep_their_path_and_refuse_unsafe_advertisements() {
+        let frames = normalize_relay_url(
+            "https://api.example.test/api/aokie-companion/relay/frames",
+            "framesUrl",
+        )
+        .unwrap();
+        // The mailbox path is authoritative: normalize_gateway_url's
+        // /v2/realtime rewrite would destroy it.
+        assert_eq!(frames.path(), "/api/aokie-companion/relay/frames");
+        assert_ne!(frames.path(), "/v2/realtime");
+
+        assert!(
+            normalize_relay_url("https://api.example.test/relay?since=4", "streamUrl").is_ok(),
+            "an existing query is not a reason to refuse the endpoint"
+        );
+        assert!(normalize_relay_url("https://user:pass@api.example.test/relay", "framesUrl").is_err());
+        assert!(normalize_relay_url("https://api.example.test/relay#part", "framesUrl").is_err());
+        assert!(normalize_relay_url("/api/aokie-companion/relay/frames", "framesUrl").is_err());
+        assert!(normalize_relay_url("wss://api.example.test/relay", "framesUrl").is_err());
+        assert!(normalize_relay_url("http://public.example.test/relay", "framesUrl").is_err());
+
+        // The live install serves plain http on .local names, so managed-beta
+        // builds accept exactly those and nothing wider.
+        let local = normalize_relay_url("http://api.formlogic.local/api/relay/frames", "framesUrl");
+        let loopback = normalize_relay_url("http://127.0.0.1:17872/api/relay/frames", "framesUrl");
+        if cfg!(feature = "managed-beta-driver") {
+            assert!(local.is_ok());
+            assert!(loopback.is_ok());
+            assert_eq!(local.unwrap().path(), "/api/relay/frames");
+        } else {
+            assert!(local.is_err());
+            assert!(loopback.is_err());
+        }
+    }
+
+    #[test]
+    fn admission_tolerates_the_relay_member_and_defaults_to_the_socket() {
+        let authority = test_authority();
+
+        let socket_only = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority.clone())
+            .unwrap();
+        assert!(
+            socket_only.relay.is_none(),
+            "an admission without the member keeps the untouched WebSocket path"
+        );
+        assert_eq!(socket_only.transport_label(), "websocket");
+
+        let mut advertised = admission_value("app_a", "aokie", &authority);
+        advertised["relay"] = json!({
+            "challengeUrl": "https://api.example.test/api/aokie-companion/relay/challenge",
+            "framesUrl": "https://api.example.test/api/aokie-companion/relay/frames",
+            "streamUrl": "https://api.example.test/api/aokie-companion/relay/stream"
+        });
+        let response: AdmissionResponse =
+            serde_json::from_value(advertised.clone()).expect("the relay member is tolerated");
+        let credentials = response
+            .into_credentials(None, "aokie", authority.clone())
+            .unwrap();
+        let relay = credentials.relay.as_ref().expect("relay endpoints survive");
+        assert_eq!(
+            relay.stream_url,
+            "https://api.example.test/api/aokie-companion/relay/stream"
+        );
+        assert_eq!(credentials.transport_label(), "relay");
+        assert!(!format!("{credentials:?}").contains("aokie-adm-v2.secret-value"));
+
+        // A split-origin or unsafe advertisement degrades to the socket
+        // instead of failing the admission the live line depends on.
+        let mut split = advertised.clone();
+        split["relay"]["streamUrl"] = json!("https://elsewhere.example.test/relay/stream");
+        let degraded: AdmissionResponse = serde_json::from_value(split).unwrap();
+        assert!(degraded
+            .into_credentials(None, "aokie", authority.clone())
+            .unwrap()
+            .relay
+            .is_none());
+
+        // A server that grows the advertisement keeps this build on the relay:
+        // the transport hint is additive, so an unknown member is ignored
+        // rather than failing the admission the live line depends on.
+        let mut grown = advertised.clone();
+        grown["relay"]["pollUrl"] = json!("https://api.example.test/api/aokie-companion/relay/frames");
+        let tolerated: AdmissionResponse =
+            serde_json::from_value(grown).expect("an added relay member is not fatal");
+        assert!(tolerated
+            .into_credentials(None, "aokie", authority.clone())
+            .unwrap()
+            .relay
+            .is_some());
+
+        // A reshaped advertisement this build cannot use degrades to the
+        // socket — it must never cost the whole admission.
+        let mut reshaped = advertised.clone();
+        reshaped["relay"] = json!({"framesUrl": "https://api.example.test/relay/frames"});
+        let degraded: AdmissionResponse =
+            serde_json::from_value(reshaped).expect("a reshaped relay member is not fatal");
+        assert!(degraded
+            .into_credentials(None, "aokie", authority.clone())
+            .unwrap()
+            .relay
+            .is_none());
+
+        // The admission document itself stays strict: tolerance is scoped to
+        // the additive transport hint, not to the security envelope.
+        let mut unknown = advertised;
+        unknown["mailboxUrl"] = json!("https://api.example.test/relay/mailbox");
+        assert!(serde_json::from_value::<AdmissionResponse>(unknown).is_err());
+    }
+
+    #[test]
+    fn the_admission_request_asks_for_the_relay_carrier_this_build_can_actually_open() {
+        let authority = test_authority();
+        let params = admission_request_params(Some("app_a"), "aokie", &authority).unwrap();
+
+        // Desktop forwards the optional `relay` member ONLY to a build that
+        // declares it, and strips it otherwise. Without this the carrier is
+        // unreachable: every admission arrives relay-less and the plugin sits
+        // on the WebSocket gateway forever, looking exactly like a backend that
+        // never advertised.
+        let declared = params.get("supportedTransports");
+        if cfg!(feature = "voice") {
+            assert_eq!(
+                declared,
+                Some(&json!([RELAY_TRANSPORT])),
+                "the relay carrier only activates when the plugin asks for it"
+            );
+        } else {
+            assert!(
+                declared.is_none(),
+                "a build with no relay carrier must keep the pre-relay request shape"
+            );
+        }
+
+        // The rest of the request is the pre-relay contract, unchanged.
+        assert_eq!(params.get("pluginId"), Some(&json!("aokie")));
+        assert_eq!(params.get("appId"), Some(&json!("app_a")));
+        assert_eq!(
+            params.get("peerRosterHash"),
+            Some(&json!(authority.roster_hash))
+        );
+        assert!(admission_request_params(None, "aokie", &authority)
+            .unwrap()
+            .get("appId")
+            .is_none());
+    }
+
+    #[test]
+    fn endpoint_hello_is_identical_whichever_transport_fetched_the_challenge() {
+        let authority = test_authority();
+        let credentials = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority.clone())
+            .unwrap();
+        let now = unix_now().unwrap();
+        let challenge = EndpointChallengeFrame {
+            kind: "endpoint_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            subject_id: "aokie".into(),
+            role: AdmissionRole::Plugin,
+            connection_id: "relay_c0ffee".into(),
+            challenge_nonce: "challenge_abc123".into(),
+            admission_jti: "jti_abc123".into(),
+            holder_key_thumbprint: authority.endpoint_key.thumbprint.clone(),
+            expected_peer_key_thumbprint: None,
+            approved_peer_key_thumbprints: authority.approved_thumbprints(),
+            peer_roster_revision: Some(authority.roster_revision),
+            peer_roster_hash: Some(authority.roster_hash.clone()),
+            expires_at: now + 30,
+        };
+
+        let (socket_hello, socket_nonce) = endpoint_hello(&challenge, &credentials, now).unwrap();
+        let (relay_hello, relay_nonce) = endpoint_hello(&challenge, &credentials, now).unwrap();
+
+        // Only the per-connection nonces differ; everything the gateway binds
+        // the connection to comes from the challenge itself.
+        assert_ne!(socket_nonce, relay_nonce);
+        assert_eq!(socket_hello.app_id, relay_hello.app_id);
+        assert_eq!(socket_hello.plugin_id, relay_hello.plugin_id);
+        for hello in [&socket_hello, &relay_hello] {
+            hello.validate().unwrap();
+            let claims = &hello.endpoint_proof.claims;
+            assert_eq!(claims.connection_id, challenge.connection_id);
+            assert_eq!(claims.challenge_nonce, challenge.challenge_nonce);
+            assert_eq!(claims.admission_jti, challenge.admission_jti);
+            assert_eq!(claims.expires_at, challenge.expires_at);
+            assert_eq!(
+                claims.approved_peer_key_thumbprints,
+                authority.approved_thumbprints()
+            );
+            assert!(claims.expected_peer_key_thumbprint.is_none());
+        }
+
+        // A challenge minted for another identity is refused on either carrier.
+        let mut foreign = challenge.clone();
+        foreign.app_id = "app_b".into();
+        assert!(endpoint_hello(&foreign, &credentials, now).is_err());
+
+        // The plugin role must never be handed a mobile's peer expectation.
+        let mut peered = challenge;
+        peered.expected_peer_key_thumbprint = Some("mobile-thumbprint".into());
+        assert!(endpoint_hello(&peered, &credentials, now).is_err());
+    }
+
+    #[test]
     fn gateway_error_envelope_accepts_typed_fields_without_app_identity() {
         let encoded = json!({
             "kind": "error",
@@ -1858,6 +2222,176 @@ mod tests {
 
         let notice: ErrorNotice = parse_gateway_frame(&encoded).unwrap();
         assert_eq!(notice.code, "stale_snapshot");
+    }
+}
+
+/// One session, two possible carriers. Every [`GatewaySession`] method already
+/// speaks text in and text out, so the protocol itself is transport-blind: the
+/// WebSocket gateway remains the default and the FormLogic-hosted relay is
+/// selected only when an admission advertises it.
+///
+/// Exactly one of these exists per session, so the size gap between the
+/// carriers buys nothing worth boxing the socket the live path runs on.
+#[allow(clippy::large_enum_variant)]
+enum GatewayTransport {
+    WebSocket(WebSocketTransport),
+    #[cfg(feature = "voice")]
+    Relay(crate::companion_relay::RelayChannel),
+}
+
+/// The WebSocket carrier owns its own heartbeat bookkeeping so an admission
+/// rotation replaces the ping schedule together with the socket it belongs to.
+struct WebSocketTransport {
+    socket: GatewaySocket,
+    next_ping: Instant,
+    awaiting_pong: Option<Instant>,
+}
+
+impl GatewayTransport {
+    async fn open(
+        credentials: &SessionCredentials,
+        status: &Arc<Mutex<GatewayStatusSnapshot>>,
+        attempt: u32,
+    ) -> Result<(Self, String), WorkerError> {
+        #[cfg(feature = "voice")]
+        if let Some(relay) = credentials.relay.as_ref() {
+            let (mut channel, challenge) = crate::companion_relay::RelayChannel::connect(
+                relay,
+                &credentials.token,
+                &credentials.app_id,
+                &credentials.plugin_id,
+                credentials.endpoint_authority.approved_thumbprints(),
+            )
+            .await?;
+            // The identical validation + signing the socket runs, so a relay
+            // session proves the same endpoint identity from the same document.
+            let (hello, session_nonce) = endpoint_hello(&challenge, credentials, unix_now()?)?;
+            let encoded = serde_json::to_string(&hello)
+                .map_err(|_| WorkerError::reconnect("Companion frame could not be encoded"))?;
+            channel.arm(encoded);
+            set_status(status, GatewayConnectionPhase::Connected, attempt, None);
+            return Ok((Self::Relay(channel), session_nonce));
+        }
+        #[cfg(not(feature = "voice"))]
+        if credentials.relay.is_some() {
+            // The relay carrier rides reqwest, which only the voice build
+            // pulls in. Say so once and use the proven WebSocket path rather
+            // than pretending the advertisement was never made.
+            eprintln!(
+                "[aokie-plugin][companion] stage=relay_unavailable transport=websocket detail=The hosted relay transport requires the voice build"
+            );
+        }
+        let (socket, session_nonce) = open_gateway_socket(credentials, status, attempt).await?;
+        Ok((
+            Self::WebSocket(WebSocketTransport {
+                socket,
+                next_ping: Instant::now() + PING_INTERVAL,
+                awaiting_pong: None,
+            }),
+            session_nonce,
+        ))
+    }
+
+    async fn send_text(&mut self, encoded: &str) -> Result<(), WorkerError> {
+        match self {
+            Self::WebSocket(transport) => transport
+                .socket
+                .send(Message::Text(encoded.into()))
+                .await
+                .map_err(safe_ws_error),
+            #[cfg(feature = "voice")]
+            Self::Relay(channel) => channel.send_text(encoded).await,
+        }
+    }
+
+    /// `Ok(None)` means "nothing for the session this tick" — the carrier's own
+    /// keepalive traffic never reaches the protocol layer.
+    async fn recv_text(&mut self, tick: Duration) -> Result<Option<String>, WorkerError> {
+        match self {
+            Self::WebSocket(transport) => transport.recv_text(tick).await,
+            #[cfg(feature = "voice")]
+            Self::Relay(channel) => channel.recv_text(tick).await,
+        }
+    }
+
+    async fn tick_heartbeat(&mut self) -> Result<(), WorkerError> {
+        match self {
+            Self::WebSocket(transport) => transport.tick_heartbeat().await,
+            // The relay has no connection to keep warm: the server sends SSE
+            // heartbeat comments and the reader tracks its own read idleness.
+            #[cfg(feature = "voice")]
+            Self::Relay(_) => Ok(()),
+        }
+    }
+
+    /// Preserve carrier-level continuity across an admission rotation.
+    ///
+    /// The socket needs nothing here — the gateway holds the routing and the
+    /// predecessor stays live during the overlap. The relay has no such
+    /// middleman: its replacement must inherit the read cursor and the learned
+    /// device routes, or it re-reads frames the session already handled.
+    fn adopt_routing_from(&mut self, previous: &mut Self) {
+        match (self, previous) {
+            #[cfg(feature = "voice")]
+            (Self::Relay(next), Self::Relay(previous)) => next.adopt_routing_from(previous),
+            _ => {}
+        }
+    }
+
+    async fn close(self) {
+        match self {
+            Self::WebSocket(mut transport) => {
+                let _ = transport.socket.send(Message::Close(None)).await;
+            }
+            #[cfg(feature = "voice")]
+            Self::Relay(channel) => channel.close().await,
+        }
+    }
+}
+
+impl WebSocketTransport {
+    async fn recv_text(&mut self, tick: Duration) -> Result<Option<String>, WorkerError> {
+        match tokio::time::timeout(tick, self.socket.next()).await {
+            Err(_) => Ok(None),
+            Ok(Some(Ok(Message::Text(encoded)))) => Ok(Some(encoded.as_str().to_string())),
+            Ok(Some(Ok(Message::Ping(payload)))) => {
+                self.socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .map_err(safe_ws_error)?;
+                Ok(None)
+            }
+            Ok(Some(Ok(Message::Pong(_)))) => {
+                self.awaiting_pong = None;
+                Ok(None)
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => Err(WorkerError::reconnect(
+                "Companion gateway closed the socket",
+            )),
+            Ok(Some(Ok(_))) => Err(WorkerError::reconnect(
+                "Companion gateway sent a non-text protocol frame",
+            )),
+            Ok(Some(Err(error))) => Err(safe_ws_error(error)),
+        }
+    }
+
+    async fn tick_heartbeat(&mut self) -> Result<(), WorkerError> {
+        if let Some(sent_at) = self.awaiting_pong {
+            if sent_at.elapsed() >= PONG_TIMEOUT {
+                return Err(WorkerError::reconnect(
+                    "Companion gateway heartbeat timed out",
+                ));
+            }
+        }
+        if Instant::now() >= self.next_ping {
+            self.socket
+                .send(Message::Ping(Default::default()))
+                .await
+                .map_err(safe_ws_error)?;
+            self.awaiting_pong = Some(Instant::now());
+            self.next_ping = Instant::now() + PING_INTERVAL;
+        }
+        Ok(())
     }
 }
 
@@ -1905,6 +2439,21 @@ async fn open_gateway_socket(
     let challenge: EndpointChallengeFrame = serde_json::from_str(challenge_encoded.as_str())
         .map_err(|_| WorkerError::reconnect("Companion endpoint challenge is malformed"))?;
     let now = unix_now()?;
+    let (hello, session_nonce) = endpoint_hello(&challenge, credentials, now)?;
+    send_json(&mut socket, &hello).await?;
+    set_status(status, GatewayConnectionPhase::Connected, attempt, None);
+    Ok((socket, session_nonce))
+}
+
+/// Validate an endpoint challenge against local identity and sign the plugin
+/// hello it demands. Transport-free on purpose: the WebSocket gateway reads
+/// its challenge off the socket and the hosted relay fetches the same document
+/// over HTTP, and both must produce a byte-identical proof from it.
+fn endpoint_hello(
+    challenge: &EndpointChallengeFrame,
+    credentials: &SessionCredentials,
+    now: u64,
+) -> Result<(PluginHello, String), WorkerError> {
     challenge
         .validate(now)
         .map_err(|_| WorkerError::reconnect("Companion endpoint challenge is invalid"))?;
@@ -1962,9 +2511,7 @@ async fn open_gateway_socket(
     hello
         .validate()
         .map_err(|_| WorkerError::rebootstrap("Companion plugin hello is invalid"))?;
-    send_json(&mut socket, &hello).await?;
-    set_status(status, GatewayConnectionPhase::Connected, attempt, None);
-    Ok((socket, session_nonce))
+    Ok((hello, session_nonce))
 }
 
 async fn run_socket(
@@ -1975,27 +2522,30 @@ async fn run_socket(
     status: &Arc<Mutex<GatewayStatusSnapshot>>,
     attempt: u32,
 ) -> Result<(), WorkerError> {
-    let (mut socket, session_nonce) = open_gateway_socket(&credentials, status, attempt).await?;
+    let (mut transport, session_nonce) =
+        GatewayTransport::open(&credentials, status, attempt).await?;
     let media = radio
         .remote_media()
         .ok_or_else(|| WorkerError::reconnect("Companion media endpoint is unavailable"))?;
     let mut session = GatewaySession::new(&credentials, session_nonce);
     let mut admission_deadline = Instant::now() + credentials.lifetime;
-    let mut retiring_socket: Option<(GatewaySocket, Instant)> = None;
-    let mut next_ping = Instant::now() + PING_INTERVAL;
-    let mut awaiting_pong: Option<Instant> = None;
+    let mut retiring_transport: Option<(GatewayTransport, Instant)> = None;
 
     loop {
-        if retiring_socket
+        if retiring_transport
             .as_ref()
             .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
         {
-            retiring_socket.take();
+            // Dropped rather than closed, exactly as before: the gateway has
+            // already fenced this predecessor off the replacement hello, and
+            // an explicit close frame here would be new behaviour on the
+            // rotation path a live call depends on.
+            retiring_transport.take();
         }
         if *stop_rx.borrow() {
-            let _ = socket.send(Message::Close(None)).await;
-            if let Some((mut retiring, _)) = retiring_socket.take() {
-                let _ = retiring.send(Message::Close(None)).await;
+            transport.close().await;
+            if let Some((retiring, _)) = retiring_transport.take() {
+                retiring.close().await;
             }
             return Ok(());
         }
@@ -2013,7 +2563,7 @@ async fn run_socket(
                 credentials.endpoint_authority.clone(),
             )?;
             let (replacement, replacement_nonce) =
-                open_gateway_socket(&refreshed, status, attempt).await?;
+                GatewayTransport::open(&refreshed, status, attempt).await?;
             session.rotate_credentials(&refreshed, replacement_nonce)?;
 
             // Keep the authenticated predecessor alive briefly while the
@@ -2021,14 +2571,14 @@ async fn run_socket(
             // live same-authority rotation, preserves every current lease and
             // fences the predecessor itself. Dropping the old socket first
             // would make an otherwise healthy active call look like an outage.
-            let predecessor = std::mem::replace(&mut socket, replacement);
-            retiring_socket = Some((predecessor, Instant::now() + Duration::from_secs(2)));
+            let mut predecessor = std::mem::replace(&mut transport, replacement);
+            transport.adopt_routing_from(&mut predecessor);
+            retiring_transport = Some((predecessor, Instant::now() + Duration::from_secs(2)));
             credentials = refreshed;
             admission_deadline = Instant::now() + credentials.lifetime;
-            next_ping = Instant::now() + PING_INTERVAL;
-            awaiting_pong = None;
             eprintln!(
-                "[aokie-plugin][companion] stage=admission_rotated continuity=preserved app={} plugin={} active_peers={}",
+                "[aokie-plugin][companion] stage=admission_rotated continuity=preserved transport={} app={} plugin={} active_peers={}",
+                credentials.transport_label(),
                 credentials.app_id,
                 credentials.plugin_id,
                 session.peers.len()
@@ -2037,91 +2587,42 @@ async fn run_socket(
         }
 
         for encoded in session.drain_end_caller_results()? {
-            socket
-                .send(Message::Text(encoded.into()))
-                .await
-                .map_err(safe_ws_error)?;
+            transport.send_text(&encoded).await?;
         }
         for encoded in session.drain_media_events(media, radio)? {
-            socket
-                .send(Message::Text(encoded.into()))
-                .await
-                .map_err(safe_ws_error)?;
+            transport.send_text(&encoded).await?;
         }
         if Instant::now() >= session.next_snapshot_poll {
             session.next_snapshot_poll = Instant::now() + SNAPSHOT_POLL;
             if let Some(encoded) = session.authoritative_state_frame(radio)? {
-                socket
-                    .send(Message::Text(encoded.into()))
-                    .await
-                    .map_err(safe_ws_error)?;
+                transport.send_text(&encoded).await?;
             }
             if let Some(encoded) = session.assistance_frame(radio)? {
-                socket
-                    .send(Message::Text(encoded.into()))
-                    .await
-                    .map_err(safe_ws_error)?;
+                transport.send_text(&encoded).await?;
             }
         }
 
-        if let Some(sent_at) = awaiting_pong {
-            if sent_at.elapsed() >= PONG_TIMEOUT {
-                return Err(WorkerError::reconnect(
-                    "Companion gateway heartbeat timed out",
-                ));
-            }
-        }
-        if Instant::now() >= next_ping {
-            socket
-                .send(Message::Ping(Default::default()))
-                .await
-                .map_err(safe_ws_error)?;
-            awaiting_pong = Some(Instant::now());
-            next_ping = Instant::now() + PING_INTERVAL;
-        }
+        transport.tick_heartbeat().await?;
 
-        match tokio::time::timeout(READ_TICK, socket.next()).await {
-            Err(_) => {}
-            Ok(Some(Ok(Message::Text(encoded)))) => {
-                let inbound_kind = serde_json::from_str::<Envelope>(encoded.as_str())
-                    .map(|frame| frame.kind)
-                    .unwrap_or_else(|_| "malformed".into());
-                let outbound = session
-                    .handle_inbound(encoded.as_str(), media, radio)
-                    .map_err(|error| {
-                        eprintln!(
-                            "[aokie-plugin][companion] stage=inbound_rejected frame={} kind={} detail={}",
-                            inbound_kind,
-                            error.kind.label(),
-                            sanitize_status_message(&error.message)
-                        );
-                        error
-                    })?;
-                for encoded in outbound {
-                    socket
-                        .send(Message::Text(encoded.into()))
-                        .await
-                        .map_err(safe_ws_error)?;
-                }
-            }
-            Ok(Some(Ok(Message::Ping(payload)))) => {
-                socket
-                    .send(Message::Pong(payload))
-                    .await
-                    .map_err(safe_ws_error)?;
-            }
-            Ok(Some(Ok(Message::Pong(_)))) => awaiting_pong = None,
-            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
-                return Err(WorkerError::reconnect(
-                    "Companion gateway closed the socket",
-                ));
-            }
-            Ok(Some(Ok(_))) => {
-                return Err(WorkerError::reconnect(
-                    "Companion gateway sent a non-text protocol frame",
-                ));
-            }
-            Ok(Some(Err(error))) => return Err(safe_ws_error(error)),
+        let Some(encoded) = transport.recv_text(READ_TICK).await? else {
+            continue;
+        };
+        let inbound_kind = serde_json::from_str::<Envelope>(&encoded)
+            .map(|frame| frame.kind)
+            .unwrap_or_else(|_| "malformed".into());
+        let outbound = session
+            .handle_inbound(&encoded, media, radio)
+            .map_err(|error| {
+                eprintln!(
+                    "[aokie-plugin][companion] stage=inbound_rejected frame={} kind={} detail={}",
+                    inbound_kind,
+                    error.kind.label(),
+                    sanitize_status_message(&error.message)
+                );
+                error
+            })?;
+        for encoded in outbound {
+            transport.send_text(&encoded).await?;
         }
     }
 }

@@ -35,6 +35,12 @@ pub mod assistance;
 pub mod call_session;
 pub mod command_journal;
 pub mod companion_gateway;
+/// The FormLogic-hosted relay carrier for [`companion_gateway`]. Voice-gated
+/// because it rides `reqwest`, which only the voice build pulls in; the
+/// gateway itself compiles unconditionally and falls back to the WebSocket
+/// transport when this module is absent.
+#[cfg(feature = "voice")]
+pub mod companion_relay;
 pub mod config;
 pub mod connector;
 pub mod consent;
