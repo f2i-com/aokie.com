@@ -18,7 +18,8 @@ use aokie_protocol::v2::{
     MobileAssistanceAnswerFrame, MobileEndCallerChallengeRequestFrame, MobileEndCallerConfirmFrame,
     MobileHello, MobileIdleSyncFrame, MobileOfferAnswerFrame, MobileOfferSurface,
     MobileRtcSignalFrame, MobileSnapshotFrame, PluginAssistanceRequestFrame,
-    PluginEndCallerResultFrame, RtcSignal, ServiceMode, SignedPendingMobileOffer, TelephonyState,
+    PluginEndCallerResultFrame, PluginHello, PluginIdleFrame, PluginSnapshotFrame,
+    ProjectedCallSnapshot, RtcSignal, ServiceMode, SignedPendingMobileOffer, TelephonyState,
     TrickleCandidateClaims, V2ProtocolError, MAX_LEASE_TOKEN_BYTES, MAX_SAFE_INTEGER,
     SCHEMA_VERSION,
 };
@@ -80,6 +81,542 @@ const MAX_ANSWERED_ASSISTANCE_REQUESTS: usize = 64;
 type V2WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type V2Writer = SplitSink<V2WebSocket, Message>;
 type V2Reader = SplitStream<V2WebSocket>;
+
+/// How long one receive tick waits before handing control back to the session
+/// loop. Only a cadence: nothing is lost when it elapses.
+const TRANSPORT_READ_TICK: Duration = Duration::from_millis(200);
+
+/// Environment opt-in for POSTING ANYTHING AT ALL over the relay.
+///
+/// ⚠️ DEFAULT OFF, DELIBERATELY, AND IT COVERS EVERY OUTBOUND FRAME — not just
+/// the hello. The live plugin's frame dispatcher accepts exactly eight
+/// GATEWAY-dialect kinds (`claim_proposal`, `lease_granted`, `lease_renewed`,
+/// `lease_revoked`, `rtc_signal`, `assistance_answer`, `end_caller_execute`,
+/// `error`) and ends in `_ => Err(reconnect("unsupported frame"))`, which tears
+/// its session down. Over the socket a gateway process TRANSLATED the mobile
+/// dialect into that one; on the relay nothing does, so every frame this
+/// session emits is fatal to the peer:
+///
+/// * `mobile_hello`, `lease_request`, `end_caller_challenge_request` and
+///   `end_caller_confirm` have no arm at all — straight to the catch-all.
+/// * the two kind names that DO overlap still fail to parse, because the twins
+///   are `deny_unknown_fields` and differ: `MobileRtcSignalFrame` carries a
+///   `leaseToken` `PluginRtcSignalFrame` does not, and
+///   `MobileAssistanceAnswerFrame` carries an `idempotencyKey` while
+///   `PluginAssistanceAnswerFrame` wants a `deviceId`. A parse failure is a
+///   teardown too.
+///
+/// So once this Companion is on the plugin's approved roster, ONE tap in the
+/// Companion UI — answer, end-caller, assistance — would drop the session of a
+/// desktop answering a real phone line, and would do it again on every retry.
+/// Gating only the hello would have left every one of those paths open.
+///
+/// Turning this on is safe only after the plugin ships additive arms for the
+/// mobile dialect. Until then the carrier runs genuinely read-only: it
+/// authenticates, primes its cursor and reads the stream, and posts nothing.
+///
+/// ⚠️ Read-only also means SILENT, and roster approval does not change that.
+/// The plugin's relay routing is speak-first — it learns a party from an
+/// inbound frame and broadcasts only to parties it has learned — so a build
+/// that posts nothing is never a destination, approved or not. Expect
+/// `initial_sync` to time out on a loop until the plugin can accept a hello.
+const RELAY_SEND_ENV: &str = "AOKIE_COMPANION_RELAY_SEND_HELLO";
+
+fn relay_send_opt_in() -> bool {
+    relay_send_opt_in_from(std::env::var(RELAY_SEND_ENV).ok().as_deref())
+}
+
+/// Exactly `"1"`, nothing else. Split out so the rule can be locked without a
+/// test mutating process-wide environment under a parallel runner.
+fn relay_send_opt_in_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// One session, two possible carriers.
+///
+/// Every protocol decision already happens on text in and text out, so the
+/// session is transport-blind: the WebSocket gateway remains the default and
+/// the FormLogic-hosted relay is selected only when an admission advertises one.
+///
+/// Exactly one of these exists per session, so the size gap between the
+/// carriers buys nothing worth boxing the socket the live path runs on.
+#[allow(clippy::large_enum_variant)]
+enum V2Transport {
+    WebSocket { writer: V2Writer, reader: V2Reader },
+    Relay(RelayCarrier),
+}
+
+/// The relay channel plus everything the absent gateway used to supply.
+struct RelayCarrier {
+    channel: crate::companion_relay::RelayChannel,
+    /// Fetched over HTTP while connecting, and consumed once by the handshake.
+    /// Over the socket the challenge is the server's first frame; over the
+    /// relay it is a document on an authenticated route, so the carrier holds
+    /// it until the handshake asks.
+    challenge: Option<EndpointChallengeFrame>,
+    shim: GatewayShim,
+}
+
+/// What one receive tick produced for the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum V2Inbound {
+    /// Nothing happened this tick.
+    Idle,
+    /// The carrier proved liveness without producing a protocol frame: a
+    /// WebSocket ping, or relay stream bytes that carried no session frame.
+    /// Distinct from [`Self::Idle`] because it feeds the inbound freshness
+    /// timer.
+    Alive,
+    Text(String),
+    Pong,
+    /// The peer ended the session in an expected way; logged, never surfaced as
+    /// an error banner.
+    Closed(String),
+    /// The carrier failed in a way the operator should see.
+    Failed(String),
+}
+
+impl V2Transport {
+    fn websocket(socket: V2WebSocket) -> Self {
+        let (writer, reader) = socket.split();
+        Self::WebSocket { writer, reader }
+    }
+
+    /// The WebSocket keeps itself warm with ping/pong; the relay does not have a
+    /// connection to keep warm, because the server sends SSE heartbeat comments
+    /// and the reader tracks its own read idleness.
+    fn uses_websocket_heartbeat(&self) -> bool {
+        matches!(self, Self::WebSocket { .. })
+    }
+
+    /// Deliver one frame.
+    ///
+    /// Over the socket every frame goes out unchanged. Over the relay ALL of
+    /// them are withheld unless [`RELAY_SEND_ENV`] opts in — see that constant
+    /// for why posting any frame in today's mobile dialect tears down the
+    /// session of a desktop on a live call.
+    ///
+    /// A withheld frame reports success so the session survives: the caller's
+    /// contract is "false breaks the session", and dropping the working READ
+    /// path because a user tapped an action the peer cannot accept would be a
+    /// worse outcome than the action quietly not happening. The cost is that a
+    /// queued user action resolves as delivered; that is bounded to the
+    /// opt-in-off relay path, which is exactly the path where no user action
+    /// can be honoured at all.
+    async fn send_text(&mut self, encoded: String) -> bool {
+        match self {
+            Self::WebSocket { writer, .. } => send_text(writer, encoded).await,
+            Self::Relay(relay) => {
+                if !relay_send_opt_in() {
+                    let kind = parse_kind(&encoded).unwrap_or_else(|_| "unparsed".into());
+                    eprintln!(
+                        "[AokieCompanion][relay] holding outbound {kind}: the plugin has no handler for the mobile dialect yet (set {RELAY_SEND_ENV}=1 once it does)"
+                    );
+                    return true;
+                }
+                relay.channel.send_text(&encoded).await
+            }
+        }
+    }
+
+    async fn send_ping(&mut self) -> bool {
+        match self {
+            Self::WebSocket { writer, .. } => {
+                send_message(writer, Message::Ping(Default::default())).await
+            }
+            Self::Relay(_) => true,
+        }
+    }
+
+    /// The endpoint challenge this session must answer.
+    ///
+    /// Both carriers hand back the SAME document type, so the validation and
+    /// signing in [`endpoint_handshake`] are shared verbatim and a relay session
+    /// provably proves the same endpoint identity as a socket one.
+    async fn next_challenge(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<EndpointChallengeFrame, String> {
+        match self {
+            Self::Relay(relay) => relay
+                .challenge
+                .take()
+                .ok_or_else(|| "v2 transport closed before endpoint proof".to_string()),
+            Self::WebSocket { .. } => loop {
+                if Instant::now() >= deadline {
+                    return Err("endpoint proof challenge timed out".into());
+                }
+                match self.recv(TRANSPORT_READ_TICK).await {
+                    V2Inbound::Text(text) => {
+                        if parse_kind(&text)? != "endpoint_challenge" {
+                            return Err(
+                                "v2 server did not begin with an endpoint proof challenge".into()
+                            );
+                        }
+                        return strict_parse::<EndpointChallengeFrame>(&text, "endpoint challenge");
+                    }
+                    V2Inbound::Idle | V2Inbound::Alive | V2Inbound::Pong => {}
+                    V2Inbound::Closed(_) => {
+                        return Err("v2 transport closed before endpoint proof".into())
+                    }
+                    V2Inbound::Failed(message) => return Err(message),
+                }
+            },
+        }
+    }
+
+    fn is_relay(&self) -> bool {
+        matches!(self, Self::Relay(_))
+    }
+
+    async fn recv(&mut self, tick: Duration) -> V2Inbound {
+        match self {
+            Self::WebSocket { writer, reader } => {
+                match tokio::time::timeout(tick, reader.next()).await {
+                    Err(_) => V2Inbound::Idle,
+                    Ok(Some(Ok(Message::Text(text)))) => V2Inbound::Text(text.as_str().to_string()),
+                    Ok(Some(Ok(Message::Ping(bytes)))) => {
+                        if send_message(writer, Message::Pong(bytes)).await {
+                            V2Inbound::Alive
+                        } else {
+                            V2Inbound::Failed("protocol-v2 heartbeat reply failed".into())
+                        }
+                    }
+                    Ok(Some(Ok(Message::Pong(_)))) => V2Inbound::Pong,
+                    Ok(Some(Ok(Message::Close(frame)))) => V2Inbound::Closed(format!(
+                        "gateway closed the active socket: {frame:?}"
+                    )),
+                    Ok(None) => V2Inbound::Closed("active socket reached EOF".into()),
+                    Ok(Some(Err(error))) => {
+                        V2Inbound::Closed(format!("active socket read failed: {error}"))
+                    }
+                    Ok(Some(Ok(_))) => {
+                        V2Inbound::Failed("gateway sent a non-text protocol-v2 frame".into())
+                    }
+                }
+            }
+            Self::Relay(relay) => match relay.channel.recv(tick).await {
+                Ok(crate::companion_relay::RelayReceive::Idle) => V2Inbound::Idle,
+                Ok(crate::companion_relay::RelayReceive::Alive) => V2Inbound::Alive,
+                Ok(crate::companion_relay::RelayReceive::Frame(frame)) => {
+                    match relay.shim.translate(&frame) {
+                        Ok(Some(translated)) => V2Inbound::Text(translated),
+                        // A plugin frame this build has no mobile equivalent
+                        // for is carrier traffic, not a session fault: the
+                        // shim is deliberately as tolerant inbound as the
+                        // plugin is strict, because erroring here would churn
+                        // the session on every frame outside the subset.
+                        Ok(None) => V2Inbound::Alive,
+                        Err(message) => V2Inbound::Failed(message),
+                    }
+                }
+                Err(message) => V2Inbound::Failed(message),
+            },
+        }
+    }
+
+    /// Preserve carrier-level continuity across an admission rotation.
+    ///
+    /// The socket needs nothing here — the gateway holds the routing and the
+    /// predecessor stays live during the overlap. The relay has no such
+    /// middleman: its replacement must inherit the read cursor and any frame
+    /// already read but not yet handled, or it re-reads what the session has
+    /// already processed. The shim's sequence must carry too, because the
+    /// session tracks authoritative state on a monotonic high-water mark.
+    fn adopt_routing_from(&mut self, previous: &mut Self) {
+        if let (Self::Relay(next), Self::Relay(previous)) = (self, previous) {
+            next.channel.adopt_routing_from(&mut previous.channel);
+            next.shim.adopt_sequence_from(&previous.shim);
+        }
+    }
+
+    // No `close`: this session has always ended by dropping the carrier, and
+    // the relay has nothing to close either — the mailbox holds no
+    // per-connection state and already-posted frames stay readable until their
+    // TTL expires. Sending a socket close frame here would be new behaviour on
+    // a path a live call depends on.
+}
+
+/// The gateway's translation job, done client-side on the relay path.
+///
+/// Over the WebSocket a gateway process sat between the two endpoints and
+/// TRANSLATED: the plugin speaks `plugin_hello` / `plugin_snapshot` /
+/// `plugin_idle`, the Companion understands `snapshot` / `idle_sync`, and the
+/// two dialects are otherwise disjoint. The relay is a dumb mailbox, so that
+/// translation has to happen here.
+///
+/// ⚠️ The plugin's frames carry an `eventId`, NOT a sequence, and no grants —
+/// the gateway minted both. So this shim is not a renaming pass: it supplies the
+/// monotonic `sequence` the session tracks authoritative state on, and the
+/// `grants` from the admission the server actually issued. A translation that
+/// merely copied fields across would fail `validate_snapshot` on every frame.
+///
+/// Scope is the READ-ONLY subset. The lease path (`claim_decision`,
+/// `plugin_lease_revoke`) and RTC signalling are dropped rather than
+/// half-translated; when they land, note that `MobileRtcSignalFrame` carries a
+/// `leaseToken` its plugin twin does not, and both are `deny_unknown_fields`, so
+/// the shim must strip it exactly as `aokie-protocol`'s own comment (v2.rs, on
+/// `validate_routed_mobile`) records the gateway doing.
+struct GatewayShim {
+    app_id: String,
+    grants: Vec<Grant>,
+    /// The Desktop endpoint key this admission pinned and the user confirmed.
+    /// A `plugin_hello` that does not prove possession of it is not our peer.
+    expected_peer_key_thumbprint: String,
+    /// Cleared until the peer proves itself; authoritative state is never
+    /// projected from an unauthenticated sender.
+    peer_verified: bool,
+    sequence: u64,
+}
+
+/// Desktop endpoints that have proved possession of their admission-pinned key
+/// during this process's lifetime, keyed `<app_id>/<thumbprint>`.
+///
+/// ⚠️ Peer proof MUST outlive one carrier. The plugin greets a party exactly
+/// once per PLUGIN session: its `greeted` set is cleared when the plugin arms a
+/// rotated hello, never when this Companion reconnects. So a Companion that
+/// verifies, loses its carrier and comes back is never greeted again — and with
+/// verification scoped to the carrier, `peer_gate` would then drop every
+/// snapshot for the rest of the plugin's session. That is not a slow recovery,
+/// it is a permanent read deadlock that only a plugin restart clears, and the
+/// same gap swallows an admission rotation whenever the line is quiet enough
+/// that no state change re-greets us inside the replacement's 15s sync window.
+///
+/// Caching cannot promote an impostor. An entry is written only after a real
+/// signature over the EXACT thumbprint the admission pinned and the user
+/// confirmed, and it is read back only for that same app and thumbprint — so
+/// the set can never say more than "this Desktop already proved itself to us".
+fn proven_peers() -> &'static Mutex<HashSet<String>> {
+    static PROVEN: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    PROVEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn proven_peer_key(app_id: &str, thumbprint: &str) -> String {
+    format!("{app_id}/{thumbprint}")
+}
+
+impl GatewayShim {
+    fn new(app_id: String, grants: Vec<Grant>, expected_peer_key_thumbprint: String) -> Self {
+        // A duplicate grant fails `validate_snapshot`/`validate_idle_sync` on
+        // EVERY frame, so a server that ever repeats one must not silently
+        // brick the relay path.
+        let mut unique = Vec::with_capacity(grants.len());
+        for grant in grants {
+            if !unique.contains(&grant) {
+                unique.push(grant);
+            }
+        }
+        // A Desktop that already proved this exact key to this process stays
+        // proven: the plugin will not greet us a second time, so re-demanding a
+        // hello here deadlocks the read path rather than securing anything.
+        let peer_verified = proven_peers()
+            .lock()
+            .map(|proven| proven.contains(&proven_peer_key(&app_id, &expected_peer_key_thumbprint)))
+            .unwrap_or(false);
+        Self {
+            app_id,
+            grants: unique,
+            expected_peer_key_thumbprint,
+            peer_verified,
+            sequence: 0,
+        }
+    }
+
+    /// Start minting from the session's CURRENT high-water mark rather than
+    /// zero.
+    ///
+    /// ⚠️ The counter this shim mints is compared against a mark that lives in
+    /// [`ClientState`] and SURVIVES an admission rotation. A fresh session
+    /// begins with both at zero, but a rotation that CHANGES carrier does not:
+    /// a WebSocket session rotating onto the relay would start minting at 1
+    /// against a gateway-era mark of N, and `is_new_authoritative_sequence`
+    /// discards every one of them — silently, because `handle_gateway_frame`
+    /// returns `Ok(())` on a stale sequence rather than erroring. The session
+    /// would read Connected while its state never moved again. Seeding keeps
+    /// the counter continuous across a carrier change in either direction.
+    fn seed_sequence(&mut self, authoritative_sequence: u64) {
+        self.sequence = self.sequence.max(authoritative_sequence);
+    }
+
+    /// The session's authoritative high-water mark must never go backwards
+    /// across an admission rotation, or the replacement's first snapshot is
+    /// discarded as stale by `is_new_authoritative_sequence`.
+    ///
+    /// ⚠️ `peer_verified` carries only while the admission still pins the SAME
+    /// Desktop endpoint key. [`proven_peers`] is deliberately keyed by
+    /// `<app_id>/<thumbprint>` so proof can never transfer to a different key;
+    /// ORing the predecessor's flag in unconditionally would launder it around
+    /// exactly that key. A rotation CAN re-pin — that is what happens when the
+    /// Desktop's endpoint identity changes — and the replacement must then see
+    /// the new key prove possession before any state is projected.
+    fn adopt_sequence_from(&mut self, previous: &Self) {
+        self.sequence = self.sequence.max(previous.sequence);
+        if self.expected_peer_key_thumbprint == previous.expected_peer_key_thumbprint {
+            self.peer_verified = self.peer_verified || previous.peer_verified;
+        }
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        self.sequence = self.sequence.saturating_add(1);
+        self.sequence
+    }
+
+    /// `Ok(None)` means "carrier traffic, nothing for the session".
+    ///
+    /// Deliberately as tolerant inbound as the plugin is strict: an unknown kind
+    /// is dropped with a log rather than erroring, because erroring would churn
+    /// the whole session over one frame outside this subset. The single
+    /// exception is a `plugin_hello` that fails to prove itself — that is an
+    /// impostor or a misconfiguration, and translating its state would be worse
+    /// than stopping.
+    fn translate(&mut self, encoded: &str) -> Result<Option<String>, String> {
+        match parse_kind(encoded)?.as_str() {
+            "plugin_hello" => {
+                self.accept_peer_hello(encoded)?;
+                Ok(None)
+            }
+            "plugin_snapshot" => {
+                let frame: PluginSnapshotFrame = strict_parse(encoded, "plugin snapshot")?;
+                frame.validate().map_err(|error| error.to_string())?;
+                let Some(()) = self.peer_gate("plugin_snapshot") else {
+                    return Ok(None);
+                };
+                self.project(frame)
+            }
+            "plugin_idle" => {
+                let frame: PluginIdleFrame = strict_parse(encoded, "plugin idle")?;
+                frame.validate().map_err(|error| error.to_string())?;
+                let Some(()) = self.peer_gate("plugin_idle") else {
+                    return Ok(None);
+                };
+                if frame.app_id != self.app_id {
+                    return Err("relay idle frame is bound to another app".into());
+                }
+                let idle = MobileIdleSyncFrame {
+                    kind: "idle_sync".into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: frame.app_id,
+                    sequence: self.next_sequence(),
+                    grants: self.grants.clone(),
+                };
+                idle.validate().map_err(|error| error.to_string())?;
+                serde_json::to_string(&idle)
+                    .map(Some)
+                    .map_err(|_| "could not encode a translated idle sync".to_string())
+            }
+            other => {
+                eprintln!(
+                    "[AokieCompanion][relay] dropped an untranslated plugin frame: {other}"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Authoritative state from an unproven peer is dropped, not refused.
+    ///
+    /// The plugin greets every party on first contact and re-greets after an
+    /// admission rotation, so a session that primed its cursor past a hello
+    /// recovers on the next one. Erroring instead would turn a recoverable
+    /// ordering gap into a reconnect loop.
+    fn peer_gate(&self, kind: &str) -> Option<()> {
+        if self.peer_verified {
+            return Some(());
+        }
+        eprintln!(
+            "[AokieCompanion][relay] dropped {kind}: the Desktop peer has not proved its endpoint key yet"
+        );
+        None
+    }
+
+    fn accept_peer_hello(&mut self, encoded: &str) -> Result<(), String> {
+        let hello: PluginHello = strict_parse(encoded, "plugin hello")?;
+        hello.validate().map_err(|error| error.to_string())?;
+        hello
+            .endpoint_proof
+            .verify(unix_now()?)
+            .map_err(|error| error.to_string())?;
+        if hello.app_id != self.app_id {
+            return Err("relay peer hello is bound to another app".into());
+        }
+        // The binding that matters: over the socket the gateway vouched for the
+        // plugin's identity, so on the relay this is the Companion's own proof
+        // that the state it is about to project came from the Desktop its
+        // admission pinned and its user confirmed.
+        if hello.endpoint_proof.claims.holder_key_thumbprint != self.expected_peer_key_thumbprint {
+            return Err("relay peer hello presented an unexpected Desktop endpoint key".into());
+        }
+        if !self.peer_verified {
+            eprintln!("[AokieCompanion][relay] Desktop peer proved its endpoint key");
+        }
+        self.peer_verified = true;
+        // Remembered for the life of the process, because the plugin will not
+        // greet this party again until its own session rotates.
+        if let Ok(mut proven) = proven_peers().lock() {
+            proven.insert(proven_peer_key(
+                &self.app_id,
+                &self.expected_peer_key_thumbprint,
+            ));
+        }
+        Ok(())
+    }
+
+    fn project(&mut self, frame: PluginSnapshotFrame) -> Result<Option<String>, String> {
+        if frame.app_id != self.app_id {
+            return Err("relay snapshot is bound to another app".into());
+        }
+        let source = frame.snapshot;
+        // ⚠️ `Vec<Caption>` and `Option<Vec<Caption>>` are NOT the same
+        // statement, so this field cannot simply be wrapped. Authoritative
+        // captions are "what was transcribed"; the projected `Option` means
+        // "captions are EXPOSED to this device", and `validate_snapshot` refuses
+        // a `Some` that consent does not currently permit — rejecting the WHOLE
+        // snapshot, not just the captions. So the shim has to make the decision
+        // the gateway used to make: expose only when the consent policy allows
+        // it and this admission actually holds the grant. Withholding costs a
+        // caption; getting it wrong costs every snapshot.
+        let captions_permitted = source.remote_consent.enabled
+            && source.remote_consent.acknowledged
+            && source.remote_consent.captions_enabled
+            && self.grants.contains(&Grant::CaptionsRead);
+        let projected = ProjectedCallSnapshot {
+            call_id: source.call_id,
+            call_epoch: source.call_epoch,
+            owner_epoch: source.owner_epoch,
+            switchboard_revision: source.switchboard_revision,
+            remote_revision: source.remote_revision,
+            telephony_state: source.telephony_state,
+            service_mode: source.service_mode,
+            media_state: source.media_state,
+            remote_capabilities: source.remote_capabilities,
+            secondary_call_policy: source.secondary_call_policy,
+            secondary_call: source.secondary_call,
+            remote_consent: source.remote_consent,
+            caller: source.caller,
+            captions: captions_permitted.then_some(source.captions),
+            // The plugin publishes neither, and inventing either would be the
+            // shim asserting state no endpoint authored: participant presence
+            // is a gateway-side roster, and a pending offer must carry the
+            // Desktop's own signature to be answerable at all.
+            participants: Vec::new(),
+            audio_levels: source.audio_levels,
+            pending_mobile_offers: Vec::new(),
+            occurred_at: source.occurred_at,
+        };
+        let snapshot = MobileSnapshotFrame {
+            kind: "snapshot".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: frame.app_id,
+            sequence: self.next_sequence(),
+            grants: self.grants.clone(),
+            snapshot: projected,
+        };
+        validate_snapshot(&snapshot, &self.app_id)?;
+        serde_json::to_string(&snapshot)
+            .map(Some)
+            .map_err(|_| "could not encode a translated snapshot".to_string())
+    }
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct V2State {
@@ -306,6 +843,13 @@ impl PendingEndCaller {
 }
 
 impl V2State {
+    /// The high-water mark `is_new_authoritative_sequence` compares against.
+    /// Read by the relay carrier so a client-minted counter starts above
+    /// whatever the previous carrier already delivered.
+    async fn authoritative_sequence(&self) -> u64 {
+        self.inner.lock().await.authoritative_sequence
+    }
+
     pub(crate) async fn reset(&self) {
         let mut state = self.inner.lock().await;
         let answered_assistance_requests = std::mem::take(&mut state.answered_assistance_requests);
@@ -1570,9 +2114,80 @@ async fn fail_native_call_actions_on_disconnect(app: &AppHandle, state: &V2State
 }
 
 struct ManagedTransportRotation {
-    writer: V2Writer,
-    reader: V2Reader,
+    transport: V2Transport,
     admission: ManagedAdmission,
+}
+
+/// Everything the relay carrier needs, gathered while the admission is still in
+/// hand.
+///
+/// A relay only ever accompanies a MANAGED admission, which is also the only
+/// place `expected_peer_key_thumbprint` and the granted scopes exist — so a
+/// custom profile structurally cannot take this path.
+#[derive(Debug, Clone)]
+struct RelayCarrierPlan {
+    endpoints: crate::managed_auth::RelayEndpoints,
+    access_token: String,
+    grants: Vec<Grant>,
+    expected_peer_key_thumbprint: String,
+}
+
+impl RelayCarrierPlan {
+    fn from_admission(admission: &ManagedAdmission) -> Option<Self> {
+        Some(Self {
+            endpoints: admission.relay.clone()?,
+            access_token: admission.access_token.clone(),
+            grants: admission.grants.clone(),
+            expected_peer_key_thumbprint: admission.expected_peer_key_thumbprint.clone(),
+        })
+    }
+}
+
+/// Why a carrier could not be opened.
+///
+/// Named rather than stringly-typed because the session treats a finished
+/// admission differently from an unreachable endpoint, and that distinction has
+/// to survive both carriers.
+enum TransportOpenFailure {
+    AdmissionRejected,
+    Unavailable(String),
+    TimedOut,
+}
+
+async fn open_relay_transport(
+    plan: &RelayCarrierPlan,
+    state: &V2State,
+    app_id: &str,
+    device_id: &str,
+) -> Result<V2Transport, TransportOpenFailure> {
+    let (channel, challenge) = crate::companion_relay::RelayChannel::connect(
+        &plan.endpoints,
+        &plan.access_token,
+        app_id,
+        device_id,
+    )
+    .await
+    .map_err(|error| {
+        if error.admission_rejected {
+            TransportOpenFailure::AdmissionRejected
+        } else {
+            TransportOpenFailure::Unavailable(error.message)
+        }
+    })?;
+    let mut shim = GatewayShim::new(
+        app_id.to_owned(),
+        plan.grants.clone(),
+        plan.expected_peer_key_thumbprint.clone(),
+    );
+    // Read from the LIVE session rather than assumed zero: a rotation does not
+    // reset `authoritative_sequence`, so a carrier change would otherwise mint
+    // sequences the session silently discards as stale. See `seed_sequence`.
+    shim.seed_sequence(state.authoritative_sequence().await);
+    Ok(V2Transport::Relay(RelayCarrier {
+        channel,
+        challenge: Some(challenge),
+        shim,
+    }))
 }
 
 enum ManagedTransportRotationError {
@@ -1606,6 +2221,44 @@ async fn open_overlapping_managed_transport(
         )
         .await
         .map_err(ManagedTransportRotationError::Admission)?;
+    // A rotation stays on the carrier the refreshed admission calls for: the
+    // relay when it advertises one, the signed gateway otherwise.
+    if let Some(plan) = RelayCarrierPlan::from_admission(&admission) {
+        let mut transport = open_relay_transport(&plan, state, app_id, device_id)
+            .await
+            .map_err(|failure| {
+                ManagedTransportRotationError::Transport(match failure {
+                    TransportOpenFailure::AdmissionRejected => {
+                        "replacement protocol-v2 admission was rejected".into()
+                    }
+                    TransportOpenFailure::Unavailable(message) => message,
+                    TransportOpenFailure::TimedOut => {
+                        "replacement protocol-v2 connection attempt timed out".into()
+                    }
+                })
+            })?;
+        endpoint_handshake(
+            app,
+            state,
+            endpoint_identity,
+            peer_trust,
+            profile_id,
+            app_id,
+            device_id,
+            session_nonce,
+            Some(&admission.expected_peer_key_thumbprint),
+            &mut transport,
+        )
+        .await
+        .map_err(ManagedTransportRotationError::Transport)?;
+        initial_sync(app, state, media_state, app_id, &mut transport)
+            .await
+            .map_err(ManagedTransportRotationError::Transport)?;
+        return Ok(ManagedTransportRotation {
+            transport,
+            admission,
+        });
+    }
     let gateway_url = managed_gateway_url(&admission.gateway_url)
         .map_err(ManagedTransportRotationError::Transport)?;
     let authorization =
@@ -1653,7 +2306,7 @@ async fn open_overlapping_managed_transport(
             ));
         }
     };
-    let (mut writer, mut reader) = socket.split();
+    let mut transport = V2Transport::websocket(socket);
     endpoint_handshake(
         app,
         state,
@@ -1664,17 +2317,15 @@ async fn open_overlapping_managed_transport(
         device_id,
         session_nonce,
         Some(&admission.expected_peer_key_thumbprint),
-        &mut writer,
-        &mut reader,
+        &mut transport,
     )
     .await
     .map_err(ManagedTransportRotationError::Transport)?;
-    initial_sync(app, state, media_state, app_id, &mut writer, &mut reader)
+    initial_sync(app, state, media_state, app_id, &mut transport)
         .await
         .map_err(ManagedTransportRotationError::Transport)?;
     Ok(ManagedTransportRotation {
-        writer,
-        reader,
+        transport,
         admission,
     })
 }
@@ -1725,6 +2376,7 @@ pub(crate) fn spawn(
                 attempt_relay_only,
                 admission_expected_peer_key_thumbprint,
                 admission_refresh_deadline,
+                attempt_relay,
             ) = if let Some(deployment_id) = config.managed_deployment_id.as_deref() {
                 match managed_auth
                     .admission(
@@ -1765,6 +2417,7 @@ pub(crate) fn spawn(
                                 continue;
                             }
                         };
+                        let relay = RelayCarrierPlan::from_admission(&admission);
                         (
                             url,
                             bearer,
@@ -1772,6 +2425,7 @@ pub(crate) fn spawn(
                             admission.relay_only,
                             Some(admission.expected_peer_key_thumbprint),
                             Some(managed_admission_refresh_deadline(admission.expires_at)),
+                            relay,
                         )
                     }
                     Err(error) => {
@@ -1792,6 +2446,9 @@ pub(crate) fn spawn(
                     config.relay_only,
                     None,
                     None,
+                    // A custom profile has no managed admission, so it has no
+                    // relay advertisement and no pinned Desktop peer key.
+                    None,
                 )
             };
             let session_nonce =
@@ -1807,34 +2464,56 @@ pub(crate) fn spawn(
                 )
                 .await;
 
-            let mut request = match attempt_url.as_str().into_client_request() {
-                Ok(request) => request,
-                Err(_) => {
-                    emit_error(&app, "could not create protocol-v2 realtime request");
-                    return;
+            let opened = if let Some(plan) = attempt_relay.as_ref() {
+                open_relay_transport(plan, &state, &config.app_id, &config.device_id).await
+            } else {
+                let mut request = match attempt_url.as_str().into_client_request() {
+                    Ok(request) => request,
+                    Err(_) => {
+                        emit_error(&app, "could not create protocol-v2 realtime request");
+                        return;
+                    }
+                };
+                request
+                    .headers_mut()
+                    .insert("authorization", attempt_authorization);
+                request
+                    .headers_mut()
+                    .insert("x-aokie-app-id", app_header.clone());
+                request
+                    .headers_mut()
+                    .insert("x-aokie-device-id", device_header.clone());
+                let websocket_config = WebSocketConfig::default()
+                    .max_message_size(Some(MAX_MESSAGE_BYTES))
+                    .max_frame_size(Some(MAX_MESSAGE_BYTES));
+                match tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    connect_async_with_config(request, Some(websocket_config), false),
+                )
+                .await
+                {
+                    Ok(Ok((socket, _))) => Ok(V2Transport::websocket(socket)),
+                    Ok(Err(error)) => Err(
+                        if matches!(
+                            &error,
+                            WebSocketError::Http(response)
+                                if matches!(
+                                    response.status(),
+                                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                                )
+                        ) {
+                            TransportOpenFailure::AdmissionRejected
+                        } else {
+                            TransportOpenFailure::Unavailable(
+                                "protocol-v2 realtime endpoint is unavailable".into(),
+                            )
+                        },
+                    ),
+                    Err(_) => Err(TransportOpenFailure::TimedOut),
                 }
             };
-            request
-                .headers_mut()
-                .insert("authorization", attempt_authorization);
-            request
-                .headers_mut()
-                .insert("x-aokie-app-id", app_header.clone());
-            request
-                .headers_mut()
-                .insert("x-aokie-device-id", device_header.clone());
-            let websocket_config = WebSocketConfig::default()
-                .max_message_size(Some(MAX_MESSAGE_BYTES))
-                .max_frame_size(Some(MAX_MESSAGE_BYTES));
-
-            let connected = tokio::time::timeout(
-                CONNECT_TIMEOUT,
-                connect_async_with_config(request, Some(websocket_config), false),
-            )
-            .await;
-            match connected {
-                Ok(Ok((socket, _))) => {
-                    let (mut writer, mut reader) = socket.split();
+            match opened {
+                Ok(mut transport) => {
                     let handshake = endpoint_handshake(
                         &app,
                         &state,
@@ -1845,8 +2524,7 @@ pub(crate) fn spawn(
                         &config.device_id,
                         &session_nonce,
                         admission_expected_peer_key_thumbprint.as_deref(),
-                        &mut writer,
-                        &mut reader,
+                        &mut transport,
                     )
                     .await;
                     if let Err(message) = handshake {
@@ -1860,15 +2538,9 @@ pub(crate) fn spawn(
                             emit_error(&app, &message);
                         }
                     } else {
-                        let synced = initial_sync(
-                            &app,
-                            &state,
-                            &media_state,
-                            &config.app_id,
-                            &mut writer,
-                            &mut reader,
-                        )
-                        .await;
+                        let synced =
+                            initial_sync(&app, &state, &media_state, &config.app_id, &mut transport)
+                                .await;
                         match synced {
                             Err(message) => {
                                 if config.managed_deployment_id.is_some()
@@ -1924,6 +2596,12 @@ pub(crate) fn spawn(
                                 );
                                 tokio::pin!(admission_refresh);
                                 let managed_deployment_id = config.managed_deployment_id.as_deref();
+                                // Cached because a select guard cannot borrow the
+                                // transport while another arm takes it mutably —
+                                // and re-read after a rotation, which is the one
+                                // place the carrier can change under the loop.
+                                let mut websocket_heartbeat =
+                                    transport.uses_websocket_heartbeat();
 
                                 loop {
                                     tokio::select! {
@@ -1953,8 +2631,28 @@ pub(crate) fn spawn(
                                                             rotation.admission.relay_only,
                                                         )
                                                         .await;
-                                                    writer = rotation.writer;
-                                                    reader = rotation.reader;
+                                                    // The replacement inherits the
+                                                    // predecessor's relay cursor and
+                                                    // sequence before it reads anything,
+                                                    // or it replays state the session
+                                                    // has already handled.
+                                                    let mut predecessor = std::mem::replace(
+                                                        &mut transport,
+                                                        rotation.transport,
+                                                    );
+                                                    transport.adopt_routing_from(&mut predecessor);
+                                                    // A refreshed admission can
+                                                    // change carrier. Left stale,
+                                                    // a relay replacement would
+                                                    // be pinged, never ponged,
+                                                    // and time itself out.
+                                                    websocket_heartbeat =
+                                                        transport.uses_websocket_heartbeat();
+                                                    // Dropped rather than closed, exactly
+                                                    // as before: an explicit close frame
+                                                    // here would be new behaviour on the
+                                                    // rotation path a live call depends on.
+                                                    drop(predecessor);
                                                     admission_refresh.as_mut().reset(
                                                         managed_admission_refresh_deadline(
                                                             rotation.admission.expires_at,
@@ -1997,8 +2695,8 @@ pub(crate) fn spawn(
                                             emit_error(&app, "protocol-v2 pong timed out");
                                             break;
                                         }
-                                        _ = ping.tick(), if !awaiting_pong => {
-                                            if !send_message(&mut writer, Message::Ping(Default::default())).await {
+                                        _ = ping.tick(), if !awaiting_pong && websocket_heartbeat => {
+                                            if !transport.send_ping().await {
                                                 break;
                                             }
                                             awaiting_pong = true;
@@ -2007,7 +2705,7 @@ pub(crate) fn spawn(
                                         _ = heartbeat.tick() => {
                                             match heartbeat_frame(&state, &config.app_id).await {
                                                 Ok(Some(frame)) => {
-                                                    if !send_text(&mut writer, frame).await { break; }
+                                                    if !transport.send_text(frame).await { break; }
                                                 }
                                                 Ok(None) => {}
                                                 Err(message) => {
@@ -2025,7 +2723,7 @@ pub(crate) fn spawn(
                                                         answer_request_id,
                                                         revoke_request_id,
                                                     } = native;
-                                                    if send_text(&mut writer, encoded).await {
+                                                    if transport.send_text(encoded).await {
                                                         if let Some(action_id) = answer_action_id {
                                                             if let Err(message) = crate::android_runtime::complete_native_call_action(
                                                                 &app,
@@ -2068,7 +2766,7 @@ pub(crate) fn spawn(
                                             match local {
                                                 Ok(signal) => match local_rtc_frame(&state, signal).await {
                                                     Ok(Some(frame)) => {
-                                                        if !send_text(&mut writer, frame).await { break; }
+                                                        if !transport.send_text(frame).await { break; }
                                                     }
                                                     Ok(None) => {}
                                                     Err(message) => {
@@ -2089,16 +2787,16 @@ pub(crate) fn spawn(
                                                 let _ = queued.completion.send(Err("realtime session changed before delivery".into()));
                                                 break;
                                             }
-                                            if send_text(&mut writer, queued.encoded).await {
+                                            if transport.send_text(queued.encoded).await {
                                                 let _ = queued.completion.send(Ok(()));
                                             } else {
                                                 let _ = queued.completion.send(Err("protocol-v2 frame could not be delivered".into()));
                                                 break;
                                             }
                                         }
-                                        incoming = reader.next() => {
+                                        incoming = transport.recv(TRANSPORT_READ_TICK) => {
                                             match incoming {
-                                                Some(Ok(Message::Text(text))) => {
+                                                V2Inbound::Text(text) => {
                                                     freshness.as_mut().reset(Instant::now() + INBOUND_FRESHNESS);
                                                     if let Err(message) = handle_gateway_frame(
                                                         &app,
@@ -2111,36 +2809,27 @@ pub(crate) fn spawn(
                                                         break;
                                                     }
                                                 }
-                                                Some(Ok(Message::Ping(bytes))) => {
+                                                // Carrier liveness without a protocol
+                                                // frame: a socket ping, or relay stream
+                                                // bytes. It feeds the freshness timer
+                                                // exactly as an inbound frame does,
+                                                // which is what keeps a healthy but
+                                                // quiet relay from timing itself out.
+                                                V2Inbound::Alive => {
                                                     freshness.as_mut().reset(Instant::now() + INBOUND_FRESHNESS);
-                                                    if !send_message(&mut writer, Message::Pong(bytes)).await { break; }
                                                 }
-                                                Some(Ok(Message::Pong(_))) => {
+                                                V2Inbound::Pong => {
                                                     freshness.as_mut().reset(Instant::now() + INBOUND_FRESHNESS);
                                                     awaiting_pong = false;
                                                     ping.reset();
                                                 }
-                                                Some(Ok(Message::Close(frame))) => {
-                                                    eprintln!(
-                                                        "[AokieCompanion][realtime] gateway closed the active socket: {:?}",
-                                                        frame,
-                                                    );
+                                                V2Inbound::Idle => {}
+                                                V2Inbound::Closed(detail) => {
+                                                    eprintln!("[AokieCompanion][realtime] {detail}");
                                                     break;
                                                 }
-                                                Some(Err(error)) => {
-                                                    eprintln!(
-                                                        "[AokieCompanion][realtime] active socket read failed: {error}"
-                                                    );
-                                                    break;
-                                                }
-                                                None => {
-                                                    eprintln!(
-                                                        "[AokieCompanion][realtime] active socket reached EOF"
-                                                    );
-                                                    break;
-                                                }
-                                                Some(Ok(_)) => {
-                                                    emit_error(&app, "gateway sent a non-text protocol-v2 frame");
+                                                V2Inbound::Failed(message) => {
+                                                    emit_error(&app, &message);
                                                     break;
                                                 }
                                             }
@@ -2161,23 +2850,18 @@ pub(crate) fn spawn(
                         }
                     }
                 }
-                Ok(Err(error)) => {
-                    if matches!(
-                        &error,
-                        WebSocketError::Http(response)
-                            if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-                    ) {
-                        emit_error(&app, "protocol-v2 admission expired");
-                        emit_transport(&app, TransportEvent::Transport { value: "offline" });
-                        state.reset().await;
-                        if config.managed_deployment_id.is_none() {
-                            return;
-                        }
-                    } else {
-                        emit_error(&app, "protocol-v2 realtime endpoint is unavailable");
+                Err(TransportOpenFailure::AdmissionRejected) => {
+                    emit_error(&app, "protocol-v2 admission expired");
+                    emit_transport(&app, TransportEvent::Transport { value: "offline" });
+                    state.reset().await;
+                    if config.managed_deployment_id.is_none() {
+                        return;
                     }
                 }
-                Err(_) => emit_error(&app, "protocol-v2 connection attempt timed out"),
+                Err(TransportOpenFailure::Unavailable(message)) => emit_error(&app, &message),
+                Err(TransportOpenFailure::TimedOut) => {
+                    emit_error(&app, "protocol-v2 connection attempt timed out")
+                }
             }
 
             state.reset().await;
@@ -2211,7 +2895,7 @@ fn realtime_profile_id(config: &RealtimeConfig) -> Result<String, String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn endpoint_handshake<S, R>(
+async fn endpoint_handshake(
     app: &AppHandle,
     state: &V2State,
     endpoint_identity: &crate::endpoint_identity::EndpointIdentity,
@@ -2221,38 +2905,12 @@ async fn endpoint_handshake<S, R>(
     device_id: &str,
     session_nonce: &str,
     admission_expected_peer_key_thumbprint: Option<&str>,
-    writer: &mut S,
-    reader: &mut R,
-) -> Result<(), String>
-where
-    S: SinkExt<Message> + Unpin,
-    S::Error: std::fmt::Debug,
-    R: StreamExt<Item = Result<Message, WebSocketError>> + Unpin,
-{
+    transport: &mut V2Transport,
+) -> Result<(), String> {
     let deadline = Instant::now() + CONNECT_TIMEOUT;
-    let challenge = loop {
-        let incoming = tokio::time::timeout_at(deadline, reader.next())
-            .await
-            .map_err(|_| "endpoint proof challenge timed out".to_string())?;
-        match incoming {
-            Some(Ok(Message::Text(text))) => {
-                if parse_kind(&text)? != "endpoint_challenge" {
-                    return Err("v2 server did not begin with an endpoint proof challenge".into());
-                }
-                break strict_parse::<EndpointChallengeFrame>(&text, "endpoint challenge")?;
-            }
-            Some(Ok(Message::Ping(bytes))) => {
-                if !send_message(writer, Message::Pong(bytes)).await {
-                    return Err("endpoint proof challenge heartbeat failed".into());
-                }
-            }
-            Some(Ok(Message::Pong(_))) => {}
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                return Err("v2 transport closed before endpoint proof".into())
-            }
-            Some(Ok(_)) => return Err("endpoint proof challenge requires a text frame".into()),
-        }
-    };
+    // Both carriers hand back the same document; only where it comes from
+    // differs (the socket's first frame, or an authenticated relay route).
+    let challenge = transport.next_challenge(deadline).await?;
     let now = unix_now()?;
     challenge.validate(now).map_err(|error| error.to_string())?;
     if challenge.app_id != app_id
@@ -2311,7 +2969,7 @@ where
     hello.validate().map_err(|error| error.to_string())?;
     let encoded = serde_json::to_string(&hello)
         .map_err(|_| "could not encode endpoint-authenticated mobile hello".to_string())?;
-    if !send_text(writer, encoded).await {
+    if !transport.send_text(encoded).await {
         return Err("endpoint-authenticated mobile hello could not be delivered".into());
     }
     state
@@ -2320,26 +2978,34 @@ where
     Ok(())
 }
 
-async fn initial_sync<S, R>(
+async fn initial_sync(
     app: &AppHandle,
     state: &V2State,
     media_state: &NativeMediaState,
     expected_app_id: &str,
-    writer: &mut S,
-    reader: &mut R,
-) -> Result<(), String>
-where
-    S: SinkExt<Message> + Unpin,
-    S::Error: std::fmt::Debug,
-    R: StreamExt<Item = Result<Message, WebSocketError>> + Unpin,
-{
+    transport: &mut V2Transport,
+) -> Result<(), String> {
     let deadline = Instant::now() + INITIAL_SYNC_TIMEOUT;
     loop {
-        let incoming = tokio::time::timeout_at(deadline, reader.next())
-            .await
-            .map_err(|_| "protocol-v2 authoritative sync timed out".to_string())?;
-        match incoming {
-            Some(Ok(Message::Text(text))) => {
+        if Instant::now() >= deadline {
+            if transport.is_relay() {
+                // The expected outcome, and roster approval alone does NOT
+                // change it. The plugin's relay routing is speak-first: it
+                // learns a party only from an inbound frame (`learn_route`) and
+                // broadcasts only to parties it has learned, so a Companion
+                // that has posted nothing is not a destination at all — before
+                // OR after approval. With outbound frames withheld (see
+                // `RELAY_SEND_ENV`) silence is therefore the correct steady
+                // state, not a fault. Said plainly here so it does not get
+                // misread as a broken transport or a missing approval.
+                eprintln!(
+                    "[AokieCompanion][relay] no authoritative state arrived: the carrier is up, but the plugin only publishes to a party that has spoken to it, and this build posts nothing yet"
+                );
+            }
+            return Err("protocol-v2 authoritative sync timed out".into());
+        }
+        match transport.recv(TRANSPORT_READ_TICK).await {
+            V2Inbound::Text(text) => {
                 let kind = parse_kind(&text)?;
                 if kind != "snapshot" && kind != "idle_sync" {
                     return Err(
@@ -2349,16 +3015,11 @@ where
                 handle_gateway_frame(app, state, media_state, expected_app_id, &text).await?;
                 return Ok(());
             }
-            Some(Ok(Message::Ping(bytes))) => {
-                if !send_message(writer, Message::Pong(bytes)).await {
-                    return Err("protocol-v2 sync heartbeat failed".into());
-                }
-            }
-            Some(Ok(Message::Pong(_))) => {}
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+            V2Inbound::Idle | V2Inbound::Alive | V2Inbound::Pong => {}
+            V2Inbound::Closed(_) => {
                 return Err("protocol-v2 transport closed before authoritative sync".into());
             }
-            Some(Ok(_)) => return Err("protocol-v2 sync requires text frames".into()),
+            V2Inbound::Failed(message) => return Err(message),
         }
     }
 }
@@ -4378,6 +5039,637 @@ mod tests {
         assert!(lease_heartbeat_due(now + 14, now).unwrap());
         assert!(lease_heartbeat_due(now + 1, now).unwrap());
         assert!(lease_heartbeat_due(now, now).is_err());
+    }
+
+    fn authoritative_snapshot() -> aokie_protocol::v2::AuthoritativeCallSnapshot {
+        aokie_protocol::v2::AuthoritativeCallSnapshot {
+            call_id: "call_a".into(),
+            call_epoch: 1,
+            owner_epoch: 0,
+            switchboard_revision: 1,
+            remote_revision: 1,
+            telephony_state: TelephonyState::Active,
+            service_mode: ServiceMode::AokieActive,
+            media_state: MediaState::Ready,
+            remote_capabilities: RemoteCapabilities {
+                software_hold: false,
+                carrier_hold_evidence: CarrierHoldEvidence::Unknown,
+                secondary_call_observation: SecondaryCallObservation::Unknown,
+                voice_consult: false,
+                takeover: false,
+            },
+            secondary_call_policy: SecondaryCallPolicy::Normal,
+            secondary_call: None,
+            remote_consent: aokie_protocol::v2::RemoteConsentPolicy {
+                policy_id: "aokie_remote_access".into(),
+                policy_version: 3,
+                enabled: false,
+                acknowledged: false,
+                acknowledged_at: None,
+                expires_at: None,
+                captions_enabled: false,
+                assistance_enabled: false,
+                monitor_enabled: false,
+                consult_enabled: false,
+                takeover_enabled: false,
+            },
+            caller: None,
+            captions: Vec::new(),
+            audio_levels: None,
+            occurred_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn verified_shim() -> GatewayShim {
+        let mut shim = GatewayShim::new(
+            "app_a".into(),
+            vec![Grant::StateRead, Grant::Monitor],
+            "desktop_key_thumbprint_1".into(),
+        );
+        // The hello path is proven separately; these cases exercise the
+        // translation, which only runs once the peer is proven.
+        shim.peer_verified = true;
+        shim
+    }
+
+    fn plugin_snapshot_frame() -> String {
+        plugin_snapshot_frame_for("app_a")
+    }
+
+    fn plugin_snapshot_frame_for(app_id: &str) -> String {
+        serde_json::to_string(&PluginSnapshotFrame {
+            kind: "plugin_snapshot".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: app_id.into(),
+            event_id: "event_1".into(),
+            snapshot: authoritative_snapshot(),
+        })
+        .expect("fixture encodes")
+    }
+
+    /// The shim stands in for the gateway that used to sit between the two
+    /// endpoints. This is the proof it works BEFORE any roster approval: the
+    /// fixture is built with `aokie-protocol`'s own constructors and the result
+    /// is asserted with its own validators.
+    #[test]
+    fn a_plugin_snapshot_translates_into_a_valid_mobile_snapshot() {
+        let mut shim = verified_shim();
+
+        let translated = shim
+            .translate(&plugin_snapshot_frame())
+            .expect("a well-formed plugin snapshot translates")
+            .expect("a snapshot is a session frame");
+
+        let frame: MobileSnapshotFrame =
+            serde_json::from_str(&translated).expect("the translation is a mobile snapshot");
+        assert_eq!(frame.kind, "snapshot");
+        // The session's own gate is the real assertion: a translation the
+        // protocol layer would reject is worthless.
+        validate_snapshot(&frame, "app_a").expect("the translation passes the session's own gate");
+        frame
+            .snapshot
+            .validate()
+            .expect("the projection passes the protocol's own validator");
+        assert_eq!(frame.snapshot.call_id, "call_a");
+        // Neither is something the plugin publishes, and inventing either would
+        // assert state no endpoint authored.
+        assert!(frame.snapshot.participants.is_empty());
+        assert!(frame.snapshot.pending_mobile_offers.is_empty());
+        assert_eq!(frame.grants, vec![Grant::StateRead, Grant::Monitor]);
+    }
+
+    /// ⚠️ THE safety constraint of the relay carrier.
+    ///
+    /// The live plugin's dispatcher accepts eight gateway-dialect kinds and
+    /// ends in `_ => Err(reconnect("unsupported frame"))`; its relay carrier
+    /// admits any frame from an approved roster member. Over the socket a
+    /// gateway translated the mobile dialect into that one, and on the relay
+    /// nothing does — so once this Companion is approved, ANY frame it posts
+    /// tears down the session of a desktop answering a real phone line, and
+    /// does it again on every retry. Nothing goes out until the plugin ships
+    /// handlers.
+    #[test]
+    fn the_relay_withholds_every_outbound_frame_unless_explicitly_opted_in() {
+        assert!(
+            !relay_send_opt_in(),
+            "posting to the plugin must never be the default"
+        );
+
+        assert!(relay_send_opt_in_from(Some("1")));
+        for refused in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some(" 1")] {
+            assert!(
+                !relay_send_opt_in_from(refused),
+                "{refused:?} must not read as consent"
+            );
+        }
+    }
+
+    /// Every kind this session can emit is fatal to today's plugin — by the
+    /// catch-all arm, or by a `deny_unknown_fields` twin that does not match.
+    /// Gating only `mobile_hello` would have left the rest of them live, which
+    /// is worse than the hello: a hello fires once per session, whereas
+    /// `end_caller_confirm` fires when a user taps a button mid-call.
+    #[test]
+    fn no_frame_this_session_emits_is_one_the_plugin_can_accept() {
+        // The plugin's dispatcher arms, verbatim.
+        const PLUGIN_ACCEPTS: [&str; 8] = [
+            "claim_proposal",
+            "lease_granted",
+            "lease_renewed",
+            "lease_revoked",
+            "rtc_signal",
+            "assistance_answer",
+            "end_caller_execute",
+            "error",
+        ];
+        // Kinds this build posts, from the encode sites in this module.
+        const MOBILE_EMITS: [&str; 6] = [
+            "mobile_hello",
+            "lease_request",
+            "lease_heartbeat",
+            "end_caller_challenge_request",
+            "end_caller_confirm",
+            "assistance_answer",
+        ];
+
+        for kind in MOBILE_EMITS {
+            if PLUGIN_ACCEPTS.contains(&kind) {
+                // The one overlapping name still fails: the twins are
+                // `deny_unknown_fields` and disagree on their members, so the
+                // plugin's parse — not its dispatch — is what tears down.
+                assert_eq!(kind, "assistance_answer");
+                let mobile = serde_json::to_string(&MobileAssistanceAnswerFrame {
+                    kind: kind.into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: "app_a".into(),
+                    request_id: "request_a".into(),
+                    idempotency_key: "mobile:device_a:request_a".into(),
+                    answer_id: "answer_a".into(),
+                    call_id: "call_a".into(),
+                    call_epoch: 1,
+                    owner_epoch: 0,
+                    switchboard_revision: 1,
+                    remote_revision: 1,
+                    answer: "yes".into(),
+                })
+                .expect("fixture encodes");
+                assert!(
+                    serde_json::from_str::<aokie_protocol::v2::PluginAssistanceAnswerFrame>(
+                        &mobile
+                    )
+                    .is_err(),
+                    "the mobile assistance answer must not silently parse as the plugin's twin"
+                );
+            }
+        }
+
+        // And the rtc signal the local media path emits, for the same reason.
+        assert!(
+            serde_json::from_str::<aokie_protocol::v2::PluginRtcSignalFrame>(
+                "{\"kind\":\"rtc_signal\",\"schemaVersion\":1,\"appId\":\"app_a\",\"signalId\":\"s\",\"pluginId\":\"aokie\",\"deviceId\":\"d\",\"leaseToken\":\"t\",\"leaseJti\":\"j\",\"rtcSessionId\":\"r\",\"sdpRevision\":1}"
+            )
+            .is_err(),
+            "leaseToken has no home in the plugin's twin"
+        );
+    }
+
+    fn signed_plugin_hello(
+        desktop: &crate::endpoint_identity::EndpointIdentity,
+        app_id: &str,
+    ) -> String {
+        let now = unix_now().expect("clock");
+        let approved = vec!["mobile_key_thumbprint_1".to_string()];
+        let revision = 1;
+        let proof = desktop
+            .sign_hello(HelloProofClaims {
+                app_id: app_id.into(),
+                subject_id: "aokie".into(),
+                role: AdmissionRole::Plugin,
+                connection_id: "connection_p".into(),
+                challenge_nonce: "challenge_p".into(),
+                admission_jti: "admission_p".into(),
+                session_nonce: "session_p".into(),
+                holder_key_thumbprint: desktop.thumbprint().into(),
+                expected_peer_key_thumbprint: None,
+                approved_peer_key_thumbprints: approved.clone(),
+                peer_roster_revision: Some(revision),
+                peer_roster_hash: Some(aokie_protocol::v2::peer_roster_hash(revision, &approved)),
+                nonce: "proof_nonce_p".into(),
+                jti: "proof_jti_p".into(),
+                issued_at: now,
+                expires_at: now + 20,
+            })
+            .expect("the plugin hello proof signs");
+        serde_json::to_string(&PluginHello {
+            kind: "plugin_hello".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: app_id.into(),
+            plugin_id: "aokie".into(),
+            session_nonce: "session_p".into(),
+            endpoint_proof: proof,
+        })
+        .expect("fixture encodes")
+    }
+
+    /// Over the socket the gateway vouched for the plugin's identity. On the
+    /// relay nothing does, so this hello is the Companion's OWN proof that the
+    /// state it is about to project came from the Desktop its admission pinned
+    /// and its user confirmed — not merely from something holding a plugin-role
+    /// admission for this app.
+    #[test]
+    fn a_plugin_hello_must_prove_the_admission_pinned_desktop_key() {
+        let desktop = crate::endpoint_identity::EndpointIdentity::from_secret([9; 32])
+            .expect("test identity");
+        let impostor = crate::endpoint_identity::EndpointIdentity::from_secret([11; 32])
+            .expect("test identity");
+        let shim_for = |app_id: &str| {
+            GatewayShim::new(
+                app_id.into(),
+                vec![Grant::StateRead],
+                desktop.thumbprint().into(),
+            )
+        };
+
+        // ⚠️ Each case gets its OWN app id. Proof is remembered per
+        // `<app_id>/<thumbprint>` for the life of the process (see
+        // `proven_peers`), so sharing one id here would let the successful case
+        // pre-verify the refusal cases and assert nothing.
+
+        // The real peer: consumed rather than forwarded, and it unlocks state.
+        let mut shim = shim_for("app_proof_ok");
+        assert!(!shim.peer_verified);
+        assert_eq!(
+            shim.translate(&signed_plugin_hello(&desktop, "app_proof_ok")),
+            Ok(None)
+        );
+        assert!(shim.peer_verified);
+
+        // A different endpoint key, however well signed, is not our Desktop.
+        let mut shim = shim_for("app_proof_impostor");
+        assert!(shim
+            .translate(&signed_plugin_hello(&impostor, "app_proof_impostor"))
+            .is_err());
+        assert!(!shim.peer_verified);
+
+        // Nor is our Desktop speaking for another app.
+        let mut shim = shim_for("app_proof_crossed");
+        assert!(shim
+            .translate(&signed_plugin_hello(&desktop, "app_proof_other"))
+            .is_err());
+        assert!(!shim.peer_verified);
+
+        // A hello whose signature does not cover its claims is refused before
+        // any claim is read.
+        let mut tampered: Value =
+            serde_json::from_str(&signed_plugin_hello(&desktop, "app_proof_tampered_src")).unwrap();
+        tampered["endpointProof"]["claims"]["appId"] = serde_json::json!("app_proof_tampered");
+        let mut shim = shim_for("app_proof_tampered");
+        assert!(shim.translate(&tampered.to_string()).is_err());
+        assert!(!shim.peer_verified);
+    }
+
+    /// ⚠️ The plugin greets a party exactly ONCE per plugin session — its
+    /// `greeted` set is cleared when it arms a rotated hello, never when this
+    /// Companion reconnects. So if peer proof were scoped to one carrier, a
+    /// Companion that verified and then lost its stream would never be greeted
+    /// again, and `peer_gate` would drop every snapshot for the rest of the
+    /// plugin's session: a permanent read deadlock, not a slow recovery. Proof
+    /// therefore survives the carrier.
+    #[test]
+    fn a_proven_desktop_stays_proven_across_a_companion_reconnect() {
+        let desktop = crate::endpoint_identity::EndpointIdentity::from_secret([21; 32])
+            .expect("test identity");
+        let shim_for = || {
+            GatewayShim::new(
+                "app_reconnect".into(),
+                vec![Grant::StateRead],
+                desktop.thumbprint().into(),
+            )
+        };
+
+        let mut first = shim_for();
+        assert!(!first.peer_verified, "nothing is trusted before a proof");
+        first
+            .translate(&signed_plugin_hello(&desktop, "app_reconnect"))
+            .expect("the real Desktop proves itself");
+
+        // A brand new carrier — the reconnect the plugin will not greet again.
+        let mut reconnected = shim_for();
+        assert!(
+            reconnected.peer_verified,
+            "a Desktop that already proved this key must not have to prove it again"
+        );
+        assert!(
+            reconnected
+                .translate(&plugin_snapshot_frame_for("app_reconnect"))
+                .expect("translates")
+                .is_some(),
+            "authoritative state must flow after a reconnect, or the read path is dead"
+        );
+
+        // The memory is bound to app AND key: it never vouches for anyone else.
+        let other_app = GatewayShim::new(
+            "app_reconnect_other".into(),
+            vec![Grant::StateRead],
+            desktop.thumbprint().into(),
+        );
+        assert!(!other_app.peer_verified);
+        let other_key = GatewayShim::new(
+            "app_reconnect".into(),
+            vec![Grant::StateRead],
+            "some_other_desktop_thumbprint".into(),
+        );
+        assert!(!other_key.peer_verified);
+    }
+
+    /// `Vec<Caption>` → `Option<Vec<Caption>>` is a change of MEANING, not just
+    /// of shape: the projected `Option` says whether captions are exposed to
+    /// this device, and `validate_snapshot` rejects the entire snapshot when a
+    /// `Some` outruns consent. Wrapping the field unconditionally would
+    /// therefore have discarded every snapshot on a line without caption
+    /// consent — which is the default.
+    #[test]
+    fn captions_are_exposed_only_when_consent_and_grants_allow_it() {
+        let mut consented = authoritative_snapshot();
+        consented.captions = vec![aokie_protocol::v2::Caption {
+            caption_id: "caption_1".into(),
+            speaker: "caller".into(),
+            text: "hello".into(),
+            occurred_at: Utc::now().to_rfc3339(),
+            final_text: true,
+        }];
+        consented.remote_consent.enabled = true;
+        consented.remote_consent.acknowledged = true;
+        consented.remote_consent.acknowledged_at = Some(Utc::now().to_rfc3339());
+        consented.remote_consent.captions_enabled = true;
+
+        let encode = |snapshot: &aokie_protocol::v2::AuthoritativeCallSnapshot| {
+            serde_json::to_string(&PluginSnapshotFrame {
+                kind: "plugin_snapshot".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                event_id: "event_1".into(),
+                snapshot: snapshot.clone(),
+            })
+            .expect("fixture encodes")
+        };
+        let projected = |shim: &mut GatewayShim, snapshot| {
+            let translated = shim
+                .translate(&encode(snapshot))
+                .expect("translates")
+                .expect("is a session frame");
+            let frame: MobileSnapshotFrame = serde_json::from_str(&translated).unwrap();
+            validate_snapshot(&frame, "app_a").expect("the session accepts the translation");
+            frame.snapshot.captions
+        };
+
+        // Consent given AND the grant held: the captions come through.
+        let mut with_grant = GatewayShim::new(
+            "app_a".into(),
+            vec![Grant::StateRead, Grant::CaptionsRead],
+            "desktop_key_thumbprint_1".into(),
+        );
+        with_grant.peer_verified = true;
+        assert_eq!(
+            projected(&mut with_grant, &consented).map(|captions| captions.len()),
+            Some(1)
+        );
+
+        // Consent given but the grant withheld: nothing is exposed, and the
+        // rest of the snapshot still arrives.
+        let mut without_grant = verified_shim();
+        assert_eq!(projected(&mut without_grant, &consented), None);
+
+        // The default line has no caption consent at all.
+        let unconsented = authoritative_snapshot();
+        assert_eq!(projected(&mut with_grant, &unconsented), None);
+    }
+
+    /// ⚠️ The plugin's frames carry an `eventId`, never a sequence — the gateway
+    /// minted the monotonic counter the session tracks state on. A shim that
+    /// merely renamed fields would fail `validate_snapshot` on every frame.
+    #[test]
+    fn the_shim_mints_the_monotonic_sequence_the_gateway_used_to_supply() {
+        let mut shim = verified_shim();
+
+        let mut sequences = Vec::new();
+        for _ in 0..3 {
+            let translated = shim
+                .translate(&plugin_snapshot_frame())
+                .expect("translates")
+                .expect("is a session frame");
+            let frame: MobileSnapshotFrame = serde_json::from_str(&translated).unwrap();
+            sequences.push(frame.sequence);
+        }
+
+        // Starts at 1 (zero fails validation) and never repeats, or
+        // `is_new_authoritative_sequence` would discard live state as stale.
+        assert_eq!(sequences, vec![1, 2, 3]);
+
+        // A rotation must not restart it, for the same reason.
+        let mut replacement = verified_shim();
+        replacement.adopt_sequence_from(&shim);
+        let translated = replacement
+            .translate(&plugin_snapshot_frame())
+            .expect("translates")
+            .expect("is a session frame");
+        let frame: MobileSnapshotFrame = serde_json::from_str(&translated).unwrap();
+        assert_eq!(frame.sequence, 4);
+    }
+
+    /// ⚠️ A rotation that CHANGES carrier is the case a relay-to-relay handover
+    /// does not cover.
+    ///
+    /// `authoritative_sequence` lives in [`ClientState`] and survives an
+    /// admission rotation — only `reset`/`begin` clear it, and neither runs on
+    /// the rotation path. So a WebSocket session that rotates onto the relay
+    /// hands the shim a session already sitting at the gateway's mark, and a
+    /// shim that started at zero would mint 1, 2, 3 … which
+    /// `is_new_authoritative_sequence` discards. Silently: `handle_gateway_frame`
+    /// returns `Ok(())` on a stale sequence rather than erroring, so
+    /// `initial_sync` still succeeds and the session reads Connected while its
+    /// state never moves again. Deploying the backend's relay advertisement
+    /// under a live Companion is exactly how that happens.
+    #[test]
+    fn a_carrier_change_mints_above_the_sequence_the_previous_carrier_reached() {
+        let gateway_high_water = 4_812;
+        let mut shim = verified_shim();
+        shim.seed_sequence(gateway_high_water);
+
+        let translated = shim
+            .translate(&plugin_snapshot_frame())
+            .expect("translates")
+            .expect("is a session frame");
+        let frame: MobileSnapshotFrame = serde_json::from_str(&translated).unwrap();
+
+        assert!(
+            is_new_authoritative_sequence(
+                &ClientState {
+                    authoritative_sequence: gateway_high_water,
+                    ..ClientState::default()
+                },
+                frame.sequence,
+            ),
+            "the session must accept the first frame after a carrier change",
+        );
+        assert_eq!(frame.sequence, gateway_high_water + 1);
+
+        // Seeding never drags a counter BACKWARDS: a relay session that has
+        // already minted past the mark keeps its own position.
+        let mut ahead = verified_shim();
+        ahead.sequence = gateway_high_water + 10;
+        ahead.seed_sequence(gateway_high_water);
+        assert_eq!(ahead.sequence, gateway_high_water + 10);
+    }
+
+    /// [`proven_peers`] is keyed `<app_id>/<thumbprint>` precisely so proof can
+    /// never transfer to a different Desktop key. Carrying `peer_verified`
+    /// across a rotation unconditionally would launder it around that key: a
+    /// re-pinned admission would project authoritative state without the NEW
+    /// key ever proving possession.
+    #[test]
+    fn a_rotation_that_repins_the_desktop_key_must_see_it_prove_itself_again() {
+        let shim_with_pin = |pin: &str| {
+            GatewayShim::new(
+                "app_rotation_pin".into(),
+                vec![Grant::StateRead],
+                pin.into(),
+            )
+        };
+
+        let mut proven = shim_with_pin("desktop_key_before");
+        proven.peer_verified = true;
+
+        // Same pin: proof carries, or a quiet line would deadlock its reads
+        // waiting for a greeting the plugin has already sent.
+        let mut same_pin = shim_with_pin("desktop_key_before");
+        same_pin.adopt_sequence_from(&proven);
+        assert!(same_pin.peer_verified);
+
+        // Re-pinned: the replacement starts unproven, and drops authoritative
+        // state until the new key signs a hello.
+        let mut repinned = shim_with_pin("desktop_key_after");
+        repinned.adopt_sequence_from(&proven);
+        assert!(
+            !repinned.peer_verified,
+            "proof for one Desktop key must not vouch for another",
+        );
+        assert_eq!(
+            repinned.translate(&plugin_snapshot_frame()),
+            Ok(None),
+            "state from an unproven re-pinned peer is dropped",
+        );
+        // The cursor still carries, so the replacement does not regress.
+        assert_eq!(repinned.sequence, proven.sequence);
+    }
+
+    #[test]
+    fn a_plugin_idle_translates_into_a_valid_idle_sync() {
+        let mut shim = verified_shim();
+        let encoded = serde_json::to_string(&PluginIdleFrame {
+            kind: "plugin_idle".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            event_id: "event_2".into(),
+        })
+        .expect("fixture encodes");
+
+        let translated = shim
+            .translate(&encoded)
+            .expect("a well-formed plugin idle translates")
+            .expect("an idle frame is a session frame");
+
+        let frame: MobileIdleSyncFrame =
+            serde_json::from_str(&translated).expect("the translation is an idle sync");
+        frame
+            .validate()
+            .expect("the translation passes the protocol's own validator");
+        validate_idle_sync(&frame, "app_a").expect("and the session's own gate");
+        assert_eq!(frame.sequence, 1);
+    }
+
+    /// Inbound tolerance is the whole point: the plugin's dispatcher errors on
+    /// an unknown kind, and a shim that copied that would churn the session on
+    /// every frame outside the translated subset.
+    #[test]
+    fn frames_outside_the_translated_subset_are_dropped_rather_than_erroring() {
+        let mut shim = verified_shim();
+
+        for untranslated in [
+            "{\"kind\":\"claim_decision\"}",
+            "{\"kind\":\"plugin_lease_revoke\"}",
+            "{\"kind\":\"something_this_build_has_never_heard_of\"}",
+        ] {
+            assert_eq!(
+                shim.translate(untranslated),
+                Ok(None),
+                "{untranslated} must drop quietly"
+            );
+        }
+        // Dropping cost nothing: the next real frame still gets sequence 1.
+        let translated = shim
+            .translate(&plugin_snapshot_frame())
+            .expect("translates")
+            .expect("is a session frame");
+        let frame: MobileSnapshotFrame = serde_json::from_str(&translated).unwrap();
+        assert_eq!(frame.sequence, 1);
+    }
+
+    /// Over the socket the gateway vouched for the plugin. On the relay nothing
+    /// does, so authoritative state from an unproven sender is never projected.
+    #[test]
+    fn authoritative_state_is_not_projected_until_the_desktop_peer_proves_itself() {
+        let mut shim = GatewayShim::new(
+            "app_a".into(),
+            vec![Grant::StateRead],
+            "desktop_key_thumbprint_1".into(),
+        );
+
+        // Dropped, not refused: the plugin re-greets after a rotation, so an
+        // ordering gap has to be able to heal instead of looping the session.
+        assert_eq!(shim.translate(&plugin_snapshot_frame()), Ok(None));
+
+        shim.peer_verified = true;
+        assert!(shim
+            .translate(&plugin_snapshot_frame())
+            .expect("translates once proven")
+            .is_some());
+    }
+
+    #[test]
+    fn a_snapshot_bound_to_another_app_is_refused() {
+        let mut shim = verified_shim();
+        let encoded = serde_json::to_string(&PluginSnapshotFrame {
+            kind: "plugin_snapshot".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_b".into(),
+            event_id: "event_1".into(),
+            snapshot: authoritative_snapshot(),
+        })
+        .expect("fixture encodes");
+
+        assert!(shim.translate(&encoded).is_err());
+    }
+
+    /// A duplicate grant fails `validate_snapshot` on EVERY frame, so it must
+    /// not be able to brick the relay path.
+    #[test]
+    fn duplicate_admission_grants_cannot_brick_every_translated_frame() {
+        let mut shim = GatewayShim::new(
+            "app_a".into(),
+            vec![Grant::StateRead, Grant::StateRead, Grant::Monitor],
+            "desktop_key_thumbprint_1".into(),
+        );
+        shim.peer_verified = true;
+
+        let translated = shim
+            .translate(&plugin_snapshot_frame())
+            .expect("translates")
+            .expect("is a session frame");
+        let frame: MobileSnapshotFrame = serde_json::from_str(&translated).unwrap();
+
+        assert_eq!(frame.grants, vec![Grant::StateRead, Grant::Monitor]);
+        validate_snapshot(&frame, "app_a").expect("deduped grants pass the session's gate");
     }
 
     #[test]

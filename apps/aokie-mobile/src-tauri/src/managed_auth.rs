@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aokie_media::IceServerConfig;
+use aokie_protocol::v2::Grant;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rand::{rngs::OsRng, RngCore};
@@ -152,6 +153,34 @@ pub(crate) struct ManagedAdmission {
     pub(crate) relay_only: bool,
     pub(crate) oauth_device_id: String,
     pub(crate) expected_peer_key_thumbprint: String,
+    /// The FormLogic-hosted frame mailbox, when this admission advertises one
+    /// AND it survived [`usable_relay_endpoints`]. `None` keeps the session on
+    /// the WebSocket gateway: the relay is an additive sibling carrier, never a
+    /// substitution for the signed `gateway_url`.
+    pub(crate) relay: Option<RelayEndpoints>,
+    /// The admission's own granted scopes, as the protocol enum.
+    ///
+    /// Only the relay path reads these. Over the WebSocket the gateway stamps
+    /// `grants` onto every projected frame it emits; on the relay there is no
+    /// gateway, so the shim that translates plugin frames has to supply them
+    /// from the admission the server actually issued.
+    pub(crate) grants: Vec<Grant>,
+}
+
+/// The three relay routes an admission may advertise.
+///
+/// ⚠️ Deliberately NOT `deny_unknown_fields`, unlike every security-bearing
+/// document around it. This is an additive transport hint: a server that later
+/// advertises another member (the long-poll fallback the relay controller
+/// already serves is the obvious next one) must leave this build using the
+/// three URLs it does understand, not lose the whole admission over a member it
+/// was never taught.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RelayEndpoints {
+    pub(crate) challenge_url: String,
+    pub(crate) frames_url: String,
+    pub(crate) stream_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +256,17 @@ struct AdmissionResponse {
     #[serde(deserialize_with = "deserialize_nullable_unix_timestamp")]
     turn_credential_expires_at: NullableUnixTimestamp,
     device: DeviceRecord,
+    /// Tolerated ahead of the backend that advertises it: this decoder is
+    /// `deny_unknown_fields`, so the member has to be accepted before it can
+    /// ever arrive. Shipping the two in the other order takes every installed
+    /// Companion down with "managed admission response is invalid".
+    ///
+    /// Held as a raw value rather than a typed member ON PURPOSE. Decoding it
+    /// inline would make a malformed or reshaped advertisement fail the whole
+    /// admission, when the transport is additive and the correct answer is to
+    /// stay on the WebSocket gateway.
+    #[serde(default)]
+    relay: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1232,7 +1272,13 @@ async fn request_admission(
             "appId":session.app_id,
             "deviceId":session.device_id,
             "displayName":"Aokie Companion",
-            "holderKeyThumbprint":holder_key_thumbprint
+            "holderKeyThumbprint":holder_key_thumbprint,
+            // Opt in to the hosted relay. A server that has never heard of the
+            // member ignores it — the admission route tolerates unknown request
+            // keys — so this is safe against every deployed backend, and a
+            // backend that does understand it will not advertise `relay` to a
+            // build that stayed silent.
+            "supportedTransports":["relay"]
         }))
         .send()
         .await
@@ -1266,6 +1312,10 @@ async fn request_admission(
         expires_at: admission.expires_at,
         ice_servers,
         relay_only: admission.relay_only,
+        grants: admission_grants(&admission.scopes),
+        // Evaluated AFTER validation so a rejected relay can never mask a
+        // failed admission, and never so as to fail one.
+        relay: admission.relay.and_then(usable_relay_endpoints),
     })
 }
 
@@ -1376,6 +1426,92 @@ fn validate_admission(
         admission.turn_credential_expires_at.value(),
         now,
     )
+}
+
+/// Accept an advertised relay only when it decodes to the shape this build
+/// understands, every URL is safe, AND all three share one origin.
+///
+/// A rejected advertisement degrades to the WebSocket gateway rather than
+/// failing the admission: the transport is additive, and refusing the whole
+/// admission over it would take the Companion surface down harder than simply
+/// not adopting the new path.
+pub(crate) fn usable_relay_endpoints(
+    advertisement: serde_json::Value,
+) -> Option<RelayEndpoints> {
+    let relay: RelayEndpoints = match serde_json::from_value(advertisement) {
+        Ok(relay) => relay,
+        Err(_) => {
+            eprintln!(
+                "[AokieCompanion][relay] advertisement rejected: not the shape this build understands"
+            );
+            return None;
+        }
+    };
+    let checked = [
+        normalize_relay_url(&relay.challenge_url, "challengeUrl"),
+        normalize_relay_url(&relay.frames_url, "framesUrl"),
+        normalize_relay_url(&relay.stream_url, "streamUrl"),
+    ];
+    let mut origins = Vec::with_capacity(checked.len());
+    for outcome in &checked {
+        match outcome {
+            Ok(url) => origins.push(url.origin()),
+            Err(message) => {
+                eprintln!("[AokieCompanion][relay] advertisement rejected: {message}");
+                return None;
+            }
+        }
+    }
+    if origins.windows(2).any(|pair| pair[0] != pair[1]) {
+        eprintln!(
+            "[AokieCompanion][relay] advertisement rejected: relay URLs span more than one origin"
+        );
+        return None;
+    }
+    Some(relay)
+}
+
+/// The relay's own URL gate.
+///
+/// Deliberately NOT [`managed_gateway_url`]: that one pins the `/v2/realtime`
+/// path and the `ws`/`wss` scheme, so every relay URL would fail it. The
+/// plaintext carve-out is the same narrow one the rest of this module applies —
+/// the exact `api.formlogic.local` WAMP host, and only in a managed-beta-local
+/// build.
+fn normalize_relay_url(raw: &str, label: &str) -> Result<Url, String> {
+    let invalid = |detail: &str| format!("relay {label} {detail}");
+    let url = Url::parse(raw).map_err(|_| invalid("is not an absolute URL"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid("must not contain credentials"));
+    }
+    if url.fragment().is_some() {
+        return Err(invalid("must not contain a fragment"));
+    }
+    if url.host_str().is_none() {
+        return Err(invalid("has no host"));
+    }
+    let local_beta = cfg!(feature = "managed-beta-local")
+        && url.scheme() == "http"
+        && url.host_str() == Some("api.formlogic.local");
+    if url.scheme() != "https" && !local_beta {
+        return Err(invalid("must use https"));
+    }
+    Ok(url)
+}
+
+/// Map the admission's granted scopes onto the protocol enum.
+///
+/// [`validate_admission`] has already refused anything outside
+/// [`MANAGED_ADMISSION_GRANTS`], so an unmapped name cannot reach here; it is
+/// dropped rather than guessed at, because a grant this build does not know is
+/// a capability it cannot honour anyway.
+fn admission_grants(scopes: &[String]) -> Vec<Grant> {
+    scopes
+        .iter()
+        .filter_map(|scope| {
+            serde_json::from_value::<Grant>(serde_json::Value::String(scope.clone())).ok()
+        })
+        .collect()
 }
 
 fn native_client() -> Result<reqwest::Client, String> {
@@ -1730,6 +1866,162 @@ mod tests {
     use super::*;
     use crate::discovery::test_discovery_document_with_relay_policy;
 
+    fn admission_body(relay: Option<serde_json::Value>) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "accessToken": "a".repeat(32),
+            "tokenType": "Bearer",
+            "expiresIn": 120,
+            "expiresAt": 1_800_000_120_u64,
+            "gatewayUrl": "wss://gateway.example.test/v2/realtime",
+            "appId": "app_a",
+            "subjectId": "device_a",
+            "role": "mobile",
+            "holderKeyThumbprint": "holder",
+            "expectedPeerKeyThumbprint": "peer",
+            "scopes": ["state_read", "monitor"],
+            "iceServers": [],
+            "relayOnly": false,
+            "turnCredentialExpiresAt": serde_json::Value::Null,
+            "device": {
+                "id": "oauth_device_a",
+                "appId": "app_a",
+                "subjectId": "device_a",
+                "role": "mobile",
+                "displayName": "Aokie Companion",
+                "grants": ["state_read", "monitor"],
+                "approvedAt": "2026-07-18T00:00:00Z",
+                "lastSeenAt": "2026-07-18T00:00:00Z"
+            }
+        });
+        if let Some(relay) = relay {
+            body["relay"] = relay;
+        }
+        body
+    }
+
+    fn relay_advertisement(origin: &str) -> serde_json::Value {
+        serde_json::json!({
+            "challengeUrl": format!("{origin}/api/aokie-companion/relay/challenge"),
+            "framesUrl": format!("{origin}/api/aokie-companion/relay/frames"),
+            "streamUrl": format!("{origin}/api/aokie-companion/relay/stream"),
+        })
+    }
+
+    /// The whole reason the decoder change ships BEFORE the backend advertises
+    /// the member: `AdmissionResponse` is `deny_unknown_fields`, so an
+    /// unexpected `relay` would fail the entire admission and take the
+    /// Companion surface down with "managed admission response is invalid".
+    #[test]
+    fn an_advertised_relay_does_not_fail_the_admission_decoder() {
+        let encoded =
+            serde_json::to_vec(&admission_body(Some(relay_advertisement("https://api.example.test"))))
+                .expect("fixture encodes");
+
+        let admission: AdmissionResponse =
+            serde_json::from_slice(&encoded).expect("an advertised relay decodes");
+
+        assert!(admission.relay.is_some());
+        // Absent is still the normal case and must stay valid.
+        let without = serde_json::to_vec(&admission_body(None)).expect("fixture encodes");
+        let admission: AdmissionResponse =
+            serde_json::from_slice(&without).expect("an admission without a relay decodes");
+        assert!(admission.relay.is_none());
+    }
+
+    /// The member is held as a raw value precisely so a reshaped advertisement
+    /// degrades to the WebSocket gateway instead of failing the admission.
+    #[test]
+    fn a_malformed_relay_advertisement_degrades_rather_than_erroring() {
+        for malformed in [
+            serde_json::json!("https://api.example.test"),
+            serde_json::json!({"challengeUrl": "https://api.example.test/challenge"}),
+            serde_json::json!({"challengeUrl": 7, "framesUrl": 8, "streamUrl": 9}),
+        ] {
+            let encoded = serde_json::to_vec(&admission_body(Some(malformed.clone())))
+                .expect("fixture encodes");
+
+            let admission: AdmissionResponse = serde_json::from_slice(&encoded)
+                .unwrap_or_else(|_| panic!("{malformed} must not fail the admission decoder"));
+
+            assert!(
+                admission.relay.and_then(usable_relay_endpoints).is_none(),
+                "{malformed} must not be adopted as a carrier"
+            );
+        }
+    }
+
+    #[test]
+    fn a_usable_relay_advertisement_is_adopted_whole() {
+        let relay = usable_relay_endpoints(relay_advertisement("https://api.example.test"))
+            .expect("a well-formed same-origin https advertisement is usable");
+
+        assert_eq!(
+            relay.challenge_url,
+            "https://api.example.test/api/aokie-companion/relay/challenge"
+        );
+        // Unknown members are additive hints, not grounds to refuse the carrier:
+        // a backend that later advertises a long-poll route must leave this
+        // build using the three URLs it does understand.
+        let mut forward_compatible = relay_advertisement("https://api.example.test");
+        forward_compatible["longPollUrl"] = serde_json::json!("https://api.example.test/poll");
+        assert!(usable_relay_endpoints(forward_compatible).is_some());
+    }
+
+    #[test]
+    fn relay_advertisements_that_are_not_safe_are_refused() {
+        // Cross-origin: one route pointing somewhere else is how a carrier gets
+        // split across a host the admission never authorised.
+        let mut cross_origin = relay_advertisement("https://api.example.test");
+        cross_origin["streamUrl"] =
+            serde_json::json!("https://elsewhere.example.test/api/aokie-companion/relay/stream");
+        assert!(usable_relay_endpoints(cross_origin).is_none());
+
+        for unsafe_url in [
+            // Credentials in the URL.
+            "https://user:pass@api.example.test/api/aokie-companion/relay/stream",
+            // A fragment.
+            "https://api.example.test/api/aokie-companion/relay/stream#x",
+            // Not absolute.
+            "/api/aokie-companion/relay/stream",
+            // A scheme this carrier does not speak.
+            "ftp://api.example.test/api/aokie-companion/relay/stream",
+        ] {
+            let mut advertisement = relay_advertisement("https://api.example.test");
+            advertisement["streamUrl"] = serde_json::json!(unsafe_url);
+            assert!(
+                usable_relay_endpoints(advertisement).is_none(),
+                "{unsafe_url} must not be adopted"
+            );
+        }
+    }
+
+    /// Plaintext is a managed-beta-local carve-out for the exact WAMP API host
+    /// and nothing else — `formlogic.local` is a DIFFERENT origin that serves
+    /// the web app, not the API.
+    #[test]
+    fn plaintext_relay_urls_follow_the_same_narrow_local_carve_out() {
+        let local = usable_relay_endpoints(relay_advertisement("http://api.formlogic.local"));
+        assert_eq!(local.is_some(), cfg!(feature = "managed-beta-local"));
+
+        assert!(usable_relay_endpoints(relay_advertisement("http://formlogic.local")).is_none());
+        assert!(usable_relay_endpoints(relay_advertisement("http://127.0.0.1:8080")).is_none());
+        assert!(usable_relay_endpoints(relay_advertisement("http://api.example.test")).is_none());
+    }
+
+    #[test]
+    fn admission_grants_map_onto_the_protocol_enum() {
+        assert_eq!(
+            admission_grants(&["state_read".into(), "monitor".into()]),
+            vec![Grant::StateRead, Grant::Monitor]
+        );
+        // validate_admission already refuses unknown grants; an unmapped name
+        // is dropped rather than guessed at.
+        assert_eq!(
+            admission_grants(&["state_read".into(), "not_a_grant".into()]),
+            vec![Grant::StateRead]
+        );
+    }
+
     #[test]
     fn pkce_material_has_rfc7636_lengths() {
         let verifier = random_base64url(32);
@@ -1946,6 +2238,7 @@ mod tests {
                 approved_at: "2026-07-16T00:00:00Z".into(),
                 last_seen_at: "2026-07-16T00:00:00Z".into(),
             },
+            relay: None,
         };
 
         validate_admission(&session, &admission, "mobile_key_thumbprint_1").unwrap();

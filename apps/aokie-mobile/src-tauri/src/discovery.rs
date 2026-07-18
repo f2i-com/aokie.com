@@ -1281,6 +1281,24 @@ mod tests {
         assert!(!discovery.relay_only);
         assert_eq!(discovery.turn_credential_expires_at, None);
         assert!(discovery.remote_consent.is_some());
+
+        // The hosted relay is advertised on the ADMISSION, not here — discovery
+        // is pre-auth and cached, and its payload is doubly key-gated. What this
+        // live check can prove is that relay routes on the deployment's own
+        // advertised API origin pass the carrier's URL gate, so a plaintext WAMP
+        // deployment is actually reachable by this build.
+        let origin = discovery
+            .api_base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/api")
+            .to_string();
+        let relay = crate::managed_auth::usable_relay_endpoints(json!({
+            "challengeUrl": format!("{origin}/api/aokie-companion/relay/challenge"),
+            "framesUrl": format!("{origin}/api/aokie-companion/relay/frames"),
+            "streamUrl": format!("{origin}/api/aokie-companion/relay/stream"),
+        }))
+        .expect("the live deployment's origin is one this build will carry a relay on");
+        assert!(relay.stream_url.ends_with("/relay/stream"));
     }
 
     #[test]
