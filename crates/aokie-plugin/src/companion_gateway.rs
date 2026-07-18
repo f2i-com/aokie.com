@@ -53,6 +53,16 @@ const SNAPSHOT_REFRESH: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 const ADMISSION_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+/// Begin replacing an admission while this much of its already safety-bounded
+/// lifetime remains. The current carrier stays authoritative throughout the
+/// overlap, so broker and endpoint-challenge latency cannot stop lease
+/// heartbeats from reaching the session loop.
+const ADMISSION_ROTATION_OVERLAP: Duration = Duration::from_secs(30);
+/// A replacement carrier opens away from the authority loop, but it is still
+/// bounded: an attempt that cannot prove its endpoint before this window must
+/// yield to a retry while the predecessor is still inside its safe lifetime.
+const ADMISSION_TRANSPORT_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+const ADMISSION_ROTATION_RETRY_DELAY: Duration = Duration::from_secs(1);
 // plugin.init's compact bootstrap intentionally omits token expiry. Consume it
 // once and rotate through the Desktop broker quickly rather than assuming the
 // gateway's maximum admission lifetime.
@@ -402,6 +412,7 @@ impl Drop for CompanionGatewayHandle {
     }
 }
 
+#[derive(Clone)]
 struct SessionCredentials {
     endpoint: Url,
     token: String,
@@ -1548,8 +1559,9 @@ struct GatewaySession {
     relay_hello_rejections_suppressed: u32,
     /// A relay party that must be greeted again before the next publish,
     /// carried from [`Self::accept_mobile_hello`] out to the carrier that owns
-    /// the greeting book. Set only for a hello whose proof VERIFIED, so an
-    /// unauthenticated frame can never provoke an extra hello.
+    /// the greeting book and can fetch a fresh challenge. Set only for a hello
+    /// whose proof VERIFIED, so an unauthenticated frame can never provoke an
+    /// extra signed hello.
     relay_regreet_party: Option<String>,
     /// A device route proved by the hello currently being handled.
     ///
@@ -1652,6 +1664,20 @@ impl GatewaySession {
         self.relay_verified_route.take()
     }
 
+    /// Force the current authoritative state to be published on the next loop
+    /// turn. Called once when a mobile hello is admitted and again after its
+    /// asynchronous fresh plugin proof is installed: state sent while the
+    /// challenge was in flight cannot substitute for state BEHIND that proof.
+    fn rearm_authoritative_publication(&mut self) {
+        self.authoritative_idle = false;
+        self.last_snapshot_fingerprint = None;
+        self.last_snapshot_sent = None;
+        self.relay_snapshot_event_id = None;
+        self.relay_snapshot_delivered_devices.clear();
+        self.last_assistance_request_sent = None;
+        self.next_snapshot_poll = Instant::now();
+    }
+
     fn rotate_credentials(
         &mut self,
         credentials: &SessionCredentials,
@@ -1688,6 +1714,24 @@ impl GatewaySession {
                 RelayReplayResult::RetiredPreparedRtcDropped { .. }
             )
         });
+        Ok(())
+    }
+
+    fn apply_admission_rotation(
+        &mut self,
+        credentials: &SessionCredentials,
+        plugin_session_nonce: String,
+        preserve_continuity: bool,
+        media: &RemoteMediaHandle,
+    ) -> Result<(), WorkerError> {
+        if preserve_continuity {
+            return self.rotate_credentials(credentials, plugin_session_nonce);
+        }
+        // Sequence numbers, routes and lease heartbeats from another relay
+        // mailbox cannot prove authority here. Return the caller first, then
+        // replace every logical-session registry in one assignment.
+        media.fail_closed_all("gateway_admission_domain_changed");
+        *self = Self::new(credentials, plugin_session_nonce);
         Ok(())
     }
 }
@@ -5552,6 +5596,845 @@ mod tests {
     }
 
     #[test]
+    fn a_relay_regreeting_refreshes_an_expired_proof_without_rotating_the_session() {
+        let authority = test_authority();
+        let credentials = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority.clone())
+            .unwrap();
+        let refresh_now = unix_now().unwrap();
+        let original_now = refresh_now.saturating_sub(40);
+        let logical_session = "plugin_session_live_takeover";
+        let original_challenge = EndpointChallengeFrame {
+            kind: "endpoint_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            subject_id: "aokie".into(),
+            role: AdmissionRole::Plugin,
+            connection_id: "relay_original".into(),
+            challenge_nonce: "challenge_original".into(),
+            admission_jti: "admission_original".into(),
+            holder_key_thumbprint: authority.endpoint_key.thumbprint.clone(),
+            expected_peer_key_thumbprint: None,
+            approved_peer_key_thumbprints: authority.approved_thumbprints(),
+            peer_roster_revision: Some(authority.roster_revision),
+            peer_roster_hash: Some(authority.roster_hash.clone()),
+            expires_at: original_now + 30,
+        };
+        let original = endpoint_hello_for_session(
+            &original_challenge,
+            &credentials,
+            original_now,
+            logical_session,
+        )
+        .unwrap();
+        assert_eq!(
+            original.endpoint_proof.verify(refresh_now),
+            Err(V2ProtocolError::Expired),
+            "the cached proof reproduces the live failure after its 30-second window"
+        );
+
+        let fresh_challenge = EndpointChallengeFrame {
+            connection_id: "relay_refreshed".into(),
+            challenge_nonce: "challenge_refreshed".into(),
+            admission_jti: "admission_refreshed".into(),
+            expires_at: refresh_now + 30,
+            ..original_challenge
+        };
+        let refreshed = endpoint_hello_for_session(
+            &fresh_challenge,
+            &credentials,
+            refresh_now,
+            logical_session,
+        )
+        .unwrap();
+
+        refreshed.validate().unwrap();
+        refreshed.endpoint_proof.verify(refresh_now).unwrap();
+        assert_eq!(refreshed.session_nonce, logical_session);
+        assert_eq!(
+            refreshed.endpoint_proof.claims.session_nonce,
+            logical_session
+        );
+        assert_eq!(
+            refreshed.endpoint_proof.claims.connection_id,
+            "relay_refreshed"
+        );
+        assert_ne!(
+            refreshed.endpoint_proof.claims.jti,
+            original.endpoint_proof.claims.jti
+        );
+    }
+
+    #[cfg(feature = "voice")]
+    #[tokio::test]
+    async fn refreshed_relay_greeting_is_sent_before_the_rearmed_state() {
+        let authority = test_authority();
+        let credentials = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority.clone())
+            .unwrap();
+        let now = unix_now().unwrap();
+        let logical_session = "plugin_session_live_takeover";
+        let original_now = now.saturating_sub(40);
+        let original_challenge = EndpointChallengeFrame {
+            kind: "endpoint_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            subject_id: "aokie".into(),
+            role: AdmissionRole::Plugin,
+            connection_id: "relay_original".into(),
+            challenge_nonce: "challenge_original".into(),
+            admission_jti: "admission_original".into(),
+            holder_key_thumbprint: authority.endpoint_key.thumbprint.clone(),
+            expected_peer_key_thumbprint: None,
+            approved_peer_key_thumbprints: authority.approved_thumbprints(),
+            peer_roster_revision: Some(authority.roster_revision),
+            peer_roster_hash: Some(authority.roster_hash.clone()),
+            expires_at: original_now + 30,
+        };
+        let original = endpoint_hello_for_session(
+            &original_challenge,
+            &credentials,
+            original_now,
+            logical_session,
+        )
+        .unwrap();
+        let original_jti = original.endpoint_proof.claims.jti.clone();
+
+        let fresh_challenge = EndpointChallengeFrame {
+            connection_id: "relay_refreshed".into(),
+            challenge_nonce: "challenge_refreshed".into(),
+            admission_jti: "admission_refreshed".into(),
+            expires_at: now + 30,
+            ..original_challenge
+        };
+        let challenge_response = fresh_challenge.clone();
+        let posts = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_posts = posts.clone();
+        let router = axum::Router::new()
+            .route(
+                "/challenge",
+                axum::routing::get(move || {
+                    let challenge = challenge_response.clone();
+                    async move { axum::Json(challenge) }
+                }),
+            )
+            .route(
+                "/frames",
+                axum::routing::get(|| async { axum::Json(json!({"frames": [], "lastSeq": 0})) })
+                    .post(move |axum::Json(body): axum::Json<Value>| {
+                        let captured_posts = captured_posts.clone();
+                        async move {
+                            captured_posts.lock().unwrap().push(body);
+                            axum::http::StatusCode::OK
+                        }
+                    }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let endpoints = RelayEndpoints {
+            challenge_url: format!("http://{address}/challenge"),
+            frames_url: format!("http://{address}/frames"),
+            stream_url: format!("http://{address}/stream"),
+        };
+        let (mut channel, _) = crate::companion_relay::RelayChannel::connect(
+            &endpoints,
+            &credentials.token,
+            &credentials.app_id,
+            &credentials.plugin_id,
+            authority.approved_thumbprints(),
+        )
+        .await
+        .unwrap();
+        channel.arm(serde_json::to_string(&original).unwrap());
+        let party = relay_party(&authority.approved_thumbprints()[0]);
+        channel.authorize_route("device_a", &party, &HashSet::from([Grant::StateRead]));
+        let mut transport = GatewayTransport::Relay(channel);
+        let state = "{\"kind\":\"plugin_snapshot\",\"deviceId\":\"device_a\"}";
+
+        // Establish the bug's starting point: this party was greeted while the
+        // original proof was current, but the cached document is now expired.
+        transport.send_text(state).await.unwrap();
+        posts.lock().unwrap().clear();
+
+        let mut tasks = RelayGreetingTasks::default();
+        tasks.schedule(
+            party.clone(),
+            transport.regreeting_request().unwrap(),
+            credentials.clone(),
+            logical_session.into(),
+        );
+        let greeting = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(result) = tasks.take_finished().await.into_iter().next() {
+                    break result.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fresh challenge completes");
+        assert!(transport.install_regreeting(greeting));
+        transport.send_text(state).await.unwrap();
+
+        let posted = posts.lock().unwrap();
+        assert_eq!(posted.len(), 1);
+        let frames = posted[0]["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 2, "fresh hello must precede re-armed state");
+        let hello: PluginHello = serde_json::from_value(frames[0].clone()).unwrap();
+        hello.endpoint_proof.verify(unix_now().unwrap()).unwrap();
+        assert_eq!(hello.session_nonce, logical_session);
+        assert_eq!(hello.endpoint_proof.claims.session_nonce, logical_session);
+        assert_eq!(
+            hello.endpoint_proof.claims.connection_id,
+            fresh_challenge.connection_id
+        );
+        assert_ne!(hello.endpoint_proof.claims.jti, original_jti);
+        assert_eq!(frames[1]["kind"], "plugin_snapshot");
+        server.abort();
+    }
+
+    #[test]
+    fn admission_domain_change_returns_caller_and_drops_all_lease_continuity() {
+        let mut harness = RelayHarness::new();
+        let active =
+            activate_takeover_without_replacement_peer(&mut harness, "request_domain_change_reset");
+        assert_eq!(active.lease.phase, LeasePhase::Active);
+        assert_eq!(harness.session.relay_leases.len(), 1);
+        let authority = harness.session.endpoint_authority.clone();
+        let refreshed = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority)
+            .unwrap();
+
+        harness
+            .session
+            .apply_admission_rotation(
+                &refreshed,
+                "plugin_session_new_domain".into(),
+                false,
+                &harness.media,
+            )
+            .unwrap();
+
+        assert_eq!(
+            harness.media.snapshot().service_mode,
+            LocalServiceMode::AokieActive
+        );
+        assert_eq!(
+            harness.session.plugin_session_nonce,
+            "plugin_session_new_domain"
+        );
+        assert!(harness.session.relay_leases.is_empty());
+        assert!(harness.session.leases.is_empty());
+        assert!(harness.session.relay_peers.is_empty());
+        assert!(harness.session.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delayed_admission_rotation_keeps_heartbeats_ahead_of_lease_expiry() {
+        let mut harness = RelayHarness::new();
+        let active = activate_takeover_without_replacement_peer(
+            &mut harness,
+            "request_admission_rotation_nonblocking",
+        );
+        assert_eq!(active.lease.phase, LeasePhase::Active);
+        let logical_session = harness.session.plugin_session_nonce.clone();
+
+        // Put the predecessor lease one second from expiry. The delayed
+        // replacement represents the broker + endpoint challenge/open that
+        // used to run synchronously on this same authority path.
+        let now = unix_now().unwrap();
+        harness
+            .session
+            .leases
+            .get_mut(&active.lease.jti)
+            .expect("the active lease is current")
+            .expires_at = now + 1;
+        let host_rpc = HostRpc::new();
+        let (request_id, _line, response) = host_rpc.begin("companion.admission", json!({}));
+        let authority = test_authority();
+        let credentials = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority)
+            .unwrap();
+        let mut rotation = AdmissionRotationTask {
+            host_rpc: host_rpc.clone(),
+            generation: 0,
+            phase: Some(AdmissionRotationPhase::Broker(PendingAdmissionBroker {
+                request_id,
+                response,
+                started_at: Instant::now(),
+                expected_app_id: credentials.app_id.clone(),
+                plugin_id: credentials.plugin_id.clone(),
+                endpoint_authority: credentials.endpoint_authority.clone(),
+                status: Arc::new(Mutex::new(GatewayStatusSnapshot::starting())),
+                attempt: 0,
+                predecessor_domain: AdmissionCarrierDomain::WebSocket,
+            })),
+        };
+        assert!(rotation.is_pending());
+
+        let polled_at = Instant::now();
+        assert!(rotation.take_finished().await.is_none());
+        assert!(
+            polled_at.elapsed() < Duration::from_millis(50),
+            "polling an unfinished rotation must not inherit its delay"
+        );
+
+        // The heartbeat is handled while the replacement remains in flight,
+        // rotating the lease beyond its old deadline. Sweeping at a synthetic
+        // time after that old deadline therefore keeps authority alive. The
+        // former inline refresh could not read this frame before the sweep.
+        let heartbeat = json!({
+            "kind": "lease_heartbeat",
+            "schemaVersion": SCHEMA_VERSION,
+            "appId": "app_a",
+            "requestId": "heartbeat_during_admission_rotation",
+            "idempotencyKey": "idem_heartbeat_during_admission_rotation",
+            "leaseToken": active.lease_token
+        })
+        .to_string();
+        let renewed_frames = harness.post(&heartbeat);
+        let renewed = harness.granted(&renewed_frames);
+        assert_eq!(renewed.status, PluginLeaseStatus::Renewed);
+        assert_eq!(renewed.lease.phase, LeasePhase::Active);
+        harness.settle(&renewed_frames, TransportDelivery::Delivered);
+        assert!(rotation.is_pending());
+        assert_eq!(
+            harness.session.expire_relay_leases(now + 2, &harness.media),
+            0,
+            "the queued heartbeat must renew before the old lease deadline is swept"
+        );
+        assert_eq!(harness.session.relay_leases.len(), 1);
+        assert!(harness.session.leases.contains_key(&renewed.lease.jti));
+        assert_eq!(harness.session.plugin_session_nonce, logical_session);
+
+        assert!(host_rpc.try_route_response(&json!({
+            "id": request_id,
+            "error": {"code": -32000, "message": "synthetic broker refusal"}
+        })));
+        let failure = match rotation
+            .take_finished()
+            .await
+            .expect("the broker response completes the rotation")
+        {
+            Ok(_) => panic!("the synthetic broker refusal unexpectedly opened a transport"),
+            Err(error) => error,
+        };
+        assert_eq!(failure.kind, WorkerErrorKind::Rebootstrap);
+        assert_eq!(harness.session.relay_leases.len(), 1);
+        assert!(harness.session.leases.contains_key(&renewed.lease.jti));
+    }
+
+    #[cfg(feature = "voice")]
+    #[tokio::test]
+    async fn delayed_real_relay_rotation_opens_off_the_authority_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let authority = test_authority();
+        let now = unix_now().unwrap();
+        let challenge = EndpointChallengeFrame {
+            kind: "endpoint_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            subject_id: "aokie".into(),
+            role: AdmissionRole::Plugin,
+            connection_id: "relay_admission_rotation".into(),
+            challenge_nonce: "challenge_admission_rotation".into(),
+            admission_jti: "admission_rotation".into(),
+            holder_key_thumbprint: authority.endpoint_key.thumbprint.clone(),
+            expected_peer_key_thumbprint: None,
+            approved_peer_key_thumbprints: authority.approved_thumbprints(),
+            peer_roster_revision: Some(authority.roster_revision),
+            peer_roster_hash: Some(authority.roster_hash.clone()),
+            expires_at: now + 30,
+        };
+        let tail_requests = Arc::new(AtomicUsize::new(0));
+        let seen_tail_requests = tail_requests.clone();
+        let router = axum::Router::new()
+            .route(
+                "/challenge",
+                axum::routing::get(move || {
+                    let challenge = challenge.clone();
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        axum::Json(challenge)
+                    }
+                }),
+            )
+            .route(
+                "/frames",
+                axum::routing::get(move || {
+                    seen_tail_requests.fetch_add(1, Ordering::SeqCst);
+                    async { axum::Json(json!({"frames": [], "lastSeq": 0})) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let endpoints = RelayEndpoints {
+            challenge_url: format!("http://{address}/challenge"),
+            frames_url: format!("http://{address}/frames"),
+            stream_url: format!("http://{address}/stream"),
+        };
+        let mut credentials = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority)
+            .unwrap();
+        // Local test servers deliberately bypass production URL admission;
+        // the production decoder's HTTPS/managed-beta policy has its own
+        // contract tests. Everything from replacement open onward is real.
+        credentials.relay = Some(endpoints);
+
+        let host_rpc = HostRpc::new();
+        let status = Arc::new(Mutex::new(GatewayStatusSnapshot {
+            configured: true,
+            connected: true,
+            phase: GatewayConnectionPhase::Connected,
+            reconnect_attempt: 0,
+            last_error: None,
+            changed_at: aokie_core::events::now_iso8601(),
+        }));
+        let rotation_credentials = credentials.clone();
+        let delayed_open = tokio::spawn(async move {
+            let (transport, plugin_session_nonce) =
+                GatewayTransport::open_replacement(&rotation_credentials, &status, 0, true).await?;
+            Ok(OpenedAdmissionRotation {
+                generation: 7,
+                credentials: rotation_credentials,
+                transport,
+                plugin_session_nonce,
+                preserve_continuity: true,
+            })
+        });
+        let mut rotation = AdmissionRotationTask::from_opening_for_test(host_rpc, 7, delayed_open);
+        tokio::task::yield_now().await;
+        assert!(rotation.take_finished().await.is_none());
+        assert!(rotation.is_pending());
+
+        let mut harness = RelayHarness::new();
+        let active = activate_takeover_without_replacement_peer(
+            &mut harness,
+            "request_real_admission_rotation_nonblocking",
+        );
+        harness
+            .session
+            .leases
+            .get_mut(&active.lease.jti)
+            .unwrap()
+            .expires_at = now + 1;
+        let heartbeat = json!({
+            "kind": "lease_heartbeat",
+            "schemaVersion": SCHEMA_VERSION,
+            "appId": "app_a",
+            "requestId": "heartbeat_during_real_admission_open",
+            "idempotencyKey": "idem_heartbeat_during_real_admission_open",
+            "leaseToken": active.lease_token
+        })
+        .to_string();
+        let renewed_frames = harness.post(&heartbeat);
+        let renewed = harness.granted(&renewed_frames);
+        harness.settle(&renewed_frames, TransportDelivery::Delivered);
+        assert_eq!(renewed.status, PluginLeaseStatus::Renewed);
+        assert_eq!(
+            harness.session.expire_relay_leases(now + 2, &harness.media),
+            0
+        );
+        assert!(rotation.is_pending());
+
+        let opened = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(result) = rotation.take_finished().await {
+                    break match result {
+                        Ok(opened) => opened,
+                        Err(error) => panic!("replacement failed: {}", error.message),
+                    };
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the delayed replacement opens");
+        assert_eq!(opened.generation, 7);
+        assert!(opened.transport.is_relay());
+        assert_eq!(
+            tail_requests.load(Ordering::SeqCst),
+            0,
+            "a same-relay replacement inherits the predecessor cursor instead of walking the tail"
+        );
+        assert_eq!(harness.session.relay_leases.len(), 1);
+        assert!(harness.session.leases.contains_key(&renewed.lease.jti));
+        opened.transport.close().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_rotation_defers_the_fencing_hello_until_atomic_handoff() {
+        enum OldSocketCommand {
+            Frame(String),
+            Close,
+        }
+
+        let authority = test_authority();
+        let now = unix_now().unwrap();
+        let challenge = |suffix: &str| EndpointChallengeFrame {
+            kind: "endpoint_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            subject_id: "aokie".into(),
+            role: AdmissionRole::Plugin,
+            connection_id: format!("ws_rotation_{suffix}"),
+            challenge_nonce: format!("challenge_ws_rotation_{suffix}"),
+            admission_jti: format!("admission_ws_rotation_{suffix}"),
+            holder_key_thumbprint: authority.endpoint_key.thumbprint.clone(),
+            expected_peer_key_thumbprint: None,
+            approved_peer_key_thumbprints: authority.approved_thumbprints(),
+            peer_roster_revision: Some(authority.roster_revision),
+            peer_roster_hash: Some(authority.roster_hash.clone()),
+            expires_at: now + 30,
+        };
+        let old_challenge = challenge("old");
+        let replacement_challenge = challenge("replacement");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral listener");
+        let address = listener.local_addr().expect("listener address");
+        let (old_commands, mut old_command_rx) =
+            tokio::sync::mpsc::unbounded_channel::<OldSocketCommand>();
+        let fence_old = old_commands.clone();
+        let (old_ready_tx, old_ready_rx) = tokio::sync::oneshot::channel();
+        let (new_hello_tx, mut new_hello_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (old_stream, _) = listener.accept().await.unwrap();
+            let mut old_socket = tokio_tungstenite::accept_async(old_stream).await.unwrap();
+            old_socket
+                .send(Message::Text(
+                    serde_json::to_string(&old_challenge).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            let old_hello = old_socket.next().await.unwrap().unwrap();
+            assert!(matches!(old_hello, Message::Text(_)));
+            let _ = old_ready_tx.send(());
+            let old_writer = tokio::spawn(async move {
+                while let Some(command) = old_command_rx.recv().await {
+                    match command {
+                        OldSocketCommand::Frame(encoded) => {
+                            old_socket
+                                .send(Message::Text(encoded.into()))
+                                .await
+                                .unwrap();
+                        }
+                        OldSocketCommand::Close => {
+                            let _ = old_socket.send(Message::Close(None)).await;
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let (replacement_stream, _) = listener.accept().await.unwrap();
+            let mut replacement_socket = tokio_tungstenite::accept_async(replacement_stream)
+                .await
+                .unwrap();
+            replacement_socket
+                .send(Message::Text(
+                    serde_json::to_string(&replacement_challenge)
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let replacement_hello = replacement_socket.next().await.unwrap().unwrap();
+            let Message::Text(encoded) = replacement_hello else {
+                panic!("replacement endpoint proof is a text frame");
+            };
+            let hello: PluginHello = serde_json::from_str(encoded.as_str()).unwrap();
+            assert_eq!(hello.kind, "plugin_hello");
+            // This is the v2 gateway's same-plugin behaviour: accepting the
+            // replacement hello immediately fences the predecessor.
+            fence_old.send(OldSocketCommand::Close).unwrap();
+            let _ = new_hello_tx.send(());
+            while let Some(message) = replacement_socket.next().await {
+                if matches!(message, Ok(Message::Close(_)) | Err(_)) {
+                    break;
+                }
+            }
+            let _ = old_writer.await;
+        });
+
+        let mut credentials = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority)
+            .unwrap();
+        credentials.endpoint =
+            Url::parse(&format!("ws://{address}/v2/realtime")).expect("local ws URL");
+        credentials.relay = None;
+        credentials.relay_only = false;
+        let status = Arc::new(Mutex::new(GatewayStatusSnapshot::starting()));
+        let (mut current, current_nonce) = GatewayTransport::open(&credentials, &status, 0)
+            .await
+            .unwrap();
+        old_ready_rx.await.unwrap();
+
+        let (mut replacement, replacement_nonce) =
+            GatewayTransport::open_replacement(&credentials, &status, 0, false)
+                .await
+                .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), &mut new_hello_rx)
+                .await
+                .is_err(),
+            "background open must not send the hello that fences the live predecessor"
+        );
+
+        let mut harness = RelayHarness::new();
+        harness.session.plugin_session_nonce = current_nonce;
+        let active =
+            activate_takeover_without_replacement_peer(&mut harness, "request_ws_rotation_handoff");
+        let heartbeat = json!({
+            "kind": "lease_heartbeat",
+            "schemaVersion": SCHEMA_VERSION,
+            "appId": "app_a",
+            "requestId": "heartbeat_before_ws_handoff",
+            "idempotencyKey": "idem_heartbeat_before_ws_handoff",
+            "leaseToken": active.lease_token
+        })
+        .to_string();
+        old_commands
+            .send(OldSocketCommand::Frame(heartbeat))
+            .unwrap();
+        let inbound = current
+            .recv_text(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect("the predecessor still carries its heartbeat");
+        let renewed_frames = harness.post(&inbound);
+        let renewed = harness.granted(&renewed_frames);
+        harness.settle(&renewed_frames, TransportDelivery::Delivered);
+        assert_eq!(renewed.status, PluginLeaseStatus::Renewed);
+
+        replacement.activate_replacement().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut new_hello_rx)
+            .await
+            .expect("the replacement hello reaches the gateway")
+            .unwrap();
+        harness
+            .session
+            .rotate_credentials(&credentials, replacement_nonce)
+            .unwrap();
+        let mut fenced_predecessor = std::mem::replace(&mut current, replacement);
+        assert!(current.adopt_routing_from(&mut fenced_predecessor));
+        assert!(
+            fenced_predecessor
+                .recv_text(Duration::from_secs(1))
+                .await
+                .is_err(),
+            "the gateway really fenced the old socket after the committed hello"
+        );
+        assert_eq!(harness.session.relay_leases.len(), 1);
+        assert!(harness.session.leases.contains_key(&renewed.lease.jti));
+
+        current.close().await;
+        drop(old_commands);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("test gateway shuts down")
+            .unwrap();
+    }
+
+    #[cfg(feature = "voice")]
+    #[tokio::test]
+    async fn delayed_or_failed_regreeting_never_stalls_active_takeover_heartbeats() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let authority = test_authority();
+        let credentials = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority.clone())
+            .unwrap();
+        let now = unix_now().unwrap();
+        let challenge = EndpointChallengeFrame {
+            kind: "endpoint_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            subject_id: "aokie".into(),
+            role: AdmissionRole::Plugin,
+            connection_id: "relay_delayed".into(),
+            challenge_nonce: "challenge_delayed".into(),
+            admission_jti: "admission_delayed".into(),
+            holder_key_thumbprint: authority.endpoint_key.thumbprint.clone(),
+            expected_peer_key_thumbprint: None,
+            approved_peer_key_thumbprints: authority.approved_thumbprints(),
+            peer_roster_revision: Some(authority.roster_revision),
+            peer_roster_hash: Some(authority.roster_hash.clone()),
+            expires_at: now + 30,
+        };
+        let challenge_requests = Arc::new(AtomicUsize::new(0));
+        let seen_challenges = challenge_requests.clone();
+        let challenge_response = challenge.clone();
+        let router = axum::Router::new()
+            .route(
+                "/challenge",
+                axum::routing::get(move || {
+                    let request = seen_challenges.fetch_add(1, Ordering::SeqCst);
+                    let challenge = challenge_response.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        if request == 0 {
+                            // Initial channel open is unrelated to per-party
+                            // re-greeting and completes immediately.
+                            return axum::Json(challenge).into_response();
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        if request == 1 {
+                            axum::Json(challenge).into_response()
+                        } else {
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/frames",
+                axum::routing::get(|| async { axum::Json(json!({"frames": [], "lastSeq": 0})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let endpoints = RelayEndpoints {
+            challenge_url: format!("http://{address}/challenge"),
+            frames_url: format!("http://{address}/frames"),
+            stream_url: format!("http://{address}/stream"),
+        };
+        let (channel, _) = crate::companion_relay::RelayChannel::connect(
+            &endpoints,
+            &credentials.token,
+            &credentials.app_id,
+            &credentials.plugin_id,
+            authority.approved_thumbprints(),
+        )
+        .await
+        .unwrap();
+        let transport = GatewayTransport::Relay(channel);
+
+        let mut harness = RelayHarness::new();
+        let active = activate_takeover_without_replacement_peer(
+            &mut harness,
+            "request_regreeting_nonblocking",
+        );
+        assert_eq!(active.lease.phase, LeasePhase::Active);
+        let logical_session = harness.session.plugin_session_nonce.clone();
+        let party = harness.party.clone();
+        let heartbeat = |request_id: &str, token: &str| {
+            json!({
+                "kind": "lease_heartbeat",
+                "schemaVersion": SCHEMA_VERSION,
+                "appId": "app_a",
+                "requestId": request_id,
+                "idempotencyKey": format!("idem_{request_id}"),
+                "leaseToken": token
+            })
+            .to_string()
+        };
+
+        let mut tasks = RelayGreetingTasks::default();
+        tasks.schedule(
+            party.clone(),
+            transport.regreeting_request().unwrap(),
+            credentials.clone(),
+            logical_session.clone(),
+        );
+        // A repeat hello coalesces rather than spawning an unbounded second
+        // challenge request for the same roster party.
+        tasks.schedule(
+            party.clone(),
+            transport.regreeting_request().unwrap(),
+            credentials.clone(),
+            logical_session.clone(),
+        );
+        tokio::task::yield_now().await;
+        assert!(tasks.is_pending(&party));
+        assert!(tasks.take_finished().await.is_empty());
+
+        // The delayed HTTP request is still in flight, but the exact active
+        // takeover heartbeat rotates normally on the authority path.
+        let renewed_frames =
+            harness.post(&heartbeat("heartbeat_during_delay", &active.lease_token));
+        let renewed = harness.granted(&renewed_frames);
+        assert_eq!(renewed.status, PluginLeaseStatus::Renewed);
+        assert_eq!(renewed.lease.phase, LeasePhase::Active);
+        harness.settle(&renewed_frames, TransportDelivery::Delivered);
+        assert_eq!(harness.session.plugin_session_nonce, logical_session);
+        assert_eq!(harness.session.relay_leases.len(), 1);
+
+        let fresh = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(result) = tasks.take_finished().await.into_iter().next() {
+                    break result.expect("the delayed refresh succeeds");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("delayed refresh completes");
+        assert_eq!(fresh.plugin_session_nonce, logical_session);
+
+        // The next attempt is delayed and then fails. It is equally isolated:
+        // a second heartbeat advances while it is pending, and the error owns
+        // no session/media state it could revoke.
+        tasks.schedule(
+            party.clone(),
+            transport.regreeting_request().unwrap(),
+            credentials,
+            logical_session.clone(),
+        );
+        tokio::task::yield_now().await;
+        assert!(tasks.is_pending(&party));
+        let renewed_again_frames = harness.post(&heartbeat(
+            "heartbeat_during_failed_refresh",
+            &renewed.lease_token,
+        ));
+        let renewed_again = harness.granted(&renewed_again_frames);
+        assert_eq!(renewed_again.status, PluginLeaseStatus::Renewed);
+        harness.settle(&renewed_again_frames, TransportDelivery::Delivered);
+
+        let failure = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(result) = tasks.take_finished().await.into_iter().next() {
+                    break result.expect_err("the second challenge is refused");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("failed refresh completes");
+        assert_eq!(failure.kind, WorkerErrorKind::Reconnect);
+        assert_eq!(harness.session.plugin_session_nonce, logical_session);
+        assert_eq!(harness.session.relay_leases.len(), 1);
+        assert!(harness
+            .session
+            .leases
+            .contains_key(&renewed_again.lease.jti));
+        assert_eq!(
+            harness
+                .session
+                .expire_relay_leases(unix_now().unwrap(), &harness.media),
+            0,
+            "challenge failure cannot expire or revoke active authority"
+        );
+        server.abort();
+    }
+
+    #[test]
     fn gateway_error_envelope_accepts_typed_fields_without_app_identity() {
         let encoded = json!({
             "kind": "error",
@@ -5586,12 +6469,377 @@ enum GatewayTransport {
     Relay(crate::companion_relay::RelayChannel),
 }
 
+/// Carrier namespace whose authenticated connection state can survive an
+/// admission rotation. WebSocket continuity keeps the gateway's established
+/// behaviour. Relay continuity is narrower: its numeric cursor is meaningful
+/// only inside one exact mailbox domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AdmissionCarrierDomain {
+    WebSocket,
+    #[cfg(feature = "voice")]
+    Relay(crate::companion_relay::RelayCursorDomain),
+}
+
+impl AdmissionCarrierDomain {
+    fn for_credentials(credentials: &SessionCredentials) -> Result<Self, WorkerError> {
+        #[cfg(feature = "voice")]
+        if let Some(endpoints) = credentials.relay.as_ref() {
+            let domain = crate::companion_relay::RelayCursorDomain::from_endpoints(
+                endpoints,
+                &credentials.app_id,
+                &credentials.plugin_id,
+            )
+            .ok_or_else(|| WorkerError::rebootstrap("Companion relay cursor domain is invalid"))?;
+            return Ok(Self::Relay(domain));
+        }
+        #[cfg(not(feature = "voice"))]
+        let _ = credentials;
+        Ok(Self::WebSocket)
+    }
+
+    fn inherits_relay_cursor(&self) -> bool {
+        #[cfg(feature = "voice")]
+        {
+            return matches!(self, Self::Relay(_));
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            false
+        }
+    }
+}
+
 /// The WebSocket carrier owns its own heartbeat bookkeeping so an admission
 /// rotation replaces the ping schedule together with the socket it belongs to.
 struct WebSocketTransport {
     socket: GatewaySocket,
     next_ping: Instant,
     awaiting_pong: Option<Instant>,
+    /// Replacement sockets finish their endpoint challenge in the background
+    /// but do not send this hello until the authority loop is ready to swap.
+    /// Sending it earlier lets the gateway fence the predecessor before the
+    /// loop has taken ownership of the replacement.
+    pending_hello: Option<String>,
+}
+
+/// A freshly challenged hello prepared away from the call-authority loop.
+#[cfg(feature = "voice")]
+#[derive(Debug)]
+struct FreshRelayGreeting {
+    channel_id: u64,
+    party: String,
+    plugin_session_nonce: String,
+    encoded_hello: String,
+}
+
+/// Bounded, per-party greeting refresh work.
+///
+/// Fetching the relay challenge may consume the full HTTP timeout. These tasks
+/// own clone-only request/signing inputs and never borrow [`GatewayTransport`],
+/// so `run_socket` continues receiving lease heartbeats and reconciling media
+/// authority while the request is delayed. A repeated hello for the same party
+/// coalesces onto its existing task.
+#[cfg(feature = "voice")]
+#[derive(Default)]
+struct RelayGreetingTasks {
+    by_party: HashMap<String, tokio::task::JoinHandle<Result<FreshRelayGreeting, WorkerError>>>,
+}
+
+#[cfg(feature = "voice")]
+impl RelayGreetingTasks {
+    fn schedule(
+        &mut self,
+        party: String,
+        request: crate::companion_relay::RelayGreetingRequest,
+        credentials: SessionCredentials,
+        plugin_session_nonce: String,
+    ) {
+        if self.by_party.contains_key(&party) {
+            return;
+        }
+        let task_party = party.clone();
+        let channel_id = request.channel_id();
+        let handle = tokio::spawn(async move {
+            let challenge = request.fetch_challenge().await?;
+            let hello = endpoint_hello_for_session(
+                &challenge,
+                &credentials,
+                unix_now()?,
+                &plugin_session_nonce,
+            )?;
+            let encoded_hello = serde_json::to_string(&hello)
+                .map_err(|_| WorkerError::reconnect("Companion frame could not be encoded"))?;
+            Ok(FreshRelayGreeting {
+                channel_id,
+                party: task_party,
+                plugin_session_nonce,
+                encoded_hello,
+            })
+        });
+        self.by_party.insert(party, handle);
+    }
+
+    /// Drain only tasks Tokio already marks complete. Awaiting one of these
+    /// cannot inherit the challenge timeout; work still in flight remains in
+    /// the map and the authority loop proceeds immediately.
+    async fn take_finished(&mut self) -> Vec<Result<FreshRelayGreeting, WorkerError>> {
+        let finished = self
+            .by_party
+            .iter()
+            .filter_map(|(party, task)| task.is_finished().then(|| party.clone()))
+            .collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(finished.len());
+        for party in finished {
+            let Some(task) = self.by_party.remove(&party) else {
+                continue;
+            };
+            results.push(match task.await {
+                Ok(result) => result,
+                Err(_) => Err(WorkerError::reconnect(
+                    "Companion relay greeting refresh task stopped",
+                )),
+            });
+        }
+        results
+    }
+
+    fn abort_all(&mut self) {
+        for (_, task) in self.by_party.drain() {
+            task.abort();
+        }
+    }
+
+    #[cfg(test)]
+    fn is_pending(&self, party: &str) -> bool {
+        self.by_party.contains_key(party)
+    }
+}
+
+#[cfg(feature = "voice")]
+impl Drop for RelayGreetingTasks {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
+/// A fully authenticated replacement prepared without borrowing the carrier
+/// or session whose authority it will supersede.
+struct OpenedAdmissionRotation {
+    generation: u64,
+    credentials: SessionCredentials,
+    transport: GatewayTransport,
+    plugin_session_nonce: String,
+    preserve_continuity: bool,
+}
+
+struct PendingAdmissionBroker {
+    request_id: u64,
+    response: std::sync::mpsc::Receiver<crate::host_rpc::HostResult>,
+    started_at: Instant,
+    expected_app_id: String,
+    plugin_id: String,
+    endpoint_authority: Arc<EndpointAuthority>,
+    status: Arc<Mutex<GatewayStatusSnapshot>>,
+    attempt: u32,
+    predecessor_domain: AdmissionCarrierDomain,
+}
+
+enum AdmissionRotationPhase {
+    Broker(PendingAdmissionBroker),
+    Opening(tokio::task::JoinHandle<Result<OpenedAdmissionRotation, WorkerError>>),
+}
+
+/// One overlapping admission replacement.
+///
+/// The Desktop RPC receiver is polled with `try_recv`, and endpoint opening is
+/// owned by a Tokio task. Neither phase can wait on the sole session loop, so
+/// the predecessor continues reading heartbeats and renewing active authority
+/// until the replacement is complete. At most one generation is in flight.
+struct AdmissionRotationTask {
+    host_rpc: Arc<HostRpc>,
+    generation: u64,
+    phase: Option<AdmissionRotationPhase>,
+}
+
+impl AdmissionRotationTask {
+    fn begin(
+        host_rpc: Arc<HostRpc>,
+        generation: u64,
+        credentials: &SessionCredentials,
+        status: Arc<Mutex<GatewayStatusSnapshot>>,
+        attempt: u32,
+        predecessor_domain: AdmissionCarrierDomain,
+    ) -> Result<Self, WorkerError> {
+        let params = admission_request_params(
+            Some(&credentials.app_id),
+            &credentials.plugin_id,
+            &credentials.endpoint_authority,
+        )?;
+        let (request_id, line, response) =
+            host_rpc.begin("companion.admission", Value::Object(params));
+        let mut sink = StdoutSink::new();
+        if sink.send_line(&line).is_err() {
+            host_rpc.forget(request_id);
+            return Err(WorkerError::rebootstrap(
+                "Desktop admission broker is unavailable",
+            ));
+        }
+        Ok(Self {
+            host_rpc,
+            generation,
+            phase: Some(AdmissionRotationPhase::Broker(PendingAdmissionBroker {
+                request_id,
+                response,
+                started_at: Instant::now(),
+                expected_app_id: credentials.app_id.clone(),
+                plugin_id: credentials.plugin_id.clone(),
+                endpoint_authority: credentials.endpoint_authority.clone(),
+                status,
+                attempt,
+                predecessor_domain,
+            })),
+        })
+    }
+
+    /// Return only a completed result. Pending broker and transport work is
+    /// observed, never awaited, by the authority loop.
+    async fn take_finished(&mut self) -> Option<Result<OpenedAdmissionRotation, WorkerError>> {
+        let broker_result = match self.phase.as_mut() {
+            Some(AdmissionRotationPhase::Broker(pending)) => {
+                if pending.started_at.elapsed() >= ADMISSION_RPC_TIMEOUT {
+                    Some(Err(WorkerError::rebootstrap(
+                        "Desktop admission refresh timed out",
+                    )))
+                } else {
+                    match pending.response.try_recv() {
+                        Ok(Ok(value)) => Some(Ok(value)),
+                        Ok(Err(_)) => Some(Err(WorkerError::rebootstrap(
+                            "Desktop rejected Companion admission refresh",
+                        ))),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                            WorkerError::rebootstrap("Desktop admission refresh stopped"),
+                        )),
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(result) = broker_result {
+            let Some(AdmissionRotationPhase::Broker(pending)) = self.phase.take() else {
+                return Some(Err(WorkerError::reconnect(
+                    "Companion admission rotation lost its broker state",
+                )));
+            };
+            if result.is_err() {
+                self.host_rpc.forget(pending.request_id);
+            }
+            let value = match result {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
+            let response: AdmissionResponse = match serde_json::from_value(value) {
+                Ok(response) => response,
+                Err(_) => {
+                    return Some(Err(WorkerError::rebootstrap(
+                        "Desktop returned an invalid Companion admission response",
+                    )))
+                }
+            };
+            let credentials = match response.into_credentials(
+                Some(&pending.expected_app_id),
+                &pending.plugin_id,
+                pending.endpoint_authority,
+            ) {
+                Ok(credentials) => credentials,
+                Err(error) => return Some(Err(error)),
+            };
+            let replacement_domain = match AdmissionCarrierDomain::for_credentials(&credentials) {
+                Ok(domain) => domain,
+                Err(error) => return Some(Err(error)),
+            };
+            let preserve_continuity = pending.predecessor_domain == replacement_domain;
+            let inherit_relay_cursor =
+                preserve_continuity && pending.predecessor_domain.inherits_relay_cursor();
+            let generation = self.generation;
+            let handle = tokio::spawn(async move {
+                let opened = tokio::time::timeout(
+                    ADMISSION_TRANSPORT_OPEN_TIMEOUT,
+                    GatewayTransport::open_replacement(
+                        &credentials,
+                        &pending.status,
+                        pending.attempt,
+                        inherit_relay_cursor,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    WorkerError::reconnect(
+                        "Companion replacement transport did not open before its deadline",
+                    )
+                })??;
+                Ok(OpenedAdmissionRotation {
+                    generation,
+                    credentials,
+                    transport: opened.0,
+                    plugin_session_nonce: opened.1,
+                    preserve_continuity,
+                })
+            });
+            self.phase = Some(AdmissionRotationPhase::Opening(handle));
+            return None;
+        }
+
+        let opening_finished = matches!(
+            self.phase.as_ref(),
+            Some(AdmissionRotationPhase::Opening(task)) if task.is_finished()
+        );
+        if !opening_finished {
+            return None;
+        }
+        let Some(AdmissionRotationPhase::Opening(task)) = self.phase.take() else {
+            return Some(Err(WorkerError::reconnect(
+                "Companion admission rotation lost its transport state",
+            )));
+        };
+        Some(match task.await {
+            Ok(result) => result,
+            Err(_) => Err(WorkerError::reconnect(
+                "Companion admission rotation task stopped",
+            )),
+        })
+    }
+
+    #[cfg(all(test, feature = "voice"))]
+    fn from_opening_for_test(
+        host_rpc: Arc<HostRpc>,
+        generation: u64,
+        task: tokio::task::JoinHandle<Result<OpenedAdmissionRotation, WorkerError>>,
+    ) -> Self {
+        Self {
+            host_rpc,
+            generation,
+            phase: Some(AdmissionRotationPhase::Opening(task)),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_pending(&self) -> bool {
+        self.phase.is_some()
+    }
+}
+
+impl Drop for AdmissionRotationTask {
+    fn drop(&mut self) {
+        match self.phase.take() {
+            Some(AdmissionRotationPhase::Broker(pending)) => {
+                self.host_rpc.forget(pending.request_id);
+            }
+            Some(AdmissionRotationPhase::Opening(task)) => task.abort(),
+            None => {}
+        }
+    }
 }
 
 impl GatewayTransport {
@@ -5600,16 +6848,47 @@ impl GatewayTransport {
         status: &Arc<Mutex<GatewayStatusSnapshot>>,
         attempt: u32,
     ) -> Result<(Self, String), WorkerError> {
+        Self::open_inner(credentials, status, attempt, false, false).await
+    }
+
+    async fn open_replacement(
+        credentials: &SessionCredentials,
+        status: &Arc<Mutex<GatewayStatusSnapshot>>,
+        attempt: u32,
+        inherit_relay_cursor: bool,
+    ) -> Result<(Self, String), WorkerError> {
+        Self::open_inner(credentials, status, attempt, inherit_relay_cursor, true).await
+    }
+
+    async fn open_inner(
+        credentials: &SessionCredentials,
+        status: &Arc<Mutex<GatewayStatusSnapshot>>,
+        attempt: u32,
+        inherit_relay_cursor: bool,
+        defer_websocket_hello: bool,
+    ) -> Result<(Self, String), WorkerError> {
         #[cfg(feature = "voice")]
         if let Some(relay) = credentials.relay.as_ref() {
-            let (mut channel, challenge) = crate::companion_relay::RelayChannel::connect(
-                relay,
-                &credentials.token,
-                &credentials.app_id,
-                &credentials.plugin_id,
-                credentials.endpoint_authority.approved_thumbprints(),
-            )
-            .await?;
+            let approved = credentials.endpoint_authority.approved_thumbprints();
+            let (mut channel, challenge) = if inherit_relay_cursor {
+                crate::companion_relay::RelayChannel::connect_replacement(
+                    relay,
+                    &credentials.token,
+                    &credentials.app_id,
+                    &credentials.plugin_id,
+                    approved,
+                )
+                .await?
+            } else {
+                crate::companion_relay::RelayChannel::connect(
+                    relay,
+                    &credentials.token,
+                    &credentials.app_id,
+                    &credentials.plugin_id,
+                    approved,
+                )
+                .await?
+            };
             // The identical validation + signing the socket runs, so a relay
             // session proves the same endpoint identity from the same document.
             let (hello, session_nonce) = endpoint_hello(&challenge, credentials, unix_now()?)?;
@@ -5628,12 +6907,16 @@ impl GatewayTransport {
                 "[aokie-plugin][companion] stage=relay_unavailable transport=websocket detail=The hosted relay transport requires the voice build"
             );
         }
-        let (socket, session_nonce) = open_gateway_socket(credentials, status, attempt).await?;
+        #[cfg(not(feature = "voice"))]
+        let _ = inherit_relay_cursor;
+        let (socket, session_nonce, pending_hello) =
+            open_gateway_socket(credentials, status, attempt, defer_websocket_hello).await?;
         Ok((
             Self::WebSocket(WebSocketTransport {
                 socket,
                 next_ping: Instant::now() + PING_INTERVAL,
                 awaiting_pong: None,
+                pending_hello,
             }),
             session_nonce,
         ))
@@ -5754,20 +7037,27 @@ impl GatewayTransport {
         let _ = (device_id, party, authenticated_grants);
     }
 
-    /// Retire a relay party's greeting so the next frame it receives is again
-    /// preceded by this session's signed `plugin_hello`.
-    ///
-    /// The socket has no greeting book — the gateway delivered the hello to
-    /// each connection itself — so this is a no-op there and the WebSocket path
-    /// stays byte-identical.
-    fn forget_greeting(&mut self, party: &str) {
+    /// Clone-only input for a non-blocking relay greeting refresh.
+    #[cfg(feature = "voice")]
+    fn regreeting_request(&self) -> Option<crate::companion_relay::RelayGreetingRequest> {
         match self {
-            Self::WebSocket(_) => {}
-            #[cfg(feature = "voice")]
-            Self::Relay(channel) => channel.forget_greeting(party),
+            Self::WebSocket(_) => None,
+            Self::Relay(channel) => Some(channel.regreeting_request()),
         }
-        // `party` is unused on a non-voice build, where no relay exists.
-        let _ = party;
+    }
+
+    /// Install only into the relay channel that launched the refresh. An
+    /// admission rotation replaces that channel and makes late work a no-op.
+    #[cfg(feature = "voice")]
+    fn install_regreeting(&mut self, greeting: FreshRelayGreeting) -> bool {
+        match self {
+            Self::WebSocket(_) => false,
+            Self::Relay(channel) => channel.install_regreeting(
+                greeting.channel_id,
+                &greeting.party,
+                greeting.encoded_hello,
+            ),
+        }
     }
 
     /// Preserve carrier-level continuity across an admission rotation.
@@ -5776,11 +7066,56 @@ impl GatewayTransport {
     /// predecessor stays live during the overlap. The relay has no such
     /// middleman: its replacement must inherit the read cursor and the learned
     /// device routes, or it re-reads frames the session already handled.
-    fn adopt_routing_from(&mut self, previous: &mut Self) {
-        match (self, previous) {
+    fn admission_domain(&self) -> Result<AdmissionCarrierDomain, WorkerError> {
+        match self {
+            Self::WebSocket(_) => Ok(AdmissionCarrierDomain::WebSocket),
             #[cfg(feature = "voice")]
-            (Self::Relay(next), Self::Relay(previous)) => next.adopt_routing_from(previous),
-            _ => {}
+            Self::Relay(channel) => channel
+                .cursor_domain()
+                .map(AdmissionCarrierDomain::Relay)
+                .ok_or_else(|| {
+                    WorkerError::rebootstrap("Companion relay cursor domain is invalid")
+                }),
+        }
+    }
+
+    /// Commit a prepared replacement's identity proof. Relay hellos are
+    /// cached and naturally go out with the next addressed post. WebSocket
+    /// hellos fence the predecessor immediately, so they are deliberately
+    /// withheld until this call runs on the authority loop immediately before
+    /// the atomic transport swap.
+    async fn activate_replacement(&mut self) -> Result<(), WorkerError> {
+        match self {
+            Self::WebSocket(transport) => {
+                let Some(encoded) = transport.pending_hello.as_ref() else {
+                    return Ok(());
+                };
+                transport
+                    .socket
+                    .send(Message::Text(encoded.clone().into()))
+                    .await
+                    .map_err(safe_ws_error)?;
+                transport.pending_hello = None;
+                Ok(())
+            }
+            #[cfg(feature = "voice")]
+            Self::Relay(_) => Ok(()),
+        }
+    }
+
+    fn adopt_routing_from(&mut self, previous: &mut Self) -> bool {
+        #[cfg(feature = "voice")]
+        {
+            return match (self, previous) {
+                (Self::Relay(next), Self::Relay(previous)) => next.adopt_routing_from(previous),
+                (Self::WebSocket(_), Self::WebSocket(_)) => true,
+                _ => false,
+            };
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = (self, previous);
+            true
         }
     }
 
@@ -5845,7 +7180,8 @@ async fn open_gateway_socket(
     credentials: &SessionCredentials,
     status: &Arc<Mutex<GatewayStatusSnapshot>>,
     attempt: u32,
-) -> Result<(GatewaySocket, String), WorkerError> {
+    defer_hello: bool,
+) -> Result<(GatewaySocket, String, Option<String>), WorkerError> {
     let mut request = credentials
         .endpoint
         .as_str()
@@ -5886,9 +7222,17 @@ async fn open_gateway_socket(
         .map_err(|_| WorkerError::reconnect("Companion endpoint challenge is malformed"))?;
     let now = unix_now()?;
     let (hello, session_nonce) = endpoint_hello(&challenge, credentials, now)?;
-    send_json(&mut socket, &hello).await?;
-    set_status(status, GatewayConnectionPhase::Connected, attempt, None);
-    Ok((socket, session_nonce))
+    let pending_hello = if defer_hello {
+        Some(
+            serde_json::to_string(&hello)
+                .map_err(|_| WorkerError::reconnect("Companion frame could not be encoded"))?,
+        )
+    } else {
+        send_json(&mut socket, &hello).await?;
+        set_status(status, GatewayConnectionPhase::Connected, attempt, None);
+        None
+    };
+    Ok((socket, session_nonce, pending_hello))
 }
 
 /// Validate an endpoint challenge against local identity and sign the plugin
@@ -5900,6 +7244,23 @@ fn endpoint_hello(
     credentials: &SessionCredentials,
     now: u64,
 ) -> Result<(PluginHello, String), WorkerError> {
+    let session_nonce = format!("plugin_session_{}", uuid::Uuid::new_v4().simple());
+    let hello = endpoint_hello_for_session(challenge, credentials, now, &session_nonce)?;
+    Ok((hello, session_nonce))
+}
+
+/// Mint a fresh endpoint proof while retaining the logical plugin session.
+///
+/// Relay peers can re-introduce themselves long after the original hello's
+/// short proof expired. Re-greeting must bind a fresh relay challenge to the
+/// session nonce already carried by leases and RTC authentication; rotating
+/// that nonce would instead fence the live session we are trying to preserve.
+fn endpoint_hello_for_session(
+    challenge: &EndpointChallengeFrame,
+    credentials: &SessionCredentials,
+    now: u64,
+    session_nonce: &str,
+) -> Result<PluginHello, WorkerError> {
     challenge
         .validate(now)
         .map_err(|_| WorkerError::reconnect("Companion endpoint challenge is invalid"))?;
@@ -5917,7 +7278,6 @@ fn endpoint_hello(
             "Companion endpoint challenge does not match the local identity and approved roster",
         ));
     }
-    let session_nonce = format!("plugin_session_{}", uuid::Uuid::new_v4().simple());
     let proof_claims = HelloProofClaims {
         app_id: credentials.app_id.clone(),
         subject_id: credentials.plugin_id.clone(),
@@ -5925,7 +7285,7 @@ fn endpoint_hello(
         connection_id: challenge.connection_id.clone(),
         challenge_nonce: challenge.challenge_nonce.clone(),
         admission_jti: challenge.admission_jti.clone(),
-        session_nonce: session_nonce.clone(),
+        session_nonce: session_nonce.to_owned(),
         holder_key_thumbprint: authority.endpoint_key.thumbprint.clone(),
         expected_peer_key_thumbprint: None,
         approved_peer_key_thumbprints: authority.approved_thumbprints(),
@@ -5951,18 +7311,25 @@ fn endpoint_hello(
         schema_version: SCHEMA_VERSION,
         app_id: credentials.app_id.clone(),
         plugin_id: credentials.plugin_id.clone(),
-        session_nonce: session_nonce.clone(),
+        session_nonce: session_nonce.to_owned(),
         endpoint_proof: proof,
     };
     hello
         .validate()
         .map_err(|_| WorkerError::rebootstrap("Companion plugin hello is invalid"))?;
-    Ok((hello, session_nonce))
+    Ok(hello)
+}
+
+fn admission_rotation_times(now: Instant, lifetime: Duration) -> (Instant, Instant) {
+    let deadline = now + lifetime;
+    let overlap = lifetime.min(ADMISSION_ROTATION_OVERLAP);
+    let starts_at = deadline.checked_sub(overlap).unwrap_or(now);
+    (starts_at, deadline)
 }
 
 async fn run_socket(
     mut credentials: SessionCredentials,
-    host_rpc: &HostRpc,
+    host_rpc: &Arc<HostRpc>,
     radio: &RadioHandle,
     stop_rx: &mut watch::Receiver<bool>,
     status: &Arc<Mutex<GatewayStatusSnapshot>>,
@@ -5974,8 +7341,15 @@ async fn run_socket(
         .remote_media()
         .ok_or_else(|| WorkerError::reconnect("Companion media endpoint is unavailable"))?;
     let mut session = GatewaySession::new(&credentials, session_nonce);
-    let mut admission_deadline = Instant::now() + credentials.lifetime;
+    let (mut admission_refresh_at, mut admission_deadline) =
+        admission_rotation_times(Instant::now(), credentials.lifetime);
+    let mut admission_retry_at = admission_refresh_at;
+    let mut admission_generation = 0_u64;
+    let mut admission_rotation: Option<AdmissionRotationTask> = None;
+    let mut admission_rotation_error: Option<WorkerError> = None;
     let mut retiring_transport: Option<(GatewayTransport, Instant)> = None;
+    #[cfg(feature = "voice")]
+    let mut relay_greeting_tasks = RelayGreetingTasks::default();
 
     loop {
         if retiring_transport
@@ -5995,41 +7369,158 @@ async fn run_socket(
             }
             return Ok(());
         }
-        if Instant::now() >= admission_deadline {
-            set_status(
-                status,
-                GatewayConnectionPhase::AdmissionRefresh,
-                attempt,
-                None,
-            );
-            let refreshed = refresh_admission(
-                host_rpc,
-                Some(&credentials.app_id),
-                &credentials.plugin_id,
-                credentials.endpoint_authority.clone(),
-            )?;
-            let (replacement, replacement_nonce) =
-                GatewayTransport::open(&refreshed, status, attempt).await?;
-            session.rotate_credentials(&refreshed, replacement_nonce)?;
+        let rotation_result = match admission_rotation.as_mut() {
+            Some(rotation) => rotation.take_finished().await,
+            None => None,
+        };
+        if let Some(result) = rotation_result {
+            admission_rotation.take();
+            match result {
+                Ok(opened) if opened.generation == admission_generation => {
+                    let OpenedAdmissionRotation {
+                        credentials: refreshed,
+                        transport: mut replacement,
+                        plugin_session_nonce: replacement_nonce,
+                        preserve_continuity,
+                        ..
+                    } = opened;
 
-            // Keep the authenticated predecessor alive briefly while the
-            // gateway consumes the replacement hello. The gateway then sees a
-            // live same-authority rotation, preserves every current lease and
-            // fences the predecessor itself. Dropping the old socket first
-            // would make an otherwise healthy active call look like an outage.
-            let mut predecessor = std::mem::replace(&mut transport, replacement);
-            transport.adopt_routing_from(&mut predecessor);
-            retiring_transport = Some((predecessor, Instant::now() + Duration::from_secs(2)));
-            credentials = refreshed;
-            admission_deadline = Instant::now() + credentials.lifetime;
-            eprintln!(
-                "[aokie-plugin][companion] stage=admission_rotated continuity=preserved transport={} app={} plugin={} active_peers={}",
-                credentials.transport_label(),
-                credentials.app_id,
-                credentials.plugin_id,
-                session.peers.len()
-            );
-            continue;
+                    // A WebSocket plugin_hello fences the predecessor at the
+                    // gateway. Commit it only now, when this loop already owns
+                    // the finished replacement and will not read/write the old
+                    // socket again before swapping.
+                    replacement.activate_replacement().await?;
+                    session.apply_admission_rotation(
+                        &refreshed,
+                        replacement_nonce,
+                        preserve_continuity,
+                        media,
+                    )?;
+
+                    // Keep the authenticated predecessor alive briefly while
+                    // the gateway consumes the replacement hello. The
+                    // predecessor has continued reading and renewing leases
+                    // for the whole broker/open overlap; only this atomic swap
+                    // transfers its cursor and routes to the proven successor.
+                    let mut predecessor = std::mem::replace(&mut transport, replacement);
+                    if preserve_continuity && !transport.adopt_routing_from(&mut predecessor) {
+                        media.fail_closed_all("gateway_admission_continuity_mismatch");
+                        return Err(WorkerError::reconnect(
+                            "Companion replacement transport changed continuity domains",
+                        ));
+                    }
+                    retiring_transport.take();
+                    retiring_transport =
+                        Some((predecessor, Instant::now() + Duration::from_secs(2)));
+                    #[cfg(feature = "voice")]
+                    relay_greeting_tasks.abort_all();
+                    credentials = refreshed;
+                    admission_generation = admission_generation.saturating_add(1);
+                    let times = admission_rotation_times(Instant::now(), credentials.lifetime);
+                    admission_refresh_at = times.0;
+                    admission_deadline = times.1;
+                    admission_retry_at = admission_refresh_at;
+                    admission_rotation_error = None;
+                    eprintln!(
+                        "[aokie-plugin][companion] stage=admission_rotated continuity={} transport={} app={} plugin={} active_peers={}",
+                        if preserve_continuity { "preserved" } else { "reset" },
+                        credentials.transport_label(),
+                        credentials.app_id,
+                        credentials.plugin_id,
+                        session.peers.len()
+                    );
+                    continue;
+                }
+                Ok(opened) => {
+                    // A newer generation won before this completion was
+                    // observed. It owns no session state; close it and leave
+                    // the current carrier authoritative.
+                    opened.transport.close().await;
+                    admission_rotation_error = Some(WorkerError::reconnect(
+                        "A stale Companion admission replacement was discarded",
+                    ));
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[aokie-plugin][companion] stage=admission_rotation_deferred kind={} detail={}",
+                        error.kind.label(),
+                        sanitize_status_message(&error.message)
+                    );
+                    admission_rotation_error = Some(error);
+                }
+            }
+            admission_retry_at = Instant::now() + ADMISSION_ROTATION_RETRY_DELAY;
+        }
+
+        let now = Instant::now();
+        if now >= admission_deadline {
+            admission_rotation.take();
+            return Err(admission_rotation_error.take().unwrap_or_else(|| {
+                WorkerError::expired(
+                    "Companion admission could not rotate before its safe lifetime ended",
+                )
+            }));
+        }
+        if admission_rotation.is_none() && now >= admission_refresh_at && now >= admission_retry_at
+        {
+            let predecessor_domain = transport.admission_domain()?;
+            match AdmissionRotationTask::begin(
+                Arc::clone(host_rpc),
+                admission_generation,
+                &credentials,
+                Arc::clone(status),
+                attempt,
+                predecessor_domain,
+            ) {
+                Ok(rotation) => {
+                    admission_rotation = Some(rotation);
+                    eprintln!(
+                        "[aokie-plugin][companion] stage=admission_rotation_started continuity=overlap transport={} app={} plugin={}",
+                        credentials.transport_label(),
+                        credentials.app_id,
+                        credentials.plugin_id
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[aokie-plugin][companion] stage=admission_rotation_deferred kind={} detail={}",
+                        error.kind.label(),
+                        sanitize_status_message(&error.message)
+                    );
+                    admission_rotation_error = Some(error);
+                    admission_retry_at = now + ADMISSION_ROTATION_RETRY_DELAY;
+                }
+            }
+        }
+
+        #[cfg(feature = "voice")]
+        for completed in relay_greeting_tasks.take_finished().await {
+            match completed {
+                Ok(greeting) => {
+                    if greeting.plugin_session_nonce == session.plugin_session_nonce
+                        && transport.install_regreeting(greeting)
+                    {
+                        // State may already have been published while the HTTP
+                        // challenge was in flight. Re-arm it now so the next
+                        // publish is guaranteed to follow the fresh hello.
+                        session.rearm_authoritative_publication();
+                    } else {
+                        // A logical-session or channel rotation won the race.
+                        // Its own newly armed hello is authoritative; stale
+                        // work is a contained no-op.
+                    }
+                }
+                Err(error) => {
+                    // A fresh peer greeting is recoverable signalling. Never
+                    // turn a challenge outage into a live-call failback; a
+                    // later verified mobile hello will schedule another try.
+                    eprintln!(
+                        "[aokie-plugin][companion] stage=relay_regreet_deferred kind={} detail={}",
+                        error.kind.label(),
+                        sanitize_status_message(&error.message)
+                    );
+                }
+            }
         }
 
         // Which carrier is live decides two things the session cannot infer on
@@ -6121,11 +7612,22 @@ async fn run_socket(
         // Before anything else goes out: a Companion that just proved itself
         // may have lost the proof WE gave it (a restarted process keeps its
         // on-disk endpoint key, so it is the same party, but its memory of our
-        // hello is gone). Retire its greeting mark here, while the re-armed
-        // publish is still one loop turn away, so the state it is about to
-        // receive arrives behind a hello it can verify.
+        // hello is gone). Fetch a new challenge and replace the cached proof
+        // before retiring its greeting mark, while the re-armed publish is
+        // still one loop turn away, so the state it is about to receive arrives
+        // behind a CURRENT hello it can verify.
         if let Some(party) = session.take_relay_regreet_party() {
-            transport.forget_greeting(&party);
+            #[cfg(feature = "voice")]
+            if let Some(request) = transport.regreeting_request() {
+                relay_greeting_tasks.schedule(
+                    party,
+                    request,
+                    credentials.clone(),
+                    session.plugin_session_nonce.clone(),
+                );
+            }
+            #[cfg(not(feature = "voice"))]
+            let _ = party;
         }
         for encoded in outbound {
             let delivery = transport.send_text(&encoded).await?;
@@ -7224,13 +8726,7 @@ impl GatewaySession {
         // Assistance delivery is per current verified audience. A newly
         // admitted eligible device is owed the current projected snapshot and
         // then the still-pending request; both deliveries are idempotent.
-        self.authoritative_idle = false;
-        self.last_snapshot_fingerprint = None;
-        self.last_snapshot_sent = None;
-        self.relay_snapshot_event_id = None;
-        self.relay_snapshot_delivered_devices.clear();
-        self.last_assistance_request_sent = None;
-        self.next_snapshot_poll = Instant::now();
+        self.rearm_authoritative_publication();
 
         // Re-arming publication is only half of going live. The Companion
         // DROPS authoritative state from a peer that has not proved its
@@ -7242,10 +8738,11 @@ impl GatewaySession {
         // one of them, for the rest of this plugin session.
         //
         // A verified `mobile_hello` IS the signal that a Companion has started
-        // a session with us, so it retires that party's greeting mark. The
-        // party is derived from the thumbprint the signature just proved, never
-        // from the carrier's routing header or the frame's self-asserted
-        // `deviceId`.
+        // a session with us, so it asks the carrier to fetch a fresh challenge,
+        // re-sign this logical plugin session and retire that party's greeting
+        // mark. The party is derived from the thumbprint the signature just
+        // proved, never from the carrier's routing header or the frame's
+        // self-asserted `deviceId`.
         self.relay_regreet_party = Some(verified_party);
         eprintln!(
             "[aokie-plugin][companion] stage=relay_peer_hello device={} detail=An approved Companion joined this relay session and authoritative state was re-armed",
