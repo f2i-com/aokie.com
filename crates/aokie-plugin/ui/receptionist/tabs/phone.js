@@ -168,7 +168,10 @@
   }
 
   function ensureTimers() {
-    var wantFast = secondsLeft > 0 || !!confirmPrompt;
+    // root == null → the tab is unmounted: never (re)start the fast timer.
+    // An in-flight poll that completes AFTER unmount lands here — without
+    // the guard it would silently restart 2 s polling for an inactive tab.
+    var wantFast = root != null && (secondsLeft > 0 || !!confirmPrompt);
     if (wantFast && windowTimer == null) {
       windowTimer = window.setInterval(function () {
         if (!document.hidden) windowTick();
@@ -282,7 +285,11 @@
     HOST.command('phone.removePaired', { address: address })
       .then(
         function () {
-          return loadBonded();
+          // The roster refresh is best-effort: a transient failure must not
+          // reject through the busy-reset below (busy would stick forever).
+          return loadBonded().catch(function () {
+            /* the idle poll recovers the roster */
+          });
         },
         function (e) {
           error = errMsg(e);

@@ -118,6 +118,10 @@
     var consentP = HOST.consent.get().then(
       function (s) {
         status = s || null;
+        // A previous load's failure must not haunt a now-healthy status
+        // readout (accept-flow errors render while the wizard is open and
+        // accept() manages its own error slot before calling load()).
+        error = null;
         // Re-consent starts from what was previously granted.
         if (!scopesSeeded && s && s.grant && s.grant.scopes) {
           for (var i = 0; i < SCOPE_ROWS.length; i++) {
