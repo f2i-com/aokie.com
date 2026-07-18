@@ -1655,6 +1655,44 @@ fn emit_turn_full(
     );
 }
 
+/// Ordering guard for overlap back-dating: the estimated speech start of a
+/// caller turn seeded from overlap capture may never land at (or before) the
+/// speech-start stamp of the bot line it was spoken OVER — the transcript
+/// sorts by these stamps, and an estimate that overshoots flips the visible
+/// order. Live call 8576ba9e (2026-07-18): line noise during the carrier's
+/// answer transition tripped the capture threshold at the greeting's very
+/// first frames, pinning the caller's estimate to the answer instant - 6ms
+/// BEFORE the greeting's own stamp - so the transcript opened with the
+/// caller's line. The margin keeps the caller turn safely after the bot line
+/// even across the microseconds between the two stamp computations.
+#[cfg(feature = "voice")]
+const OVERLAP_ORDER_MARGIN_MS: u64 = 60;
+
+/// Clamped back-date for an overlap-seeded caller turn: at most
+/// `since_speech_start - margin` ago, so it always sorts AFTER the bot line
+/// it interrupted. Pure math half, unit-tested.
+#[cfg(feature = "voice")]
+fn overlap_backdate_ms(captured_ms: u64, since_speech_start_ms: u64) -> u64 {
+    captured_ms.min(since_speech_start_ms.saturating_sub(OVERLAP_ORDER_MARGIN_MS))
+}
+
+/// Format an overlap turn's back-dated `at` from the captured sample count,
+/// clamped against the elapsed time since the interrupted line began speaking.
+/// NOT used for the outbound pre-line hello (the callee's pickup genuinely
+/// precedes the agent's opening line — sorting it first is correct there).
+#[cfg(feature = "voice")]
+fn overlap_backdate(
+    captured_samples: usize,
+    sr_hz: usize,
+    since_speech_start: Duration,
+) -> String {
+    let captured_ms = (captured_samples * 1000 / sr_hz.max(1)) as u64;
+    aokie_core::events::iso8601_ago_ms(overlap_backdate_ms(
+        captured_ms,
+        since_speech_start.as_millis() as u64,
+    ))
+}
+
 /// Emit the buffered `call.incoming` NOW if it hasn't gone out yet (audit
 /// AOK-LIF-001). The incoming event is normally held briefly for caller-ID
 /// enrichment; every other call-scoped event (ringing/answered/audio/ended)
@@ -3286,7 +3324,7 @@ fn speak_manager_line(
         return;
     }
     let t0 = Instant::now();
-    let out = tts_speak(bt, synth, line, sr, None, None, None, 1.0, None, None);
+    let out = tts_speak(bt, synth, line, sr, None, None, None, 1.0, None, None, None);
     note_tts_outcome(status, &out);
     if out.dur > Duration::ZERO {
         emit_turn_with_delivery(
@@ -3949,6 +3987,42 @@ fn connect_agent_client(
 #[cfg(feature = "voice")]
 const GREETING_PERSONALIZE_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Post-answer SETTLE before the greeting's first AUDIO frame reaches the
+/// SCO. The channel is often already up at answer (this Pixel opens it during
+/// RINGING for the in-band ringtone), but the carrier's answer transition
+/// (ringback -> voice path, roughly 0.5-1s on VoLTE) is still routing — a
+/// greeting audible the instant of ATA loses its first words and the caller
+/// hears it mid-sentence (live call 8576ba9e 2026-07-18). Applied as an
+/// audio EGRESS gate inside the speak path, never as a pre-speak hold: the
+/// greeting occupies the floor from the first loop pass after answer (caller
+/// speech in the window rides overlap capture), synthesis runs during the
+/// gate, and the gate is anchored at the greet clock's start — perceived
+/// delay is max(settle, synth/overlay time), never the sum. ⚠️ A pre-speak
+/// hold variant shipped briefly and let the caller's pickup word become a
+/// replied-to first turn that CANCELLED the personalized greeting (live call
+/// e77457c6 2026-07-18) — do not reintroduce it.
+#[cfg(feature = "voice")]
+const GREETING_ANSWER_SETTLE_DEFAULT_MS: u64 = 700;
+
+/// Env override AOKIE_GREETING_SETTLE_MS: 0 disables, capped at 3000 (a
+/// misconfigured huge value must never add seconds of post-answer dead air).
+/// Unset / unparsable = the default. Pure for tests.
+#[cfg(feature = "voice")]
+fn parse_greeting_settle_ms(v: Option<&str>) -> u64 {
+    match v.and_then(|s| s.trim().parse::<u64>().ok()) {
+        Some(n) => n.min(3000),
+        None => GREETING_ANSWER_SETTLE_DEFAULT_MS,
+    }
+}
+
+#[cfg(feature = "voice")]
+fn greeting_answer_settle() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| {
+        parse_greeting_settle_ms(std::env::var("AOKIE_GREETING_SETTLE_MS").ok().as_deref())
+    }))
+}
+
 /// §9.3: should the greeting WAIT for the personalization overlay? Only when
 /// the caller id is KNOWN (the flow that pushes the overlay triggers on the
 /// caller-id event — no id, no push coming) and the overlay hasn't arrived,
@@ -4308,6 +4382,15 @@ fn tts_speak(
     rate: f32,
     finish_extra: Option<std::time::Duration>,
     mut probe: Option<&mut SttProbeLane<'_>>,
+    // Post-answer settle (greeting only): hold SCO EGRESS until this instant.
+    // Synthesis, mic capture, the probe lane and urgent controls all keep
+    // running — the caller's early words become overlap capture that seeds
+    // their first turn AFTER the speech, instead of a normal turn whose
+    // agent reply cancels the greeting (live call e77457c6 2026-07-18: an
+    // arm-level settle hold left the line "listening", the caller's pickup
+    // "Yeah." got a full reply, and the already-conversed guard skipped the
+    // personalized greeting entirely).
+    egress_hold: Option<std::time::Instant>,
 ) -> SpeakOutcome {
     use std::time::Duration;
     let none = SpeakOutcome {
@@ -4406,8 +4489,11 @@ fn tts_speak(
                 Err(_) => break,
             }
         }
-        // Top up the SCO TX queue, bounded to the playout lead.
+        // Top up the SCO TX queue, bounded to the playout lead. The egress
+        // hold gates ONLY this send path — everything else in the loop
+        // (synthesis collection, mic drain, probe lane, controls) runs on.
         while !pending.is_empty()
+            && egress_hold.is_none_or(|g| now >= g)
             && may_queue_more(
                 playback.first,
                 playback.samples,
@@ -4654,6 +4740,7 @@ fn speak_announcement(
         Some(&mut probe),
         pace,
         protected_max_ms,
+        None,
         None,
     );
     probe.action.take()
@@ -4995,6 +5082,9 @@ fn speak_planned(
     pace: &crate::speech_plan::PaceState,
     protected_max_ms: u32,
     mut probe: Option<&mut SttProbeLane<'_>>,
+    // Forwarded to every span's tts_speak: only the first span can actually
+    // wait (later spans start after the gate has long passed). See tts_speak.
+    egress_hold: Option<std::time::Instant>,
 ) -> PlannedSpeech {
     use std::time::Duration;
     let spans = crate::speech_plan::plan_spans(raw_text, pace, protected_max_ms);
@@ -5027,6 +5117,7 @@ fn speak_planned(
             span.rate,
             finish_extra,
             probe.as_deref_mut(),
+            egress_hold,
         );
         outcome.dur += out.dur;
         if out.dur > Duration::ZERO {
@@ -8697,6 +8788,16 @@ fn run_loop(
                                 .as_ref()
                                 .is_some_and(|o| o.call_id == s.id);
                             let started = *greet_hold_started.get_or_insert_with(Instant::now);
+                            // ⚠️ The post-answer SETTLE is deliberately NOT a
+                            // hold here: an arm-level hold leaves the line in
+                            // "listening" state, so the caller's pickup word
+                            // during the silence becomes a normal first turn,
+                            // the agent replies to it, and the already-conversed
+                            // guard above then SKIPS the personalized greeting
+                            // (live call e77457c6 2026-07-18). The settle rides
+                            // the speak call as an audio EGRESS gate instead —
+                            // the greeting takes the floor immediately and the
+                            // caller's early words ride overlap capture.
                             // rejectPrivate needs to KNOW the id is absent, not
                             // merely late: this phone's CLCC id lands ~100ms
                             // post-answer, so give it a bounded window before
@@ -8737,16 +8838,26 @@ fn run_loop(
                             };
                             #[cfg(not(feature = "voice"))]
                             let screened: Option<&'static str> = None;
-                            Some((s.id.clone(), sr, screened))
+                            // Post-answer settle → audio EGRESS gate: the
+                            // greeting (or screen message) starts synthesizing
+                            // and holding the floor NOW, but its first frame
+                            // reaches the SCO only once the carrier's answer
+                            // transition has settled.
+                            #[cfg(feature = "voice")]
+                            let egress_gate =
+                                greet_hold_started.map(|t| t + greeting_answer_settle());
+                            #[cfg(not(feature = "voice"))]
+                            let egress_gate: Option<std::time::Instant> = None;
+                            Some((s.id.clone(), sr, screened, egress_gate))
                         }
                     }
                 }
                 _ => None,
             }
         };
-        if let Some((corr, sr, screened)) = greet_now {
+        if let Some((corr, sr, screened, egress_gate)) = greet_now {
             #[cfg(not(feature = "voice"))]
-            let _ = (&corr, sr, screened);
+            let _ = (&corr, sr, screened, egress_gate);
             #[cfg(feature = "voice")]
             if let Some(reason) = screened {
                 // Screened call (spec Phase 0): no greeting, no agent — the
@@ -8775,6 +8886,7 @@ fn run_loop(
                         &ctx.pace,
                         protected_max_ms,
                         None,
+                        egress_gate,
                     );
                 } else {
                     // A blank message hangs up SILENTLY — but an AT+CHUP fired
@@ -8868,6 +8980,7 @@ fn run_loop(
                         &ctx.pace,
                         protected_max_ms,
                         lane_ref,
+                        egress_gate,
                     );
                     let out = planned.outcome;
                     if !planned.text.trim().is_empty() {
@@ -8919,8 +9032,10 @@ fn run_loop(
                         stt_buf = crate::voice::to_f32_16k(&out.captured_speech, sr as u32);
                         stt_had_speech = true;
                         turn_overlapped = true;
-                        turn_overlap_at = Some(aokie_core::events::iso8601_ago_ms(
-                            (out.captured_speech.len() * 1000 / (sr as usize).max(1)) as u64,
+                        turn_overlap_at = Some(overlap_backdate(
+                            out.captured_speech.len(),
+                            sr as usize,
+                            speak_started.elapsed(),
                         ));
                     }
                     if !pre_line.is_empty() {
@@ -9080,6 +9195,7 @@ fn run_loop(
                         Some(&mut probe),
                         &ctx.pace,
                         protected_max_ms,
+                        None,
                         None,
                     );
                     if let Some(action) = probe.action.take() {
@@ -10046,6 +10162,7 @@ fn run_loop(
                                         ctx.pace.base(),
                                         None,
                                         None,
+                                        None,
                                     );
                                     note_tts_outcome(&status, &out);
                                     if !barge_in {
@@ -10066,10 +10183,10 @@ fn run_loop(
                                         stt_had_speech = true;
                                         stt_silence = Duration::ZERO;
                                         turn_overlapped = true;
-                                        turn_overlap_at = Some(aokie_core::events::iso8601_ago_ms(
-                                            (out.captured_speech.len() * 1000
-                                                / (sr as usize).max(1))
-                                                as u64,
+                                        turn_overlap_at = Some(overlap_backdate(
+                                            out.captured_speech.len(),
+                                            sr as usize,
+                                            ack_started.elapsed(),
                                         ));
                                     }
                                     if out.dur > Duration::ZERO {
@@ -10156,6 +10273,7 @@ fn run_loop(
                                             &replay_pace,
                                             protected_max_ms,
                                             lane_ref,
+                                            None,
                                         );
                                         let out = planned.outcome;
                                         note_tts_outcome(&status, &out);
@@ -10179,12 +10297,11 @@ fn run_loop(
                                             stt_had_speech = true;
                                             stt_silence = Duration::ZERO;
                                             turn_overlapped = true;
-                                            turn_overlap_at =
-                                                Some(aokie_core::events::iso8601_ago_ms(
-                                                    (out.captured_speech.len() * 1000
-                                                        / (sr as usize).max(1))
-                                                        as u64,
-                                                ));
+                                            turn_overlap_at = Some(overlap_backdate(
+                                                out.captured_speech.len(),
+                                                sr as usize,
+                                                replay_started.elapsed(),
+                                            ));
                                         }
                                         if out.dur > Duration::ZERO
                                             && !planned.played_text.is_empty()
@@ -10762,6 +10879,7 @@ fn run_loop(
                                                 &ctx.pace,
                                                 protected_max_ms,
                                                 lane_ref,
+                                                None,
                                             );
                                             let out = planned.outcome;
                                             // A spoken floor command mid-sentence pauses the
@@ -11272,9 +11390,10 @@ fn run_loop(
                                     stt_had_speech = true;
                                     stt_silence = Duration::ZERO;
                                     turn_overlapped = true;
-                                    turn_overlap_at = Some(aokie_core::events::iso8601_ago_ms(
-                                        (overlap_capture.len() * 1000 / (sr as usize).max(1))
-                                            as u64,
+                                    turn_overlap_at = Some(overlap_backdate(
+                                        overlap_capture.len(),
+                                        sr as usize,
+                                        t0.elapsed(),
                                     ));
                                 }
                                 // ── Phase 3: MANAGER CHANGE REQUEST ─────────
@@ -11451,6 +11570,7 @@ fn run_loop(
                                     let out = tts_speak(
                                         bt, &synth, ABUSE_LINE, sr, None, None, None, 1.0, None,
                                         None,
+                                        None,
                                     );
                                     note_tts_outcome(&status, &out);
                                     if out.dur > Duration::ZERO {
@@ -11563,6 +11683,7 @@ fn run_loop(
                                         None,
                                         None,
                                         1.0,
+                                        None,
                                         None,
                                         None,
                                     );
@@ -11825,6 +11946,7 @@ fn run_loop(
                                             &ctx.pace,
                                             protected_max_ms,
                                             None,
+                                            None,
                                         );
                                         if let Some(action) = probe.action.take() {
                                             perform_cancel_action(
@@ -11951,6 +12073,7 @@ fn run_loop(
                                             &ctx.pace,
                                             protected_max_ms,
                                             None,
+                                            None,
                                         );
                                         if let Some(action) = fprobe.action.take() {
                                             perform_cancel_action(
@@ -12014,6 +12137,7 @@ fn run_loop(
                                                 Some(&mut sprobe),
                                                 &ctx.pace,
                                                 protected_max_ms,
+                                                None,
                                                 None,
                                             );
                                             if let Some(action) = sprobe.action.take() {
@@ -12079,6 +12203,7 @@ fn run_loop(
                                         Some(&mut hprobe),
                                         &ctx.pace,
                                         protected_max_ms,
+                                        None,
                                         None,
                                     );
                                     if let Some(action) = hprobe.action.take() {
@@ -12161,6 +12286,7 @@ fn run_loop(
                             ctx.pace.base(),
                             None,
                             None,
+                            None,
                         );
                         note_tts_outcome(&status, &out);
                         if barge_in {
@@ -12178,9 +12304,10 @@ fn run_loop(
                                 stt_had_speech = true;
                                 stt_silence = Duration::ZERO;
                                 turn_overlapped = true;
-                                turn_overlap_at = Some(aokie_core::events::iso8601_ago_ms(
-                                    (out.captured_speech.len() * 1000 / (sr as usize).max(1))
-                                        as u64,
+                                turn_overlap_at = Some(overlap_backdate(
+                                    out.captured_speech.len(),
+                                    sr as usize,
+                                    check_started.elapsed(),
                                 ));
                             }
                         } else {
@@ -12236,6 +12363,7 @@ fn run_loop(
                             None,
                             Some(&mut probe),
                             ctx.pace.base(),
+                            None,
                             None,
                             None,
                         );
@@ -12756,6 +12884,7 @@ fn run_loop(
                             Some(&mut probe),
                             &ctx.pace,
                             protected_max_ms,
+                            None,
                             None,
                         );
                         let out = planned.outcome;
@@ -14357,6 +14486,35 @@ mod tests {
         assert!(!looks_like_bare_pin("1234", 0));
         // A plain sentence with no digits never matches.
         assert!(!looks_like_bare_pin("what appointments are booked", 4));
+    }
+
+    /// Live call 8576ba9e (2026-07-18): an overlap estimate that overshoots
+    /// to (or past) the interrupted bot line's own speech start flips the
+    /// visible transcript order — the clamp keeps the caller turn strictly
+    /// after the line it was spoken over.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn overlap_backdate_never_reaches_the_interrupted_lines_start() {
+        // Estimate overshoots the whole playback window: clamped to margin.
+        assert_eq!(overlap_backdate_ms(5000, 5000), 5000 - OVERLAP_ORDER_MARGIN_MS);
+        // Estimate deeper than the window (pre-roll/noise pollution): clamped.
+        assert_eq!(overlap_backdate_ms(9000, 4000), 4000 - OVERLAP_ORDER_MARGIN_MS);
+        // A genuine mid-line interruption keeps its honest estimate.
+        assert_eq!(overlap_backdate_ms(1200, 5000), 1200);
+        // Degenerate tiny window never underflows.
+        assert_eq!(overlap_backdate_ms(500, 30), 0);
+    }
+
+    /// AOKIE_GREETING_SETTLE_MS parse: default 700, 0 disables, capped 3000.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn greeting_settle_env_parses_with_default_and_cap() {
+        assert_eq!(parse_greeting_settle_ms(None), 700);
+        assert_eq!(parse_greeting_settle_ms(Some("garbage")), 700);
+        assert_eq!(parse_greeting_settle_ms(Some("")), 700);
+        assert_eq!(parse_greeting_settle_ms(Some("0")), 0);
+        assert_eq!(parse_greeting_settle_ms(Some(" 500 ")), 500);
+        assert_eq!(parse_greeting_settle_ms(Some("99999")), 3000);
     }
 
     #[cfg(feature = "voice")]
