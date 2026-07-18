@@ -1,0 +1,385 @@
+/*
+ * Consent tab — CONSENT-001, the consent status + wizard FormLogic Desktop
+ * owns, ported faithfully from desktop/src/aokie/ConsentWizard.tsx
+ * (ConsentSection + ConsentWizard; SCOPE_ROWS copy verbatim).
+ *
+ * Before the Aokie receptionist touches a phone line, the OPERATOR must
+ * accept a versioned, scoped grant covering exactly what the system will
+ * access and where that data can be sent. Accepting issues a grant SIGNED by
+ * this Desktop's per-install key (PluginHost.consent.issue) and flips
+ * enforcement on (`settings.set consentMode='enforce'`), so a denied scope
+ * is refused at the point of capture, not just hidden in the UI.
+ *
+ * Sandbox deltas: the wizard renders INLINE (no modal overlay in the tab),
+ * and the privacy-disclosure link renders as plain text (the sandboxed
+ * iframe cannot open external pages). The compiled surface offers no revoke
+ * button — re-consent via the wizard is the only path, ported as-is.
+ */
+(function () {
+  'use strict';
+
+  var HOST = window.PluginHost;
+  var TABS = window.__aokieTabs;
+  if (!HOST || !TABS) return;
+  var U = TABS.util;
+  var esc = U.esc;
+  var errMsg = U.errMsg;
+  var ICONS = U.icons;
+
+  // ---- SCOPE_ROWS — copy VERBATIM from ConsentWizard.tsx ------------------
+
+  var SCOPE_ROWS = [
+    {
+      key: 'bluetooth',
+      label: 'Bluetooth phone link',
+      detail:
+        'Pair with your phone and handle calls through the Aokie dongle. Required for every phone feature — deny it and the receptionist stays offline.',
+      defaultOn: true,
+    },
+    {
+      key: 'transcription',
+      label: 'Live call transcription',
+      detail:
+        "Caller audio is transcribed so the receptionist can understand and reply. Deny it and NO audio reaches any speech engine — calls can still ring, but the AI can't converse.",
+      defaultOn: true,
+    },
+    {
+      key: 'sms',
+      label: 'SMS (read + send)',
+      detail:
+        'Read message threads and send replies/confirmations through your phone (MAP profile).',
+      defaultOn: true,
+    },
+    {
+      key: 'contacts',
+      label: 'Contacts (caller names)',
+      detail: 'Look up the caller in your phone book (PBAP) so records show a name, not a number.',
+      defaultOn: true,
+    },
+    {
+      key: 'recording',
+      label: 'Call audio recording',
+      detail:
+        'Store raw call audio. Not currently used by any feature — leave off unless a future feature asks for it.',
+      defaultOn: false,
+    },
+    {
+      key: 'remoteCaptions',
+      label: 'Companion live captions',
+      detail:
+        'Send permission-filtered live caption text to authorised Companion users through the selected FormLogic or custom signalling server.',
+      defaultOn: false,
+    },
+    {
+      key: 'remoteAssistance',
+      label: 'Companion private assistance',
+      detail:
+        'Let Aokie ask an authorised team member one bounded question and accept one typed answer. Full transcripts and arbitrary recipient selection are not included.',
+      defaultOn: false,
+    },
+    {
+      key: 'remoteMonitoring',
+      label: 'Companion listen-only audio',
+      detail:
+        'Bridge caller audio over endpoint-encrypted WebRTC to authorised observers. Their microphones are not requested and cannot publish to the caller path.',
+      defaultOn: false,
+    },
+    {
+      key: 'remoteConsult',
+      label: 'Companion private voice consultation',
+      detail:
+        'Place the caller on software hold and open an isolated Aokie-to-operator voice lane. Caller audio cannot enter the consult and consult audio cannot reach the caller.',
+      defaultOn: false,
+    },
+    {
+      key: 'remoteTakeover',
+      label: 'Companion call takeover',
+      detail:
+        "Let one authorised Companion user speak to the caller through Aokie's encrypted media bridge using the Companion device's microphone and speakers. Desktop and the Aokie plugin relay the audio; they do not pair local audio hardware. This is not a carrier transfer.",
+      defaultOn: false,
+    },
+  ];
+
+  // ---- state --------------------------------------------------------------
+
+  var root = null;
+  var status = undefined; // consent.get result: undefined loading, null failed
+  var settingsBag = {}; // live settings (endpoints become the destination list)
+  var scopes = {};
+  var scopesSeeded = false;
+  var retentionDays = 90;
+  var wizardOpen = false;
+  var submitting = false;
+  var error = null;
+
+  for (var i = 0; i < SCOPE_ROWS.length; i++) scopes[SCOPE_ROWS[i].key] = SCOPE_ROWS[i].defaultOn;
+
+  function load() {
+    var consentP = HOST.consent.get().then(
+      function (s) {
+        status = s || null;
+        // Re-consent starts from what was previously granted.
+        if (!scopesSeeded && s && s.grant && s.grant.scopes) {
+          for (var i = 0; i < SCOPE_ROWS.length; i++) {
+            var key = SCOPE_ROWS[i].key;
+            if (typeof s.grant.scopes[key] === 'boolean') scopes[key] = s.grant.scopes[key];
+          }
+          scopesSeeded = true;
+        }
+      },
+      function (e) {
+        if (status === undefined) status = null;
+        error = errMsg(e);
+      }
+    );
+    // The settings bag feeds the "where call data goes" destination list —
+    // best-effort (the wizard degrades to the local-processing paragraph).
+    var settingsP = HOST.command('settings.get').then(
+      function (data) {
+        settingsBag = (data && data.settings) || {};
+      },
+      function () {
+        settingsBag = {};
+      }
+    );
+    return Promise.all([consentP, settingsP]).then(render);
+  }
+
+  /** The remote destinations this configuration would send data to. Shown
+   *  verbatim; accepted verbatim. */
+  function uniqueDestinations() {
+    var keys = ['aiEndpoint', 'sttEndpoint', 'ttsEndpoint'];
+    var out = [];
+    for (var i = 0; i < keys.length; i++) {
+      var v = typeof settingsBag[keys[i]] === 'string' ? settingsBag[keys[i]].trim() : '';
+      if (v.length > 0 && out.indexOf(v) === -1) out.push(v);
+    }
+    return out;
+  }
+
+  function accept() {
+    if (submitting) return;
+    submitting = true;
+    error = null;
+    render();
+    var grantScopes = {
+      bluetooth: !!scopes.bluetooth,
+      contacts: !!scopes.contacts,
+      sms: !!scopes.sms,
+      transcription: !!scopes.transcription,
+      recording: !!scopes.recording,
+      remoteCaptions: !!scopes.remoteCaptions,
+      remoteAssistance: !!scopes.remoteAssistance,
+      remoteMonitoring: !!scopes.remoteMonitoring,
+      remoteConsult: !!scopes.remoteConsult,
+      remoteTakeover: !!scopes.remoteTakeover,
+      retentionDays: retentionDays,
+      destinations: uniqueDestinations(),
+    };
+    HOST.consent
+      .issue({
+        version: (status && status.requiredVersion) || 1,
+        scopes: grantScopes,
+        expiresDays: 365,
+      })
+      .then(function () {
+        // Production posture from here on: enforcement, not warnings.
+        return HOST.command('settings.set', { consentMode: 'enforce' });
+      })
+      .then(
+        function () {
+          HOST.toast(
+            'success',
+            'Consent recorded — enforcement is on; denied scopes are refused at the point of capture.'
+          );
+          wizardOpen = false;
+          submitting = false;
+          return load();
+        },
+        function (e) {
+          error = errMsg(e);
+          submitting = false;
+          render();
+        }
+      );
+  }
+
+  // ---- rendering ----------------------------------------------------------
+
+  function statusCardHtml() {
+    if (status === undefined) return '<p class="rcp-loading">Loading…</p>';
+    if (status === null) {
+      return (
+        '<p class="rcp-error">' +
+        esc(error || 'consent.get failed — is the plugin running?') +
+        '</p>'
+      );
+    }
+    var grant = status.grant || null;
+    var enforced = status.mode === 'enforce';
+    var needsAction =
+      !grant || grant.version !== status.requiredVersion || !enforced || !!status.note;
+
+    var badge;
+    if (grant && enforced && !needsAction) {
+      badge =
+        '<span class="rcp-badge is-ok" title="' +
+        esc('Accepted ' + (grant.acceptedAt || '') + ' by ' + (grant.acceptedBy || 'operator') + ' · expires ' + (grant.expiresAt || '—')) +
+        '">Consent v' + esc(grant.version) + ' · enforced</span>';
+    } else {
+      badge =
+        '<span class="rcp-badge is-pending" title="' +
+        esc(status.note || status.blocked || 'Consent has not been recorded on this device.') +
+        '">' +
+        (status.blocked
+          ? 'Consent required — phone offline'
+          : grant
+            ? 'Consent needs review'
+            : 'Consent not recorded') +
+        '</span>';
+    }
+    var warnHint =
+      status.mode === 'warn'
+        ? '<p class="rcp-hint">warn mode (developer override) — sensitive processing runs with consent unrecorded</p>'
+        : '';
+    return (
+      '<div class="rcp-card__body">' +
+      '<div class="rcp-actions" style="margin-top: 0; justify-content: space-between;">' +
+      '<span>' + badge + '</span>' +
+      '<button type="button" class="rcp-button' + (grant ? '' : ' is-primary') + '" data-act="cns-toggle">' +
+      (wizardOpen ? 'Hide' : grant ? 'Review consent' : 'Set up consent') +
+      '</button>' +
+      '</div>' +
+      warnHint +
+      '</div>'
+    );
+  }
+
+  function wizardHtml() {
+    if (!wizardOpen) return '';
+    var dests = uniqueDestinations();
+    var scopeRows = [];
+    for (var i = 0; i < SCOPE_ROWS.length; i++) {
+      var row = SCOPE_ROWS[i];
+      scopeRows.push(
+        '<label class="rcp-scope-row">' +
+          '<input type="checkbox" data-scope="' + row.key + '"' + (scopes[row.key] ? ' checked' : '') + ' />' +
+          '<span><strong>' + esc(row.label) + '</strong>' +
+          '<span class="rcp-scope-detail">' + esc(row.detail) + '</span></span>' +
+          '</label>'
+      );
+    }
+    var destBlock;
+    if (dests.length === 0) {
+      destBlock =
+        '<p class="rcp-hint">All speech-processing endpoints are local to this machine. If a Companion scope is ' +
+        'enabled, authorised state, captions or endpoint-encrypted WebRTC media can still travel through the ' +
+        'selected FormLogic or custom deployment. The signalling server never receives unencrypted call audio; ' +
+        "TURN can only relay encrypted packets. Linked FormLogic records follow each form's own retention settings.</p>";
+    } else {
+      var items = [];
+      for (var d = 0; d < dests.length; d++) {
+        items.push('<li><code>' + esc(dests[d]) + '</code></li>');
+      }
+      destBlock =
+        '<p class="rcp-hint">These configured endpoints will receive call data (transcripts/audio for processing). ' +
+        'Changing them later to somewhere new requires re-consent:</p>' +
+        '<ul class="rcp-dest-list">' + items.join('') + '</ul>';
+    }
+    return (
+      '<section class="rcp-card">' +
+      '<div class="rcp-card__heading">' +
+      '<div class="rcp-card__heading-copy">' +
+      '<small>ACCESS &amp; CONSENT</small>' +
+      '<h3>Phone receptionist — access &amp; consent</h3>' +
+      '</div>' +
+      '</div>' +
+      '<div class="rcp-card__body">' +
+      '<p class="rcp-hint" style="margin-top: 0;">Version ' + esc((status && status.requiredVersion) || 1) +
+      " · grants expire after 12 months · signed by this computer, so it can't be copied to another install. " +
+      'Privacy &amp; data-handling disclosure: <code>formlogic.com/privacy</code></p>' +
+      '<div style="margin-top: 8px;">' + scopeRows.join('') + '</div>' +
+      '<div style="margin-top: 12px;">' +
+      '<strong style="font-size: 11px;">Where call data goes</strong>' +
+      destBlock +
+      '</div>' +
+      '<label class="rcp-field" style="max-width: 260px;"><span>Record retention (days)</span>' +
+      '<input type="number" id="cns-retention" min="1" max="3650" value="' + esc(retentionDays) + '" /></label>' +
+      '<div class="rcp-callout is-warn" style="margin-top: 12px;">' + ICONS.alert +
+      '<span><strong>Your callers, your responsibility:</strong> laws on call recording, transcription and AI ' +
+      "disclosure differ by jurisdiction. Many require you to TELL callers they're speaking with an AI and/or " +
+      'being transcribed — put it in your greeting. Confirm your local requirements before going live.</span></div>' +
+      (error ? '<p class="rcp-error" style="padding: 10px 0 0;">' + esc(error) + '</p>' : '') +
+      '<div class="rcp-actions">' +
+      '<button type="button" class="rcp-button" data-act="cns-close"' + (submitting ? ' disabled' : '') + '>Not now</button>' +
+      '<button type="button" class="rcp-button is-primary" data-act="cns-accept"' + (submitting ? ' disabled' : '') + '>' +
+      (submitting ? 'Recording…' : 'Accept & enforce') +
+      '</button>' +
+      '</div>' +
+      '</div>' +
+      '</section>'
+    );
+  }
+
+  function render() {
+    if (!root) return;
+    root.innerHTML =
+      '<section class="rcp-card">' +
+      '<div class="rcp-card__heading">' +
+      '<div class="rcp-card__heading-copy">' +
+      '<small>CONSENT</small>' +
+      '<h3>Operator consent &amp; enforcement</h3>' +
+      '</div>' +
+      '</div>' +
+      statusCardHtml() +
+      (!wizardOpen && status !== undefined && status !== null && error
+        ? '<p class="rcp-error">' + esc(error) + '</p>'
+        : '') +
+      '</section>' +
+      wizardHtml();
+  }
+
+  // ---- wiring -------------------------------------------------------------
+
+  function wire(el) {
+    if (el.__aokieConsentWired) return;
+    el.__aokieConsentWired = true;
+    el.addEventListener('click', function (e) {
+      var btn = e.target && e.target.closest ? e.target.closest('[data-act]') : null;
+      if (!btn || btn.disabled) return;
+      var act = btn.getAttribute('data-act');
+      if (act === 'cns-toggle') {
+        wizardOpen = !wizardOpen;
+        error = null;
+        render();
+      } else if (act === 'cns-close') {
+        wizardOpen = false;
+        render();
+      } else if (act === 'cns-accept') accept();
+    });
+    el.addEventListener('change', function (e) {
+      var t = e.target;
+      if (!t || !t.getAttribute) return;
+      var scope = t.getAttribute('data-scope');
+      if (scope != null) {
+        scopes[scope] = !!t.checked;
+        return;
+      }
+      if (t.id === 'cns-retention') {
+        retentionDays = Math.max(1, Number(t.value) || 90);
+      }
+    });
+  }
+
+  TABS.register('consent', {
+    mount: function (el) {
+      root = el;
+      wire(el);
+      render();
+      load();
+    },
+    unmount: function () {
+      root = null;
+    },
+  });
+})();
