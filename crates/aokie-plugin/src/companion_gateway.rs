@@ -1455,6 +1455,13 @@ enum RelayReplayResult {
     Rejected {
         encoded: String,
     },
+    /// A native RTC failure both rejects the provoking signal and revokes the
+    /// exact lease. Relay egress posts these frames separately, so retries must
+    /// reproduce both byte-for-byte without executing the teardown twice.
+    TerminalRtcFailure {
+        revocation: String,
+        rejection: String,
+    },
     RtcAccepted {
         mode: LeaseMode,
     },
@@ -1479,8 +1486,36 @@ struct RelayReplay {
     seen_at: Instant,
 }
 
+/// One exact terminal lease notice still owed to a relay Companion.
+///
+/// The lease has already been retired locally; this is delivery bookkeeping
+/// only and must never execute that teardown again.  `encoded` is retained
+/// byte-for-byte because the mobile's completed-revocation tombstone makes an
+/// exact duplicate safe, while synthesising a later notice could change the
+/// JTI/fence that proves which authority ended.
+struct PendingRelayRevocation {
+    encoded: String,
+    device_id: String,
+    registered_at: Instant,
+    next_attempt_at: Instant,
+    expires_at: Instant,
+}
+
 /// Relay peers remembered per session. One owner rarely approves more.
 const MAX_RELAY_PEERS: usize = 16;
+/// Terminal notices may briefly outlive the leases/peers they retire. Keep
+/// enough room for every admitted peer plus overlap, but never let a broken
+/// relay grow an unbounded egress ledger.
+const MAX_PENDING_RELAY_REVOCATIONS: usize = MAX_RELAY_PEERS * 2;
+/// Relay delivery has its own bounded retry/backoff. Sending only the oldest
+/// debt per gateway tick prevents a full ledger from delaying lease expiry,
+/// heartbeats and caller-state reconciliation for many seconds.
+const MAX_PENDING_RELAY_REVOCATIONS_PER_POLL: usize = 1;
+/// Companion lease expiry (or a fresh-session snapshot after reconnect) is
+/// the bounded fallback. Exact revokes get a retry window long enough to cross
+/// transient relay backpressure, without posting four times a second forever
+/// to an unavailable phone.
+const PENDING_RELAY_REVOCATION_TTL: Duration = Duration::from_secs(30);
 /// Live minted offers held at once: at most one published per (device, mode),
 /// plus superseded ones kept until expiry so an in-flight answer still resolves.
 const MAX_RELAY_OFFERS: usize = 32;
@@ -1592,6 +1627,7 @@ struct GatewaySession {
     relay_leases: HashMap<String, RelayLease>,
     deferred_prepare: Option<DeferredPrepare>,
     pending_relay_status: Option<PendingRelayStatus>,
+    pending_relay_revocations: HashMap<String, PendingRelayRevocation>,
     /// Strictly increasing per session, so a replayed older takeover fence can
     /// never look current.
     next_takeover_fence: u64,
@@ -1646,6 +1682,7 @@ impl GatewaySession {
             relay_leases: HashMap::new(),
             deferred_prepare: None,
             pending_relay_status: None,
+            pending_relay_revocations: HashMap::new(),
             next_takeover_fence: 1,
             relay_request_budget: HashMap::new(),
             relay_rtc_signal_budget: HashMap::new(),
@@ -1839,6 +1876,28 @@ mod tests {
         GatewaySession::new(&credentials, "plugin_session_a".into())
     }
 
+    fn test_plugin_revocation(
+        session: &GatewaySession,
+        device_id: &str,
+        lease_id: &str,
+    ) -> (PluginLeaseRevokeFrame, String) {
+        let frame = PluginLeaseRevokeFrame {
+            kind: "plugin_lease_revoke".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: session.app_id.clone(),
+            device_id: device_id.into(),
+            lease_id: lease_id.into(),
+            lease_jti: format!("{lease_id}_jti"),
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            fence: 9,
+            reason: "terminal_rtc_failure".into(),
+        };
+        frame.validate().unwrap();
+        let encoded = serde_json::to_string(&frame).unwrap();
+        (frame, encoded)
+    }
+
     fn remote_snapshot(
         service_mode: LocalServiceMode,
         talk_audio_forwarded: bool,
@@ -1906,6 +1965,132 @@ mod tests {
         assert!(session.ice_servers.is_empty());
         assert_eq!(session.leases.len(), lease_count);
         assert_eq!(session.peers.len(), peer_count);
+    }
+
+    #[test]
+    fn pending_revokes_follow_admission_continuity_but_not_a_new_mobile_session_or_domain() {
+        let authority = test_authority();
+        let credentials = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority.clone())
+            .unwrap();
+        let mut session = GatewaySession::new(&credentials, "plugin_session_old".into());
+        session.relay_carrier = true;
+        let (_, encoded) = test_plugin_revocation(&session, "device_a", "lease_continuity");
+        session.prepare_relay_delivery(&encoded);
+        assert_eq!(session.pending_relay_revocations.len(), 1);
+
+        let refreshed = admission("app_a", "aokie", &authority)
+            .into_credentials(None, "aokie", authority)
+            .unwrap();
+        session
+            .rotate_credentials(&refreshed, "plugin_session_rotated".into())
+            .unwrap();
+        assert!(session
+            .pending_relay_revocations
+            .get("lease_continuity")
+            .is_some_and(|pending| pending.encoded == encoded));
+
+        let media = RemoteMediaHandle::spawn().unwrap();
+        session.revoke_relay_device_authority("device_a", &full_relay_grants(), true, &media);
+        assert!(session.pending_relay_revocations.is_empty());
+
+        session.prepare_relay_delivery(&encoded);
+        assert_eq!(session.pending_relay_revocations.len(), 1);
+        session
+            .apply_admission_rotation(
+                &refreshed,
+                "plugin_session_new_domain".into(),
+                false,
+                &media,
+            )
+            .unwrap();
+        assert!(session.pending_relay_revocations.is_empty());
+    }
+
+    #[test]
+    fn pending_revoke_retry_is_fair_when_the_oldest_delivery_drops_again() {
+        let mut harness = RelayHarness::new();
+        let (_, first) =
+            test_plugin_revocation(&harness.session, &harness.device_id, "lease_retry_a");
+        let (_, second) =
+            test_plugin_revocation(&harness.session, &harness.device_id, "lease_retry_b");
+        harness.session.prepare_relay_delivery(&first);
+        harness.session.prepare_relay_delivery(&second);
+
+        let due_at = Instant::now();
+        {
+            let first_pending = harness
+                .session
+                .pending_relay_revocations
+                .get_mut("lease_retry_a")
+                .unwrap();
+            first_pending.registered_at = due_at;
+            first_pending.next_attempt_at = due_at;
+            let second_pending = harness
+                .session
+                .pending_relay_revocations
+                .get_mut("lease_retry_b")
+                .unwrap();
+            second_pending.registered_at = due_at + Duration::from_nanos(1);
+            second_pending.next_attempt_at = due_at;
+        }
+
+        let first_attempt = harness.session.due_pending_relay_revocations(due_at);
+        assert_eq!(first_attempt, vec![first.clone()]);
+        assert_eq!(
+            harness
+                .session
+                .pending_relay_revocations
+                .get("lease_retry_b")
+                .unwrap()
+                .next_attempt_at,
+            due_at,
+            "only the selected revoke advances"
+        );
+        harness.session.finish_relay_delivery(
+            &first,
+            TransportDelivery::Dropped,
+            &harness.media,
+            &harness.radio,
+        );
+
+        let second_attempt = harness
+            .session
+            .due_pending_relay_revocations(Instant::now());
+        assert_eq!(second_attempt, vec![second]);
+    }
+
+    #[test]
+    fn pending_revoke_ledger_evicts_oldest_at_its_cap_and_prunes_its_ttl() {
+        let mut session = test_gateway_session();
+        session.relay_carrier = true;
+        let base = Instant::now();
+        for index in 0..(MAX_PENDING_RELAY_REVOCATIONS + 3) {
+            let lease_id = format!("lease_bounded_{index:02}");
+            let (frame, encoded) = test_plugin_revocation(&session, "device_a", &lease_id);
+            session.register_pending_relay_revocation(
+                &frame,
+                &encoded,
+                base + Duration::from_nanos(index as u64),
+            );
+        }
+        assert_eq!(
+            session.pending_relay_revocations.len(),
+            MAX_PENDING_RELAY_REVOCATIONS
+        );
+        assert!(!session
+            .pending_relay_revocations
+            .contains_key("lease_bounded_00"));
+        assert!(session
+            .pending_relay_revocations
+            .contains_key("lease_bounded_03"));
+
+        assert!(session
+            .due_pending_relay_revocations(
+                base + PENDING_RELAY_REVOCATION_TTL + Duration::from_secs(1)
+            )
+            .is_empty());
+        assert!(session.pending_relay_revocations.is_empty());
     }
 
     fn takeover_claims(session: &GatewaySession, phase: LeasePhase) -> LeaseClaims {
@@ -2317,6 +2502,7 @@ mod tests {
         /// loop does after every relay POST.
         fn settle(&mut self, frames: &[String], delivery: TransportDelivery) {
             let encoded = frames.first().expect("a relay frame was returned");
+            self.session.prepare_relay_delivery(encoded);
             self.session
                 .finish_relay_delivery(encoded, delivery, &self.media, &self.radio);
         }
@@ -2342,9 +2528,10 @@ mod tests {
         }
 
         fn rejection(&self, frames: &[String]) -> PluginClaimRejectedFrame {
-            let encoded = frames.first().expect("a refusal frame was returned");
-            serde_json::from_str(encoded)
-                .unwrap_or_else(|_| panic!("expected a refusal, got {encoded}"))
+            frames
+                .iter()
+                .find_map(|encoded| serde_json::from_str(encoded).ok())
+                .unwrap_or_else(|| panic!("expected a refusal, got {frames:?}"))
         }
     }
 
@@ -3622,8 +3809,26 @@ mod tests {
         })
         .unwrap();
         let refused = harness.post(&signal);
+        assert_eq!(refused.len(), 2);
+        assert!(serde_json::from_str::<PluginLeaseRevokeFrame>(&refused[0]).is_ok());
+        assert!(serde_json::from_str::<PluginClaimRejectedFrame>(&refused[1]).is_ok());
         assert_eq!(harness.rejection(&refused).code, "lease_unknown");
-        assert_eq!(harness.post(&signal), refused);
+        let revocations = refused
+            .iter()
+            .filter_map(|encoded| serde_json::from_str::<PluginLeaseRevokeFrame>(encoded).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(revocations.len(), 1);
+        let revocation = &revocations[0];
+        assert_eq!(revocation.device_id, status.lease.device_id);
+        assert_eq!(revocation.lease_id, status.lease.lease_id);
+        assert_eq!(revocation.lease_jti, status.lease.jti);
+        assert_eq!(revocation.call_id, status.lease.call_id);
+        assert_eq!(revocation.call_epoch, status.lease.call_epoch);
+        assert_eq!(revocation.fence, status.lease.fence);
+        assert_eq!(revocation.reason, "terminal_rtc_failure");
+
+        let replay = harness.post(&signal);
+        assert_eq!(replay, refused);
         assert!(harness.session.relay_leases.is_empty());
         assert!(harness.session.leases.is_empty());
         assert!(harness.session.prepared.is_none());
@@ -3631,6 +3836,182 @@ mod tests {
             harness.media.snapshot().service_mode,
             LocalServiceMode::AokieActive
         );
+    }
+
+    #[test]
+    fn terminal_rtc_failure_retries_dropped_exact_revoke_egress_until_delivered() {
+        let mut harness = RelayHarness::new();
+        let provisional_frames = harness.claim(LeaseMode::Takeover, "request_exact_rtc_failure");
+        let provisional = harness.granted(&provisional_frames);
+        harness.settle(&provisional_frames, TransportDelivery::Delivered);
+        let binding = binding_for_claims(&provisional.lease);
+        harness
+            .media
+            .install_test_prepared_peer(binding.clone(), 10_000)
+            .unwrap();
+        harness.session.peers.insert(
+            provisional.lease.rtc_session_id.clone(),
+            PeerRoute {
+                binding,
+                lease_jti: provisional.lease.jti.clone(),
+                device_id: provisional.lease.device_id.clone(),
+                sdp_revision: 1,
+                transport_generation: 1,
+                lease_ttl_ms: 10_000,
+                connected: false,
+                remote_audio_ready: false,
+                remote_microphone_ready: false,
+                transition_requested: false,
+            },
+        );
+        harness
+            .media
+            .close_peer(
+                &provisional.lease.rtc_session_id,
+                "simulate signalling endpoint loss",
+            )
+            .unwrap();
+        let signal = signed_mobile_ice(
+            &provisional.lease,
+            &provisional.lease_token,
+            "signal_exact_rtc_failure",
+            "candidate_jti_exact_rtc_failure",
+            1,
+            1,
+        );
+
+        // The terminal transition executes once and returns the exact revoke
+        // first. Model the relay rejecting that outbound POST: no inbound
+        // redelivery from the phone is involved in the retry below.
+        let failed = harness.post(&signal);
+        assert_eq!(failed.len(), 2);
+        assert!(serde_json::from_str::<PluginLeaseRevokeFrame>(&failed[0]).is_ok());
+        assert!(serde_json::from_str::<PluginClaimRejectedFrame>(&failed[1]).is_ok());
+        assert_eq!(harness.rejection(&failed).code, "lease_unknown");
+        let revocations = failed
+            .iter()
+            .filter_map(|encoded| serde_json::from_str::<PluginLeaseRevokeFrame>(encoded).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(revocations.len(), 1);
+        let revocation = &revocations[0];
+        assert_eq!(revocation.device_id, provisional.lease.device_id);
+        assert_eq!(revocation.lease_id, provisional.lease.lease_id);
+        assert_eq!(revocation.lease_jti, provisional.lease.jti);
+        assert_eq!(revocation.call_id, provisional.lease.call_id);
+        assert_eq!(revocation.call_epoch, provisional.lease.call_epoch);
+        assert_eq!(revocation.fence, provisional.lease.fence);
+        assert_eq!(revocation.reason, "terminal_rtc_failure");
+        assert!(harness.session.peers.is_empty());
+        assert!(harness.session.leases.is_empty());
+        assert!(harness.session.relay_leases.is_empty());
+
+        harness.settle(&failed, TransportDelivery::Dropped);
+        assert_eq!(harness.session.pending_relay_revocations.len(), 1);
+        let due = harness
+            .session
+            .due_pending_relay_revocations(Instant::now() + SNAPSHOT_POLL);
+        assert_eq!(due, vec![failed[0].clone()]);
+        harness.session.prepare_relay_delivery(&due[0]);
+        harness.session.finish_relay_delivery(
+            &due[0],
+            TransportDelivery::Delivered,
+            &harness.media,
+            &harness.radio,
+        );
+        assert!(harness.session.pending_relay_revocations.is_empty());
+
+        // A later inbound redelivery is still answered byte-for-byte without
+        // re-running teardown. If that replayed revoke is itself dropped, the
+        // same egress ledger re-arms it and clears only on exact delivery.
+        let replay = harness.post(&signal);
+        assert_eq!(replay, failed);
+        assert!(harness.session.peers.is_empty());
+        assert!(harness.session.leases.is_empty());
+        assert!(harness.session.relay_leases.is_empty());
+        harness.settle(&replay, TransportDelivery::Dropped);
+        let replay_due = harness
+            .session
+            .due_pending_relay_revocations(Instant::now() + SNAPSHOT_POLL);
+        assert_eq!(replay_due, vec![failed[0].clone()]);
+        harness.session.prepare_relay_delivery(&replay_due[0]);
+        harness.session.finish_relay_delivery(
+            &replay_due[0],
+            TransportDelivery::Delivered,
+            &harness.media,
+            &harness.radio,
+        );
+        assert!(harness.session.pending_relay_revocations.is_empty());
+    }
+
+    #[test]
+    fn terminal_rtc_failure_never_revokes_a_foreign_peer_named_by_the_frame() {
+        let mut harness = RelayHarness::new();
+        let provisional_frames = harness.claim(LeaseMode::Takeover, "request_foreign_rtc_failure");
+        let provisional = harness.granted(&provisional_frames);
+        harness.settle(&provisional_frames, TransportDelivery::Delivered);
+
+        let foreign_rtc = "rtc_foreign".to_string();
+        let mut foreign_binding = binding_for_claims(&provisional.lease);
+        foreign_binding.rtc_session_id = foreign_rtc.clone();
+        foreign_binding.device_id = "device_foreign".into();
+        foreign_binding.lease_id = Some("lease_foreign".into());
+        harness.session.peers.insert(
+            foreign_rtc.clone(),
+            PeerRoute {
+                binding: foreign_binding,
+                lease_jti: "lease_jti_foreign".into(),
+                device_id: "device_foreign".into(),
+                sdp_revision: 1,
+                transport_generation: 1,
+                lease_ttl_ms: 10_000,
+                connected: true,
+                remote_audio_ready: true,
+                remote_microphone_ready: false,
+                transition_requested: false,
+            },
+        );
+        let signal = serde_json::to_string(&MobileRtcSignalFrame {
+            kind: "rtc_signal".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: provisional.lease.app_id.clone(),
+            signal_id: "signal_foreign_rtc_failure".into(),
+            plugin_id: provisional.lease.plugin_id.clone(),
+            device_id: provisional.lease.device_id.clone(),
+            lease_token: provisional.lease_token.clone(),
+            lease_jti: provisional.lease.jti.clone(),
+            rtc_session_id: foreign_rtc.clone(),
+            sdp_revision: 1,
+            transport_generation: 1,
+            call_id: provisional.lease.call_id.clone(),
+            call_epoch: provisional.lease.call_epoch,
+            owner_epoch: provisional.lease.owner_epoch,
+            fence: provisional.lease.fence,
+            signal: RtcSignal::Close {
+                reason: "foreign route probe".into(),
+            },
+        })
+        .unwrap();
+
+        let failed = harness.post(&signal);
+        assert_eq!(failed.len(), 2);
+        assert!(serde_json::from_str::<PluginLeaseRevokeFrame>(&failed[0]).is_ok());
+        assert!(serde_json::from_str::<PluginClaimRejectedFrame>(&failed[1]).is_ok());
+        assert_eq!(harness.rejection(&failed).code, "lease_unknown");
+        let revocation = failed
+            .iter()
+            .find_map(|encoded| serde_json::from_str::<PluginLeaseRevokeFrame>(encoded).ok())
+            .expect("the authenticated lease gets an exact terminal notice");
+        assert_eq!(revocation.device_id, provisional.lease.device_id);
+        assert_eq!(revocation.lease_id, provisional.lease.lease_id);
+        assert_eq!(revocation.lease_jti, provisional.lease.jti);
+        assert_ne!(revocation.device_id, "device_foreign");
+        assert_ne!(revocation.lease_id, "lease_foreign");
+        assert!(
+            harness.session.peers.contains_key(&foreign_rtc),
+            "an authenticated device can retire only its recognised lease, never a peer named by untrusted rtcSessionId"
+        );
+        assert!(harness.session.leases.is_empty());
+        assert!(harness.session.relay_leases.is_empty());
     }
 
     #[test]
@@ -7536,21 +7917,36 @@ async fn run_socket(
         session.expire_unbound_active_rebind(Instant::now(), media);
         session.reconcile_relay_media_authority(media);
 
+        let publication_due = Instant::now() >= session.next_snapshot_poll;
+        if publication_due {
+            session.next_snapshot_poll = Instant::now() + SNAPSHOT_POLL;
+            // A terminal revoke is the exact proof that caller authority has
+            // returned. Pay the oldest bounded delivery debt before every
+            // ordinary egress lane, without re-running completed teardown.
+            for encoded in session.due_pending_relay_revocations(Instant::now()) {
+                session.prepare_relay_delivery(&encoded);
+                let delivery = transport.send_text(&encoded).await?;
+                session.finish_relay_delivery(&encoded, delivery, media, radio);
+            }
+        }
         for encoded in session.drain_end_caller_results()? {
+            session.prepare_relay_delivery(&encoded);
             let delivery = transport.send_text(&encoded).await?;
             session.finish_relay_delivery(&encoded, delivery, media, radio);
         }
         for encoded in session.drain_media_events(media, radio)? {
+            session.prepare_relay_delivery(&encoded);
             let delivery = transport.send_text(&encoded).await?;
             session.finish_relay_delivery(&encoded, delivery, media, radio);
         }
-        if Instant::now() >= session.next_snapshot_poll {
-            session.next_snapshot_poll = Instant::now() + SNAPSHOT_POLL;
+        if publication_due {
             for encoded in session.authoritative_state_frames(radio)? {
+                session.prepare_relay_delivery(&encoded);
                 let delivery = transport.send_text(&encoded).await?;
                 session.finish_relay_delivery(&encoded, delivery, media, radio);
             }
             if let Some(encoded) = session.assistance_frame(radio)? {
+                session.prepare_relay_delivery(&encoded);
                 let delivery = transport.send_text(&encoded).await?;
                 session.finish_relay_delivery(&encoded, delivery, media, radio);
             }
@@ -7630,6 +8026,7 @@ async fn run_socket(
             let _ = party;
         }
         for encoded in outbound {
+            session.prepare_relay_delivery(&encoded);
             let delivery = transport.send_text(&encoded).await?;
             session.finish_relay_delivery(&encoded, delivery, media, radio);
         }
@@ -9468,6 +9865,10 @@ impl GatewaySession {
                     "grant_required",
                     "the authenticated admission no longer grants this media mode",
                 ),
+                RelayReplayResult::TerminalRtcFailure {
+                    revocation,
+                    rejection,
+                } => vec![revocation, rejection],
                 RelayReplayResult::Rejected { encoded } => vec![encoded],
                 _ => self.relay_reject(
                     &device_id,
@@ -9563,20 +9964,19 @@ impl GatewaySession {
             signal: frame.signal,
         };
         if routed.validate_routed_mobile().is_err() {
-            self.revoke_relay_lease_by_id(
-                &recognised.lease_id,
+            return self.relay_recorded_terminal_rtc_failure(
+                &recognised,
+                &routed.rtc_session_id,
                 "terminal_rtc_contract_failure",
-                media,
-            );
-            return self.relay_recorded_rejection(
                 &replay_key,
                 &fingerprint,
                 &device_id,
                 &request_id,
-                "lease_unknown",
                 "that RTC signal failed contract validation",
+                media,
             );
         }
+        let rtc_session_id = routed.rtc_session_id.clone();
         match self.handle_rtc_signal(routed, media, radio) {
             Ok(()) => {
                 self.relay_record_replay(
@@ -9596,14 +9996,16 @@ impl GatewaySession {
                 // authority with no usable media path. ICE-order retries are
                 // not currently classified as safe; candidates are accepted
                 // only after the exact peer exists.
-                self.revoke_relay_lease_by_id(&recognised.lease_id, "terminal_rtc_failure", media);
-                self.relay_recorded_rejection(
+                self.relay_recorded_terminal_rtc_failure(
+                    &recognised,
+                    &rtc_session_id,
+                    "terminal_rtc_failure",
                     &replay_key,
                     &fingerprint,
                     &device_id,
                     &request_id,
-                    "lease_unknown",
                     &error.message,
+                    media,
                 )
             }
         }
@@ -10010,6 +10412,12 @@ impl GatewaySession {
                 .retain(|_, replay| replay.device_id != device_id);
             self.retired_prepared_rtc
                 .retain(|_, retired| retired.claims.device_id != device_id);
+            // The replacement mobile session did not hold the retired
+            // session's in-memory lease. Its fresh authoritative snapshot is
+            // the proof it needs; do not deliver terminal notices owed to the
+            // predecessor endpoint session into the replacement.
+            self.pending_relay_revocations
+                .retain(|_, pending| pending.device_id != device_id);
         }
     }
 
@@ -10396,6 +10804,107 @@ impl GatewaySession {
         self.relay_encode(&frame)
     }
 
+    /// Register an exact terminal revoke before asking the relay to carry it.
+    ///
+    /// This deliberately runs before `send_text`: a delivery result may be
+    /// `Dropped`, and the terminal media transition that produced this frame
+    /// has already happened.  Retrying the retained bytes is safe; rebuilding
+    /// the transition is not.
+    fn prepare_relay_delivery(&mut self, encoded: &str) {
+        if !self.relay_carrier {
+            return;
+        }
+        let Some(frame) = self.outbound_relay_revocation(encoded) else {
+            return;
+        };
+        self.register_pending_relay_revocation(&frame, encoded, Instant::now());
+    }
+
+    fn outbound_relay_revocation(&self, encoded: &str) -> Option<PluginLeaseRevokeFrame> {
+        serde_json::from_str::<PluginLeaseRevokeFrame>(encoded)
+            .ok()
+            .filter(|frame| frame.app_id == self.app_id && frame.validate().is_ok())
+    }
+
+    fn prune_pending_relay_revocations(&mut self, now: Instant) {
+        self.pending_relay_revocations
+            .retain(|_, pending| pending.expires_at > now);
+    }
+
+    fn register_pending_relay_revocation(
+        &mut self,
+        frame: &PluginLeaseRevokeFrame,
+        encoded: &str,
+        now: Instant,
+    ) {
+        self.prune_pending_relay_revocations(now);
+        if self
+            .pending_relay_revocations
+            .get(&frame.lease_id)
+            .is_some_and(|pending| pending.encoded == encoded)
+        {
+            return;
+        }
+        if self.pending_relay_revocations.len() >= MAX_PENDING_RELAY_REVOCATIONS
+            && !self.pending_relay_revocations.contains_key(&frame.lease_id)
+        {
+            if let Some(oldest) = self
+                .pending_relay_revocations
+                .iter()
+                .min_by_key(|(_, pending)| pending.registered_at)
+                .map(|(lease_id, _)| lease_id.clone())
+            {
+                self.pending_relay_revocations.remove(&oldest);
+            }
+        }
+        let next_attempt_at = now + SNAPSHOT_POLL;
+        self.pending_relay_revocations.insert(
+            frame.lease_id.clone(),
+            PendingRelayRevocation {
+                encoded: encoded.to_owned(),
+                device_id: frame.device_id.clone(),
+                registered_at: now,
+                next_attempt_at,
+                expires_at: now + PENDING_RELAY_REVOCATION_TTL,
+            },
+        );
+        if self.next_snapshot_poll > next_attempt_at {
+            self.next_snapshot_poll = next_attempt_at;
+        }
+    }
+
+    /// Return due notices in first-registration order and move their next due
+    /// time forward one normal publication tick. Delivery completion either
+    /// clears the exact bytes or re-arms them; neither path touches authority.
+    fn due_pending_relay_revocations(&mut self, now: Instant) -> Vec<String> {
+        self.prune_pending_relay_revocations(now);
+        let mut due_lease_ids = self
+            .pending_relay_revocations
+            .iter()
+            .filter(|(_, pending)| pending.next_attempt_at <= now)
+            .map(|(lease_id, pending)| {
+                (
+                    pending.next_attempt_at,
+                    pending.registered_at,
+                    lease_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        due_lease_ids.sort_by(|left, right| left.cmp(right));
+        due_lease_ids
+            .into_iter()
+            .take(MAX_PENDING_RELAY_REVOCATIONS_PER_POLL)
+            .filter_map(|(_, _, lease_id)| {
+                self.pending_relay_revocations
+                    .get_mut(&lease_id)
+                    .map(|pending| {
+                        pending.next_attempt_at = now + SNAPSHOT_POLL;
+                        pending.encoded.clone()
+                    })
+            })
+            .collect()
+    }
+
     /// Commit or roll back the exact relay status frame just sent.
     fn finish_relay_delivery(
         &mut self,
@@ -10404,6 +10913,35 @@ impl GatewaySession {
         media: &RemoteMediaHandle,
         radio: &RadioHandle,
     ) {
+        if self.relay_carrier {
+            if let Some(frame) = self.outbound_relay_revocation(encoded) {
+                match delivery {
+                    TransportDelivery::Delivered => {
+                        let exact = self
+                            .pending_relay_revocations
+                            .get(&frame.lease_id)
+                            .is_some_and(|pending| pending.encoded == encoded);
+                        if exact {
+                            self.pending_relay_revocations.remove(&frame.lease_id);
+                        }
+                    }
+                    TransportDelivery::Dropped => {
+                        let now = Instant::now();
+                        self.register_pending_relay_revocation(&frame, encoded, now);
+                        if let Some(pending) = self
+                            .pending_relay_revocations
+                            .get_mut(&frame.lease_id)
+                            .filter(|pending| pending.encoded == encoded)
+                        {
+                            pending.next_attempt_at = now + SNAPSHOT_POLL;
+                            if self.next_snapshot_poll > pending.next_attempt_at {
+                                self.next_snapshot_poll = pending.next_attempt_at;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if self.relay_carrier {
             if let Ok(frame) = serde_json::from_str::<PluginSnapshotFrame>(encoded) {
                 if self.relay_snapshot_event_id.as_deref() == Some(frame.event_id.as_str()) {
@@ -10698,6 +11236,143 @@ impl GatewaySession {
             );
         }
         frames
+    }
+
+    /// Fail one authenticated RTC operation without leaving either side with
+    /// an ambiguous media lease.
+    ///
+    /// The generic claim rejection is retained for operation correlation, but
+    /// it intentionally carries no lease identity and therefore cannot prove
+    /// authority return to the Companion.  Pair the first refusal with an
+    /// exact, fully-fenced plugin revocation. Relay egress posts each frame
+    /// separately, so the replay result preserves both byte-for-byte with the
+    /// authoritative revocation first. Replaying them does not re-run the
+    /// terminal state transition; mobile applies duplicate revokes through its
+    /// completed-revocation tombstone.
+    #[allow(clippy::too_many_arguments)]
+    fn relay_recorded_terminal_rtc_failure(
+        &mut self,
+        recognised: &RelayLease,
+        rtc_session_id: &str,
+        reason: &str,
+        replay_key: &str,
+        fingerprint: &str,
+        device_id: &str,
+        request_id: &str,
+        message: &str,
+        media: &RemoteMediaHandle,
+    ) -> Vec<String> {
+        let revocation = match self.fail_relay_rtc_authority(
+            recognised,
+            rtc_session_id,
+            reason,
+            media,
+        ) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                eprintln!(
+                    "[aokie-plugin][takeover] stage=terminal_rtc_revoke_encode_failed rtc={} detail={}",
+                    sanitize_gateway_code(rtc_session_id),
+                    sanitize_status_message(&error.message)
+                );
+                None
+            }
+        };
+        let rejection = self
+            .relay_reject(device_id, request_id, "lease_unknown", message)
+            .into_iter()
+            .next();
+        match (revocation, rejection) {
+            (Some(revocation), Some(rejection)) => {
+                self.relay_record_replay(
+                    replay_key.to_owned(),
+                    fingerprint.to_owned(),
+                    device_id.to_owned(),
+                    RelayReplayResult::TerminalRtcFailure {
+                        revocation: revocation.clone(),
+                        rejection: rejection.clone(),
+                    },
+                );
+                vec![revocation, rejection]
+            }
+            (None, Some(rejection)) => {
+                self.relay_record_replay(
+                    replay_key.to_owned(),
+                    fingerprint.to_owned(),
+                    device_id.to_owned(),
+                    RelayReplayResult::Rejected {
+                        encoded: rejection.clone(),
+                    },
+                );
+                vec![rejection]
+            }
+            (Some(revocation), None) => vec![revocation],
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// Retire only the lease authenticated before grant narrowing.  A supplied
+    /// rtcSessionId can name another peer, so it is safe to call `fail_peer`
+    /// only when that route also matches the recognised device, JTI and stable
+    /// lease.  Otherwise revoke the recognised lease without touching the
+    /// foreign route and construct its notice from the plugin-minted claims.
+    fn fail_relay_rtc_authority(
+        &mut self,
+        recognised: &RelayLease,
+        rtc_session_id: &str,
+        reason: &str,
+        media: &RemoteMediaHandle,
+    ) -> Result<Option<String>, WorkerError> {
+        let claims = self
+            .leases
+            .get(&recognised.current_jti)
+            .filter(|claims| {
+                claims.device_id == recognised.device_id
+                    && claims.lease_id == recognised.lease_id
+                    && claims.jti == recognised.current_jti
+            })
+            .cloned();
+        let expected_binding = claims.as_ref().map(binding_for_claims);
+        let exact_peer = self.peers.get(rtc_session_id).is_some_and(|route| {
+            route.device_id == recognised.device_id
+                && route.lease_jti == recognised.current_jti
+                && route.binding.lease_id.as_deref() == Some(recognised.lease_id.as_str())
+                && expected_binding
+                    .as_ref()
+                    .is_some_and(|binding| route.binding == *binding)
+        });
+        if exact_peer {
+            return self.fail_peer(rtc_session_id, reason, media);
+        }
+
+        self.revoke_relay_lease_by_id(&recognised.lease_id, reason, media);
+        claims
+            .map(|claims| self.encode_failed_lease_revocation(&claims, reason))
+            .transpose()
+    }
+
+    fn encode_failed_lease_revocation(
+        &self,
+        claims: &LeaseClaims,
+        reason: &str,
+    ) -> Result<String, WorkerError> {
+        let frame = PluginLeaseRevokeFrame {
+            kind: "plugin_lease_revoke".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: self.app_id.clone(),
+            device_id: claims.device_id.clone(),
+            lease_id: claims.lease_id.clone(),
+            lease_jti: claims.jti.clone(),
+            call_id: claims.call_id.clone(),
+            call_epoch: claims.call_epoch,
+            fence: claims.fence,
+            reason: reason.into(),
+        };
+        frame
+            .validate()
+            .map_err(|_| WorkerError::reconnect("Media revocation frame is invalid"))?;
+        serde_json::to_string(&frame)
+            .map_err(|_| WorkerError::reconnect("Media revocation could not be encoded"))
     }
 
     /// Encode one outbound relay frame, dropping it rather than failing.
