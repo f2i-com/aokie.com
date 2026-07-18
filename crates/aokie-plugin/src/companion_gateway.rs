@@ -1351,6 +1351,24 @@ struct RelayLease {
     mode: LeaseMode,
 }
 
+/// The exact receive-only RTC binding that was superseded when a PREPARED
+/// consult/takeover became ACTIVE.
+///
+/// Relay delivery is at-least-once and trickled ICE can overtake the ACTIVE
+/// lease status.  Keeping this binding briefly lets the plugin recognise that
+/// exact, already-retired generation and discard it without presenting it to
+/// the native peer.  It is deliberately not a lease alias: only RTC signalling
+/// consults it, every binding field and the bearer token must match, and it can
+/// never renew, revoke, route media, or mutate caller ownership.
+#[derive(Clone)]
+struct RetiredPreparedRtcBinding {
+    claims: LeaseClaims,
+    token: String,
+    sdp_revision: u64,
+    transport_generation: u64,
+    expires_at: Instant,
+}
+
 /// A consult/takeover claim that has been minted but deliberately NOT armed.
 ///
 /// See [`GatewaySession::finish_relay_delivery`] for why the arming waits.
@@ -1429,6 +1447,14 @@ enum RelayReplayResult {
     RtcAccepted {
         mode: LeaseMode,
     },
+    /// A valid signal for the just-retired PREPARED generation was consumed as
+    /// a no-op.  Its replay lifetime is the tombstone lifetime, not the normal
+    /// two-minute operation ledger lifetime.
+    RetiredPreparedRtcDropped {
+        lease_id: String,
+        mode: LeaseMode,
+        expires_at: Instant,
+    },
     HeartbeatStatus {
         lease_id: String,
     },
@@ -1474,9 +1500,18 @@ const RELAY_TAKEOVER_ACTIVE_REBIND_TIMEOUT: Duration = Duration::from_secs(30);
 /// active-peer rebind much more tightly so a missing offer cannot become an
 /// indefinitely renewable silent hold.
 const RELAY_CONSULT_ACTIVE_REBIND_TIMEOUT: Duration = Duration::from_secs(8);
-/// Rolling window and budget for peer requests, per device.
+/// Rolling window and budget for control requests, per device.
 const RELAY_REQUEST_WINDOW: Duration = Duration::from_secs(10);
 const RELAY_REQUEST_BUDGET: u32 = 10;
+/// RTC trickle is naturally bursty (offer plus a set of gathered candidates),
+/// so it has an independent bounded lane.  Sharing the ten-request control
+/// lane made one healthy offer + lease + candidate burst deterministically
+/// throttle its own ACTIVE rebind.
+const RELAY_RTC_SIGNAL_BUDGET: u32 = 32;
+/// At-least-once relay ordering can deliver the final PREPARED candidates just
+/// after the ACTIVE token/JTI rotation.  Ten seconds covers that reordering
+/// without turning the old bearer into long-lived authority.
+const RETIRED_PREPARED_RTC_TTL: Duration = Duration::from_secs(10);
 /// How long a replay result is remembered, and how many at once.
 const RELAY_REPLAY_TTL: Duration = Duration::from_secs(120);
 const MAX_RELAY_REPLAYS: usize = 256;
@@ -1549,6 +1584,8 @@ struct GatewaySession {
     /// never look current.
     next_takeover_fence: u64,
     relay_request_budget: HashMap<String, (Instant, u32)>,
+    relay_rtc_signal_budget: HashMap<String, (Instant, u32)>,
+    retired_prepared_rtc: HashMap<String, RetiredPreparedRtcBinding>,
     relay_replays: HashMap<String, RelayReplay>,
 }
 
@@ -1599,6 +1636,8 @@ impl GatewaySession {
             pending_relay_status: None,
             next_takeover_fence: 1,
             relay_request_budget: HashMap::new(),
+            relay_rtc_signal_budget: HashMap::new(),
+            retired_prepared_rtc: HashMap::new(),
             relay_replays: HashMap::new(),
         }
     }
@@ -1639,6 +1678,16 @@ impl GatewaySession {
         self.last_assistance_request_sent = None;
         self.relay_snapshot_event_id = None;
         self.relay_snapshot_delivered_devices.clear();
+        // Endpoint-session rotation invalidates every signature context the
+        // retired PREPARED generation carried.  It must not survive merely as
+        // a bearer-token match.
+        self.retired_prepared_rtc.clear();
+        self.relay_replays.retain(|_, replay| {
+            !matches!(
+                &replay.result,
+                RelayReplayResult::RetiredPreparedRtcDropped { .. }
+            )
+        });
         Ok(())
     }
 }
@@ -2291,6 +2340,136 @@ mod tests {
             &harness.radio,
         );
         active
+    }
+
+    /// Exercise the same PREPARED -> ACTIVE delivery rotation as production,
+    /// while marking the prepared peer's negotiated revision/generation.  The
+    /// native test seam does not negotiate SDP itself, so the two values are
+    /// supplied explicitly here.
+    fn activate_takeover_with_retired_prepared_rtc(
+        harness: &mut RelayHarness,
+        request_id: &str,
+    ) -> (PluginLeaseStatusFrame, PluginLeaseStatusFrame) {
+        let provisional_frames = harness.claim(LeaseMode::Takeover, request_id);
+        let provisional = harness.granted(&provisional_frames);
+        harness.settle(&provisional_frames, TransportDelivery::Delivered);
+        let prepared = harness
+            .session
+            .prepared
+            .as_mut()
+            .expect("the provisional grant is armed");
+        prepared.provisional_sdp_revision = 1;
+        prepared.provisional_transport_generation = 1;
+        let provisional_binding = binding_for_claims(&provisional.lease);
+        harness
+            .media
+            .install_test_prepared_peer(provisional_binding.clone(), 10_000)
+            .unwrap();
+        harness
+            .media
+            .ack_prepare_human(&provisional_binding)
+            .unwrap();
+        let active_frames = harness
+            .session
+            .drain_media_events(&harness.media, &harness.radio)
+            .unwrap();
+        let active_encoded = active_frames
+            .iter()
+            .find(|encoded| {
+                serde_json::from_str::<PluginLeaseStatusFrame>(encoded)
+                    .is_ok_and(|status| status.status == PluginLeaseStatus::Active)
+            })
+            .expect("preparation emits an active lease")
+            .clone();
+        let active = serde_json::from_str(&active_encoded).unwrap();
+        harness.session.finish_relay_delivery(
+            &active_encoded,
+            TransportDelivery::Delivered,
+            &harness.media,
+            &harness.radio,
+        );
+        assert!(harness
+            .session
+            .retired_prepared_rtc
+            .contains_key(&provisional.lease.lease_id));
+        (provisional, active)
+    }
+
+    fn signed_mobile_ice(
+        lease: &LeaseClaims,
+        lease_token: &str,
+        signal_id: &str,
+        endpoint_jti: &str,
+        sdp_revision: u64,
+        transport_generation: u64,
+    ) -> String {
+        let signing_key = approved_mobile_signing_key();
+        let endpoint_key =
+            EndpointPublicKey::from_ed25519_bytes(&signing_key.verifying_key().to_bytes());
+        let now = unix_now().unwrap();
+        let candidate = "candidate:1 1 UDP 2122260223 192.0.2.1 54321 typ host".to_string();
+        let claims = TrickleCandidateClaims {
+            app_id: lease.app_id.clone(),
+            plugin_id: lease.plugin_id.clone(),
+            device_id: lease.device_id.clone(),
+            rtc_session_id: lease.rtc_session_id.clone(),
+            endpoint_session_nonce: lease.session_nonce.clone(),
+            lease_jti: lease.jti.clone(),
+            endpoint_role: AdmissionRole::Mobile,
+            holder_key_thumbprint: lease.mobile_key_thumbprint.clone(),
+            peer_key_thumbprint: lease.plugin_key_thumbprint.clone(),
+            call_id: lease.call_id.clone(),
+            call_epoch: lease.call_epoch,
+            owner_epoch: lease.owner_epoch,
+            fence: lease.fence,
+            sdp_revision,
+            transport_generation,
+            candidate: Some(candidate.clone()),
+            sdp_mid: Some("0".into()),
+            sdp_m_line_index: Some(0),
+            end_of_candidates: false,
+            nonce: format!("candidate_nonce_{endpoint_jti}"),
+            jti: endpoint_jti.into(),
+            issued_at: now,
+            expires_at: now + 30,
+        };
+        let signature = URL_SAFE_NO_PAD.encode(
+            signing_key
+                .sign(
+                    &claims
+                        .signing_bytes()
+                        .expect("candidate claims canonicalize"),
+                )
+                .to_bytes(),
+        );
+        serde_json::to_string(&MobileRtcSignalFrame {
+            kind: "rtc_signal".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: lease.app_id.clone(),
+            signal_id: signal_id.into(),
+            plugin_id: lease.plugin_id.clone(),
+            device_id: lease.device_id.clone(),
+            lease_token: lease_token.into(),
+            lease_jti: lease.jti.clone(),
+            rtc_session_id: lease.rtc_session_id.clone(),
+            sdp_revision,
+            transport_generation,
+            call_id: lease.call_id.clone(),
+            call_epoch: lease.call_epoch,
+            owner_epoch: lease.owner_epoch,
+            fence: lease.fence,
+            signal: RtcSignal::Ice {
+                candidate,
+                sdp_mid: Some("0".into()),
+                sdp_m_line_index: Some(0),
+                envelope: SignedTrickleCandidateEnvelope {
+                    endpoint_key,
+                    claims,
+                    signature,
+                },
+            },
+        })
+        .expect("signed mobile ICE encodes")
     }
 
     fn consenting_gate() -> crate::remote_media::RemoteConsentGate {
@@ -3411,6 +3590,164 @@ mod tests {
     }
 
     #[test]
+    fn exact_late_prepared_ice_is_replay_fenced_and_cannot_touch_the_active_lease() {
+        let mut harness = RelayHarness::new();
+        let (prepared, active) =
+            activate_takeover_with_retired_prepared_rtc(&mut harness, "request_late_prepared_ice");
+        let current_before = harness
+            .session
+            .relay_leases
+            .get(&active.lease.lease_id)
+            .expect("the active stable lease is current")
+            .clone();
+        let active_claims_before = harness
+            .session
+            .leases
+            .get(&active.lease.jti)
+            .expect("active authority is committed")
+            .clone();
+        let peer_count_before = harness.session.peers.len();
+        let signal = signed_mobile_ice(
+            &prepared.lease,
+            &prepared.lease_token,
+            "signal_late_prepared_ice",
+            "candidate_jti_late_prepared_ice",
+            1,
+            1,
+        );
+
+        assert!(
+            harness.post(&signal).is_empty(),
+            "an exact valid late candidate is consumed as a no-op"
+        );
+        assert_eq!(
+            harness
+                .session
+                .relay_leases
+                .get(&active.lease.lease_id)
+                .expect("the current lease survives")
+                .current_jti,
+            current_before.current_jti
+        );
+        assert_eq!(
+            harness
+                .session
+                .relay_leases
+                .get(&active.lease.lease_id)
+                .expect("the current lease survives")
+                .token,
+            current_before.token
+        );
+        assert_eq!(
+            harness.session.leases.get(&active.lease.jti),
+            Some(&active_claims_before)
+        );
+        assert_eq!(harness.session.leases.len(), 1);
+        assert_eq!(harness.session.peers.len(), peer_count_before);
+        let charged = harness
+            .session
+            .relay_rtc_signal_budget
+            .get(&harness.device_id)
+            .expect("the first late signal used the RTC lane")
+            .1;
+        assert!(
+            harness.post(&signal).is_empty(),
+            "an at-least-once redelivery is also a no-op"
+        );
+        assert_eq!(
+            harness
+                .session
+                .relay_rtc_signal_budget
+                .get(&harness.device_id)
+                .unwrap()
+                .1,
+            charged,
+            "replay lookup happens before the RTC lane is charged"
+        );
+
+        let revoke = json!({
+            "kind": "lease_revoke",
+            "schemaVersion": SCHEMA_VERSION,
+            "appId": "app_a",
+            "requestId": "request_late_prepared_ice_revoke",
+            "idempotencyKey": "idem_late_prepared_ice_revoke",
+            "leaseToken": active.lease_token,
+            "reason": "operator_return"
+        })
+        .to_string();
+        assert!(harness.post(&revoke).is_empty());
+        assert!(
+            harness.session.retired_prepared_rtc.is_empty(),
+            "stable-lease revoke also clears its old-generation tombstone"
+        );
+        assert!(harness.session.relay_replays.values().all(|replay| {
+            !matches!(
+                &replay.result,
+                RelayReplayResult::RetiredPreparedRtcDropped { .. }
+            )
+        }));
+    }
+
+    #[test]
+    fn altered_or_expired_prepared_rtc_bindings_are_never_tombstone_authorized() {
+        let mut harness = RelayHarness::new();
+        let (prepared, active) = activate_takeover_with_retired_prepared_rtc(
+            &mut harness,
+            "request_retired_binding_limits",
+        );
+        let current_jti = active.lease.jti.clone();
+        let current_token = active.lease_token.clone();
+
+        // Even the approved mobile signer cannot widen the remembered route:
+        // a changed owner epoch is a different binding and remains unknown.
+        let mut altered = prepared.lease.clone();
+        altered.owner_epoch = altered.owner_epoch.saturating_add(1);
+        let refused = harness.post(&signed_mobile_ice(
+            &altered,
+            &prepared.lease_token,
+            "signal_altered_prepared_ice",
+            "candidate_jti_altered_prepared_ice",
+            1,
+            1,
+        ));
+        assert_eq!(harness.rejection(&refused).code, "lease_unknown");
+        assert_eq!(
+            harness
+                .session
+                .relay_leases
+                .get(&active.lease.lease_id)
+                .unwrap()
+                .current_jti,
+            current_jti
+        );
+
+        harness
+            .session
+            .retired_prepared_rtc
+            .get_mut(&prepared.lease.lease_id)
+            .expect("the exact old generation is remembered")
+            .expires_at = Instant::now();
+        let refused = harness.post(&signed_mobile_ice(
+            &prepared.lease,
+            &prepared.lease_token,
+            "signal_expired_prepared_ice",
+            "candidate_jti_expired_prepared_ice",
+            1,
+            1,
+        ));
+        assert_eq!(harness.rejection(&refused).code, "lease_unknown");
+        assert!(harness.session.retired_prepared_rtc.is_empty());
+        let current = harness
+            .session
+            .relay_leases
+            .get(&active.lease.lease_id)
+            .expect("rejecting the old binding leaves ACTIVE current");
+        assert_eq!(current.current_jti, current_jti);
+        assert_eq!(current.token, current_token);
+        assert!(harness.session.leases.contains_key(&active.lease.jti));
+    }
+
+    #[test]
     fn active_rebind_deadline_is_not_renewable_and_frees_the_claimant() {
         let mut harness = RelayHarness::new();
         let active = activate_takeover_without_replacement_peer(
@@ -3972,6 +4309,81 @@ mod tests {
             "a roster member that loops must not drive signing at whatever rate it likes"
         );
         assert!(harness.session.relay_leases.is_empty());
+    }
+
+    #[test]
+    fn a_normal_claim_and_candidate_burst_use_independent_device_lanes() {
+        let mut harness = RelayHarness::new();
+        let offer = harness.offer_for(LeaseMode::Monitor);
+        let answer = offer_answer(&offer, &harness.device_id, "request_lane_split");
+        assert!(!harness.post(&answer).is_empty());
+        let request = lease_request(&offer, "request_lane_split", "rtc_lane_split");
+        assert!(!harness.post(&request).is_empty());
+        assert_eq!(
+            harness
+                .session
+                .relay_request_budget
+                .get(&harness.device_id)
+                .expect("offer + lease spend the control lane")
+                .1,
+            2
+        );
+        assert!(harness.session.relay_rtc_signal_budget.is_empty());
+
+        // The live incident contained sixteen inbound SDP/ICE signals across
+        // the prepared and active negotiations.  That healthy burst must not
+        // consume (or be consumed by) the offer/lease control allowance.
+        for _ in 0..16 {
+            assert!(!harness.session.relay_rtc_over_budget(&harness.device_id));
+        }
+        assert_eq!(
+            harness
+                .session
+                .relay_request_budget
+                .get(&harness.device_id)
+                .unwrap()
+                .1,
+            2
+        );
+        assert!(
+            !harness.session.relay_over_budget(&harness.device_id),
+            "a later control remains inside its own allowance"
+        );
+
+        let control_before_replay = harness
+            .session
+            .relay_request_budget
+            .get(&harness.device_id)
+            .unwrap()
+            .1;
+        assert!(!harness.post(&answer).is_empty());
+        assert_eq!(
+            harness
+                .session
+                .relay_request_budget
+                .get(&harness.device_id)
+                .unwrap()
+                .1,
+            control_before_replay,
+            "control replays are resolved before charging too"
+        );
+    }
+
+    #[test]
+    fn rtc_trickle_is_bounded_per_device_without_spending_control_budget() {
+        let mut harness = RelayHarness::new();
+        for _ in 0..RELAY_RTC_SIGNAL_BUDGET {
+            assert!(!harness.session.relay_rtc_over_budget(&harness.device_id));
+        }
+        assert!(harness.session.relay_rtc_over_budget(&harness.device_id));
+        assert!(
+            harness.session.relay_request_budget.is_empty(),
+            "RTC floods cannot exhaust the control lane"
+        );
+        assert!(
+            !harness.session.relay_rtc_over_budget("device_b"),
+            "one device cannot spend another device's RTC allowance"
+        );
     }
 
     #[test]
@@ -7508,6 +7920,7 @@ impl GatewaySession {
                     && tokens_match(&lease.token, &frame.lease_token)
             })
             .cloned();
+        let retired_before_narrowing = self.retired_prepared_rtc_for_frame(&frame);
         self.relay_reconcile_frame_grants(&device_id, authenticated_grants, media);
         let replay_key = format!("rtc\u{1f}{device_id}\u{1f}{}", frame.signal_id);
         let Ok(fingerprint) = serde_json::to_string(&frame) else {
@@ -7534,6 +7947,30 @@ impl GatewaySession {
                     "grant_required",
                     "the authenticated admission no longer grants this media mode",
                 ),
+                RelayReplayResult::RetiredPreparedRtcDropped {
+                    mode, expires_at, ..
+                } if expires_at > Instant::now()
+                    && self.relay_mode_is_authorized(&device_id, authenticated_grants, mode) =>
+                {
+                    Vec::new()
+                }
+                RelayReplayResult::RetiredPreparedRtcDropped { expires_at, .. }
+                    if expires_at <= Instant::now() =>
+                {
+                    self.relay_replays.remove(&replay_key);
+                    self.relay_reject(
+                        &device_id,
+                        &request_id,
+                        "lease_unknown",
+                        "that retired RTC generation has expired",
+                    )
+                }
+                RelayReplayResult::RetiredPreparedRtcDropped { .. } => self.relay_reject(
+                    &device_id,
+                    &request_id,
+                    "grant_required",
+                    "the authenticated admission no longer grants this media mode",
+                ),
                 RelayReplayResult::Rejected { encoded } => vec![encoded],
                 _ => self.relay_reject(
                     &device_id,
@@ -7543,7 +7980,7 @@ impl GatewaySession {
                 ),
             };
         }
-        if self.relay_over_budget(&device_id) {
+        if self.relay_rtc_over_budget(&device_id) {
             return self.relay_reject(&device_id, &request_id, "rate_limited", "too many requests");
         }
         if !self.relay_replay_has_room(&replay_key) {
@@ -7553,6 +7990,47 @@ impl GatewaySession {
                 "rate_limited",
                 "the replay ledger is full",
             );
+        }
+        if let Some(retired) = retired_before_narrowing {
+            if !self.relay_mode_is_authorized(&device_id, authenticated_grants, retired.claims.mode)
+            {
+                return self.relay_reject(
+                    &device_id,
+                    &request_id,
+                    "grant_required",
+                    "the authenticated admission no longer grants this media mode",
+                );
+            }
+            if !self.authenticate_retired_prepared_rtc(&frame, &retired) {
+                return self.relay_recorded_rejection(
+                    &replay_key,
+                    &fingerprint,
+                    &device_id,
+                    &request_id,
+                    "lease_unknown",
+                    "that retired RTC signal did not match its endpoint proof",
+                );
+            }
+            self.relay_record_replay(
+                replay_key,
+                fingerprint,
+                device_id.clone(),
+                RelayReplayResult::RetiredPreparedRtcDropped {
+                    lease_id: retired.claims.lease_id.clone(),
+                    mode: retired.claims.mode,
+                    expires_at: retired.expires_at,
+                },
+            );
+            eprintln!(
+                "[aokie-plugin][takeover] stage=retired_prepared_rtc_dropped device={} call={} lease={} rtc={} sdp={} generation={} detail=A late signal for the superseded receive-only generation was replay-fenced and ignored",
+                sanitize_gateway_code(&device_id),
+                retired.claims.call_id,
+                retired.claims.lease_id,
+                retired.claims.rtc_session_id,
+                retired.sdp_revision,
+                retired.transport_generation
+            );
+            return Vec::new();
         }
         let Some(recognised) = recognised_before_narrowing else {
             return self.relay_reject(
@@ -8033,6 +8511,8 @@ impl GatewaySession {
         if session_changed {
             self.relay_replays
                 .retain(|_, replay| replay.device_id != device_id);
+            self.retired_prepared_rtc
+                .retain(|_, retired| retired.claims.device_id != device_id);
         }
     }
 
@@ -8225,6 +8705,16 @@ impl GatewaySession {
     /// would let a heartbeat renew a lease that failing media already revoked.
     fn retire_relay_lease(&mut self, lease_id: &str) {
         self.relay_leases.remove(lease_id);
+        self.retired_prepared_rtc.remove(lease_id);
+        self.relay_replays.retain(|_, replay| {
+            !matches!(
+                &replay.result,
+                RelayReplayResult::RetiredPreparedRtcDropped {
+                    lease_id: retired_lease_id,
+                    ..
+                } if retired_lease_id == lease_id
+            )
+        });
         if self
             .deferred_prepare
             .as_ref()
@@ -8239,6 +8729,143 @@ impl GatewaySession {
         {
             self.pending_relay_status = None;
         }
+    }
+
+    fn prune_retired_prepared_rtc(&mut self, now: Instant) {
+        self.retired_prepared_rtc
+            .retain(|_, retired| retired.expires_at > now);
+    }
+
+    /// Remember one superseded PREPARED generation as a drop-only binding.
+    ///
+    /// The stable lease cap is also the global tombstone cap, and only one
+    /// generation per device is retained.  A claimant therefore cannot grow
+    /// memory by repeatedly rotating generations or reconnecting.
+    fn remember_retired_prepared_rtc(
+        &mut self,
+        claims: LeaseClaims,
+        token: String,
+        sdp_revision: u64,
+        transport_generation: u64,
+    ) {
+        let now = Instant::now();
+        self.prune_retired_prepared_rtc(now);
+        let Ok(now_unix) = unix_now() else {
+            return;
+        };
+        let remaining = claims.expires_at.saturating_sub(now_unix);
+        if remaining == 0 {
+            return;
+        }
+        let ttl = RETIRED_PREPARED_RTC_TTL.min(Duration::from_secs(remaining));
+        self.retired_prepared_rtc.retain(|_, retired| {
+            retired.claims.device_id != claims.device_id
+                || retired.claims.lease_id == claims.lease_id
+        });
+        if self.retired_prepared_rtc.len() >= MAX_RELAY_LEASES
+            && !self.retired_prepared_rtc.contains_key(&claims.lease_id)
+        {
+            if let Some(oldest) = self
+                .retired_prepared_rtc
+                .iter()
+                .min_by_key(|(_, retired)| retired.expires_at)
+                .map(|(lease_id, _)| lease_id.clone())
+            {
+                self.retired_prepared_rtc.remove(&oldest);
+            }
+        }
+        self.retired_prepared_rtc.insert(
+            claims.lease_id.clone(),
+            RetiredPreparedRtcBinding {
+                claims,
+                token,
+                sdp_revision,
+                transport_generation,
+                expires_at: now + ttl,
+            },
+        );
+    }
+
+    /// Return the exact retired PREPARED binding named by this frame.
+    ///
+    /// This is intentionally stricter than finding a stable lease: every
+    /// immutable route field and the old bearer token must agree.  Matching
+    /// only the lease id would turn the tombstone into an authority alias.
+    fn retired_prepared_rtc_for_frame(
+        &mut self,
+        frame: &MobileRtcSignalFrame,
+    ) -> Option<RetiredPreparedRtcBinding> {
+        self.prune_retired_prepared_rtc(Instant::now());
+        self.retired_prepared_rtc
+            .values()
+            .find(|retired| {
+                matches!(
+                    &frame.signal,
+                    RtcSignal::Ice { .. } | RtcSignal::IceComplete { .. }
+                ) && retired.claims.phase == LeasePhase::Prepared
+                    && retired.claims.device_id == frame.device_id
+                    && retired.claims.jti == frame.lease_jti
+                    && retired.claims.rtc_session_id == frame.rtc_session_id
+                    && retired.claims.call_id == frame.call_id
+                    && retired.claims.call_epoch == frame.call_epoch
+                    && retired.claims.owner_epoch == frame.owner_epoch
+                    && retired.claims.fence == frame.fence
+                    && retired.sdp_revision == frame.sdp_revision
+                    && retired.transport_generation == frame.transport_generation
+                    && tokens_match(&retired.token, &frame.lease_token)
+            })
+            .cloned()
+    }
+
+    /// Verify that an exact tombstone match was signed by the same approved
+    /// mobile endpoint and session as the retired lease.  A bearer alone is
+    /// insufficient even though the result will only be dropped.
+    fn authenticate_retired_prepared_rtc(
+        &mut self,
+        frame: &MobileRtcSignalFrame,
+        retired: &RetiredPreparedRtcBinding,
+    ) -> bool {
+        let Ok(now) = unix_now() else {
+            return false;
+        };
+        let Ok(Some(authentication)) = frame.signal.verify_endpoint_authentication(now) else {
+            return false;
+        };
+        let supplied_key = match &frame.signal {
+            RtcSignal::Offer { binding, .. } | RtcSignal::Answer { binding, .. } => {
+                &binding.endpoint_key
+            }
+            RtcSignal::Ice { envelope, .. } | RtcSignal::IceComplete { envelope } => {
+                &envelope.endpoint_key
+            }
+            RtcSignal::Close { .. } => return false,
+        };
+        let Some(approved_key) = self
+            .endpoint_authority
+            .approved_mobile_keys
+            .get(authentication.holder_key_thumbprint())
+        else {
+            return false;
+        };
+        let expected = &retired.claims;
+        if supplied_key != approved_key
+            || authentication.endpoint_role() != AdmissionRole::Mobile
+            || authentication.endpoint_session_nonce() != expected.session_nonce
+            || authentication.holder_key_thumbprint() != expected.mobile_key_thumbprint
+            || authentication.peer_key_thumbprint() != expected.plugin_key_thumbprint
+        {
+            return false;
+        }
+        self.used_endpoint_jtis
+            .retain(|_, expires_at| *expires_at > now);
+        if self.used_endpoint_jtis.contains_key(authentication.jti())
+            || self.used_endpoint_jtis.len() >= MAX_USED_ENDPOINT_JTIS
+        {
+            return false;
+        }
+        self.used_endpoint_jtis
+            .insert(authentication.jti().to_owned(), authentication.expires_at());
+        true
     }
 
     /// Encode a minted lease for the device that asked for it.
@@ -8454,6 +9081,38 @@ impl GatewaySession {
                     }
                     return;
                 }
+                // Preserve only the exact PREPARED receive-only generation
+                // that this delivered ACTIVE status supersedes.  This is a
+                // short-lived drop-only tombstone, never an alternate live
+                // token/JTI for the stable lease.
+                let retired = self.relay_leases.get(&lease_id).and_then(|entry| {
+                    self.prepared
+                        .as_ref()
+                        .filter(|prepared| prepared.provisional.lease_id == lease_id)
+                        .filter(|prepared| {
+                            entry.phase == LeasePhase::Prepared
+                                && prepared.provisional.phase == LeasePhase::Prepared
+                                && entry.current_jti == prepared.provisional.jti
+                                && prepared.provisional_sdp_revision > 0
+                                && prepared.provisional_transport_generation > 0
+                        })
+                        .map(|prepared| {
+                            (
+                                prepared.provisional.clone(),
+                                entry.token.clone(),
+                                prepared.provisional_sdp_revision,
+                                prepared.provisional_transport_generation,
+                            )
+                        })
+                });
+                if let Some((claims, token, sdp_revision, transport_generation)) = retired {
+                    self.remember_retired_prepared_rtc(
+                        claims,
+                        token,
+                        sdp_revision,
+                        transport_generation,
+                    );
+                }
                 self.leases
                     .retain(|_, existing| existing.lease_id != lease_id);
                 self.leases.insert(claims.jti.clone(), claims.clone());
@@ -8551,35 +9210,58 @@ impl GatewaySession {
             .unwrap_or_default()
     }
 
-    /// Whether this device has already spent its request budget.
+    /// Whether this device has already spent its control-request budget.
     ///
     /// A roster member that misbehaves — or simply loops — must not be able to
     /// drive minting, signing and radio snapshots at whatever rate it likes on
     /// the process that also runs the radio.
     fn relay_over_budget(&mut self, device_id: &str) -> bool {
+        Self::relay_budget_over(
+            &mut self.relay_request_budget,
+            device_id,
+            RELAY_REQUEST_BUDGET,
+        )
+    }
+
+    /// Whether this device has already spent its independent RTC trickle
+    /// budget.  Keeping this separate is essential: healthy ICE gathering is
+    /// bursty, while offer/lease/heartbeat controls are not.
+    fn relay_rtc_over_budget(&mut self, device_id: &str) -> bool {
+        Self::relay_budget_over(
+            &mut self.relay_rtc_signal_budget,
+            device_id,
+            RELAY_RTC_SIGNAL_BUDGET,
+        )
+    }
+
+    fn relay_budget_over(
+        budget: &mut HashMap<String, (Instant, u32)>,
+        device_id: &str,
+        limit: u32,
+    ) -> bool {
         let now = Instant::now();
-        self.relay_request_budget
-            .retain(|_, (started, _)| now.duration_since(*started) < RELAY_REQUEST_WINDOW);
-        if self.relay_request_budget.len() >= MAX_RELAY_PEERS
-            && !self.relay_request_budget.contains_key(device_id)
-        {
+        budget.retain(|_, (started, _)| now.duration_since(*started) < RELAY_REQUEST_WINDOW);
+        if budget.len() >= MAX_RELAY_PEERS && !budget.contains_key(device_id) {
             return true;
         }
-        let entry = self
-            .relay_request_budget
-            .entry(device_id.to_owned())
-            .or_insert((now, 0));
+        let entry = budget.entry(device_id.to_owned()).or_insert((now, 0));
         if now.duration_since(entry.0) >= RELAY_REQUEST_WINDOW {
             *entry = (now, 0);
         }
         entry.1 = entry.1.saturating_add(1);
-        entry.1 > RELAY_REQUEST_BUDGET
+        entry.1 > limit
     }
 
     fn relay_prune_replays(&mut self) {
         let now = Instant::now();
-        self.relay_replays
-            .retain(|_, replay| now.duration_since(replay.seen_at) < RELAY_REPLAY_TTL);
+        self.relay_replays.retain(|_, replay| {
+            now.duration_since(replay.seen_at) < RELAY_REPLAY_TTL
+                && !matches!(
+                    &replay.result,
+                    RelayReplayResult::RetiredPreparedRtcDropped { expires_at, .. }
+                        if *expires_at <= now
+                )
+        });
     }
 
     fn relay_replay(&mut self, key: &str) -> Option<RelayReplay> {
