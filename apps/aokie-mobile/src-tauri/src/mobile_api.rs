@@ -157,6 +157,11 @@ struct TeamMember {
     #[serde(deserialize_with = "deserialize_required_nullable")]
     role_name: RequiredNullable<String>,
     is_current_user: bool,
+    // Schema 1 omitted this non-authoritative UI projection. Accepting that
+    // exact older shape keeps a newly updated client rollback-compatible;
+    // native serialization still always emits the explicit boolean to TS.
+    #[serde(default)]
+    is_current_device: bool,
     priority: u32,
     enabled: bool,
     availability: CompanionAvailabilityStatus,
@@ -753,6 +758,9 @@ impl TeamMember {
         if self.priority > 1_000_000 {
             return Err("routing member priority is invalid".into());
         }
+        if self.is_current_device && !self.is_current_user {
+            return Err("routing member current device is not owned by the current user".into());
+        }
         validate_timestamp(
             &self.availability_updated_at,
             "routing member availabilityUpdatedAt",
@@ -882,6 +890,15 @@ fn validate_groups(groups: &[RoutingGroup]) -> Result<(), String> {
         validate_text(&group.name, 120, "routing group name")?;
         if !ids.insert(&group.id) || group.members.len() > 200 {
             return Err("Companion routing group is duplicated or too large".into());
+        }
+        if group
+            .members
+            .iter()
+            .filter(|member| member.is_current_device)
+            .count()
+            > 1
+        {
+            return Err("Companion routing group identifies multiple current devices".into());
         }
         for member in &group.members {
             member.validate()?;
@@ -1211,7 +1228,7 @@ mod tests {
             "id":"group_1","name":"Primary","policy":"priority","enabled":true,
             "members":[{
               "staffId":"staff_1","displayName":"Test User","roleName":"Owner",
-              "isCurrentUser":true,"priority":1,"enabled":true,"availability":"available",
+              "isCurrentUser":true,"isCurrentDevice":true,"priority":1,"enabled":true,"availability":"available",
               "availabilityUpdatedAt":"2026-07-16 03:00:00","availabilityExpiresAt":null
             }]
           }],
@@ -1222,9 +1239,14 @@ mod tests {
         }"#;
         assert!(parse_response::<CompanionRouting>(routing.as_bytes()).is_ok());
 
+        let legacy = routing.replace("\"isCurrentDevice\":true,", "");
+        let parsed_legacy = parse_response::<CompanionRouting>(legacy.as_bytes())
+            .expect("schema-1 routing remains rollback-compatible");
+        assert!(!parsed_legacy.routing_groups[0].members[0].is_current_device);
+
         let mismatched = routing.replace(
-            "\"displayName\":\"Test User\",\"roleName\":\"Owner\",\n              \"isCurrentUser\":true,\"priority\"",
-            "\"displayName\":\"Wrong User\",\"roleName\":\"Owner\",\n              \"isCurrentUser\":true,\"priority\"",
+            "\"displayName\":\"Test User\",\"roleName\":\"Owner\",\n              \"isCurrentUser\":true,\"isCurrentDevice\":true,\"priority\"",
+            "\"displayName\":\"Wrong User\",\"roleName\":\"Owner\",\n              \"isCurrentUser\":true,\"isCurrentDevice\":true,\"priority\"",
         );
         assert!(parse_response::<CompanionRouting>(mismatched.as_bytes()).is_err());
 
@@ -1233,5 +1255,11 @@ mod tests {
             "\"staffId\":\"staff_outside_cap\"",
         );
         assert!(parse_response::<CompanionRouting>(capped_directory_member.as_bytes()).is_ok());
+
+        let foreign_current_device = routing.replace(
+            "\"isCurrentUser\":true,\"isCurrentDevice\":true,\"priority\"",
+            "\"isCurrentUser\":false,\"isCurrentDevice\":true,\"priority\"",
+        );
+        assert!(parse_response::<CompanionRouting>(foreign_current_device.as_bytes()).is_err());
     }
 }
