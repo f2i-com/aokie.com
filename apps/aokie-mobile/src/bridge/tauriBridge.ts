@@ -37,6 +37,7 @@ import type {
   NativeMediaSignal,
   NativeMediaSignalEvent,
   NativeMediaStateEvent,
+  NativeMediaLevelsEvent,
   NativeSdpSignal,
   RealtimeConfig,
   RuntimeCapabilities,
@@ -58,7 +59,7 @@ const SAFE_ID = /^[A-Za-z0-9._:-]{1,200}$/;
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const MEDIA_PHASE = /^[a-z][a-z0-9_]{0,63}$/;
 const MEDIA_MODES = new Set(["monitor", "prepared_consult", "prepared_talk", "consult", "talk"]);
-const V2_GRANTS = new Set<V2Grant>(["state_read", "caller_read", "captions_read", "assistance_read", "assistance_respond", "monitor", "consult", "takeover", "resume_aokie", "rtc_signal", "end_caller"]);
+const V2_GRANTS = new Set<V2Grant>(["state_read", "caller_read", "captions_read", "assistance_read", "assistance_respond", "monitor", "consult", "takeover", "resume_aokie", "rtc_signal", "end_caller", "participants_read", "participant_identity_read", "audio_levels_read"]);
 const V2_LEASE_MODES = new Set<V2LeaseMode>(["monitor", "consult", "takeover"]);
 const MAX_SDP_BYTES = 128 * 1024;
 const MAX_CANDIDATE_BYTES = 8 * 1024;
@@ -67,6 +68,7 @@ const DB_TIMESTAMP = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 const COMPANION_CAPABILITIES = new Set<CompanionCapability>([
   "state_read", "caller_read", "captions_read", "monitor", "consult", "takeover",
   "resume_aokie", "rtc_signal", "assistance_read", "assistance_respond", "end_caller",
+  "participants_read", "participant_identity_read", "audio_levels_read",
 ]);
 const COMPANION_AVAILABILITY = new Set<CompanionAvailabilityState>(["available", "busy", "offline", "do_not_disturb"]);
 const COMPANION_SESSION_MODES = new Set(["monitor", "consult", "takeover"]);
@@ -243,6 +245,25 @@ export function parseNativeMediaStateEvent(value: unknown): NativeMediaStateEven
     microphoneActive: event.microphoneActive,
     remoteAudioReady: event.remoteAudioReady,
     ...(typeof event.reason === "string" ? { reason: event.reason } : {}),
+  };
+}
+
+export function parseNativeMediaLevelsEvent(value: unknown): NativeMediaLevelsEvent | null {
+  if (value === null) return null;
+  const event = record(value, "native media levels event");
+  exactKeys(event, ["session", "microphoneLevelPermille", "remoteLevelPermille", "measuredAt"], "native media levels event");
+  const parseLevel = (level: unknown, label: string): number | undefined => {
+    if (level === undefined) return undefined;
+    if (!Number.isInteger(level) || Number(level) < 0 || Number(level) > 1_000) {
+      throw new Error(`Invalid native ${label} level`);
+    }
+    return Number(level);
+  };
+  return {
+    session: parseNativeMediaSession(event.session),
+    microphoneLevelPermille: parseLevel(event.microphoneLevelPermille, "microphone"),
+    remoteLevelPermille: parseLevel(event.remoteLevelPermille, "remote audio"),
+    measuredAt: timestamp(event.measuredAt, "native media level measurement"),
   };
 }
 
@@ -587,7 +608,7 @@ export function parseV2Snapshot(value: unknown): V2CallSnapshotEvent {
   exactKeys(snapshot, [
     "callId", "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "telephonyState", "serviceMode",
     "mediaState", "remoteCapabilities", "secondaryCallPolicy", "secondaryCall", "remoteConsent", "caller", "captions",
-    "participants", "audioLevels", "pendingMobileOffers", "occurredAt",
+    "participants", "audioLevels", "companionMicrophoneMuted", "pendingMobileOffers", "occurredAt",
   ], "protocol-v2 call snapshot");
   const telephony = new Set(["ringing", "active", "held", "ending", "ended"]);
   const service = new Set(["aokie_active", "soft_hold", "consult_pending", "consult_active", "human_pending", "human_active", "returning_to_aokie", "recovering", "ended"]);
@@ -689,6 +710,12 @@ export function parseV2Snapshot(value: unknown): V2CallSnapshotEvent {
       levelKeys.add(levelKey);
     }
   }
+  if (snapshot.companionMicrophoneMuted !== undefined && typeof snapshot.companionMicrophoneMuted !== "boolean") {
+    throw new Error("Invalid protocol-v2 microphone mute state");
+  }
+  if (snapshot.companionMicrophoneMuted === true && snapshot.serviceMode !== "consult_active" && snapshot.serviceMode !== "human_active") {
+    throw new Error("Unsafe protocol-v2 microphone mute state");
+  }
   if (!Array.isArray(snapshot.pendingMobileOffers) || snapshot.pendingMobileOffers.length > 8) throw new Error("Invalid protocol-v2 mobile offers");
   const offerIds = new Set<string>();
   const offerJtis = new Set<string>();
@@ -701,7 +728,7 @@ export function parseV2Snapshot(value: unknown): V2CallSnapshotEvent {
     const offer = record(signedOffer.offer, "protocol-v2 mobile offer");
     exactKeys(offer, [
       "offerId", "opportunityId", "targetDeviceId", "targetHolderKeyThumbprint", "offeredMode", "surface", "appId", "callId",
-      "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "requiredConsentPolicyId", "requiredConsentPolicyVersion",
+      "callEpoch", "ownerEpoch", "switchboardRevision", "remoteRevision", "acceptedTransferRequestId", "requiredConsentPolicyId", "requiredConsentPolicyVersion",
       "requiredGrants", "issuedAt", "expiresAt", "jti",
     ], "protocol-v2 mobile offer");
     const offerId = safeIdentifier(offer.offerId, "mobile offer ID");
@@ -723,6 +750,10 @@ export function parseV2Snapshot(value: unknown): V2CallSnapshotEvent {
     const ownerEpoch = safeInteger(offer.ownerEpoch, 0, "mobile offer owner epoch");
     const switchboardRevision = safeInteger(offer.switchboardRevision, 0, "mobile offer switchboard revision");
     const remoteRevision = safeInteger(offer.remoteRevision, 0, "mobile offer remote revision");
+    if (offer.acceptedTransferRequestId !== undefined) {
+      safeIdentifier(offer.acceptedTransferRequestId, "accepted transfer request ID");
+      if (offer.offeredMode !== "takeover") throw new Error("Unsafe protocol-v2 transfer offer");
+    }
     const consentVersion = safeInteger(offer.requiredConsentPolicyVersion, 1, "mobile offer consent policy version");
     const issuedAt = safeInteger(offer.issuedAt, 0, "mobile offer issue time");
     const expiresAt = safeInteger(offer.expiresAt, 1, "mobile offer expiry");
@@ -737,7 +768,8 @@ export function parseV2Snapshot(value: unknown): V2CallSnapshotEvent {
       return grant as V2Grant;
     });
     const modeGrant = offer.offeredMode as V2LeaseMode;
-    if (new Set(requiredGrants).size !== requiredGrants.length || !requiredGrants.includes("state_read") || !requiredGrants.includes("rtc_signal") || !requiredGrants.includes(modeGrant)) {
+    if (new Set(requiredGrants).size !== requiredGrants.length || !requiredGrants.includes("state_read") || !requiredGrants.includes("rtc_signal") || !requiredGrants.includes(modeGrant) ||
+        (offer.acceptedTransferRequestId !== undefined && !requiredGrants.includes("assistance_respond"))) {
       throw new Error("Unsafe protocol-v2 mobile offer grants");
     }
   }
@@ -749,7 +781,13 @@ export function parseV2Snapshot(value: unknown): V2CallSnapshotEvent {
   safeInteger(snapshot.switchboardRevision, 0, "protocol-v2 switchboard revision");
   safeInteger(snapshot.remoteRevision, 0, "protocol-v2 remote revision");
   timestamp(snapshot.occurredAt, "protocol-v2 timestamp");
-  return frame as unknown as V2CallSnapshotEvent;
+  return {
+    ...frame,
+    snapshot: {
+      ...snapshot,
+      companionMicrophoneMuted: snapshot.companionMicrophoneMuted === true,
+    },
+  } as unknown as V2CallSnapshotEvent;
 }
 
 export function parseV2IdleSync(value: unknown): V2IdleSyncEvent {
@@ -777,7 +815,7 @@ export function parseV2Assistance(value: unknown): V2AssistanceRequestEvent | nu
   const frame = record(value, "protocol-v2 assistance request");
   exactKeys(frame, [
     "kind", "schemaVersion", "appId", "eventId", "requestId", "callId", "callEpoch", "ownerEpoch",
-    "switchboardRevision", "remoteRevision", "question", "context", "expiresAt",
+    "switchboardRevision", "remoteRevision", "question", "context", "transferOffered", "expiresAt",
   ], "protocol-v2 assistance request");
   if (frame.kind !== "assistance_request" || frame.schemaVersion !== 2) throw new Error("Invalid protocol-v2 assistance request");
   safeIdentifier(frame.appId, "assistance app ID");
@@ -796,7 +834,10 @@ export function parseV2Assistance(value: unknown): V2AssistanceRequestEvent | nu
   if (frame.context !== undefined && (typeof frame.context !== "string" || !frame.context.trim() || frame.context.length > 2_000 || /[\u0000-\u001f\u007f]/.test(frame.context))) {
     throw new Error("Invalid protocol-v2 assistance context");
   }
-  return frame as unknown as V2AssistanceRequestEvent;
+  if (frame.transferOffered !== undefined && typeof frame.transferOffered !== "boolean") {
+    throw new Error("Invalid protocol-v2 transfer offer");
+  }
+  return { ...frame, transferOffered: frame.transferOffered === true } as unknown as V2AssistanceRequestEvent;
 }
 
 export function parseV2AssistanceAnswerAccepted(value: unknown): V2AssistanceAnswerAcceptedEvent {
@@ -1492,9 +1533,15 @@ export class TauriCompanionBridge implements CompanionBridge {
     await invoke("realtime_send", { command });
   }
 
-  async requestV2Lease(mode: V2LeaseMode): Promise<V2RequestReceipt> {
+  async requestV2Lease(mode: V2LeaseMode, acceptedTransferRequestId?: string): Promise<V2RequestReceipt> {
     if (!V2_LEASE_MODES.has(mode)) throw new Error("Unsupported protocol-v2 lease mode");
-    return parseRequestReceipt(await invoke("realtime_v2_request_lease", { mode }));
+    if (acceptedTransferRequestId !== undefined) {
+      safeIdentifier(acceptedTransferRequestId, "accepted transfer request ID");
+      if (mode !== "takeover") throw new Error("Only takeover can accept a transfer request");
+    }
+    return parseRequestReceipt(await invoke("realtime_v2_request_lease", {
+      request: { mode, ...(acceptedTransferRequestId ? { acceptedTransferRequestId } : {}) },
+    }));
   }
 
   async revokeV2Lease(reason: string): Promise<V2RequestReceipt> {
@@ -1502,11 +1549,19 @@ export class TauriCompanionBridge implements CompanionBridge {
     return parseRequestReceipt(await invoke("realtime_v2_revoke_lease", { reason }));
   }
 
-  async answerV2Assistance(requestId: string, answer: string): Promise<{ requestId: string; answerId: string }> {
+  async answerV2Assistance(requestId: string, answer: string, responseAction: "answer" | "decline" = "answer"): Promise<{ requestId: string; answerId: string }> {
     safeIdentifier(requestId, "assistance request ID");
+    if (responseAction !== "answer" && responseAction !== "decline") throw new Error("Invalid assistance response action");
     if (!answer.trim() || answer.length > 2_000 || /[\u0000-\u001f\u007f]/.test(answer)) throw new Error("Invalid assistance answer");
     return parseAssistanceReceipt(await invoke("realtime_v2_answer_assistance", {
-      request: { requestId, answer: answer.trim() },
+      request: { requestId, responseAction, answer: answer.trim() },
+    }));
+  }
+
+  async setV2MicrophoneMuted(muted: boolean): Promise<V2RequestReceipt> {
+    if (typeof muted !== "boolean") throw new Error("Invalid microphone mute request");
+    return parseRequestReceipt(await invoke("realtime_v2_set_microphone_muted", {
+      request: { muted },
     }));
   }
 
@@ -1680,6 +1735,14 @@ export class TauriCompanionBridge implements CompanionBridge {
         } catch (error) {
           this.emit({ type: "local_media", value: null });
           this.emit({ type: "error", message: error instanceof Error ? error.message : "Invalid native media state" });
+        }
+      }),
+      listen<unknown>("aokie-companion://media-levels", ({ payload }) => {
+        try {
+          this.emit({ type: "media_levels", value: parseNativeMediaLevelsEvent(payload) });
+        } catch (error) {
+          this.emit({ type: "media_levels", value: null });
+          this.emit({ type: "error", message: error instanceof Error ? error.message : "Invalid native media levels" });
         }
       }),
       listen<unknown>("aokie-companion://v2-snapshot", ({ payload }) => {

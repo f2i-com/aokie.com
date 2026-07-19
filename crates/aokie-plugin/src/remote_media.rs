@@ -18,7 +18,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aokie_media::{
     DesktopPeer, IceCandidateSignal, IceServerConfig, MediaMode, OwnedAudioFrame, PeerEvent,
@@ -55,6 +55,11 @@ const ONGOING_TALK_PCM_TIMEOUT: Duration = Duration::from_secs(2);
 /// must return the caller to Aokie just as aggressively as takeover.
 const FIRST_CONSULT_PCM_TIMEOUT: Duration = Duration::from_secs(1);
 const ONGOING_CONSULT_PCM_TIMEOUT: Duration = Duration::from_secs(2);
+/// Hold a real endpoint sample briefly, then decay it linearly. If no PCM has
+/// arrived by the stale bound the source is omitted rather than fabricated as
+/// silent/connected.
+const AUDIO_LEVEL_HOLD: Duration = Duration::from_millis(180);
+const AUDIO_LEVEL_STALE: Duration = Duration::from_millis(1_500);
 
 /// The radio-owned service state.  `HumanActive` is entered only after the
 /// radio thread has flushed caller TX and acknowledged the pending permit.
@@ -92,12 +97,48 @@ pub struct RemoteMediaSnapshot {
     /// True only after an authorized microphone frame for the exact active
     /// talk binding reached the caller-bound Bluetooth enqueue seam.
     pub talk_audio_forwarded: bool,
+    pub microphone_muted: bool,
     pub radio_reserved: bool,
     pub dropped_sco_frames: u64,
     pub quarantined_talk_frames: u64,
     pub dropped_events: u64,
     pub consent: RemoteConsentGate,
     pub captions: Vec<RemoteCaption>,
+    pub participants: Vec<RemoteParticipant>,
+    pub audio_levels: Vec<RemoteAudioLevel>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteParticipantState {
+    Connected,
+    Prepared,
+    Active,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteParticipant {
+    pub participant_id: String,
+    pub device_id: String,
+    pub mode: MediaMode,
+    pub state: RemoteParticipantState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAudioLevelSource {
+    Caller,
+    Aokie,
+    Companion,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAudioLevel {
+    pub source: RemoteAudioLevelSource,
+    pub participant_id: Option<String>,
+    pub level_permille: u16,
 }
 
 /// Exact proof that Aokie, rather than a pending/active Companion route, owns
@@ -158,13 +199,13 @@ impl Default for RemoteConsentGate {
 }
 
 impl RemoteConsentGate {
-    fn is_current(&self) -> bool {
+    pub(crate) fn is_current(&self) -> bool {
         self.enabled
             && self.acknowledged
-            && self
-                .expires_at
-                .as_deref()
-                .is_none_or(|expiry| expiry > aokie_core::events::now_iso8601().as_str())
+            && self.expires_at.as_deref().is_none_or(|expiry| {
+                chrono::DateTime::parse_from_rfc3339(expiry)
+                    .is_ok_and(|expiry| expiry > chrono::Utc::now())
+            })
     }
 
     fn allows(&self, mode: MediaMode) -> bool {
@@ -340,6 +381,30 @@ struct CallRecord {
 struct PendingRoute {
     permit: RoutePermit,
     transition_dispatched: bool,
+    transfer_guard: Option<TransferActivationGuard>,
+}
+
+#[derive(Clone)]
+struct TransferActivationGuard {
+    request_id: String,
+    offered_fence: crate::assistance::AssistanceCallFence,
+    device_id: String,
+    deadline: Instant,
+}
+
+fn bounded_transfer_deadline(
+    setup_expires_at: u64,
+    now_unix: u64,
+    now_monotonic: Instant,
+) -> Result<Instant, String> {
+    let remaining = setup_expires_at
+        .checked_sub(now_unix)
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| "accepted transfer setup deadline expired".to_string())?
+        .min(crate::assistance::TRANSFER_SETUP_SECONDS);
+    now_monotonic
+        .checked_add(Duration::from_secs(remaining))
+        .ok_or_else(|| "accepted transfer setup deadline is out of range".to_string())
 }
 
 #[derive(Clone)]
@@ -381,6 +446,21 @@ struct ActiveRoute {
     last_forwarded_at: Option<Instant>,
 }
 
+#[derive(Clone)]
+struct ObservedAudioLevel {
+    call_id: String,
+    call_epoch: u64,
+    participant_id: Option<String>,
+    level_permille: u16,
+    observed_at: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallerOutputAttribution {
+    Aokie,
+    Companion,
+}
+
 struct RemoteMediaState {
     calls: HashMap<String, CallRecord>,
     call_order: VecDeque<String>,
@@ -405,6 +485,10 @@ struct RemoteMediaState {
     pending_route: Option<PendingRoute>,
     active_route: Option<ActiveRoute>,
     talk_audio_binding: Option<SessionBinding>,
+    microphone_mute_binding: Option<SessionBinding>,
+    caller_audio_level: Option<ObservedAudioLevel>,
+    aokie_audio_level: Option<ObservedAudioLevel>,
+    companion_audio_levels: HashMap<String, ObservedAudioLevel>,
     return_binding: Option<SessionBinding>,
     return_reason: Option<String>,
     return_dispatched: bool,
@@ -432,6 +516,10 @@ impl Default for RemoteMediaState {
             pending_route: None,
             active_route: None,
             talk_audio_binding: None,
+            microphone_mute_binding: None,
+            caller_audio_level: None,
+            aokie_audio_level: None,
+            companion_audio_levels: HashMap::new(),
             return_binding: None,
             return_reason: None,
             return_dispatched: false,
@@ -545,95 +633,103 @@ impl RemoteMediaHandle {
     }
 
     pub fn snapshot(&self) -> RemoteMediaSnapshot {
-        let state = self.inner.state.lock().ok();
-        let (
-            call_id,
-            call_epoch,
-            owner_epoch,
-            remote_revision,
-            service_mode,
-            peer_count,
-            binding,
-            talk_audio_forwarded,
-            consent,
-            captions,
-        ) = state
+        let Some(state) = self.inner.state.lock().ok() else {
+            return RemoteMediaSnapshot {
+                call_id: None,
+                call_epoch: 0,
+                owner_epoch: 0,
+                remote_revision: 0,
+                service_mode: ServiceMode::Recovering,
+                peer_count: 0,
+                talk_device_id: None,
+                talk_lease_id: None,
+                talk_fence: 0,
+                talk_audio_forwarded: false,
+                microphone_muted: false,
+                radio_reserved: self.radio_reserved(),
+                dropped_sco_frames: self.inner.dropped_sco_frames.load(Ordering::Relaxed),
+                quarantined_talk_frames: self.inner.quarantined_talk_frames.load(Ordering::Relaxed),
+                dropped_events: self.inner.dropped_events.load(Ordering::Relaxed),
+                consent: RemoteConsentGate::default(),
+                captions: Vec::new(),
+                participants: Vec::new(),
+                audio_levels: Vec::new(),
+            };
+        };
+        let current = state.current_record();
+        let call_id = state.current_call_id.clone();
+        let call_epoch = current.map_or(0, |record| record.call_epoch);
+        let owner_epoch = current.map_or(0, |record| record.owner_epoch);
+        let binding = state
+            .active_route
             .as_ref()
-            .map(|state| {
-                let current = state.current_record();
-                let route = state
-                    .active_route
+            .map(|route| &route.permit.binding)
+            .or_else(|| state.active_consult.as_ref().map(|route| &route.binding))
+            .or_else(|| {
+                state
+                    .pending_route
                     .as_ref()
                     .map(|route| &route.permit.binding)
-                    .or_else(|| state.active_consult.as_ref().map(|route| &route.binding))
-                    .or_else(|| {
-                        state
-                            .pending_route
-                            .as_ref()
-                            .map(|route| &route.permit.binding)
-                    })
-                    .or_else(|| {
-                        state
-                            .pending_consult
-                            .as_ref()
-                            .map(|pending| &pending.binding)
-                    })
-                    .or_else(|| {
-                        state
-                            .pending_prepare
-                            .as_ref()
-                            .map(|pending| &pending.binding)
-                    })
-                    .or_else(|| {
-                        state
-                            .prepared_claim
-                            .as_ref()
-                            .map(|prepared| &prepared.provisional_binding)
-                    });
-                (
-                    state.current_call_id.clone(),
-                    current.map_or(0, |record| record.call_epoch),
-                    current.map_or(0, |record| record.owner_epoch),
-                    state.remote_revision,
-                    state.service_mode,
-                    state.peers.len(),
-                    route.cloned(),
-                    route.is_some_and(|binding| state.talk_audio_binding.as_ref() == Some(binding)),
-                    state.consent.effective(),
-                    state.captions.iter().cloned().collect::<Vec<_>>(),
-                )
             })
-            .unwrap_or((
-                None,
-                0,
-                0,
-                0,
-                ServiceMode::Recovering,
-                0,
-                None,
-                false,
-                RemoteConsentGate::default(),
-                Vec::new(),
-            ));
+            .or_else(|| {
+                state
+                    .pending_consult
+                    .as_ref()
+                    .map(|pending| &pending.binding)
+            })
+            .or_else(|| {
+                state
+                    .pending_prepare
+                    .as_ref()
+                    .map(|pending| &pending.binding)
+            })
+            .or_else(|| {
+                state
+                    .prepared_claim
+                    .as_ref()
+                    .map(|prepared| &prepared.provisional_binding)
+            })
+            .cloned();
+        let mut participants = state
+            .peers
+            .values()
+            .map(|slot| RemoteParticipant {
+                participant_id: companion_participant_id(&slot.binding),
+                device_id: slot.binding.device_id.clone(),
+                mode: slot.binding.mode,
+                state: state.participant_state(&slot.binding),
+            })
+            .collect::<Vec<_>>();
+        participants.sort_by(|left, right| left.participant_id.cmp(&right.participant_id));
+        let audio_levels = state.current_audio_levels(Instant::now());
+        let microphone_muted = state
+            .microphone_mute_binding
+            .as_ref()
+            .is_some_and(|muted| state.binding_is_active_media_owner(muted, Instant::now()));
         RemoteMediaSnapshot {
             call_id,
             call_epoch,
             owner_epoch,
-            remote_revision,
-            service_mode,
-            peer_count,
+            remote_revision: state.remote_revision,
+            service_mode: state.service_mode,
+            peer_count: state.peers.len(),
             talk_device_id: binding.as_ref().map(|binding| binding.device_id.clone()),
             talk_lease_id: binding
                 .as_ref()
                 .and_then(|binding| binding.lease_id.clone()),
             talk_fence: binding.as_ref().map_or(0, |binding| binding.fence),
-            talk_audio_forwarded,
-            radio_reserved: self.radio_reserved(),
+            talk_audio_forwarded: binding
+                .as_ref()
+                .is_some_and(|binding| state.talk_audio_binding.as_ref() == Some(binding)),
+            microphone_muted,
+            radio_reserved: state.radio_reserved(),
             dropped_sco_frames: self.inner.dropped_sco_frames.load(Ordering::Relaxed),
             quarantined_talk_frames: self.inner.quarantined_talk_frames.load(Ordering::Relaxed),
             dropped_events: self.inner.dropped_events.load(Ordering::Relaxed),
-            consent,
-            captions,
+            consent: state.consent.effective(),
+            captions: state.captions.iter().cloned().collect(),
+            participants,
+            audio_levels,
         }
     }
 
@@ -858,6 +954,7 @@ impl RemoteMediaHandle {
                 state.pending_prepare = None;
                 state.prepared_claim = None;
                 state.talk_audio_binding = None;
+                state.clear_binding_observations(&binding);
                 state.return_dispatched = false;
                 if needs_return {
                     state.return_binding = Some(binding);
@@ -1017,6 +1114,82 @@ impl RemoteMediaHandle {
         })
     }
 
+    /// Change the Desktop-owned microphone gate for one exact active media
+    /// owner. The caller's switchboard revision is fenced by the gateway; the
+    /// media revision is rechecked here while the same lock that gates PCM is
+    /// held, then advanced as the authoritative acknowledgement.
+    pub fn set_microphone_muted(
+        &self,
+        binding: &SessionBinding,
+        expected_remote_revision: u64,
+        muted: bool,
+    ) -> Result<u64, String> {
+        let revision = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| "remote media state poisoned".to_string())?
+            .set_microphone_muted(binding, expected_remote_revision, muted, Instant::now())?;
+        self.refresh_reserved();
+        Ok(revision)
+    }
+
+    /// Linearize the final Desktop-to-caller write against mute authority.
+    /// When this returns, a successful mute acknowledgement cannot race one
+    /// more Bluetooth write that was already popped from the WebRTC queue.
+    pub fn send_talk_pcm_if_unmuted<F>(
+        &self,
+        binding: &SessionBinding,
+        samples: &[i16],
+        send: F,
+    ) -> bool
+    where
+        F: FnOnce() -> bool,
+    {
+        if samples.is_empty() {
+            return false;
+        }
+        let (sent, first) = {
+            let Ok(mut state) = self.inner.state.lock() else {
+                return false;
+            };
+            let now = Instant::now();
+            if !state.allows_talk(binding, now)
+                || state.microphone_is_muted_for(binding, now)
+                || !send()
+            {
+                return false;
+            }
+            let Some(route) = state.active_route.as_mut() else {
+                return false;
+            };
+            if route.permit.binding != *binding {
+                return false;
+            }
+            route.last_forwarded_at = Some(now);
+            state.observe_companion_audio(binding, samples, now);
+            let first = state.talk_audio_binding.as_ref() != Some(binding);
+            if first {
+                state.talk_audio_binding = Some(binding.clone());
+                state.bump_revision();
+            }
+            (true, first)
+        };
+        if first {
+            let (peak, level_permille) = pcm_level_summary(samples);
+            eprintln!(
+                "[aokie-plugin][takeover] stage=microphone_pcm_to_sco call={} owner_epoch={} rtc={} samples={} rate_level_permille={} peak={}",
+                binding.call_id,
+                binding.owner_epoch,
+                binding.rtc_session_id,
+                samples.len(),
+                level_permille,
+                peak,
+            );
+        }
+        sent
+    }
+
     /// Records the first exact caller-bound frame accepted by the Bluetooth
     /// runtime. This is deliberately later than "microphone armed" and later
     /// than WebRTC track negotiation, so protocol snapshots cannot claim an
@@ -1030,7 +1203,7 @@ impl RemoteMediaHandle {
                 return false;
             };
             let now = Instant::now();
-            if !state.allows_talk(binding, now) {
+            if !state.allows_talk(binding, now) || state.microphone_is_muted_for(binding, now) {
                 return false;
             }
             let Some(route) = state.active_route.as_mut() else {
@@ -1040,6 +1213,7 @@ impl RemoteMediaHandle {
                 return false;
             }
             route.last_forwarded_at = Some(now);
+            state.observe_companion_audio(binding, samples, now);
             if state.talk_audio_binding.as_ref() == Some(binding) {
                 false
             } else {
@@ -1078,6 +1252,53 @@ impl RemoteMediaHandle {
         binding: SessionBinding,
         lease_ttl_ms: u64,
     ) -> Result<(), String> {
+        self.request_takeover_with_guard(binding, lease_ttl_ms, None)
+    }
+
+    /// Request a takeover that is valid only for one accepted assistance
+    /// transfer and only until its separate setup deadline. The deadline is
+    /// converted once to monotonic time and travels with the pending route all
+    /// the way to the radio ACK linearization point.
+    pub fn request_transfer_takeover(
+        &self,
+        binding: SessionBinding,
+        lease_ttl_ms: u64,
+        request_id: String,
+        offered_fence: crate::assistance::AssistanceCallFence,
+        device_id: String,
+        setup_expires_at: u64,
+    ) -> Result<(), String> {
+        if binding.device_id != device_id
+            || binding.call_id != offered_fence.call_id
+            || binding.call_epoch != offered_fence.call_epoch
+            || !crate::assistance::global().transfer_activation_is_current(
+                &request_id,
+                &offered_fence,
+                &device_id,
+            )
+        {
+            return Err("accepted transfer is no longer current before takeover setup".into());
+        }
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch".to_string())?
+            .as_secs();
+        let deadline = bounded_transfer_deadline(setup_expires_at, now_unix, Instant::now())?;
+        let guard = TransferActivationGuard {
+            request_id,
+            offered_fence,
+            device_id,
+            deadline,
+        };
+        self.request_takeover_with_guard(binding, lease_ttl_ms, Some(guard))
+    }
+
+    fn request_takeover_with_guard(
+        &self,
+        binding: SessionBinding,
+        lease_ttl_ms: u64,
+        transfer_guard: Option<TransferActivationGuard>,
+    ) -> Result<(), String> {
         let ttl = validate_ttl(lease_ttl_ms)?;
         {
             let mut state = self
@@ -1088,7 +1309,7 @@ impl RemoteMediaHandle {
             if !state.consent.allows(MediaMode::Talk) {
                 return Err("current remote consent does not permit takeover".into());
             }
-            state.request_takeover(binding.clone(), ttl)?;
+            state.request_takeover_guarded(binding.clone(), ttl, transfer_guard)?;
         }
         self.refresh_reserved();
         self.emit(binding, RemoteMediaEventKind::TakeoverPending);
@@ -1234,7 +1455,16 @@ impl RemoteMediaHandle {
     /// preventing local microphone echo and preserving the PstnIn-only talker
     /// contract.
     pub fn try_push_caller_output(&self, samples: &[i16], sample_rate: u32) {
-        self.inner.try_push_caller_output(samples, sample_rate);
+        self.inner
+            .try_push_caller_output(samples, sample_rate, CallerOutputAttribution::Aokie);
+    }
+
+    /// Mirror caller-bound owner PCM to listen-only peers without attributing
+    /// it to Aokie. The exact Companion participant meter was already updated
+    /// at the mute/lease-gated talk seam before this mirror is reached.
+    pub fn try_mirror_companion_output(&self, samples: &[i16], sample_rate: u32) {
+        self.inner
+            .try_push_caller_output(samples, sample_rate, CallerOutputAttribution::Companion);
     }
 
     /// Internal-only consult consumer.  It is separate from the caller-bound
@@ -1249,12 +1479,15 @@ impl RemoteMediaHandle {
                 .and_then(|receiver| receiver.try_recv().ok())?;
             let allowed = self.inner.state.lock().ok().is_some_and(|mut state| {
                 let now = Instant::now();
-                if !state.allows_consult(&routed.binding, now) {
+                if !state.allows_consult(&routed.binding, now)
+                    || state.microphone_is_muted_for(&routed.binding, now)
+                {
                     return false;
                 }
                 if let Some(active) = state.active_consult.as_mut() {
                     active.last_received_at = Some(now);
                 }
+                state.observe_companion_audio(&routed.binding, &routed.frame.samples, now);
                 true
             });
             self.refresh_reserved();
@@ -1304,12 +1537,11 @@ impl RemoteMediaHandle {
                 .try_lock()
                 .ok()
                 .and_then(|receiver| receiver.try_recv().ok())?;
-            let allowed = self
-                .inner
-                .state
-                .lock()
-                .ok()
-                .is_some_and(|mut state| state.allows_talk(&routed.binding, Instant::now()));
+            let allowed = self.inner.state.lock().ok().is_some_and(|mut state| {
+                let now = Instant::now();
+                state.allows_talk(&routed.binding, now)
+                    && !state.microphone_is_muted_for(&routed.binding, now)
+            });
             self.refresh_reserved();
             if allowed {
                 return Some(routed.frame);
@@ -1374,13 +1606,32 @@ impl RemoteMediaHandle {
     /// Physical ACK from the radio loop after flushing every queued Aokie
     /// sample.  Only this operation opens both transmit gates.
     pub fn ack_enter_human(&self, binding: &SessionBinding) -> Result<(), String> {
+        let transfer_authorized = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| "remote media state poisoned".to_string())?;
+            state
+                .pending_route
+                .as_ref()
+                .filter(|pending| pending.permit.binding == *binding)
+                .and_then(|pending| pending.transfer_guard.clone())
+        }
+        .is_none_or(|guard| {
+            crate::assistance::global().transfer_activation_is_current(
+                &guard.request_id,
+                &guard.offered_fence,
+                &guard.device_id,
+            )
+        });
         let (actor, permit) = {
             let mut state = self
                 .inner
                 .state
                 .lock()
                 .map_err(|_| "remote media state poisoned".to_string())?;
-            state.ack_enter(binding, Instant::now())?
+            state.ack_enter(binding, Instant::now(), transfer_authorized)?
         };
         actor
             .try_send(ActorCommand::Authorize(permit))
@@ -1495,6 +1746,35 @@ impl RemoteMediaHandle {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_test_active_talk_peer(
+        &self,
+        binding: SessionBinding,
+        lease_ttl_ms: u64,
+    ) -> Result<(), String> {
+        let ttl = validate_ttl(lease_ttl_ms)?;
+        let (actor_tx, _actor_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
+        let (remote_ice_tx, _remote_ice_rx) = mpsc::channel(REMOTE_ICE_QUEUE_CAPACITY);
+        let (caller_pcm_tx, _caller_pcm_rx) = mpsc::channel(CALLER_PCM_QUEUE_CAPACITY);
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| "remote media state poisoned".to_string())?;
+        state.insert_peer(PeerSlot {
+            binding: binding.clone(),
+            lease_expires_at: Instant::now() + ttl,
+            actor_tx,
+            remote_ice_tx,
+            caller_pcm_tx,
+        })?;
+        state.request_takeover(binding.clone(), ttl)?;
+        let _ = state.ack_enter(&binding, Instant::now(), false)?;
+        drop(state);
+        self.refresh_reserved();
+        Ok(())
+    }
+
     fn remote_ice_for(
         &self,
         rtc_session_id: &str,
@@ -1602,25 +1882,28 @@ impl RemoteMediaInner {
         if normalized.is_empty() {
             return;
         }
-        let Ok(state) = self.state.try_lock() else {
+        let Ok(mut state) = self.state.try_lock() else {
             self.dropped_sco_frames.fetch_add(1, Ordering::Relaxed);
             return;
         };
         let now = Instant::now();
-        let Some(current_id) = state.current_call_id.as_deref() else {
+        let Some(current_id) = state.current_call_id.clone() else {
             return;
         };
         let Some(record) = state.current_record() else {
             return;
         };
+        let call_epoch = record.call_epoch;
+        let owner_epoch = record.owner_epoch;
+        state.observe_caller_audio(&normalized, now);
         for slot in state.peers.values() {
             if !routes_caller_ingress(
                 &state.consent,
                 slot,
                 now,
-                current_id,
-                record.call_epoch,
-                record.owner_epoch,
+                &current_id,
+                call_epoch,
+                owner_epoch,
             ) {
                 continue;
             }
@@ -1630,7 +1913,12 @@ impl RemoteMediaInner {
         }
     }
 
-    fn try_push_caller_output(&self, samples: &[i16], sample_rate: u32) {
+    fn try_push_caller_output(
+        &self,
+        samples: &[i16],
+        sample_rate: u32,
+        attribution: CallerOutputAttribution,
+    ) {
         if samples.is_empty() || sample_rate == 0 {
             return;
         }
@@ -1638,25 +1926,30 @@ impl RemoteMediaInner {
         if normalized.is_empty() {
             return;
         }
-        let Ok(state) = self.state.try_lock() else {
+        let Ok(mut state) = self.state.try_lock() else {
             self.dropped_sco_frames.fetch_add(1, Ordering::Relaxed);
             return;
         };
         let now = Instant::now();
-        let Some(current_id) = state.current_call_id.as_deref() else {
+        let Some(current_id) = state.current_call_id.clone() else {
             return;
         };
         let Some(record) = state.current_record() else {
             return;
         };
+        let call_epoch = record.call_epoch;
+        let owner_epoch = record.owner_epoch;
+        if attribution == CallerOutputAttribution::Aokie {
+            state.observe_aokie_audio(&normalized, now);
+        }
         for slot in state.peers.values() {
             if !routes_caller_output(
                 &state.consent,
                 slot,
                 now,
-                current_id,
-                record.call_epoch,
-                record.owner_epoch,
+                &current_id,
+                call_epoch,
+                owner_epoch,
             ) {
                 continue;
             }
@@ -1687,7 +1980,7 @@ pub fn try_capture_caller_output_globally(samples: &[i16], sample_rate: u32) {
     let Some(inner) = slot.try_lock().ok().and_then(|active| active.upgrade()) else {
         return;
     };
-    inner.try_push_caller_output(samples, sample_rate);
+    inner.try_push_caller_output(samples, sample_rate, CallerOutputAttribution::Aokie);
 }
 
 /// Publish one finalized caption from the existing live STT/delivery source.
@@ -1819,6 +2112,210 @@ impl RemoteMediaState {
         self.calls.get_mut(&call_id)
     }
 
+    fn participant_state(&self, binding: &SessionBinding) -> RemoteParticipantState {
+        if self.binding_is_active_media_owner(binding, Instant::now()) {
+            RemoteParticipantState::Active
+        } else if binding.mode == MediaMode::Monitor {
+            RemoteParticipantState::Connected
+        } else {
+            // A non-monitor peer is never represented as an active speaker
+            // merely because its DTLS transport connected. Until the exact
+            // radio-owned route is active it remains prepared.
+            RemoteParticipantState::Prepared
+        }
+    }
+
+    fn binding_is_active_media_owner(&self, binding: &SessionBinding, now: Instant) -> bool {
+        if !self.current_call_active
+            || self.current_call_id.as_deref() != Some(binding.call_id.as_str())
+            || self.current_record().is_none_or(|record| {
+                record.call_epoch != binding.call_epoch || record.owner_epoch != binding.owner_epoch
+            })
+        {
+            return false;
+        }
+        let live_peer = self
+            .peers
+            .get(&binding.rtc_session_id)
+            .is_some_and(|slot| slot.binding == *binding && slot.lease_expires_at > now);
+        if !live_peer {
+            return false;
+        }
+        match binding.mode {
+            MediaMode::Talk => {
+                self.service_mode == ServiceMode::HumanActive
+                    && self.consent.allows(MediaMode::Talk)
+                    && self.active_route.as_ref().is_some_and(|route| {
+                        route.permit.binding == *binding
+                            && route.permit.is_current_for(binding, now)
+                    })
+            }
+            MediaMode::Consult => {
+                self.service_mode == ServiceMode::ConsultActive
+                    && self.consent.allows(MediaMode::Consult)
+                    && self
+                        .active_consult
+                        .as_ref()
+                        .is_some_and(|route| route.binding == *binding && route.expires_at > now)
+            }
+            MediaMode::Monitor | MediaMode::PreparedConsult | MediaMode::PreparedTalk => false,
+        }
+    }
+
+    fn microphone_is_muted_for(&self, binding: &SessionBinding, now: Instant) -> bool {
+        self.microphone_mute_binding.as_ref() == Some(binding)
+            && self.binding_is_active_media_owner(binding, now)
+    }
+
+    fn set_microphone_muted(
+        &mut self,
+        binding: &SessionBinding,
+        expected_remote_revision: u64,
+        muted: bool,
+        now: Instant,
+    ) -> Result<u64, String> {
+        if self.remote_revision != expected_remote_revision {
+            return Err("remoteRevision changed before microphone mute was applied".into());
+        }
+        if !matches!(binding.mode, MediaMode::Consult | MediaMode::Talk)
+            || !self.binding_is_active_media_owner(binding, now)
+        {
+            return Err(
+                "only the exact active Companion media owner may change microphone mute".into(),
+            );
+        }
+        let already = self.microphone_mute_binding.as_ref() == Some(binding);
+        if already == muted {
+            return Ok(self.remote_revision);
+        }
+        self.microphone_mute_binding = muted.then(|| binding.clone());
+        // Buffered PCM received before the mute boundary is no longer
+        // meaningful authority evidence after the gate closes.
+        if muted {
+            self.companion_audio_levels
+                .remove(&companion_participant_id(binding));
+        }
+        self.bump_revision();
+        Ok(self.remote_revision)
+    }
+
+    fn clear_binding_observations(&mut self, binding: &SessionBinding) {
+        if self.microphone_mute_binding.as_ref() == Some(binding) {
+            self.microphone_mute_binding = None;
+        }
+        self.companion_audio_levels
+            .remove(&companion_participant_id(binding));
+    }
+
+    fn clear_all_media_observations(&mut self) {
+        self.microphone_mute_binding = None;
+        self.caller_audio_level = None;
+        self.aokie_audio_level = None;
+        self.companion_audio_levels.clear();
+    }
+
+    fn observe_caller_audio(&mut self, samples: &[i16], now: Instant) {
+        let (Some(call_id), Some(record)) =
+            (self.current_call_id.clone(), self.current_record().cloned())
+        else {
+            return;
+        };
+        let (_, level_permille) = pcm_level_summary(samples);
+        self.caller_audio_level = Some(ObservedAudioLevel {
+            call_id,
+            call_epoch: record.call_epoch,
+            participant_id: None,
+            level_permille,
+            observed_at: now,
+        });
+    }
+
+    fn observe_aokie_audio(&mut self, samples: &[i16], now: Instant) {
+        let (Some(call_id), Some(record)) =
+            (self.current_call_id.clone(), self.current_record().cloned())
+        else {
+            return;
+        };
+        let (_, level_permille) = pcm_level_summary(samples);
+        self.aokie_audio_level = Some(ObservedAudioLevel {
+            call_id,
+            call_epoch: record.call_epoch,
+            participant_id: None,
+            level_permille,
+            observed_at: now,
+        });
+    }
+
+    fn observe_companion_audio(&mut self, binding: &SessionBinding, samples: &[i16], now: Instant) {
+        let participant_id = companion_participant_id(binding);
+        let (_, level_permille) = pcm_level_summary(samples);
+        self.companion_audio_levels.insert(
+            participant_id.clone(),
+            ObservedAudioLevel {
+                call_id: binding.call_id.clone(),
+                call_epoch: binding.call_epoch,
+                participant_id: Some(participant_id),
+                level_permille,
+                observed_at: now,
+            },
+        );
+    }
+
+    fn current_audio_levels(&self, now: Instant) -> Vec<RemoteAudioLevel> {
+        let Some(call_id) = self.current_call_id.as_deref() else {
+            return Vec::new();
+        };
+        let Some(record) = self.current_record() else {
+            return Vec::new();
+        };
+        let mut levels = Vec::new();
+        if let Some(level) = self
+            .caller_audio_level
+            .as_ref()
+            .and_then(|observed| observed_level_for_call(observed, call_id, record.call_epoch, now))
+        {
+            levels.push(RemoteAudioLevel {
+                source: RemoteAudioLevelSource::Caller,
+                participant_id: None,
+                level_permille: level,
+            });
+        }
+        if let Some(level) = self
+            .aokie_audio_level
+            .as_ref()
+            .and_then(|observed| observed_level_for_call(observed, call_id, record.call_epoch, now))
+        {
+            levels.push(RemoteAudioLevel {
+                source: RemoteAudioLevelSource::Aokie,
+                participant_id: None,
+                level_permille: level,
+            });
+        }
+        for observed in self.companion_audio_levels.values() {
+            let Some(level_permille) =
+                observed_level_for_call(observed, call_id, record.call_epoch, now)
+            else {
+                continue;
+            };
+            let Some(participant_id) = observed.participant_id.clone() else {
+                continue;
+            };
+            if !self.peers.values().any(|slot| {
+                companion_participant_id(&slot.binding) == participant_id
+                    && self.binding_is_active_media_owner(&slot.binding, now)
+            }) {
+                continue;
+            }
+            levels.push(RemoteAudioLevel {
+                source: RemoteAudioLevelSource::Companion,
+                participant_id: Some(participant_id),
+                level_permille,
+            });
+        }
+        levels.sort_by(|left, right| left.participant_id.cmp(&right.participant_id));
+        levels
+    }
+
     fn observe_call(
         &mut self,
         call_id: Option<&str>,
@@ -1830,6 +2327,9 @@ impl RemoteMediaState {
         if self.current_call_id.as_deref() == call_id {
             if self.current_call_active != active {
                 self.current_call_active = active;
+                if !active {
+                    self.clear_all_media_observations();
+                }
                 self.bump_revision();
             }
             return (Vec::new(), Vec::new());
@@ -1867,6 +2367,7 @@ impl RemoteMediaState {
         self.return_dispatched = false;
         self.current_call_id = call_id.map(str::to_string);
         self.captions.clear();
+        self.clear_all_media_observations();
         self.current_call_active = active;
 
         if let Some(call_id) = call_id {
@@ -2196,6 +2697,15 @@ impl RemoteMediaState {
         binding: SessionBinding,
         requested_ttl: Duration,
     ) -> Result<(), String> {
+        self.request_takeover_guarded(binding, requested_ttl, None)
+    }
+
+    fn request_takeover_guarded(
+        &mut self,
+        binding: SessionBinding,
+        requested_ttl: Duration,
+        transfer_guard: Option<TransferActivationGuard>,
+    ) -> Result<(), String> {
         if binding.mode != MediaMode::Talk {
             return Err("only a talk peer may request caller ownership".into());
         }
@@ -2247,6 +2757,7 @@ impl RemoteMediaState {
         self.pending_route = Some(PendingRoute {
             permit,
             transition_dispatched: false,
+            transfer_guard,
         });
         self.prepared_claim = None;
         self.fence_autonomous_aokie_actions();
@@ -2398,6 +2909,7 @@ impl RemoteMediaState {
         self.pending_route = None;
         self.active_route = None;
         self.talk_audio_binding = None;
+        self.clear_binding_observations(binding);
         if needs_return {
             self.return_binding = Some(binding.clone());
             self.return_reason = Some(sanitize_reason(reason));
@@ -2423,6 +2935,7 @@ impl RemoteMediaState {
             .peers
             .remove(rtc_session_id)
             .ok_or_else(|| format!("unknown or closed rtcSessionId {rtc_session_id:?}"))?;
+        self.clear_binding_observations(&slot.binding);
         let active_route_needs_return = self
             .active_consult
             .as_ref()
@@ -2467,6 +2980,7 @@ impl RemoteMediaState {
             self.pending_route = None;
             self.active_route = None;
             self.active_consult = None;
+            self.clear_binding_observations(&slot.binding);
             self.return_binding = Some(slot.binding.clone());
             self.return_reason = Some(sanitize_reason(reason));
             self.return_dispatched = false;
@@ -2481,6 +2995,7 @@ impl RemoteMediaState {
 
     fn fail_closed_all(&mut self, reason: &str) -> (Vec<PeerSlot>, Option<SessionBinding>) {
         let slots = self.peers.drain().map(|(_, slot)| slot).collect::<Vec<_>>();
+        self.clear_all_media_observations();
         let pending_prepare = self.pending_prepare.take();
         let prepared_claim = self.prepared_claim.take();
         let pending_consult = self.pending_consult.take();
@@ -2558,19 +3073,23 @@ impl RemoteMediaState {
         let mut return_notice = None;
         let mut cancelled = None;
         if let Some(active) = self.active_consult.as_ref() {
+            let microphone_muted = self.microphone_mute_binding.as_ref() == Some(&active.binding);
             let peer_expired = self
                 .peers
                 .get(&active.binding.rtc_session_id)
                 .is_none_or(|slot| slot.lease_expires_at <= now);
             let timeout_reason = if active.expires_at <= now || peer_expired {
                 Some("consult_lease_expired")
-            } else if active.last_received_at.is_none()
+            } else if !microphone_muted
+                && active.last_received_at.is_none()
                 && now.saturating_duration_since(active.activated_at) >= FIRST_CONSULT_PCM_TIMEOUT
             {
                 Some("consult_audio_never_arrived")
-            } else if active.last_received_at.is_some_and(|last| {
-                now.saturating_duration_since(last) >= ONGOING_CONSULT_PCM_TIMEOUT
-            }) {
+            } else if !microphone_muted
+                && active.last_received_at.is_some_and(|last| {
+                    now.saturating_duration_since(last) >= ONGOING_CONSULT_PCM_TIMEOUT
+                })
+            {
                 Some("consult_audio_stalled")
             } else {
                 None
@@ -2582,6 +3101,7 @@ impl RemoteMediaState {
                     .get(&binding.rtc_session_id)
                     .map(|slot| slot.actor_tx.clone());
                 self.active_consult = None;
+                self.clear_binding_observations(&binding);
                 let reason = reason.to_string();
                 self.return_binding = Some(binding.clone());
                 self.return_reason = Some(reason.clone());
@@ -2592,6 +3112,8 @@ impl RemoteMediaState {
             }
         }
         if let Some(active) = self.active_route.as_ref() {
+            let microphone_muted =
+                self.microphone_mute_binding.as_ref() == Some(&active.permit.binding);
             let peer_expired = self
                 .peers
                 .get(&active.permit.binding.rtc_session_id)
@@ -2599,13 +3121,16 @@ impl RemoteMediaState {
             let timeout_reason =
                 if !active.permit.is_current_for(&active.permit.binding, now) || peer_expired {
                     Some("lease_expired")
-                } else if active.last_forwarded_at.is_none()
+                } else if !microphone_muted
+                    && active.last_forwarded_at.is_none()
                     && now.saturating_duration_since(active.activated_at) >= FIRST_TALK_PCM_TIMEOUT
                 {
                     Some("talk_audio_never_arrived")
-                } else if active.last_forwarded_at.is_some_and(|last| {
-                    now.saturating_duration_since(last) >= ONGOING_TALK_PCM_TIMEOUT
-                }) {
+                } else if !microphone_muted
+                    && active.last_forwarded_at.is_some_and(|last| {
+                        now.saturating_duration_since(last) >= ONGOING_TALK_PCM_TIMEOUT
+                    })
+                {
                     Some("talk_audio_stalled")
                 } else {
                     None
@@ -2617,6 +3142,7 @@ impl RemoteMediaState {
                     .get(&binding.rtc_session_id)
                     .map(|slot| slot.actor_tx.clone());
                 self.active_route = None;
+                self.clear_binding_observations(&binding);
                 let reason = reason.to_string();
                 self.return_binding = Some(binding.clone());
                 self.return_reason = Some(reason.clone());
@@ -2631,14 +3157,26 @@ impl RemoteMediaState {
                 .peers
                 .get(&pending.permit.binding.rtc_session_id)
                 .is_none_or(|slot| slot.lease_expires_at <= now);
-            if !pending.permit.is_current_for(&pending.permit.binding, now) || peer_expired {
+            let transfer_expired = pending
+                .transfer_guard
+                .as_ref()
+                .is_some_and(|guard| guard.deadline <= now);
+            if !pending.permit.is_current_for(&pending.permit.binding, now)
+                || peer_expired
+                || transfer_expired
+            {
                 let binding = pending.permit.binding.clone();
                 revoked = self
                     .peers
                     .get(&binding.rtc_session_id)
                     .map(|slot| slot.actor_tx.clone());
                 self.pending_route = None;
-                let reason = "lease_expired_before_physical_ack".to_string();
+                let reason = if transfer_expired {
+                    "transfer_expired_before_physical_ack"
+                } else {
+                    "lease_expired_before_physical_ack"
+                }
+                .to_string();
                 self.return_binding = Some(binding.clone());
                 self.return_reason = Some(reason.clone());
                 return_notice = Some((binding, reason));
@@ -2873,6 +3411,7 @@ impl RemoteMediaState {
         &mut self,
         binding: &SessionBinding,
         now: Instant,
+        transfer_authorized: bool,
     ) -> Result<(mpsc::Sender<ActorCommand>, RoutePermit), String> {
         self.validate_live_binding(binding)?;
         if !self.consent.allows(MediaMode::Talk) {
@@ -2885,6 +3424,16 @@ impl RemoteMediaState {
             .pending_route
             .take()
             .ok_or_else(|| "there is no pending takeover".to_string())?;
+        if pending.transfer_guard.as_ref().is_some_and(|guard| {
+            !transfer_authorized
+                || guard.deadline <= now
+                || guard.device_id != binding.device_id
+                || guard.offered_fence.call_id != binding.call_id
+                || guard.offered_fence.call_epoch != binding.call_epoch
+        }) {
+            self.pending_route = Some(pending);
+            return Err("accepted transfer expired or changed before physical ACK".into());
+        }
         if pending.permit.binding != *binding || !pending.permit.is_current_for(binding, now) {
             self.pending_route = Some(pending);
             return Err("pending takeover binding is stale or expired".into());
@@ -2931,6 +3480,7 @@ impl RemoteMediaState {
         self.pending_consult = None;
         self.pending_prepare = None;
         self.prepared_claim = None;
+        self.clear_binding_observations(&binding);
         self.return_reason = None;
         self.return_dispatched = false;
         self.service_mode = ServiceMode::AokieActive;
@@ -3348,6 +3898,36 @@ fn sanitize_reason(reason: &str) -> String {
     }
 }
 
+fn companion_participant_id(binding: &SessionBinding) -> String {
+    // rtcSessionId is already a validated opaque identifier and changes with
+    // each native endpoint. Reusing it avoids leaking the owner/device subject
+    // while preserving an exact key for participant-bound audio levels.
+    binding.rtc_session_id.clone()
+}
+
+fn observed_level_for_call(
+    observed: &ObservedAudioLevel,
+    call_id: &str,
+    call_epoch: u64,
+    now: Instant,
+) -> Option<u16> {
+    if observed.call_id != call_id || observed.call_epoch != call_epoch {
+        return None;
+    }
+    let age = now.saturating_duration_since(observed.observed_at);
+    if age > AUDIO_LEVEL_STALE {
+        return None;
+    }
+    if age <= AUDIO_LEVEL_HOLD {
+        return Some(observed.level_permille);
+    }
+    let fade = AUDIO_LEVEL_STALE.saturating_sub(AUDIO_LEVEL_HOLD);
+    let remaining = AUDIO_LEVEL_STALE.saturating_sub(age);
+    let scaled = u128::from(observed.level_permille).saturating_mul(remaining.as_millis())
+        / fade.as_millis().max(1);
+    Some(u16::try_from(scaled).unwrap_or(0))
+}
+
 fn pcm_level_summary(samples: &[i16]) -> (u16, u16) {
     if samples.is_empty() {
         return (0, 0);
@@ -3399,6 +3979,59 @@ pub fn resample_mono(samples: &[i16], from_hz: u32, to_hz: u32) -> Vec<i16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_deadline_conversion_caps_backward_wall_clock_steps() {
+        let now = Instant::now();
+        let deadline = bounded_transfer_deadline(u64::MAX, 1, now).unwrap();
+        assert!(deadline >= now);
+        assert!(
+            deadline <= now + Duration::from_secs(crate::assistance::TRANSFER_SETUP_SECONDS),
+            "a backward wall-clock step cannot extend the monotonic setup guard"
+        );
+        assert!(bounded_transfer_deadline(10, 10, now).is_err());
+        assert!(bounded_transfer_deadline(9, 10, now).is_err());
+    }
+
+    #[test]
+    fn actual_aokie_playout_pcm_drives_and_clears_its_meter() {
+        let mut state = RemoteMediaState::default();
+        state.observe_call(Some("call_a"), true);
+        let now = Instant::now();
+        state.observe_aokie_audio(&vec![12_000; 160], now);
+        let levels = state.current_audio_levels(now);
+        assert!(levels.iter().any(|level| {
+            level.source == RemoteAudioLevelSource::Aokie
+                && level.participant_id.is_none()
+                && level.level_permille > 0
+        }));
+        assert!(state
+            .current_audio_levels(now + AUDIO_LEVEL_STALE + Duration::from_millis(1))
+            .iter()
+            .all(|level| level.source != RemoteAudioLevelSource::Aokie));
+        state.observe_aokie_audio(&vec![12_000; 160], now);
+        state.observe_call(None, false);
+        assert!(state.current_audio_levels(now).is_empty());
+    }
+
+    #[test]
+    fn companion_caller_output_mirror_never_drives_the_aokie_meter() {
+        let handle = RemoteMediaHandle::spawn().unwrap();
+        handle.observe_physical_call(Some("call_a"), true);
+        let pcm = vec![12_000; 160];
+
+        handle.try_mirror_companion_output(&pcm, MEDIA_SAMPLE_RATE_HZ);
+        assert!(handle
+            .snapshot()
+            .audio_levels
+            .iter()
+            .all(|level| level.source != RemoteAudioLevelSource::Aokie));
+
+        handle.try_push_caller_output(&pcm, MEDIA_SAMPLE_RATE_HZ);
+        assert!(handle.snapshot().audio_levels.iter().any(|level| {
+            level.source == RemoteAudioLevelSource::Aokie && level.level_permille > 0
+        }));
+    }
 
     fn binding(mode: MediaMode, owner_epoch: u64, fence: u64, suffix: &str) -> SessionBinding {
         SessionBinding {
@@ -3761,7 +4394,7 @@ mod tests {
                 binding: talk.clone()
             })
         );
-        state.ack_enter(&talk, Instant::now()).unwrap();
+        state.ack_enter(&talk, Instant::now(), true).unwrap();
         assert_eq!(state.service_mode, ServiceMode::HumanActive);
         assert_eq!(state.current_record().unwrap().owner_epoch, 1);
         state.request_revoke(&talk, "operator_return").unwrap();
@@ -3774,6 +4407,72 @@ mod tests {
         assert_eq!(state.current_record().unwrap().owner_epoch, 2);
         assert_eq!(state.service_mode, ServiceMode::AokieActive);
         assert!(!state.radio_reserved());
+    }
+
+    #[test]
+    fn accepted_transfer_cannot_cross_its_deadline_at_the_physical_ack() {
+        let mut state = active_state();
+        let talk =
+            prepare_active_talk(&mut state, "transfer_deadline", 19, Duration::from_secs(30));
+        let requested_at = Instant::now();
+        let deadline = requested_at + Duration::from_millis(5);
+        state
+            .request_takeover_guarded(
+                talk.clone(),
+                Duration::from_secs(20),
+                Some(TransferActivationGuard {
+                    request_id: "assist_transfer_deadline".into(),
+                    offered_fence: crate::assistance::AssistanceCallFence {
+                        call_id: talk.call_id.clone(),
+                        call_epoch: talk.call_epoch,
+                        owner_epoch: 0,
+                        switchboard_revision: 4,
+                        remote_revision: 5,
+                    },
+                    device_id: talk.device_id.clone(),
+                    deadline,
+                }),
+            )
+            .unwrap();
+        assert_eq!(state.service_mode, ServiceMode::HumanPending);
+
+        assert!(state.ack_enter(&talk, deadline, true).is_err());
+        assert_ne!(state.service_mode, ServiceMode::HumanActive);
+        assert!(state.active_route.is_none());
+        assert!(matches!(
+            state.next_transition(deadline).0,
+            Some(RadioTransition::ReturnToAokie { .. })
+        ));
+
+        let mut authority_changed = active_state();
+        let talk = prepare_active_talk(
+            &mut authority_changed,
+            "transfer_authority",
+            20,
+            Duration::from_secs(30),
+        );
+        authority_changed
+            .request_takeover_guarded(
+                talk.clone(),
+                Duration::from_secs(20),
+                Some(TransferActivationGuard {
+                    request_id: "assist_transfer_authority".into(),
+                    offered_fence: crate::assistance::AssistanceCallFence {
+                        call_id: talk.call_id.clone(),
+                        call_epoch: talk.call_epoch,
+                        owner_epoch: 0,
+                        switchboard_revision: 4,
+                        remote_revision: 5,
+                    },
+                    device_id: talk.device_id.clone(),
+                    deadline: Instant::now() + Duration::from_secs(5),
+                }),
+            )
+            .unwrap();
+        assert!(authority_changed
+            .ack_enter(&talk, Instant::now(), false)
+            .is_err());
+        assert_ne!(authority_changed.service_mode, ServiceMode::HumanActive);
     }
 
     #[test]
@@ -3911,7 +4610,7 @@ mod tests {
                 state.next_transition(Instant::now()).0,
                 Some(RadioTransition::EnterHuman { .. })
             ));
-            state.ack_enter(&talk, Instant::now()).unwrap();
+            state.ack_enter(&talk, Instant::now(), true).unwrap();
         }
         active.refresh_reserved();
         assert_eq!(active.snapshot().service_mode, ServiceMode::HumanActive);
@@ -3940,7 +4639,7 @@ mod tests {
             .request_takeover(talk.clone(), Duration::from_secs(20))
             .unwrap();
         no_first.next_transition(start);
-        no_first.ack_enter(&talk, start).unwrap();
+        no_first.ack_enter(&talk, start, true).unwrap();
         let (transition, _, notice, _) = no_first.next_transition(start + FIRST_TALK_PCM_TIMEOUT);
         assert!(matches!(
             transition,
@@ -3955,7 +4654,7 @@ mod tests {
             .request_takeover(talk.clone(), Duration::from_secs(20))
             .unwrap();
         stalled.next_transition(start);
-        stalled.ack_enter(&talk, start).unwrap();
+        stalled.ack_enter(&talk, start, true).unwrap();
         let last = start + Duration::from_millis(100);
         stalled
             .active_route
@@ -3995,7 +4694,7 @@ mod tests {
                 state.next_transition(Instant::now()).0,
                 Some(RadioTransition::EnterHuman { .. })
             ));
-            state.ack_enter(&talk, Instant::now()).unwrap();
+            state.ack_enter(&talk, Instant::now(), true).unwrap();
             talk
         };
         handle.refresh_reserved();
@@ -4041,7 +4740,7 @@ mod tests {
                 state.next_transition(Instant::now()).0,
                 Some(RadioTransition::EnterHuman { .. })
             ));
-            state.ack_enter(&talk, Instant::now()).unwrap();
+            state.ack_enter(&talk, Instant::now(), true).unwrap();
             talk
         };
         handle.refresh_reserved();
@@ -4094,7 +4793,7 @@ mod tests {
             .request_takeover(talk.clone(), Duration::from_millis(2))
             .unwrap();
         state.next_transition(Instant::now());
-        state.ack_enter(&talk, Instant::now()).unwrap();
+        state.ack_enter(&talk, Instant::now(), true).unwrap();
         std::thread::sleep(Duration::from_millis(4));
         assert!(!state.allows_talk(&talk, Instant::now()));
         assert_eq!(state.service_mode, ServiceMode::ReturningToAokie);
@@ -4435,6 +5134,20 @@ mod tests {
         assert!(!state.consent.effective().captions_enabled);
         assert!(!state.consent.effective().assistance_enabled);
 
+        state.consent.expires_at = Some("not-an-rfc3339-instant".into());
+        assert!(state.validate_open(&monitor).is_err());
+        assert!(
+            !state.consent.effective().monitor_enabled,
+            "a malformed policy timestamp can never authorize audio"
+        );
+
+        state.consent.expires_at = Some("2000-01-01T23:59:59+14:00".into());
+        assert!(state.validate_open(&monitor).is_err());
+        assert!(
+            !state.consent.effective().monitor_enabled,
+            "offset timestamps are compared as instants rather than text"
+        );
+
         state.consent.expires_at = Some("2999-01-01T00:00:00Z".into());
         state.consent.acknowledged = false;
         assert!(state.validate_open(&monitor).is_err());
@@ -4470,7 +5183,7 @@ mod tests {
                 .request_takeover(talk.clone(), Duration::from_secs(20))
                 .unwrap();
             state.next_transition(Instant::now());
-            state.ack_enter(&talk, Instant::now()).unwrap();
+            state.ack_enter(&talk, Instant::now(), true).unwrap();
             state.consent.expires_at = Some("2000-01-01T00:00:00Z".into());
             assert!(
                 !state.allows_talk(&talk, Instant::now()),

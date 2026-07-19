@@ -45,6 +45,7 @@ export type {
   NativeMediaSignal,
   NativeMediaSignalEvent,
   NativeMediaStateEvent,
+  NativeMediaLevelsEvent,
   NativeSdpSignal,
   RealtimeConfig,
   RuntimeCapabilities,

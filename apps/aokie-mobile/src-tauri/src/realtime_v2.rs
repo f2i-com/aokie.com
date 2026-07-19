@@ -14,17 +14,19 @@ use aokie_media::{
     IceCandidateSignal, IceServerConfig, MediaMode, SdpSignal, SdpSignalType, SessionBinding,
 };
 use aokie_protocol::v2::{
-    sdp_dtls_fingerprint, sdp_sha256, AdmissionRole, EndCallerChallengeFrame, EndCallerOutcome,
-    EndpointBindingClaims, EndpointChallengeFrame, Grant, HelloProofClaims, LeaseClaims,
-    LeaseHeartbeatFrame, LeaseMode, LeasePhase, LeaseRequestFrame, LeaseRevokeFrame, MediaState,
-    MobileAssistanceAnswerFrame, MobileEndCallerChallengeRequestFrame, MobileEndCallerConfirmFrame,
-    MobileHello, MobileIdleSyncFrame, MobileOfferAnswerFrame, MobileOfferSurface,
+    sdp_dtls_fingerprint, sdp_sha256, AdmissionRole, AssistanceResponseAction, AudioLevelSource,
+    EndCallerChallengeFrame, EndCallerOutcome, EndpointBindingClaims, EndpointChallengeFrame,
+    Grant, HelloProofClaims, LeaseClaims, LeaseHeartbeatFrame, LeaseMode, LeasePhase,
+    LeaseRequestFrame, LeaseRevokeFrame, MediaState, MobileAssistanceAnswerFrame,
+    MobileEndCallerChallengeRequestFrame, MobileEndCallerConfirmFrame, MobileHello,
+    MobileIdleSyncFrame, MobileMicrophoneMuteFrame, MobileOfferAnswerFrame, MobileOfferSurface,
     MobileRtcSignalFrame, MobileSnapshotFrame, PluginAssistanceRequestFrame,
     PluginClaimRejectedFrame, PluginEndCallerResultFrame, PluginHello, PluginIdleFrame,
-    PluginLeaseRevokeFrame, PluginLeaseStatus, PluginLeaseStatusFrame, PluginOfferAcceptedFrame,
-    PluginRtcSignalFrame, PluginSnapshotFrame, ProjectedCallSnapshot, RemoteConsentPolicy,
-    RtcSignal, ServiceMode, SignedPendingMobileOffer, TelephonyState, TrickleCandidateClaims,
-    V2ProtocolError, MAX_LEASE_TOKEN_BYTES, MAX_SAFE_INTEGER, SCHEMA_VERSION,
+    PluginLeaseRevokeFrame, PluginLeaseStatus, PluginLeaseStatusFrame,
+    PluginMicrophoneMuteStatusFrame, PluginOfferAcceptedFrame, PluginRtcSignalFrame,
+    PluginSnapshotFrame, ProjectedCallSnapshot, RemoteConsentPolicy, RtcSignal, ServiceMode,
+    SignedPendingMobileOffer, TelephonyState, TrickleCandidateClaims, V2ProtocolError,
+    MAX_LEASE_TOKEN_BYTES, MAX_SAFE_INTEGER, SCHEMA_VERSION,
 };
 use chrono::{DateTime, Utc};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -102,8 +104,13 @@ const MANAGED_HANDOFF_MIN_LEASE_REMAINING: Duration =
 const NATIVE_ACTION_POLL: Duration = Duration::from_millis(200);
 const URGENT_CONTROL_POLL: Duration = Duration::from_millis(100);
 const NATIVE_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
+// Core-Telecom's explicit user hang-up must outlive the plugin's bounded
+// physical radio termination (8-10 s), while still completing before
+// Android's 15-second native-action waiter gives up.
+const NATIVE_HANGUP_TIMEOUT: Duration = Duration::from_secs(12);
 const LEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const REVOKE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(4);
+const MICROPHONE_MUTE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(8);
 // UI confirmation times out quickly, but relay/status delivery can lag across
 // the full 20-second plugin lease. Retain only the exact locally-closed lineage
 // long enough to contain and return a late renewal/RTC frame without reviving
@@ -118,6 +125,11 @@ const MAX_COMPLETED_REVOKES: usize = 256;
 // identity; the prebuilt outbound frame continues to own exact at-least-once
 // delivery of the original attempt.
 const MAX_SPENT_MOBILE_OFFERS: usize = 64;
+// A locally timed-out offer answer can still receive its independently
+// delivered Desktop acknowledgement. Keep only its non-secret exact fence,
+// across call and transport resets, so stale authority is terminally
+// contained even after the call-scoped spent-offer cache has moved on.
+const MAX_TERMINAL_OFFER_ACCEPTANCES: usize = 64;
 // Native media activation failures must surrender the authority the Desktop
 // already minted, even when the receive loop is about to reconnect. Keep the
 // exact-token revoke in a tiny, bounded queue that survives transport resets.
@@ -154,24 +166,18 @@ const RELAY_SEND_ENV: &str = "AOKIE_COMPANION_RELAY_SEND_HELLO";
 /// a newly-added mobile frame does not reach a live Desktop until the plugin
 /// has an explicit relay arm for it. The socket gateway remains unaffected and
 /// still receives every frame.
-const RELAY_PLUGIN_ADMITTED_KINDS: [&str; 6] = [
+const RELAY_PLUGIN_ADMITTED_KINDS: [&str; 10] = [
     "mobile_hello",
     "mobile_offer_answer",
     "lease_request",
     "rtc_signal",
     "lease_heartbeat",
     "lease_revoke",
+    "microphone_mute",
+    "assistance_answer",
+    "end_caller_challenge_request",
+    "end_caller_confirm",
 ];
-
-// These grants describe actions that the signed admission may authorize in
-// general, but the relay dispatcher in this release cannot carry. Never
-// project them into relay UI authority: a disabled control is safer and more
-// truthful than a button whose frame would be silently withheld.
-const RELAY_UNSUPPORTED_PROJECTED_GRANTS: [Grant; 2] = [Grant::AssistanceRespond, Grant::EndCaller];
-const RELAY_ASSISTANCE_UNSUPPORTED: &str =
-    "text assistance answers are not supported by the managed relay; use Private consult";
-const RELAY_END_CALLER_UNSUPPORTED: &str =
-    "ending the caller call is not supported by the managed relay; return the call to Aokie instead";
 
 fn relay_send_enabled() -> bool {
     relay_send_enabled_from(std::env::var(RELAY_SEND_ENV).ok().as_deref())
@@ -249,18 +255,16 @@ impl V2Transport {
     ///
     /// Over the socket every frame goes out unchanged. Over the relay a frame is
     /// posted when the emergency kill switch is not set and its kind is in
-    /// [`RELAY_PLUGIN_ADMITTED_KINDS`]. The plugin now actions that lease/RTC
-    /// family in the mobile dialect; assistance and caller-ending still have no
-    /// relay translation and are withheld here rather than sent into a silent
-    /// drop.
+    /// [`RELAY_PLUGIN_ADMITTED_KINDS`]. The plugin actions that lease/RTC,
+    /// assistance, and two-step caller-ending family in the mobile dialect.
     ///
     /// A withheld frame reports success so the session survives: the caller's
     /// contract is "false breaks the session", and dropping the working READ
     /// path because a user tapped an action the peer cannot accept would be a
     /// worse outcome than the action quietly not happening. The cost is that a
     /// queued user action resolves as delivered. That is limited to an explicit
-    /// operator kill or an unsupported relay action; neither may destabilise a
-    /// Desktop that is handling a real call.
+    /// operator kill or a future, not-yet-admitted action; neither may
+    /// destabilise a Desktop that is handling a real call.
     async fn send_text(&mut self, encoded: String) -> bool {
         match self {
             Self::WebSocket { writer, .. } => send_text(writer, encoded).await,
@@ -365,19 +369,6 @@ impl V2Transport {
 
     fn same_carrier_as(&self, other: &Self) -> bool {
         managed_carrier_continuity(self.is_relay(), other.is_relay())
-    }
-
-    fn unsupported_user_frame(&self, encoded: &str) -> Option<&'static str> {
-        if !self.is_relay() {
-            return None;
-        }
-        match parse_kind(encoded).ok().as_deref() {
-            Some("assistance_answer") => Some(RELAY_ASSISTANCE_UNSUPPORTED),
-            Some("end_caller_challenge_request" | "end_caller_confirm") => {
-                Some(RELAY_END_CALLER_UNSUPPORTED)
-            }
-            _ => None,
-        }
     }
 
     async fn recv(&mut self, tick: Duration) -> V2Inbound {
@@ -490,9 +481,8 @@ fn predecessor_arm_still_current(fence_started: &AtomicBool) -> bool {
 /// The opposite direction stays in the mobile dialect and is consumed by the
 /// plugin's relay-only dispatcher. In particular, that dispatcher authenticates
 /// `MobileRtcSignalFrame::leaseToken`, strips it, and hands the remaining
-/// plugin-shaped signal to the unchanged RTC handler. Assistance and caller
-/// ending are still outside this relay subset and are withheld at the transport
-/// boundary above.
+/// plugin-shaped signal to the unchanged RTC handler. Assistance answers
+/// and the two-step caller-ending flow use their strict mobile frames too.
 struct GatewayShim {
     app_id: String,
     device_id: String,
@@ -577,11 +567,7 @@ impl GatewayShim {
     }
 
     fn projected_grants(&self) -> Vec<Grant> {
-        self.grants
-            .iter()
-            .copied()
-            .filter(|grant| !RELAY_UNSUPPORTED_PROJECTED_GRANTS.contains(grant))
-            .collect()
+        self.grants.clone()
     }
 
     /// `Ok(None)` means "carrier traffic, nothing for the session".
@@ -811,6 +797,104 @@ impl GatewayShim {
                 }
                 Ok(Some(encoded.to_owned()))
             }
+            "microphone_mute_status" => {
+                let frame: PluginMicrophoneMuteStatusFrame =
+                    strict_parse(encoded, "plugin microphone mute status")?;
+                let Some(()) = self.peer_gate("microphone_mute_status") else {
+                    return Ok(None);
+                };
+                if frame.app_id != self.app_id
+                    || !self.targets_this_device(&frame.device_id, "microphone_mute_status")
+                    || !self.grants.contains(&Grant::StateRead)
+                    || !self.grants.contains(&Grant::RtcSignal)
+                    || (!self.grants.contains(&Grant::Takeover)
+                        && !self.grants.contains(&Grant::Consult))
+                {
+                    return Ok(None);
+                }
+                frame.validate().map_err(|error| error.to_string())?;
+                Ok(Some(encoded.to_owned()))
+            }
+            "assistance_answer_accepted" => {
+                let frame: AssistanceAnswerAcceptedFrame =
+                    strict_parse(encoded, "plugin assistance answer acknowledgement")?;
+                let Some(()) = self.peer_gate("assistance_answer_accepted") else {
+                    return Ok(None);
+                };
+                validate_common(
+                    &frame.kind,
+                    frame.schema_version,
+                    Some(&frame.app_id),
+                    &self.app_id,
+                )?;
+                if !frame.accepted
+                    || !self.grants.contains(&Grant::StateRead)
+                    || !self.grants.contains(&Grant::AssistanceRespond)
+                {
+                    return Ok(None);
+                }
+                validate_id(&frame.request_id, "assistance requestId")?;
+                validate_id(&frame.answer_id, "assistance answerId")?;
+                Ok(Some(encoded.to_owned()))
+            }
+            "end_caller_challenge" => {
+                let frame: EndCallerChallengeFrame =
+                    strict_parse(encoded, "plugin caller-ending challenge")?;
+                let Some(()) = self.peer_gate("end_caller_challenge") else {
+                    return Ok(None);
+                };
+                if frame.app_id != self.app_id
+                    || !self.targets_this_device(&frame.device_id, "end_caller_challenge")
+                    || !self.grants.contains(&Grant::StateRead)
+                    || !self.grants.contains(&Grant::Takeover)
+                    || !self.grants.contains(&Grant::EndCaller)
+                {
+                    return Ok(None);
+                }
+                match frame.validate(unix_now()?) {
+                    Ok(()) => Ok(Some(encoded.to_owned())),
+                    Err(V2ProtocolError::Expired) => Ok(None),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            "end_caller_submitted" => {
+                let frame: EndCallerSubmittedFrame =
+                    strict_parse(encoded, "plugin caller-ending acknowledgement")?;
+                let Some(()) = self.peer_gate("end_caller_submitted") else {
+                    return Ok(None);
+                };
+                validate_common(
+                    &frame.kind,
+                    frame.schema_version,
+                    Some(&frame.app_id),
+                    &self.app_id,
+                )?;
+                if !frame.accepted
+                    || !self.grants.contains(&Grant::StateRead)
+                    || !self.grants.contains(&Grant::Takeover)
+                    || !self.grants.contains(&Grant::EndCaller)
+                {
+                    return Ok(None);
+                }
+                validate_id(&frame.request_id, "caller-ending requestId")?;
+                validate_id(&frame.operation_id, "caller-ending operationId")?;
+                validate_id(&frame.confirmation_id, "caller-ending confirmationId")?;
+                Ok(Some(encoded.to_owned()))
+            }
+            "end_caller_result" => {
+                let frame: PluginEndCallerResultFrame =
+                    strict_parse(encoded, "plugin caller-ending result")?;
+                let Some(()) = self.peer_gate("end_caller_result") else {
+                    return Ok(None);
+                };
+                if frame.app_id != self.app_id
+                    || !self.targets_this_device(&frame.device_id, "end_caller_result")
+                {
+                    return Ok(None);
+                }
+                frame.validate().map_err(|error| error.to_string())?;
+                Ok(Some(encoded.to_owned()))
+            }
             other => {
                 eprintln!("[AokieCompanion][relay] dropped an untranslated plugin frame: {other}");
                 Ok(None)
@@ -907,10 +991,46 @@ impl GatewayShim {
         // the gateway used to make: expose only when the consent policy allows
         // it and this admission actually holds the grant. Withholding costs a
         // caption; getting it wrong costs every snapshot.
-        let captions_permitted = source.remote_consent.enabled
-            && source.remote_consent.acknowledged
+        let consent_current = remote_consent_is_current(&source.remote_consent, unix_now()?);
+        let captions_permitted = consent_current
             && source.remote_consent.captions_enabled
             && self.grants.contains(&Grant::CaptionsRead);
+        let participants = if consent_current && self.grants.contains(&Grant::ParticipantsRead) {
+            source
+                .participants
+                .into_iter()
+                .map(|mut participant| {
+                    if !self.grants.contains(&Grant::ParticipantIdentityRead) {
+                        participant.subject_id = None;
+                        participant.display_label = None;
+                    }
+                    participant
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let participant_ids = participants
+            .iter()
+            .map(|participant| participant.participant_id.as_str())
+            .collect::<HashSet<_>>();
+        let audio_levels = (consent_current && self.grants.contains(&Grant::AudioLevelsRead))
+            .then_some(source.audio_levels)
+            .flatten()
+            .map(|levels| {
+                levels
+                    .into_iter()
+                    .filter(|level| {
+                        level.source != AudioLevelSource::Companion
+                            || level
+                                .participant_id
+                                .as_deref()
+                                .is_some_and(|participant_id| {
+                                    participant_ids.contains(participant_id)
+                                })
+                    })
+                    .collect()
+            });
         let projected = ProjectedCallSnapshot {
             call_id: source.call_id,
             call_epoch: source.call_epoch,
@@ -930,15 +1050,9 @@ impl GatewayShim {
                 .then_some(source.caller)
                 .flatten(),
             captions: captions_permitted.then_some(source.captions),
-            // Participant presence is a gateway-side roster the plugin does not
-            // publish, and inventing it would be the shim asserting state no
-            // endpoint authored.
-            participants: Vec::new(),
-            audio_levels: self
-                .grants
-                .contains(&Grant::AudioLevelsRead)
-                .then_some(source.audio_levels)
-                .flatten(),
+            participants,
+            audio_levels,
+            companion_microphone_muted: source.companion_microphone_muted,
             // Offers, by contrast, ARE authored — on this carrier the plugin is
             // the lease authority and signs its own, so passing them through is
             // relaying the Desktop's statement, not manufacturing one.
@@ -1010,6 +1124,21 @@ struct SpentMobileOffer {
     call_epoch: u64,
     offer_id: String,
     offer_jti: String,
+    offered_mode: LeaseMode,
+    // Present only when the offer was spent by a lease answer. This exact
+    // terminal identity contains an acceptance that arrives after the local
+    // attempt timed out, without promoting it into fresh authority.
+    offer_request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalOfferAcceptance {
+    app_id: String,
+    device_id: String,
+    request_id: String,
+    offer_id: String,
+    offer_jti: String,
+    offered_mode: LeaseMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1037,17 +1166,18 @@ struct ClientState {
     authoritative_sequence: u64,
     snapshot: Option<MobileSnapshotFrame>,
     spent_mobile_offers: VecDeque<SpentMobileOffer>,
+    terminal_offer_acceptances: VecDeque<TerminalOfferAcceptance>,
     pending: Option<PendingLease>,
     lease: Option<ClientLease>,
+    pending_microphone_mute: Option<PendingMicrophoneMute>,
     pending_revoke: Option<PendingRevoke>,
     local_expiry_tombstones: VecDeque<LocalExpiryTombstone>,
     pending_native_end: Option<PendingNativeEnd>,
+    pending_native_hangup: Option<PendingNativeHangup>,
     ice_servers: Vec<IceServerConfig>,
     relay_only: bool,
-    // Carrier capability, not ICE policy. The managed relay intentionally
-    // supports only the lease/RTC family in this release; user commands that
-    // have no relay dispatcher must fail explicitly before they mutate local
-    // pending state.
+    // Carrier capability, not ICE policy. Used for at-least-once replay
+    // fencing where relay mail can redeliver an already-applied response.
     relay_transport: bool,
     // Managed admission is fresher authority than a previously projected
     // snapshot during an overlapping transport rotation. Custom WebSocket
@@ -1095,6 +1225,26 @@ fn rtc_signal_replay_key(signal_id: &str) -> String {
 
 fn claim_rejection_replay_key(request_id: &str) -> String {
     format!("claim-rejected:{request_id}")
+}
+
+fn microphone_mute_status_replay_key(request_id: &str) -> String {
+    format!("microphone-mute-status:{request_id}")
+}
+
+fn assistance_answer_accepted_replay_key(request_id: &str) -> String {
+    format!("assistance-answer-accepted:{request_id}")
+}
+
+fn end_caller_challenge_replay_key(request_id: &str) -> String {
+    format!("end-caller-challenge:{request_id}")
+}
+
+fn end_caller_submitted_replay_key(request_id: &str) -> String {
+    format!("end-caller-submitted:{request_id}")
+}
+
+fn end_caller_result_replay_key(operation_id: &str) -> String {
+    format!("end-caller-result:{operation_id}")
 }
 
 fn relay_frame_digest(encoded: &str) -> [u8; 32] {
@@ -1397,6 +1547,83 @@ struct ClientLease {
     session: MediaSession,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingMicrophoneMuteStage {
+    ArmingNative,
+    AwaitingStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingMicrophoneMute {
+    request_id: String,
+    lease_id: String,
+    lease_jti: String,
+    rtc_session_id: String,
+    call_id: String,
+    call_epoch: u64,
+    owner_epoch: u64,
+    switchboard_revision: u64,
+    remote_revision: u64,
+    fence: u64,
+    muted: bool,
+    session: MediaSession,
+    stage: PendingMicrophoneMuteStage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotMicrophoneMuteReconciliation {
+    None,
+    Confirmed(PendingMicrophoneMute),
+    Stale(PendingMicrophoneMute),
+}
+
+fn reconcile_microphone_mute_from_snapshot(
+    client: &mut ClientState,
+    frame: &MobileSnapshotFrame,
+) -> SnapshotMicrophoneMuteReconciliation {
+    let Some(pending) = client.pending_microphone_mute.as_ref() else {
+        return SnapshotMicrophoneMuteReconciliation::None;
+    };
+    let lease_exact = client.lease.as_ref().is_some_and(|lease| {
+        lease.claims.lease_id == pending.lease_id
+            && lease.claims.jti == pending.lease_jti
+            && lease.claims.rtc_session_id == pending.rtc_session_id
+            && lease.claims.call_id == pending.call_id
+            && lease.claims.call_epoch == pending.call_epoch
+            && lease.claims.owner_epoch == pending.owner_epoch
+            && lease.claims.fence == pending.fence
+            && lease.session == pending.session
+    });
+    let snapshot_exact = frame.snapshot.call_id == pending.call_id
+        && frame.snapshot.call_epoch == pending.call_epoch
+        && frame.snapshot.owner_epoch == pending.owner_epoch
+        && frame.snapshot.switchboard_revision == pending.switchboard_revision
+        && frame.snapshot.telephony_state == TelephonyState::Active
+        && matches!(
+            frame.snapshot.service_mode,
+            ServiceMode::HumanActive | ServiceMode::ConsultActive
+        );
+    if !lease_exact || !snapshot_exact {
+        return SnapshotMicrophoneMuteReconciliation::Stale(
+            client
+                .pending_microphone_mute
+                .take()
+                .expect("checked microphone mute transaction"),
+        );
+    }
+    if frame.snapshot.remote_revision > pending.remote_revision
+        && frame.snapshot.companion_microphone_muted == pending.muted
+    {
+        return SnapshotMicrophoneMuteReconciliation::Confirmed(
+            client
+                .pending_microphone_mute
+                .take()
+                .expect("checked microphone mute transaction"),
+        );
+    }
+    SnapshotMicrophoneMuteReconciliation::None
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UrgentControlFrame {
     app_id: String,
@@ -1433,6 +1660,7 @@ fn apply_rotated_admission_grants(
         .flatten();
     if lease.is_some() {
         client.pending_end_caller = None;
+        client.pending_microphone_mute = None;
     }
     AdmissionGrantDeescalation { pending, lease }
 }
@@ -1687,11 +1915,19 @@ struct PendingNativeEnd {
     deadline: Instant,
 }
 
+#[derive(Clone)]
+struct PendingNativeHangup {
+    action_id: String,
+    deadline: Instant,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum NativeCallActionKind {
     Answer,
+    Decline,
     End,
+    Hangup,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1705,6 +1941,10 @@ struct NativeCallAction {
     call_id: String,
     call_epoch: u64,
     owner_epoch: u64,
+    #[serde(default)]
+    accepted_transfer_request_id: Option<String>,
+    #[serde(default)]
+    response_text: Option<String>,
     created_at: u64,
 }
 
@@ -1712,6 +1952,7 @@ struct NativeOutbound {
     encoded: String,
     answer_action_id: Option<String>,
     answer_request_id: Option<String>,
+    assistance_answer_id: Option<String>,
     revoke_request_id: Option<String>,
 }
 
@@ -1749,6 +1990,54 @@ impl PendingEndCaller {
     }
 }
 
+fn apply_end_caller_result(
+    client: &mut ClientState,
+    frame: &PluginEndCallerResultFrame,
+) -> Result<(Option<ClientLease>, Option<String>), String> {
+    let (challenge, operation_id) = match client.pending_end_caller.as_ref() {
+        Some(PendingEndCaller::AwaitingResult {
+            challenge,
+            operation_id,
+            ..
+        }) => (challenge, operation_id),
+        _ => return Err("unsolicited caller-ending result".into()),
+    };
+    if operation_id != &frame.operation_id
+        || challenge.confirmation_id != frame.confirmation_id
+        || challenge.device_id != frame.device_id
+        || challenge.call_id != frame.call_id
+        || challenge.call_epoch != frame.call_epoch
+        || challenge.owner_epoch != frame.owner_epoch
+        || challenge.switchboard_revision != frame.switchboard_revision
+        || challenge.remote_revision != frame.remote_revision
+        || challenge.lease_id != frame.lease_id
+        || challenge.fence != frame.fence
+    {
+        return Err("caller-ending result crossed an operation fence".into());
+    }
+    client.pending_end_caller = None;
+    let native_hangup_action_id = client
+        .pending_native_hangup
+        .take()
+        .map(|pending| pending.action_id);
+    let lease_to_close = if frame.outcome == EndCallerOutcome::Completed
+        && client.lease.as_ref().is_some_and(|lease| {
+            lease.claims.app_id == frame.app_id
+                && lease.claims.device_id == frame.device_id
+                && lease.claims.call_id == frame.call_id
+                && lease.claims.call_epoch == frame.call_epoch
+                && lease.claims.owner_epoch == frame.owner_epoch
+                && lease.claims.lease_id == frame.lease_id
+                && lease.claims.fence == frame.fence
+        }) {
+        client.pending_microphone_mute = None;
+        client.lease.take()
+    } else {
+        None
+    };
+    Ok((lease_to_close, native_hangup_action_id))
+}
+
 impl V2State {
     /// The high-water mark `is_new_authoritative_sequence` compares against.
     /// Read by the relay carrier so a client-minted counter starts above
@@ -1764,12 +2053,14 @@ impl V2State {
         let completed_revokes = std::mem::take(&mut state.completed_revokes);
         let urgent_control_frames = std::mem::take(&mut state.urgent_control_frames);
         let spent_mobile_offers = std::mem::take(&mut state.spent_mobile_offers);
+        let terminal_offer_acceptances = std::mem::take(&mut state.terminal_offer_acceptances);
         *state = ClientState {
             answered_assistance_requests,
             applied_relay_frames,
             completed_revokes,
             urgent_control_frames,
             spent_mobile_offers,
+            terminal_offer_acceptances,
             ..ClientState::default()
         };
     }
@@ -1793,6 +2084,9 @@ impl V2State {
         urgent_control_frames.retain(|frame| frame.app_id == app_id);
         let mut spent_mobile_offers = std::mem::take(&mut state.spent_mobile_offers);
         spent_mobile_offers.retain(|spent| spent.app_id == app_id && spent.device_id == device_id);
+        let mut terminal_offer_acceptances = std::mem::take(&mut state.terminal_offer_acceptances);
+        terminal_offer_acceptances
+            .retain(|terminal| terminal.app_id == app_id && terminal.device_id == device_id);
         *state = ClientState {
             app_id: Some(app_id.to_owned()),
             device_id: Some(device_id.to_owned()),
@@ -1807,6 +2101,7 @@ impl V2State {
             completed_revokes,
             urgent_control_frames,
             spent_mobile_offers,
+            terminal_offer_acceptances,
             ..ClientState::default()
         };
     }
@@ -1831,11 +2126,16 @@ impl V2State {
         media_state: &NativeMediaState,
         reason: &str,
     ) -> Result<(), String> {
-        let (pending, lease, queue_error) = {
+        let (pending, native_hangup_action_id, lease, queue_error) = {
             let mut client = self.inner.lock().await;
             let pending = client.pending.take();
+            let native_hangup_action_id = client
+                .pending_native_hangup
+                .take()
+                .map(|pending| pending.action_id);
             let lease = client.lease.take();
             client.pending_end_caller = None;
+            client.pending_microphone_mute = None;
             let queue_error = if let Some(lease) = lease.as_ref() {
                 let retain_until = Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL;
                 let tombstone_error =
@@ -1847,7 +2147,7 @@ impl V2State {
             } else {
                 None
             };
-            (pending, lease, queue_error)
+            (pending, native_hangup_action_id, lease, queue_error)
         };
         if let Some(pending) = pending {
             if let Some(action_id) = pending.native_action_id.as_deref() {
@@ -1864,6 +2164,15 @@ impl V2State {
                 &pending.call_id,
                 pending.call_epoch,
                 "cancel",
+                "managed_admission_continuity_changed",
+            )
+            .await;
+        }
+        if let Some(action_id) = native_hangup_action_id {
+            let _ = crate::android_runtime::complete_native_call_action(
+                app,
+                &action_id,
+                false,
                 "managed_admission_continuity_changed",
             )
             .await;
@@ -1956,12 +2265,14 @@ impl V2State {
             let completed_revokes = std::mem::take(&mut state.completed_revokes);
             let urgent_control_frames = std::mem::take(&mut state.urgent_control_frames);
             let spent_mobile_offers = std::mem::take(&mut state.spent_mobile_offers);
+            let terminal_offer_acceptances = std::mem::take(&mut state.terminal_offer_acceptances);
             *state = ClientState {
                 answered_assistance_requests,
                 applied_relay_frames,
                 completed_revokes,
                 urgent_control_frames,
                 spent_mobile_offers,
+                terminal_offer_acceptances,
                 ..ClientState::default()
             };
         }
@@ -2003,6 +2314,12 @@ pub struct V2AssistanceReceipt {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EndCallerConfirmRequest {
     confirmation_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MicrophoneMuteRequest {
+    muted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2071,6 +2388,8 @@ struct EndCallerFailureEvent {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssistanceAnswerRequest {
     request_id: String,
+    #[serde(default)]
+    response_action: AssistanceResponseAction,
     answer: String,
 }
 
@@ -2218,6 +2537,10 @@ fn tracks_gateway_request(client: &ClientState, request_id: &str) -> bool {
             .pending_end_caller
             .as_ref()
             .is_some_and(|pending| pending.request_id() == request_id)
+        || client
+            .pending_microphone_mute
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
 }
 
 fn grant_for_requested_mode(mode: LeaseMode) -> Result<Grant, String> {
@@ -2252,8 +2575,9 @@ fn current_client_grants(client: &ClientState) -> &[Grant] {
         .unwrap_or_default()
 }
 
-fn current_consent_permits_mode(consent: &RemoteConsentPolicy, mode: LeaseMode, now: u64) -> bool {
-    consent.allows(mode)
+fn remote_consent_is_current(consent: &RemoteConsentPolicy, now: u64) -> bool {
+    consent.enabled
+        && consent.acknowledged
         && consent.expires_at.as_ref().is_none_or(|expires_at| {
             DateTime::parse_from_rfc3339(expires_at)
                 .ok()
@@ -2262,31 +2586,22 @@ fn current_consent_permits_mode(consent: &RemoteConsentPolicy, mode: LeaseMode, 
         })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RelayUnsupportedAction {
-    AssistanceAnswer,
-    EndCaller,
-}
-
-fn require_supported_user_action(
-    client: &ClientState,
-    action: RelayUnsupportedAction,
-) -> Result<(), String> {
-    if !client.relay_transport {
-        return Ok(());
-    }
-    Err(match action {
-        RelayUnsupportedAction::AssistanceAnswer => RELAY_ASSISTANCE_UNSUPPORTED.into(),
-        RelayUnsupportedAction::EndCaller => RELAY_END_CALLER_UNSUPPORTED.into(),
-    })
+fn current_consent_permits_mode(consent: &RemoteConsentPolicy, mode: LeaseMode, now: u64) -> bool {
+    remote_consent_is_current(consent, now) && consent.allows(mode)
 }
 
 #[tauri::command]
 pub async fn realtime_v2_request_lease(
     state: State<'_, RealtimeState>,
-    mode: LeaseMode,
+    request: V2LeaseRequest,
 ) -> Result<V2RequestReceipt, String> {
-    let (frame, request_id) = prepare_offer_answer(&state.v2, mode, None).await?;
+    let (frame, request_id) = prepare_offer_answer_for_transfer(
+        &state.v2,
+        request.mode,
+        None,
+        request.accepted_transfer_request_id.as_deref(),
+    )
+    .await?;
     let encoded = serde_json::to_string(&frame)
         .map_err(|_| "could not encode protocol-v2 mobile offer answer".to_string())?;
     if let Err(error) = enqueue_encoded(&state, encoded).await {
@@ -2296,10 +2611,27 @@ pub async fn realtime_v2_request_lease(
     Ok(V2RequestReceipt { request_id })
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct V2LeaseRequest {
+    mode: LeaseMode,
+    #[serde(default)]
+    accepted_transfer_request_id: Option<String>,
+}
+
 async fn prepare_offer_answer(
     state: &V2State,
     requested_mode: LeaseMode,
     native_action: Option<&NativeCallAction>,
+) -> Result<(MobileOfferAnswerFrame, String), String> {
+    prepare_offer_answer_for_transfer(state, requested_mode, native_action, None).await
+}
+
+async fn prepare_offer_answer_for_transfer(
+    state: &V2State,
+    requested_mode: LeaseMode,
+    native_action: Option<&NativeCallAction>,
+    accepted_transfer_request_id: Option<&str>,
 ) -> Result<(MobileOfferAnswerFrame, String), String> {
     let (frame, request_id) = {
         let mut client = state.inner.lock().await;
@@ -2310,6 +2642,8 @@ async fn prepare_offer_answer(
             || client.lease.is_some()
             || client.pending_revoke.is_some()
             || client.pending_native_end.is_some()
+            || client.pending_end_caller.is_some()
+            || client.pending_native_hangup.is_some()
         {
             return Err("a media lease is already pending or active".into());
         }
@@ -2322,6 +2656,7 @@ async fn prepare_offer_answer(
             &snapshot,
             requested_mode,
             native_action,
+            accepted_transfer_request_id,
             unix_now()?,
         )?;
         let mode = selected.offer.offered_mode;
@@ -2350,6 +2685,24 @@ async fn prepare_offer_answer(
             && !matches!(snapshot.snapshot.service_mode, ServiceMode::AokieActive)
         {
             return Err("takeover is not available in the current service mode".into());
+        }
+        if let Some(request_id) = accepted_transfer_request_id {
+            validate_id(request_id, "accepted transfer requestId")?;
+            let assistance = client
+                .assistance
+                .as_ref()
+                .ok_or("the transfer request is no longer active")?;
+            if !assistance.transfer_offered
+                || assistance.request_id != request_id
+                || assistance.expires_at <= unix_now()?
+                || assistance.call_id != snapshot.snapshot.call_id
+                || assistance.call_epoch != snapshot.snapshot.call_epoch
+                || assistance.owner_epoch != snapshot.snapshot.owner_epoch
+                || assistance.switchboard_revision != snapshot.snapshot.switchboard_revision
+                || assistance.remote_revision != snapshot.snapshot.remote_revision
+            {
+                return Err("the accepted transfer request is stale against call state".into());
+            }
         }
         if matches!(mode, LeaseMode::Consult) {
             if !matches!(snapshot.snapshot.service_mode, ServiceMode::AokieActive) {
@@ -2398,6 +2751,7 @@ async fn prepare_offer_answer(
             rtc_session_id: rtc_session_id.clone(),
             accepted_offer_id: selected.offer.offer_id.clone(),
             accepted_offer_jti: selected.offer.jti.clone(),
+            accepted_transfer_request_id: selected.offer.accepted_transfer_request_id.clone(),
         };
         frame.validate().map_err(|error| error.to_string())?;
         let answer = MobileOfferAnswerFrame {
@@ -2422,7 +2776,7 @@ async fn prepare_offer_answer(
         // clearing a failed claim must never reveal the same cached offer to a
         // second button press. The exact `answer` value remains available to
         // the outbound transport for its normal at-least-once retry.
-        tombstone_mobile_offer(&mut client, &selected);
+        tombstone_mobile_offer(&mut client, &selected, Some(&offer_request_id));
         client.pending = Some(PendingLease {
             request_id: request_id.clone(),
             offer_request_id,
@@ -2449,6 +2803,7 @@ fn select_mobile_offer(
     snapshot: &MobileSnapshotFrame,
     requested_mode: LeaseMode,
     native_action: Option<&NativeCallAction>,
+    accepted_transfer_request_id: Option<&str>,
     now: u64,
 ) -> Result<SignedPendingMobileOffer, String> {
     let device_id = client
@@ -2476,6 +2831,7 @@ fn select_mobile_offer(
                 && offer.owner_epoch == snapshot.snapshot.owner_epoch
                 && offer.switchboard_revision == snapshot.snapshot.switchboard_revision
                 && offer.remote_revision == snapshot.snapshot.remote_revision
+                && offer.accepted_transfer_request_id.as_deref() == accepted_transfer_request_id
                 && offer.required_consent_policy_id == snapshot.snapshot.remote_consent.policy_id
                 && offer.required_consent_policy_version
                     == snapshot.snapshot.remote_consent.policy_version
@@ -2495,6 +2851,8 @@ fn select_mobile_offer(
                             && offer.call_id == action.call_id
                             && offer.call_epoch == action.call_epoch
                             && offer.owner_epoch == action.owner_epoch
+                            && offer.accepted_transfer_request_id
+                                == action.accepted_transfer_request_id
                             && offer.surface == MobileOfferSurface::VoiceSystemUi
                     }
                     None => {
@@ -2510,6 +2868,194 @@ fn select_mobile_offer(
         return Err("multiple signed mobile offers require an explicit offer selection".into());
     }
     Ok(selected.clone())
+}
+
+fn authoritative_android_offer(
+    client: &ClientState,
+    now: u64,
+) -> Result<Option<crate::android_runtime::AndroidAuthoritativeOffer>, String> {
+    let Some(snapshot) = client.snapshot.as_ref() else {
+        return Ok(None);
+    };
+    let Some(device_id) = client.device_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(holder_key_thumbprint) = client
+        .endpoint_identity
+        .as_ref()
+        .map(crate::endpoint_identity::EndpointIdentity::thumbprint)
+    else {
+        return Ok(None);
+    };
+    let active_transfer_id = client.assistance.as_ref().and_then(|assistance| {
+        (assistance.transfer_offered
+            && assistance.expires_at > now
+            && assistance.app_id == snapshot.app_id
+            && assistance.call_id == snapshot.snapshot.call_id
+            && assistance.call_epoch == snapshot.snapshot.call_epoch
+            && assistance.owner_epoch == snapshot.snapshot.owner_epoch
+            && assistance.switchboard_revision == snapshot.snapshot.switchboard_revision
+            && assistance.remote_revision == snapshot.snapshot.remote_revision)
+            .then_some(assistance.request_id.as_str())
+    });
+    let grants = current_client_grants(client);
+    let mut matches = snapshot
+        .snapshot
+        .pending_mobile_offers
+        .iter()
+        .filter(|signed| {
+            let offer = &signed.offer;
+            !mobile_offer_was_spent(client, signed)
+                && signed.validate(now).is_ok()
+                && offer.surface == MobileOfferSurface::VoiceSystemUi
+                && offer.offered_mode == LeaseMode::Takeover
+                && offer.target_device_id == device_id
+                && offer.target_holder_key_thumbprint == holder_key_thumbprint
+                && offer.app_id == snapshot.app_id
+                && offer.call_id == snapshot.snapshot.call_id
+                && offer.call_epoch == snapshot.snapshot.call_epoch
+                && offer.owner_epoch == snapshot.snapshot.owner_epoch
+                && offer.switchboard_revision == snapshot.snapshot.switchboard_revision
+                && offer.remote_revision == snapshot.snapshot.remote_revision
+                && offer.accepted_transfer_request_id.as_deref() == active_transfer_id
+                && offer.required_consent_policy_id == snapshot.snapshot.remote_consent.policy_id
+                && offer.required_consent_policy_version
+                    == snapshot.snapshot.remote_consent.policy_version
+                && offer
+                    .required_grants
+                    .iter()
+                    .all(|required| grants.contains(required))
+                && current_consent_permits_mode(
+                    &snapshot.snapshot.remote_consent,
+                    LeaseMode::Takeover,
+                    now,
+                )
+        });
+    let Some(selected) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err("multiple native call offers matched current authenticated state".into());
+    }
+    let offer = &selected.offer;
+    Ok(Some(crate::android_runtime::AndroidAuthoritativeOffer {
+        schema_version: 1,
+        event_id: offer.opportunity_id.clone(),
+        offer_id: offer.offer_id.clone(),
+        opportunity_id: offer.opportunity_id.clone(),
+        app_id: offer.app_id.clone(),
+        call_id: offer.call_id.clone(),
+        call_epoch: offer.call_epoch,
+        owner_epoch: offer.owner_epoch,
+        expires_at: offer.expires_at,
+        accepted_transfer_request_id: offer.accepted_transfer_request_id.clone(),
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AndroidOfferReconciliation {
+    Present(crate::android_runtime::AndroidAuthoritativeOffer),
+    Cancel { call_id: String, call_epoch: u64 },
+    PreserveLocalClaim,
+    None,
+}
+
+fn android_offer_reconciliation(
+    client: &ClientState,
+    now: u64,
+) -> Result<AndroidOfferReconciliation, String> {
+    let Some(snapshot) = client.snapshot.as_ref() else {
+        return Ok(AndroidOfferReconciliation::None);
+    };
+    let call_id = snapshot.snapshot.call_id.as_str();
+    let call_epoch = snapshot.snapshot.call_epoch;
+    let local_claim = client
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.call_id == call_id && pending.call_epoch == call_epoch)
+        || client.lease.as_ref().is_some_and(|lease| {
+            lease.claims.call_id == call_id && lease.claims.call_epoch == call_epoch
+        });
+    if local_claim {
+        return Ok(AndroidOfferReconciliation::PreserveLocalClaim);
+    }
+    if let Some(offer) = authoritative_android_offer(client, now)? {
+        return Ok(AndroidOfferReconciliation::Present(offer));
+    }
+    Ok(AndroidOfferReconciliation::Cancel {
+        call_id: call_id.to_owned(),
+        call_epoch,
+    })
+}
+
+/// Resolve the exact call identity whose Android call surface must be retired
+/// before transport state is cleared. A ringing VoiceSystemUi offer has no
+/// pending lease yet, so the authenticated snapshot is the final fallback.
+fn native_call_to_cancel_on_disconnect(client: &ClientState) -> Option<(String, u64)> {
+    client
+        .pending
+        .as_ref()
+        .map(|pending| (pending.call_id.clone(), pending.call_epoch))
+        .or_else(|| {
+            client
+                .lease
+                .as_ref()
+                .map(|lease| (lease.claims.call_id.clone(), lease.claims.call_epoch))
+        })
+        .or_else(|| {
+            client.snapshot.as_ref().map(|snapshot| {
+                (
+                    snapshot.snapshot.call_id.clone(),
+                    snapshot.snapshot.call_epoch,
+                )
+            })
+        })
+}
+
+/// A direct snapshot-to-snapshot call transition must cancel the previous
+/// native identity before publishing the replacement. Cancelling the new call
+/// cannot match the old encrypted offer-store record and leaves it ringing.
+fn replaced_snapshot_call(
+    client: &ClientState,
+    incoming: &MobileSnapshotFrame,
+) -> Option<(String, u64)> {
+    client.snapshot.as_ref().and_then(|previous| {
+        (previous.snapshot.call_id != incoming.snapshot.call_id
+            || previous.snapshot.call_epoch != incoming.snapshot.call_epoch)
+            .then(|| {
+                (
+                    previous.snapshot.call_id.clone(),
+                    previous.snapshot.call_epoch,
+                )
+            })
+    })
+}
+
+async fn publish_current_android_offer(app: &AppHandle, state: &V2State) -> Result<(), String> {
+    let reconciliation = {
+        let client = state.inner.lock().await;
+        android_offer_reconciliation(&client, unix_now()?)?
+    };
+    match reconciliation {
+        AndroidOfferReconciliation::Present(offer) => {
+            let _ = crate::android_runtime::present_authoritative_offer(app, &offer).await?;
+        }
+        AndroidOfferReconciliation::Cancel {
+            call_id,
+            call_epoch,
+        } => {
+            let _ = crate::android_runtime::reconcile_offer(
+                app,
+                &call_id,
+                call_epoch,
+                "cancel",
+                "authoritative_voice_offer_unavailable",
+            )
+            .await?;
+        }
+        AndroidOfferReconciliation::PreserveLocalClaim | AndroidOfferReconciliation::None => {}
+    }
+    Ok(())
 }
 
 fn mobile_offer_was_spent(client: &ClientState, signed: &SignedPendingMobileOffer) -> bool {
@@ -2530,6 +3076,68 @@ fn spent_mobile_offer_matches(spent: &SpentMobileOffer, signed: &SignedPendingMo
         && (spent.offer_id == offer.offer_id || spent.offer_jti == offer.jti)
 }
 
+fn remember_terminal_offer_acceptance(client: &mut ClientState, pending: &PendingLease) {
+    let Some(device_id) = client.device_id.clone() else {
+        return;
+    };
+    let terminal = TerminalOfferAcceptance {
+        app_id: pending.lease_frame.app_id.clone(),
+        device_id,
+        request_id: pending.offer_request_id.clone(),
+        offer_id: pending.accepted_offer_id.clone(),
+        offer_jti: pending.accepted_offer_jti.clone(),
+        offered_mode: pending.mode,
+    };
+    if client
+        .terminal_offer_acceptances
+        .iter()
+        .any(|known| known == &terminal)
+    {
+        return;
+    }
+    if client.terminal_offer_acceptances.len() >= MAX_TERMINAL_OFFER_ACCEPTANCES {
+        client.terminal_offer_acceptances.pop_front();
+    }
+    client.terminal_offer_acceptances.push_back(terminal);
+}
+
+fn terminal_offer_acceptance_matches(
+    client: &ClientState,
+    frame: &MobileOfferAcceptedFrame,
+) -> Result<bool, String> {
+    if let Some(terminal) = client
+        .terminal_offer_acceptances
+        .iter()
+        .find(|terminal| terminal.request_id == frame.request_id)
+    {
+        return if terminal.app_id == frame.app_id
+            && terminal.offer_id == frame.offer_id
+            && terminal.offer_jti == frame.offer_jti
+            && terminal.offered_mode == frame.offered_mode
+        {
+            Ok(true)
+        } else {
+            Err("late mobile offer acknowledgement crossed its terminal offer fence".into())
+        };
+    }
+    let Some(spent) = client
+        .spent_mobile_offers
+        .iter()
+        .find(|spent| spent.offer_request_id.as_deref() == Some(frame.request_id.as_str()))
+    else {
+        return Ok(false);
+    };
+    if spent.app_id == frame.app_id
+        && spent.offer_id == frame.offer_id
+        && spent.offer_jti == frame.offer_jti
+        && spent.offered_mode == frame.offered_mode
+    {
+        Ok(true)
+    } else {
+        Err("late mobile offer acknowledgement crossed its terminal offer fence".into())
+    }
+}
+
 fn retain_spent_mobile_offers_for_snapshot(client: &mut ClientState, frame: &MobileSnapshotFrame) {
     let device_id = client.device_id.as_deref();
     client.spent_mobile_offers.retain(|spent| {
@@ -2547,7 +3155,11 @@ fn suppress_spent_mobile_offers(client: &ClientState, frame: &mut MobileSnapshot
         .retain(|offer| !mobile_offer_was_spent(client, offer));
 }
 
-fn tombstone_mobile_offer(client: &mut ClientState, selected: &SignedPendingMobileOffer) {
+fn tombstone_mobile_offer(
+    client: &mut ClientState,
+    selected: &SignedPendingMobileOffer,
+    offer_request_id: Option<&str>,
+) {
     if !mobile_offer_was_spent(client, selected) {
         if client.spent_mobile_offers.len() >= MAX_SPENT_MOBILE_OFFERS {
             client.spent_mobile_offers.pop_front();
@@ -2559,7 +3171,18 @@ fn tombstone_mobile_offer(client: &mut ClientState, selected: &SignedPendingMobi
             call_epoch: selected.offer.call_epoch,
             offer_id: selected.offer.offer_id.clone(),
             offer_jti: selected.offer.jti.clone(),
+            offered_mode: selected.offer.offered_mode,
+            offer_request_id: offer_request_id.map(str::to_owned),
         });
+    } else if let Some(offer_request_id) = offer_request_id {
+        // A decline may have tombstoned this offer without an acceptance
+        // request. Never overwrite another request identity, but enrich that
+        // exact one-shot record when the lease-answer path owns it.
+        if let Some(spent) = client.spent_mobile_offers.iter_mut().find(|spent| {
+            spent_mobile_offer_matches(spent, selected) && spent.offer_request_id.is_none()
+        }) {
+            spent.offer_request_id = Some(offer_request_id.to_owned());
+        }
     }
     if let Some(snapshot) = client.snapshot.as_mut() {
         let spent = SpentMobileOffer {
@@ -2569,6 +3192,8 @@ fn tombstone_mobile_offer(client: &mut ClientState, selected: &SignedPendingMobi
             call_epoch: selected.offer.call_epoch,
             offer_id: selected.offer.offer_id.clone(),
             offer_jti: selected.offer.jti.clone(),
+            offered_mode: selected.offer.offered_mode,
+            offer_request_id: offer_request_id.map(str::to_owned),
         };
         snapshot
             .snapshot
@@ -2582,16 +3207,15 @@ async fn clear_pending_lease(state: &V2State, request_id: &str) -> Option<String
     if client.pending.as_ref().is_some_and(|pending| {
         pending.request_id == request_id || pending.offer_request_id == request_id
     }) {
-        return client
-            .pending
-            .take()
-            .and_then(|pending| pending.native_action_id);
+        let pending = client.pending.take().expect("checked pending lease");
+        remember_terminal_offer_acceptance(&mut client, &pending);
+        return pending.native_action_id;
     }
     None
 }
 
 fn validate_native_action(action: &NativeCallAction, now: u64) -> Result<(), String> {
-    if action.schema_version != 1
+    if action.schema_version != 2
         || action.call_epoch == 0
         || action.call_epoch > MAX_SAFE_INTEGER
         || action.owner_epoch > MAX_SAFE_INTEGER
@@ -2607,6 +3231,33 @@ fn validate_native_action(action: &NativeCallAction, now: u64) -> Result<(), Str
         (&action.call_id, "native callId"),
     ] {
         validate_id(value, label)?;
+    }
+    if let Some(request_id) = &action.accepted_transfer_request_id {
+        validate_id(request_id, "native acceptedTransferRequestId")?;
+    }
+    if action.response_text.as_ref().is_some_and(|text| {
+        text.is_empty() || text.len() > 500 || text.chars().any(char::is_control)
+    }) {
+        return Err("native transfer response text is invalid".into());
+    }
+    match action.kind {
+        NativeCallActionKind::Answer => {
+            if action.response_text.is_some() {
+                return Err("native Answer cannot carry response text".into());
+            }
+        }
+        NativeCallActionKind::Decline => {
+            if action.accepted_transfer_request_id.is_none() || action.response_text.is_none() {
+                return Err("native Decline lacks its exact transfer response binding".into());
+            }
+        }
+        NativeCallActionKind::End | NativeCallActionKind::Hangup => {
+            if action.accepted_transfer_request_id.is_some() || action.response_text.is_some() {
+                return Err(
+                    "native call termination cannot carry transfer response authority".into(),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -2655,7 +3306,6 @@ pub async fn realtime_v2_prepare_end_caller(
         if client.generation == 0 {
             return Err("protocol-v2 realtime is offline".into());
         }
-        require_supported_user_action(&client, RelayUnsupportedAction::EndCaller)?;
         if client.pending_end_caller.is_some() {
             return Err("a caller-ending confirmation is already pending".into());
         }
@@ -2713,7 +3363,6 @@ pub async fn realtime_v2_confirm_end_caller(
         if client.generation == 0 {
             return Err("protocol-v2 realtime is offline".into());
         }
-        require_supported_user_action(&client, RelayUnsupportedAction::EndCaller)?;
         validate_local_end_caller(&client, unix_now()?)?;
         let challenge = match client.pending_end_caller.as_ref() {
             Some(PendingEndCaller::AwaitingConfirmation { challenge })
@@ -2785,18 +3434,402 @@ pub async fn realtime_v2_confirm_end_caller(
     Ok(V2RequestReceipt { request_id })
 }
 
+fn current_microphone_mute_authority(
+    client: &ClientState,
+    now: u64,
+) -> Result<(MobileSnapshotFrame, ClientLease), String> {
+    if client.generation == 0 {
+        return Err("protocol-v2 realtime is offline".into());
+    }
+    if client.pending_revoke.is_some() {
+        return Err("the media lease is already returning to Aokie".into());
+    }
+    let snapshot = client
+        .snapshot
+        .as_ref()
+        .ok_or("protocol-v2 authoritative state is unavailable")?;
+    let lease = client
+        .lease
+        .as_ref()
+        .ok_or("an active Companion media lease is required")?;
+    if lease.claims.phase != LeasePhase::Active
+        || !matches!(lease.claims.mode, LeaseMode::Takeover | LeaseMode::Consult)
+        || lease.claims.expires_at <= now
+        || lease.session.expires_at <= Utc::now()
+    {
+        return Err("the current Companion media lease cannot change microphone authority".into());
+    }
+    if !grants_permit_lease_mode(current_client_grants(client), lease.claims.mode)
+        || snapshot.app_id != lease.claims.app_id
+        || snapshot.snapshot.call_id != lease.claims.call_id
+        || snapshot.snapshot.call_epoch != lease.claims.call_epoch
+        || snapshot.snapshot.owner_epoch != lease.claims.owner_epoch
+        || snapshot.snapshot.telephony_state != TelephonyState::Active
+        || matches!(
+            snapshot.snapshot.media_state,
+            MediaState::None | MediaState::Failed
+        )
+        || !current_consent_permits_mode(&snapshot.snapshot.remote_consent, lease.claims.mode, now)
+        || !matches!(
+            (lease.claims.mode, snapshot.snapshot.service_mode.clone()),
+            (LeaseMode::Takeover, ServiceMode::HumanActive)
+                | (LeaseMode::Consult, ServiceMode::ConsultActive)
+        )
+    {
+        return Err("the active media lease no longer matches authoritative call state".into());
+    }
+    Ok((snapshot.clone(), lease.clone()))
+}
+
+fn pending_microphone_mute(
+    request_id: String,
+    muted: bool,
+    stage: PendingMicrophoneMuteStage,
+    snapshot: &MobileSnapshotFrame,
+    lease: &ClientLease,
+) -> PendingMicrophoneMute {
+    PendingMicrophoneMute {
+        request_id,
+        lease_id: lease.claims.lease_id.clone(),
+        lease_jti: lease.claims.jti.clone(),
+        rtc_session_id: lease.claims.rtc_session_id.clone(),
+        call_id: lease.claims.call_id.clone(),
+        call_epoch: lease.claims.call_epoch,
+        owner_epoch: lease.claims.owner_epoch,
+        switchboard_revision: snapshot.snapshot.switchboard_revision,
+        remote_revision: snapshot.snapshot.remote_revision,
+        fence: lease.claims.fence,
+        muted,
+        session: lease.session.clone(),
+        stage,
+    }
+}
+
+fn microphone_mute_frame(
+    pending: &PendingMicrophoneMute,
+    app_id: String,
+    device_id: &str,
+    lease_token: String,
+) -> Result<MobileMicrophoneMuteFrame, String> {
+    let frame = MobileMicrophoneMuteFrame {
+        kind: "microphone_mute".into(),
+        schema_version: SCHEMA_VERSION,
+        app_id,
+        request_id: pending.request_id.clone(),
+        idempotency_key: format!("mobile:{device_id}:{}", pending.request_id),
+        lease_token,
+        rtc_session_id: pending.rtc_session_id.clone(),
+        call_id: pending.call_id.clone(),
+        call_epoch: pending.call_epoch,
+        owner_epoch: pending.owner_epoch,
+        switchboard_revision: pending.switchboard_revision,
+        remote_revision: pending.remote_revision,
+        fence: pending.fence,
+        muted: pending.muted,
+    };
+    frame.validate().map_err(|error| error.to_string())?;
+    Ok(frame)
+}
+
+async fn clear_pending_microphone_mute(state: &V2State, request_id: &str) {
+    let mut client = state.inner.lock().await;
+    if client
+        .pending_microphone_mute
+        .as_ref()
+        .is_some_and(|pending| pending.request_id == request_id)
+    {
+        client.pending_microphone_mute = None;
+    }
+}
+
+#[tauri::command]
+pub async fn realtime_v2_set_microphone_muted(
+    app: AppHandle,
+    state: State<'_, RealtimeState>,
+    media_state: State<'_, NativeMediaState>,
+    request: MicrophoneMuteRequest,
+) -> Result<V2RequestReceipt, String> {
+    let (request_id, mut frame, initial_session, initial_remote_revision) = {
+        let mut client = state.v2.inner.lock().await;
+        if client.pending_microphone_mute.is_some() {
+            return Err(
+                "a microphone authority change is already awaiting Desktop confirmation".into(),
+            );
+        }
+        let (snapshot, lease) = current_microphone_mute_authority(&client, unix_now()?)?;
+        if snapshot.snapshot.companion_microphone_muted == request.muted {
+            return Err(if request.muted {
+                "the Desktop microphone gate is already muted"
+            } else {
+                "the Desktop microphone gate is already unmuted"
+            }
+            .into());
+        }
+        let request_id = state.v2.next_id("microphone_mute");
+        let stage = if request.muted {
+            PendingMicrophoneMuteStage::AwaitingStatus
+        } else {
+            PendingMicrophoneMuteStage::ArmingNative
+        };
+        let pending =
+            pending_microphone_mute(request_id.clone(), request.muted, stage, &snapshot, &lease);
+        let frame = request
+            .muted
+            .then(|| {
+                microphone_mute_frame(
+                    &pending,
+                    snapshot.app_id.clone(),
+                    &lease.claims.device_id,
+                    lease.token.clone(),
+                )
+            })
+            .transpose()?;
+        let initial_session = lease.session.clone();
+        let initial_remote_revision = snapshot.snapshot.remote_revision;
+        client.pending_microphone_mute = Some(pending);
+        (request_id, frame, initial_session, initial_remote_revision)
+    };
+
+    if !request.muted {
+        let arm_result = async {
+            media::arm_microphone(
+                &app,
+                media_state.inner(),
+                SessionRequest {
+                    session: initial_session.clone(),
+                },
+            )
+            .await?;
+            media::await_microphone_proof(
+                media_state.inner(),
+                &initial_session,
+                Duration::from_secs(1),
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = arm_result {
+            clear_pending_microphone_mute(&state.v2, &request_id).await;
+            let _ = media::disarm_microphone(
+                &app,
+                media_state.inner(),
+                SessionRequest {
+                    session: initial_session,
+                },
+            )
+            .await;
+            return Err(error);
+        }
+
+        let built_frame = async {
+            let mut client = state.v2.inner.lock().await;
+            let (snapshot, lease) = current_microphone_mute_authority(&client, unix_now()?)?;
+            let pending = client
+                .pending_microphone_mute
+                .as_mut()
+                .filter(|pending| {
+                    pending.request_id == request_id
+                        && pending.stage == PendingMicrophoneMuteStage::ArmingNative
+                        && !pending.muted
+                })
+                .ok_or("the microphone unmute transaction is no longer current")?;
+            if !snapshot.snapshot.companion_microphone_muted
+                || lease.session != initial_session
+                || pending.call_id != lease.claims.call_id
+                || pending.call_epoch != lease.claims.call_epoch
+                || pending.owner_epoch != lease.claims.owner_epoch
+                || pending.fence != lease.claims.fence
+            {
+                return Err("microphone authority changed while native capture was proving".into());
+            }
+            *pending = pending_microphone_mute(
+                request_id.clone(),
+                false,
+                PendingMicrophoneMuteStage::AwaitingStatus,
+                &snapshot,
+                &lease,
+            );
+            microphone_mute_frame(
+                pending,
+                snapshot.app_id,
+                &lease.claims.device_id,
+                lease.token,
+            )
+        }
+        .await;
+        match built_frame {
+            Ok(built) => frame = Some(built),
+            Err(error) => {
+                clear_pending_microphone_mute(&state.v2, &request_id).await;
+                let _ = media::disarm_microphone(
+                    &app,
+                    media_state.inner(),
+                    SessionRequest {
+                        session: initial_session,
+                    },
+                )
+                .await;
+                return Err(error);
+            }
+        }
+    }
+
+    let encoded = serde_json::to_string(frame.as_ref().expect("mute frame was built"))
+        .map_err(|_| "could not encode microphone authority request".to_string())?;
+    if let Err(error) = enqueue_encoded(&state, encoded).await {
+        clear_pending_microphone_mute(&state.v2, &request_id).await;
+        if !request.muted {
+            let _ = media::disarm_microphone(
+                &app,
+                media_state.inner(),
+                SessionRequest {
+                    session: initial_session,
+                },
+            )
+            .await;
+        }
+        return Err(error);
+    }
+
+    let deadline = Instant::now() + MICROPHONE_MUTE_CONFIRM_TIMEOUT;
+    loop {
+        let result = {
+            let client = state.v2.inner.lock().await;
+            let pending_current = client
+                .pending_microphone_mute
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == request_id);
+            match current_microphone_mute_authority(&client, unix_now()?) {
+                Ok((snapshot, lease))
+                    if snapshot.snapshot.companion_microphone_muted == request.muted
+                        && snapshot.snapshot.remote_revision > initial_remote_revision
+                        && !pending_current =>
+                {
+                    Some(Ok(lease.session))
+                }
+                Ok(_) if !pending_current => Some(Err(
+                    "Desktop did not confirm the requested microphone authority".into(),
+                )),
+                Err(error) if !pending_current => Some(Err(error)),
+                _ => None,
+            }
+        };
+        if let Some(result) = result {
+            match result {
+                Ok(session) => {
+                    if request.muted {
+                        media::disarm_microphone(
+                            &app,
+                            media_state.inner(),
+                            SessionRequest { session },
+                        )
+                        .await?;
+                    }
+                    return Ok(V2RequestReceipt { request_id });
+                }
+                Err(error) => {
+                    if !request.muted {
+                        let _ = media::disarm_microphone(
+                            &app,
+                            media_state.inner(),
+                            SessionRequest {
+                                session: initial_session,
+                            },
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            let safely_muted_session = {
+                let mut client = state.v2.inner.lock().await;
+                let authority_now = unix_now().ok();
+                let authoritative = client
+                    .pending_microphone_mute
+                    .as_ref()
+                    .filter(|pending| pending.request_id == request_id && pending.muted)
+                    .and_then(|_| {
+                        authority_now
+                            .and_then(|now| current_microphone_mute_authority(&client, now).ok())
+                    })
+                    .filter(|(snapshot, _)| {
+                        snapshot.snapshot.companion_microphone_muted
+                            && snapshot.snapshot.remote_revision > initial_remote_revision
+                    })
+                    .map(|(_, lease)| lease.session);
+                if client
+                    .pending_microphone_mute
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request_id)
+                {
+                    client.pending_microphone_mute = None;
+                }
+                authoritative
+            };
+            if let Some(session) = safely_muted_session {
+                let _ =
+                    media::disarm_microphone(&app, media_state.inner(), SessionRequest { session })
+                        .await;
+                return Err(
+                    "Desktop mute is authoritative and the native microphone was safely disarmed, but its targeted confirmation timed out"
+                        .into(),
+                );
+            }
+            // A timeout can never leave native capture running after the user
+            // explicitly asked to mute. Desktop authority may still be
+            // unresolved, so distinguish that fail-closed local state from an
+            // authoritative mute instead of claiming convergence.
+            let _ = media::disarm_microphone(
+                &app,
+                media_state.inner(),
+                SessionRequest {
+                    session: initial_session,
+                },
+            )
+            .await;
+            return Err(if request.muted {
+                "Desktop mute confirmation timed out; the handset microphone was locally disarmed for privacy"
+            } else {
+                "Desktop microphone authority confirmation timed out; the handset microphone was safely disarmed"
+            }
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tauri::command]
 pub async fn realtime_v2_answer_assistance(
     state: State<'_, RealtimeState>,
     request: AssistanceAnswerRequest,
 ) -> Result<V2AssistanceReceipt, String> {
+    let request_id = request.request_id.clone();
+    let (frame, answer_id) = prepare_assistance_answer(&state.v2, &request, None).await?;
+    let encoded = serde_json::to_string(&frame)
+        .map_err(|_| "could not encode protocol-v2 assistance answer".to_string())?;
+    if let Err(error) = enqueue_encoded(&state, encoded).await {
+        clear_pending_assistance_answer(&state.v2, &answer_id).await;
+        return Err(error);
+    }
+    Ok(V2AssistanceReceipt {
+        request_id,
+        answer_id,
+    })
+}
+
+async fn prepare_assistance_answer(
+    state: &V2State,
+    request: &AssistanceAnswerRequest,
+    native_action: Option<&NativeCallAction>,
+) -> Result<(MobileAssistanceAnswerFrame, String), String> {
     let answer = request.answer.trim();
     let (frame, answer_id) = {
-        let mut client = state.v2.inner.lock().await;
+        let mut client = state.inner.lock().await;
         if client.generation == 0 {
             return Err("protocol-v2 realtime is offline".into());
         }
-        require_supported_user_action(&client, RelayUnsupportedAction::AssistanceAnswer)?;
         let now = unix_now()?;
         if discard_expired_assistance(&mut client, now, None) {
             return Err("the assistance request is stale or expired".into());
@@ -2811,9 +3844,15 @@ pub async fn realtime_v2_answer_assistance(
         if assistance.request_id != request.request_id {
             return Err("the assistance request is stale or expired".into());
         }
+        if request.response_action == AssistanceResponseAction::Decline
+            && !assistance.transfer_offered
+        {
+            return Err("only an active transfer offer can be declined".into());
+        }
         let snapshot = client
             .snapshot
             .as_ref()
+            .cloned()
             .ok_or("protocol-v2 authoritative state is unavailable")?;
         if !snapshot.grants.contains(&Grant::AssistanceRespond)
             || !snapshot.snapshot.remote_consent.enabled
@@ -2834,7 +3873,33 @@ pub async fn realtime_v2_answer_assistance(
             .device_id
             .clone()
             .ok_or("v2 device identity is unavailable")?;
-        let answer_id = state.v2.next_id("answer");
+        let selected_native_offer = if let Some(action) = native_action {
+            validate_native_action(action, now)?;
+            let transfer_request_id = action
+                .accepted_transfer_request_id
+                .as_deref()
+                .ok_or("native transfer decline has no exact request binding")?;
+            if action.kind != NativeCallActionKind::Decline
+                || request.response_action != AssistanceResponseAction::Decline
+                || request.request_id != transfer_request_id
+                || action.response_text.as_deref() != Some(answer)
+            {
+                return Err(
+                    "native transfer decline does not match its authenticated action".into(),
+                );
+            }
+            Some(select_mobile_offer(
+                &client,
+                &snapshot,
+                LeaseMode::Takeover,
+                Some(action),
+                Some(transfer_request_id),
+                now,
+            )?)
+        } else {
+            None
+        };
+        let answer_id = state.next_id("answer");
         let frame = MobileAssistanceAnswerFrame {
             kind: "assistance_answer".into(),
             schema_version: SCHEMA_VERSION,
@@ -2847,25 +3912,24 @@ pub async fn realtime_v2_answer_assistance(
             owner_epoch: assistance.owner_epoch,
             switchboard_revision: assistance.switchboard_revision,
             remote_revision: assistance.remote_revision,
+            response_action: request.response_action,
             answer: answer.to_owned(),
         };
         frame.validate().map_err(|error| error.to_string())?;
+        if let Some(selected) = selected_native_offer.as_ref() {
+            tombstone_mobile_offer(&mut client, selected, None);
+        }
         client.pending_assistance_answer = Some(answer_id.clone());
         (frame, answer_id)
     };
-    let encoded = serde_json::to_string(&frame)
-        .map_err(|_| "could not encode protocol-v2 assistance answer".to_string())?;
-    if let Err(error) = enqueue_encoded(&state, encoded).await {
-        let mut client = state.v2.inner.lock().await;
-        if client.pending_assistance_answer.as_deref() == Some(answer_id.as_str()) {
-            client.pending_assistance_answer = None;
-        }
-        return Err(error);
+    Ok((frame, answer_id))
+}
+
+async fn clear_pending_assistance_answer(state: &V2State, answer_id: &str) {
+    let mut client = state.inner.lock().await;
+    if client.pending_assistance_answer.as_deref() == Some(answer_id) {
+        client.pending_assistance_answer = None;
     }
-    Ok(V2AssistanceReceipt {
-        request_id: request.request_id,
-        answer_id,
-    })
 }
 
 #[tauri::command]
@@ -2901,6 +3965,11 @@ async fn prepare_revoke(
                 "a media lease return is already awaiting authoritative confirmation".into(),
             );
         }
+        if client.pending_native_hangup.is_some() {
+            return Err(
+                "caller hang-up confirmation must complete before returning the lease".into(),
+            );
+        }
         match (
             native_action_id.as_deref(),
             client.pending_native_end.as_ref(),
@@ -2915,6 +3984,7 @@ async fn prepare_revoke(
             .take()
             .ok_or("there is no active media lease")?;
         client.pending_end_caller = None;
+        client.pending_microphone_mute = None;
         let request_id = state.next_id("request");
         let device_id = client
             .device_id
@@ -3001,6 +4071,9 @@ async fn poll_native_call_actions(
     if let Some(outbound) = take_ready_lease_request(state).await? {
         return Ok(Some(outbound));
     }
+    if let Some(outbound) = progress_native_hangup(app, state).await? {
+        return Ok(Some(outbound));
+    }
     if let Some(outbound) = progress_native_end(app, state, media_state).await? {
         return Ok(Some(outbound));
     }
@@ -3027,7 +4100,14 @@ async fn poll_native_call_actions(
     let action_id = action.action_id.clone();
     let result: Result<Option<NativeOutbound>, String> = match action.kind {
         NativeCallActionKind::Answer => {
-            match prepare_offer_answer(state, LeaseMode::Takeover, Some(&action)).await {
+            match prepare_offer_answer_for_transfer(
+                state,
+                LeaseMode::Takeover,
+                Some(&action),
+                action.accepted_transfer_request_id.as_deref(),
+            )
+            .await
+            {
                 Ok((frame, request_id)) => serde_json::to_string(&frame)
                     .map(|encoded| {
                         Some(NativeOutbound {
@@ -3036,6 +4116,7 @@ async fn poll_native_call_actions(
                             // accepted offer advances to an actual lease request.
                             answer_action_id: None,
                             answer_request_id: Some(request_id),
+                            assistance_answer_id: None,
                             revoke_request_id: None,
                         })
                     })
@@ -3043,10 +4124,40 @@ async fn poll_native_call_actions(
                 Err(message) => Err(message),
             }
         }
+        NativeCallActionKind::Decline => {
+            let request_id = action
+                .accepted_transfer_request_id
+                .clone()
+                .ok_or("native transfer decline has no exact request binding")?;
+            let answer = action
+                .response_text
+                .clone()
+                .ok_or("native transfer decline has no private response")?;
+            let request = AssistanceAnswerRequest {
+                request_id,
+                response_action: AssistanceResponseAction::Decline,
+                answer,
+            };
+            match prepare_assistance_answer(state, &request, Some(&action)).await {
+                Ok((frame, answer_id)) => serde_json::to_string(&frame)
+                    .map(|encoded| {
+                        Some(NativeOutbound {
+                            encoded,
+                            answer_action_id: Some(action.action_id.clone()),
+                            answer_request_id: None,
+                            assistance_answer_id: Some(answer_id),
+                            revoke_request_id: None,
+                        })
+                    })
+                    .map_err(|_| "could not encode native transfer decline response".to_string()),
+                Err(message) => Err(message),
+            }
+        }
         NativeCallActionKind::End => match queue_native_end(state, action).await {
             Ok(()) => progress_native_end(app, state, media_state).await,
             Err(message) => Err(message),
         },
+        NativeCallActionKind::Hangup => queue_native_hangup(state, action).await.map(Some),
     };
     if let Err(message) = &result {
         let _ = crate::android_runtime::complete_native_call_action(
@@ -3080,6 +4191,7 @@ async fn take_ready_lease_request(state: &V2State) -> Result<Option<NativeOutbou
         encoded,
         answer_action_id: pending.native_action_id.clone(),
         answer_request_id: Some(pending.request_id.clone()),
+        assistance_answer_id: None,
         revoke_request_id: None,
     }))
 }
@@ -3094,6 +4206,194 @@ async fn mark_native_answer_delivered(state: &V2State, request_id: &str, action_
         pending.native_action_id = None;
         pending.native_deadline = None;
     }
+}
+
+async fn queue_native_hangup(
+    state: &V2State,
+    action: NativeCallAction,
+) -> Result<NativeOutbound, String> {
+    let mut client = state.inner.lock().await;
+    if client.pending_native_hangup.is_some()
+        || client.pending_end_caller.is_some()
+        || client.pending_native_end.is_some()
+        || client.pending_revoke.is_some()
+    {
+        return Err("a caller-ending or lease-return operation is already pending".into());
+    }
+    validate_local_end_caller(&client, unix_now()?)?;
+    let snapshot = client.snapshot.as_ref().expect("validated snapshot");
+    let lease = client.lease.as_ref().expect("validated lease");
+    if action.kind != NativeCallActionKind::Hangup
+        || client.app_id.as_deref() != Some(action.app_id.as_str())
+        || snapshot.app_id != action.app_id
+        || snapshot.snapshot.call_id != action.call_id
+        || snapshot.snapshot.call_epoch != action.call_epoch
+        || snapshot.snapshot.owner_epoch != action.owner_epoch
+        || lease.claims.app_id != action.app_id
+        || lease.claims.call_id != action.call_id
+        || lease.claims.call_epoch != action.call_epoch
+        || lease.claims.owner_epoch != action.owner_epoch
+    {
+        return Err("native Hangup does not match the exact active takeover owner".into());
+    }
+    let request_id = state.next_id("end_prepare");
+    let device_id = client
+        .device_id
+        .clone()
+        .ok_or("v2 device identity is unavailable")?;
+    let frame = MobileEndCallerChallengeRequestFrame {
+        kind: "end_caller_challenge_request".into(),
+        schema_version: SCHEMA_VERSION,
+        app_id: snapshot.app_id.clone(),
+        request_id: request_id.clone(),
+        idempotency_key: format!("mobile:{device_id}:{request_id}"),
+        lease_token: lease.token.clone(),
+        call_id: lease.claims.call_id.clone(),
+        call_epoch: lease.claims.call_epoch,
+        owner_epoch: lease.claims.owner_epoch,
+        switchboard_revision: snapshot.snapshot.switchboard_revision,
+        remote_revision: snapshot.snapshot.remote_revision,
+        fence: lease.claims.fence,
+    };
+    frame.validate().map_err(|error| error.to_string())?;
+    let encoded = serde_json::to_string(&frame)
+        .map_err(|_| "could not encode native caller-ending challenge request".to_string())?;
+    client.pending_end_caller = Some(PendingEndCaller::AwaitingChallenge { request_id });
+    client.pending_native_hangup = Some(PendingNativeHangup {
+        action_id: action.action_id,
+        deadline: Instant::now() + NATIVE_HANGUP_TIMEOUT,
+    });
+    Ok(NativeOutbound {
+        encoded,
+        answer_action_id: None,
+        answer_request_id: None,
+        assistance_answer_id: None,
+        revoke_request_id: None,
+    })
+}
+
+fn native_hangup_confirmation_frame(
+    state: &V2State,
+    client: &ClientState,
+    challenge: &EndCallerChallengeFrame,
+    now: u64,
+) -> Result<MobileEndCallerConfirmFrame, String> {
+    validate_local_end_caller(client, now)?;
+    if challenge.expires_at <= now {
+        return Err("the caller-ending confirmation expired".into());
+    }
+    let snapshot = client.snapshot.as_ref().expect("validated snapshot");
+    let lease = client.lease.as_ref().expect("validated lease");
+    if challenge.device_id != client.device_id.as_deref().unwrap_or_default()
+        || challenge.call_id != lease.claims.call_id
+        || challenge.call_epoch != lease.claims.call_epoch
+        || challenge.owner_epoch != lease.claims.owner_epoch
+        || challenge.switchboard_revision != snapshot.snapshot.switchboard_revision
+        || challenge.remote_revision != snapshot.snapshot.remote_revision
+        || challenge.lease_id != lease.claims.lease_id
+        || challenge.fence != lease.claims.fence
+    {
+        return Err("the caller-ending confirmation is stale against live authority".into());
+    }
+    let request_id = state.next_id("end_confirm");
+    let device_id = client
+        .device_id
+        .clone()
+        .ok_or("v2 device identity is unavailable")?;
+    let frame = MobileEndCallerConfirmFrame {
+        kind: "end_caller_confirm".into(),
+        schema_version: SCHEMA_VERSION,
+        app_id: challenge.app_id.clone(),
+        request_id: request_id.clone(),
+        idempotency_key: format!("mobile:{device_id}:{request_id}"),
+        confirmation_id: challenge.confirmation_id.clone(),
+        nonce: challenge.nonce.clone(),
+        lease_token: lease.token.clone(),
+        call_id: challenge.call_id.clone(),
+        call_epoch: challenge.call_epoch,
+        owner_epoch: challenge.owner_epoch,
+        switchboard_revision: challenge.switchboard_revision,
+        remote_revision: challenge.remote_revision,
+        fence: challenge.fence,
+    };
+    frame.validate().map_err(|error| error.to_string())?;
+    Ok(frame)
+}
+
+async fn progress_native_hangup(
+    app: &AppHandle,
+    state: &V2State,
+) -> Result<Option<NativeOutbound>, String> {
+    enum Decision {
+        Wait,
+        Send(MobileEndCallerConfirmFrame),
+        Reject(String, String),
+    }
+
+    let decision = {
+        let mut client = state.inner.lock().await;
+        let Some(native) = client.pending_native_hangup.clone() else {
+            return Ok(None);
+        };
+        match client.pending_end_caller.clone() {
+            Some(PendingEndCaller::AwaitingChallenge { .. })
+            | Some(PendingEndCaller::AwaitingSubmission { .. })
+            | Some(PendingEndCaller::AwaitingResult { .. }) => Decision::Wait,
+            Some(PendingEndCaller::AwaitingConfirmation { challenge }) => {
+                let result =
+                    native_hangup_confirmation_frame(state, &client, &challenge, unix_now()?);
+                match result {
+                    Ok(frame) => {
+                        client.pending_end_caller = Some(PendingEndCaller::AwaitingSubmission {
+                            request_id: frame.request_id.clone(),
+                            challenge,
+                        });
+                        Decision::Send(frame)
+                    }
+                    Err(message) => {
+                        client.pending_end_caller = None;
+                        client.pending_native_hangup = None;
+                        Decision::Reject(native.action_id, message)
+                    }
+                }
+            }
+            None => {
+                client.pending_native_hangup = None;
+                Decision::Reject(
+                    native.action_id,
+                    "caller-ending challenge state was lost".into(),
+                )
+            }
+        }
+    };
+
+    match decision {
+        Decision::Wait => Ok(None),
+        Decision::Send(frame) => Ok(Some(NativeOutbound {
+            encoded: serde_json::to_string(&frame)
+                .map_err(|_| "could not encode native caller-ending confirmation".to_string())?,
+            answer_action_id: None,
+            answer_request_id: None,
+            assistance_answer_id: None,
+            revoke_request_id: None,
+        })),
+        Decision::Reject(action_id, message) => reject_native_hangup(app, action_id, message).await,
+    }
+}
+
+async fn reject_native_hangup(
+    app: &AppHandle,
+    action_id: String,
+    message: String,
+) -> Result<Option<NativeOutbound>, String> {
+    let _ = crate::android_runtime::complete_native_call_action(
+        app,
+        &action_id,
+        false,
+        "caller_end_unconfirmed",
+    )
+    .await;
+    Err(message)
 }
 
 async fn queue_native_end(state: &V2State, action: NativeCallAction) -> Result<(), String> {
@@ -3217,6 +4517,7 @@ async fn progress_native_end(
                     .map_err(|_| "could not encode Core-Telecom lease return".to_string())?,
                 answer_action_id: None,
                 answer_request_id: None,
+                assistance_answer_id: None,
                 revoke_request_id: Some(frame.request_id),
             }))
         }
@@ -3224,7 +4525,7 @@ async fn progress_native_end(
 }
 
 async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
-    let (native_end, pending_revoke, pending_lease) = {
+    let (native_end, native_hangup, pending_revoke, pending_lease) = {
         let mut client = state.inner.lock().await;
         let now = Instant::now();
         purge_local_expiry_tombstones(&mut client, now);
@@ -3237,6 +4538,20 @@ async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
                 .pending_native_end
                 .take()
                 .map(|pending| pending.action.action_id)
+        } else {
+            None
+        };
+        let native_hangup = if client
+            .pending_native_hangup
+            .as_ref()
+            .is_some_and(|pending| pending.deadline <= now)
+        {
+            let action_id = client
+                .pending_native_hangup
+                .take()
+                .map(|pending| pending.action_id);
+            client.pending_end_caller = None;
+            action_id
         } else {
             None
         };
@@ -3259,8 +4574,25 @@ async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
                 .take()
                 .map(|pending| (pending, native_timeout))
         });
-        (native_end, pending_revoke, pending_lease)
+        if let Some((pending, _)) = pending_lease.as_ref() {
+            remember_terminal_offer_acceptance(&mut client, pending);
+        }
+        (native_end, native_hangup, pending_revoke, pending_lease)
     };
+
+    if let Some(action_id) = native_hangup {
+        let _ = crate::android_runtime::complete_native_call_action(
+            app,
+            &action_id,
+            false,
+            "caller_end_unconfirmed",
+        )
+        .await;
+        emit_error(
+            app,
+            "Caller hang-up was not authoritatively confirmed; Companion remains on the live call",
+        );
+    }
 
     let timed_out_action = native_end.or_else(|| {
         pending_revoke
@@ -3312,11 +4644,15 @@ async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
 }
 
 async fn fail_native_call_actions_on_disconnect(app: &AppHandle, state: &V2State) {
-    let (action_ids, pending_call) = {
+    let (action_ids, native_call) = {
         let mut client = state.inner.lock().await;
         let mut action_ids = Vec::new();
         if let Some(pending) = client.pending_native_end.take() {
             action_ids.push(pending.action.action_id);
+        }
+        if let Some(pending) = client.pending_native_hangup.take() {
+            action_ids.push(pending.action_id);
+            client.pending_end_caller = None;
         }
         if let Some(pending) = client.pending_revoke.take() {
             if let Some(action_id) = pending.native_action_id {
@@ -3330,11 +4666,8 @@ async fn fail_native_call_actions_on_disconnect(app: &AppHandle, state: &V2State
         {
             action_ids.push(action_id);
         }
-        let pending_call = client
-            .pending
-            .as_ref()
-            .map(|pending| (pending.call_id.clone(), pending.call_epoch));
-        (action_ids, pending_call)
+        let native_call = native_call_to_cancel_on_disconnect(&client);
+        (action_ids, native_call)
     };
     for action_id in action_ids {
         let _ = crate::android_runtime::complete_native_call_action(
@@ -3345,7 +4678,7 @@ async fn fail_native_call_actions_on_disconnect(app: &AppHandle, state: &V2State
         )
         .await;
     }
-    if let Some((call_id, call_epoch)) = pending_call {
+    if let Some((call_id, call_epoch)) = native_call {
         let _ = crate::android_runtime::reconcile_offer(
             app,
             &call_id,
@@ -4038,20 +5371,29 @@ pub(crate) fn spawn(
                                                      }
                                                      if let Some(native) = deferred_native.take() {
                                                          let NativeOutbound {
-                                                             encoded,
-                                                             answer_action_id,
-                                                             answer_request_id,
-                                                             ..
-                                                         } = native;
-                                                         if !transport.send_text(encoded).await {
-                                                             break 'active_session "deferred native action failed on managed replacement".to_string();
-                                                         }
-                                                         if let Some(action_id) = answer_action_id {
-                                                             if let Err(message) = crate::android_runtime::complete_native_call_action(
-                                                                 &app,
-                                                                 &action_id,
-                                                                 true,
-                                                                 "lease_request_sent",
+                                                              encoded,
+                                                              answer_action_id,
+                                                              answer_request_id,
+                                                              assistance_answer_id,
+                                                              ..
+                                                          } = native;
+                                                          if !transport.send_text(encoded).await {
+                                                              if let Some(answer_id) = assistance_answer_id.as_deref() {
+                                                                  clear_pending_assistance_answer(&state, answer_id).await;
+                                                              }
+                                                              break 'active_session "deferred native action failed on managed replacement".to_string();
+                                                          }
+                                                          if let Some(action_id) = answer_action_id {
+                                                              let success_code = if assistance_answer_id.is_some() {
+                                                                  "assistance_decline_sent"
+                                                              } else {
+                                                                  "lease_request_sent"
+                                                              };
+                                                              if let Err(message) = crate::android_runtime::complete_native_call_action(
+                                                                  &app,
+                                                                  &action_id,
+                                                                  true,
+                                                                  success_code,
                                                              ).await {
                                                                  emit_error(&app, &message);
                                                              } else if let Some(request_id) = answer_request_id.as_deref() {
@@ -4060,9 +5402,7 @@ pub(crate) fn spawn(
                                                          }
                                                      }
                                                      if let Some(queued) = deferred_command.take() {
-                                                         if let Some(message) = transport.unsupported_user_frame(&queued.encoded) {
-                                                             let _ = queued.completion.send(Err(message.into()));
-                                                         } else if transport.send_text(queued.encoded).await {
+                                                         if transport.send_text(queued.encoded).await {
                                                              let _ = queued.completion.send(Ok(()));
                                                          } else {
                                                              let _ = queued.completion.send(Err("protocol-v2 frame could not be delivered".into()));
@@ -4282,25 +5622,34 @@ pub(crate) fn spawn(
                                                     }
                                                     let NativeOutbound {
                                                         encoded: _,
-                                                        answer_action_id,
-                                                        answer_request_id,
-                                                        revoke_request_id,
+                                                         answer_action_id,
+                                                         answer_request_id,
+                                                         assistance_answer_id,
+                                                         revoke_request_id,
                                                     } = native;
                                                     if delivered {
-                                                        if let Some(action_id) = answer_action_id {
-                                                            if let Err(message) = crate::android_runtime::complete_native_call_action(
-                                                                &app,
-                                                                &action_id,
-                                                                true,
-                                                                "lease_request_sent",
+                                                         if let Some(action_id) = answer_action_id {
+                                                             let success_code = if assistance_answer_id.is_some() {
+                                                                 "assistance_decline_sent"
+                                                             } else {
+                                                                 "lease_request_sent"
+                                                             };
+                                                             if let Err(message) = crate::android_runtime::complete_native_call_action(
+                                                                 &app,
+                                                                 &action_id,
+                                                                 true,
+                                                                 success_code,
                                                             ).await {
                                                                 emit_error(&app, &message);
                                                             } else if let Some(request_id) = answer_request_id.as_deref() {
                                                                 mark_native_answer_delivered(&state, request_id, &action_id).await;
                                                             }
                                                         }
-                                                    } else {
-                                                        let cleared_answer_action = if let Some(request_id) = answer_request_id {
+                                                     } else {
+                                                         if let Some(answer_id) = assistance_answer_id.as_deref() {
+                                                             clear_pending_assistance_answer(&state, answer_id).await;
+                                                         }
+                                                         let cleared_answer_action = if let Some(request_id) = answer_request_id {
                                                             clear_pending_lease(&state, &request_id).await
                                                         } else {
                                                             None
@@ -4387,15 +5736,6 @@ pub(crate) fn spawn(
                                                     break 'active_session "multiple user commands crossed the managed handoff fence".to_string();
                                                 }
                                                 continue 'active_session;
-                                            }
-                                            // A command can be enqueued just before an admission
-                                            // rotates from the socket gateway onto the relay. Recheck
-                                            // the actual carrier at delivery time so that race returns
-                                            // an explicit unsupported result instead of the relay's
-                                            // tolerant send path reporting a silent success.
-                                            if let Some(message) = transport.unsupported_user_frame(&queued.encoded) {
-                                                let _ = queued.completion.send(Err(message.into()));
-                                                continue;
                                             }
                                             if transport.send_text(queued.encoded.clone()).await {
                                                 let _ = queued.completion.send(Ok(()));
@@ -4900,6 +6240,9 @@ async fn handle_gateway_frame(
                 stale_end_caller_request,
                 confirmed_revoke_action_id,
                 grant_revoked_lease,
+                replaced_native_call,
+                microphone_mute_reconciliation,
+                failed_native_hangup_action_id,
             ) = {
                 let mut client = state.inner.lock().await;
                 if !is_new_authoritative_sequence(&client, frame.sequence) {
@@ -4931,18 +6274,30 @@ async fn handle_gateway_frame(
                             )
                     })
                     .cloned();
+                let mut failed_native_hangup_action_id = None;
                 if grant_revoked_lease.is_some() {
                     client.lease = None;
-                    client.pending_end_caller = None;
+                    if client
+                        .pending_end_caller
+                        .as_ref()
+                        .is_none_or(|pending| !pending.is_awaiting_result())
+                    {
+                        client.pending_end_caller = None;
+                        failed_native_hangup_action_id = client
+                            .pending_native_hangup
+                            .take()
+                            .map(|pending| pending.action_id);
+                    }
                 }
+                let microphone_mute_reconciliation =
+                    reconcile_microphone_mute_from_snapshot(&mut client, &frame);
                 let assistance_cleared = client.assistance.as_ref().is_some_and(|assistance| {
                     frame.snapshot.call_id != assistance.call_id
                         || frame.snapshot.call_epoch != assistance.call_epoch
                         || frame.snapshot.owner_epoch != assistance.owner_epoch
                         || frame.snapshot.switchboard_revision != assistance.switchboard_revision
                         || frame.snapshot.remote_revision != assistance.remote_revision
-                        || !frame.snapshot.remote_consent.enabled
-                        || !frame.snapshot.remote_consent.acknowledged
+                        || !remote_consent_is_current(&frame.snapshot.remote_consent, now)
                         || !frame.snapshot.remote_consent.assistance_enabled
                 });
                 if assistance_cleared {
@@ -4990,7 +6345,14 @@ async fn handle_gateway_frame(
                     });
                 if stale_end_caller_request.is_some() {
                     client.pending_end_caller = None;
+                    failed_native_hangup_action_id = failed_native_hangup_action_id.or_else(|| {
+                        client
+                            .pending_native_hangup
+                            .take()
+                            .map(|pending| pending.action_id)
+                    });
                 }
+                let replaced_native_call = replaced_snapshot_call(&client, &frame);
                 let confirmed_revoke_action_id =
                     take_snapshot_confirmed_pending_revoke(&mut client, &frame)?
                         .and_then(|pending| pending.native_action_id);
@@ -5007,6 +6369,9 @@ async fn handle_gateway_frame(
                     stale_end_caller_request,
                     confirmed_revoke_action_id,
                     grant_revoked_lease,
+                    replaced_native_call,
+                    microphone_mute_reconciliation,
+                    failed_native_hangup_action_id,
                 )
             };
             if let Some(action_id) = confirmed_revoke_action_id {
@@ -5015,6 +6380,15 @@ async fn handle_gateway_frame(
                     &action_id,
                     true,
                     "lease_return_confirmed",
+                )
+                .await;
+            }
+            if let Some(action_id) = failed_native_hangup_action_id {
+                let _ = crate::android_runtime::complete_native_call_action(
+                    app,
+                    &action_id,
+                    false,
+                    "caller_end_authority_changed",
                 )
                 .await;
             }
@@ -5031,6 +6405,32 @@ async fn handle_gateway_frame(
                 )
                 .await;
                 emit_lease_reset(app);
+            }
+            let microphone_session_to_disarm = match &microphone_mute_reconciliation {
+                SnapshotMicrophoneMuteReconciliation::Confirmed(pending) if pending.muted => {
+                    Some(pending.session.clone())
+                }
+                SnapshotMicrophoneMuteReconciliation::Stale(pending) => {
+                    Some(pending.session.clone())
+                }
+                _ => None,
+            };
+            if let Some(session) = microphone_session_to_disarm {
+                let _ =
+                    media::disarm_microphone(app, media_state, SessionRequest { session }).await;
+            }
+            if let Some((call_id, call_epoch)) = replaced_native_call {
+                let _ = crate::android_runtime::reconcile_offer(
+                    app,
+                    &call_id,
+                    call_epoch,
+                    "cancel",
+                    "authoritative_call_replaced",
+                )
+                .await;
+            }
+            if let Err(message) = publish_current_android_offer(app, state).await {
+                emit_error(app, &message);
             }
             app.emit("aokie-companion://v2-snapshot", frame)
                 .map_err(|_| "could not deliver protocol-v2 snapshot".to_string())?;
@@ -5102,6 +6502,9 @@ async fn handle_gateway_frame(
             if !publish {
                 return Ok(());
             }
+            if let Err(message) = publish_current_android_offer(app, state).await {
+                emit_error(app, &message);
+            }
             app.emit("aokie-companion://v2-assistance", Some(frame))
                 .map_err(|_| "could not deliver protocol-v2 assistance request".to_string())?;
         }
@@ -5119,10 +6522,16 @@ async fn handle_gateway_frame(
             }
             validate_id(&frame.request_id, "assistance requestId")?;
             validate_id(&frame.answer_id, "assistance answerId")?;
-            let publish = {
+            let replay_key = assistance_answer_accepted_replay_key(&frame.request_id);
+            let (publish, transfer_call) = {
                 let mut client = state.inner.lock().await;
+                if client.relay_transport
+                    && applied_relay_frame_is_replay(&client, &replay_key, encoded)?
+                {
+                    return Ok(());
+                }
                 if assistance_was_answered(&client, &frame.app_id, &frame.request_id) {
-                    false
+                    (false, None)
                 } else {
                     if client
                         .assistance
@@ -5133,20 +6542,53 @@ async fn handle_gateway_frame(
                     {
                         return Err("unsolicited assistance acknowledgement".into());
                     }
+                    let transfer_call = client.assistance.as_ref().and_then(|request| {
+                        request
+                            .transfer_offered
+                            .then(|| (request.call_id.clone(), request.call_epoch))
+                    });
                     remember_answered_assistance(&mut client, &frame.app_id, &frame.request_id);
                     client.assistance = None;
                     client.pending_assistance_answer = None;
-                    true
+                    (true, transfer_call)
                 }
             };
             if !publish {
                 return Ok(());
             }
+            if let Some((call_id, call_epoch)) = transfer_call {
+                let _ = crate::android_runtime::reconcile_offer(
+                    app,
+                    &call_id,
+                    call_epoch,
+                    "cancel",
+                    "transfer_response_accepted",
+                )
+                .await;
+            }
             app.emit("aokie-companion://v2-assistance-answered", frame)
                 .map_err(|_| {
                     "could not deliver protocol-v2 assistance acknowledgement".to_string()
                 })?;
+            {
+                let mut client = state.inner.lock().await;
+                if client.relay_transport {
+                    remember_applied_relay_frame(&mut client, replay_key, encoded)?;
+                }
+            }
             emit_assistance_reset(app);
+        }
+        "microphone_mute_status" => {
+            let frame: PluginMicrophoneMuteStatusFrame =
+                strict_parse(encoded, "microphone mute status")?;
+            let updated =
+                apply_microphone_mute_status(state, expected_app_id, frame, encoded).await?;
+            if let Some(snapshot) = updated {
+                app.emit("aokie-companion://v2-snapshot", snapshot)
+                    .map_err(|_| {
+                        "could not deliver authoritative microphone mute state".to_string()
+                    })?;
+            }
         }
         "end_caller_challenge" => {
             let frame: EndCallerChallengeFrame = strict_parse(encoded, "caller-ending challenge")?;
@@ -5156,8 +6598,14 @@ async fn handle_gateway_frame(
             if frame.app_id != expected_app_id {
                 return Err("caller-ending challenge belongs to another application".into());
             }
-            {
+            let replay_key = end_caller_challenge_replay_key(&frame.request_id);
+            let native_hangup = {
                 let mut client = state.inner.lock().await;
+                if client.relay_transport
+                    && applied_relay_frame_is_replay(&client, &replay_key, encoded)?
+                {
+                    return Ok(());
+                }
                 let expected_request = match client.pending_end_caller.as_ref() {
                     Some(PendingEndCaller::AwaitingChallenge { request_id }) => request_id,
                     _ => return Err("unsolicited caller-ending challenge".into()),
@@ -5182,14 +6630,21 @@ async fn handle_gateway_frame(
                 client.pending_end_caller = Some(PendingEndCaller::AwaitingConfirmation {
                     challenge: frame.clone(),
                 });
-            }
+                client.pending_native_hangup.is_some()
+            };
             // The nonce remains native-only. A stray WebView click cannot
             // manufacture or replay the second protocol operation.
-            app.emit(
-                "aokie-companion://v2-end-caller",
-                EndCallerChallengeEvent::from(&frame),
-            )
-            .map_err(|_| "could not deliver caller-ending challenge".to_string())?;
+            if !native_hangup {
+                app.emit(
+                    "aokie-companion://v2-end-caller",
+                    EndCallerChallengeEvent::from(&frame),
+                )
+                .map_err(|_| "could not deliver caller-ending challenge".to_string())?;
+            }
+            let mut client = state.inner.lock().await;
+            if client.relay_transport {
+                remember_applied_relay_frame(&mut client, replay_key, encoded)?;
+            }
         }
         "end_caller_submitted" => {
             let frame: EndCallerSubmittedFrame =
@@ -5206,8 +6661,14 @@ async fn handle_gateway_frame(
             validate_id(&frame.request_id, "caller-ending requestId")?;
             validate_id(&frame.operation_id, "caller-ending operationId")?;
             validate_id(&frame.confirmation_id, "caller-ending confirmationId")?;
+            let replay_key = end_caller_submitted_replay_key(&frame.request_id);
             {
                 let mut client = state.inner.lock().await;
+                if client.relay_transport
+                    && applied_relay_frame_is_replay(&client, &replay_key, encoded)?
+                {
+                    return Ok(());
+                }
                 let (request_id, challenge) = match client.pending_end_caller.as_ref() {
                     Some(PendingEndCaller::AwaitingSubmission {
                         request_id,
@@ -5228,6 +6689,10 @@ async fn handle_gateway_frame(
             }
             app.emit("aokie-companion://v2-end-caller", frame)
                 .map_err(|_| "could not deliver caller-ending acknowledgement".to_string())?;
+            let mut client = state.inner.lock().await;
+            if client.relay_transport {
+                remember_applied_relay_frame(&mut client, replay_key, encoded)?;
+            }
         }
         "end_caller_result" => {
             let frame: PluginEndCallerResultFrame = strict_parse(encoded, "caller-ending result")?;
@@ -5235,38 +6700,28 @@ async fn handle_gateway_frame(
             if frame.app_id != expected_app_id {
                 return Err("caller-ending result belongs to another application".into());
             }
-            let lease_to_close = {
+            let replay_key = end_caller_result_replay_key(&frame.operation_id);
+            let completed = frame.outcome == EndCallerOutcome::Completed;
+            let (lease_to_close, native_hangup_action_id) = {
                 let mut client = state.inner.lock().await;
-                let (challenge, operation_id) = match client.pending_end_caller.as_ref() {
-                    Some(PendingEndCaller::AwaitingResult {
-                        challenge,
-                        operation_id,
-                        ..
-                    }) => (challenge, operation_id),
-                    _ => return Err("unsolicited caller-ending result".into()),
-                };
-                if operation_id != &frame.operation_id
-                    || challenge.confirmation_id != frame.confirmation_id
-                    || challenge.device_id != frame.device_id
-                    || challenge.call_id != frame.call_id
-                    || challenge.call_epoch != frame.call_epoch
-                    || challenge.owner_epoch != frame.owner_epoch
-                    || challenge.switchboard_revision != frame.switchboard_revision
-                    || challenge.remote_revision != frame.remote_revision
-                    || challenge.lease_id != frame.lease_id
-                    || challenge.fence != frame.fence
+                if client.relay_transport
+                    && applied_relay_frame_is_replay(&client, &replay_key, encoded)?
                 {
-                    return Err("caller-ending result crossed an operation fence".into());
+                    return Ok(());
                 }
-                client.pending_end_caller = None;
-                if frame.outcome == EndCallerOutcome::Completed {
-                    client.lease.take()
+                apply_end_caller_result(&mut client, &frame)?
+            };
+            let emit_result = app
+                .emit("aokie-companion://v2-end-caller", frame)
+                .map_err(|_| "could not deliver caller-ending result".to_string());
+            let replay_result = {
+                let mut client = state.inner.lock().await;
+                if client.relay_transport {
+                    remember_applied_relay_frame(&mut client, replay_key, encoded)
                 } else {
-                    None
+                    Ok(())
                 }
             };
-            app.emit("aokie-companion://v2-end-caller", frame)
-                .map_err(|_| "could not deliver caller-ending result".to_string())?;
             if let Some(lease) = lease_to_close {
                 let _ = media::revoke(
                     app,
@@ -5279,6 +6734,21 @@ async fn handle_gateway_frame(
                 .await;
                 emit_lease_reset(app);
             }
+            if let Some(action_id) = native_hangup_action_id {
+                let _ = crate::android_runtime::complete_native_call_action(
+                    app,
+                    &action_id,
+                    completed,
+                    if completed {
+                        "caller_end_confirmed"
+                    } else {
+                        "caller_end_failed"
+                    },
+                )
+                .await;
+            }
+            replay_result?;
+            emit_result?;
         }
         "mobile_offer_accepted" => {
             let frame: MobileOfferAcceptedFrame =
@@ -5330,6 +6800,7 @@ async fn handle_gateway_frame(
                 }
             }
             let mut end_caller_failed = false;
+            let mut native_hangup_failed = None;
             let mut native_answer_failed = None;
             let mut native_revoke_failed = None;
             let mut rejected_call = None;
@@ -5367,7 +6838,18 @@ async fn handle_gateway_frame(
                     .is_some_and(|pending| pending.request_id() == request_id)
                 {
                     client.pending_end_caller = None;
+                    native_hangup_failed = client
+                        .pending_native_hangup
+                        .take()
+                        .map(|pending| pending.action_id);
                     end_caller_failed = true;
+                }
+                if client
+                    .pending_microphone_mute
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == *request_id)
+                {
+                    client.pending_microphone_mute = None;
                 }
             }
             if let Some((call_id, call_epoch)) = rejected_call {
@@ -5395,6 +6877,15 @@ async fn handle_gateway_frame(
                     &action_id,
                     false,
                     "offer_or_lease_rejected",
+                )
+                .await;
+            }
+            if let Some(action_id) = native_hangup_failed {
+                let _ = crate::android_runtime::complete_native_call_action(
+                    app,
+                    &action_id,
+                    false,
+                    "caller_end_rejected",
                 )
                 .await;
             }
@@ -5444,6 +6935,19 @@ async fn apply_mobile_offer_accepted(
     if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
         return Ok(());
     }
+    let acceptance_is_for_current_pending = client
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.offer_request_id == frame.request_id);
+    if !acceptance_is_for_current_pending && terminal_offer_acceptance_matches(&client, &frame)? {
+        // The one-shot offer remains spent, no lease request is released, and
+        // exact relay replays become no-ops. This is a terminal receipt only;
+        // it never revives the timed-out attempt or opens native media. The
+        // Desktop's separate accepted-offer reservation remains bounded by
+        // its own 45-second setup deadline; this receipt does not release it.
+        remember_applied_relay_frame(&mut client, replay_key, encoded)?;
+        return Ok(());
+    }
     let pending = client
         .pending
         .as_mut()
@@ -5459,6 +6963,68 @@ async fn apply_mobile_offer_accepted(
     pending.stage = PendingLeaseStage::ReadyForLeaseDelivery;
     remember_applied_relay_frame(&mut client, replay_key, encoded)?;
     Ok(())
+}
+
+async fn apply_microphone_mute_status(
+    state: &V2State,
+    expected_app_id: &str,
+    frame: PluginMicrophoneMuteStatusFrame,
+    encoded: &str,
+) -> Result<Option<MobileSnapshotFrame>, String> {
+    frame.validate().map_err(|error| error.to_string())?;
+    if frame.app_id != expected_app_id {
+        return Err("microphone mute status belongs to another application".into());
+    }
+    let replay_key = microphone_mute_status_replay_key(&frame.request_id);
+    let mut client = state.inner.lock().await;
+    if client.relay_transport && applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
+        return Ok(None);
+    }
+    let pending = client
+        .pending_microphone_mute
+        .as_ref()
+        .filter(|pending| {
+            pending.request_id == frame.request_id
+                && pending.stage == PendingMicrophoneMuteStage::AwaitingStatus
+        })
+        .ok_or("unsolicited microphone mute status")?
+        .clone();
+    let (mut snapshot, lease) = current_microphone_mute_authority(&client, unix_now()?)?;
+    if frame.device_id != client.device_id.as_deref().unwrap_or_default()
+        || frame.lease_id != pending.lease_id
+        || frame.lease_jti != pending.lease_jti
+        || frame.rtc_session_id != pending.rtc_session_id
+        || frame.call_id != pending.call_id
+        || frame.call_epoch != pending.call_epoch
+        || frame.owner_epoch != pending.owner_epoch
+        || frame.switchboard_revision != pending.switchboard_revision
+        || frame.remote_revision <= pending.remote_revision
+        || frame.fence != pending.fence
+        || frame.muted != pending.muted
+        || lease.claims.lease_id != pending.lease_id
+        || lease.claims.rtc_session_id != pending.rtc_session_id
+        || lease.claims.call_id != pending.call_id
+        || lease.claims.call_epoch != pending.call_epoch
+        || lease.claims.owner_epoch != pending.owner_epoch
+        || lease.claims.fence != pending.fence
+        || snapshot.snapshot.switchboard_revision != pending.switchboard_revision
+    {
+        return Err("microphone mute status crossed its exact lease or call fence".into());
+    }
+    if snapshot.snapshot.remote_revision > frame.remote_revision {
+        if snapshot.snapshot.companion_microphone_muted != frame.muted {
+            return Err("newer authoritative state contradicted microphone mute status".into());
+        }
+    } else {
+        snapshot.snapshot.remote_revision = frame.remote_revision;
+        snapshot.snapshot.companion_microphone_muted = frame.muted;
+        client.snapshot = Some(snapshot.clone());
+    }
+    client.pending_microphone_mute = None;
+    if client.relay_transport {
+        remember_applied_relay_frame(&mut client, replay_key, encoded)?;
+    }
+    Ok(Some(snapshot))
 }
 
 async fn apply_lease_status(
@@ -6029,6 +7595,7 @@ async fn abort_lease_status(
             LeaseStatusPredecessor::Lease { .. } => client.lease = None,
         }
         client.pending_end_caller = None;
+        client.pending_microphone_mute = None;
     }
 
     let queue_error = if client.urgent_control_frames.len() >= MAX_URGENT_CONTROL_FRAMES {
@@ -6385,6 +7952,7 @@ async fn apply_remote_rtc(
                     .is_some_and(|current| current.claims.jti == lease.claims.jti)
                 {
                     client.lease = None;
+                    client.pending_microphone_mute = None;
                 }
                 client.pending_end_caller = None;
             }
@@ -6551,6 +8119,7 @@ async fn apply_revocation(
             });
             if !newer_authority_exists {
                 client.pending_end_caller = None;
+                client.pending_microphone_mute = None;
             }
             (
                 pending.lease,
@@ -6578,6 +8147,7 @@ async fn apply_revocation(
         } else if current_matches {
             remember_completed_revoke(&mut client, completed_revoke_from_frame(&frame, encoded))?;
             client.pending_end_caller = None;
+            client.pending_microphone_mute = None;
             (
                 client
                     .lease
@@ -6822,6 +8392,7 @@ fn prepare_claim_rejection(
         lease.request_id == frame.request_id && matches!(lease.claims.phase, LeasePhase::Prepared)
     }) {
         let lease = client.lease.take().expect("checked provisional lease");
+        client.pending_microphone_mute = None;
         return Ok(ClaimRejectionAction::RejectPrepared { lease });
     }
 
@@ -6941,6 +8512,7 @@ fn take_expired_lease_locked(
     }
     let lease = client.lease.take().expect("expired lease was present");
     client.pending_end_caller = None;
+    client.pending_microphone_mute = None;
     let queue_error = queue_exact_lease_revocation(state, client, &lease, "lease_expired").err();
     let tombstone_error = push_local_expiry_tombstone(
         client,
@@ -6989,6 +8561,7 @@ fn take_failed_private_consult(
         return None;
     }
     client.pending_end_caller = None;
+    client.pending_microphone_mute = None;
     client.lease.take()
 }
 
@@ -7306,6 +8879,13 @@ fn transition_to_idle(
     {
         failed_native_action_ids.push(action_id);
     }
+    if let Some(action_id) = client
+        .pending_native_hangup
+        .take()
+        .map(|pending| pending.action_id)
+    {
+        failed_native_action_ids.push(action_id);
+    }
     failed_native_action_ids.sort();
     failed_native_action_ids.dedup();
 
@@ -7314,6 +8894,7 @@ fn transition_to_idle(
     client.spent_mobile_offers.clear();
     client.lease = None;
     client.local_expiry_tombstones.clear();
+    client.pending_microphone_mute = None;
     client.assistance = None;
     client.pending_assistance_answer = None;
     client.pending_end_caller = None;
@@ -7379,11 +8960,28 @@ fn validate_snapshot(frame: &MobileSnapshotFrame, expected_app_id: &str) -> Resu
             validate_text(number, 40, "caller maskedNumber")?;
         }
     }
+    let consent_current = remote_consent_is_current(&snapshot.remote_consent, unix_now()?);
+    if (!snapshot.participants.is_empty() || snapshot.audio_levels.is_some()) && !consent_current {
+        return Err("snapshot exposed participants or audio levels without current consent".into());
+    }
+    if !snapshot.participants.is_empty() && !frame.grants.contains(&Grant::ParticipantsRead) {
+        return Err("snapshot exposed participants without the current roster grant".into());
+    }
+    if snapshot
+        .participants
+        .iter()
+        .any(|participant| participant.subject_id.is_some() || participant.display_label.is_some())
+        && !frame.grants.contains(&Grant::ParticipantIdentityRead)
+    {
+        return Err(
+            "snapshot exposed participant identity without the current identity grant".into(),
+        );
+    }
+    if snapshot.audio_levels.is_some() && !frame.grants.contains(&Grant::AudioLevelsRead) {
+        return Err("snapshot exposed audio levels without the current levels grant".into());
+    }
     if let Some(captions) = &snapshot.captions {
-        if !snapshot.remote_consent.enabled
-            || !snapshot.remote_consent.acknowledged
-            || !snapshot.remote_consent.captions_enabled
-        {
+        if !consent_current || !snapshot.remote_consent.captions_enabled {
             return Err("snapshot exposed captions without current consent".into());
         }
         if captions.len() > 200 {
@@ -7943,7 +9541,7 @@ mod tests {
             .snapshot
             .pending_mobile_offers[0]
             .clone();
-        tombstone_mobile_offer(&mut client, &spent);
+        tombstone_mobile_offer(&mut client, &spent, None);
         let frame = MobileIdleSyncFrame {
             kind: "idle_sync".into(),
             schema_version: SCHEMA_VERSION,
@@ -8478,6 +10076,7 @@ mod tests {
                 rtc_session_id: claims.rtc_session_id.clone(),
                 accepted_offer_id: "offer_exact_a".into(),
                 accepted_offer_jti: "offer_jti_exact_a".into(),
+                accepted_transfer_request_id: None,
             },
             stage: PendingLeaseStage::LeaseRequested,
             deadline: Instant::now() + LEASE_REQUEST_TIMEOUT,
@@ -9531,7 +11130,9 @@ mod tests {
             },
             caller: None,
             captions: Vec::new(),
+            participants: Vec::new(),
             audio_levels: None,
+            companion_microphone_muted: false,
             pending_mobile_offers: Vec::new(),
             occurred_at: Utc::now().to_rfc3339(),
         }
@@ -9623,6 +11224,7 @@ mod tests {
                 owner_epoch: 0,
                 switchboard_revision: 1,
                 remote_revision: 1,
+                accepted_transfer_request_id: None,
                 required_consent_policy_id: "aokie_remote_access".into(),
                 required_consent_policy_version: 3,
                 required_grants: vec![
@@ -9874,7 +11476,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_projection_hides_unsupported_actions_but_keeps_voice_consult_inputs() {
+    fn relay_projection_keeps_supported_assistance_and_owner_end_call_grants() {
         let mut shim = shim_granting(vec![
             Grant::StateRead,
             Grant::RtcSignal,
@@ -9890,27 +11492,8 @@ mod tests {
         let snapshot: MobileSnapshotFrame = serde_json::from_str(&translated).unwrap();
         assert!(snapshot.grants.contains(&Grant::AssistanceRead));
         assert!(snapshot.grants.contains(&Grant::Consult));
-        assert!(!snapshot.grants.contains(&Grant::AssistanceRespond));
-        assert!(!snapshot.grants.contains(&Grant::EndCaller));
-
-        let relay_client = ClientState {
-            relay_transport: true,
-            ..ClientState::default()
-        };
-        assert_eq!(
-            require_supported_user_action(&relay_client, RelayUnsupportedAction::AssistanceAnswer,),
-            Err(RELAY_ASSISTANCE_UNSUPPORTED.into())
-        );
-        assert_eq!(
-            require_supported_user_action(&relay_client, RelayUnsupportedAction::EndCaller),
-            Err(RELAY_END_CALLER_UNSUPPORTED.into())
-        );
-        let socket_client = ClientState::default();
-        assert!(require_supported_user_action(
-            &socket_client,
-            RelayUnsupportedAction::AssistanceAnswer,
-        )
-        .is_ok());
+        assert!(snapshot.grants.contains(&Grant::AssistanceRespond));
+        assert!(snapshot.grants.contains(&Grant::EndCaller));
     }
 
     #[test]
@@ -10255,6 +11838,7 @@ mod tests {
             remote_revision: 13,
             question: "Can you advise?".into(),
             context: None,
+            transfer_offered: false,
             expires_at: unix_now().unwrap() + 20,
         };
         let encoded = serde_json::to_string(&frame).unwrap();
@@ -10284,6 +11868,7 @@ mod tests {
             remote_revision: 13,
             question: "Can you advise?".into(),
             context: None,
+            transfer_offered: false,
             expires_at: unix_now().unwrap(),
         };
         let mut shim = shim_granting(vec![Grant::StateRead, Grant::AssistanceRead]);
@@ -10336,7 +11921,7 @@ mod tests {
     #[test]
     fn an_untranslated_plugin_kind_is_still_dropped_rather_than_erroring() {
         let mut shim = shim_granting(vec![Grant::StateRead, Grant::Monitor]);
-        for kind in ["end_caller_challenge", "something_a_future_plugin_invents"] {
+        for kind in ["something_a_future_plugin_invents"] {
             let encoded = plugin_frame(serde_json::json!({
                 "kind": kind,
                 "schemaVersion": SCHEMA_VERSION,
@@ -10350,6 +11935,11 @@ mod tests {
             "plugin_lease_status",
             "plugin_claim_rejected",
             "plugin_lease_revoke",
+            "microphone_mute_status",
+            "assistance_answer_accepted",
+            "end_caller_challenge",
+            "end_caller_submitted",
+            "end_caller_result",
             "rtc_signal",
         ] {
             let encoded = plugin_frame(serde_json::json!({
@@ -10698,19 +12288,21 @@ mod tests {
     /// This is stronger than documenting the current set: `send_text` consults
     /// the same predicate immediately before the carrier POST, so a future
     /// outbound kind is held by default until both ends explicitly add it.
-    /// Assistance and caller-ending remain valid on the WebSocket gateway path,
-    /// but are deliberately held on the relay until their translations land.
     #[test]
     fn only_plugin_admitted_mobile_kinds_can_cross_the_relay_boundary() {
         // Verbatim arms in GatewaySession::handle_relay_peer_frame, plus the
         // independently handled authenticated hello.
-        const PLUGIN_RELAY_ACCEPTS: [&str; 6] = [
+        const PLUGIN_RELAY_ACCEPTS: [&str; 10] = [
             "mobile_hello",
             "mobile_offer_answer",
             "lease_request",
             "rtc_signal",
             "lease_heartbeat",
             "lease_revoke",
+            "microphone_mute",
+            "assistance_answer",
+            "end_caller_challenge_request",
+            "end_caller_confirm",
         ];
         assert_eq!(RELAY_PLUGIN_ADMITTED_KINDS, PLUGIN_RELAY_ACCEPTS);
         for kind in PLUGIN_RELAY_ACCEPTS {
@@ -10721,9 +12313,6 @@ mod tests {
         }
 
         for held in [
-            "assistance_answer",
-            "end_caller_challenge_request",
-            "end_caller_confirm",
             // Gateway-dialect authority notices are never mobile requests.
             "claim_proposal",
             "lease_granted",
@@ -11049,6 +12638,80 @@ mod tests {
         assert_eq!(projected(&mut with_grant, &unconsented), None);
     }
 
+    #[test]
+    fn participants_and_levels_fail_closed_when_consent_expires_or_is_malformed() {
+        let mut source = authoritative_snapshot();
+        source.remote_consent.enabled = true;
+        source.remote_consent.acknowledged = true;
+        source.remote_consent.acknowledged_at = Some(Utc::now().to_rfc3339());
+        source.remote_consent.expires_at =
+            Some((Utc::now() + chrono::Duration::seconds(60)).to_rfc3339());
+        source.participants = vec![aokie_protocol::v2::ParticipantPresence {
+            participant_id: "participant_owner".into(),
+            mode: aokie_protocol::v2::ParticipantMode::Talker,
+            state: aokie_protocol::v2::ParticipantState::Active,
+            subject_id: Some("owner_a".into()),
+            display_label: Some("Owner".into()),
+        }];
+        source.audio_levels = Some(vec![aokie_protocol::v2::NormalizedAudioLevel {
+            source: AudioLevelSource::Companion,
+            participant_id: Some("participant_owner".into()),
+            level_permille: 420,
+        }]);
+        let mut shim = GatewayShim::new(
+            "app_a".into(),
+            "device_a".into(),
+            vec![
+                Grant::StateRead,
+                Grant::ParticipantsRead,
+                Grant::ParticipantIdentityRead,
+                Grant::AudioLevelsRead,
+            ],
+            "desktop_key_thumbprint_1".into(),
+        );
+        shim.peer_verified = true;
+        let project =
+            |shim: &mut GatewayShim, snapshot: &aokie_protocol::v2::AuthoritativeCallSnapshot| {
+                let encoded = serde_json::to_string(&PluginSnapshotFrame {
+                    kind: "plugin_snapshot".into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: "app_a".into(),
+                    event_id: "privacy_event".into(),
+                    device_id: Some("device_a".into()),
+                    snapshot: snapshot.clone(),
+                })
+                .unwrap();
+                let translated = shim.translate(&encoded).unwrap().unwrap();
+                serde_json::from_str::<MobileSnapshotFrame>(&translated).unwrap()
+            };
+
+        let current = project(&mut shim, &source);
+        assert_eq!(current.snapshot.participants.len(), 1);
+        assert_eq!(current.snapshot.audio_levels.as_ref().unwrap().len(), 1);
+        validate_snapshot(&current, "app_a").unwrap();
+
+        let mut expired = source.clone();
+        expired.remote_consent.expires_at =
+            Some((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        let expired_projection = project(&mut shim, &expired);
+        assert!(expired_projection.snapshot.participants.is_empty());
+        assert!(expired_projection.snapshot.audio_levels.is_none());
+
+        let mut malformed = source;
+        malformed.remote_consent.expires_at = Some("not-an-rfc3339-time".into());
+        let malformed_projection = project(&mut shim, &malformed);
+        assert!(malformed_projection.snapshot.participants.is_empty());
+        assert!(malformed_projection.snapshot.audio_levels.is_none());
+
+        let mut leaked_expired = current.clone();
+        leaked_expired.snapshot.remote_consent.expires_at =
+            Some((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        assert!(validate_snapshot(&leaked_expired, "app_a").is_err());
+        let mut leaked_malformed = current;
+        leaked_malformed.snapshot.remote_consent.expires_at = Some("bad-time".into());
+        assert!(validate_snapshot(&leaked_malformed, "app_a").is_err());
+    }
+
     /// ⚠️ The plugin's frames carry an `eventId`, never a sequence — the gateway
     /// minted the monotonic counter the session tracks state on. A shim that
     /// merely renamed fields would fail `validate_snapshot` on every frame.
@@ -11324,6 +12987,7 @@ mod tests {
                 captions: None,
                 participants: Vec::new(),
                 audio_levels: None,
+                companion_microphone_muted: false,
                 pending_mobile_offers: Vec::new(),
                 occurred_at: Utc::now().to_rfc3339(),
             },
@@ -11380,6 +13044,7 @@ mod tests {
                     captions: None,
                     participants: Vec::new(),
                     audio_levels: None,
+                    companion_microphone_muted: false,
                     pending_mobile_offers: Vec::new(),
                     occurred_at: Utc::now().to_rfc3339(),
                 },
@@ -11417,6 +13082,7 @@ mod tests {
                 owner_epoch: 4,
                 switchboard_revision: 11,
                 remote_revision: 13,
+                accepted_transfer_request_id: None,
                 required_consent_policy_id: "aokie_remote_access".into(),
                 required_consent_policy_version: 3,
                 required_grants: vec![Grant::StateRead, Grant::RtcSignal, mode_grant],
@@ -11467,6 +13133,7 @@ mod tests {
                 captions: None,
                 participants: Vec::new(),
                 audio_levels: None,
+                companion_microphone_muted: false,
                 pending_mobile_offers: vec![offer],
                 occurred_at: Utc::now().to_rfc3339(),
             },
@@ -11484,6 +13151,7 @@ mod tests {
             remote_revision: 13,
             question: "Can you advise?".into(),
             context: None,
+            transfer_offered: false,
             expires_at: now + 20,
         });
         ClientState {
@@ -11500,7 +13168,7 @@ mod tests {
 
     fn native_answer_action() -> NativeCallAction {
         NativeCallAction {
-            schema_version: 1,
+            schema_version: 2,
             action_id: "native_answer_a".into(),
             kind: NativeCallActionKind::Answer,
             offer_id: "offer_exact_a".into(),
@@ -11508,8 +13176,225 @@ mod tests {
             call_id: "call_a".into(),
             call_epoch: 7,
             owner_epoch: 4,
+            accepted_transfer_request_id: None,
+            response_text: None,
             created_at: unix_now().unwrap(),
         }
+    }
+
+    fn transfer_client(surface: MobileOfferSurface) -> ClientState {
+        let mut client = offered_client(LeaseMode::Takeover, surface);
+        let now = unix_now().unwrap();
+        let snapshot = client.snapshot.as_mut().unwrap();
+        snapshot.grants.push(Grant::AssistanceRead);
+        snapshot.grants.push(Grant::AssistanceRespond);
+        let offer = &mut snapshot.snapshot.pending_mobile_offers[0].offer;
+        offer.accepted_transfer_request_id = Some("transfer_request_a".into());
+        offer.required_grants.push(Grant::AssistanceRespond);
+        client.assistance = Some(PluginAssistanceRequestFrame {
+            kind: "assistance_request".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            event_id: "transfer_event_a".into(),
+            request_id: "transfer_request_a".into(),
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            owner_epoch: 4,
+            switchboard_revision: 11,
+            remote_revision: 13,
+            question: "Can you take this caller?".into(),
+            context: None,
+            transfer_offered: true,
+            expires_at: now + 20,
+        });
+        client
+    }
+
+    fn native_transfer_action(kind: NativeCallActionKind) -> NativeCallAction {
+        NativeCallAction {
+            kind,
+            accepted_transfer_request_id: Some("transfer_request_a".into()),
+            response_text: (kind == NativeCallActionKind::Decline).then(|| "declined".into()),
+            ..native_answer_action()
+        }
+    }
+
+    #[tokio::test]
+    async fn native_transfer_answer_requires_the_exact_action_bound_request() {
+        let state = V2State::default();
+        *state.inner.lock().await = transfer_client(MobileOfferSurface::VoiceSystemUi);
+        let action = native_transfer_action(NativeCallActionKind::Answer);
+        let (_, request_id) = prepare_offer_answer_for_transfer(
+            &state,
+            LeaseMode::Takeover,
+            Some(&action),
+            action.accepted_transfer_request_id.as_deref(),
+        )
+        .await
+        .expect("exact transfer answer selects the voice-system offer");
+        let client = state.inner.lock().await;
+        assert_eq!(
+            client
+                .pending
+                .as_ref()
+                .unwrap()
+                .lease_frame
+                .accepted_transfer_request_id
+                .as_deref(),
+            Some("transfer_request_a")
+        );
+        assert_eq!(client.pending.as_ref().unwrap().request_id, request_id);
+        assert_eq!(
+            android_offer_reconciliation(&client, unix_now().unwrap()).unwrap(),
+            AndroidOfferReconciliation::PreserveLocalClaim
+        );
+
+        let generic = V2State::default();
+        *generic.inner.lock().await = transfer_client(MobileOfferSurface::VoiceSystemUi);
+        assert!(
+            prepare_offer_answer(&generic, LeaseMode::Takeover, Some(&native_answer_action()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_transfer_decline_is_private_exact_and_spends_its_offer() {
+        let state = V2State::default();
+        *state.inner.lock().await = transfer_client(MobileOfferSurface::VoiceSystemUi);
+        let action = native_transfer_action(NativeCallActionKind::Decline);
+        let request = AssistanceAnswerRequest {
+            request_id: "transfer_request_a".into(),
+            response_action: AssistanceResponseAction::Decline,
+            answer: "declined".into(),
+        };
+        let (frame, answer_id) = prepare_assistance_answer(&state, &request, Some(&action))
+            .await
+            .expect("exact native decline becomes an authenticated assistance answer");
+        assert_eq!(frame.response_action, AssistanceResponseAction::Decline);
+        assert_eq!(frame.answer, "declined");
+        let client = state.inner.lock().await;
+        assert_eq!(
+            client.pending_assistance_answer.as_deref(),
+            Some(answer_id.as_str())
+        );
+        assert_eq!(client.spent_mobile_offers.len(), 1);
+    }
+
+    #[test]
+    fn android_transfer_surface_requires_current_authenticated_assistance() {
+        let now = unix_now().unwrap();
+        let client = transfer_client(MobileOfferSurface::VoiceSystemUi);
+        let presented = authoritative_android_offer(&client, now)
+            .unwrap()
+            .expect("current transfer publishes its exact native surface");
+        assert_eq!(
+            presented.accepted_transfer_request_id.as_deref(),
+            Some("transfer_request_a")
+        );
+
+        let mut missing_assistance = client;
+        missing_assistance.assistance = None;
+        assert!(matches!(
+            android_offer_reconciliation(&missing_assistance, now).unwrap(),
+            AndroidOfferReconciliation::Cancel { .. }
+        ));
+
+        let mut other_device_won = transfer_client(MobileOfferSurface::VoiceSystemUi);
+        other_device_won
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .pending_mobile_offers
+            .clear();
+        assert!(matches!(
+            android_offer_reconciliation(&other_device_won, now).unwrap(),
+            AndroidOfferReconciliation::Cancel { .. }
+        ));
+
+        let mut expired = transfer_client(MobileOfferSurface::VoiceSystemUi);
+        expired
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .pending_mobile_offers[0]
+            .offer
+            .expires_at = now;
+        assert!(matches!(
+            android_offer_reconciliation(&expired, now).unwrap(),
+            AndroidOfferReconciliation::Cancel { .. }
+        ));
+
+        let mut narrowed = transfer_client(MobileOfferSurface::VoiceSystemUi);
+        narrowed
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .grants
+            .retain(|grant| *grant != Grant::Takeover);
+        assert!(matches!(
+            android_offer_reconciliation(&narrowed, now).unwrap(),
+            AndroidOfferReconciliation::Cancel { .. }
+        ));
+
+        let mut consent_withdrawn = transfer_client(MobileOfferSurface::VoiceSystemUi);
+        consent_withdrawn
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .remote_consent
+            .takeover_enabled = false;
+        assert!(matches!(
+            android_offer_reconciliation(&consent_withdrawn, now).unwrap(),
+            AndroidOfferReconciliation::Cancel { .. }
+        ));
+
+        let mut disconnected = transfer_client(MobileOfferSurface::VoiceSystemUi);
+        disconnected.snapshot = None;
+        assert_eq!(
+            android_offer_reconciliation(&disconnected, now).unwrap(),
+            AndroidOfferReconciliation::None
+        );
+
+        assert_eq!(
+            android_offer_reconciliation(&end_caller_client(), now).unwrap(),
+            AndroidOfferReconciliation::PreserveLocalClaim
+        );
+    }
+
+    #[test]
+    fn realtime_disconnect_cancels_a_merely_ringing_native_offer_before_reset() {
+        let mut client = offered_client(LeaseMode::Takeover, MobileOfferSurface::VoiceSystemUi);
+
+        let cancel = native_call_to_cancel_on_disconnect(&client)
+            .expect("the authenticated ringing snapshot owns a native surface");
+        assert_eq!(cancel, ("call_a".into(), 7));
+
+        // The disconnect path captures this identity while state is still
+        // authoritative, before reset_generation clears the snapshot.
+        client.snapshot = None;
+        assert_eq!(native_call_to_cancel_on_disconnect(&client), None);
+        assert_eq!(cancel, ("call_a".into(), 7));
+    }
+
+    #[test]
+    fn direct_new_call_snapshot_cancels_the_previous_native_call_identity() {
+        let client = offered_client(LeaseMode::Takeover, MobileOfferSurface::VoiceSystemUi);
+        let mut replacement = client.snapshot.as_ref().unwrap().clone();
+        replacement.sequence += 1;
+        replacement.snapshot.call_id = "call_b".into();
+        replacement.snapshot.call_epoch = 8;
+
+        assert_eq!(
+            replaced_snapshot_call(&client, &replacement),
+            Some(("call_a".into(), 7))
+        );
+
+        let same_call = client.snapshot.as_ref().unwrap().clone();
+        assert_eq!(replaced_snapshot_call(&client, &same_call), None);
     }
 
     #[tokio::test]
@@ -11611,6 +13496,61 @@ mod tests {
                 "no current signed mobile offer permits this lease"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn late_exact_transfer_offer_ack_is_terminal_after_local_timeout() {
+        let state = V2State::default();
+        *state.inner.lock().await = transfer_client(MobileOfferSurface::VoiceSystemUi);
+        let action = native_transfer_action(NativeCallActionKind::Answer);
+        let (answer, lease_request_id) = prepare_offer_answer_for_transfer(
+            &state,
+            LeaseMode::Takeover,
+            Some(&action),
+            Some("transfer_request_a"),
+        )
+        .await
+        .expect("the transfer offer is answered once");
+
+        // Model the local 10-second timeout: the pending attempt is gone but
+        // its exact one-shot offer tombstone remains. Desktop may retain its
+        // separate reservation until the 45-second setup deadline.
+        assert_eq!(
+            clear_pending_lease(&state, &lease_request_id).await,
+            Some("native_answer_a".into())
+        );
+        {
+            let mut client = state.inner.lock().await;
+            let mut next_call = client.snapshot.as_ref().unwrap().clone();
+            next_call.sequence += 1;
+            next_call.snapshot.call_id = "call_b".into();
+            next_call.snapshot.call_epoch = 8;
+            retain_spent_mobile_offers_for_snapshot(&mut client, &next_call);
+            assert!(client.spent_mobile_offers.is_empty());
+            assert_eq!(client.terminal_offer_acceptances.len(), 1);
+            client.snapshot = Some(next_call);
+        }
+        let accepted = MobileOfferAcceptedFrame {
+            kind: "mobile_offer_accepted".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: answer.request_id,
+            offer_id: answer.offer_id,
+            offer_jti: answer.offer_jti,
+            offered_mode: answer.offered_mode,
+            accepted: true,
+        };
+        let encoded = serde_json::to_string(&accepted).unwrap();
+
+        apply_mobile_offer_accepted(&state, "app_a", accepted.clone(), &encoded)
+            .await
+            .expect("the exact late receipt is contained without reviving authority");
+        apply_mobile_offer_accepted(&state, "app_a", accepted, &encoded)
+            .await
+            .expect("an exact relay replay remains a terminal no-op");
+        assert!(state.inner.lock().await.pending.is_none());
+        assert!(state.inner.lock().await.lease.is_none());
+        assert!(take_ready_lease_request(&state).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -12343,6 +14283,170 @@ mod tests {
             .push(Grant::EndCaller);
         client.snapshot.as_mut().unwrap().snapshot.service_mode = ServiceMode::ReturningToAokie;
         assert!(validate_local_end_caller(&client, now).is_err());
+    }
+
+    #[test]
+    fn newer_exact_snapshot_completes_a_lost_targeted_mute_status() {
+        let mut client = end_caller_client();
+        let snapshot = client.snapshot.as_ref().unwrap().clone();
+        let lease = client.lease.as_ref().unwrap().clone();
+        client.pending_microphone_mute = Some(pending_microphone_mute(
+            "microphone_mute_a".into(),
+            true,
+            PendingMicrophoneMuteStage::AwaitingStatus,
+            &snapshot,
+            &lease,
+        ));
+        let mut newer = snapshot;
+        newer.sequence += 1;
+        newer.snapshot.remote_revision += 1;
+        newer.snapshot.companion_microphone_muted = true;
+
+        assert!(matches!(
+            reconcile_microphone_mute_from_snapshot(&mut client, &newer),
+            SnapshotMicrophoneMuteReconciliation::Confirmed(pending)
+                if pending.muted && pending.session == lease.session
+        ));
+        assert!(client.pending_microphone_mute.is_none());
+    }
+
+    #[tokio::test]
+    async fn native_hangup_uses_challenge_confirmation_and_failed_result_keeps_media() {
+        let state = V2State::default();
+        *state.inner.lock().await = end_caller_client();
+        let mut action = native_answer_action();
+        action.action_id = "native_hangup_a".into();
+        action.kind = NativeCallActionKind::Hangup;
+        let outbound = queue_native_hangup(&state, action)
+            .await
+            .expect("exact active owner may begin caller hangup");
+        let request: MobileEndCallerChallengeRequestFrame =
+            serde_json::from_str(&outbound.encoded).unwrap();
+        assert_eq!(request.kind, "end_caller_challenge_request");
+
+        let challenge = {
+            let client = state.inner.lock().await;
+            let snapshot = client.snapshot.as_ref().unwrap();
+            let lease = client.lease.as_ref().unwrap();
+            assert!(client.pending_native_hangup.is_some());
+            EndCallerChallengeFrame {
+                kind: "end_caller_challenge".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                request_id: request.request_id.clone(),
+                confirmation_id: "confirmation_a".into(),
+                nonce: "nonce_a".into(),
+                device_id: "device_a".into(),
+                call_id: lease.claims.call_id.clone(),
+                call_epoch: lease.claims.call_epoch,
+                owner_epoch: lease.claims.owner_epoch,
+                switchboard_revision: snapshot.snapshot.switchboard_revision,
+                remote_revision: snapshot.snapshot.remote_revision,
+                lease_id: lease.claims.lease_id.clone(),
+                fence: lease.claims.fence,
+                expires_at: unix_now().unwrap() + 10,
+            }
+        };
+        let confirmation = {
+            let client = state.inner.lock().await;
+            native_hangup_confirmation_frame(&state, &client, &challenge, unix_now().unwrap())
+                .expect("system gesture confirms only the exact returned challenge")
+        };
+        assert_eq!(confirmation.kind, "end_caller_confirm");
+        assert_eq!(confirmation.confirmation_id, challenge.confirmation_id);
+        assert_eq!(confirmation.nonce, challenge.nonce);
+
+        let operation_id = "caller_end_operation_a".to_string();
+        let failed = PluginEndCallerResultFrame {
+            kind: "end_caller_result".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            operation_id: operation_id.clone(),
+            confirmation_id: challenge.confirmation_id.clone(),
+            device_id: challenge.device_id.clone(),
+            call_id: challenge.call_id.clone(),
+            call_epoch: challenge.call_epoch,
+            owner_epoch: challenge.owner_epoch,
+            switchboard_revision: challenge.switchboard_revision,
+            remote_revision: challenge.remote_revision,
+            lease_id: challenge.lease_id.clone(),
+            fence: challenge.fence,
+            outcome: EndCallerOutcome::Failed,
+            code: Some("radio_end_failed".into()),
+            message: Some("the radio did not confirm caller termination".into()),
+        };
+        failed.validate().unwrap();
+        let mut client = state.inner.lock().await;
+        client.pending_end_caller = Some(PendingEndCaller::AwaitingResult {
+            request_id: confirmation.request_id,
+            challenge: challenge.clone(),
+            operation_id: operation_id.clone(),
+        });
+        let original_lease = client.lease.clone();
+        let (lease_to_close, native_action) =
+            apply_end_caller_result(&mut client, &failed).unwrap();
+        assert!(lease_to_close.is_none());
+        assert_eq!(native_action.as_deref(), Some("native_hangup_a"));
+        assert_eq!(client.lease, original_lease);
+        assert!(client.pending_end_caller.is_none());
+        assert!(client.pending_native_hangup.is_none());
+
+        let mut turnover = end_caller_client();
+        turnover.pending_end_caller = Some(PendingEndCaller::AwaitingResult {
+            request_id: "end_confirm_delayed".into(),
+            challenge: challenge.clone(),
+            operation_id: operation_id.clone(),
+        });
+        turnover.pending_native_hangup = Some(PendingNativeHangup {
+            action_id: "native_hangup_delayed".into(),
+            deadline: Instant::now() + NATIVE_HANGUP_TIMEOUT,
+        });
+        let mut newer_claims = turnover.lease.as_ref().unwrap().claims.clone();
+        newer_claims.owner_epoch += 1;
+        newer_claims.lease_id = "media_new_owner".into();
+        newer_claims.jti = "lease_new_owner".into();
+        newer_claims.rtc_session_id = "rtc_new_owner".into();
+        newer_claims.fence += 1;
+        let newer_lease = ClientLease {
+            request_id: "newer_takeover_request".into(),
+            token: "v2.newer.signature".into(),
+            session: session_from_claims(&newer_claims, 3, 3).unwrap(),
+            claims: newer_claims,
+        };
+        turnover.lease = Some(newer_lease.clone());
+        let mut completed = failed;
+        completed.outcome = EndCallerOutcome::Completed;
+        completed.code = None;
+        completed.message = None;
+        completed.validate().unwrap();
+        let (lease_to_close, native_action) =
+            apply_end_caller_result(&mut turnover, &completed).unwrap();
+        assert!(lease_to_close.is_none());
+        assert_eq!(native_action.as_deref(), Some("native_hangup_delayed"));
+        assert_eq!(turnover.lease.as_ref(), Some(&newer_lease));
+    }
+
+    #[tokio::test]
+    async fn new_claims_are_blocked_while_any_caller_end_operation_is_pending() {
+        let state = V2State::default();
+        let mut client = offered_client(LeaseMode::Takeover, MobileOfferSurface::InApp);
+        client.pending_end_caller = Some(PendingEndCaller::AwaitingChallenge {
+            request_id: "end_prepare_pending".into(),
+        });
+        *state.inner.lock().await = client;
+        assert!(prepare_offer_answer(&state, LeaseMode::Takeover, None)
+            .await
+            .is_err());
+
+        let mut client = offered_client(LeaseMode::Takeover, MobileOfferSurface::InApp);
+        client.pending_native_hangup = Some(PendingNativeHangup {
+            action_id: "native_hangup_pending".into(),
+            deadline: Instant::now() + NATIVE_HANGUP_TIMEOUT,
+        });
+        *state.inner.lock().await = client;
+        assert!(prepare_offer_answer(&state, LeaseMode::Takeover, None)
+            .await
+            .is_err());
     }
 
     #[test]

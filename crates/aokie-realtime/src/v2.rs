@@ -6,15 +6,16 @@
 use super::{header_id, Admission, AdmissionRegistry, AdmissionRole, Gateway, MAX_MESSAGE_BYTES};
 use aokie_protocol::v2::{
     parse_mobile_frame, parse_plugin_frame, tracks_for, AdmissionClaims,
-    AdmissionRole as TokenAdmissionRole, AuthoritativeCallSnapshot, EndCallerChallengeFrame,
-    EndCallerOutcome, EndpointChallengeFrame, EndpointPublicKey, Grant, LeaseClaims,
-    LeaseHeartbeatFrame, LeaseMode, LeasePhase, LeaseRequestFrame, LeaseRevokeFrame,
+    AdmissionRole as TokenAdmissionRole, AudioLevelSource, AuthoritativeCallSnapshot,
+    EndCallerChallengeFrame, EndCallerOutcome, EndpointChallengeFrame, EndpointPublicKey, Grant,
+    LeaseClaims, LeaseHeartbeatFrame, LeaseMode, LeasePhase, LeaseRequestFrame, LeaseRevokeFrame,
     MobileAssistanceAnswerFrame, MobileEndCallerChallengeRequestFrame, MobileEndCallerConfirmFrame,
-    MobileHello, MobileIdleSyncFrame, MobileInbound, MobileOfferAnswerFrame, MobileOfferSurface,
-    MobileRtcSignalFrame, MobileSnapshotFrame, PendingMobileOfferClaims,
-    PluginAssistanceAnswerFrame, PluginAssistanceRequestFrame, PluginClaimDecisionFrame,
-    PluginEndCallerExecuteFrame, PluginEndCallerResultFrame, PluginHello, PluginIdleFrame,
-    PluginInbound, PluginLeaseRevokeFrame, PluginRtcSignalFrame, PluginSnapshotFrame,
+    MobileHello, MobileIdleSyncFrame, MobileInbound, MobileMicrophoneMuteFrame,
+    MobileOfferAnswerFrame, MobileOfferSurface, MobileRtcSignalFrame, MobileSnapshotFrame,
+    PendingMobileOfferClaims, PluginAssistanceAnswerFrame, PluginAssistanceRequestFrame,
+    PluginClaimDecisionFrame, PluginEndCallerExecuteFrame, PluginEndCallerResultFrame, PluginHello,
+    PluginIdleFrame, PluginInbound, PluginLeaseRevokeFrame, PluginMicrophoneMuteFrame,
+    PluginMicrophoneMuteStatusFrame, PluginRtcSignalFrame, PluginSnapshotFrame,
     ProjectedCallSnapshot, RtcSignal, ServiceMode, SignedHelloProof, SignedPendingMobileOffer,
     TelephonyState, ENDPOINT_PROOF_MAX_LIFETIME, LEASE_AUDIENCE, MAX_SAFE_INTEGER,
     MOBILE_OFFER_MAX_LIFETIME, SCHEMA_VERSION,
@@ -517,6 +518,7 @@ struct V2App {
     signals: HashSet<(String, String)>,
     signal_order: VecDeque<(String, String)>,
     assistance: Option<AssistanceRecord>,
+    pending_microphone_mutes: HashMap<String, PendingMicrophoneMute>,
     end_caller_challenges: HashMap<String, EndCallerChallengeRecord>,
     used_end_caller_confirmations: HashSet<String>,
     used_end_caller_order: VecDeque<String>,
@@ -577,6 +579,7 @@ impl Default for V2App {
             signals: HashSet::new(),
             signal_order: VecDeque::new(),
             assistance: None,
+            pending_microphone_mutes: HashMap::new(),
             end_caller_challenges: HashMap::new(),
             used_end_caller_confirmations: HashSet::new(),
             used_end_caller_order: VecDeque::new(),
@@ -792,6 +795,22 @@ struct AssistanceRecord {
     request: PluginAssistanceRequestFrame,
     fingerprint: [u8; 32],
     answered: bool,
+}
+
+struct PendingMicrophoneMute {
+    device_id: String,
+    idempotency_key: String,
+    fingerprint: [u8; 32],
+    lease_id: String,
+    lease_jti: String,
+    rtc_session_id: String,
+    call_id: String,
+    call_epoch: u64,
+    owner_epoch: u64,
+    switchboard_revision: u64,
+    remote_revision: u64,
+    fence: u64,
+    muted: bool,
 }
 
 struct EndCallerChallengeRecord {
@@ -1639,6 +1658,9 @@ async fn handle_mobile(
         MobileInbound::AssistanceAnswer(frame) => {
             handle_assistance_answer(gateway, admission, connection_id, frame).await
         }
+        MobileInbound::MicrophoneMute(frame) => {
+            handle_microphone_mute(gateway, admission, connection_id, frame).await
+        }
         MobileInbound::EndCallerChallengeRequest(frame) => {
             handle_end_caller_challenge_request(gateway, admission, connection_id, frame).await
         }
@@ -1683,6 +1705,13 @@ async fn handle_plugin(
         }
         PluginInbound::AssistanceRequest(frame) => {
             handle_assistance_request(gateway, admission, connection_id, frame).await
+        }
+        PluginInbound::MicrophoneMute(_) => Err(GatewayError::fatal(
+            "invalid_frame",
+            "plugin microphone command is gateway-to-plugin only",
+        )),
+        PluginInbound::MicrophoneMuteStatus(frame) => {
+            handle_microphone_mute_status(gateway, admission, connection_id, frame).await
         }
         PluginInbound::EndCallerResult(frame) => {
             handle_end_caller_result(gateway, admission, connection_id, frame).await
@@ -1943,6 +1972,19 @@ fn refresh_pending_mobile_offers(
         app.mobile_offer_winners.clear();
         return Ok(());
     }
+    let live_assistance = app.assistance.as_ref().filter(|record| {
+        !record.answered
+            && record.request.expires_at > now
+            && record.request.call_id == snapshot.call_id
+            && record.request.call_epoch == snapshot.call_epoch
+            && record.request.owner_epoch == snapshot.owner_epoch
+            && record.request.switchboard_revision == snapshot.switchboard_revision
+            && record.request.remote_revision == snapshot.remote_revision
+    });
+    let transfer_request_id = live_assistance
+        .filter(|record| record.request.transfer_offered)
+        .map(|record| record.request.request_id.clone());
+    let consult_available = live_assistance.is_some_and(|record| !record.request.transfer_offered);
     let abandoned_acceptances = app
         .accepted_mobile_offers
         .iter()
@@ -1954,6 +1996,10 @@ fn refresh_pending_mobile_offers(
                 || offer.owner_epoch != snapshot.owner_epoch
                 || offer.switchboard_revision != snapshot.switchboard_revision
                 || offer.remote_revision != snapshot.remote_revision
+                || offer.accepted_transfer_request_id.as_deref()
+                    != (offer.offered_mode == LeaseMode::Takeover)
+                        .then_some(transfer_request_id.as_deref())
+                        .flatten()
                 || offer.required_consent_policy_id != snapshot.remote_consent.policy_id
                 || offer.required_consent_policy_version != snapshot.remote_consent.policy_version
                 || !snapshot.remote_consent.allows(offer.offered_mode)
@@ -1980,6 +2026,10 @@ fn refresh_pending_mobile_offers(
             && signed.offer.owner_epoch == snapshot.owner_epoch
             && signed.offer.switchboard_revision == snapshot.switchboard_revision
             && signed.offer.remote_revision == snapshot.remote_revision
+            && signed.offer.accepted_transfer_request_id.as_deref()
+                == (signed.offer.offered_mode == LeaseMode::Takeover)
+                    .then_some(transfer_request_id.as_deref())
+                    .flatten()
             && signed.offer.required_consent_policy_id == snapshot.remote_consent.policy_id
             && signed.offer.required_consent_policy_version
                 == snapshot.remote_consent.policy_version
@@ -2008,11 +2058,6 @@ fn refresh_pending_mobile_offers(
                 MobileOfferSurface::InApp,
             ),
             (
-                LeaseMode::Consult,
-                Grant::Consult,
-                MobileOfferSurface::VoiceSystemUi,
-            ),
-            (
                 LeaseMode::Takeover,
                 Grant::Takeover,
                 MobileOfferSurface::InApp,
@@ -2030,8 +2075,27 @@ fn refresh_pending_mobile_offers(
             {
                 continue;
             }
-            let opportunity_id =
-                mobile_opportunity_id(app_id, &snapshot.call_id, snapshot.owner_epoch, mode);
+            if mode == LeaseMode::Consult && !consult_available {
+                continue;
+            }
+            let accepted_transfer_request_id = (mode == LeaseMode::Takeover)
+                .then(|| transfer_request_id.clone())
+                .flatten();
+            if surface == MobileOfferSurface::VoiceSystemUi
+                && accepted_transfer_request_id.is_none()
+            {
+                continue;
+            }
+            if accepted_transfer_request_id.is_some() && !peer.has(Grant::AssistanceRespond) {
+                continue;
+            }
+            let opportunity_id = mobile_opportunity_id(
+                app_id,
+                &snapshot.call_id,
+                snapshot.owner_epoch,
+                mode,
+                accepted_transfer_request_id.as_deref(),
+            );
             if app.mobile_offer_winners.contains_key(&opportunity_id)
                 || app.pending_mobile_offers.values().any(|signed| {
                     signed.offer.opportunity_id == opportunity_id
@@ -2055,9 +2119,16 @@ fn refresh_pending_mobile_offers(
                 owner_epoch: snapshot.owner_epoch,
                 switchboard_revision: snapshot.switchboard_revision,
                 remote_revision: snapshot.remote_revision,
+                accepted_transfer_request_id: accepted_transfer_request_id.clone(),
                 required_consent_policy_id: snapshot.remote_consent.policy_id.clone(),
                 required_consent_policy_version: snapshot.remote_consent.policy_version,
-                required_grants: vec![Grant::StateRead, Grant::RtcSignal, grant],
+                required_grants: {
+                    let mut grants = vec![Grant::StateRead, Grant::RtcSignal, grant];
+                    if accepted_transfer_request_id.is_some() {
+                        grants.push(Grant::AssistanceRespond);
+                    }
+                    grants
+                },
                 issued_at: now,
                 expires_at: now + MOBILE_OFFER_MAX_LIFETIME,
                 jti: format!("offer_jti_{}", uuid::Uuid::new_v4().simple()),
@@ -2075,8 +2146,17 @@ fn refresh_pending_mobile_offers(
     Ok(())
 }
 
-fn mobile_opportunity_id(app_id: &str, call_id: &str, owner_epoch: u64, mode: LeaseMode) -> String {
-    let material = format!("{app_id}\0{call_id}\0{owner_epoch}\0{mode:?}");
+fn mobile_opportunity_id(
+    app_id: &str,
+    call_id: &str,
+    owner_epoch: u64,
+    mode: LeaseMode,
+    accepted_transfer_request_id: Option<&str>,
+) -> String {
+    let material = format!(
+        "{app_id}\0{call_id}\0{owner_epoch}\0{mode:?}\0{}",
+        accepted_transfer_request_id.unwrap_or_default()
+    );
     format!(
         "opportunity_{}",
         &hex(&Sha256::digest(material.as_bytes()))[..24]
@@ -2291,6 +2371,7 @@ async fn handle_lease_request(
         || accepted_offer.owner_epoch != frame.expected_owner_epoch
         || accepted_offer.switchboard_revision != frame.expected_switchboard_revision
         || accepted_offer.remote_revision != frame.expected_remote_revision
+        || accepted_offer.accepted_transfer_request_id != frame.accepted_transfer_request_id
         || accepted_offer.expires_at <= now
     {
         return Err(GatewayError::fatal(
@@ -2507,7 +2588,8 @@ async fn handle_lease_request(
             "requestId": frame.request_id,
             "deviceId": admission.subject_id,
             "leaseToken": token,
-            "lease": claims
+            "lease": claims,
+            "acceptedTransferRequestId": frame.accepted_transfer_request_id
         }),
     )?;
     app.plugin
@@ -2854,6 +2936,232 @@ async fn handle_plugin_revoke(
     )
 }
 
+async fn handle_microphone_mute(
+    gateway: &Gateway,
+    admission: &Admission,
+    connection_id: &str,
+    frame: MobileMicrophoneMuteFrame,
+) -> Result<(), GatewayError> {
+    require_app(&frame.app_id, admission)?;
+    let request_fingerprint = fingerprint(&frame)?;
+    let now = unix_now()?;
+    let claims = gateway.inner.v2.signer()?.verify(&frame.lease_token, now)?;
+    let mut apps = gateway.inner.v2.apps.lock().await;
+    let app = current_mobile_app_mut(&mut apps, admission, connection_id)?;
+    app.mobiles
+        .get_mut(&admission.subject_id)
+        .expect("checked mobile")
+        .admit_general()?;
+    match app.cached(
+        &admission.subject_id,
+        &frame.idempotency_key,
+        request_fingerprint,
+    ) {
+        Cached::Replay(response) => return app.mobiles[&admission.subject_id].send(response),
+        Cached::Conflict => {
+            return send_mobile_error(
+                app,
+                &admission.subject_id,
+                "idempotency_conflict",
+                "idempotency key was reused with a different microphone request",
+                Some(&frame.request_id),
+            )
+        }
+        Cached::Miss => {}
+    }
+    validate_lease_binding(app, admission, &claims, false)?;
+    let peer = &app.mobiles[&admission.subject_id];
+    let mode_granted = match claims.mode {
+        LeaseMode::Takeover => peer.has(Grant::Takeover),
+        LeaseMode::Consult => peer.has(Grant::Consult),
+        LeaseMode::Monitor => false,
+    };
+    if !mode_granted || !peer.has(Grant::RtcSignal) || claims.phase != LeasePhase::Active {
+        return Err(GatewayError::fatal(
+            "forbidden",
+            "an active consult/takeover media grant is required",
+        ));
+    }
+    let snapshot = app
+        .snapshot
+        .as_ref()
+        .ok_or_else(|| GatewayError::fatal("endpoint_unavailable", "call state is unavailable"))?;
+    let active_mode = matches!(
+        (&claims.mode, &snapshot.service_mode),
+        (LeaseMode::Takeover, ServiceMode::HumanActive)
+            | (LeaseMode::Consult, ServiceMode::ConsultActive)
+    );
+    if claims.rtc_session_id != frame.rtc_session_id
+        || claims.call_id != frame.call_id
+        || claims.call_epoch != frame.call_epoch
+        || claims.owner_epoch != frame.owner_epoch
+        || claims.fence != frame.fence
+        || snapshot.call_id != frame.call_id
+        || snapshot.call_epoch != frame.call_epoch
+        || snapshot.owner_epoch != frame.owner_epoch
+        || snapshot.switchboard_revision != frame.switchboard_revision
+        || snapshot.remote_revision != frame.remote_revision
+        || !active_mode
+    {
+        return send_mobile_error(
+            app,
+            &admission.subject_id,
+            "stale_state",
+            "microphone request crossed its active call or switchboard fence",
+            Some(&frame.request_id),
+        );
+    }
+    if let Some(pending) = app.pending_microphone_mutes.get(&frame.request_id) {
+        if pending.device_id == admission.subject_id
+            && pending.fingerprint == request_fingerprint
+            && pending.idempotency_key == frame.idempotency_key
+        {
+            return Ok(());
+        }
+        return send_mobile_error(
+            app,
+            &admission.subject_id,
+            "request_conflict",
+            "microphone requestId is already pending with different content",
+            Some(&frame.request_id),
+        );
+    }
+    if app
+        .pending_microphone_mutes
+        .values()
+        .any(|pending| pending.device_id == admission.subject_id)
+    {
+        return send_mobile_error(
+            app,
+            &admission.subject_id,
+            "microphone_request_pending",
+            "another microphone request is awaiting Desktop confirmation",
+            Some(&frame.request_id),
+        );
+    }
+    let routed = PluginMicrophoneMuteFrame {
+        kind: "plugin_microphone_mute".into(),
+        schema_version: SCHEMA_VERSION,
+        app_id: admission.app_id.clone(),
+        device_id: admission.subject_id.clone(),
+        request_id: frame.request_id.clone(),
+        lease_id: claims.lease_id.clone(),
+        lease_jti: claims.jti.clone(),
+        rtc_session_id: claims.rtc_session_id.clone(),
+        call_id: claims.call_id.clone(),
+        call_epoch: claims.call_epoch,
+        owner_epoch: claims.owner_epoch,
+        switchboard_revision: frame.switchboard_revision,
+        remote_revision: frame.remote_revision,
+        fence: claims.fence,
+        muted: frame.muted,
+    };
+    routed
+        .validate()
+        .map_err(|_| GatewayError::fatal("internal", "routed microphone request is invalid"))?;
+    app.plugin
+        .as_ref()
+        .ok_or_else(|| GatewayError::nonfatal("endpoint_reconnecting", "plugin is unavailable"))?
+        .send(serialize(&routed)?)?;
+    app.pending_microphone_mutes.insert(
+        frame.request_id,
+        PendingMicrophoneMute {
+            device_id: admission.subject_id.clone(),
+            idempotency_key: frame.idempotency_key,
+            fingerprint: request_fingerprint,
+            lease_id: claims.lease_id,
+            lease_jti: claims.jti,
+            rtc_session_id: claims.rtc_session_id,
+            call_id: claims.call_id,
+            call_epoch: claims.call_epoch,
+            owner_epoch: claims.owner_epoch,
+            switchboard_revision: frame.switchboard_revision,
+            remote_revision: frame.remote_revision,
+            fence: claims.fence,
+            muted: frame.muted,
+        },
+    );
+    Ok(())
+}
+
+async fn handle_microphone_mute_status(
+    gateway: &Gateway,
+    admission: &Admission,
+    connection_id: &str,
+    frame: PluginMicrophoneMuteStatusFrame,
+) -> Result<(), GatewayError> {
+    require_app(&frame.app_id, admission)?;
+    let mut apps = gateway.inner.v2.apps.lock().await;
+    let app = current_plugin_mut(&mut apps, admission, connection_id)?;
+    app.plugin
+        .as_mut()
+        .expect("checked plugin")
+        .admit_general()?;
+    let pending = app
+        .pending_microphone_mutes
+        .get(&frame.request_id)
+        .ok_or_else(|| GatewayError::nonfatal("stale_request", "microphone request is gone"))?;
+    if pending.device_id != frame.device_id
+        || pending.lease_id != frame.lease_id
+        || pending.lease_jti != frame.lease_jti
+        || pending.rtc_session_id != frame.rtc_session_id
+        || pending.call_id != frame.call_id
+        || pending.call_epoch != frame.call_epoch
+        || pending.owner_epoch != frame.owner_epoch
+        || pending.switchboard_revision != frame.switchboard_revision
+        || pending.remote_revision > frame.remote_revision
+        || pending.fence != frame.fence
+        || pending.muted != frame.muted
+    {
+        return Err(GatewayError::fatal(
+            "microphone_result_mismatch",
+            "plugin microphone status crossed its exact request fence",
+        ));
+    }
+    let lease = app
+        .leases
+        .get(&frame.lease_jti)
+        .ok_or_else(|| GatewayError::nonfatal("stale_lease", "microphone lease is gone"))?;
+    if lease.claims.device_id != frame.device_id
+        || lease.claims.lease_id != frame.lease_id
+        || lease.claims.rtc_session_id != frame.rtc_session_id
+        || lease.claims.call_id != frame.call_id
+        || lease.claims.call_epoch != frame.call_epoch
+        || lease.claims.owner_epoch != frame.owner_epoch
+        || lease.claims.fence != frame.fence
+        || lease.claims.phase != LeasePhase::Active
+    {
+        return Err(GatewayError::fatal(
+            "microphone_result_mismatch",
+            "plugin microphone status does not match the active lease",
+        ));
+    }
+    let pending = app
+        .pending_microphone_mutes
+        .remove(&frame.request_id)
+        .expect("validated pending microphone request");
+    if let Some(snapshot) = app.snapshot.as_mut() {
+        if snapshot.call_id == frame.call_id
+            && snapshot.call_epoch == frame.call_epoch
+            && snapshot.owner_epoch == frame.owner_epoch
+            && snapshot.switchboard_revision == frame.switchboard_revision
+            && frame.remote_revision >= snapshot.remote_revision
+        {
+            snapshot.remote_revision = frame.remote_revision;
+            snapshot.companion_microphone_muted = frame.muted;
+        }
+    }
+    let encoded = serialize(&frame)?;
+    let result = send_to_mobile(app, &frame.device_id, encoded.clone());
+    app.cache(
+        &frame.device_id,
+        &pending.idempotency_key,
+        pending.fingerprint,
+        encoded,
+    );
+    result
+}
+
 async fn handle_assistance_request(
     gateway: &Gateway,
     admission: &Admission,
@@ -2942,6 +3250,12 @@ async fn handle_assistance_request(
         fingerprint: request_fingerprint,
         answered: false,
     });
+    // Transfer acceptance rides the normal signed Takeover offer. Re-mint and
+    // republish immediately so the assistance frame and its request-bound
+    // offer cannot get separated until some unrelated state snapshot arrives.
+    refresh_pending_mobile_offers(app, &admission.app_id, gateway.inner.v2.signer()?, now)?;
+    app.sequence = next_authoritative_sequence(app.sequence)?;
+    broadcast_projected_snapshots(app, &admission.app_id)?;
     Ok(())
 }
 
@@ -3055,6 +3369,7 @@ async fn handle_assistance_answer(
         owner_epoch: frame.owner_epoch,
         switchboard_revision: frame.switchboard_revision,
         remote_revision: frame.remote_revision,
+        response_action: frame.response_action,
         answer: frame.answer,
     };
     routed.validate().map_err(|_| {
@@ -4069,15 +4384,12 @@ fn projected_snapshot(app: &V2App, app_id: &str, peer: &V2Peer) -> Result<String
             .then(|| snapshot.caller.clone())
             .flatten(),
         captions: (peer.has(Grant::CaptionsRead)
-            && snapshot.remote_consent.enabled
-            && snapshot.remote_consent.acknowledged
+            && remote_consent_is_current(snapshot)
             && snapshot.remote_consent.captions_enabled)
             .then(|| snapshot.captions.clone()),
-        participants: projected_participants(app, app_id, peer),
-        audio_levels: peer
-            .has(Grant::AudioLevelsRead)
-            .then(|| snapshot.audio_levels.clone())
-            .flatten(),
+        participants: projected_participants(snapshot, peer),
+        audio_levels: projected_audio_levels(snapshot, peer),
+        companion_microphone_muted: snapshot.companion_microphone_muted,
         pending_mobile_offers: app
             .mobiles
             .iter()
@@ -4135,51 +4447,63 @@ fn broadcast_projected_snapshots(app: &mut V2App, app_id: &str) -> Result<(), Ga
 }
 
 fn projected_participants(
-    app: &V2App,
-    app_id: &str,
+    snapshot: &AuthoritativeCallSnapshot,
     viewer: &V2Peer,
 ) -> Vec<aokie_protocol::v2::ParticipantPresence> {
-    use aokie_protocol::v2::{ParticipantMode, ParticipantPresence, ParticipantState};
-    if !viewer.has(Grant::ParticipantsRead) {
+    if !remote_consent_is_current(snapshot) || !viewer.has(Grant::ParticipantsRead) {
         return Vec::new();
     }
     let reveal_identity = viewer.has(Grant::ParticipantIdentityRead);
-    let mut participants = app
-        .mobiles
-        .keys()
-        .map(|device_id| {
-            let lease = app
-                .leases
-                .values()
-                .filter(|record| record.claims.device_id == *device_id)
-                .max_by_key(|record| record.claims.expires_at);
-            let (mode, state) = lease.map_or(
-                (ParticipantMode::Observer, ParticipantState::Connected),
-                |record| {
-                    let mode = match record.claims.mode {
-                        LeaseMode::Monitor => ParticipantMode::Observer,
-                        LeaseMode::Consult => ParticipantMode::Advisor,
-                        LeaseMode::Takeover => ParticipantMode::Talker,
-                    };
-                    let state = match record.claims.phase {
-                        LeasePhase::Prepared => ParticipantState::Prepared,
-                        LeasePhase::Active => ParticipantState::Active,
-                    };
-                    (mode, state)
-                },
-            );
-            let opaque = Sha256::digest(format!("{app_id}\0{device_id}").as_bytes());
-            ParticipantPresence {
-                participant_id: format!("participant_{}", &hex(&opaque)[..24]),
-                mode,
-                state,
-                subject_id: reveal_identity.then(|| device_id.clone()),
-                display_label: None,
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut participants = snapshot.participants.clone();
+    if !reveal_identity {
+        for participant in &mut participants {
+            participant.subject_id = None;
+            participant.display_label = None;
+        }
+    }
     participants.sort_by(|left, right| left.participant_id.cmp(&right.participant_id));
     participants
+}
+
+fn projected_audio_levels(
+    snapshot: &AuthoritativeCallSnapshot,
+    viewer: &V2Peer,
+) -> Option<Vec<aokie_protocol::v2::NormalizedAudioLevel>> {
+    if !remote_consent_is_current(snapshot) || !viewer.has(Grant::AudioLevelsRead) {
+        return None;
+    }
+    let participant_ids = viewer.has(Grant::ParticipantsRead).then(|| {
+        snapshot
+            .participants
+            .iter()
+            .map(|participant| participant.participant_id.as_str())
+            .collect::<HashSet<_>>()
+    });
+    snapshot.audio_levels.as_ref().map(|levels| {
+        levels
+            .iter()
+            .filter(|level| {
+                level.source != AudioLevelSource::Companion
+                    || participant_ids.as_ref().is_some_and(|participants| {
+                        level
+                            .participant_id
+                            .as_deref()
+                            .is_some_and(|participant_id| participants.contains(participant_id))
+                    })
+            })
+            .cloned()
+            .collect()
+    })
+}
+
+fn remote_consent_is_current(snapshot: &AuthoritativeCallSnapshot) -> bool {
+    let consent = &snapshot.remote_consent;
+    consent.enabled
+        && consent.acknowledged
+        && consent.expires_at.as_deref().is_none_or(|expiry| {
+            chrono::DateTime::parse_from_rfc3339(expiry)
+                .is_ok_and(|expiry| expiry > chrono::Utc::now())
+        })
 }
 
 fn new_claims(
@@ -4761,7 +5085,9 @@ mod tests {
                 occurred_at: "2026-07-16T00:00:00Z".into(),
                 final_text: true,
             }],
+            participants: Vec::new(),
             audio_levels: None,
+            companion_microphone_muted: false,
             // The gateway is the lease authority on this carrier and mints
             // offers into the PROJECTED snapshot; a plugin-authored
             // authoritative snapshot carries none.
@@ -5093,6 +5419,7 @@ mod tests {
                 remote_revision: 13,
                 question: "Can you help?".into(),
                 context: None,
+                transfer_offered: false,
                 expires_at: now + 60,
             },
             fingerprint: [5; 32],
@@ -6233,7 +6560,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_offer_surfaces_cover_in_app_and_native_without_duplicate_authority() {
+    fn native_ringing_is_only_for_one_live_transfer_opportunity() {
         let gateway = gateway();
         let signer = gateway.inner.v2.signer().unwrap();
         let (mut app, _, _) = app_with_peers();
@@ -6248,74 +6575,87 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        let monitor = offers_for(&app, LeaseMode::Monitor);
-        let consult = offers_for(&app, LeaseMode::Consult);
-        let takeover = offers_for(&app, LeaseMode::Takeover);
-        assert_eq!(monitor.len(), 1);
-        assert_eq!(monitor[0].offer.surface, MobileOfferSurface::InApp);
-        for offers in [&consult, &takeover] {
-            assert_eq!(offers.len(), 2);
-            assert!(offers
-                .iter()
-                .any(|signed| signed.offer.surface == MobileOfferSurface::InApp));
-            assert!(offers
-                .iter()
-                .any(|signed| signed.offer.surface == MobileOfferSurface::VoiceSystemUi));
-            assert_eq!(
-                offers[0].offer.opportunity_id,
-                offers[1].offer.opportunity_id
-            );
-            assert_ne!(offers[0].offer.offer_id, offers[1].offer.offer_id);
-            assert_ne!(offers[0].offer.jti, offers[1].offer.jti);
+        for mode in [LeaseMode::Monitor, LeaseMode::Takeover] {
+            let offers = offers_for(&app, mode);
+            assert_eq!(offers.len(), 1);
+            assert_eq!(offers[0].offer.surface, MobileOfferSurface::InApp);
+            assert!(offers[0].offer.accepted_transfer_request_id.is_none());
         }
-        assert_eq!(app.pending_mobile_offers.len(), 5);
+        assert!(offers_for(&app, LeaseMode::Consult).is_empty());
+        assert_eq!(app.pending_mobile_offers.len(), 2);
 
-        let retained_jtis = app
-            .pending_mobile_offers
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
+        let snapshot = app.snapshot.as_ref().unwrap().clone();
+        app.assistance = Some(AssistanceRecord {
+            request: PluginAssistanceRequestFrame {
+                kind: "assistance_request".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                event_id: "assist_event_advice".into(),
+                request_id: "assist_advice".into(),
+                call_id: snapshot.call_id.clone(),
+                call_epoch: snapshot.call_epoch,
+                owner_epoch: snapshot.owner_epoch,
+                switchboard_revision: snapshot.switchboard_revision,
+                remote_revision: snapshot.remote_revision,
+                question: "Can the owner approve this?".into(),
+                context: None,
+                transfer_offered: false,
+                expires_at: 200,
+            },
+            fingerprint: [7; 32],
+            answered: false,
+        });
         refresh_pending_mobile_offers(&mut app, "app_a", signer, 101).unwrap();
-        assert_eq!(app.pending_mobile_offers.len(), 5);
-        assert_eq!(
-            retained_jtis,
-            app.pending_mobile_offers
-                .keys()
-                .cloned()
-                .collect::<HashSet<_>>()
-        );
-
-        let snapshot = app.snapshot.as_mut().expect("active snapshot");
-        snapshot.switchboard_revision += 1;
-        snapshot.remote_revision += 1;
-        snapshot.remote_consent.policy_version += 1;
-        refresh_pending_mobile_offers(&mut app, "app_a", signer, 102).unwrap();
-        let revised_jtis = app
-            .pending_mobile_offers
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
-        assert_eq!(revised_jtis.len(), 5);
-        assert!(retained_jtis.is_disjoint(&revised_jtis));
-        let revised_snapshot = app.snapshot.as_ref().expect("active snapshot");
-        assert!(app.pending_mobile_offers.values().all(|signed| {
-            signed.offer.switchboard_revision == revised_snapshot.switchboard_revision
-                && signed.offer.remote_revision == revised_snapshot.remote_revision
-                && signed.offer.required_consent_policy_version
-                    == revised_snapshot.remote_consent.policy_version
-        }));
-
-        let rotated_key = test_endpoint_key(8);
-        app.mobiles
-            .get_mut("device_a")
-            .expect("mobile peer")
-            .endpoint_key = rotated_key.clone();
-        refresh_pending_mobile_offers(&mut app, "app_a", signer, 103).unwrap();
-        assert_eq!(app.pending_mobile_offers.len(), 5);
+        let consult = offers_for(&app, LeaseMode::Consult);
+        assert_eq!(consult.len(), 1);
+        assert_eq!(consult[0].offer.surface, MobileOfferSurface::InApp);
         assert!(app
             .pending_mobile_offers
             .values()
-            .all(|signed| { signed.offer.target_holder_key_thumbprint == rotated_key.thumbprint }));
+            .all(|offer| { offer.offer.surface != MobileOfferSurface::VoiceSystemUi }));
+
+        app.assistance = Some(AssistanceRecord {
+            request: PluginAssistanceRequestFrame {
+                kind: "assistance_request".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                event_id: "assist_event_transfer".into(),
+                request_id: "assist_transfer".into(),
+                call_id: snapshot.call_id,
+                call_epoch: snapshot.call_epoch,
+                owner_epoch: snapshot.owner_epoch,
+                switchboard_revision: snapshot.switchboard_revision,
+                remote_revision: snapshot.remote_revision,
+                question: "Caller requested the owner".into(),
+                context: None,
+                transfer_offered: true,
+                expires_at: 200,
+            },
+            fingerprint: [8; 32],
+            answered: false,
+        });
+        refresh_pending_mobile_offers(&mut app, "app_a", signer, 102).unwrap();
+        let takeover = offers_for(&app, LeaseMode::Takeover);
+        assert_eq!(takeover.len(), 2);
+        assert!(takeover
+            .iter()
+            .any(|offer| offer.offer.surface == MobileOfferSurface::InApp));
+        assert!(takeover
+            .iter()
+            .any(|offer| offer.offer.surface == MobileOfferSurface::VoiceSystemUi));
+        assert!(takeover.iter().all(|offer| {
+            offer.offer.accepted_transfer_request_id.as_deref() == Some("assist_transfer")
+                && offer
+                    .offer
+                    .required_grants
+                    .contains(&Grant::AssistanceRespond)
+        }));
+        assert_eq!(
+            takeover[0].offer.opportunity_id,
+            takeover[1].offer.opportunity_id
+        );
+        assert_ne!(takeover[0].offer.offer_id, takeover[1].offer.offer_id);
+        assert_ne!(takeover[0].offer.jti, takeover[1].offer.jti);
     }
 
     #[test]
@@ -6773,6 +7113,114 @@ mod tests {
     }
 
     #[test]
+    fn audio_level_projection_preserves_authoritative_participant_joins_and_privacy() {
+        let (mut app, _, _) = app_with_peers();
+        let snapshot = app.snapshot.as_mut().unwrap();
+        snapshot.participants = vec![aokie_protocol::v2::ParticipantPresence {
+            participant_id: "rtc_a".into(),
+            mode: aokie_protocol::v2::ParticipantMode::Talker,
+            state: aokie_protocol::v2::ParticipantState::Active,
+            subject_id: Some("device_a".into()),
+            display_label: Some("Owner Companion".into()),
+        }];
+        snapshot.audio_levels = Some(vec![
+            aokie_protocol::v2::NormalizedAudioLevel {
+                source: AudioLevelSource::Caller,
+                participant_id: None,
+                level_permille: 310,
+            },
+            aokie_protocol::v2::NormalizedAudioLevel {
+                source: AudioLevelSource::Aokie,
+                participant_id: None,
+                level_permille: 420,
+            },
+            aokie_protocol::v2::NormalizedAudioLevel {
+                source: AudioLevelSource::Companion,
+                participant_id: Some("rtc_a".into()),
+                level_permille: 730,
+            },
+            aokie_protocol::v2::NormalizedAudioLevel {
+                source: AudioLevelSource::Companion,
+                participant_id: Some("rtc_orphan".into()),
+                level_permille: 999,
+            },
+        ]);
+
+        let (audio_only, _) = peer(
+            "audio_only",
+            "nonce",
+            vec![Grant::StateRead, Grant::AudioLevelsRead],
+        );
+        let value: Value =
+            serde_json::from_str(&projected_snapshot(&app, "app_a", &audio_only).unwrap()).unwrap();
+        assert_eq!(
+            value["snapshot"]["participants"].as_array().unwrap().len(),
+            0
+        );
+        let levels = value["snapshot"]["audioLevels"].as_array().unwrap();
+        assert_eq!(levels.len(), 2);
+        assert!(levels.iter().all(|level| level["source"] != "companion"));
+
+        let (participant_view, _) = peer(
+            "participant_view",
+            "nonce",
+            vec![
+                Grant::StateRead,
+                Grant::AudioLevelsRead,
+                Grant::ParticipantsRead,
+            ],
+        );
+        let value: Value =
+            serde_json::from_str(&projected_snapshot(&app, "app_a", &participant_view).unwrap())
+                .unwrap();
+        let participant = &value["snapshot"]["participants"][0];
+        assert_eq!(participant["participantId"], "rtc_a");
+        assert!(participant.get("subjectId").is_none());
+        assert!(participant.get("displayLabel").is_none());
+        let levels = value["snapshot"]["audioLevels"].as_array().unwrap();
+        assert_eq!(levels.len(), 3);
+        assert!(levels
+            .iter()
+            .any(|level| { level["source"] == "companion" && level["participantId"] == "rtc_a" }));
+        assert!(levels
+            .iter()
+            .all(|level| level["participantId"] != "rtc_orphan"));
+
+        let (identity_view, _) = peer(
+            "identity_view",
+            "nonce",
+            vec![
+                Grant::StateRead,
+                Grant::ParticipantsRead,
+                Grant::ParticipantIdentityRead,
+            ],
+        );
+        let value: Value =
+            serde_json::from_str(&projected_snapshot(&app, "app_a", &identity_view).unwrap())
+                .unwrap();
+        assert_eq!(
+            value["snapshot"]["participants"][0]["subjectId"],
+            "device_a"
+        );
+        assert_eq!(
+            value["snapshot"]["participants"][0]["displayLabel"],
+            "Owner Companion"
+        );
+
+        app.snapshot.as_mut().unwrap().remote_consent.expires_at =
+            Some("2000-01-01T00:00:00Z".into());
+        let value: Value =
+            serde_json::from_str(&projected_snapshot(&app, "app_a", &participant_view).unwrap())
+                .unwrap();
+        assert!(value["snapshot"]["participants"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(value["snapshot"].get("audioLevels").is_none());
+        assert!(value["snapshot"].get("captions").is_none());
+    }
+
+    #[test]
     fn first_winner_fence_is_positive_and_monotonic() {
         let mut app = V2App::default();
         assert_eq!(app.next_talk_fence().unwrap(), 1);
@@ -7117,8 +7565,13 @@ mod tests {
             lease_jti: claims.jti.clone(),
             active: false,
         });
-        let opportunity_id =
-            mobile_opportunity_id("app_a", &claims.call_id, claims.owner_epoch, claims.mode);
+        let opportunity_id = mobile_opportunity_id(
+            "app_a",
+            &claims.call_id,
+            claims.owner_epoch,
+            claims.mode,
+            None,
+        );
         app.mobile_offer_winners
             .insert(opportunity_id.clone(), "accepted_offer_jti".into());
         app.leases.insert(

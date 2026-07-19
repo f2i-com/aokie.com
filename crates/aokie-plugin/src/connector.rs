@@ -558,9 +558,14 @@ impl Plugin {
             .get("autoConnectPhone")
             .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() != Some("false")))
             .unwrap_or(true);
-        std::env::set_var("AOKIE_AUTO_CONNECT_PHONE", if auto_connect { "1" } else { "0" });
+        std::env::set_var(
+            "AOKIE_AUTO_CONNECT_PHONE",
+            if auto_connect { "1" } else { "0" },
+        );
         if auto_connect {
-            eprintln!("[aokie-plugin] autoConnectPhone ON → will page the last phone at radio start");
+            eprintln!(
+                "[aokie-plugin] autoConnectPhone ON → will page the last phone at radio start"
+            );
         }
         // holdAndCallWaiting (Phase 4): the radio advertises HFP three-way
         // calling in BRSF and negotiates AT+CHLD=? / AT+CCWA=1 at SLC time,
@@ -2624,8 +2629,9 @@ impl Plugin {
                 // changes nothing (all-or-nothing, like validation above).
                 let sealed_manager_pin = match obj.get("managerPin") {
                     Some(v) => Some(
-                        crate::manager_pin::seal(v.as_str().unwrap_or(""))
-                            .map_err(|e| CmdError::failed(format!("cannot secure managerPin: {e}")))?,
+                        crate::manager_pin::seal(v.as_str().unwrap_or("")).map_err(|e| {
+                            CmdError::failed(format!("cannot secure managerPin: {e}"))
+                        })?,
                     ),
                     None => None,
                 };
@@ -3872,7 +3878,11 @@ fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
         ("managerNumbers", "AOKIE_MANAGER_NUMBERS"),
         ("managerPin", "AOKIE_MANAGER_PIN"),
     ] {
-        let stored = settings.get(key).and_then(|v| v.as_str()).unwrap_or("").trim();
+        let stored = settings
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         // AOK-304A: the stored managerPin is a sealed token — reveal it to the
         // plaintext PIN the radio compares against, only in this process's env.
         let v = if key == "managerPin" {
@@ -4114,7 +4124,11 @@ fn apply_tts_engine_env(settings: &Map<String, Value>) {
         ("ttsEngine", "AOKIE_TTS_ENGINE"),
         ("ttsModelDir", "AOKIE_TTS_MODEL_DIR"),
     ] {
-        match settings.get(setting_key).and_then(Value::as_str).map(str::trim) {
+        match settings
+            .get(setting_key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+        {
             Some(v) if !v.is_empty() => std::env::set_var(env_key, v),
             _ => std::env::remove_var(env_key),
         }
@@ -6188,7 +6202,10 @@ mod tests {
             .expect("managerPin persisted");
         assert!(!stored.is_empty());
         if aokie_core::dpapi::platform_supported() {
-            assert!(aokie_core::dpapi::is_sealed(stored), "windows seals the PIN at rest");
+            assert!(
+                aokie_core::dpapi::is_sealed(stored),
+                "windows seals the PIN at rest"
+            );
             assert_ne!(stored, "731905", "the PIN is never stored in the clear");
         }
         assert_eq!(crate::manager_pin::reveal(stored), "731905");
@@ -6260,13 +6277,20 @@ mod tests {
         std::fs::write(&live, r#"{"settings":{}}"#).unwrap();
         let corrupt = dir.path().join("settings.json.corrupt");
         // Unparseable (truncated) but carrying a SEALED managerPin token.
-        std::fs::write(&corrupt, r#"{"settings":{"managerPin":"dpapi:AAAA","truncated"#).unwrap();
+        std::fs::write(
+            &corrupt,
+            r#"{"settings":{"managerPin":"dpapi:AAAA","truncated"#,
+        )
+        .unwrap();
         scrub_manager_pin_siblings(&live);
         assert!(corrupt.is_file(), "sealed-PIN corruption evidence is kept");
         // The same file carrying a PLAINTEXT pin is a leak — scrubbed.
         std::fs::write(&corrupt, r#"{"settings":{"managerPin":"731905","truncated"#).unwrap();
         scrub_manager_pin_siblings(&live);
-        assert!(!corrupt.is_file(), "plaintext-PIN corruption evidence is scrubbed");
+        assert!(
+            !corrupt.is_file(),
+            "plaintext-PIN corruption evidence is scrubbed"
+        );
     }
 
     #[test]

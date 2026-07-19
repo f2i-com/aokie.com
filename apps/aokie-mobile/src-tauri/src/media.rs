@@ -21,6 +21,8 @@ const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_SESSION_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const PEER_EVENT_POLL: Duration = Duration::from_millis(50);
 const MICROPHONE_PERMISSION_POLL: Duration = Duration::from_millis(500);
+const AUDIO_LEVEL_POLL: Duration = Duration::from_millis(125);
+const AUDIO_LEVEL_STATS_TIMEOUT: Duration = Duration::from_millis(50);
 const LOCAL_PROOF_INTERVAL: Duration = Duration::from_secs(5);
 const LOCAL_PROOF_TTL: chrono::Duration = chrono::Duration::milliseconds(7_500);
 #[cfg(target_os = "windows")]
@@ -154,6 +156,17 @@ pub(crate) struct MediaStatusEvent {
     pub(crate) remote_audio_ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaLevelsEvent {
+    session: MediaSession,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    microphone_level_permille: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_level_permille: Option<u16>,
+    measured_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -335,6 +348,7 @@ impl NativeMediaState {
             close_peer(app, active, "closed", "authenticated transport closed").await;
         } else if let Some(app) = app {
             emit_local_proof_reset(app);
+            emit_media_levels_reset(app);
         }
     }
 
@@ -835,6 +849,14 @@ pub async fn media_disarm_microphone(
     state: State<'_, NativeMediaState>,
     request: SessionRequest,
 ) -> Result<(), String> {
+    disarm_microphone(&app, state.inner(), request).await
+}
+
+pub(crate) async fn disarm_microphone(
+    app: &AppHandle,
+    state: &NativeMediaState,
+    request: SessionRequest,
+) -> Result<(), String> {
     let active = state.active_for(&request.session).await?;
     active
         .evidence
@@ -846,9 +868,63 @@ pub async fn media_disarm_microphone(
         .microphone_active
         .store(false, Ordering::Release);
     active.evidence.live_active.store(false, Ordering::Release);
-    reset_proof_if_active(&app, &active.evidence);
-    emit_status(&app, &active, "microphone_disarmed", None).await;
+    reset_proof_if_active(app, &active.evidence);
+    emit_status(app, &active, "microphone_disarmed", None).await;
     Ok(())
+}
+
+/// Wait for the exact native route to remain fully live long enough for the
+/// Desktop's sustained-RTP proof window to converge. This is used only when
+/// clearing an authoritative Desktop mute: capture is armed while Desktop
+/// still drops PCM, and the unmute request is sent after this bounded proof.
+pub(crate) async fn await_microphone_proof(
+    state: &NativeMediaState,
+    session: &MediaSession,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut post_arm_baseline = None;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err("native microphone proof did not converge before unmute".into());
+        }
+        let active = state.active_for(session).await?;
+        let route_current = active.evidence.connected.load(Ordering::Acquire)
+            && active.evidence.remote_audio_ready.load(Ordering::Acquire)
+            && active.evidence.microphone_active.load(Ordering::Acquire);
+        if route_current {
+            // Native stats collection is external I/O. Bound every poll by the
+            // transaction's remaining budget so a wedged platform stats call
+            // cannot hold an unmute request open beyond its one-second proof
+            // window.
+            let stats_budget = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(250));
+            let progress = match tokio::time::timeout(stats_budget, async {
+                active.peer.lock().await.microphone_sample_progress().await
+            })
+            .await
+            {
+                Ok(result) => result.map_err(|error| error.to_string())?,
+                Err(_) => None,
+            };
+            if let Some(progress) = progress {
+                match post_arm_baseline {
+                    Some(baseline) if progress.strictly_advanced_from(baseline) => return Ok(()),
+                    None => post_arm_baseline = Some(progress),
+                    _ => {}
+                }
+            }
+        } else {
+            post_arm_baseline = None;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("native microphone proof did not converge before unmute".into());
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
+    }
 }
 
 #[tauri::command]
@@ -961,12 +1037,14 @@ pub(crate) async fn close(
         close_peer(Some(app), active, "closed", reason).await;
     } else {
         emit_local_proof_reset(app);
+        emit_media_levels_reset(app);
     }
     Ok(())
 }
 
 async fn watch_peer(state: NativeMediaState, app: AppHandle, active: ActiveMedia) {
     let mut next_proof = tokio::time::Instant::now();
+    let mut next_audio_levels = tokio::time::Instant::now();
     let mut next_microphone_permission_check = tokio::time::Instant::now();
     #[cfg(target_os = "android")]
     let mut next_audio_route_check = tokio::time::Instant::now();
@@ -1237,6 +1315,28 @@ async fn watch_peer(state: NativeMediaState, app: AppHandle, active: ActiveMedia
             next_proof = tokio::time::Instant::now() + LOCAL_PROOF_INTERVAL;
         }
 
+        if active.evidence.connected.load(Ordering::Acquire)
+            && tokio::time::Instant::now() >= next_audio_levels
+        {
+            let levels = {
+                let peer = active.peer.lock().await;
+                tokio::time::timeout(AUDIO_LEVEL_STATS_TIMEOUT, peer.audio_levels()).await
+            };
+            if let Ok(Ok(levels)) = levels {
+                let session = active.session.read().await.clone();
+                let _ = app.emit(
+                    "aokie-companion://media-levels",
+                    MediaLevelsEvent {
+                        session,
+                        microphone_level_permille: levels.microphone_level_permille,
+                        remote_level_permille: levels.remote_level_permille,
+                        measured_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                    },
+                );
+            }
+            next_audio_levels = tokio::time::Instant::now() + AUDIO_LEVEL_POLL;
+        }
+
         let current = state.inner.slot.lock().await.active.clone();
         if current
             .as_ref()
@@ -1299,6 +1399,7 @@ async fn close_peer(
             .await;
         }
         reset_proof_if_active(app, &active.evidence);
+        emit_media_levels_reset(app);
         emit_status(app, &active, phase, Some(reason.to_string())).await;
     }
 }
@@ -1390,6 +1491,10 @@ fn emit_local_proof(app: &AppHandle, session: &MediaSession) {
 
 fn emit_local_proof_reset(app: &AppHandle) {
     let _ = app.emit::<Option<LocalMediaProof>>("aokie-companion://local-media", None);
+}
+
+fn emit_media_levels_reset(app: &AppHandle) {
+    let _ = app.emit::<Option<MediaLevelsEvent>>("aokie-companion://media-levels", None);
 }
 
 fn reset_proof_if_active(app: &AppHandle, evidence: &ConnectionEvidence) {

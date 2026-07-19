@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.enableEdgeToEdge
 import androidx.core.content.ContextCompat
 
@@ -29,10 +30,24 @@ class MainActivity : TauriActivity() {
   }
 
   private fun handleWakeIntent(intent: Intent?) {
-    if (intent?.action == ACTION_REFRESH_AUTHORITATIVE_ASSISTANCE) {
+    if (shouldWakeForAuthoritativeTransfer(intent?.action)) {
       // The intent contains no assistance content. Bringing the authenticated
       // app forward is the action; v2 sync supplies current authoritative data.
       AokieOfferStore.recordDiagnostic(this, "assistance_offer_opened_for_authoritative_refresh")
+      // Light the display for this exact transfer action only. Never opt into
+      // showWhenLocked: the privacy-safe CallStyle can appear on a secure lock
+      // screen, while transcript/caller data remains behind device unlock.
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+        setShowWhenLocked(false)
+        setTurnScreenOn(true)
+        window.decorView.postDelayed({ setTurnScreenOn(false) }, 2_000L)
+      } else {
+        window.addFlags(WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+        window.decorView.postDelayed(
+          { window.clearFlags(WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON) },
+          2_000L,
+        )
+      }
     }
   }
 
@@ -111,6 +126,28 @@ class MainActivity : TauriActivity() {
   fun completeAokieNativeCallAction(actionId: String, accepted: Int, code: String): Int =
     if (AokieNativeCallActionStore.complete(this, actionId, accepted > 0, code)) 1 else -1
 
+  /**
+   * Presents only a signed offer already revalidated by the native Rust v2
+   * client. The encoded value remains in the JNI/Keystore boundary and never
+   * enters WebView state. An opaque push can wake the app, but cannot populate
+   * the transfer request binding accepted by Answer or Decline.
+   */
+  fun presentAokieAuthoritativeOffer(encoded: String): Int {
+    val offer = AokieVoiceOffer.fromAuthoritativeJson(encoded) ?: return -1
+    val committed = AokieOfferStore.acceptAuthoritative(this, offer) ?: return -1
+    if (!AokieCallNotifications.notificationsAllowed(this)) return -1
+    val intent = Intent(this, AokieIncomingCallService::class.java)
+      .setAction(AokieIncomingCallService.ACTION_PRESENT)
+      .putExtra(AokieIncomingCallService.EXTRA_OFFER_ID, committed.offerId)
+    return runCatching {
+      ContextCompat.startForegroundService(this, intent)
+      1
+    }.getOrElse {
+      AokieOfferStore.cancel(this, committed.offerId, "authoritative_offer_foreground_start_failed")
+      -1
+    }
+  }
+
   /** System-owned communication routes; no Bluetooth address crosses JNI. */
   fun beginAokieCommunicationAudio(): Int = AokieAudioRoutes.begin(this)
 
@@ -171,3 +208,6 @@ class MainActivity : TauriActivity() {
       "com.aokie.companion.action.REFRESH_AUTHORITATIVE_ASSISTANCE"
   }
 }
+
+internal fun shouldWakeForAuthoritativeTransfer(action: String?): Boolean =
+  action == MainActivity.ACTION_REFRESH_AUTHORITATIVE_ASSISTANCE

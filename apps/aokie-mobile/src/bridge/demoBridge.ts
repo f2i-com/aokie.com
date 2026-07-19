@@ -171,7 +171,7 @@ export class DemoCompanionBridge implements CompanionBridge {
     this.emit({ type: "snapshot", value: structuredClone(this.snapshot) });
   }
 
-  async requestV2Lease(_mode: V2LeaseMode): Promise<V2RequestReceipt> {
+  async requestV2Lease(_mode: V2LeaseMode, _acceptedTransferRequestId?: string): Promise<V2RequestReceipt> {
     throw new Error("Demo mode cannot request live media authority.");
   }
 
@@ -179,8 +179,12 @@ export class DemoCompanionBridge implements CompanionBridge {
     throw new Error("Demo mode has no live media authority.");
   }
 
-  async answerV2Assistance(requestId: string, _answer: string): Promise<{ requestId: string; answerId: string }> {
+  async answerV2Assistance(requestId: string, _answer: string, _responseAction?: "answer" | "decline"): Promise<{ requestId: string; answerId: string }> {
     return { requestId, answerId: `demo_answer_${Date.now()}` };
+  }
+
+  async setV2MicrophoneMuted(_muted: boolean): Promise<V2RequestReceipt> {
+    throw new Error("Demo mode cannot change live microphone authority.");
   }
 
   async prepareEndCaller(): Promise<V2RequestReceipt> {

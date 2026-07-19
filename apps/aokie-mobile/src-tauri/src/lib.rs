@@ -32,7 +32,7 @@ use realtime::{
 };
 use realtime_v2::{
     realtime_v2_answer_assistance, realtime_v2_confirm_end_caller, realtime_v2_prepare_end_caller,
-    realtime_v2_request_lease, realtime_v2_revoke_lease,
+    realtime_v2_request_lease, realtime_v2_revoke_lease, realtime_v2_set_microphone_muted,
 };
 use serde::Serialize;
 use server_profiles::{
@@ -182,6 +182,7 @@ pub fn run() {
             realtime_v2_answer_assistance,
             realtime_v2_prepare_end_caller,
             realtime_v2_confirm_end_caller,
+            realtime_v2_set_microphone_muted,
             media_create_offer,
             media_get_audio_devices,
             media_select_audio_devices,

@@ -94,9 +94,10 @@ export class UnavailableCompanionBridge implements CompanionBridge {
     throw new Error(UNAVAILABLE_MESSAGE);
   }
 
-  async requestV2Lease(_mode: V2LeaseMode): Promise<V2RequestReceipt> { throw new Error(UNAVAILABLE_MESSAGE); }
+  async requestV2Lease(_mode: V2LeaseMode, _acceptedTransferRequestId?: string): Promise<V2RequestReceipt> { throw new Error(UNAVAILABLE_MESSAGE); }
   async revokeV2Lease(_reason: string): Promise<V2RequestReceipt> { throw new Error(UNAVAILABLE_MESSAGE); }
-  async answerV2Assistance(_requestId: string, _answer: string): Promise<{ requestId: string; answerId: string }> { throw new Error(UNAVAILABLE_MESSAGE); }
+  async answerV2Assistance(_requestId: string, _answer: string, _responseAction?: "answer" | "decline"): Promise<{ requestId: string; answerId: string }> { throw new Error(UNAVAILABLE_MESSAGE); }
+  async setV2MicrophoneMuted(_muted: boolean): Promise<V2RequestReceipt> { throw new Error(UNAVAILABLE_MESSAGE); }
   async prepareEndCaller(): Promise<V2RequestReceipt> { throw new Error(UNAVAILABLE_MESSAGE); }
   async confirmEndCaller(_confirmationId: string): Promise<V2RequestReceipt> { throw new Error(UNAVAILABLE_MESSAGE); }
   async confirmDesktopPeerTrust(_challenge: DesktopPeerTrustChallenge, _approved: boolean): Promise<void> { throw new Error(UNAVAILABLE_MESSAGE); }

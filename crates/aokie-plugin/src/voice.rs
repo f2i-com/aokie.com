@@ -297,8 +297,7 @@ impl TtsEngine {
                 rt.synthesize_stream(text, voice, |chunk, _rate| {
                     // Per-chunk linear resample: the one-sample boundary discontinuity is
                     // inaudible over an 8/16 kHz phone link and keeps latency minimal.
-                    let resampled =
-                        crate::speech_wire::resample_linear(chunk, native, target_rate);
+                    let resampled = crate::speech_wire::resample_linear(chunk, native, target_rate);
                     let pcm = f32_to_i16(&resampled);
                     total += pcm.len();
                     on_pcm(&pcm)
@@ -777,9 +776,7 @@ mod tests {
         assert_eq!(loudness_guard(&mut silence), 1.0);
         assert!(silence.iter().all(|&s| s == 0.0));
         // Normal speech level (peak ~0.4, rms well under 0.12): untouched.
-        let mut normal: Vec<f32> = (0..4_000)
-            .map(|i| (i as f32 * 0.05).sin() * 0.15)
-            .collect();
+        let mut normal: Vec<f32> = (0..4_000).map(|i| (i as f32 * 0.05).sin() * 0.15).collect();
         assert_eq!(loudness_guard(&mut normal), 1.0);
         // Hot Piper-class output (peak beyond full scale): peak capped ≤0.85,
         // rms capped ≤0.12.
@@ -847,9 +844,7 @@ mod tests {
         // A bundle-local espeak-ng-data wins over the parent's.
         std::fs::create_dir_all(bundle.join("espeak-ng-data")).unwrap();
         let cfg = sherpa_config_for_dir(&bundle).unwrap();
-        assert!(cfg
-            .data_dir
-            .contains("vits-piper-en_US-test-medium"));
+        assert!(cfg.data_dir.contains("vits-piper-en_US-test-medium"));
 
         // voices.bin flips the engine to kokoro.
         std::fs::write(bundle.join("voices.bin"), b"x").unwrap();
@@ -899,11 +894,18 @@ mod tests {
         assert_eq!(engine.engine_name(), "sherpa-onnx");
         let start = std::time::Instant::now();
         let pcm = engine
-            .synthesize("Thank you for calling! How can I help you today?", "", 16_000)
+            .synthesize(
+                "Thank you for calling! How can I help you today?",
+                "",
+                16_000,
+            )
             .expect("synthesis succeeds");
         let synth_ms = start.elapsed().as_millis();
         let audio_ms = pcm.len() as u128 / 16;
-        println!("sherpa synth: {} samples ({audio_ms} ms of audio) in {synth_ms} ms", pcm.len());
+        println!(
+            "sherpa synth: {} samples ({audio_ms} ms of audio) in {synth_ms} ms",
+            pcm.len()
+        );
         assert!(pcm.len() > 8_000, "under 0.5s of audio for a full sentence");
         assert!(
             pcm.iter().any(|&s| s.abs() > 1000),

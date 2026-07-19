@@ -14,6 +14,7 @@ import {
   parseManagedConnectConfig,
   parseLocalMediaProof,
   parseNativeMediaSession,
+  parseNativeMediaLevelsEvent,
   parseNativeMediaSignalEvent,
   parseNativeAudioDevices,
   parseServerProfiles,
@@ -155,6 +156,35 @@ describe("local native media proof", () => {
       session,
       signal: { kind: "offer", description: { type: "answer", sdp: "v=0\r\n" } },
     })).toThrow();
+  });
+
+  it("accepts only exact-session native WebRTC levels and explicit resets", () => {
+    const session = {
+      appId: "app_test",
+      streamNonce: "stream_test",
+      rtcSessionId: "rtc_test",
+      callId: "call_test",
+      callEpoch: 3,
+      ownerEpoch: 8,
+      deviceId: "device_test",
+      mode: "talk",
+      leaseId: "lease_talk",
+      fence: 2,
+      sdpRevision: 1,
+      transportGeneration: 1,
+      expiresAt: "2026-07-16T00:01:00Z",
+    } as const;
+    const levels = {
+      session,
+      microphoneLevelPermille: 421,
+      remoteLevelPermille: 307,
+      measuredAt: "2026-07-16T00:00:10.125Z",
+    };
+    expect(parseNativeMediaLevelsEvent(levels)).toEqual(levels);
+    expect(parseNativeMediaLevelsEvent(null)).toBeNull();
+    expect(() => parseNativeMediaLevelsEvent({ ...levels, remoteLevelPermille: 1_001 })).toThrow();
+    expect(() => parseNativeMediaLevelsEvent({ ...levels, session: { ...session, mode: "monitor" } })).toThrow();
+    expect(() => parseNativeMediaLevelsEvent({ ...levels, inventedLevel: 500 })).toThrow();
   });
 });
 

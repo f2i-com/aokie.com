@@ -776,6 +776,36 @@ svg { flex: 0 0 auto; }
 .assistance-context span { color: #6f649d; font-size: 8px; font-weight: 780; letter-spacing: 0.07em; text-transform: uppercase; }
 .assistance-context small { color: #625a82; font-size: 10px; line-height: 1.45; }
 
+.transfer-transcript {
+  display: grid;
+  gap: 9px;
+  margin: 0 0 13px;
+  border: 1px solid rgba(19, 33, 58, 0.11);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.82);
+  padding: 12px 13px;
+}
+
+.transfer-transcript-turns {
+  display: grid;
+  gap: 8px;
+  max-height: 210px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 3px;
+}
+
+.transfer-transcript-turns article {
+  display: grid;
+  grid-template-columns: minmax(54px, auto) 1fr;
+  gap: 9px;
+  align-items: start;
+}
+
+.transfer-transcript-turns strong { color: var(--violet); font-size: 10px; line-height: 1.45; }
+.transfer-transcript-turns p { margin: 0; color: var(--ink); font-size: 12px; line-height: 1.45; }
+.transfer-transcript .runtime-muted { margin: 0; }
+
 .assistance-answer-field { display: grid; gap: 7px; }
 .assistance-answer-field > span { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .assistance-answer-field strong { color: var(--navy); font-size: 11px; }
