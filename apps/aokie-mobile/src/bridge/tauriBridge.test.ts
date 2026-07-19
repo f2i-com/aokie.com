@@ -413,6 +413,23 @@ describe("managed Companion account data", () => {
     expect(() => parseCompanionBootstrap({ ...bootstrap, device: missingRevocation })).toThrow();
   });
 
+  it("accepts the complete managed participant capability set", () => {
+    const capabilities = [
+      "state_read", "caller_read", "captions_read", "participants_read",
+      "participant_identity_read", "audio_levels_read", "monitor", "consult",
+      "takeover", "resume_aokie", "rtc_signal", "assistance_read",
+      "assistance_respond", "end_caller",
+    ];
+    const parsed = parseCompanionBootstrap({
+      ...bootstrap,
+      device: { ...bootstrap.device, grants: capabilities },
+      capabilities,
+    });
+
+    expect(parsed.capabilities).toEqual(capabilities);
+    expect(parsed.device.grants).toEqual(capabilities);
+  });
+
   it("requires one current staff identity and cross-checks known routing staff", () => {
     expect(() => parseCompanionBootstrap({
       ...bootstrap,
