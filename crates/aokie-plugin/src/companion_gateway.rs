@@ -4,7 +4,7 @@
 //! the physical radio truth.  Only SDP/ICE and epoch-bound lease transitions
 //! cross the WebSocket; PCM remains inside native WebRTC tracks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,15 +14,19 @@ use aokie_media::{
 };
 use aokie_protocol::v2::{
     peer_roster_hash, sdp_dtls_fingerprint, sdp_sha256, tracks_for, AdmissionRole,
-    AuthoritativeCallSnapshot, CallerProjection, Caption, CarrierHoldEvidence, EndCallerOutcome,
-    EndpointBindingClaims, EndpointChallengeFrame, EndpointKeyAlgorithm, EndpointPublicKey, Grant,
-    HelloProofClaims, LeaseClaims, LeaseHeartbeatFrame, LeaseMode, LeasePhase, LeaseRequestFrame,
-    LeaseRevokeFrame, MediaState, MobileHello, MobileOfferAnswerFrame, MobileOfferSurface,
-    MobileRtcSignalFrame, PendingMobileOfferClaims, PluginAssistanceAnswerFrame,
+    AudioLevelSource, AuthoritativeCallSnapshot, CallerProjection, Caption, CarrierHoldEvidence,
+    EndCallerChallengeFrame, EndCallerOutcome, EndpointBindingClaims, EndpointChallengeFrame,
+    EndpointKeyAlgorithm, EndpointPublicKey, Grant, HelloProofClaims, LeaseClaims,
+    LeaseHeartbeatFrame, LeaseMode, LeasePhase, LeaseRequestFrame, LeaseRevokeFrame, MediaState,
+    MobileAssistanceAnswerFrame, MobileEndCallerChallengeRequestFrame, MobileEndCallerConfirmFrame,
+    MobileHello, MobileMicrophoneMuteFrame, MobileOfferAnswerFrame, MobileOfferSurface,
+    MobileRtcSignalFrame, NormalizedAudioLevel, ParticipantMode, ParticipantPresence,
+    ParticipantState, PendingMobileOfferClaims, PluginAssistanceAnswerFrame,
     PluginAssistanceRequestFrame, PluginClaimDecisionFrame, PluginClaimRejectedFrame,
     PluginEndCallerExecuteFrame, PluginEndCallerResultFrame, PluginHello, PluginIdleFrame,
-    PluginLeaseRevokeFrame, PluginLeaseStatus, PluginLeaseStatusFrame, PluginOfferAcceptedFrame,
-    PluginRtcSignalFrame, PluginSnapshotFrame, RemoteCapabilities, RemoteConsentPolicy, RtcSignal,
+    PluginLeaseRevokeFrame, PluginLeaseStatus, PluginLeaseStatusFrame, PluginMicrophoneMuteFrame,
+    PluginMicrophoneMuteStatusFrame, PluginOfferAcceptedFrame, PluginRtcSignalFrame,
+    PluginSnapshotFrame, RemoteCapabilities, RemoteConsentPolicy, RtcSignal,
     SecondaryCallObservation, SecondaryCallPolicy, ServiceMode as ProtocolServiceMode,
     SignedEndpointBinding, SignedHelloProof, SignedPendingMobileOffer,
     SignedTrickleCandidateEnvelope, TelephonyState, TrickleCandidateClaims, V2ProtocolError,
@@ -33,6 +37,7 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, http::HeaderValue, Message};
 use url::Url;
@@ -43,8 +48,8 @@ use crate::radio::{
     CompanionEndCallerFailure, CompanionEndCallerRequest, RadioControl, RadioHandle,
 };
 use crate::remote_media::{
-    OpenPeerRequest, RemoteMediaEvent, RemoteMediaEventKind, RemoteMediaHandle,
-    ServiceMode as LocalServiceMode,
+    OpenPeerRequest, RemoteAudioLevelSource, RemoteMediaEvent, RemoteMediaEventKind,
+    RemoteMediaHandle, RemoteParticipantState, ServiceMode as LocalServiceMode,
 };
 
 const READ_TICK: Duration = Duration::from_millis(100);
@@ -1278,6 +1283,15 @@ fn tokens_match(minted: &str, presented: &str) -> bool {
         == 0
 }
 
+fn transfer_opportunity_id(request_id: &str) -> String {
+    let digest = Sha256::digest(request_id.as_bytes());
+    let suffix = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("transfer_opportunity_{suffix}")
+}
+
 type GatewaySocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -1393,7 +1407,6 @@ struct DeferredPrepare {
     lease_id: String,
     device_id: String,
     request_id: String,
-    offer_id: String,
     offer: MintedOffer,
     replay_key: String,
 }
@@ -1448,7 +1461,9 @@ impl PendingRelayStatus {
 enum RelayReplayResult {
     OfferAccepted {
         encoded: String,
+        offer_id: String,
         mode: LeaseMode,
+        required_grants: Vec<Grant>,
     },
     LeaseStatus {
         lease_id: String,
@@ -1479,6 +1494,13 @@ enum RelayReplayResult {
     },
     HeartbeatStatus {
         lease_id: String,
+    },
+    /// An operation whose successful response is already completely encoded.
+    /// The required grants are rechecked on every replay so a narrower fresh
+    /// admission cannot use an old acknowledgement to preserve authority.
+    DirectResponse {
+        encoded: String,
+        required_grants: Vec<Grant>,
     },
 }
 
@@ -1565,12 +1587,21 @@ const RETIRED_PREPARED_RTC_TTL: Duration = Duration::from_secs(10);
 /// How long a replay result is remembered, and how many at once.
 const RELAY_REPLAY_TTL: Duration = Duration::from_secs(120);
 const MAX_RELAY_REPLAYS: usize = 256;
+/// Caller ending deliberately requires a second, short-lived, one-use
+/// confirmation.  The relay is only a carrier; the plugin that owns the
+/// physical radio mints and consumes this nonce itself.
+const RELAY_END_CALLER_CONFIRM_TTL: u64 = 12;
+const MAX_RELAY_END_CALLER_CHALLENGES: usize = MAX_RELAY_PEERS;
+const MAX_USED_RELAY_END_CALLER_CONFIRMATIONS: usize = 64;
 
 struct GatewaySession {
     app_id: String,
     plugin_id: String,
     plugin_session_nonce: String,
     endpoint_authority: Arc<EndpointAuthority>,
+    /// The process mailbox in production, injected as an isolated clone in
+    /// tests so the offer/decline decision CAS can be exercised deterministically.
+    assistance: crate::assistance::AssistanceBroker,
     used_endpoint_jtis: HashMap<String, u64>,
     ice_servers: Vec<IceServerConfig>,
     relay_only: bool,
@@ -1585,6 +1616,10 @@ struct GatewaySession {
     relay_snapshot_event_id: Option<String>,
     relay_snapshot_delivered_devices: HashSet<String>,
     pending_end_caller: HashMap<String, PendingEndCaller>,
+    accepted_transfers: HashMap<String, AcceptedTransferLease>,
+    relay_end_caller_challenges: HashMap<String, RelayEndCallerChallenge>,
+    used_relay_end_caller_confirmations: HashSet<String>,
+    used_relay_end_caller_order: VecDeque<String>,
     /// Unhandled relay frame kinds already reported, so a Companion emitting one
     /// on a timer cannot wrap the bounded log ring during a call. Bounded, and
     /// keyed by kind so a genuinely NEW kind is still surfaced once.
@@ -1628,6 +1663,11 @@ struct GatewaySession {
     relay_carrier: bool,
     relay_peers: HashMap<String, RelayPeer>,
     relay_offers: HashMap<String, MintedOffer>,
+    relay_offer_winners: HashMap<String, String>,
+    /// Transfer offer removed for lease validation but not yet installed as a
+    /// delivery-gated provisional claim. Any terminal validation exit drains
+    /// this exact entry and releases the AssistanceBroker reservation.
+    relay_redeeming_transfer_offers: HashMap<String, MintedOffer>,
     relay_leases: HashMap<String, RelayLease>,
     deferred_prepare: Option<DeferredPrepare>,
     pending_relay_status: Option<PendingRelayStatus>,
@@ -1653,6 +1693,44 @@ struct PendingEndCaller {
     result_rx: std::sync::mpsc::Receiver<Result<(), CompanionEndCallerFailure>>,
 }
 
+#[derive(Clone)]
+struct AcceptedTransferLease {
+    request_id: String,
+    offered_fence: crate::assistance::AssistanceCallFence,
+    device_id: String,
+    setup_expires_at: u64,
+    failback_requested: bool,
+}
+
+#[derive(Clone)]
+struct RelayEndCallerChallenge {
+    frame: EndCallerChallengeFrame,
+    lease_jti: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayAssistanceAnswerAcceptedFrame {
+    kind: &'static str,
+    schema_version: u16,
+    app_id: String,
+    request_id: String,
+    answer_id: String,
+    accepted: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayEndCallerSubmittedFrame {
+    kind: &'static str,
+    schema_version: u16,
+    app_id: String,
+    request_id: String,
+    operation_id: String,
+    confirmation_id: String,
+    accepted: bool,
+}
+
 impl GatewaySession {
     fn new(credentials: &SessionCredentials, plugin_session_nonce: String) -> Self {
         Self {
@@ -1660,6 +1738,7 @@ impl GatewaySession {
             plugin_id: credentials.plugin_id.clone(),
             plugin_session_nonce,
             endpoint_authority: credentials.endpoint_authority.clone(),
+            assistance: crate::assistance::global().clone(),
             used_endpoint_jtis: HashMap::new(),
             ice_servers: credentials.ice_servers.clone(),
             relay_only: credentials.relay_only,
@@ -1674,6 +1753,10 @@ impl GatewaySession {
             relay_snapshot_event_id: None,
             relay_snapshot_delivered_devices: HashSet::new(),
             pending_end_caller: HashMap::new(),
+            accepted_transfers: HashMap::new(),
+            relay_end_caller_challenges: HashMap::new(),
+            used_relay_end_caller_confirmations: HashSet::new(),
+            used_relay_end_caller_order: VecDeque::new(),
             dropped_relay_kinds: HashSet::new(),
             relay_hello_rejection_logged_at: None,
             relay_hello_rejections_suppressed: 0,
@@ -1683,6 +1766,8 @@ impl GatewaySession {
             relay_carrier: false,
             relay_peers: HashMap::new(),
             relay_offers: HashMap::new(),
+            relay_offer_winners: HashMap::new(),
+            relay_redeeming_transfer_offers: HashMap::new(),
             relay_leases: HashMap::new(),
             deferred_prepare: None,
             pending_relay_status: None,
@@ -1877,7 +1962,9 @@ mod tests {
         let credentials = admission("app_a", "aokie", &authority)
             .into_credentials(None, "aokie", authority)
             .unwrap();
-        GatewaySession::new(&credentials, "plugin_session_a".into())
+        let mut session = GatewaySession::new(&credentials, "plugin_session_a".into());
+        session.assistance = crate::assistance::AssistanceBroker::default();
+        session
     }
 
     fn test_plugin_revocation(
@@ -1917,12 +2004,15 @@ mod tests {
             talk_lease_id: Some("lease_a".into()),
             talk_fence: 1,
             talk_audio_forwarded,
+            microphone_muted: false,
             radio_reserved: true,
             dropped_sco_frames: 0,
             quarantined_talk_frames: 0,
             dropped_events: 0,
             consent: crate::remote_media::RemoteConsentGate::default(),
             captions: Vec::new(),
+            participants: Vec::new(),
+            audio_levels: Vec::new(),
         }
     }
 
@@ -1941,6 +2031,52 @@ mod tests {
         assert_eq!(
             authoritative_media_state(&consult, true),
             MediaState::Active
+        );
+    }
+
+    #[test]
+    fn socket_authoritative_telemetry_requires_current_remote_consent() {
+        let mut remote = remote_snapshot(LocalServiceMode::HumanActive, true);
+        remote.participants = vec![crate::remote_media::RemoteParticipant {
+            participant_id: "rtc_owner".into(),
+            device_id: "device_owner".into(),
+            mode: MediaMode::Talk,
+            state: RemoteParticipantState::Active,
+        }];
+        remote.audio_levels = vec![crate::remote_media::RemoteAudioLevel {
+            source: RemoteAudioLevelSource::Companion,
+            participant_id: Some("rtc_owner".into()),
+            level_permille: 700,
+        }];
+
+        let (participants, levels) = authoritative_remote_telemetry(&remote);
+        assert!(participants.is_empty());
+        assert!(levels.is_none(), "disabled consent exposes no telemetry");
+
+        remote.consent.enabled = true;
+        remote.consent.acknowledged = true;
+        remote.consent.acknowledged_at = Some("2026-07-19T00:00:00Z".into());
+        remote.consent.expires_at = Some("2999-01-01T00:00:00Z".into());
+        let (participants, levels) = authoritative_remote_telemetry(&remote);
+        assert_eq!(participants.len(), 1);
+        assert_eq!(levels.as_ref().map(Vec::len), Some(1));
+
+        remote.consent.expires_at = Some("2000-01-01T00:00:00Z".into());
+        let (participants, levels) = authoritative_remote_telemetry(&remote);
+        assert!(participants.is_empty());
+        assert!(levels.is_none(), "expired consent exposes no telemetry");
+
+        remote.consent.expires_at = Some("not-an-rfc3339-instant".into());
+        let (participants, levels) = authoritative_remote_telemetry(&remote);
+        assert!(participants.is_empty());
+        assert!(levels.is_none(), "malformed consent fails closed");
+
+        remote.consent.expires_at = Some("2000-01-01T23:59:59+14:00".into());
+        let (participants, levels) = authoritative_remote_telemetry(&remote);
+        assert!(participants.is_empty());
+        assert!(
+            levels.is_none(),
+            "an offset timestamp is compared as an instant, not as text"
         );
     }
 
@@ -2441,6 +2577,41 @@ mod tests {
             self.session.pending_relay_status = None;
         }
 
+        fn request_transfer(
+            &self,
+            reason: &str,
+        ) -> (String, crate::assistance::AssistanceCallFence) {
+            let remote = self.media.snapshot();
+            let fence = crate::assistance::AssistanceCallFence {
+                call_id: remote.call_id.expect("test call is active"),
+                call_epoch: remote.call_epoch,
+                owner_epoch: remote.owner_epoch,
+                switchboard_revision: self.radio.switchboard_revision(),
+                remote_revision: remote.remote_revision,
+            };
+            let request_id = self
+                .session
+                .assistance
+                .request_transfer(fence.clone(), reason, None, 60)
+                .expect("transfer request is accepted");
+            (request_id, fence)
+        }
+
+        fn transfer_offer_for(
+            &mut self,
+            request_id: &str,
+            surface: MobileOfferSurface,
+        ) -> SignedPendingMobileOffer {
+            self.publish_offers()
+                .into_iter()
+                .find(|offer| {
+                    offer.offer.offered_mode == LeaseMode::Takeover
+                        && offer.offer.surface == surface
+                        && offer.offer.accepted_transfer_request_id.as_deref() == Some(request_id)
+                })
+                .unwrap_or_else(|| panic!("a {surface:?} transfer offer is published"))
+        }
+
         /// Publish a snapshot and return the offers it carried.
         ///
         /// Publication is normally edge-triggered on a state change or the
@@ -2763,8 +2934,32 @@ mod tests {
             rtc_session_id: rtc_session_id.into(),
             accepted_offer_id: offer.offer.offer_id.clone(),
             accepted_offer_jti: offer.offer.jti.clone(),
+            accepted_transfer_request_id: offer.offer.accepted_transfer_request_id.clone(),
         })
         .expect("lease request encodes")
+    }
+
+    fn assistance_decline(
+        request_id: &str,
+        fence: &crate::assistance::AssistanceCallFence,
+        answer_id: &str,
+    ) -> String {
+        serde_json::to_string(&MobileAssistanceAnswerFrame {
+            kind: "assistance_answer".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: request_id.into(),
+            idempotency_key: format!("idem_{answer_id}"),
+            answer_id: answer_id.into(),
+            call_id: fence.call_id.clone(),
+            call_epoch: fence.call_epoch,
+            owner_epoch: fence.owner_epoch,
+            switchboard_revision: fence.switchboard_revision,
+            remote_revision: fence.remote_revision,
+            response_action: aokie_protocol::v2::AssistanceResponseAction::Decline,
+            answer: "declined".into(),
+        })
+        .expect("assistance decline encodes")
     }
 
     #[test]
@@ -2899,7 +3094,11 @@ mod tests {
         let granted = harness.post(&lease_request(&offer, "request_first", "rtc_a"));
         assert!(!granted.is_empty());
         let refused = harness.post(&lease_request(&offer, "request_third", "rtc_b"));
-        assert!(refused.is_empty(), "a spent offer resolves to nobody");
+        assert_eq!(
+            harness.rejection(&refused).code,
+            "offer_retired",
+            "a spent offer is explicitly retired so the endpoint cannot retry it"
+        );
     }
 
     #[test]
@@ -3037,6 +3236,88 @@ mod tests {
         let refused = harness.post_with_grants(&spoofed_request.to_string(), &monitor_grants);
         assert_eq!(harness.rejection(&refused).code, "grant_required");
         assert!(harness.session.relay_leases.is_empty());
+    }
+
+    #[test]
+    fn narrowed_transfer_endpoint_cannot_reserve_the_multi_device_winner() {
+        let mut grants = full_relay_grants();
+        grants.insert(Grant::AssistanceRespond);
+        let mut harness = RelayHarness::with_grants(grants.clone());
+        let holder = harness.session.relay_peers[&harness.device_id]
+            .holder_key_thumbprint
+            .clone();
+        harness.session.relay_peers.insert(
+            "device_b".into(),
+            RelayPeer {
+                holder_key_thumbprint: holder.clone(),
+                session_nonce: "mobile_session_b".into(),
+                grants: grants.clone(),
+            },
+        );
+        let (request_id, _) = harness.request_transfer("The caller asked for the owner");
+        let opportunity_id = transfer_opportunity_id(&request_id);
+        let offers = harness.publish_offers();
+        let offer_a = offers
+            .iter()
+            .find(|offer| {
+                offer.offer.target_device_id == harness.device_id
+                    && offer.offer.surface == MobileOfferSurface::InApp
+                    && offer.offer.accepted_transfer_request_id.as_deref()
+                        == Some(request_id.as_str())
+            })
+            .cloned()
+            .expect("device A gets the transfer offer");
+        let signed_b = offers
+            .iter()
+            .find(|offer| {
+                offer.offer.target_device_id == "device_b"
+                    && offer.offer.surface == MobileOfferSurface::InApp
+                    && offer.offer.accepted_transfer_request_id.as_deref()
+                        == Some(request_id.as_str())
+            })
+            .cloned()
+            .expect("device B gets the same transfer opportunity");
+
+        let narrowed = grants
+            .iter()
+            .copied()
+            .filter(|grant| *grant != Grant::AssistanceRespond)
+            .collect::<HashSet<_>>();
+        let refused = harness.post_with_grants(
+            &offer_answer(&offer_a, &harness.device_id, "request_narrowed_transfer"),
+            &narrowed,
+        );
+        assert_eq!(harness.rejection(&refused).code, "grant_required");
+        assert!(!harness
+            .session
+            .relay_offer_winners
+            .contains_key(&opportunity_id));
+
+        let party_b = relay_party(&holder);
+        let accepted = harness
+            .session
+            .handle_relay_peer_frame(
+                &offer_answer(&signed_b, "device_b", "request_valid_transfer"),
+                Some(&party_b),
+                Some("device_b"),
+                &grants,
+                &harness.media,
+                &harness.radio,
+            )
+            .unwrap();
+        assert!(!accepted.is_empty());
+        assert_eq!(
+            harness.session.relay_offer_winners.get(&opportunity_id),
+            Some(&signed_b.offer.offer_id)
+        );
+        assert_eq!(
+            harness
+                .session
+                .assistance
+                .pending_transfer("call_a", 1)
+                .and_then(|pending| pending.accepted_by),
+            Some("device_b".into())
+        );
     }
 
     #[test]
@@ -3435,6 +3716,260 @@ mod tests {
     }
 
     #[test]
+    fn dropped_transfer_provisional_retires_spent_frames_and_mints_a_fresh_offer() {
+        let mut grants = full_relay_grants();
+        grants.insert(Grant::AssistanceRespond);
+        let mut harness = RelayHarness::with_grants(grants);
+        let (transfer_request_id, _) = harness.request_transfer("The caller asked for the owner");
+        let opportunity_id = transfer_opportunity_id(&transfer_request_id);
+        let offer = harness.transfer_offer_for(&transfer_request_id, MobileOfferSurface::InApp);
+        let answer = offer_answer(&offer, &harness.device_id, "request_transfer_drop");
+        let accepted = harness.post(&answer);
+        assert!(serde_json::from_str::<PluginOfferAcceptedFrame>(&accepted[0]).is_ok());
+        harness.settle(&accepted, TransportDelivery::Delivered);
+
+        let request = lease_request(&offer, "request_transfer_drop", "rtc_transfer_drop");
+        let granted = harness.post(&request);
+        assert_eq!(
+            harness.granted(&granted).status,
+            PluginLeaseStatus::Provisional
+        );
+        harness.settle(&granted, TransportDelivery::Dropped);
+
+        assert!(!harness
+            .session
+            .relay_offer_winners
+            .contains_key(&opportunity_id));
+        assert!(!harness
+            .session
+            .relay_offers
+            .contains_key(&offer.offer.offer_id));
+        assert_eq!(
+            harness
+                .session
+                .assistance
+                .pending_transfer("call_a", 1)
+                .and_then(|pending| pending.accepted_by),
+            None,
+            "a grant the endpoint never received cannot reserve the transfer"
+        );
+
+        let replayed_answer = harness.post(&answer);
+        assert_eq!(
+            harness.rejection(&replayed_answer).code,
+            "offer_retired",
+            "the cached mobile answer must not re-arm its spent invitation"
+        );
+        let replayed_lease = harness.post(&request);
+        assert_eq!(harness.rejection(&replayed_lease).code, "offer_retired");
+
+        let fresh = harness.transfer_offer_for(&transfer_request_id, MobileOfferSurface::InApp);
+        assert_ne!(fresh.offer.offer_id, offer.offer.offer_id);
+        assert_ne!(fresh.offer.jti, offer.offer.jti);
+        assert_eq!(fresh.offer.opportunity_id, opportunity_id);
+        assert!(!harness
+            .answer(&fresh, "request_transfer_drop_fresh")
+            .is_empty());
+    }
+
+    #[test]
+    fn dropped_transfer_acceptance_ack_releases_the_cas_and_retires_its_answer() {
+        let mut grants = full_relay_grants();
+        grants.insert(Grant::AssistanceRespond);
+        let mut harness = RelayHarness::with_grants(grants);
+        let (request_id, _) = harness.request_transfer("The caller asked for the owner");
+        let offer = harness.transfer_offer_for(&request_id, MobileOfferSurface::InApp);
+        let answer = offer_answer(&offer, &harness.device_id, "request_ack_drop");
+        let accepted = harness.post(&answer);
+        harness.settle(&accepted, TransportDelivery::Dropped);
+
+        assert_eq!(
+            harness
+                .session
+                .assistance
+                .pending_transfer("call_a", 1)
+                .and_then(|pending| pending.accepted_by),
+            None
+        );
+        let replayed = harness.post(&answer);
+        assert_eq!(harness.rejection(&replayed).code, "offer_retired");
+        let fresh = harness.transfer_offer_for(&request_id, MobileOfferSurface::InApp);
+        assert_ne!(fresh.offer.offer_id, offer.offer.offer_id);
+    }
+
+    #[test]
+    fn transfer_offer_accept_and_decline_share_one_decision_cas() {
+        let mut grants = full_relay_grants();
+        grants.insert(Grant::AssistanceRespond);
+
+        let mut accept_first = RelayHarness::with_grants(grants.clone());
+        let (request_id, fence) = accept_first.request_transfer("The caller asked for the owner");
+        let in_app = accept_first.transfer_offer_for(&request_id, MobileOfferSurface::InApp);
+        let voice = accept_first
+            .publish_offers()
+            .into_iter()
+            .find(|offer| {
+                offer.offer.surface == MobileOfferSurface::VoiceSystemUi
+                    && offer.offer.accepted_transfer_request_id.as_deref()
+                        == Some(request_id.as_str())
+            })
+            .expect("the native surface shares the transfer opportunity");
+        assert_eq!(in_app.offer.opportunity_id, voice.offer.opportunity_id);
+        let accepted = accept_first.answer(&in_app, "request_accept_first");
+        accept_first.settle(&accepted, TransportDelivery::Delivered);
+        let declined = accept_first.post(&assistance_decline(
+            &request_id,
+            &fence,
+            "answer_after_accept",
+        ));
+        assert_eq!(accept_first.rejection(&declined).code, "already_answered");
+        let duplicate_surface = accept_first.post(&offer_answer(
+            &voice,
+            &accept_first.device_id,
+            "request_duplicate_surface",
+        ));
+        assert_eq!(
+            accept_first.rejection(&duplicate_surface).code,
+            "offer_already_answered"
+        );
+        assert_eq!(
+            accept_first
+                .session
+                .assistance
+                .pending_transfer("call_a", 1)
+                .and_then(|pending| pending.accepted_by),
+            Some("device_a".into())
+        );
+
+        let mut decline_first = RelayHarness::with_grants(grants);
+        let (request_id, fence) = decline_first.request_transfer("The caller asked for the owner");
+        let offer = decline_first.transfer_offer_for(&request_id, MobileOfferSurface::InApp);
+        let decline = decline_first.post(&assistance_decline(
+            &request_id,
+            &fence,
+            "answer_decline_first",
+        ));
+        assert_eq!(
+            serde_json::from_str::<Value>(&decline[0]).unwrap()["kind"],
+            "assistance_answer_accepted"
+        );
+        let late_accept = decline_first.answer(&offer, "request_after_decline");
+        assert_eq!(
+            decline_first.rejection(&late_accept).code,
+            "transfer_unavailable"
+        );
+        assert!(!decline_first
+            .session
+            .relay_offer_winners
+            .contains_key(&offer.offer.opportunity_id));
+    }
+
+    #[test]
+    fn accepted_transfer_offer_remains_hidden_but_redeemable_through_setup_window() {
+        let mut grants = full_relay_grants();
+        grants.insert(Grant::AssistanceRespond);
+        let mut harness = RelayHarness::with_grants(grants);
+        let (request_id, _) = harness.request_transfer("The caller asked for the owner");
+        let offer = harness.transfer_offer_for(&request_id, MobileOfferSurface::InApp);
+        let accepted = harness.answer(&offer, "request_expired_offer_setup");
+        harness.settle(&accepted, TransportDelivery::Delivered);
+        harness
+            .session
+            .relay_offers
+            .get_mut(&offer.offer.offer_id)
+            .unwrap()
+            .claims
+            .expires_at = 1;
+
+        let published = harness.publish_offers();
+        assert!(harness
+            .session
+            .relay_offers
+            .contains_key(&offer.offer.offer_id));
+        assert!(published.iter().all(|candidate| {
+            candidate.offer.offered_mode != LeaseMode::Takeover
+                || candidate.offer.accepted_transfer_request_id.as_deref()
+                    == Some(request_id.as_str())
+        }));
+
+        // Prepared media can legitimately advance mutable owner/media
+        // revisions while this accepted reservation is still setting up. The
+        // physical call identity remains the suppression key; final activation
+        // continues to require the original exact assistance fence.
+        harness.session.last_snapshot_fingerprint = None;
+        harness.session.last_snapshot_sent = None;
+        let encoded = harness
+            .session
+            .snapshot_frame(&harness.radio)
+            .unwrap()
+            .unwrap();
+        let mut advanced = serde_json::from_str::<PluginSnapshotFrame>(&encoded)
+            .unwrap()
+            .snapshot;
+        advanced.owner_epoch += 1;
+        advanced.remote_revision += 1;
+        advanced.pending_mobile_offers.clear();
+        let advanced = harness
+            .session
+            .attach_pending_offers(advanced, &harness.media.snapshot())
+            .unwrap();
+        assert!(advanced
+            .pending_mobile_offers
+            .iter()
+            .all(|candidate| candidate.offer.offered_mode != LeaseMode::Takeover));
+
+        let request = lease_request(&offer, "request_expired_offer_setup", "rtc_expired_offer");
+        let granted = harness.post(&request);
+        assert_eq!(
+            harness.granted(&granted).status,
+            PluginLeaseStatus::Provisional
+        );
+    }
+
+    #[test]
+    fn terminal_rate_limits_retire_mobile_spent_transfer_offers() {
+        let mut grants = full_relay_grants();
+        grants.insert(Grant::AssistanceRespond);
+
+        let mut answer_limited = RelayHarness::with_grants(grants.clone());
+        let (request_id, _) = answer_limited.request_transfer("Please transfer me");
+        let offer = answer_limited.transfer_offer_for(&request_id, MobileOfferSurface::InApp);
+        answer_limited.session.relay_request_budget.insert(
+            answer_limited.device_id.clone(),
+            (Instant::now(), RELAY_REQUEST_BUDGET),
+        );
+        let refused = answer_limited.answer(&offer, "request_answer_limited");
+        assert_eq!(answer_limited.rejection(&refused).code, "rate_limited");
+        answer_limited.session.relay_request_budget.clear();
+        let fresh = answer_limited.transfer_offer_for(&request_id, MobileOfferSurface::InApp);
+        assert_ne!(fresh.offer.offer_id, offer.offer.offer_id);
+
+        let mut lease_limited = RelayHarness::with_grants(grants);
+        let (request_id, _) = lease_limited.request_transfer("Please transfer me");
+        let offer = lease_limited.transfer_offer_for(&request_id, MobileOfferSurface::InApp);
+        let accepted = lease_limited.answer(&offer, "request_lease_limited");
+        lease_limited.settle(&accepted, TransportDelivery::Delivered);
+        lease_limited.session.relay_request_budget.insert(
+            lease_limited.device_id.clone(),
+            (Instant::now(), RELAY_REQUEST_BUDGET),
+        );
+        let request = lease_request(&offer, "request_lease_limited", "rtc_lease_limited");
+        let refused = lease_limited.post(&request);
+        assert_eq!(lease_limited.rejection(&refused).code, "rate_limited");
+        assert_eq!(
+            lease_limited
+                .session
+                .assistance
+                .pending_transfer("call_a", 1)
+                .and_then(|pending| pending.accepted_by),
+            None
+        );
+        lease_limited.session.relay_request_budget.clear();
+        let fresh = lease_limited.transfer_offer_for(&request_id, MobileOfferSurface::InApp);
+        assert_ne!(fresh.offer.offer_id, offer.offer.offer_id);
+    }
+
+    #[test]
     fn a_dropped_monitor_grant_leaves_no_hidden_authority_and_can_retry() {
         let mut harness = RelayHarness::new();
         let offer = harness.offer_for(LeaseMode::Monitor);
@@ -3527,6 +4062,18 @@ mod tests {
             occurred_at: "2026-07-19T00:00:00Z".into(),
             final_text: true,
         }];
+        raw.snapshot.participants = vec![ParticipantPresence {
+            participant_id: "rtc_owner".into(),
+            mode: ParticipantMode::Talker,
+            state: ParticipantState::Active,
+            subject_id: Some("device_owner".into()),
+            display_label: Some("Owner Companion".into()),
+        }];
+        raw.snapshot.audio_levels = Some(vec![NormalizedAudioLevel {
+            source: AudioLevelSource::Companion,
+            participant_id: Some("rtc_owner".into()),
+            level_permille: 700,
+        }]);
         let encoded = serde_json::to_string(&raw).unwrap();
 
         // State alone can render the call shell, but it cannot reveal caller
@@ -3578,6 +4125,40 @@ mod tests {
             .iter()
             .all(|offer| offer.offer.target_device_id == harness.device_id
                 && offer.offer.offered_mode == LeaseMode::Monitor));
+
+        harness
+            .session
+            .relay_peers
+            .get_mut(&harness.device_id)
+            .unwrap()
+            .grants = HashSet::from([
+            Grant::StateRead,
+            Grant::ParticipantsRead,
+            Grant::ParticipantIdentityRead,
+            Grant::AudioLevelsRead,
+        ]);
+        let projected = harness.session.relay_project_snapshot(&encoded).unwrap();
+        let current: PluginSnapshotFrame = serde_json::from_str(&projected[0]).unwrap();
+        assert_eq!(current.snapshot.participants, raw.snapshot.participants);
+        assert_eq!(current.snapshot.audio_levels, raw.snapshot.audio_levels);
+
+        let mut expired = raw;
+        expired.snapshot.remote_consent.expires_at = Some("2000-01-01T00:00:00Z".into());
+        let expired = serde_json::to_string(&expired).unwrap();
+        let projected = harness.session.relay_project_snapshot(&expired).unwrap();
+        let redacted: PluginSnapshotFrame = serde_json::from_str(&projected[0]).unwrap();
+        assert!(redacted.snapshot.participants.is_empty());
+        assert!(redacted.snapshot.audio_levels.is_none());
+
+        let mut malformed: PluginSnapshotFrame = serde_json::from_str(&encoded).unwrap();
+        malformed.snapshot.remote_consent.expires_at = Some("not-rfc3339".into());
+        let projected = harness
+            .session
+            .relay_project_snapshot(&serde_json::to_string(&malformed).unwrap())
+            .unwrap();
+        let redacted: PluginSnapshotFrame = serde_json::from_str(&projected[0]).unwrap();
+        assert!(redacted.snapshot.participants.is_empty());
+        assert!(redacted.snapshot.audio_levels.is_none());
     }
 
     #[test]
@@ -5326,12 +5907,12 @@ mod tests {
         let grants = full_relay_grants();
         quiesce_publication(&mut session);
 
-        // Kinds this carrier still has no authority to act on: the assistance
-        // answer and the caller-ending pair parse plugin-dialect twins only a
-        // gateway produces.
+        // Gateway authority frames remain permanently non-actionable from an
+        // untrusted peer, even though mobile assistance/end-caller requests
+        // now have their own authenticated relay translations.
         for encoded in [
-            json!({"kind": "assistance_answer", "schemaVersion": SCHEMA_VERSION}).to_string(),
-            json!({"kind": "end_caller_confirm", "schemaVersion": SCHEMA_VERSION}).to_string(),
+            json!({"kind": "claim_proposal", "schemaVersion": SCHEMA_VERSION}).to_string(),
+            json!({"kind": "claim_decision", "schemaVersion": SCHEMA_VERSION}).to_string(),
             "{ this is not json".to_string(),
         ] {
             assert!(session
@@ -5800,6 +6381,188 @@ mod tests {
         assert_eq!(frame.switchboard_revision, execute.switchboard_revision);
         assert_eq!(frame.remote_revision, execute.remote_revision);
         assert_eq!(frame.fence, execute.fence);
+    }
+
+    #[test]
+    fn relay_caller_end_prepare_then_fresh_confirm_queues_one_physical_hangup() {
+        let mut grants = full_relay_grants();
+        grants.insert(Grant::EndCaller);
+        let mut harness = RelayHarness::with_grants(grants);
+        let active =
+            activate_takeover_without_replacement_peer(&mut harness, "request_end_caller_owner");
+        let active_binding = binding_for_claims(&active.lease);
+        harness
+            .media
+            .install_test_active_talk_peer(active_binding, 20_000)
+            .expect("the test route reaches exact active physical ownership");
+        let remote = harness.media.snapshot();
+        let switchboard_revision = harness.radio.switchboard_revision();
+
+        let prepare_request_id = "request_end_prepare";
+        let prepare = MobileEndCallerChallengeRequestFrame {
+            kind: "end_caller_challenge_request".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: harness.session.app_id.clone(),
+            request_id: prepare_request_id.into(),
+            idempotency_key: "idem_end_prepare".into(),
+            lease_token: active.lease_token.clone(),
+            call_id: active.lease.call_id.clone(),
+            call_epoch: active.lease.call_epoch,
+            owner_epoch: active.lease.owner_epoch,
+            switchboard_revision,
+            remote_revision: remote.remote_revision,
+            fence: active.lease.fence,
+        };
+        let challenge_frames =
+            harness.post(&serde_json::to_string(&prepare).expect("prepare encodes"));
+        let challenge: EndCallerChallengeFrame = serde_json::from_str(
+            challenge_frames
+                .first()
+                .expect("the relay returns a confirmation challenge"),
+        )
+        .expect("challenge decodes");
+        assert_eq!(challenge.request_id, prepare_request_id);
+
+        // The native client deliberately mints a fresh operation/request ID
+        // for the destructive confirmation. Confirmation ID + nonce + the
+        // exact active lease and physical fences bind it to this preparation;
+        // the request ID is an idempotency/routing identity, not authority.
+        let confirm_request_id = "request_end_confirm";
+        assert_ne!(confirm_request_id, prepare_request_id);
+        let confirm = MobileEndCallerConfirmFrame {
+            kind: "end_caller_confirm".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: harness.session.app_id.clone(),
+            request_id: confirm_request_id.into(),
+            idempotency_key: "idem_end_confirm".into(),
+            confirmation_id: challenge.confirmation_id.clone(),
+            nonce: challenge.nonce,
+            lease_token: active.lease_token.clone(),
+            call_id: challenge.call_id,
+            call_epoch: challenge.call_epoch,
+            owner_epoch: challenge.owner_epoch,
+            switchboard_revision: challenge.switchboard_revision,
+            remote_revision: challenge.remote_revision,
+            fence: challenge.fence,
+        };
+        let submitted = harness.post(&serde_json::to_string(&confirm).expect("confirm encodes"));
+        let submitted: Value = serde_json::from_str(
+            submitted
+                .first()
+                .expect("the relay acknowledges the queued physical hangup"),
+        )
+        .expect("submission acknowledgement decodes");
+        assert_eq!(submitted["kind"], "end_caller_submitted");
+        assert_eq!(submitted["requestId"], confirm_request_id);
+        assert_eq!(submitted["confirmationId"], challenge.confirmation_id);
+        assert_eq!(submitted["accepted"], true);
+        let submitted_operation_id = submitted["operationId"]
+            .as_str()
+            .expect("the submission names its physical operation")
+            .to_owned();
+
+        let physical_reply = match harness
+            ._control_rx
+            .try_recv()
+            .expect("one physical hangup command is queued")
+        {
+            crate::radio::RadioControl::EndCallerFromCompanion { request, reply } => {
+                assert_eq!(request.call_id, active.lease.call_id);
+                assert_eq!(request.device_id, harness.device_id);
+                assert_eq!(request.lease_id, active.lease.lease_id);
+                assert_eq!(request.fence, active.lease.fence);
+                reply
+            }
+            _ => panic!("the queued command must be the caller hangup"),
+        };
+        assert!(matches!(
+            harness._control_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(
+            harness
+                .session
+                .drain_end_caller_results(&harness.media)
+                .unwrap()
+                .is_empty(),
+            "queue admission is not physical completion"
+        );
+        physical_reply.send(Ok(())).unwrap();
+        let completed = harness
+            .session
+            .drain_end_caller_results(&harness.media)
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+        let completed: PluginEndCallerResultFrame =
+            serde_json::from_str(&completed[0]).expect("completion result decodes");
+        assert_eq!(completed.outcome, EndCallerOutcome::Completed);
+        assert_eq!(completed.operation_id, submitted_operation_id);
+    }
+
+    #[test]
+    fn socket_end_caller_waits_for_the_same_physical_result_channel() {
+        let mut harness = RelayHarness::new();
+        let active = activate_takeover_without_replacement_peer(
+            &mut harness,
+            "request_socket_end_caller_owner",
+        );
+        let active_binding = binding_for_claims(&active.lease);
+        harness
+            .media
+            .install_test_active_talk_peer(active_binding, 20_000)
+            .expect("the test route reaches exact active physical ownership");
+        let remote = harness.media.snapshot();
+        let execute = PluginEndCallerExecuteFrame {
+            kind: "end_caller_execute".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: harness.session.app_id.clone(),
+            operation_id: "operation_socket_end".into(),
+            confirmation_id: "confirmation_socket_end".into(),
+            device_id: harness.device_id.clone(),
+            call_id: active.lease.call_id.clone(),
+            call_epoch: active.lease.call_epoch,
+            owner_epoch: active.lease.owner_epoch,
+            switchboard_revision: harness.radio.switchboard_revision(),
+            remote_revision: remote.remote_revision,
+            lease_id: active.lease.lease_id.clone(),
+            lease_jti: active.lease.jti.clone(),
+            fence: active.lease.fence,
+        };
+        execute.validate().unwrap();
+        let immediate = harness
+            .session
+            .handle_inbound(
+                &serde_json::to_string(&execute).unwrap(),
+                &harness.media,
+                &harness.radio,
+                false,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(immediate.is_empty());
+        let physical_reply = match harness._control_rx.try_recv().unwrap() {
+            crate::radio::RadioControl::EndCallerFromCompanion { request, reply } => {
+                assert_eq!(request.call_id, execute.call_id);
+                reply
+            }
+            _ => panic!("the socket command must use the physical caller-ending lane"),
+        };
+        assert!(harness
+            .session
+            .drain_end_caller_results(&harness.media)
+            .unwrap()
+            .is_empty());
+        physical_reply.send(Ok(())).unwrap();
+        let completed = harness
+            .session
+            .drain_end_caller_results(&harness.media)
+            .unwrap();
+        let completed: PluginEndCallerResultFrame =
+            serde_json::from_str(completed.first().unwrap()).unwrap();
+        assert_eq!(completed.outcome, EndCallerOutcome::Completed);
+        assert_eq!(completed.operation_id, execute.operation_id);
     }
 
     #[test]
@@ -7965,6 +8728,7 @@ async fn run_socket(
         session.expire_relay_leases(unix_now()?, media);
         session.expire_unbound_active_rebind(Instant::now(), media);
         session.reconcile_relay_media_authority(media);
+        session.reconcile_accepted_transfers(unix_now()?, media, radio);
 
         let publication_due = Instant::now() >= session.next_snapshot_poll;
         if publication_due {
@@ -7978,7 +8742,7 @@ async fn run_socket(
                 session.finish_relay_delivery(&encoded, delivery, media, radio);
             }
         }
-        for encoded in session.drain_end_caller_results()? {
+        for encoded in session.drain_end_caller_results(media)? {
             session.prepare_relay_delivery(&encoded);
             let delivery = transport.send_text(&encoded).await?;
             session.finish_relay_delivery(&encoded, delivery, media, radio);
@@ -8180,12 +8944,38 @@ impl GatewaySession {
             if !captions_permitted {
                 snapshot.captions.clear();
             }
-            if !peer.grants.contains(&Grant::AudioLevelsRead) {
+            let telemetry_consent_current = remote_consent_is_current(
+                snapshot.remote_consent.enabled,
+                snapshot.remote_consent.acknowledged,
+                snapshot.remote_consent.expires_at.as_deref(),
+            );
+            if !telemetry_consent_current {
+                snapshot.participants.clear();
                 snapshot.audio_levels = None;
+            } else {
+                if !peer.grants.contains(&Grant::AudioLevelsRead) {
+                    snapshot.audio_levels = None;
+                }
+                if !peer.grants.contains(&Grant::ParticipantsRead) {
+                    snapshot.participants.clear();
+                    if let Some(levels) = snapshot.audio_levels.as_mut() {
+                        levels.retain(|level| level.source != AudioLevelSource::Companion);
+                    }
+                } else if !peer.grants.contains(&Grant::ParticipantIdentityRead) {
+                    for participant in &mut snapshot.participants {
+                        participant.subject_id = None;
+                        participant.display_label = None;
+                    }
+                }
             }
             snapshot.pending_mobile_offers.retain(|offer| {
                 offer.offer.target_device_id == device_id
                     && relay_grants_allow_mode(&peer.grants, offer.offer.offered_mode)
+                    && offer
+                        .offer
+                        .required_grants
+                        .iter()
+                        .all(|grant| peer.grants.contains(grant))
             });
             let targeted = PluginSnapshotFrame {
                 kind: frame.kind.clone(),
@@ -8241,6 +9031,7 @@ impl GatewaySession {
         let switch_in_flight = radio.switch_in_flight();
         let service_mode = map_service_mode(remote.service_mode);
         let media_state = authoritative_media_state(&remote, active);
+        let (participants, audio_levels) = authoritative_remote_telemetry(&remote);
         let caller = radio.current_caller().map(|number| CallerProjection {
             label: None,
             masked_number: mask_number(&number),
@@ -8295,7 +9086,9 @@ impl GatewaySession {
                     final_text: caption.final_text,
                 })
                 .collect(),
-            audio_levels: None,
+            participants,
+            audio_levels,
+            companion_microphone_muted: remote.microphone_muted,
             pending_mobile_offers: Vec::new(),
             occurred_at: aokie_core::events::now_iso8601(),
         };
@@ -8317,7 +9110,9 @@ impl GatewaySession {
             "caller": snapshot.caller,
             "remoteConsent": snapshot.remote_consent,
             "captions": snapshot.captions,
+            "participants": snapshot.participants,
             "audioLevels": snapshot.audio_levels,
+            "companionMicrophoneMuted": snapshot.companion_microphone_muted,
             "switchInFlight": switch_in_flight,
         }))
         .map_err(|_| WorkerError::reconnect("Call snapshot fingerprint failed"))?;
@@ -8387,27 +9182,92 @@ impl GatewaySession {
             return Ok(snapshot);
         }
         let now = unix_now()?;
-        self.relay_offers
-            .retain(|_, offer| offer.claims.expires_at > now);
+        let expired = self
+            .relay_offers
+            .values()
+            .filter(|offer| offer.claims.expires_at <= now)
+            .filter(|offer| {
+                // A delivered transfer decision owns a longer, separately
+                // bounded media-setup window than the invitation itself. Keep
+                // that exact accepted offer hidden-but-redeemable until the
+                // broker window ends.
+                !offer.accepted
+                    || !offer
+                        .claims
+                        .accepted_transfer_request_id
+                        .as_deref()
+                        .and_then(|request_id| {
+                            self.assistance
+                                .pending_transfer(&offer.claims.call_id, offer.claims.call_epoch)
+                                .filter(|pending| {
+                                    pending.request_id == request_id
+                                        && pending.fence.call_id == offer.claims.call_id
+                                        && pending.fence.call_epoch == offer.claims.call_epoch
+                                        && pending.fence.owner_epoch == offer.claims.owner_epoch
+                                        && pending.fence.switchboard_revision
+                                            == offer.claims.switchboard_revision
+                                        && pending.fence.remote_revision
+                                            == offer.claims.remote_revision
+                                        && pending.accepted_by.as_deref()
+                                            == Some(offer.claims.target_device_id.as_str())
+                                })
+                        })
+                        .is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for offer in expired {
+            if offer.accepted {
+                self.retire_failed_relay_offer(offer);
+            } else {
+                self.relay_offers.remove(&offer.claims.offer_id);
+            }
+        }
 
         // Consult is the one mode with a precondition beyond consent: it exists
         // to answer a question Aokie asked, so without a current assistance
         // request there is nothing to consult about — and `handle_claim_proposal`
         // would refuse the claim anyway.
-        let assistance = crate::assistance::global().pending_frame(&self.app_id);
-        let consult_available = assistance.is_some_and(|assistance| {
+        let assistance = self.assistance.pending_frame(&self.app_id);
+        let assistance_matches = assistance.as_ref().is_some_and(|assistance| {
             assistance.call_id == snapshot.call_id
                 && assistance.call_epoch == snapshot.call_epoch
                 && assistance.owner_epoch == snapshot.owner_epoch
                 && assistance.switchboard_revision == snapshot.switchboard_revision
                 && assistance.remote_revision == snapshot.remote_revision
         });
+        let consult_available = assistance_matches
+            && assistance
+                .as_ref()
+                .is_some_and(|assistance| !assistance.transfer_offered);
+        let transfer_request_id = assistance
+            .as_ref()
+            .filter(|assistance| assistance_matches && assistance.transfer_offered)
+            .map(|assistance| assistance.request_id.clone());
+        let accepted_transfer_in_setup = self
+            .assistance
+            .accepted_transfer(&snapshot.call_id, snapshot.call_epoch)
+            .is_some();
+        let current_transfer_opportunity =
+            transfer_request_id.as_deref().map(transfer_opportunity_id);
+        self.relay_offer_winners.retain(|opportunity_id, winner| {
+            current_transfer_opportunity.as_deref() == Some(opportunity_id.as_str())
+                || self.relay_offers.values().any(|offer| {
+                    offer.claims.opportunity_id == *opportunity_id
+                        && offer.claims.offer_id == *winner
+                })
+        });
 
         let mut devices = self.relay_peers.keys().cloned().collect::<Vec<_>>();
         devices.sort();
         let mut published: Vec<SignedPendingMobileOffer> = Vec::new();
         for device_id in devices {
-            for mode in [LeaseMode::Monitor, LeaseMode::Consult, LeaseMode::Takeover] {
+            for (mode, surface) in [
+                (LeaseMode::Monitor, MobileOfferSurface::InApp),
+                (LeaseMode::Consult, MobileOfferSurface::InApp),
+                (LeaseMode::Takeover, MobileOfferSurface::InApp),
+                (LeaseMode::Takeover, MobileOfferSurface::VoiceSystemUi),
+            ] {
                 if published.len() >= MAX_PENDING_MOBILE_OFFERS {
                     break;
                 }
@@ -8415,6 +9275,37 @@ impl GatewaySession {
                     .relay_peers
                     .get(&device_id)
                     .is_some_and(|peer| relay_grants_allow_mode(&peer.grants, mode))
+                {
+                    continue;
+                }
+                let accepted_transfer_request_id = (mode == LeaseMode::Takeover)
+                    .then(|| transfer_request_id.clone())
+                    .flatten();
+                if mode == LeaseMode::Takeover
+                    && accepted_transfer_request_id.is_none()
+                    && accepted_transfer_in_setup
+                {
+                    continue;
+                }
+                if surface == MobileOfferSurface::VoiceSystemUi
+                    && accepted_transfer_request_id.is_none()
+                {
+                    continue;
+                }
+                if accepted_transfer_request_id.is_some()
+                    && !self
+                        .relay_peers
+                        .get(&device_id)
+                        .is_some_and(|peer| peer.grants.contains(&Grant::AssistanceRespond))
+                {
+                    continue;
+                }
+                if accepted_transfer_request_id
+                    .as_deref()
+                    .is_some_and(|request_id| {
+                        self.relay_offer_winners
+                            .contains_key(&transfer_opportunity_id(request_id))
+                    })
                 {
                     continue;
                 }
@@ -8433,11 +9324,25 @@ impl GatewaySession {
                 if !permitted {
                     continue;
                 }
-                if let Some(offer) = self.reusable_offer(&device_id, mode, &snapshot, now) {
+                if let Some(offer) = self.reusable_offer(
+                    &device_id,
+                    mode,
+                    surface,
+                    accepted_transfer_request_id.as_deref(),
+                    &snapshot,
+                    now,
+                ) {
                     published.push(offer);
                     continue;
                 }
-                if let Some(offer) = self.mint_offer(&device_id, mode, &snapshot, now)? {
+                if let Some(offer) = self.mint_offer(
+                    &device_id,
+                    mode,
+                    surface,
+                    accepted_transfer_request_id,
+                    &snapshot,
+                    now,
+                )? {
                     published.push(offer);
                 }
             }
@@ -8456,6 +9361,8 @@ impl GatewaySession {
         &self,
         device_id: &str,
         mode: LeaseMode,
+        surface: MobileOfferSurface,
+        accepted_transfer_request_id: Option<&str>,
         snapshot: &AuthoritativeCallSnapshot,
         now: u64,
     ) -> Option<SignedPendingMobileOffer> {
@@ -8464,6 +9371,9 @@ impl GatewaySession {
             .find(|offer| {
                 offer.claims.target_device_id == device_id
                     && offer.claims.offered_mode == mode
+                    && offer.claims.surface == surface
+                    && offer.claims.accepted_transfer_request_id.as_deref()
+                        == accepted_transfer_request_id
                     && !offer.accepted
                     && offer.claims.expires_at > now.saturating_add(RELAY_OFFER_REFRESH_MARGIN)
                     && Self::offer_matches_snapshot(&offer.claims, snapshot)
@@ -8496,6 +9406,8 @@ impl GatewaySession {
         &mut self,
         device_id: &str,
         mode: LeaseMode,
+        surface: MobileOfferSurface,
+        accepted_transfer_request_id: Option<String>,
         snapshot: &AuthoritativeCallSnapshot,
         now: u64,
     ) -> Result<Option<SignedPendingMobileOffer>, WorkerError> {
@@ -8514,6 +9426,7 @@ impl GatewaySession {
             offer.accepted
                 || offer.claims.target_device_id != device_id
                 || offer.claims.offered_mode != mode
+                || offer.claims.surface != surface
         });
         if self.relay_offers.len() >= MAX_RELAY_OFFERS {
             // Refuse to mint rather than evict: an entry still in here may be
@@ -8523,23 +9436,30 @@ impl GatewaySession {
         }
         let claims = PendingMobileOfferClaims {
             offer_id: format!("offer_{}", uuid::Uuid::new_v4().simple()),
-            opportunity_id: format!("opportunity_{}", uuid::Uuid::new_v4().simple()),
+            opportunity_id: accepted_transfer_request_id
+                .as_deref()
+                .map(transfer_opportunity_id)
+                .unwrap_or_else(|| format!("opportunity_{}", uuid::Uuid::new_v4().simple())),
             target_device_id: device_id.to_owned(),
             target_holder_key_thumbprint: peer.holder_key_thumbprint.clone(),
             offered_mode: mode,
-            surface: MobileOfferSurface::InApp,
+            surface,
             app_id: self.app_id.clone(),
             call_id: snapshot.call_id.clone(),
             call_epoch: snapshot.call_epoch,
             owner_epoch: snapshot.owner_epoch,
             switchboard_revision: snapshot.switchboard_revision,
             remote_revision: snapshot.remote_revision,
+            accepted_transfer_request_id: accepted_transfer_request_id.clone(),
             required_consent_policy_id: snapshot.remote_consent.policy_id.clone(),
             required_consent_policy_version: snapshot.remote_consent.policy_version,
             required_grants: {
                 let mut grants = vec![Grant::StateRead, Grant::RtcSignal, relay_mode_grant(mode)];
                 if mode == LeaseMode::Takeover {
                     grants.push(Grant::ResumeAokie);
+                }
+                if accepted_transfer_request_id.is_some() {
+                    grants.push(Grant::AssistanceRespond);
                 }
                 grants
             },
@@ -8575,7 +9495,7 @@ impl GatewaySession {
     }
 
     fn assistance_frame(&mut self, radio: &RadioHandle) -> Result<Option<String>, WorkerError> {
-        let Some(frame) = crate::assistance::global().pending_frame(&self.app_id) else {
+        let Some(frame) = self.assistance.pending_frame(&self.app_id) else {
             self.last_assistance_request_sent = None;
             return Ok(None);
         };
@@ -8661,6 +9581,66 @@ fn authoritative_media_state(
     }
 }
 
+fn remote_consent_is_current(enabled: bool, acknowledged: bool, expires_at: Option<&str>) -> bool {
+    enabled
+        && acknowledged
+        && expires_at.is_none_or(|expiry| {
+            chrono::DateTime::parse_from_rfc3339(expiry)
+                .is_ok_and(|expiry| expiry > chrono::Utc::now())
+        })
+}
+
+/// Builds the socket-authoritative telemetry projection. Participant presence
+/// and audio activity are consented live-call data, so neither may survive a
+/// disabled, unacknowledged, or expired remote-access policy—even before the
+/// relay applies each endpoint's narrower grant projection.
+fn authoritative_remote_telemetry(
+    remote: &crate::remote_media::RemoteMediaSnapshot,
+) -> (Vec<ParticipantPresence>, Option<Vec<NormalizedAudioLevel>>) {
+    if !remote_consent_is_current(
+        remote.consent.enabled,
+        remote.consent.acknowledged,
+        remote.consent.expires_at.as_deref(),
+    ) {
+        return (Vec::new(), None);
+    }
+    let participants = remote
+        .participants
+        .iter()
+        .map(|participant| ParticipantPresence {
+            participant_id: participant.participant_id.clone(),
+            mode: match participant.mode {
+                MediaMode::Monitor => ParticipantMode::Observer,
+                MediaMode::PreparedConsult | MediaMode::Consult => ParticipantMode::Advisor,
+                MediaMode::PreparedTalk | MediaMode::Talk => ParticipantMode::Talker,
+            },
+            state: match participant.state {
+                RemoteParticipantState::Connected => ParticipantState::Connected,
+                RemoteParticipantState::Prepared => ParticipantState::Prepared,
+                RemoteParticipantState::Active => ParticipantState::Active,
+            },
+            subject_id: Some(participant.device_id.clone()),
+            display_label: Some("Owner Companion".into()),
+        })
+        .collect();
+    let audio_levels = (!remote.audio_levels.is_empty()).then(|| {
+        remote
+            .audio_levels
+            .iter()
+            .map(|level| NormalizedAudioLevel {
+                source: match level.source {
+                    RemoteAudioLevelSource::Caller => AudioLevelSource::Caller,
+                    RemoteAudioLevelSource::Aokie => AudioLevelSource::Aokie,
+                    RemoteAudioLevelSource::Companion => AudioLevelSource::Companion,
+                },
+                participant_id: level.participant_id.clone(),
+                level_permille: level.level_permille,
+            })
+            .collect()
+    });
+    (participants, audio_levels)
+}
+
 fn remote_media_event_kind(kind: &RemoteMediaEventKind) -> &'static str {
     match kind {
         RemoteMediaEventKind::SdpAnswer { .. } => "sdp_answer",
@@ -8722,6 +9702,8 @@ struct LeaseNotice {
     device_id: String,
     lease_token: String,
     lease: LeaseClaims,
+    #[serde(default)]
+    accepted_transfer_request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -8853,10 +9835,92 @@ impl GatewaySession {
                         "Companion assistance answer failed consent or call fencing",
                     ));
                 }
-                crate::assistance::global().accept(frame).map_err(|_| {
+                self.assistance.accept(frame).map_err(|_| {
                     WorkerError::reconnect("Companion assistance answer was refused")
                 })?;
                 Ok(Vec::new())
+            }
+            "plugin_microphone_mute" => {
+                let frame: PluginMicrophoneMuteFrame = parse_gateway_frame(encoded)?;
+                frame.validate().map_err(|_| {
+                    WorkerError::reconnect("Companion microphone command is invalid")
+                })?;
+                if frame.app_id != self.app_id {
+                    return Err(WorkerError::rebootstrap(
+                        "Companion microphone command crossed application identity",
+                    ));
+                }
+                let Some(claims) = self.leases.get(&frame.lease_jti).cloned() else {
+                    return Ok(Vec::new());
+                };
+                let remote = media.snapshot();
+                let service_matches = matches!(
+                    (claims.mode, remote.service_mode),
+                    (LeaseMode::Takeover, LocalServiceMode::HumanActive)
+                        | (LeaseMode::Consult, LocalServiceMode::ConsultActive)
+                );
+                let exact = claims.lease_id == frame.lease_id
+                    && claims.jti == frame.lease_jti
+                    && claims.device_id == frame.device_id
+                    && claims.rtc_session_id == frame.rtc_session_id
+                    && claims.call_id == frame.call_id
+                    && claims.call_epoch == frame.call_epoch
+                    && claims.owner_epoch == frame.owner_epoch
+                    && claims.fence == frame.fence
+                    && claims.phase == LeasePhase::Active
+                    && radio.current_call_id().as_deref() == Some(frame.call_id.as_str())
+                    && radio.is_call_active()
+                    && !radio.switch_in_flight()
+                    && radio.switchboard_revision() == frame.switchboard_revision
+                    && remote.call_id.as_deref() == Some(frame.call_id.as_str())
+                    && remote.call_epoch == frame.call_epoch
+                    && remote.owner_epoch == frame.owner_epoch
+                    && remote.remote_revision == frame.remote_revision
+                    && remote.talk_device_id.as_deref() == Some(frame.device_id.as_str())
+                    && remote.talk_lease_id.as_deref() == Some(frame.lease_id.as_str())
+                    && remote.talk_fence == frame.fence
+                    && service_matches;
+                if !exact {
+                    eprintln!(
+                        "[aokie-plugin][companion] stage=microphone_mute_refused device={} detail=The exact call, lease, media, or switchboard fence changed",
+                        sanitize_gateway_code(&frame.device_id)
+                    );
+                    return Ok(Vec::new());
+                }
+                let binding = binding_for_claims(&claims);
+                let Ok(remote_revision) =
+                    media.set_microphone_muted(&binding, frame.remote_revision, frame.muted)
+                else {
+                    return Ok(Vec::new());
+                };
+                let status = PluginMicrophoneMuteStatusFrame {
+                    kind: "microphone_mute_status".into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: self.app_id.clone(),
+                    device_id: frame.device_id,
+                    request_id: frame.request_id,
+                    lease_id: claims.lease_id,
+                    lease_jti: claims.jti,
+                    rtc_session_id: claims.rtc_session_id,
+                    call_id: claims.call_id,
+                    call_epoch: claims.call_epoch,
+                    owner_epoch: claims.owner_epoch,
+                    switchboard_revision: radio.switchboard_revision(),
+                    remote_revision,
+                    fence: claims.fence,
+                    muted: frame.muted,
+                };
+                status.validate().map_err(|_| {
+                    WorkerError::reconnect("Companion microphone status is invalid")
+                })?;
+                self.last_snapshot_fingerprint = None;
+                self.last_snapshot_sent = None;
+                self.next_snapshot_poll = Instant::now();
+                serde_json::to_string(&status)
+                    .map(|encoded| vec![encoded])
+                    .map_err(|_| {
+                        WorkerError::reconnect("Companion microphone status could not be encoded")
+                    })
             }
             "end_caller_execute" => {
                 let frame: PluginEndCallerExecuteFrame = parse_gateway_frame(encoded)?;
@@ -8957,6 +10021,46 @@ impl GatewaySession {
                         media,
                     ));
                 }
+                "microphone_mute" => {
+                    return Ok(self.relay_microphone_mute(
+                        encoded,
+                        from_party,
+                        authenticated_subject,
+                        authenticated_grants,
+                        media,
+                        radio,
+                    ));
+                }
+                "assistance_answer" => {
+                    return Ok(self.relay_assistance_answer(
+                        encoded,
+                        from_party,
+                        authenticated_subject,
+                        authenticated_grants,
+                        media,
+                        radio,
+                    ));
+                }
+                "end_caller_challenge_request" => {
+                    return Ok(self.relay_end_caller_challenge_request(
+                        encoded,
+                        from_party,
+                        authenticated_subject,
+                        authenticated_grants,
+                        media,
+                        radio,
+                    ));
+                }
+                "end_caller_confirm" => {
+                    return Ok(self.relay_end_caller_confirm(
+                        encoded,
+                        from_party,
+                        authenticated_subject,
+                        authenticated_grants,
+                        media,
+                        radio,
+                    ));
+                }
                 _ => {}
             }
         }
@@ -9006,13 +10110,10 @@ impl GatewaySession {
         // takeover with a fence of its choosing. On this carrier the plugin
         // mints those itself, above, from live radio truth.
         //
-        // `assistance_answer` and the caller-ending pair are dropped for a
-        // duller reason: they parse plugin-dialect twins only the gateway
-        // produces (MobileAssistanceAnswerFrame carries idempotencyKey where
-        // the plugin twin wants deviceId; the caller-ending pair needs a
-        // challenge issuer this plugin does not yet have). Both twins are
-        // deny_unknown_fields, so the mobile shape cannot decode into the
-        // plugin one even by accident. Neither is on the takeover path.
+        // Assistance answers and the caller-ending pair are translated above
+        // only after the relay sender, authenticated grants, exact live call,
+        // locally minted lease and one-use operation ledgers all agree. Their
+        // plugin-dialect twins remain impossible for a peer to self-assert.
         // Keyed on the SANITIZED code, never the raw kind. A relay frame may be
         // just under the carrier's 1 MiB SSE ceiling and `kind` is peer-supplied
         // string content, so retaining raw kinds would hold up to
@@ -9241,16 +10342,24 @@ impl GatewaySession {
                 "this device has not introduced itself on this relay session",
             );
         }
-        // Capture the mode from the offer WE minted before narrowing retires
-        // offers the current admission no longer permits. The peer-controlled
-        // `offeredMode` must never choose which grant is checked.
-        let authoritative_mode = self
-            .relay_offers
-            .get(&frame.offer_id)
+        // Capture the complete signed authority requirement before narrowing
+        // retires an offer. The peer-controlled `offeredMode` must never
+        // choose which grants are checked, and AssistanceRespond is just as
+        // material as Takeover for a transfer-bound invitation.
+        let authoritative_offer = self.relay_offers.get(&frame.offer_id).cloned();
+        let authoritative_mode = authoritative_offer
+            .as_ref()
             .map(|offer| offer.claims.offered_mode)
             .unwrap_or(frame.offered_mode);
         self.relay_reconcile_frame_grants(device_id, authenticated_grants, media);
-        if !self.relay_mode_is_authorized(device_id, authenticated_grants, authoritative_mode) {
+        if authoritative_offer.as_ref().is_some_and(|offer| {
+            !self.relay_required_grants_are_authorized(
+                device_id,
+                authenticated_grants,
+                &offer.claims.required_grants,
+            )
+        }) || !self.relay_mode_is_authorized(device_id, authenticated_grants, authoritative_mode)
+        {
             return self.relay_reject(
                 device_id,
                 request_id,
@@ -9275,7 +10384,15 @@ impl GatewaySession {
                 RelayReplayResult::OfferAccepted {
                     encoded: response,
                     mode,
-                } if self.relay_mode_is_authorized(device_id, authenticated_grants, mode) => {
+                    required_grants,
+                    ..
+                } if self.relay_mode_is_authorized(device_id, authenticated_grants, mode)
+                    && self.relay_required_grants_are_authorized(
+                        device_id,
+                        authenticated_grants,
+                        &required_grants,
+                    ) =>
+                {
                     vec![response]
                 }
                 RelayReplayResult::OfferAccepted { .. } => self.relay_reject(
@@ -9284,6 +10401,7 @@ impl GatewaySession {
                     "grant_required",
                     "the authenticated admission no longer grants this media mode",
                 ),
+                RelayReplayResult::Rejected { encoded } => vec![encoded],
                 _ => self.relay_reject(
                     device_id,
                     request_id,
@@ -9292,21 +10410,12 @@ impl GatewaySession {
                 ),
             };
         }
-        if self.relay_over_budget(device_id) {
-            return self.relay_reject(device_id, request_id, "rate_limited", "too many requests");
-        }
-        if !self.relay_replay_has_room(&replay_key) {
-            return self.relay_reject(
-                device_id,
-                request_id,
-                "rate_limited",
-                "the replay ledger is full",
-            );
-        }
+        let over_budget = self.relay_over_budget(device_id);
+        let replay_has_room = self.relay_replay_has_room(&replay_key);
         let Ok(now) = unix_now() else {
             return self.relay_reject(device_id, request_id, "offer_unknown", "clock unavailable");
         };
-        let Some(minted) = self.relay_offers.get(&frame.offer_id) else {
+        let Some(minted) = self.relay_offers.get(&frame.offer_id).cloned() else {
             return self.relay_reject(
                 device_id,
                 request_id,
@@ -9332,6 +10441,18 @@ impl GatewaySession {
                 "the authenticated admission does not grant this media mode",
             );
         }
+        if !self.relay_required_grants_are_authorized(
+            &minted_device_id,
+            authenticated_grants,
+            &minted.claims.required_grants,
+        ) {
+            return self.relay_reject(
+                &minted_device_id,
+                request_id,
+                "grant_required",
+                "the authenticated admission no longer grants every operation required by this offer",
+            );
+        }
         if minted.claims.expires_at <= now {
             self.relay_offers.remove(&frame.offer_id);
             return self.relay_reject(
@@ -9342,11 +10463,31 @@ impl GatewaySession {
             );
         }
         if minted.accepted {
+            if over_budget || !replay_has_room {
+                return self.relay_reject(
+                    device_id,
+                    request_id,
+                    "rate_limited",
+                    "too many Companion requests from this device",
+                );
+            }
             return self.relay_reject(
                 device_id,
                 request_id,
                 "offer_replayed",
                 "that offer was already answered",
+            );
+        }
+        if self
+            .relay_offer_winners
+            .get(&minted.claims.opportunity_id)
+            .is_some_and(|winner| winner != &minted.claims.offer_id)
+        {
+            return self.relay_reject(
+                device_id,
+                request_id,
+                "offer_already_answered",
+                "another endpoint or surface already answered this transfer opportunity",
             );
         }
         // Every field is re-checked against what WE minted rather than trusted
@@ -9369,8 +10510,22 @@ impl GatewaySession {
                 "that answer does not match the offer this plugin issued",
             );
         }
-        if let Some(minted) = self.relay_offers.get_mut(&frame.offer_id) {
-            minted.accepted = true;
+        if over_budget || !replay_has_room {
+            // The mobile spends/tombstones an offer before sending its answer.
+            // Once the complete signed answer proved this exact invitation,
+            // a terminal local-capacity rejection must retire it too so the
+            // next snapshot carries a fresh identity the client can use.
+            self.retire_failed_relay_offer(minted.clone());
+            return self.relay_reject(
+                device_id,
+                request_id,
+                "rate_limited",
+                if over_budget {
+                    "too many requests"
+                } else {
+                    "the replay ledger is full"
+                },
+            );
         }
         let accepted = PluginOfferAcceptedFrame {
             kind: "plugin_offer_accepted".into(),
@@ -9389,13 +10544,47 @@ impl GatewaySession {
         let Ok(response) = serde_json::to_string(&accepted) else {
             return Vec::new();
         };
+        // This is the transfer decision linearization point. Offer acceptance
+        // and an explicit Assistance Decline now contend on the SAME mailbox
+        // mutex/CAS: accept-first makes Decline fail, while decline-first
+        // makes this reservation fail before any winner or ACK is recorded.
+        if let Some(transfer_request_id) = minted.claims.accepted_transfer_request_id.as_deref() {
+            let fence = crate::assistance::AssistanceCallFence {
+                call_id: minted.claims.call_id.clone(),
+                call_epoch: minted.claims.call_epoch,
+                owner_epoch: minted.claims.owner_epoch,
+                switchboard_revision: minted.claims.switchboard_revision,
+                remote_revision: minted.claims.remote_revision,
+            };
+            if self
+                .assistance
+                .accept_transfer(transfer_request_id, &fence, device_id)
+                .is_err()
+            {
+                return self.relay_reject(
+                    device_id,
+                    request_id,
+                    "transfer_unavailable",
+                    "that transfer was declined, expired, or accepted by another endpoint",
+                );
+            }
+        }
+        if let Some(stored) = self.relay_offers.get_mut(&frame.offer_id) {
+            stored.accepted = true;
+        }
+        self.relay_offer_winners.insert(
+            minted.claims.opportunity_id.clone(),
+            minted.claims.offer_id.clone(),
+        );
         self.relay_record_replay(
             replay_key,
             fingerprint,
             device_id.to_owned(),
             RelayReplayResult::OfferAccepted {
                 encoded: response.clone(),
+                offer_id: minted.claims.offer_id.clone(),
                 mode: minted_mode,
+                required_grants: minted.claims.required_grants.clone(),
             },
         );
         vec![response]
@@ -9496,7 +10685,18 @@ impl GatewaySession {
         // the asker. An unknown or unanswered offer means we have no idea who
         // this is, and there is nothing to address a refusal to either.
         let Some(minted) = self.relay_offers.get(&frame.accepted_offer_id).cloned() else {
-            return Vec::new();
+            let Some(device_id) = authenticated_subject.filter(|device_id| {
+                self.relay_sender_owns_device(from_party, authenticated_subject, device_id)
+                    && self.relay_peers.contains_key(*device_id)
+            }) else {
+                return Vec::new();
+            };
+            return self.relay_reject(
+                device_id,
+                &frame.request_id,
+                "offer_retired",
+                "that accepted offer is no longer redeemable; wait for fresh authenticated state",
+            );
         };
         if !minted.accepted || minted.claims.jti != frame.accepted_offer_jti {
             return Vec::new();
@@ -9521,10 +10721,31 @@ impl GatewaySession {
                 "the authenticated admission does not grant this media mode",
             );
         }
+        if minted.claims.accepted_transfer_request_id.is_some()
+            && !self.relay_has_exact_grants(
+                &device_id,
+                authenticated_grants,
+                &[
+                    Grant::StateRead,
+                    Grant::RtcSignal,
+                    Grant::Takeover,
+                    Grant::AssistanceRespond,
+                ],
+            )
+        {
+            return self.relay_reject(
+                &device_id,
+                &request_id,
+                "grant_required",
+                "request-bound transfer acceptance requires AssistanceRespond and Takeover",
+            );
+        }
         if self.relay_over_budget(&device_id) {
+            self.retire_failed_relay_offer(minted.clone());
             return self.relay_reject(&device_id, &request_id, "rate_limited", "too many requests");
         }
         if !self.relay_replay_has_room(&replay_key) {
+            self.retire_failed_relay_offer(minted.clone());
             return self.relay_reject(
                 &device_id,
                 &request_id,
@@ -9538,6 +10759,20 @@ impl GatewaySession {
         let Some(spent_offer) = self.relay_offers.remove(&frame.accepted_offer_id) else {
             return Vec::new();
         };
+        if spent_offer.claims.accepted_transfer_request_id.is_some() {
+            self.relay_redeeming_transfer_offers
+                .insert(spent_offer.claims.offer_id.clone(), spent_offer.clone());
+        }
+        if frame.accepted_transfer_request_id != spent_offer.claims.accepted_transfer_request_id {
+            return self.relay_recorded_rejection(
+                &replay_key,
+                &fingerprint,
+                &device_id,
+                &request_id,
+                "offer_substitution",
+                "the transfer request does not match the exact signed offer",
+            );
+        }
         if frame.mode != offered_mode {
             return self.relay_recorded_rejection(
                 &replay_key,
@@ -9645,7 +10880,8 @@ impl GatewaySession {
             );
         }
         if matches!(frame.mode, LeaseMode::Consult) {
-            let fenced = crate::assistance::global()
+            let fenced = self
+                .assistance
                 .pending_frame(&self.app_id)
                 .is_some_and(|assistance| {
                     assistance.call_id == frame.call_id
@@ -9675,6 +10911,46 @@ impl GatewaySession {
                 "clock unavailable",
             );
         };
+        let accepted_transfer =
+            if let Some(transfer_request_id) = frame.accepted_transfer_request_id.as_deref() {
+                let Some(transfer) = self
+                    .assistance
+                    .pending_transfer(&frame.call_id, remote.call_epoch)
+                else {
+                    return self.relay_recorded_rejection(
+                        &replay_key,
+                        &fingerprint,
+                        &device_id,
+                        &request_id,
+                        "transfer_unavailable",
+                        "that transfer request is no longer available",
+                    );
+                };
+                if transfer.request_id != transfer_request_id
+                    || transfer.expires_at <= now
+                    || transfer.fence.call_id != frame.call_id
+                    || transfer.fence.call_epoch != remote.call_epoch
+                    || transfer.fence.owner_epoch != remote.owner_epoch
+                    || transfer.fence.switchboard_revision != radio.switchboard_revision()
+                    || transfer.fence.remote_revision != remote.remote_revision
+                    || transfer
+                        .accepted_by
+                        .as_deref()
+                        .is_some_and(|accepted| accepted != device_id)
+                {
+                    return self.relay_recorded_rejection(
+                        &replay_key,
+                        &fingerprint,
+                        &device_id,
+                        &request_id,
+                        "transfer_unavailable",
+                        "that transfer request changed or another owner endpoint accepted it",
+                    );
+                }
+                Some(transfer)
+            } else {
+                None
+            };
         let phase = if matches!(frame.mode, LeaseMode::Monitor) {
             LeasePhase::Active
         } else {
@@ -9747,6 +11023,7 @@ impl GatewaySession {
             request_id: Some(request_id.clone()),
             lease_token: token.clone(),
             lease: lease.clone(),
+            accepted_transfer_request_id: frame.accepted_transfer_request_id.clone(),
         };
         let status = if matches!(phase, LeasePhase::Active) {
             PluginLeaseStatus::Granted
@@ -9765,6 +11042,7 @@ impl GatewaySession {
                 "the lease status could not be encoded safely",
             );
         };
+        let _ = accepted_transfer;
         self.relay_leases.insert(
             lease.lease_id.clone(),
             RelayLease {
@@ -9786,6 +11064,8 @@ impl GatewaySession {
                 lease_id: lease.lease_id.clone(),
             },
         );
+        self.relay_redeeming_transfer_offers
+            .remove(&spent_offer.claims.offer_id);
         if matches!(phase, LeasePhase::Active) {
             // Even monitor authority is committed only after delivery. A
             // dropped status must not leave a hidden lease blocking a retry.
@@ -9810,7 +11090,6 @@ impl GatewaySession {
                 lease_id: lease.lease_id.clone(),
                 device_id: device_id.clone(),
                 request_id: request_id.clone(),
-                offer_id: frame.accepted_offer_id.clone(),
                 offer: spent_offer,
                 replay_key,
             });
@@ -10321,6 +11600,7 @@ impl GatewaySession {
             request_id: Some(request_id.clone()),
             lease_token: token.clone(),
             lease: renewed.clone(),
+            accepted_transfer_request_id: None,
         };
         let frames = self.relay_lease_status(
             PluginLeaseStatus::Renewed,
@@ -10423,12 +11703,933 @@ impl GatewaySession {
         Vec::new()
     }
 
+    /// Apply one exact active-lease microphone authority change. The payload
+    /// carries no deviceId, so relay-authenticated subject metadata supplies
+    /// identity; every call/media/switchboard fence is then rechecked against
+    /// local truth while the Desktop PCM gate is changed.
+    fn relay_microphone_mute(
+        &mut self,
+        encoded: &str,
+        from_party: Option<&str>,
+        authenticated_subject: Option<&str>,
+        authenticated_grants: &HashSet<Grant>,
+        media: &RemoteMediaHandle,
+        radio: &RadioHandle,
+    ) -> Vec<String> {
+        let Ok(frame) = serde_json::from_str::<MobileMicrophoneMuteFrame>(encoded) else {
+            return Vec::new();
+        };
+        if frame.validate().is_err() || frame.app_id != self.app_id {
+            return Vec::new();
+        }
+        let Some(device_id) = authenticated_subject.map(str::to_owned) else {
+            return Vec::new();
+        };
+        if !self.relay_sender_owns_device(from_party, authenticated_subject, &device_id) {
+            return Vec::new();
+        }
+        let Some(relay) = self
+            .relay_leases
+            .values()
+            .find(|lease| {
+                lease.device_id == device_id
+                    && lease.phase == LeasePhase::Active
+                    && lease.status == PluginLeaseStatus::Active
+                    && tokens_match(&lease.token, &frame.lease_token)
+            })
+            .cloned()
+        else {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "lease_unknown",
+                "that active media lease is no longer current",
+            );
+        };
+        let required = match relay.mode {
+            LeaseMode::Takeover => vec![Grant::StateRead, Grant::RtcSignal, Grant::Takeover],
+            LeaseMode::Consult => vec![Grant::StateRead, Grant::RtcSignal, Grant::Consult],
+            LeaseMode::Monitor => {
+                return self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "mute_not_available",
+                    "listen-only monitor authority has no microphone route",
+                )
+            }
+        };
+        self.relay_reconcile_frame_grants(&device_id, authenticated_grants, media);
+        if !self.relay_has_exact_grants(&device_id, authenticated_grants, &required) {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "grant_required",
+                "the authenticated admission no longer grants this microphone route",
+            );
+        }
+        let replay_key = format!(
+            "microphone_mute\u{1f}{device_id}\u{1f}{}",
+            frame.idempotency_key
+        );
+        let Ok(fingerprint) = serde_json::to_string(&frame) else {
+            return Vec::new();
+        };
+        if let Some(replay) = self.relay_replay(&replay_key) {
+            if replay.fingerprint != fingerprint {
+                return self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "duplicate_request",
+                    "that idempotency key was already used with different content",
+                );
+            }
+            return match replay.result {
+                RelayReplayResult::DirectResponse {
+                    encoded,
+                    required_grants,
+                } if self.relay_has_exact_grants(
+                    &device_id,
+                    authenticated_grants,
+                    &required_grants,
+                ) =>
+                {
+                    vec![encoded]
+                }
+                RelayReplayResult::DirectResponse { .. } => self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "grant_required",
+                    "the authenticated admission no longer grants this microphone route",
+                ),
+                _ => self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "duplicate_request",
+                    "that idempotency key belongs to another operation",
+                ),
+            };
+        }
+        if self.relay_over_budget(&device_id) || !self.relay_replay_has_room(&replay_key) {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "rate_limited",
+                "the microphone-control operation budget is full",
+            );
+        }
+        let Ok(now) = unix_now() else {
+            return Vec::new();
+        };
+        let Some(claims) = self.leases.get(&relay.current_jti).cloned() else {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "lease_unknown",
+                "that active media lease is no longer live",
+            );
+        };
+        let remote = media.snapshot();
+        let service_matches = matches!(
+            (claims.mode, remote.service_mode),
+            (LeaseMode::Takeover, LocalServiceMode::HumanActive)
+                | (LeaseMode::Consult, LocalServiceMode::ConsultActive)
+        );
+        if claims.expires_at <= now
+            || claims.jti != relay.current_jti
+            || claims.lease_id != relay.lease_id
+            || claims.device_id != device_id
+            || claims.mode != relay.mode
+            || claims.phase != LeasePhase::Active
+            || claims.rtc_session_id != frame.rtc_session_id
+            || claims.call_id != frame.call_id
+            || claims.call_epoch != frame.call_epoch
+            || claims.owner_epoch != frame.owner_epoch
+            || claims.fence != frame.fence
+            || radio.current_call_id().as_deref() != Some(frame.call_id.as_str())
+            || !radio.is_call_active()
+            || radio.switch_in_flight()
+            || radio.switchboard_revision() != frame.switchboard_revision
+            || remote.call_id.as_deref() != Some(frame.call_id.as_str())
+            || remote.call_epoch != frame.call_epoch
+            || remote.owner_epoch != frame.owner_epoch
+            || remote.remote_revision != frame.remote_revision
+            || remote.talk_device_id.as_deref() != Some(device_id.as_str())
+            || remote.talk_lease_id.as_deref() != Some(claims.lease_id.as_str())
+            || remote.talk_fence != frame.fence
+            || !service_matches
+        {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "stale_state",
+                "the microphone request crossed its active call or switchboard fence",
+            );
+        }
+        let binding = binding_for_claims(&claims);
+        let Ok(remote_revision) =
+            media.set_microphone_muted(&binding, frame.remote_revision, frame.muted)
+        else {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "stale_state",
+                "the active microphone route changed before the request was applied",
+            );
+        };
+        let response = PluginMicrophoneMuteStatusFrame {
+            kind: "microphone_mute_status".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: self.app_id.clone(),
+            device_id: device_id.clone(),
+            request_id: frame.request_id.clone(),
+            lease_id: claims.lease_id,
+            lease_jti: claims.jti,
+            rtc_session_id: claims.rtc_session_id,
+            call_id: claims.call_id,
+            call_epoch: claims.call_epoch,
+            owner_epoch: claims.owner_epoch,
+            switchboard_revision: radio.switchboard_revision(),
+            remote_revision,
+            fence: claims.fence,
+            muted: frame.muted,
+        };
+        if response.validate().is_err() {
+            return Vec::new();
+        }
+        let Ok(response) = serde_json::to_string(&response) else {
+            return Vec::new();
+        };
+        self.relay_record_replay(
+            replay_key,
+            fingerprint,
+            device_id,
+            RelayReplayResult::DirectResponse {
+                encoded: response.clone(),
+                required_grants: required,
+            },
+        );
+        self.last_snapshot_fingerprint = None;
+        self.last_snapshot_sent = None;
+        self.next_snapshot_poll = Instant::now();
+        vec![response]
+    }
+
+    /// Translate one mobile-dialect assistance answer on the dumb relay.
+    /// Identity comes from authenticated relay metadata, never from the
+    /// payload (the mobile frame deliberately carries no deviceId).
+    fn relay_assistance_answer(
+        &mut self,
+        encoded: &str,
+        from_party: Option<&str>,
+        authenticated_subject: Option<&str>,
+        authenticated_grants: &HashSet<Grant>,
+        media: &RemoteMediaHandle,
+        radio: &RadioHandle,
+    ) -> Vec<String> {
+        let Ok(frame) = serde_json::from_str::<MobileAssistanceAnswerFrame>(encoded) else {
+            return Vec::new();
+        };
+        if frame.validate().is_err() || frame.app_id != self.app_id {
+            return Vec::new();
+        }
+        let Some(device_id) = authenticated_subject.map(str::to_owned) else {
+            return Vec::new();
+        };
+        if !self.relay_sender_owns_device(from_party, authenticated_subject, &device_id) {
+            return Vec::new();
+        }
+        self.relay_reconcile_frame_grants(&device_id, authenticated_grants, media);
+        let required = [Grant::StateRead, Grant::AssistanceRespond];
+        if !self.relay_has_exact_grants(&device_id, authenticated_grants, &required) {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "grant_required",
+                "the authenticated admission cannot answer assistance requests",
+            );
+        }
+        let replay_key = format!("assistance\u{1f}{device_id}\u{1f}{}", frame.idempotency_key);
+        let Ok(fingerprint) = serde_json::to_string(&frame) else {
+            return Vec::new();
+        };
+        if let Some(replay) = self.relay_replay(&replay_key) {
+            if replay.fingerprint != fingerprint {
+                return self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "duplicate_request",
+                    "that idempotency key was already used with different content",
+                );
+            }
+            return match replay.result {
+                RelayReplayResult::DirectResponse {
+                    encoded,
+                    required_grants,
+                } if self.relay_has_exact_grants(
+                    &device_id,
+                    authenticated_grants,
+                    &required_grants,
+                ) =>
+                {
+                    vec![encoded]
+                }
+                RelayReplayResult::DirectResponse { .. } => self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "grant_required",
+                    "the authenticated admission no longer permits this assistance answer",
+                ),
+                _ => self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "duplicate_request",
+                    "that idempotency key belongs to another operation",
+                ),
+            };
+        }
+        if self.relay_over_budget(&device_id) || !self.relay_replay_has_room(&replay_key) {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "rate_limited",
+                "the assistance operation budget is full",
+            );
+        }
+        let Some(request) = self.assistance.pending_frame(&self.app_id) else {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "stale_assistance",
+                "the assistance request is no longer pending",
+            );
+        };
+        let remote = media.snapshot();
+        if request.request_id != frame.request_id
+            || request.call_id != frame.call_id
+            || request.call_epoch != frame.call_epoch
+            || request.owner_epoch != frame.owner_epoch
+            || request.switchboard_revision != frame.switchboard_revision
+            || request.remote_revision != frame.remote_revision
+            || remote.call_id.as_deref() != Some(frame.call_id.as_str())
+            || remote.call_epoch != frame.call_epoch
+            || remote.owner_epoch != frame.owner_epoch
+            || remote.remote_revision != frame.remote_revision
+            || radio.switchboard_revision() != frame.switchboard_revision
+            || !remote.consent.enabled
+            || !remote.consent.acknowledged
+            || !remote.consent.assistance_enabled
+        {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "stale_state",
+                "the assistance answer does not match current call authority",
+            );
+        }
+        let routed = PluginAssistanceAnswerFrame {
+            kind: "assistance_answer".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: self.app_id.clone(),
+            device_id: device_id.clone(),
+            request_id: frame.request_id.clone(),
+            answer_id: frame.answer_id.clone(),
+            call_id: frame.call_id,
+            call_epoch: frame.call_epoch,
+            owner_epoch: frame.owner_epoch,
+            switchboard_revision: frame.switchboard_revision,
+            remote_revision: frame.remote_revision,
+            response_action: frame.response_action,
+            answer: frame.answer,
+        };
+        if routed.validate().is_err() || self.assistance.accept(routed).is_err() {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "already_answered",
+                "the assistance request already consumed its one answer",
+            );
+        }
+        let response = RelayAssistanceAnswerAcceptedFrame {
+            kind: "assistance_answer_accepted",
+            schema_version: SCHEMA_VERSION,
+            app_id: self.app_id.clone(),
+            request_id: frame.request_id.clone(),
+            answer_id: frame.answer_id,
+            accepted: true,
+        };
+        let Ok(response) = serde_json::to_string(&response) else {
+            return Vec::new();
+        };
+        self.relay_record_replay(
+            replay_key,
+            fingerprint,
+            device_id,
+            RelayReplayResult::DirectResponse {
+                encoded: response.clone(),
+                required_grants: required.to_vec(),
+            },
+        );
+        vec![response]
+    }
+
+    fn relay_end_caller_challenge_request(
+        &mut self,
+        encoded: &str,
+        from_party: Option<&str>,
+        authenticated_subject: Option<&str>,
+        authenticated_grants: &HashSet<Grant>,
+        media: &RemoteMediaHandle,
+        radio: &RadioHandle,
+    ) -> Vec<String> {
+        let Ok(frame) = serde_json::from_str::<MobileEndCallerChallengeRequestFrame>(encoded)
+        else {
+            return Vec::new();
+        };
+        if frame.validate().is_err() || frame.app_id != self.app_id {
+            return Vec::new();
+        }
+        let Some(device_id) = authenticated_subject.map(str::to_owned) else {
+            return Vec::new();
+        };
+        if !self.relay_sender_owns_device(from_party, authenticated_subject, &device_id) {
+            return Vec::new();
+        }
+        self.relay_reconcile_frame_grants(&device_id, authenticated_grants, media);
+        let required = [Grant::StateRead, Grant::Takeover, Grant::EndCaller];
+        if !self.relay_has_exact_grants(&device_id, authenticated_grants, &required) {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "end_caller_denied",
+                "the authenticated admission cannot end the caller call",
+            );
+        }
+        let replay_key = format!(
+            "end_challenge\u{1f}{device_id}\u{1f}{}",
+            frame.idempotency_key
+        );
+        let Ok(fingerprint) = serde_json::to_string(&frame) else {
+            return Vec::new();
+        };
+        if let Some(replay) = self.relay_replay(&replay_key) {
+            if replay.fingerprint != fingerprint {
+                return self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "duplicate_request",
+                    "that idempotency key was already used with different content",
+                );
+            }
+            return match replay.result {
+                RelayReplayResult::DirectResponse {
+                    encoded,
+                    required_grants,
+                } if self.relay_has_exact_grants(
+                    &device_id,
+                    authenticated_grants,
+                    &required_grants,
+                ) =>
+                {
+                    vec![encoded]
+                }
+                RelayReplayResult::DirectResponse { .. } => self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "end_caller_denied",
+                    "the authenticated admission no longer permits caller ending",
+                ),
+                _ => self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "duplicate_request",
+                    "that idempotency key belongs to another operation",
+                ),
+            };
+        }
+        if self.relay_over_budget(&device_id) || !self.relay_replay_has_room(&replay_key) {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "rate_limited",
+                "the caller-ending operation budget is full",
+            );
+        }
+        let Ok(now) = unix_now() else {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "stale_lease",
+                "the local clock is unavailable",
+            );
+        };
+        let Some(claims) = self.relay_validate_active_talk_owner(
+            &device_id,
+            &frame.lease_token,
+            &frame.call_id,
+            frame.call_epoch,
+            frame.owner_epoch,
+            frame.switchboard_revision,
+            frame.remote_revision,
+            frame.fence,
+            now,
+            media,
+            radio,
+        ) else {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "not_active_takeover_owner",
+                "only the exact active takeover owner may end the caller call",
+            );
+        };
+        if !self.pending_end_caller.is_empty() {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "end_caller_pending",
+                "another caller-ending operation is already pending",
+            );
+        }
+        self.prune_relay_end_caller_challenges(now);
+        if self.relay_end_caller_challenges.len() >= MAX_RELAY_END_CALLER_CHALLENGES {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "rate_limited",
+                "the caller-ending challenge ledger is full",
+            );
+        }
+        self.relay_end_caller_challenges
+            .retain(|_, challenge| challenge.frame.device_id != device_id);
+        let confirmation_id = format!("end_confirm_{}", uuid::Uuid::new_v4().simple());
+        let challenge = EndCallerChallengeFrame {
+            kind: "end_caller_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: self.app_id.clone(),
+            request_id: frame.request_id.clone(),
+            confirmation_id: confirmation_id.clone(),
+            nonce: format!("nonce_{}", uuid::Uuid::new_v4().simple()),
+            device_id: device_id.clone(),
+            call_id: claims.call_id.clone(),
+            call_epoch: claims.call_epoch,
+            owner_epoch: claims.owner_epoch,
+            switchboard_revision: frame.switchboard_revision,
+            remote_revision: frame.remote_revision,
+            lease_id: claims.lease_id.clone(),
+            fence: claims.fence,
+            expires_at: now.saturating_add(RELAY_END_CALLER_CONFIRM_TTL),
+        };
+        if challenge.validate(now).is_err() {
+            return Vec::new();
+        }
+        let Ok(response) = serde_json::to_string(&challenge) else {
+            return Vec::new();
+        };
+        self.relay_end_caller_challenges.insert(
+            confirmation_id,
+            RelayEndCallerChallenge {
+                frame: challenge,
+                lease_jti: claims.jti,
+            },
+        );
+        self.relay_record_replay(
+            replay_key,
+            fingerprint,
+            device_id,
+            RelayReplayResult::DirectResponse {
+                encoded: response.clone(),
+                required_grants: required.to_vec(),
+            },
+        );
+        vec![response]
+    }
+
+    fn relay_end_caller_confirm(
+        &mut self,
+        encoded: &str,
+        from_party: Option<&str>,
+        authenticated_subject: Option<&str>,
+        authenticated_grants: &HashSet<Grant>,
+        media: &RemoteMediaHandle,
+        radio: &RadioHandle,
+    ) -> Vec<String> {
+        let Ok(frame) = serde_json::from_str::<MobileEndCallerConfirmFrame>(encoded) else {
+            return Vec::new();
+        };
+        if frame.validate().is_err() || frame.app_id != self.app_id {
+            return Vec::new();
+        }
+        let Some(device_id) = authenticated_subject.map(str::to_owned) else {
+            return Vec::new();
+        };
+        if !self.relay_sender_owns_device(from_party, authenticated_subject, &device_id) {
+            return Vec::new();
+        }
+        self.relay_reconcile_frame_grants(&device_id, authenticated_grants, media);
+        let required = [Grant::StateRead, Grant::Takeover, Grant::EndCaller];
+        if !self.relay_has_exact_grants(&device_id, authenticated_grants, &required) {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "end_caller_denied",
+                "the authenticated admission cannot end the caller call",
+            );
+        }
+        let replay_key = format!(
+            "end_confirm\u{1f}{device_id}\u{1f}{}",
+            frame.idempotency_key
+        );
+        let Ok(fingerprint) = serde_json::to_string(&frame) else {
+            return Vec::new();
+        };
+        if let Some(replay) = self.relay_replay(&replay_key) {
+            if replay.fingerprint != fingerprint {
+                return self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "duplicate_request",
+                    "that idempotency key was already used with different content",
+                );
+            }
+            return match replay.result {
+                RelayReplayResult::DirectResponse {
+                    encoded,
+                    required_grants,
+                } if self.relay_has_exact_grants(
+                    &device_id,
+                    authenticated_grants,
+                    &required_grants,
+                ) =>
+                {
+                    vec![encoded]
+                }
+                RelayReplayResult::DirectResponse { .. } => self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "end_caller_denied",
+                    "the authenticated admission no longer permits caller ending",
+                ),
+                _ => self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "duplicate_request",
+                    "that idempotency key belongs to another operation",
+                ),
+            };
+        }
+        if self.relay_over_budget(&device_id) || !self.relay_replay_has_room(&replay_key) {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "rate_limited",
+                "the caller-ending operation budget is full",
+            );
+        }
+        let Ok(now) = unix_now() else {
+            return Vec::new();
+        };
+        self.prune_relay_end_caller_challenges(now);
+        if self
+            .used_relay_end_caller_confirmations
+            .contains(&frame.confirmation_id)
+        {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "confirmation_used",
+                "that caller-ending confirmation was already consumed",
+            );
+        }
+        let Some(challenge) = self
+            .relay_end_caller_challenges
+            .get(&frame.confirmation_id)
+            .cloned()
+        else {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "confirmation_stale",
+                "that caller-ending confirmation is no longer current",
+            );
+        };
+        let exact = challenge.frame.nonce == frame.nonce
+            && challenge.frame.device_id == device_id
+            && challenge.frame.call_id == frame.call_id
+            && challenge.frame.call_epoch == frame.call_epoch
+            && challenge.frame.owner_epoch == frame.owner_epoch
+            && challenge.frame.switchboard_revision == frame.switchboard_revision
+            && challenge.frame.remote_revision == frame.remote_revision
+            && challenge.frame.fence == frame.fence;
+        if !exact {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "confirmation_denied",
+                "the confirmation nonce or exact caller fence does not match",
+            );
+        }
+        let Some(claims) = self.relay_validate_active_talk_owner(
+            &device_id,
+            &frame.lease_token,
+            &frame.call_id,
+            frame.call_epoch,
+            frame.owner_epoch,
+            frame.switchboard_revision,
+            frame.remote_revision,
+            frame.fence,
+            now,
+            media,
+            radio,
+        ) else {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "not_active_takeover_owner",
+                "the exact takeover lease changed before confirmation",
+            );
+        };
+        if claims.jti != challenge.lease_jti || claims.lease_id != challenge.frame.lease_id {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "stale_lease",
+                "the exact takeover lease changed before confirmation",
+            );
+        }
+        if !self.pending_end_caller.is_empty() {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "end_caller_pending",
+                "another caller-ending operation is already pending",
+            );
+        }
+        let execute = PluginEndCallerExecuteFrame {
+            kind: "end_caller_execute".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: self.app_id.clone(),
+            operation_id: format!("end_op_{}", uuid::Uuid::new_v4().simple()),
+            confirmation_id: frame.confirmation_id.clone(),
+            device_id: device_id.clone(),
+            call_id: frame.call_id,
+            call_epoch: frame.call_epoch,
+            owner_epoch: frame.owner_epoch,
+            switchboard_revision: frame.switchboard_revision,
+            remote_revision: frame.remote_revision,
+            lease_id: claims.lease_id,
+            lease_jti: claims.jti,
+            fence: frame.fence,
+        };
+        if execute.validate().is_err() {
+            return Vec::new();
+        }
+        self.relay_end_caller_challenges
+            .remove(&frame.confirmation_id);
+        self.remember_used_relay_end_caller_confirmation(frame.confirmation_id.clone());
+        match self.handle_end_caller_execute(execute.clone(), radio) {
+            Ok(frames) if frames.is_empty() => {}
+            Ok(_) | Err(_) => {
+                return self.relay_reject(
+                    &device_id,
+                    &frame.request_id,
+                    "radio_unavailable",
+                    "the physical caller-ending command could not be queued",
+                );
+            }
+        }
+        let response = RelayEndCallerSubmittedFrame {
+            kind: "end_caller_submitted",
+            schema_version: SCHEMA_VERSION,
+            app_id: self.app_id.clone(),
+            request_id: frame.request_id.clone(),
+            operation_id: execute.operation_id,
+            confirmation_id: execute.confirmation_id,
+            accepted: true,
+        };
+        let Ok(response) = serde_json::to_string(&response) else {
+            return Vec::new();
+        };
+        self.relay_record_replay(
+            replay_key,
+            fingerprint,
+            device_id,
+            RelayReplayResult::DirectResponse {
+                encoded: response.clone(),
+                required_grants: required.to_vec(),
+            },
+        );
+        vec![response]
+    }
+
+    fn relay_has_exact_grants(
+        &self,
+        device_id: &str,
+        authenticated_grants: &HashSet<Grant>,
+        required: &[Grant],
+    ) -> bool {
+        self.relay_peers.get(device_id).is_some_and(|peer| {
+            required
+                .iter()
+                .all(|grant| peer.grants.contains(grant) && authenticated_grants.contains(grant))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn relay_validate_active_talk_owner(
+        &self,
+        device_id: &str,
+        lease_token: &str,
+        call_id: &str,
+        call_epoch: u64,
+        owner_epoch: u64,
+        switchboard_revision: u64,
+        remote_revision: u64,
+        fence: u64,
+        now: u64,
+        media: &RemoteMediaHandle,
+        radio: &RadioHandle,
+    ) -> Option<LeaseClaims> {
+        let relay = self.relay_leases.values().find(|lease| {
+            lease.device_id == device_id
+                && lease.mode == LeaseMode::Takeover
+                && lease.phase == LeasePhase::Active
+                && lease.status == PluginLeaseStatus::Active
+                && tokens_match(&lease.token, lease_token)
+        })?;
+        let claims = self.leases.get(&relay.current_jti)?.clone();
+        if claims.expires_at <= now
+            || claims.jti != relay.current_jti
+            || claims.lease_id != relay.lease_id
+            || claims.device_id != device_id
+            || claims.mode != LeaseMode::Takeover
+            || claims.phase != LeasePhase::Active
+            || claims.call_id != call_id
+            || claims.call_epoch != call_epoch
+            || claims.owner_epoch != owner_epoch
+            || claims.fence != fence
+            || radio.current_call_id().as_deref() != Some(call_id)
+            || !radio.is_call_active()
+            || radio.switchboard_revision() != switchboard_revision
+            || radio.switch_in_flight()
+        {
+            return None;
+        }
+        let remote = media.snapshot();
+        (remote.call_id.as_deref() == Some(call_id)
+            && remote.call_epoch == call_epoch
+            && remote.owner_epoch == owner_epoch
+            && remote.remote_revision == remote_revision
+            && remote.service_mode == LocalServiceMode::HumanActive
+            && remote.talk_device_id.as_deref() == Some(device_id)
+            && remote.talk_lease_id.as_deref() == Some(claims.lease_id.as_str())
+            && remote.talk_fence == fence
+            && remote.radio_reserved
+            && remote.consent.is_current()
+            && remote.consent.takeover_enabled)
+            .then_some(claims)
+    }
+
+    fn prune_relay_end_caller_challenges(&mut self, now: u64) {
+        self.relay_end_caller_challenges
+            .retain(|_, challenge| challenge.frame.expires_at > now);
+    }
+
+    fn remember_used_relay_end_caller_confirmation(&mut self, confirmation_id: String) {
+        if self
+            .used_relay_end_caller_confirmations
+            .insert(confirmation_id.clone())
+        {
+            self.used_relay_end_caller_order.push_back(confirmation_id);
+        }
+        while self.used_relay_end_caller_order.len() > MAX_USED_RELAY_END_CALLER_CONFIRMATIONS {
+            if let Some(oldest) = self.used_relay_end_caller_order.pop_front() {
+                self.used_relay_end_caller_confirmations.remove(&oldest);
+            }
+        }
+    }
+
     /// The lease this token belongs to, compared in constant time.
     fn relay_lease_id_for_token(&self, presented: &str) -> Option<String> {
         self.relay_leases
             .values()
             .find(|lease| tokens_match(&lease.token, presented))
             .map(|lease| lease.lease_id.clone())
+    }
+
+    /// Retire one offer whose acceptance transaction could not be delivered or
+    /// installed. The identity stays tombstoned through its rewritten replay;
+    /// the next snapshot may only publish a newly signed offer id/JTI.
+    fn retire_failed_relay_offer(&mut self, offer: MintedOffer) {
+        let offer_id = offer.claims.offer_id.clone();
+        let opportunity_id = offer.claims.opportunity_id.clone();
+        let device_id = offer.claims.target_device_id.clone();
+        self.relay_offers.remove(&offer_id);
+        self.relay_redeeming_transfer_offers.remove(&offer_id);
+        if self
+            .relay_offer_winners
+            .get(&opportunity_id)
+            .is_some_and(|winner| winner == &offer_id)
+        {
+            self.relay_offer_winners.remove(&opportunity_id);
+        }
+        if let Some(request_id) = offer.claims.accepted_transfer_request_id.as_deref() {
+            let fence = crate::assistance::AssistanceCallFence {
+                call_id: offer.claims.call_id.clone(),
+                call_epoch: offer.claims.call_epoch,
+                owner_epoch: offer.claims.owner_epoch,
+                switchboard_revision: offer.claims.switchboard_revision,
+                remote_revision: offer.claims.remote_revision,
+            };
+            let _ = self
+                .assistance
+                .release_transfer_acceptance(request_id, &fence, &device_id);
+        }
+
+        // A mobile keeps the exact encoded answer for at-least-once replay.
+        // Replaying that answer after rollback must never return the old
+        // accepted ACK and advance it toward a spent lease transaction.
+        let replay_keys = self
+            .relay_replays
+            .iter()
+            .filter_map(|(key, replay)| match &replay.result {
+                RelayReplayResult::OfferAccepted {
+                    offer_id: accepted_offer_id,
+                    ..
+                } if accepted_offer_id == &offer_id => Some(key.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for key in replay_keys {
+            let Some((request_id, replay_device)) =
+                self.relay_replays.get(&key).and_then(|replay| {
+                    serde_json::from_str::<MobileOfferAnswerFrame>(&replay.fingerprint)
+                        .ok()
+                        .map(|frame| (frame.request_id, replay.device_id.clone()))
+                })
+            else {
+                self.relay_replays.remove(&key);
+                continue;
+            };
+            let Some(encoded) = self
+                .relay_reject(
+                    &replay_device,
+                    &request_id,
+                    "offer_retired",
+                    "that offer transaction was retired before media authority was delivered",
+                )
+                .into_iter()
+                .next()
+            else {
+                self.relay_replays.remove(&key);
+                continue;
+            };
+            if let Some(replay) = self.relay_replays.get_mut(&key) {
+                replay.result = RelayReplayResult::Rejected { encoded };
+            }
+        }
+        self.last_snapshot_fingerprint = None;
+        self.last_snapshot_sent = None;
+        self.next_snapshot_poll = Instant::now();
     }
 
     /// Reconcile a verified re-hello with authority issued to its prior
@@ -10441,11 +12642,27 @@ impl GatewaySession {
         session_changed: bool,
         media: &RemoteMediaHandle,
     ) {
-        self.relay_offers.retain(|_, offer| {
-            offer.claims.target_device_id != device_id
-                || (!session_changed
-                    && relay_grants_allow_mode(authenticated_grants, offer.claims.offered_mode))
-        });
+        let retired_offers = self
+            .relay_offers
+            .values()
+            .filter(|offer| {
+                offer.claims.target_device_id == device_id
+                    && (session_changed
+                        || !relay_grants_allow_mode(
+                            authenticated_grants,
+                            offer.claims.offered_mode,
+                        )
+                        || !offer
+                            .claims
+                            .required_grants
+                            .iter()
+                            .all(|grant| authenticated_grants.contains(grant)))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for offer in retired_offers {
+            self.retire_failed_relay_offer(offer);
+        }
         let retiring = self
             .relay_leases
             .values()
@@ -10663,6 +12880,190 @@ impl GatewaySession {
         stale.len()
     }
 
+    /// Converge the assistance mailbox with authoritative media truth for
+    /// every transfer that won its one owner opportunity.
+    ///
+    /// This is snapshot-driven rather than event-only: the native event queue
+    /// is bounded and may drop a terminal marker behind ICE. HumanActive is
+    /// committed only while the separate setup deadline is live; every other
+    /// disappearance first revokes/returns media, then records unavailable
+    /// only after the same call is explicitly AokieActive again.
+    fn reconcile_accepted_transfers(
+        &mut self,
+        now: u64,
+        media: &RemoteMediaHandle,
+        radio: &RadioHandle,
+    ) -> usize {
+        let broker = self.assistance.clone();
+        let mut resolved = 0;
+        let accepted = self
+            .accepted_transfers
+            .iter()
+            .map(|(lease_id, transfer)| (lease_id.clone(), transfer.clone()))
+            .collect::<Vec<_>>();
+
+        for (lease_id, transfer) in accepted {
+            let remote = media.snapshot();
+            let same_call = remote.call_id.as_deref()
+                == Some(transfer.offered_fence.call_id.as_str())
+                && remote.call_epoch == transfer.offered_fence.call_epoch;
+            if !same_call {
+                // There is no caller left on the offered epoch to transfer.
+                // Radio call-boundary cleanup owns the mailbox; only discard
+                // this session-local correlation.
+                self.accepted_transfers.remove(&lease_id);
+                resolved += 1;
+                continue;
+            }
+
+            let exact_human_active = remote.service_mode == LocalServiceMode::HumanActive
+                && remote.talk_device_id.as_deref() == Some(transfer.device_id.as_str())
+                && remote.talk_lease_id.as_deref() == Some(lease_id.as_str());
+            if exact_human_active && !transfer.failback_requested && now < transfer.setup_expires_at
+            {
+                if broker
+                    .transfer_taken(
+                        &transfer.request_id,
+                        &transfer.offered_fence,
+                        &transfer.device_id,
+                    )
+                    .is_ok()
+                {
+                    self.accepted_transfers.remove(&lease_id);
+                    resolved += 1;
+                    continue;
+                }
+                // HumanActive without a matching live transfer request is
+                // never allowed to remain an ordinary takeover by accident.
+                if let Some(current) = self.accepted_transfers.get_mut(&lease_id) {
+                    current.failback_requested = true;
+                }
+                self.revoke_relay_lease_by_id(&lease_id, "transfer_activation_not_current", media);
+            }
+
+            let authority_present = self.relay_leases.contains_key(&lease_id)
+                || self
+                    .leases
+                    .values()
+                    .any(|claims| claims.lease_id == lease_id)
+                || self
+                    .peers
+                    .values()
+                    .any(|route| route.binding.lease_id.as_deref() == Some(lease_id.as_str()))
+                || self
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.provisional.lease_id == lease_id);
+            let must_failback = self
+                .accepted_transfers
+                .get(&lease_id)
+                .is_some_and(|current| current.failback_requested)
+                || now >= transfer.setup_expires_at
+                || !authority_present;
+            if must_failback {
+                let already_requested = self
+                    .accepted_transfers
+                    .get(&lease_id)
+                    .is_some_and(|current| current.failback_requested);
+                if let Some(current) = self.accepted_transfers.get_mut(&lease_id) {
+                    current.failback_requested = true;
+                }
+                if !already_requested && authority_present {
+                    self.revoke_relay_lease_by_id(&lease_id, "transfer_setup_failed", media);
+                }
+            }
+
+            let returned = media.snapshot();
+            let exact_aokie_return = returned.service_mode == LocalServiceMode::AokieActive
+                && returned.call_id.as_deref() == Some(transfer.offered_fence.call_id.as_str())
+                && returned.call_epoch == transfer.offered_fence.call_epoch
+                && returned.owner_epoch >= transfer.offered_fence.owner_epoch
+                && returned.remote_revision >= transfer.offered_fence.remote_revision
+                && radio.switchboard_revision() == transfer.offered_fence.switchboard_revision;
+            if must_failback && exact_aokie_return {
+                let current_fence = crate::assistance::AssistanceCallFence {
+                    call_id: transfer.offered_fence.call_id.clone(),
+                    call_epoch: transfer.offered_fence.call_epoch,
+                    owner_epoch: returned.owner_epoch,
+                    switchboard_revision: radio.switchboard_revision(),
+                    remote_revision: returned.remote_revision,
+                };
+                // Caller safety is already proved by AokieActive. If the radio
+                // consumed the mailbox after its bounded grace, this becomes a
+                // harmless bookkeeping miss rather than a reason to retain a
+                // dead session correlation forever.
+                let _ = broker.transfer_unavailable(
+                    &transfer.request_id,
+                    &transfer.offered_fence,
+                    current_fence,
+                    Some(&transfer.device_id),
+                );
+                self.accepted_transfers.remove(&lease_id);
+                resolved += 1;
+            }
+
+            // A later call-waiting/switchboard revision may make the strict
+            // speech fence intentionally unresolvable. Once exact same-call
+            // AokieActive is proved, no media authority remains, and the
+            // broker no longer exposes this accepted request (resolved or its
+            // bounded grace elapsed), drop only the dead session correlation.
+            // This never loosens TransferUnavailable's fence or speaks text.
+            let broker_still_owns_request = broker
+                .accepted_transfer(
+                    &transfer.offered_fence.call_id,
+                    transfer.offered_fence.call_epoch,
+                )
+                .is_some_and(|pending| pending.request_id == transfer.request_id);
+            if self.accepted_transfers.contains_key(&lease_id)
+                && must_failback
+                && returned.service_mode == LocalServiceMode::AokieActive
+                && returned.call_id.as_deref() == Some(transfer.offered_fence.call_id.as_str())
+                && returned.call_epoch == transfer.offered_fence.call_epoch
+                && !authority_present
+                && !broker_still_owns_request
+            {
+                self.accepted_transfers.remove(&lease_id);
+                resolved += 1;
+            }
+        }
+
+        // A transport/session fail-closed can replace GatewaySession after it
+        // has already told native media to return. Recover the one accepted
+        // mailbox from broker state and close it only behind exact AokieActive.
+        let returned = media.snapshot();
+        if returned.service_mode == LocalServiceMode::AokieActive {
+            if let Some(call_id) = returned.call_id.as_deref() {
+                if let Some(orphan) = broker.accepted_transfer(call_id, returned.call_epoch) {
+                    let tracked = self
+                        .accepted_transfers
+                        .values()
+                        .any(|current| current.request_id == orphan.request_id);
+                    if !tracked
+                        && radio.switchboard_revision() == orphan.fence.switchboard_revision
+                        && returned.owner_epoch >= orphan.fence.owner_epoch
+                        && returned.remote_revision >= orphan.fence.remote_revision
+                    {
+                        let current_fence = crate::assistance::AssistanceCallFence {
+                            call_id: orphan.fence.call_id.clone(),
+                            call_epoch: orphan.fence.call_epoch,
+                            owner_epoch: returned.owner_epoch,
+                            switchboard_revision: radio.switchboard_revision(),
+                            remote_revision: returned.remote_revision,
+                        };
+                        let _ = broker.transfer_unavailable(
+                            &orphan.request_id,
+                            &orphan.fence,
+                            current_fence,
+                            orphan.accepted_by.as_deref(),
+                        );
+                        resolved += 1;
+                    }
+                }
+            }
+        }
+        resolved
+    }
+
     /// Forget a plugin-minted lease.
     ///
     /// Called wherever the session purges its own lease book, so the relay
@@ -10685,7 +13086,10 @@ impl GatewaySession {
             .as_ref()
             .is_some_and(|deferred| deferred.lease_id == lease_id)
         {
-            self.deferred_prepare = None;
+            if let Some(deferred) = self.deferred_prepare.take() {
+                self.relay_replays.remove(&deferred.replay_key);
+                self.retire_failed_relay_offer(deferred.offer);
+            }
         }
         if self
             .pending_relay_status
@@ -10973,6 +13377,27 @@ impl GatewaySession {
         media: &RemoteMediaHandle,
         radio: &RadioHandle,
     ) {
+        if self.relay_carrier && delivery == TransportDelivery::Dropped {
+            if let Ok(frame) = serde_json::from_str::<PluginOfferAcceptedFrame>(encoded) {
+                if let Some(offer) = self
+                    .relay_offers
+                    .get(&frame.offer_id)
+                    .filter(|offer| {
+                        offer.accepted
+                            && offer.claims.target_device_id == frame.device_id
+                            && offer.claims.jti == frame.offer_jti
+                    })
+                    .cloned()
+                {
+                    self.retire_failed_relay_offer(offer);
+                    eprintln!(
+                        "[aokie-plugin][takeover] stage=relay_offer_acceptance_not_delivered device={} request={} detail=A fresh offer identity will be published; no transfer reservation remains",
+                        sanitize_gateway_code(&frame.device_id),
+                        sanitize_gateway_code(&frame.request_id)
+                    );
+                }
+            }
+        }
         if self.relay_carrier {
             if let Some(frame) = self.outbound_relay_revocation(encoded) {
                 match delivery {
@@ -11057,7 +13482,7 @@ impl GatewaySession {
             if delivery == TransportDelivery::Dropped {
                 self.relay_leases.remove(&deferred.lease_id);
                 self.relay_replays.remove(&deferred.replay_key);
-                self.relay_offers.insert(deferred.offer_id, deferred.offer);
+                self.retire_failed_relay_offer(deferred.offer);
                 eprintln!(
                     "[aokie-plugin][takeover] stage=relay_prepare_not_delivered device={} request={} detail=The provisional grant was dropped before delivery; the caller stayed with Aokie",
                     sanitize_gateway_code(&deferred.device_id),
@@ -11078,6 +13503,7 @@ impl GatewaySession {
                 self.prepared = None;
                 self.relay_replays.remove(&deferred.replay_key);
                 self.retire_relay_lease(&lease_id);
+                self.retire_failed_relay_offer(deferred.offer);
                 eprintln!(
                     "[aokie-plugin][takeover] stage=relay_prepare_failed device={} request={} detail={}",
                     sanitize_gateway_code(&device_id),
@@ -11289,6 +13715,14 @@ impl GatewaySession {
         code: &str,
         message: &str,
     ) -> Vec<String> {
+        if let Ok(frame) = serde_json::from_str::<LeaseRequestFrame>(fingerprint) {
+            if let Some(offer) = self
+                .relay_redeeming_transfer_offers
+                .remove(&frame.accepted_offer_id)
+            {
+                self.retire_failed_relay_offer(offer);
+            }
+        }
         let frames = self.relay_reject(device_id, request_id, code, message);
         if let Some(encoded) = frames.first() {
             self.relay_record_replay(
@@ -11627,6 +14061,23 @@ impl GatewaySession {
             && relay_grants_allow_mode(authenticated_grants, mode)
     }
 
+    /// Check the complete signed grant vector against both the verified hello
+    /// and the admission metadata on this exact frame. Mode-only checks are
+    /// insufficient for transfer offers, which additionally require the
+    /// AssistanceRespond authority that binds acceptance to Aokie's request.
+    fn relay_required_grants_are_authorized(
+        &self,
+        device_id: &str,
+        authenticated_grants: &HashSet<Grant>,
+        required_grants: &[Grant],
+    ) -> bool {
+        self.relay_peers.get(device_id).is_some_and(|peer| {
+            required_grants
+                .iter()
+                .all(|grant| peer.grants.contains(grant) && authenticated_grants.contains(grant))
+        })
+    }
+
     fn handle_end_caller_execute(
         &mut self,
         frame: PluginEndCallerExecuteFrame,
@@ -11705,10 +14156,7 @@ impl GatewaySession {
                 "the selected Companion is not the physical caller owner",
             )?]);
         }
-        if !remote.consent.enabled
-            || !remote.consent.acknowledged
-            || !remote.consent.takeover_enabled
-        {
+        if !remote.consent.is_current() || !remote.consent.takeover_enabled {
             return Ok(vec![encode_end_caller_failure(
                 &frame,
                 "consent_required",
@@ -11750,7 +14198,10 @@ impl GatewaySession {
         Ok(Vec::new())
     }
 
-    fn drain_end_caller_results(&mut self) -> Result<Vec<String>, WorkerError> {
+    fn drain_end_caller_results(
+        &mut self,
+        media: &RemoteMediaHandle,
+    ) -> Result<Vec<String>, WorkerError> {
         use std::sync::mpsc::TryRecvError;
         let mut finished = Vec::new();
         for (operation_id, pending) in &self.pending_end_caller {
@@ -11772,7 +14223,20 @@ impl GatewaySession {
                 continue;
             };
             let frame = match result {
-                Ok(()) => end_caller_result(&pending.execute, EndCallerOutcome::Completed, None),
+                Ok(()) => {
+                    // The physical caller is gone. Retire the exact talk lease
+                    // immediately so neither a heartbeat nor a stale end-call
+                    // challenge can preserve authority after CHUP succeeded.
+                    self.revoke_relay_lease_by_id(
+                        &pending.execute.lease_id,
+                        "caller_ended_by_owner",
+                        media,
+                    );
+                    self.retire_relay_lease(&pending.execute.lease_id);
+                    self.relay_end_caller_challenges
+                        .retain(|_, challenge| challenge.lease_jti != pending.execute.lease_jti);
+                    end_caller_result(&pending.execute, EndCallerOutcome::Completed, None)
+                }
                 Err(error) => end_caller_result(
                     &pending.execute,
                     EndCallerOutcome::Failed,
@@ -11815,13 +14279,11 @@ impl GatewaySession {
                     .remote_media()
                     .ok_or_else(|| WorkerError::reconnect("Companion media is unavailable"))?
                     .snapshot();
-                let assistance = crate::assistance::global()
-                    .pending_frame(&self.app_id)
-                    .ok_or_else(|| {
-                        WorkerError::reconnect(
-                            "Private consultation requires a current Aokie assistance request",
-                        )
-                    })?;
+                let assistance = self.assistance.pending_frame(&self.app_id).ok_or_else(|| {
+                    WorkerError::reconnect(
+                        "Private consultation requires a current Aokie assistance request",
+                    )
+                })?;
                 if !remote.consent.consult_enabled
                     || assistance.call_id != notice.lease.call_id
                     || assistance.call_epoch != notice.lease.call_epoch
@@ -11845,6 +14307,68 @@ impl GatewaySession {
             return Err(WorkerError::reconnect(
                 "Companion gateway proposed a second consult/takeover claimant",
             ));
+        }
+        if let Some(transfer_request_id) = notice.accepted_transfer_request_id.as_deref() {
+            if notice.lease.mode != LeaseMode::Takeover
+                || notice.lease.phase != LeasePhase::Prepared
+            {
+                return Err(WorkerError::reconnect(
+                    "A request-bound transfer must use a prepared takeover lease",
+                ));
+            }
+            let remote = radio
+                .remote_media()
+                .ok_or_else(|| WorkerError::reconnect("Companion media is unavailable"))?
+                .snapshot();
+            let transfer = self
+                .assistance
+                .pending_transfer(&notice.lease.call_id, notice.lease.call_epoch)
+                .ok_or_else(|| {
+                    WorkerError::reconnect("The accepted transfer request is no longer pending")
+                })?;
+            if transfer.request_id != transfer_request_id
+                || transfer.fence.call_id != notice.lease.call_id
+                || transfer.fence.call_epoch != notice.lease.call_epoch
+                || transfer.fence.owner_epoch != notice.lease.owner_epoch
+                || transfer.fence.switchboard_revision != radio.switchboard_revision()
+                || transfer.fence.remote_revision != remote.remote_revision
+                || transfer
+                    .accepted_by
+                    .as_deref()
+                    .is_some_and(|accepted| accepted != notice.device_id)
+            {
+                return Err(WorkerError::reconnect(
+                    "The accepted transfer crossed its exact assistance fence",
+                ));
+            }
+            self.assistance
+                .accept_transfer(&transfer.request_id, &transfer.fence, &notice.device_id)
+                .map_err(|_| {
+                    WorkerError::reconnect("Another owner endpoint accepted the transfer first")
+                })?;
+            let accepted = self
+                .assistance
+                .pending_transfer(&notice.lease.call_id, notice.lease.call_epoch)
+                .filter(|accepted| {
+                    accepted.request_id == transfer.request_id
+                        && accepted.fence == transfer.fence
+                        && accepted.accepted_by.as_deref() == Some(notice.device_id.as_str())
+                })
+                .ok_or_else(|| {
+                    WorkerError::reconnect(
+                        "The transfer acceptance did not produce a bounded setup window",
+                    )
+                })?;
+            self.accepted_transfers.insert(
+                notice.lease.lease_id.clone(),
+                AcceptedTransferLease {
+                    request_id: transfer.request_id,
+                    offered_fence: transfer.fence,
+                    device_id: notice.device_id.clone(),
+                    setup_expires_at: accepted.expires_at,
+                    failback_requested: false,
+                },
+            );
         }
         self.leases
             .insert(notice.lease.jti.clone(), notice.lease.clone());
@@ -12509,6 +15033,8 @@ impl GatewaySession {
             }
             let _ = media.revoke(&binding, &notice.reason);
         }
+        self.relay_end_caller_challenges
+            .retain(|_, challenge| challenge.lease_jti != notice.lease_jti);
         self.leases.remove(&notice.lease_jti);
         if self
             .prepared
@@ -12721,6 +15247,41 @@ impl GatewaySession {
         let Some((action, binding, ttl)) = action else {
             return Ok(());
         };
+        let accepted_transfer = if action == 3 {
+            binding
+                .lease_id
+                .as_deref()
+                .and_then(|lease_id| self.accepted_transfers.get(lease_id).cloned())
+        } else {
+            None
+        };
+        if let Some(accepted) = accepted_transfer.as_ref() {
+            if let Some(lease_id) = binding.lease_id.as_deref() {
+                let still_current = self
+                    .assistance
+                    .pending_transfer(
+                        &accepted.offered_fence.call_id,
+                        accepted.offered_fence.call_epoch,
+                    )
+                    .is_some_and(|pending| {
+                        pending.request_id == accepted.request_id
+                            && pending.fence == accepted.offered_fence
+                            && pending.accepted_by.as_deref() == Some(accepted.device_id.as_str())
+                            && pending.expires_at > unix_now().unwrap_or(u64::MAX)
+                    });
+                if !still_current {
+                    if let Some(current) = self.accepted_transfers.get_mut(lease_id) {
+                        current.failback_requested = true;
+                    }
+                    self.revoke_relay_lease_by_id(
+                        lease_id,
+                        "transfer_setup_expired_before_activation",
+                        media,
+                    );
+                    return Ok(());
+                }
+            }
+        }
         let action_name = match action {
             0 => "prepare_consult",
             1 => "prepare_takeover",
@@ -12739,7 +15300,17 @@ impl GatewaySession {
             0 => media.request_consult_hold(binding, ttl),
             1 => media.request_soft_hold(binding, ttl),
             2 => media.request_consult(binding, ttl),
-            _ => media.request_takeover(binding, ttl),
+            _ => match accepted_transfer {
+                Some(accepted) => media.request_transfer_takeover(
+                    binding,
+                    ttl,
+                    accepted.request_id,
+                    accepted.offered_fence,
+                    accepted.device_id,
+                    accepted.setup_expires_at,
+                ),
+                None => media.request_takeover(binding, ttl),
+            },
         };
         result.map_err(|_| {
             WorkerError::reconnect(match action {

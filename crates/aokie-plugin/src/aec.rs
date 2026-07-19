@@ -135,8 +135,7 @@ mod tests {
             .map(|i| {
                 let t = i as f32 / 16_000.0;
                 ((t * 700.0 * std::f32::consts::TAU).sin() * 24_000.0
-                    + (t * 2_900.0 * std::f32::consts::TAU).sin() * 9_000.0)
-                    as i16
+                    + (t * 2_900.0 * std::f32::consts::TAU).sin() * 9_000.0) as i16
             })
             .collect();
         // Interleave feed/process the way the paced loop does (20 ms chunks).

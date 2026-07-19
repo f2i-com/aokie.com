@@ -17,13 +17,16 @@ import {
   v2AssistanceGrantAccess,
   v2LeaseExitLabel,
   v2LeaseRevokeAllowed,
+  v2ParticipantAccess,
   v2RecoveryProgressStages,
   v2RemoteAudioProofLabel,
+  v2RemoteConsentCurrent,
   v2RouteProgressStages,
   v2RuntimeFailureReducer,
   v2SnapshotAuthorizesConfirmedTakeoverArm,
   v2SnapshotMaintainsConfirmedTakeoverAuthority,
   v2TakeoverAttemptReducer,
+  v2TransferTranscript,
   type ConfirmedTakeoverTarget,
 } from "./App";
 import type { NativeMediaSession, NativeMediaStateEvent, V2AssistanceRequestEvent, V2CallSnapshotEvent, V2LeaseEvent } from "./bridge";
@@ -119,6 +122,7 @@ function takeoverSnapshot(offerOverrides: Partial<OfferClaims> = {}): V2CallSnap
         takeoverEnabled: true,
       },
       participants: [],
+      companionMicrophoneMuted: false,
       pendingMobileOffers: [{ offer, offerToken: "signed.offer.token" }],
       occurredAt: "2027-01-15T08:00:00Z",
     },
@@ -242,6 +246,118 @@ describe("currentV2InAppOffer", () => {
     duplicate.offer.jti = "offer_jti_takeover_b";
     snapshot.snapshot.pendingMobileOffers.push(duplicate);
     expect(currentV2InAppOffer(snapshot, "device_a", "takeover", OFFER_NOW)).toBeNull();
+  });
+
+  it("keeps a transfer offer out of generic takeover and selects only its exact request", () => {
+    const snapshot = takeoverSnapshot({
+      acceptedTransferRequestId: "assistance_transfer_a",
+      requiredGrants: ["state_read", "rtc_signal", "takeover", "assistance_respond"],
+    });
+    snapshot.grants.push("assistance_respond");
+    expect(currentV2InAppOffer(snapshot, "device_a", "takeover", OFFER_NOW)).toBeNull();
+    expect(currentV2InAppOffer(
+      snapshot,
+      "device_a",
+      "takeover",
+      OFFER_NOW,
+      "assistance_transfer_a",
+    )?.offer.offerId).toBe("offer_takeover_a");
+    expect(currentV2InAppOffer(
+      snapshot,
+      "device_a",
+      "takeover",
+      OFFER_NOW,
+      "assistance_transfer_b",
+    )).toBeNull();
+  });
+});
+
+describe("v2ParticipantAccess", () => {
+  it("fails roster, identity, and levels closed to consent and their own grants", () => {
+    expect(v2ParticipantAccess([], true)).toEqual({ roster: false, identity: false, levels: false });
+    expect(v2ParticipantAccess(["participants_read"], true)).toEqual({
+      roster: true,
+      identity: false,
+      levels: false,
+    });
+    expect(v2ParticipantAccess([
+      "participants_read",
+      "participant_identity_read",
+      "audio_levels_read",
+    ], true)).toEqual({ roster: true, identity: true, levels: true });
+    expect(v2ParticipantAccess([
+      "participants_read",
+      "participant_identity_read",
+      "audio_levels_read",
+    ], false)).toEqual({ roster: false, identity: false, levels: false });
+  });
+
+  it("withdraws participant and meter access when consent expires or is malformed", () => {
+    const consent = takeoverSnapshot().snapshot.remoteConsent;
+    const now = Date.parse("2027-01-15T08:00:00Z");
+    expect(v2RemoteConsentCurrent(true, { ...consent, expiresAt: "2027-01-15T08:01:00Z" }, now)).toBe(true);
+    expect(v2RemoteConsentCurrent(true, { ...consent, expiresAt: "2027-01-15T07:59:59Z" }, now)).toBe(false);
+    expect(v2RemoteConsentCurrent(true, { ...consent, expiresAt: "not-a-time" }, now)).toBe(false);
+    expect(v2RemoteConsentCurrent(false, consent, now)).toBe(false);
+  });
+});
+
+describe("v2TransferTranscript", () => {
+  it("shows only bounded final captions under an exact transfer, consent, and grant fence", () => {
+    const snapshot = takeoverSnapshot();
+    snapshot.grants.push("assistance_read", "captions_read");
+    snapshot.snapshot.remoteConsent.captionsEnabled = true;
+    snapshot.snapshot.captions = [
+      { captionId: "caption_1", speaker: "Caller", text: "I need to move my booking.", occurredAt: "2027-01-15T08:00:00Z", finalText: true },
+      { captionId: "caption_2", speaker: "Aokie", text: "One moment please.", occurredAt: "2027-01-15T08:00:01Z", finalText: true },
+      { captionId: "caption_partial", speaker: "Caller", text: "part", occurredAt: "2027-01-15T08:00:02Z", finalText: false },
+    ];
+    const request: V2AssistanceRequestEvent = {
+      kind: "assistance_request",
+      schemaVersion: 2,
+      appId: "app_a",
+      eventId: "event_transfer_a",
+      requestId: "transfer_request_a",
+      callId: "call_a",
+      callEpoch: 7,
+      ownerEpoch: 4,
+      switchboardRevision: 11,
+      remoteRevision: 13,
+      question: "Can you take this caller?",
+      transferOffered: true,
+      expiresAt: OFFER_NOW + 20,
+    };
+    expect(v2TransferTranscript(snapshot, request, 1)).toEqual({
+      available: true,
+      captions: [snapshot.snapshot.captions[1]],
+    });
+  });
+
+  it("does not expose captions without the exact grant and transfer fence", () => {
+    const snapshot = takeoverSnapshot();
+    snapshot.snapshot.remoteConsent.captionsEnabled = true;
+    snapshot.snapshot.captions = [
+      { captionId: "caption_private", speaker: "Caller", text: "Private detail", occurredAt: "2027-01-15T08:00:00Z", finalText: true },
+    ];
+    const request: V2AssistanceRequestEvent = {
+      kind: "assistance_request",
+      schemaVersion: 2,
+      appId: "app_a",
+      eventId: "event_transfer_a",
+      requestId: "transfer_request_a",
+      callId: "call_a",
+      callEpoch: 7,
+      ownerEpoch: 4,
+      switchboardRevision: 11,
+      remoteRevision: 13,
+      question: "Can you take this caller?",
+      transferOffered: true,
+      expiresAt: OFFER_NOW + 20,
+    };
+    expect(v2TransferTranscript(snapshot, request).captions).toEqual([]);
+    snapshot.grants.push("assistance_read", "captions_read");
+    request.remoteRevision = 14;
+    expect(v2TransferTranscript(snapshot, request).captions).toEqual([]);
   });
 });
 
@@ -571,6 +687,7 @@ describe("assistance call fencing", () => {
     switchboardRevision: 11,
     remoteRevision: 13,
     question: "Can we accept the booking?",
+    transferOffered: false,
     expiresAt: OFFER_NOW + 30,
   };
 

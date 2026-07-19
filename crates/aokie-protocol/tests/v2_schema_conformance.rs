@@ -46,6 +46,16 @@ fn direction_validator(direction: &str) -> jsonschema::Validator {
     jsonschema::validator_for(&schema).expect("v2 direction schema compiles")
 }
 
+fn definition_validator(definition: &str) -> jsonschema::Validator {
+    let mut schema: Value = serde_json::from_str(SCHEMA).expect("v2 schema is JSON");
+    schema
+        .as_object_mut()
+        .expect("v2 schema is an object")
+        .remove("anyOf");
+    schema["$ref"] = json!(format!("#/$defs/{definition}"));
+    jsonschema::validator_for(&schema).expect("v2 definition schema compiles")
+}
+
 fn assert_valid(encoded: &str) -> Value {
     let value: Value = serde_json::from_str(encoded).expect("fixture is JSON");
     let errors: Vec<_> = validator()
@@ -252,6 +262,115 @@ fn authoritative_snapshots_keep_socket_omission_and_accept_relay_offers() {
     assert!(!root.is_valid(&flooded));
     assert!(!plugin_outbound.is_valid(&flooded));
     assert!(parse_plugin_frame(&flooded.to_string()).is_err());
+}
+
+#[test]
+fn transfer_mute_and_live_media_truth_are_directionally_conformant() {
+    let mobile_outbound = direction_validator("mobileToGateway");
+    let plugin_outbound = direction_validator("pluginToGateway");
+    let gateway_to_mobile = direction_validator("gatewayToMobile");
+    let gateway_to_plugin = direction_validator("gatewayToPlugin");
+    let signed_pending_mobile_offer = definition_validator("signedPendingMobileOffer");
+
+    let mobile_mute = json!({
+        "kind":"microphone_mute", "schemaVersion":2, "appId":"app_a",
+        "requestId":"mute_request_a", "idempotencyKey":"mute_idem_a",
+        "leaseToken":"signed.lease.token", "rtcSessionId":"rtc_a",
+        "callId":"call_a", "callEpoch":7, "ownerEpoch":4,
+        "switchboardRevision":11, "remoteRevision":14, "fence":9,
+        "muted":true
+    });
+    assert!(mobile_outbound.is_valid(&mobile_mute));
+    assert!(!plugin_outbound.is_valid(&mobile_mute));
+    assert!(matches!(
+        parse_mobile_frame(&mobile_mute.to_string()).unwrap(),
+        MobileInbound::MicrophoneMute(_)
+    ));
+
+    let plugin_mute = json!({
+        "kind":"plugin_microphone_mute", "schemaVersion":2, "appId":"app_a",
+        "deviceId":"device_a", "requestId":"mute_request_a",
+        "leaseId":"lease_a", "leaseJti":"lease_jti_a", "rtcSessionId":"rtc_a",
+        "callId":"call_a", "callEpoch":7, "ownerEpoch":4,
+        "switchboardRevision":11, "remoteRevision":14, "fence":9,
+        "muted":true
+    });
+    assert!(gateway_to_plugin.is_valid(&plugin_mute));
+    assert!(!plugin_outbound.is_valid(&plugin_mute));
+    assert!(matches!(
+        parse_plugin_frame(&plugin_mute.to_string()).unwrap(),
+        PluginInbound::MicrophoneMute(_)
+    ));
+
+    let mute_status = json!({
+        "kind":"microphone_mute_status", "schemaVersion":2, "appId":"app_a",
+        "deviceId":"device_a", "requestId":"mute_request_a",
+        "leaseId":"lease_a", "leaseJti":"lease_jti_a", "rtcSessionId":"rtc_a",
+        "callId":"call_a", "callEpoch":7, "ownerEpoch":4,
+        "switchboardRevision":11, "remoteRevision":15, "fence":9,
+        "muted":true
+    });
+    assert!(plugin_outbound.is_valid(&mute_status));
+    assert!(gateway_to_mobile.is_valid(&mute_status));
+    assert!(matches!(
+        parse_plugin_frame(&mute_status.to_string()).unwrap(),
+        PluginInbound::MicrophoneMuteStatus(_)
+    ));
+
+    let mut transfer_offer = pending_mobile_offer();
+    transfer_offer["offer"]["acceptedTransferRequestId"] = json!("assist_transfer_a");
+    transfer_offer["offer"]["requiredGrants"] = json!([
+        "state_read",
+        "rtc_signal",
+        "takeover",
+        "resume_aokie",
+        "assistance_respond"
+    ]);
+    assert!(signed_pending_mobile_offer.is_valid(&transfer_offer));
+    let mut unsafe_offer = transfer_offer.clone();
+    unsafe_offer["offer"]["requiredGrants"] =
+        json!(["state_read", "rtc_signal", "takeover", "resume_aokie"]);
+    assert!(!signed_pending_mobile_offer.is_valid(&unsafe_offer));
+
+    let mut transfer_lease: Value = serde_json::from_str(LEASE_REQUEST).unwrap();
+    transfer_lease["acceptedTransferRequestId"] = json!("assist_transfer_a");
+    assert!(mobile_outbound.is_valid(&transfer_lease));
+    assert!(matches!(
+        parse_mobile_frame(&transfer_lease.to_string()).unwrap(),
+        MobileInbound::LeaseRequest(_)
+    ));
+    transfer_lease["mode"] = json!("consult");
+    assert!(!mobile_outbound.is_valid(&transfer_lease));
+    assert!(parse_mobile_frame(&transfer_lease.to_string()).is_err());
+
+    let mut transfer_request: Value = serde_json::from_str(ASSISTANCE_REQUEST).unwrap();
+    transfer_request["transferOffered"] = json!(true);
+    assert!(plugin_outbound.is_valid(&transfer_request));
+    let mut decline: Value = serde_json::from_str(ASSISTANCE_ANSWER).unwrap();
+    decline["responseAction"] = json!("decline");
+    decline["answer"] = json!("declined");
+    assert!(mobile_outbound.is_valid(&decline));
+    assert!(matches!(
+        parse_mobile_frame(&decline.to_string()).unwrap(),
+        MobileInbound::AssistanceAnswer(_)
+    ));
+
+    let mut live_snapshot: Value = serde_json::from_str(PLUGIN_SNAPSHOT).unwrap();
+    live_snapshot["snapshot"]["serviceMode"] = json!("human_active");
+    live_snapshot["snapshot"]["participants"] = json!([{
+        "participantId":"rtc_a", "mode":"talker", "state":"active",
+        "subjectId":"device_a", "displayLabel":"Owner Companion"
+    }]);
+    live_snapshot["snapshot"]["audioLevels"] = json!([
+        {"source":"caller", "levelPermille":420},
+        {"source":"companion", "participantId":"rtc_a", "levelPermille":730}
+    ]);
+    live_snapshot["snapshot"]["companionMicrophoneMuted"] = json!(true);
+    assert!(plugin_outbound.is_valid(&live_snapshot));
+    assert!(matches!(
+        parse_plugin_frame(&live_snapshot.to_string()).unwrap(),
+        PluginInbound::Snapshot(_)
+    ));
 }
 
 #[test]

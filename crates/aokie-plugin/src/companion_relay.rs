@@ -893,6 +893,29 @@ impl RelayChannel {
                 })
                 .cloned()
                 .collect(),
+            // These are immediate, request-correlated acknowledgements whose
+            // socket dialect intentionally has no deviceId. The worker emits
+            // them synchronously while the exact authenticated inbound frame
+            // is still `last_inbound`; route only when its subject-to-party
+            // proof still matches the verified table. They are never ambient
+            // broadcasts and no later unrelated output uses this arm.
+            None if matches!(
+                routing.kind.as_deref(),
+                Some("assistance_answer_accepted" | "end_caller_submitted")
+            ) =>
+            {
+                self.last_inbound_subject
+                    .as_deref()
+                    .zip(self.last_inbound_party.as_deref())
+                    .and_then(|(subject, party)| {
+                        self.routes
+                            .get(subject)
+                            .filter(|route| route.party == party)
+                            .map(|route| route.party.clone())
+                    })
+                    .into_iter()
+                    .collect()
+            }
             // The only truly session-wide, non-sensitive frame. Everything
             // else must be explicitly targeted or deliberately projected
             // above; unknown untargeted kinds fail closed.

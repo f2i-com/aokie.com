@@ -41,6 +41,7 @@ aokie-dongle = { path = "../aokie-dongle" }
 aokie-ai = { path = "../aokie-ai", features = ["onnx", "sherpa"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
 # CONSENT-001: verify the Desktop-issued signature on consent grants (the
 # verify key arrives via the parent process env; grants that don't verify
 # never satisfy the consent gate).
