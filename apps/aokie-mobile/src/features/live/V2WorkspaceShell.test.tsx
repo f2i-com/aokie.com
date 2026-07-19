@@ -29,6 +29,7 @@ import V2WorkspaceShell, {
   filterCallRecords,
   loadedCallRecordCountLabel,
   nextCallRecordLimit,
+  reconcileCurrentDeviceAvailability,
   settingsValueTone,
   sortRoutingMembers,
   staffCountLabel,
@@ -391,8 +392,9 @@ const routingGroups: CompanionRoutingGroup[] = [{
   policy: "priority",
   enabled: true,
   members: [
-    { staffId: "staff_b", displayName: "Second responder", roleName: "Advisor", isCurrentUser: false, priority: 2, enabled: true, availability: "available", availabilityUpdatedAt: "2026-07-16T00:00:00Z", availabilityExpiresAt: null },
-    { staffId: "staff_a", displayName: "First responder", roleName: "Owner", isCurrentUser: true, priority: 1, enabled: true, availability: "available", availabilityUpdatedAt: "2026-07-16T00:00:00Z", availabilityExpiresAt: null },
+    { staffId: "staff_b", displayName: "Second responder", roleName: "Advisor", isCurrentUser: false, isCurrentDevice: false, priority: 2, enabled: true, availability: "available", availabilityUpdatedAt: "2026-07-16T00:00:00Z", availabilityExpiresAt: null },
+    { staffId: "staff_a", displayName: "This phone", roleName: "Owner", isCurrentUser: true, isCurrentDevice: true, priority: 1, enabled: true, availability: "available", availabilityUpdatedAt: "2026-07-16T00:00:00Z", availabilityExpiresAt: null },
+    { staffId: "staff_a", displayName: "Other phone", roleName: "Owner", isCurrentUser: true, isCurrentDevice: false, priority: 3, enabled: true, availability: "available", availabilityUpdatedAt: "2026-07-16T00:00:00Z", availabilityExpiresAt: null },
   ],
 }, {
   id: "routing_duplicate",
@@ -400,14 +402,18 @@ const routingGroups: CompanionRoutingGroup[] = [{
   policy: "all",
   enabled: true,
   members: [
-    { staffId: "staff_a", displayName: "First responder", roleName: "Owner", isCurrentUser: true, priority: 1, enabled: true, availability: "available", availabilityUpdatedAt: "2026-07-16T00:00:00Z", availabilityExpiresAt: null },
+    { staffId: "staff_a", displayName: "This phone", roleName: "Owner", isCurrentUser: true, isCurrentDevice: true, priority: 1, enabled: true, availability: "available", availabilityUpdatedAt: "2026-07-16T00:00:00Z", availabilityExpiresAt: null },
   ],
 }];
 
 describe("enriched read-only routing helpers", () => {
   it("orders members by server priority without mutating the response", () => {
     const original = routingGroups[0].members.map((member) => member.staffId);
-    expect(sortRoutingMembers(routingGroups[0].members).map((member) => member.staffId)).toEqual(["staff_a", "staff_b"]);
+    expect(sortRoutingMembers(routingGroups[0].members).map((member) => member.displayName)).toEqual([
+      "This phone",
+      "Second responder",
+      "Other phone",
+    ]);
     expect(routingGroups[0].members.map((member) => member.staffId)).toEqual(original);
   });
 
@@ -417,6 +423,39 @@ describe("enriched read-only routing helpers", () => {
 
   it("does not claim coverage from a disabled routing group", () => {
     expect(countAvailableRoutingMembers([{ ...routingGroups[0], enabled: false }])).toBe(0);
+  });
+
+  it("reconciles only the exact current device across every routing-group projection", () => {
+    const updated = reconcileCurrentDeviceAvailability(routingGroups, {
+      availability: "do_not_disturb",
+      updatedAt: "2026-07-19T02:45:16Z",
+      expiresAt: "2026-07-19T03:45:16Z",
+    });
+
+    expect(updated.flatMap((group) => group.members).filter((member) => member.isCurrentDevice)).toHaveLength(2);
+    expect(updated.flatMap((group) => group.members).filter((member) => member.isCurrentDevice)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          availability: "do_not_disturb",
+          availabilityUpdatedAt: "2026-07-19T02:45:16Z",
+          availabilityExpiresAt: "2026-07-19T03:45:16Z",
+        }),
+        expect.objectContaining({
+          availability: "do_not_disturb",
+          availabilityUpdatedAt: "2026-07-19T02:45:16Z",
+          availabilityExpiresAt: "2026-07-19T03:45:16Z",
+        }),
+      ]),
+    );
+    expect(updated[0].members.find((member) => !member.isCurrentUser)).toBe(routingGroups[0].members[0]);
+    expect(updated[0].members.find((member) => member.displayName === "Other phone"))
+      .toBe(routingGroups[0].members[2]);
+    expect(routingGroups[0].members[1].availability).toBe("available");
+    expect(countAvailableRoutingMembers(updated)).toBe(2);
+  });
+
+  it("preserves routing state when the availability endpoint returns no member record", () => {
+    expect(reconcileCurrentDeviceAvailability(routingGroups, null)).toBe(routingGroups);
   });
 
   it("selects the actual current FormLogic staff identity", () => {

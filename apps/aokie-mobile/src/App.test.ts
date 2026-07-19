@@ -12,6 +12,7 @@ import {
   isRetryableMediaArmFailure,
   shouldAutoArmConfirmedTakeover,
   shouldAcceptV2AuthoritativeSequence,
+  shouldAcceptV2MicrophoneMuteReconciliation,
   takeoverConfirmationMode,
   v2CurrentAccessPolicyPresentation,
   v2AssistanceGrantAccess,
@@ -205,6 +206,44 @@ describe("shouldAcceptV2AuthoritativeSequence", () => {
     expect(shouldAcceptV2AuthoritativeSequence(0, 0)).toBe(false);
     expect(shouldAcceptV2AuthoritativeSequence(0, Number.NaN)).toBe(false);
     expect(shouldAcceptV2AuthoritativeSequence(0, Number.MAX_SAFE_INTEGER + 1)).toBe(false);
+  });
+});
+
+describe("shouldAcceptV2MicrophoneMuteReconciliation", () => {
+  it("accepts only an offer-free same-sequence mute projection on the exact call", () => {
+    const current = activeTakeoverSnapshot();
+    current.snapshot.pendingMobileOffers = takeoverSnapshot().snapshot.pendingMobileOffers;
+    const reconciled = structuredClone(current);
+    reconciled.snapshot.remoteRevision += 1;
+    reconciled.snapshot.companionMicrophoneMuted = true;
+    reconciled.snapshot.pendingMobileOffers = [];
+
+    expect(shouldAcceptV2MicrophoneMuteReconciliation(
+      current,
+      reconciled,
+      current.sequence,
+    )).toBe(true);
+
+    const unmuted = structuredClone(reconciled);
+    unmuted.snapshot.remoteRevision += 1;
+    unmuted.snapshot.companionMicrophoneMuted = false;
+    expect(shouldAcceptV2MicrophoneMuteReconciliation(
+      reconciled,
+      unmuted,
+      current.sequence,
+    )).toBe(true);
+
+    const retainedOffer = structuredClone(reconciled);
+    retainedOffer.snapshot.pendingMobileOffers = current.snapshot.pendingMobileOffers;
+    expect(shouldAcceptV2MicrophoneMuteReconciliation(current, retainedOffer, current.sequence)).toBe(false);
+
+    const changedCallFact = structuredClone(reconciled);
+    changedCallFact.snapshot.ownerEpoch += 1;
+    expect(shouldAcceptV2MicrophoneMuteReconciliation(current, changedCallFact, current.sequence)).toBe(false);
+
+    const inventedSequence = structuredClone(reconciled);
+    inventedSequence.sequence += 1;
+    expect(shouldAcceptV2MicrophoneMuteReconciliation(current, inventedSequence, current.sequence)).toBe(false);
   });
 });
 

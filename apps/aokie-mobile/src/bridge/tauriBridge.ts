@@ -1110,22 +1110,26 @@ function parseCompanionRoutingGroups(value: unknown): CompanionRoutingGroup[] {
       throw new Error("Invalid Companion routing group");
     }
     ids.add(id);
+    let currentDevices = 0;
     const members = group.members.map((rawMember) => {
       const member = record(rawMember, "Companion routing member");
       exactKeys(member, [
-        "staffId", "displayName", "roleName", "isCurrentUser", "priority", "enabled",
+        "staffId", "displayName", "roleName", "isCurrentUser", "isCurrentDevice", "priority", "enabled",
         "availability", "availabilityUpdatedAt", "availabilityExpiresAt",
       ], "Companion routing member");
       if (typeof member.availability !== "string" || !COMPANION_AVAILABILITY.has(member.availability as CompanionAvailabilityState) ||
-        typeof member.isCurrentUser !== "boolean" || typeof member.enabled !== "boolean" ||
+        typeof member.isCurrentUser !== "boolean" || typeof member.isCurrentDevice !== "boolean" ||
+        typeof member.enabled !== "boolean" || (member.isCurrentDevice && !member.isCurrentUser) ||
         !Number.isSafeInteger(member.priority) || Number(member.priority) < 0 || Number(member.priority) > 1_000_000) {
         throw new Error("Invalid Companion routing member availability");
       }
+      currentDevices += Number(member.isCurrentDevice);
       return {
         staffId: requiredNullable(member, "staffId", (staffId) => safeIdentifier(staffId, "Companion routing staff ID"), "Companion routing staff ID"),
         displayName: companionText(member.displayName, 120, "Companion routing member name"),
         roleName: requiredNullable(member, "roleName", (roleName) => companionText(roleName, 120, "Companion routing member role"), "Companion routing member role"),
         isCurrentUser: member.isCurrentUser,
+        isCurrentDevice: member.isCurrentDevice,
         priority: Number(member.priority),
         enabled: member.enabled,
         availability: member.availability as CompanionAvailabilityState,
@@ -1133,6 +1137,7 @@ function parseCompanionRoutingGroups(value: unknown): CompanionRoutingGroup[] {
         availabilityExpiresAt: requiredNullable(member, "availabilityExpiresAt", (expiry) => companionTimestamp(expiry, "Companion routing member expiry"), "Companion routing member expiry"),
       };
     });
+    if (currentDevices > 1) throw new Error("Invalid Companion current routing device");
     return {
       id,
       name: companionText(group.name, 120, "Companion routing group name"),
@@ -1751,6 +1756,13 @@ export class TauriCompanionBridge implements CompanionBridge {
           this.emit({ type: "v2_snapshot", value: parseV2Snapshot(payload) });
         } catch (error) {
           this.emit({ type: "error", message: error instanceof Error ? error.message : "Invalid protocol-v2 snapshot" });
+        }
+      }),
+      listen<unknown>("aokie-companion://v2-microphone-mute-reconciliation", ({ payload }) => {
+        try {
+          this.emit({ type: "v2_microphone_mute_reconciliation", value: parseV2Snapshot(payload) });
+        } catch (error) {
+          this.emit({ type: "error", message: error instanceof Error ? error.message : "Invalid protocol-v2 microphone mute reconciliation" });
         }
       }),
       listen<unknown>("aokie-companion://v2-idle-sync", ({ payload }) => {

@@ -264,6 +264,7 @@ export interface CompanionTeamMember {
   displayName: string;
   roleName: string | null;
   isCurrentUser: boolean;
+  isCurrentDevice: boolean;
   priority: number;
   enabled: boolean;
   availability: CompanionAvailabilityState;
@@ -660,6 +661,7 @@ export type BridgeEvent =
   | { type: "media_state"; value: NativeMediaStateEvent }
   | { type: "media_levels"; value: NativeMediaLevelsEvent | null }
   | { type: "v2_snapshot"; value: V2CallSnapshotEvent }
+  | { type: "v2_microphone_mute_reconciliation"; value: V2CallSnapshotEvent }
   | { type: "v2_idle_sync"; value: V2IdleSyncEvent }
   | { type: "v2_lease"; value: V2LeaseEvent | null }
   | { type: "v2_assistance"; value: V2AssistanceRequestEvent | null }
