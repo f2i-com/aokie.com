@@ -439,6 +439,7 @@ describe("managed Companion account data", () => {
 
     const routingMember = {
       staffId: "staff_1", displayName: "Test User", roleName: "Owner", isCurrentUser: true,
+      isCurrentDevice: true,
       priority: 1, enabled: true, availability: "available",
       availabilityUpdatedAt: "2026-07-16T03:00:00Z", availabilityExpiresAt: null,
     };
@@ -451,6 +452,10 @@ describe("managed Companion account data", () => {
       ...withRouting,
       routingGroups: [{ ...withRouting.routingGroups[0], members: [{ ...routingMember, displayName: "Wrong User" }] }],
     })).toThrow("routing staff identity");
+    expect(() => parseCompanionBootstrap({
+      ...withRouting,
+      routingGroups: [{ ...withRouting.routingGroups[0], members: [{ ...routingMember, isCurrentUser: false }] }],
+    })).toThrow("Invalid Companion routing");
     expect(parseCompanionBootstrap({
       ...withRouting,
       routingGroups: [{ ...withRouting.routingGroups[0], members: [{ ...routingMember, staffId: "staff_outside_cap" }] }],
@@ -654,6 +659,31 @@ describe("protocol-v2 projected call truth", () => {
         }],
       },
     })).toThrow("Stale or mismatched");
+  });
+
+  it("rejects offers from an older revision but accepts an offer-free reconciliation", () => {
+    const advanced = {
+      ...snapshot,
+      sequence: snapshot.sequence + 1,
+      snapshot: {
+        ...snapshot.snapshot,
+        remoteRevision: snapshot.snapshot.remoteRevision + 1,
+        serviceMode: "human_active",
+        mediaState: "active",
+        companionMicrophoneMuted: true,
+      },
+    };
+    expect(() => parseV2Snapshot(advanced)).toThrow("Stale or mismatched");
+    expect(parseV2Snapshot({
+      ...advanced,
+      snapshot: { ...advanced.snapshot, pendingMobileOffers: [] },
+    })).toMatchObject({
+      snapshot: {
+        remoteRevision: 6,
+        companionMicrophoneMuted: true,
+        pendingMobileOffers: [],
+      },
+    });
   });
 });
 

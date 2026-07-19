@@ -1600,6 +1600,10 @@ async fn send_mobile_api_request(
     let mut request = client
         .request(method, url)
         .header(ACCEPT, "application/json")
+        // Negotiate the additive routing-member shape explicitly: older
+        // native clients strictly reject unknown response fields and must
+        // continue receiving schema 1 during a staged rollout.
+        .header("x-aokie-companion-routing-schema", "2")
         .bearer_auth(&session.access_token);
     if let Some(body) = body {
         request = request

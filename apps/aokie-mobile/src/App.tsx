@@ -122,6 +122,40 @@ export function shouldAcceptV2AuthoritativeSequence(
     && incomingSequence > lastSequence;
 }
 
+function v2MicrophoneMuteStableProjection(value: V2CallSnapshotEvent): unknown {
+  const {
+    remoteRevision: _remoteRevision,
+    companionMicrophoneMuted: _companionMicrophoneMuted,
+    pendingMobileOffers: _pendingMobileOffers,
+    ...stableSnapshot
+  } = value.snapshot;
+  return { ...value, snapshot: stableSnapshot };
+}
+
+/**
+ * A targeted mute receipt can advance remoteRevision before Desktop's next
+ * full snapshot, but it cannot truthfully mint a new authoritative sequence.
+ * Accept that same-sequence projection only on its dedicated native channel,
+ * only when every other call fact is byte-for-byte stable, and only after all
+ * offers signed for the superseded revision have been removed.
+ */
+export function shouldAcceptV2MicrophoneMuteReconciliation(
+  current: V2CallSnapshotEvent | null,
+  incoming: V2CallSnapshotEvent,
+  lastSequence: number,
+): boolean {
+  return current !== null
+    && Number.isSafeInteger(lastSequence)
+    && lastSequence > 0
+    && current.sequence === lastSequence
+    && incoming.sequence === lastSequence
+    && incoming.snapshot.remoteRevision > current.snapshot.remoteRevision
+    && incoming.snapshot.companionMicrophoneMuted !== current.snapshot.companionMicrophoneMuted
+    && incoming.snapshot.pendingMobileOffers.length === 0
+    && JSON.stringify(v2MicrophoneMuteStableProjection(incoming))
+      === JSON.stringify(v2MicrophoneMuteStableProjection(current));
+}
+
 export function assistanceExpiryDelayMs(expiresAtSeconds: number, nowMs = Date.now()): number {
   if (!Number.isSafeInteger(expiresAtSeconds) || expiresAtSeconds <= 0 || !Number.isFinite(nowMs)) return 0;
   return Math.max(0, Math.min(expiresAtSeconds * 1_000 - nowMs, 2_147_000_000));
@@ -701,6 +735,15 @@ function App() {
         }
         v2CallId.current = nextCallId;
         setV2IdleSync(null);
+        setV2Snapshot(event.value);
+      }
+      else if (event.type === "v2_microphone_mute_reconciliation") {
+        if (!shouldAcceptV2MicrophoneMuteReconciliation(
+          v2SnapshotRef.current,
+          event.value,
+          v2LastSequence.current,
+        )) return;
+        v2SnapshotRef.current = event.value;
         setV2Snapshot(event.value);
       }
       else if (event.type === "v2_idle_sync") {

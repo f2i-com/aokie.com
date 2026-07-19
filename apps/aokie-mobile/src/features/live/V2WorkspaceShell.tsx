@@ -150,6 +150,8 @@ export default function V2WorkspaceShell({
   const [callRecordsLoadingMore, setCallRecordsLoadingMore] = useState(false);
   const callRecordsLimit = useRef(CALL_RECORD_PAGE_SIZE);
   const callRecordsRequest = useRef(0);
+  const bootstrapRequest = useRef(0);
+  const routingRequest = useRef(0);
   const [callDetail, setCallDetail] = useState<CompanionCallRecordDetail | null>(null);
   const [callDetailLoading, setCallDetailLoading] = useState(false);
   const [callDetailError, setCallDetailError] = useState<string | null>(null);
@@ -189,20 +191,25 @@ export default function V2WorkspaceShell({
   }, [callRecordsHasMore, callRecordsLoadingMore, refreshCallRecords]);
 
   const refresh = useCallback(async (quiet = false) => {
+    const request = ++bootstrapRequest.current;
     if (quiet) setRefreshing(true);
     else setLoading(true);
     try {
       const value = await loadBootstrap();
+      if (request !== bootstrapRequest.current) return;
       setBootstrap(value);
       setRoutingGroups(value.routingGroups);
       setStaff(value.staff);
       setError(null);
       void refreshCallRecords();
     } catch (caught) {
+      if (request !== bootstrapRequest.current) return;
       setError(displayError(caught, "Companion workspace could not be refreshed"));
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (request === bootstrapRequest.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, [loadBootstrap, refreshCallRecords]);
 
@@ -240,12 +247,15 @@ export default function V2WorkspaceShell({
       await refreshCallRecords();
     }
     if (next === "team") {
+      const request = ++routingRequest.current;
       try {
         const routing = await loadRouting();
+        if (request !== routingRequest.current) return;
         setRoutingGroups(routing.routingGroups);
         setStaff(routing.staff);
         setError(null);
       } catch (caught) {
+        if (request !== routingRequest.current) return;
         setError(displayError(caught, "Team routing could not be refreshed"));
       }
     }
@@ -295,10 +305,27 @@ export default function V2WorkspaceShell({
 
   const updateAvailability = useCallback(async (value: CompanionAvailabilityValue) => {
     if (!bootstrap || availabilityBusy) return;
+    // A read started before this PUT must never repaint its older availability
+    // after the server has confirmed the write.
+    ++bootstrapRequest.current;
+    ++routingRequest.current;
+    setLoading(false);
+    setRefreshing(false);
     setAvailabilityBusy(true);
     try {
       const availability = await setAvailability(value, value === "available" ? 8 * 60 * 60 : 60 * 60);
-      setBootstrap((current) => current ? { ...current, availability } : current);
+      // A refresh may have started while the PUT was in flight and captured
+      // the server's pre-write state. Fence that second race as well before
+      // publishing the confirmed response into either local projection.
+      ++bootstrapRequest.current;
+      ++routingRequest.current;
+      setRefreshing(false);
+      setBootstrap((current) => current ? {
+        ...current,
+        availability,
+        routingGroups: reconcileCurrentDeviceAvailability(current.routingGroups, availability),
+      } : current);
+      setRoutingGroups((current) => reconcileCurrentDeviceAvailability(current, availability));
       setError(null);
     } catch (caught) {
       setError(displayError(caught, "Availability could not be updated"));
@@ -892,6 +919,41 @@ export function countAvailableRoutingMembers(groups: CompanionRoutingGroup[]): n
     }
   }
   return available.size;
+}
+
+/**
+ * Apply the server-confirmed availability PUT result only to routing-group
+ * projections of this exact Companion installation. One FormLogic user may
+ * own several phones, and availability is deliberately device-specific.
+ * Bootstrap and the Team screen keep separate copies, so callers use this
+ * helper for both instead of displaying a stale coverage count.
+ */
+export function reconcileCurrentDeviceAvailability(
+  groups: CompanionRoutingGroup[],
+  availability: CompanionAvailabilityRecord | null,
+): CompanionRoutingGroup[] {
+  if (!availability) return groups;
+
+  return groups.map((group) => {
+    let changed = false;
+    const members = group.members.map((member) => {
+      if (!member.isCurrentDevice) return member;
+      if (
+        member.availability === availability.availability
+        && member.availabilityUpdatedAt === availability.updatedAt
+        && member.availabilityExpiresAt === availability.expiresAt
+      ) return member;
+
+      changed = true;
+      return {
+        ...member,
+        availability: availability.availability,
+        availabilityUpdatedAt: availability.updatedAt,
+        availabilityExpiresAt: availability.expiresAt,
+      };
+    });
+    return changed ? { ...group, members } : group;
+  });
 }
 
 export function availabilityExpiryLabel(availability: CompanionAvailabilityRecord | null, nowMs = Date.now()): string {

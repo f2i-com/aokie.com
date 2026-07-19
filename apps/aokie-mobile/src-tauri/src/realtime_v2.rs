@@ -1153,6 +1153,17 @@ struct CompletedRevoke {
     // so either ordering is replay-safe without accepting changed bytes.
     frame_digest: Option<[u8; 32]>,
     unsolicited_frame_digest: Option<[u8; 32]>,
+    // A locally-closed lease can receive one relay-delayed renewal after its
+    // return was already confirmed. Retain only its tokenless immutable
+    // lineage for the original bounded close window: enough to authenticate
+    // and return that descendant without ever recreating media authority.
+    renewal_lineage: Option<CompletedReturnLineage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletedReturnLineage {
+    lease: ClientLease,
+    retain_until: Instant,
 }
 
 #[derive(Default)]
@@ -1202,8 +1213,10 @@ struct ClientState {
     // accepted the exact queued bytes.
     urgent_control_frames: VecDeque<UrgentControlFrame>,
     // Completed lease returns/revocations remain replay-fenced across a
-    // transport reconnect. Only bounded identifiers and an optional wire hash
-    // survive; no lease token or revoke payload is retained.
+    // transport reconnect. Identifiers and wire hashes are bounded by the
+    // queue; a locally-closed return may additionally retain its tokenless
+    // immutable lineage for at most LOCAL_EXPIRY_TOMBSTONE_TTL. No lease token
+    // or revoke payload is retained here.
     completed_revokes: VecDeque<CompletedRevoke>,
     pending_end_caller: Option<PendingEndCaller>,
     seen_remote_endpoint_jtis: HashSet<String>,
@@ -1344,13 +1357,43 @@ fn merge_completed_revoke(
             _ => {}
         }
     }
+    match (
+        current.renewal_lineage.as_mut(),
+        candidate.renewal_lineage.as_ref(),
+    ) {
+        (Some(current), Some(candidate)) => {
+            if current.lease != candidate.lease {
+                return Err(
+                    "completed lease revoke lineage changed immutable predecessor claims".into(),
+                );
+            }
+            // Re-observing the same completion can only narrow, never extend,
+            // the window in which a delayed descendant will be contained.
+            current.retain_until = current.retain_until.min(candidate.retain_until);
+        }
+        (None, Some(candidate)) => current.renewal_lineage = Some(candidate.clone()),
+        _ => {}
+    }
     Ok(())
+}
+
+fn purge_completed_return_lineages(client: &mut ClientState, now: Instant) {
+    for completed in &mut client.completed_revokes {
+        if completed
+            .renewal_lineage
+            .as_ref()
+            .is_some_and(|lineage| lineage.retain_until <= now)
+        {
+            completed.renewal_lineage = None;
+        }
+    }
 }
 
 fn remember_completed_revoke(
     client: &mut ClientState,
     candidate: CompletedRevoke,
 ) -> Result<(), String> {
+    purge_completed_return_lineages(client, Instant::now());
     if let Some(index) = client
         .completed_revokes
         .iter()
@@ -1372,6 +1415,8 @@ fn remember_completed_revoke(
 }
 
 fn completed_revoke_from_pending(pending: &PendingRevoke) -> CompletedRevoke {
+    let mut lease = pending.lease.clone();
+    lease.token.clear();
     CompletedRevoke {
         app_id: pending.lease.claims.app_id.clone(),
         request_id: Some(pending.request_id.clone()),
@@ -1379,6 +1424,10 @@ fn completed_revoke_from_pending(pending: &PendingRevoke) -> CompletedRevoke {
         lease_jti: pending.lease_jti.clone(),
         frame_digest: None,
         unsolicited_frame_digest: None,
+        renewal_lineage: Some(CompletedReturnLineage {
+            lease,
+            retain_until: pending.lineage_retain_until,
+        }),
     }
 }
 
@@ -1396,6 +1445,7 @@ fn completed_revoke_from_frame(frame: &LeaseRevokedFrame, encoded: &str) -> Comp
             .request_id
             .is_none()
             .then(|| relay_frame_digest(encoded)),
+        renewal_lineage: None,
     }
 }
 
@@ -1701,6 +1751,7 @@ fn queue_exact_lease_revocation(
         authoritative_remote_revision,
         native_action_id: None,
         deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+        lineage_retain_until: Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL,
     });
     match queue_error {
         Some(message) => Err(message),
@@ -1751,6 +1802,7 @@ struct PendingRevoke {
     authoritative_remote_revision: Option<u64>,
     native_action_id: Option<String>,
     deadline: Instant,
+    lineage_retain_until: Instant,
 }
 
 #[derive(Clone)]
@@ -1906,6 +1958,139 @@ fn contain_late_local_expiry_renewal(
             "[AokieCompanion][realtime] renewed local-expiry return could not enter the urgent queue: {message}"
         );
     }
+    Ok(true)
+}
+
+/// Return to Aokie closes native media before its revoke frame is posted. A
+/// heartbeat already in flight can therefore return a valid renewal after the
+/// lease moved into `pending_revoke`, or after a revoke/snapshot/idle/timeout
+/// already completed that pending return. Advance only the exact tokenless
+/// lineage, keep media closed, and return the renewed token. An unrelated
+/// status still falls through to the ordinary fail-closed checks.
+fn contain_late_return_renewal(
+    state: &V2State,
+    client: &mut ClientState,
+    frame: &LeaseStatusFrame,
+    replay_key: &str,
+    encoded: &str,
+    now: u64,
+) -> Result<bool, String> {
+    if frame.kind != "lease_renewed" {
+        return Ok(false);
+    }
+
+    // A real current lease owns the ordinary renewal transaction. A stale
+    // return lineage must never intercept or suppress its native renewal.
+    if client
+        .lease
+        .as_ref()
+        .is_some_and(|lease| validate_renewal(lease, &frame.lease).is_ok())
+    {
+        return Ok(false);
+    }
+
+    purge_completed_return_lineages(client, Instant::now());
+    let pending = client
+        .pending_revoke
+        .as_ref()
+        .filter(|pending| validate_renewal(&pending.lease, &frame.lease).is_ok())
+        .cloned();
+    let completed = client
+        .completed_revokes
+        .iter()
+        .filter_map(|completed| completed.renewal_lineage.as_ref())
+        .filter(|lineage| validate_renewal(&lineage.lease, &frame.lease).is_ok())
+        .max_by_key(|lineage| lineage.lease.claims.expires_at)
+        .cloned();
+    let Some(predecessor) = pending
+        .as_ref()
+        .map(|pending| pending.lease.clone())
+        .or_else(|| completed.as_ref().map(|completed| completed.lease.clone()))
+    else {
+        return Ok(false);
+    };
+
+    // Relay mail can arrive after the renewed token's own 20-second lifetime.
+    // It remains safe to return only when the claims were valid in their
+    // original window and exactly advance a still-retained closed lineage.
+    match frame.lease.validate(now) {
+        Ok(()) => {}
+        Err(V2ProtocolError::Expired) if frame.lease.expires_at <= now => frame
+            .lease
+            .validate(frame.lease.expires_at.saturating_sub(1))
+            .map_err(|error| error.to_string())?,
+        Err(error) => return Err(error.to_string()),
+    }
+    validate_claim_identity(client, &frame.lease)?;
+    validate_renewal(&predecessor, &frame.lease)?;
+    let mut session = predecessor.session.clone();
+    session.expires_at = expiry_datetime(frame.lease.expires_at)?;
+    let renewed = ClientLease {
+        request_id: predecessor.request_id.clone(),
+        token: frame.lease_token.clone(),
+        claims: frame.lease.clone(),
+        session,
+    };
+    let queued = exact_lease_revocation_frame(state, &renewed, "late_renewal_after_return")?;
+    let queued_after_superseding = client
+        .urgent_control_frames
+        .iter()
+        .filter(|candidate| candidate.lease_id != renewed.claims.lease_id)
+        .count();
+    if queued_after_superseding >= MAX_URGENT_CONTROL_FRAMES {
+        return Err("urgent lease-revoke queue reached its safety bound".into());
+    }
+
+    let completed_candidate = if let Some(pending) = pending.as_ref() {
+        completed_revoke_from_pending(pending)
+    } else {
+        let retain_until = completed
+            .as_ref()
+            .expect("a closed predecessor was selected")
+            .retain_until;
+        let mut tokenless = renewed.clone();
+        tokenless.token.clear();
+        CompletedRevoke {
+            app_id: tokenless.claims.app_id.clone(),
+            request_id: Some(queued.request_id.clone()),
+            lease_id: tokenless.claims.lease_id.clone(),
+            lease_jti: tokenless.claims.jti.clone(),
+            frame_digest: None,
+            unsolicited_frame_digest: None,
+            renewal_lineage: Some(CompletedReturnLineage {
+                lease: tokenless,
+                retain_until,
+            }),
+        }
+    };
+    // Reserve the replay/lineage fence before replacing queued bytes. After
+    // this succeeds, every remaining operation is infallible under the lock.
+    remember_completed_revoke(client, completed_candidate)?;
+    client
+        .urgent_control_frames
+        .retain(|candidate| candidate.lease_id != renewed.claims.lease_id);
+    client.urgent_control_frames.push_back(queued.clone());
+
+    if let Some(pending) = pending {
+        // The predecessor JTI can no longer become current after a valid
+        // renewal. Fence its late acknowledgement separately while the
+        // descendant gets a fresh pending return transaction and keeps the
+        // original UI/native-action deadline.
+        client.pending_revoke = Some(PendingRevoke {
+            request_id: queued.request_id,
+            lease_id: renewed.claims.lease_id.clone(),
+            lease_jti: renewed.claims.jti.clone(),
+            lease: renewed,
+            authoritative_sequence: pending.authoritative_sequence,
+            authoritative_remote_revision: pending.authoritative_remote_revision,
+            native_action_id: pending.native_action_id,
+            deadline: pending.deadline,
+            lineage_retain_until: pending.lineage_retain_until,
+        });
+    }
+    // If the original return was already completed, the new exact token is
+    // urgent-only cleanup: never recreate a pending action or timeout.
+    remember_applied_relay_frame(client, replay_key.to_owned(), encoded)?;
     Ok(true)
 }
 
@@ -4023,6 +4208,7 @@ async fn prepare_revoke(
             authoritative_remote_revision,
             native_action_id,
             deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+            lineage_retain_until: Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL,
         });
         if is_native_return {
             client.pending_native_end = None;
@@ -4054,6 +4240,18 @@ async fn abandon_pending_revoke(state: &V2State, request_id: &str) -> Option<Str
         .as_ref()
         .is_some_and(|pending| pending.request_id == request_id)
     {
+        let pending = client
+            .pending_revoke
+            .as_ref()
+            .expect("matching pending return was checked")
+            .clone();
+        if let Err(message) =
+            remember_completed_revoke(&mut client, completed_revoke_from_pending(&pending))
+        {
+            eprintln!(
+                "[AokieCompanion][realtime] abandoned lease return lineage could not be retained: {message}"
+            );
+        }
         return client
             .pending_revoke
             .take()
@@ -4525,10 +4723,11 @@ async fn progress_native_end(
 }
 
 async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
-    let (native_end, native_hangup, pending_revoke, pending_lease) = {
+    let (native_end, native_hangup, pending_revoke, pending_revoke_error, pending_lease) = {
         let mut client = state.inner.lock().await;
         let now = Instant::now();
         purge_local_expiry_tombstones(&mut client, now);
+        purge_completed_return_lineages(&mut client, now);
         let native_end = if client
             .pending_native_end
             .as_ref()
@@ -4555,15 +4754,8 @@ async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
         } else {
             None
         };
-        let pending_revoke = if client
-            .pending_revoke
-            .as_ref()
-            .is_some_and(|pending| pending.deadline <= now)
-        {
-            client.pending_revoke.take()
-        } else {
-            None
-        };
+        let (pending_revoke, pending_revoke_error) =
+            take_timed_out_pending_revoke(&mut client, now);
         let pending_timeout = client
             .pending
             .as_ref()
@@ -4577,8 +4769,20 @@ async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
         if let Some((pending, _)) = pending_lease.as_ref() {
             remember_terminal_offer_acceptance(&mut client, pending);
         }
-        (native_end, native_hangup, pending_revoke, pending_lease)
+        (
+            native_end,
+            native_hangup,
+            pending_revoke,
+            pending_revoke_error,
+            pending_lease,
+        )
     };
+
+    if let Some(message) = pending_revoke_error {
+        eprintln!(
+            "[AokieCompanion][realtime] timed-out lease return lineage could not be retained: {message}"
+        );
+    }
 
     if let Some(action_id) = native_hangup {
         let _ = crate::android_runtime::complete_native_call_action(
@@ -4643,8 +4847,25 @@ async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
     }
 }
 
+fn take_timed_out_pending_revoke(
+    client: &mut ClientState,
+    now: Instant,
+) -> (Option<PendingRevoke>, Option<String>) {
+    let Some(pending) = client
+        .pending_revoke
+        .as_ref()
+        .filter(|pending| pending.deadline <= now)
+        .cloned()
+    else {
+        return (None, None);
+    };
+    let lineage_error =
+        remember_completed_revoke(client, completed_revoke_from_pending(&pending)).err();
+    (client.pending_revoke.take(), lineage_error)
+}
+
 async fn fail_native_call_actions_on_disconnect(app: &AppHandle, state: &V2State) {
-    let (action_ids, native_call) = {
+    let (action_ids, native_call, lineage_error) = {
         let mut client = state.inner.lock().await;
         let mut action_ids = Vec::new();
         if let Some(pending) = client.pending_native_end.take() {
@@ -4654,6 +4875,10 @@ async fn fail_native_call_actions_on_disconnect(app: &AppHandle, state: &V2State
             action_ids.push(pending.action_id);
             client.pending_end_caller = None;
         }
+        let pending_revoke = client.pending_revoke.as_ref().cloned();
+        let lineage_error = pending_revoke.as_ref().and_then(|pending| {
+            remember_completed_revoke(&mut client, completed_revoke_from_pending(pending)).err()
+        });
         if let Some(pending) = client.pending_revoke.take() {
             if let Some(action_id) = pending.native_action_id {
                 action_ids.push(action_id);
@@ -4667,8 +4892,13 @@ async fn fail_native_call_actions_on_disconnect(app: &AppHandle, state: &V2State
             action_ids.push(action_id);
         }
         let native_call = native_call_to_cancel_on_disconnect(&client);
-        (action_ids, native_call)
+        (action_ids, native_call, lineage_error)
     };
+    if let Some(message) = lineage_error {
+        eprintln!(
+            "[AokieCompanion][realtime] interrupted lease return lineage could not be retained: {message}"
+        );
+    }
     for action_id in action_ids {
         let _ = crate::android_runtime::complete_native_call_action(
             app,
@@ -6584,10 +6814,11 @@ async fn handle_gateway_frame(
             let updated =
                 apply_microphone_mute_status(state, expected_app_id, frame, encoded).await?;
             if let Some(snapshot) = updated {
-                app.emit("aokie-companion://v2-snapshot", snapshot)
-                    .map_err(|_| {
-                        "could not deliver authoritative microphone mute state".to_string()
-                    })?;
+                app.emit(
+                    "aokie-companion://v2-microphone-mute-reconciliation",
+                    snapshot,
+                )
+                .map_err(|_| "could not deliver authoritative microphone mute state".to_string())?;
             }
         }
         "end_caller_challenge" => {
@@ -7011,13 +7242,21 @@ async fn apply_microphone_mute_status(
     {
         return Err("microphone mute status crossed its exact lease or call fence".into());
     }
-    if snapshot.snapshot.remote_revision > frame.remote_revision {
+    if snapshot.snapshot.remote_revision >= frame.remote_revision {
         if snapshot.snapshot.companion_microphone_muted != frame.muted {
-            return Err("newer authoritative state contradicted microphone mute status".into());
+            return Err("current authoritative state contradicted microphone mute status".into());
         }
     } else {
         snapshot.snapshot.remote_revision = frame.remote_revision;
         snapshot.snapshot.companion_microphone_muted = frame.muted;
+        // Pending offers are signed for every enclosing call-state fence,
+        // including remoteRevision.  This targeted status legitimately moves
+        // that revision before the plugin's forced full snapshot arrives, so
+        // retaining the cached offers would manufacture a hybrid projection:
+        // new mute truth wrapped around old signed offers.  Never rewrite an
+        // opaque offer token; discard the superseded offers and let the next
+        // authoritative snapshot repopulate freshly bound ones.
+        snapshot.snapshot.pending_mobile_offers.clear();
         client.snapshot = Some(snapshot.clone());
     }
     client.pending_microphone_mute = None;
@@ -7289,6 +7528,12 @@ where
             // grants/consent, then return it without touching any newer peer.
             return Ok(None);
         }
+        if contain_late_return_renewal(state, &mut client, &frame, &replay_key, encoded, now)? {
+            // Return-to-Aokie already closed the native peer. Advance only
+            // the exact closed token lineage and queue its renewed descendant
+            // for return without recreating media authority.
+            return Ok(None);
+        }
     }
     frame
         .lease
@@ -7304,6 +7549,11 @@ where
         {
             // A local expiry could win while current-time validation was
             // outside the lock; preserve the same exact no-native outcome.
+            return Ok(None);
+        }
+        if contain_late_return_renewal(state, &mut client, &frame, &replay_key, encoded, now)? {
+            // A user return can win in the narrow interval between the first
+            // containment check and this transaction reservation.
             return Ok(None);
         }
         purge_local_expiry_tombstones(&mut client, Instant::now());
@@ -7633,6 +7883,7 @@ async fn abort_lease_status(
             authoritative_remote_revision,
             native_action_id: None,
             deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+            lineage_retain_until: Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL,
         });
     }
     let tombstone_error = if authority_was_current && plan.operation == LeaseOperation::Renew {
@@ -10715,6 +10966,405 @@ mod tests {
         assert!(lease_heartbeat_due(now + 14, now));
         assert!(lease_heartbeat_due(now + 1, now));
         assert!(!lease_heartbeat_due(now, now));
+    }
+
+    #[tokio::test]
+    async fn renewal_crossing_return_rotates_only_the_pending_revoke_lineage() {
+        let state = V2State::default();
+        let (mut client, active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        let returning = ClientLease {
+            request_id: "claim_request_a".into(),
+            token: "signed.returning.token".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active.clone(),
+        };
+        let original_deadline = Instant::now() + REVOKE_CONFIRM_TIMEOUT;
+        client.pending_revoke = Some(PendingRevoke {
+            request_id: "return_request_old".into(),
+            lease_id: returning.claims.lease_id.clone(),
+            lease_jti: returning.claims.jti.clone(),
+            lease: returning.clone(),
+            authoritative_sequence: 8,
+            authoritative_remote_revision: Some(13),
+            native_action_id: Some("native_return_a".into()),
+            deadline: original_deadline,
+            lineage_retain_until: Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL,
+        });
+        *state.inner.lock().await = client;
+
+        let mut renewed = active;
+        renewed.expires_at += 20;
+        renewed.jti = "lease_renewed_while_returning".into();
+        let frame = lease_status_frame(
+            "lease_renewed",
+            "signed.renewed.while.returning",
+            renewed.clone(),
+        );
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let native_calls = Arc::new(AtomicU64::new(0));
+        let counted = native_calls.clone();
+        let applied = apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame.clone(),
+            &encoded,
+            move |_, _, _, _| {
+                counted.fetch_add(1, Ordering::AcqRel);
+                async { Ok(()) }
+            },
+            |_| async {},
+        )
+        .await
+        .expect("an exact in-flight renewal is contained by the return fence");
+        assert!(applied.is_none());
+        assert_eq!(native_calls.load(Ordering::Acquire), 0);
+
+        let mut client = state.inner.lock().await;
+        assert!(client.lease.is_none(), "renewal must never reopen media");
+        let pending = client
+            .pending_revoke
+            .as_ref()
+            .expect("the renewed descendant remains fenced");
+        assert_eq!(pending.lease_jti, renewed.jti);
+        assert_eq!(pending.lease.token, "signed.renewed.while.returning");
+        assert_eq!(pending.native_action_id.as_deref(), Some("native_return_a"));
+        assert_eq!(pending.deadline, original_deadline);
+        let queued = client
+            .urgent_control_frames
+            .back()
+            .expect("the renewed token gets an exact return");
+        let revoke: LeaseRevokeFrame = serde_json::from_str(&queued.encoded).unwrap();
+        assert_eq!(revoke.lease_token, "signed.renewed.while.returning");
+        assert_eq!(revoke.reason, "late_renewal_after_return");
+        assert!(client.completed_revokes.iter().any(|completed| {
+            completed.request_id.as_deref() == Some("return_request_old")
+                && completed.lease_jti == returning.claims.jti
+        }));
+
+        let renewed_notice = LeaseRevokedFrame {
+            kind: "lease_revoked".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: None,
+            lease_id: renewed.lease_id,
+            lease_jti: renewed.jti,
+            reason: "media_protocol_failure".into(),
+        };
+        assert!(pending_revoke_identity_matches(&client, &renewed_notice).unwrap());
+
+        let old_ack = LeaseRevokedFrame {
+            kind: "lease_revoked".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: Some("return_request_old".into()),
+            lease_id: returning.claims.lease_id,
+            lease_jti: returning.claims.jti,
+            reason: "returned".into(),
+        };
+        let old_ack_encoded = serde_json::to_string(&old_ack).unwrap();
+        assert!(
+            completed_revoke_frame_is_replay(&mut client, &old_ack, &old_ack_encoded,).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_renewal_is_not_hidden_by_a_pending_return() {
+        let state = V2State::default();
+        let (mut client, active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        let returning = ClientLease {
+            request_id: "claim_request_a".into(),
+            token: "signed.returning.token".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active.clone(),
+        };
+        client.pending_revoke = Some(PendingRevoke {
+            request_id: "return_request_old".into(),
+            lease_id: returning.claims.lease_id.clone(),
+            lease_jti: returning.claims.jti.clone(),
+            lease: returning,
+            authoritative_sequence: 8,
+            authoritative_remote_revision: Some(13),
+            native_action_id: None,
+            deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+            lineage_retain_until: Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL,
+        });
+        *state.inner.lock().await = client;
+
+        let mut unrelated = active;
+        unrelated.lease_id = "media_unrelated".into();
+        unrelated.jti = "lease_unrelated".into();
+        unrelated.expires_at += 20;
+        let frame = lease_status_frame("lease_renewed", "signed.unrelated", unrelated);
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let error = apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            |_, _, _, _| async { panic!("unrelated renewal must not touch native media") },
+            |_| async {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "lease_renewed has no current lease");
+        assert_eq!(
+            state
+                .inner
+                .lock()
+                .await
+                .pending_revoke
+                .as_ref()
+                .unwrap()
+                .lease_jti,
+            "lease_a"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CompletedReturnOrdering {
+        Acknowledgement,
+        Snapshot,
+        Idle,
+        Timeout,
+    }
+
+    #[tokio::test]
+    async fn renewal_after_every_completed_return_ordering_is_urgent_only_cleanup() {
+        for ordering in [
+            CompletedReturnOrdering::Acknowledgement,
+            CompletedReturnOrdering::Snapshot,
+            CompletedReturnOrdering::Idle,
+            CompletedReturnOrdering::Timeout,
+        ] {
+            let state = V2State::default();
+            let (mut client, active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+            let returning = ClientLease {
+                request_id: "claim_request_a".into(),
+                token: "signed.returning.token".into(),
+                session: session_from_claims(&active, 2, 2).unwrap(),
+                claims: active.clone(),
+            };
+            let retain_until = Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL;
+            let mut pending = PendingRevoke {
+                request_id: "return_request_old".into(),
+                lease_id: returning.claims.lease_id.clone(),
+                lease_jti: returning.claims.jti.clone(),
+                lease: returning,
+                authoritative_sequence: 8,
+                authoritative_remote_revision: Some(13),
+                native_action_id: Some("native_return_a".into()),
+                deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+                lineage_retain_until: retain_until,
+            };
+            client.authoritative_sequence = 8;
+            client.pending_revoke = Some(pending.clone());
+
+            match ordering {
+                CompletedReturnOrdering::Acknowledgement => {
+                    remember_completed_revoke(&mut client, completed_revoke_from_pending(&pending))
+                        .unwrap();
+                    client.pending_revoke = None;
+                }
+                CompletedReturnOrdering::Snapshot => {
+                    let mut snapshot = return_snapshot(LeaseMode::Takeover, 9);
+                    snapshot.snapshot.owner_epoch = active.owner_epoch + 1;
+                    snapshot.snapshot.remote_revision = 14;
+                    assert!(
+                        take_snapshot_confirmed_pending_revoke(&mut client, &snapshot)
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                CompletedReturnOrdering::Idle => {
+                    let idle = MobileIdleSyncFrame {
+                        kind: "idle_sync".into(),
+                        schema_version: SCHEMA_VERSION,
+                        app_id: "app_a".into(),
+                        sequence: 9,
+                        grants: vec![Grant::StateRead],
+                    };
+                    assert!(transition_to_idle(&mut client, &idle).unwrap().is_some());
+                }
+                CompletedReturnOrdering::Timeout => {
+                    pending.deadline = Instant::now() - Duration::from_millis(1);
+                    client.pending_revoke = Some(pending);
+                    let (timed_out, error) =
+                        take_timed_out_pending_revoke(&mut client, Instant::now());
+                    assert!(error.is_none(), "{ordering:?}: {error:?}");
+                    assert!(timed_out.is_some(), "{ordering:?}");
+                }
+            }
+            assert!(client.pending_revoke.is_none(), "{ordering:?}");
+            *state.inner.lock().await = client;
+
+            let mut renewed = active;
+            renewed.expires_at += 20;
+            renewed.jti = format!("lease_renewed_after_{ordering:?}").to_lowercase();
+            let frame = lease_status_frame(
+                "lease_renewed",
+                "signed.renewed.after.completed.return",
+                renewed.clone(),
+            );
+            let encoded = serde_json::to_string(&frame).unwrap();
+            let native_calls = Arc::new(AtomicU64::new(0));
+            let counted = native_calls.clone();
+            let applied = apply_lease_status_transaction(
+                &state,
+                "app_a",
+                frame,
+                &encoded,
+                move |_, _, _, _| {
+                    counted.fetch_add(1, Ordering::AcqRel);
+                    async { Ok(()) }
+                },
+                |_| async {},
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{ordering:?}: {error}"));
+            assert!(applied.is_none(), "{ordering:?}");
+            assert_eq!(native_calls.load(Ordering::Acquire), 0, "{ordering:?}");
+
+            let client = state.inner.lock().await;
+            assert!(client.lease.is_none(), "{ordering:?}");
+            assert!(client.pending_revoke.is_none(), "{ordering:?}");
+            let queued = client
+                .urgent_control_frames
+                .back()
+                .unwrap_or_else(|| panic!("{ordering:?}: renewed return was not queued"));
+            let revoke: LeaseRevokeFrame = serde_json::from_str(&queued.encoded).unwrap();
+            assert_eq!(
+                revoke.lease_token, "signed.renewed.after.completed.return",
+                "{ordering:?}"
+            );
+            let descendant = client
+                .completed_revokes
+                .iter()
+                .find(|completed| completed.lease_jti == renewed.jti)
+                .and_then(|completed| completed.renewal_lineage.as_ref())
+                .unwrap_or_else(|| panic!("{ordering:?}: descendant lineage was not retained"));
+            assert!(descendant.lease.token.is_empty(), "{ordering:?}");
+            assert_eq!(descendant.retain_until, retain_until, "{ordering:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_completed_return_lineage_does_not_hide_an_unsolicited_renewal() {
+        let state = V2State::default();
+        let (mut client, active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        let returning = ClientLease {
+            request_id: "claim_request_a".into(),
+            token: "signed.returning.token".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active.clone(),
+        };
+        let pending = PendingRevoke {
+            request_id: "return_request_old".into(),
+            lease_id: returning.claims.lease_id.clone(),
+            lease_jti: returning.claims.jti.clone(),
+            lease: returning,
+            authoritative_sequence: 8,
+            authoritative_remote_revision: Some(13),
+            native_action_id: None,
+            deadline: Instant::now() - Duration::from_secs(1),
+            lineage_retain_until: Instant::now() - Duration::from_millis(1),
+        };
+        remember_completed_revoke(&mut client, completed_revoke_from_pending(&pending)).unwrap();
+        *state.inner.lock().await = client;
+
+        let mut renewed = active;
+        renewed.expires_at += 20;
+        renewed.jti = "lease_after_expired_return_fence".into();
+        let frame = lease_status_frame("lease_renewed", "signed.too.late", renewed);
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let error = apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            |_, _, _, _| async { panic!("expired return lineage must not invoke native media") },
+            |_| async {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "lease_renewed has no current lease");
+        let client = state.inner.lock().await;
+        assert!(client.urgent_control_frames.is_empty());
+        assert!(client
+            .completed_revokes
+            .iter()
+            .all(|completed| completed.renewal_lineage.is_none()));
+    }
+
+    #[tokio::test]
+    async fn completed_return_renewal_cannot_mutate_newer_unrelated_authority() {
+        let state = V2State::default();
+        let (mut client, active) = lease_status_client(LeaseMode::Takeover, LeasePhase::Active);
+        let returning = ClientLease {
+            request_id: "claim_request_old".into(),
+            token: "signed.returning.old".into(),
+            session: session_from_claims(&active, 2, 2).unwrap(),
+            claims: active.clone(),
+        };
+        let pending = PendingRevoke {
+            request_id: "return_request_old".into(),
+            lease_id: returning.claims.lease_id.clone(),
+            lease_jti: returning.claims.jti.clone(),
+            lease: returning,
+            authoritative_sequence: 8,
+            authoritative_remote_revision: Some(13),
+            native_action_id: None,
+            deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+            lineage_retain_until: Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL,
+        };
+        remember_completed_revoke(&mut client, completed_revoke_from_pending(&pending)).unwrap();
+
+        let mut current_claims = active.clone();
+        current_claims.lease_id = "media_new_owner".into();
+        current_claims.jti = "lease_new_owner".into();
+        current_claims.owner_epoch += 2;
+        current_claims.expires_at += 5;
+        let current = ClientLease {
+            request_id: "claim_request_new".into(),
+            token: "signed.current.new.owner".into(),
+            session: session_from_claims(&current_claims, 3, 3).unwrap(),
+            claims: current_claims,
+        };
+        client.lease = Some(current.clone());
+        *state.inner.lock().await = client;
+
+        let mut renewed = active;
+        renewed.expires_at += 20;
+        renewed.jti = "lease_old_owner_late_renewal".into();
+        let frame = lease_status_frame(
+            "lease_renewed",
+            "signed.old.owner.late.renewal",
+            renewed.clone(),
+        );
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let native_calls = Arc::new(AtomicU64::new(0));
+        let counted = native_calls.clone();
+        assert!(apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            move |_, _, _, _| {
+                counted.fetch_add(1, Ordering::AcqRel);
+                async { Ok(()) }
+            },
+            |_| async {},
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(native_calls.load(Ordering::Acquire), 0);
+
+        let client = state.inner.lock().await;
+        assert_eq!(client.lease.as_ref(), Some(&current));
+        assert!(client.pending_revoke.is_none());
+        let queued = client.urgent_control_frames.back().unwrap();
+        assert_eq!(queued.lease_id, renewed.lease_id);
+        assert_eq!(queued.lease_jti, renewed.jti);
     }
 
     #[tokio::test]
@@ -13843,6 +14493,7 @@ mod tests {
             authoritative_remote_revision: Some(13),
             native_action_id: Some("native_return_a".into()),
             deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+            lineage_retain_until: Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL,
         }
     }
 
@@ -13927,6 +14578,7 @@ mod tests {
             authoritative_remote_revision: Some(13),
             native_action_id: None,
             deadline: Instant::now() + REVOKE_CONFIRM_TIMEOUT,
+            lineage_retain_until: Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL,
         };
         push_local_expiry_tombstone(
             &mut client,
@@ -14123,7 +14775,13 @@ mod tests {
         let state = V2State::default();
         {
             let mut client = state.inner.lock().await;
+            let retain_until = Instant::now() + LOCAL_EXPIRY_TOMBSTONE_TTL;
             for index in 0..=MAX_COMPLETED_REVOKES {
+                let mut lease = pending_revoke_fixture(LeaseMode::Takeover, 8).lease;
+                lease.token.clear();
+                lease.claims.lease_id = format!("media_{index}");
+                lease.claims.jti = format!("lease_{index}");
+                lease.session.binding.lease_id = Some(lease.claims.lease_id.clone());
                 remember_completed_revoke(
                     &mut client,
                     CompletedRevoke {
@@ -14133,11 +14791,19 @@ mod tests {
                         lease_jti: format!("lease_{index}"),
                         frame_digest: Some(relay_frame_digest(&format!("revoke_{index}"))),
                         unsolicited_frame_digest: None,
+                        renewal_lineage: Some(CompletedReturnLineage {
+                            lease,
+                            retain_until,
+                        }),
                     },
                 )
                 .unwrap();
             }
             assert_eq!(client.completed_revokes.len(), MAX_COMPLETED_REVOKES);
+            assert!(client.completed_revokes.iter().all(|completed| completed
+                .renewal_lineage
+                .as_ref()
+                .is_some_and(|lineage| lineage.lease.token.is_empty())));
             assert_eq!(
                 client
                     .completed_revokes
@@ -14153,6 +14819,10 @@ mod tests {
 
         let client = state.inner.lock().await;
         assert_eq!(client.completed_revokes.len(), MAX_COMPLETED_REVOKES);
+        assert!(client
+            .completed_revokes
+            .iter()
+            .all(|completed| completed.renewal_lineage.is_some()));
         assert_eq!(
             client
                 .completed_revokes
@@ -14283,6 +14953,158 @@ mod tests {
             .push(Grant::EndCaller);
         client.snapshot.as_mut().unwrap().snapshot.service_mode = ServiceMode::ReturningToAokie;
         assert!(validate_local_end_caller(&client, now).is_err());
+    }
+
+    #[tokio::test]
+    async fn targeted_mute_status_drops_cached_offers_from_the_superseded_revision() {
+        let state = V2State::default();
+        let mut client = end_caller_client();
+        client.relay_transport = true;
+        client
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .grants
+            .push(Grant::RtcSignal);
+        client
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .grants
+            .push(Grant::ResumeAokie);
+        let old_offer = offered_client(LeaseMode::Takeover, MobileOfferSurface::InApp)
+            .snapshot
+            .unwrap()
+            .snapshot
+            .pending_mobile_offers
+            .pop()
+            .expect("fixture has an offer at the current revision");
+        client
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .pending_mobile_offers = vec![old_offer];
+        let snapshot = client.snapshot.as_ref().unwrap().clone();
+        let lease = client.lease.as_ref().unwrap().clone();
+        client.pending_microphone_mute = Some(pending_microphone_mute(
+            "microphone_mute_a".into(),
+            true,
+            PendingMicrophoneMuteStage::AwaitingStatus,
+            &snapshot,
+            &lease,
+        ));
+        let frame = PluginMicrophoneMuteStatusFrame {
+            kind: "microphone_mute_status".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: lease.claims.app_id.clone(),
+            device_id: lease.claims.device_id.clone(),
+            request_id: "microphone_mute_a".into(),
+            lease_id: lease.claims.lease_id.clone(),
+            lease_jti: lease.claims.jti.clone(),
+            rtc_session_id: lease.claims.rtc_session_id.clone(),
+            call_id: lease.claims.call_id.clone(),
+            call_epoch: lease.claims.call_epoch,
+            owner_epoch: lease.claims.owner_epoch,
+            switchboard_revision: snapshot.snapshot.switchboard_revision,
+            remote_revision: snapshot.snapshot.remote_revision + 1,
+            fence: lease.claims.fence,
+            muted: true,
+        };
+        let encoded = serde_json::to_string(&frame).unwrap();
+        *state.inner.lock().await = client;
+
+        let projected = apply_microphone_mute_status(&state, "app_a", frame, &encoded)
+            .await
+            .unwrap()
+            .expect("the exact targeted status advances local mute truth");
+        assert_eq!(
+            projected.snapshot.remote_revision,
+            snapshot.snapshot.remote_revision + 1
+        );
+        assert!(projected.snapshot.companion_microphone_muted);
+        assert!(projected.snapshot.pending_mobile_offers.is_empty());
+
+        let client = state.inner.lock().await;
+        assert!(client.pending_microphone_mute.is_none());
+        assert_eq!(client.lease.as_ref(), Some(&lease));
+        assert!(client
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .pending_mobile_offers
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn targeted_mute_status_preserves_offers_from_an_equal_authoritative_snapshot() {
+        let state = V2State::default();
+        let mut client = end_caller_client();
+        client.relay_transport = true;
+        client
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .grants
+            .push(Grant::RtcSignal);
+        client
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .grants
+            .push(Grant::ResumeAokie);
+        let old_snapshot = client.snapshot.as_ref().unwrap().clone();
+        let lease = client.lease.as_ref().unwrap().clone();
+        client.pending_microphone_mute = Some(pending_microphone_mute(
+            "microphone_mute_a".into(),
+            true,
+            PendingMicrophoneMuteStage::AwaitingStatus,
+            &old_snapshot,
+            &lease,
+        ));
+
+        let mut fresh_offer = offered_client(LeaseMode::Takeover, MobileOfferSurface::InApp)
+            .snapshot
+            .unwrap()
+            .snapshot
+            .pending_mobile_offers
+            .pop()
+            .expect("fixture has a fresh offer");
+        fresh_offer.offer.remote_revision += 1;
+        let snapshot = client.snapshot.as_mut().unwrap();
+        snapshot.sequence += 1;
+        snapshot.snapshot.remote_revision += 1;
+        snapshot.snapshot.companion_microphone_muted = true;
+        snapshot.snapshot.pending_mobile_offers = vec![fresh_offer.clone()];
+        let authoritative = snapshot.clone();
+        let frame = PluginMicrophoneMuteStatusFrame {
+            kind: "microphone_mute_status".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: lease.claims.app_id.clone(),
+            device_id: lease.claims.device_id.clone(),
+            request_id: "microphone_mute_a".into(),
+            lease_id: lease.claims.lease_id.clone(),
+            lease_jti: lease.claims.jti.clone(),
+            rtc_session_id: lease.claims.rtc_session_id.clone(),
+            call_id: lease.claims.call_id.clone(),
+            call_epoch: lease.claims.call_epoch,
+            owner_epoch: lease.claims.owner_epoch,
+            switchboard_revision: authoritative.snapshot.switchboard_revision,
+            remote_revision: authoritative.snapshot.remote_revision,
+            fence: lease.claims.fence,
+            muted: true,
+        };
+        let encoded = serde_json::to_string(&frame).unwrap();
+        *state.inner.lock().await = client;
+
+        let projected = apply_microphone_mute_status(&state, "app_a", frame, &encoded)
+            .await
+            .unwrap()
+            .expect("the delayed targeted status is a successful receipt");
+        assert_eq!(projected, authoritative);
+        assert_eq!(projected.snapshot.pending_mobile_offers, vec![fresh_offer]);
+        assert!(state.inner.lock().await.pending_microphone_mute.is_none());
     }
 
     #[test]

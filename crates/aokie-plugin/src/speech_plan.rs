@@ -290,9 +290,12 @@ pub fn parse_assistance_marker(text: &str) -> Option<String> {
 /// assistance parsers this is deliberately strict: the complete model reply
 /// must be one exact `[[TRANSFER: short reason]]` verdict. That keeps ordinary
 /// prose (including someone merely discussing a transfer) out of the control
-/// plane. The reason fits inside the speech planner's bounded marker window,
-/// contains no nested markup/control characters, and is never itself spoken.
+/// plane. The reason contains no nested markup/control characters and is never
+/// itself spoken; overlong model metadata is canonicalised to a fixed safe
+/// reason before it can enter history or the assistance mailbox.
 pub const MAX_TRANSFER_REASON_BYTES: usize = 30;
+const MAX_TRANSFER_UNTRUSTED_REASON_BYTES: usize = 160;
+const SAFE_TRANSFER_REASON: &str = "Caller requested the owner";
 
 pub fn parse_transfer_marker(text: &str) -> Option<String> {
     let verdict = text.trim();
@@ -301,14 +304,24 @@ pub fn parse_transfer_marker(text: &str) -> Option<String> {
         .strip_suffix("]]")?
         .trim();
     if reason.is_empty()
-        || reason.len() > MAX_TRANSFER_REASON_BYTES
+        || reason.len() > MAX_TRANSFER_UNTRUSTED_REASON_BYTES
         || reason.chars().any(char::is_control)
         || reason.contains('[')
         || reason.contains(']')
     {
         return None;
     }
-    Some(reason.to_owned())
+    // The wrapper is the control verdict; the model-authored reason is only
+    // untrusted metadata and request_transfer replaces it with the same safe
+    // generic text before fan-out.  Small models can miss the prompt's byte
+    // limit by one word (or one byte).  Treat an otherwise exact verdict as a
+    // transfer intent, but canonicalise overlong metadata instead of falsely
+    // telling the caller that nobody is available without consulting routing.
+    Some(if reason.len() > MAX_TRANSFER_REASON_BYTES {
+        SAFE_TRANSFER_REASON.to_owned()
+    } else {
+        reason.to_owned()
+    })
 }
 
 /// Phase 3: extract the manager-action request from a `[[MANAGER: ...]]`
@@ -394,7 +407,10 @@ mod manager_marker_tests {
 
 #[cfg(test)]
 mod lookup_marker_tests {
-    use super::{parse_assistance_marker, parse_transfer_marker, MAX_TRANSFER_REASON_BYTES};
+    use super::{
+        parse_assistance_marker, parse_transfer_marker, MAX_TRANSFER_REASON_BYTES,
+        SAFE_TRANSFER_REASON,
+    };
 
     #[test]
     fn parse_lookup_marker_shapes() {
@@ -446,11 +462,29 @@ mod lookup_marker_tests {
         ] {
             assert_eq!(parse_transfer_marker(invalid), None, "{invalid}");
         }
-        let too_long = format!(
+        let overlong = format!(
             "[[TRANSFER: {}]]",
             "x".repeat(MAX_TRANSFER_REASON_BYTES + 1)
         );
-        assert_eq!(parse_transfer_marker(&too_long), None);
+        assert_eq!(
+            parse_transfer_marker(&overlong).as_deref(),
+            Some(SAFE_TRANSFER_REASON),
+            "an exact marker canonicalises untrusted overlong metadata"
+        );
+        assert_eq!(
+            parse_transfer_marker("[[TRANSFER: Caller wants someone in charge.]]").as_deref(),
+            Some(SAFE_TRANSFER_REASON),
+            "the live 31-byte reason remains an exact transfer intent"
+        );
+        let unbounded = format!(
+            "[[TRANSFER: {}]]",
+            "x".repeat(super::MAX_TRANSFER_UNTRUSTED_REASON_BYTES + 1)
+        );
+        assert_eq!(
+            parse_transfer_marker(&unbounded),
+            None,
+            "untrusted marker metadata remains hard-bounded"
+        );
         let largest = format!("[[TRANSFER: {}]]", "x".repeat(MAX_TRANSFER_REASON_BYTES));
         assert_eq!(parse_transfer_marker(&largest).unwrap().len(), 30);
         assert!(super::clean_text(&super::plan_spans(
