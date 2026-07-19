@@ -14,6 +14,7 @@ use tauri::{AppHandle, State};
 use crate::managed_auth::ManagedAuthState;
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_COMPANION_CAPABILITIES: usize = 14;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -35,6 +36,9 @@ pub enum CompanionCapability {
     StateRead,
     CallerRead,
     CaptionsRead,
+    ParticipantsRead,
+    ParticipantIdentityRead,
+    AudioLevelsRead,
     Monitor,
     Consult,
     Takeover,
@@ -943,7 +947,7 @@ fn validate_call_record_detail_binding(
 }
 
 fn validate_capabilities(capabilities: &[CompanionCapability]) -> Result<(), String> {
-    if capabilities.is_empty() || capabilities.len() > 11 {
+    if capabilities.is_empty() || capabilities.len() > MAX_COMPANION_CAPABILITIES {
         return Err("Companion capability list is invalid".into());
     }
     let unique: HashSet<_> = capabilities.iter().collect();
@@ -1063,6 +1067,25 @@ mod tests {
     fn required_nullable_fields_cannot_be_omitted() {
         let missing = availability_json().replace(",\"expiresAt\":null", "");
         assert!(parse_response::<CompanionAvailability>(missing.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn participant_capabilities_match_the_managed_api_schema() {
+        let capabilities: Vec<CompanionCapability> = serde_json::from_str(
+            r#"[
+              "state_read","caller_read","captions_read","participants_read",
+              "participant_identity_read","audio_levels_read","monitor","consult",
+              "takeover","resume_aokie","rtc_signal","assistance_read",
+              "assistance_respond","end_caller"
+            ]"#,
+        )
+        .unwrap();
+
+        assert_eq!(capabilities.len(), MAX_COMPANION_CAPABILITIES);
+        assert!(capabilities.contains(&CompanionCapability::ParticipantsRead));
+        assert!(capabilities.contains(&CompanionCapability::ParticipantIdentityRead));
+        assert!(capabilities.contains(&CompanionCapability::AudioLevelsRead));
+        assert!(validate_capabilities(&capabilities).is_ok());
     }
 
     #[test]
