@@ -8,6 +8,8 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -15,7 +17,10 @@ import androidx.core.app.Person
 import androidx.core.content.ContextCompat
 
 internal object AokieCallNotifications {
-  const val CALL_CHANNEL = "aokie_voice_offers"
+  // Channel settings are immutable after first creation. v2 deliberately
+  // creates a fresh channel so existing installs receive call-ringtone usage
+  // rather than retaining the original generic notification sound.
+  const val CALL_CHANNEL = "aokie_voice_offers_v2"
   const val INFORMATION_CHANNEL = "aokie_information"
 
   fun createChannels(context: Context) {
@@ -30,6 +35,14 @@ internal object AokieCallNotifications {
         description = "Genuine, expiring Aokie voice takeover offers"
         lockscreenVisibility = Notification.VISIBILITY_PRIVATE
         setShowBadge(false)
+        enableVibration(true)
+        setSound(
+          RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
+          AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build(),
+        )
       },
     )
     manager.createNotificationChannel(
@@ -74,20 +87,25 @@ internal object AokieCallNotifications {
   }
 
   fun incoming(context: Context, offer: AokieVoiceOffer): Notification {
-    val caller = Person.Builder().setName("Aokie caller").setImportant(true).build()
+    val transfer = offer.acceptedTransferRequestId != null
+    val caller = Person.Builder()
+      .setName(if (transfer) "Aokie transfer" else "Aokie caller")
+      .setImportant(true)
+      .build()
     val content = PendingIntent.getActivity(
       context,
       requestCode(offer.offerId, 1),
       Intent(context, MainActivity::class.java)
+        .setAction(if (transfer) MainActivity.ACTION_REFRESH_AUTHORITATIVE_ASSISTANCE else Intent.ACTION_MAIN)
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
     )
     val decline = serviceIntent(context, offer.offerId, AokieIncomingCallService.ACTION_DECLINE, 2)
     val answer = serviceIntent(context, offer.offerId, AokieIncomingCallService.ACTION_ANSWER, 3)
-    return NotificationCompat.Builder(context, CALL_CHANNEL)
+    val builder = NotificationCompat.Builder(context, CALL_CHANNEL)
       .setSmallIcon(android.R.drawable.sym_call_incoming)
-      .setContentTitle("Aokie voice offer")
-      .setContentText("Open securely to join the live caller")
+      .setContentTitle(if (transfer) "Aokie is transferring a caller" else "Aokie voice offer")
+      .setContentText(if (transfer) "Answer to accept the live caller" else "Open securely to join the live caller")
       .setContentIntent(content)
       .setCategory(NotificationCompat.CATEGORY_CALL)
       .setPriority(NotificationCompat.PRIORITY_MAX)
@@ -96,7 +114,16 @@ internal object AokieCallNotifications {
       .setTimeoutAfter((offer.expiresAt * 1000 - System.currentTimeMillis()).coerceAtLeast(1))
       .setStyle(NotificationCompat.CallStyle.forIncomingCall(caller, decline, answer))
       .addPerson(caller)
-      .build()
+    val fullScreenAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE ||
+      context.getSystemService(NotificationManager::class.java).canUseFullScreenIntent()
+    if (fullScreenAllowed) {
+      builder.setFullScreenIntent(content, true)
+    } else {
+      // CallStyle remains a high-priority heads-up/lock-screen surface even
+      // when the user has disabled full-screen call intents.
+      AokieOfferStore.recordDiagnostic(context, "full_screen_call_intent_not_allowed")
+    }
+    return builder.build()
   }
 
   fun ongoing(context: Context, offer: AokieVoiceOffer, authoritative: Boolean): Notification {
@@ -108,7 +135,16 @@ internal object AokieCallNotifications {
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
     )
-    val hangup = serviceIntent(context, offer.offerId, AokieIncomingCallService.ACTION_DECLINE, 5)
+    val hangup = serviceIntent(
+      context,
+      offer.offerId,
+      if (authoritative) {
+        AokieIncomingCallService.ACTION_HANG_UP
+      } else {
+        AokieIncomingCallService.ACTION_DECLINE
+      },
+      5,
+    )
     return NotificationCompat.Builder(context, CALL_CHANNEL)
       .setSmallIcon(android.R.drawable.sym_call_incoming)
       .setContentTitle(if (authoritative) "Aokie Companion call" else "Securing Aokie call")

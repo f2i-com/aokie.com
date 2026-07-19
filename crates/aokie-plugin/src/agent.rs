@@ -159,13 +159,11 @@ impl LlmClient {
             .client
             .as_ref()
             .map_err(|reason| format!("llm endpoint rejected: {reason}"))?;
-        let resp = crate::endpoint_http::with_gateway_bearer(
-            client.post(&self.endpoint),
-            &self.endpoint,
-        )
-        .json(&body)
-        .send()
-            .map_err(|e| format!("llm warm failed: {e}"))?;
+        let resp =
+            crate::endpoint_http::with_gateway_bearer(client.post(&self.endpoint), &self.endpoint)
+                .json(&body)
+                .send()
+                .map_err(|e| format!("llm warm failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("llm warm responded {}", resp.status()));
         }
@@ -223,13 +221,11 @@ impl LlmClient {
             .client
             .as_ref()
             .map_err(|reason| format!("llm endpoint rejected: {reason}"))?;
-        let resp = crate::endpoint_http::with_gateway_bearer(
-            client.post(&self.endpoint),
-            &self.endpoint,
-        )
-        .json(&body)
-        .send()
-            .map_err(|e| format!("transcript correction failed: {e}"))?;
+        let resp =
+            crate::endpoint_http::with_gateway_bearer(client.post(&self.endpoint), &self.endpoint)
+                .json(&body)
+                .send()
+                .map_err(|e| format!("transcript correction failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("transcript correction responded {}", resp.status()));
         }
@@ -309,13 +305,11 @@ impl LlmClient {
             .client
             .as_ref()
             .map_err(|reason| format!("llm endpoint rejected: {reason}"))?;
-        let resp = crate::endpoint_http::with_gateway_bearer(
-            client.post(&self.endpoint),
-            &self.endpoint,
-        )
-        .json(&body)
-        .send()
-            .map_err(|e| format!("llm request failed: {e}"))?;
+        let resp =
+            crate::endpoint_http::with_gateway_bearer(client.post(&self.endpoint), &self.endpoint)
+                .json(&body)
+                .send()
+                .map_err(|e| format!("llm request failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("llm responded {}", resp.status()));
         }
@@ -511,7 +505,11 @@ mod tests {
         let out = trim_silence_for_llm(&pcm, SR);
         // Expected ≈ 120ms pad + 1s tone + 600ms capped pause + 1s tone +
         // 120ms pad ≈ 2.85 s, from 6 s in. Assert generous bounds.
-        assert!(out.len() < 3 * sec + sec / 2, "too little trimmed: {}", out.len());
+        assert!(
+            out.len() < 3 * sec + sec / 2,
+            "too little trimmed: {}",
+            out.len()
+        );
         assert!(out.len() > 2 * sec, "speech lost: {}", out.len());
     }
 

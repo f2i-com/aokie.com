@@ -3,7 +3,7 @@
 //! Refresh credentials cross only the Rust/JNI boundary into an AES-GCM value
 //! protected by Android Keystore. They are never returned by a Tauri command.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -22,6 +22,21 @@ pub(crate) struct AndroidRuntimeDiagnostics {
     pub(crate) force_stop_state: String,
     pub(crate) call_infrastructure: String,
     pub(crate) last_native_diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AndroidAuthoritativeOffer {
+    pub(crate) schema_version: u16,
+    pub(crate) event_id: String,
+    pub(crate) offer_id: String,
+    pub(crate) opportunity_id: String,
+    pub(crate) app_id: String,
+    pub(crate) call_id: String,
+    pub(crate) call_epoch: u64,
+    pub(crate) owner_epoch: u64,
+    pub(crate) expires_at: u64,
+    pub(crate) accepted_transfer_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -289,6 +304,27 @@ pub(crate) async fn secure_store_delete(app: &AppHandle, key: &str) -> Result<()
 #[cfg(not(target_os = "android"))]
 pub(crate) async fn secure_store_delete(_app: &AppHandle, _key: &str) -> Result<(), String> {
     Err("Android secure storage is unavailable on this platform".into())
+}
+
+#[cfg(target_os = "android")]
+pub(crate) async fn present_authoritative_offer(
+    app: &AppHandle,
+    offer: &AndroidAuthoritativeOffer,
+) -> Result<bool, String> {
+    let encoded = serde_json::to_string(offer)
+        .map_err(|_| "Android authoritative offer could not be encoded".to_string())?;
+    if encoded.len() > 4 * 1024 {
+        return Err("Android authoritative offer exceeded its size limit".into());
+    }
+    Ok(call_int_string(app, "presentAokieAuthoritativeOffer", encoded).await? > 0)
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) async fn present_authoritative_offer(
+    _app: &AppHandle,
+    _offer: &AndroidAuthoritativeOffer,
+) -> Result<bool, String> {
+    Ok(false)
 }
 
 #[cfg(target_os = "android")]
@@ -705,6 +741,47 @@ async fn call_string_no_args(app: &AppHandle, method: &'static str) -> Result<St
         .await
         .map_err(|_| "Android native string bridge timed out".to_string())?
         .map_err(|_| "Android native string bridge was cancelled".to_string())?
+}
+
+#[cfg(target_os = "android")]
+async fn call_int_string(
+    app: &AppHandle,
+    method: &'static str,
+    argument: String,
+) -> Result<i32, String> {
+    use jni::objects::{JObject, JValue};
+    use tauri::Manager;
+    use tokio::sync::oneshot;
+
+    let window = app
+        .get_webview_window("main")
+        .ok_or("main Android webview is unavailable")?;
+    let (send, receive) = oneshot::channel();
+    window
+        .with_webview(move |webview| {
+            webview.jni_handle().exec(move |env, activity, _webview| {
+                let result = (|| -> Result<i32, String> {
+                    let argument = JObject::from(
+                        env.new_string(argument)
+                            .map_err(|error| error.to_string())?,
+                    );
+                    env.call_method(
+                        activity,
+                        method,
+                        "(Ljava/lang/String;)I",
+                        &[JValue::Object(&argument)],
+                    )
+                    .and_then(|value| value.i())
+                    .map_err(|error| error.to_string())
+                })();
+                let _ = send.send(result);
+            });
+        })
+        .map_err(|error| error.to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), receive)
+        .await
+        .map_err(|_| "Android native string call timed out".to_string())?
+        .map_err(|_| "Android native string call was cancelled".to_string())?
 }
 
 #[cfg(target_os = "android")]

@@ -97,6 +97,7 @@ const snapshot: V2CallSnapshotEvent = {
     caller: { label: "Authoritative caller", maskedNumber: "••• 431" },
     captions: [],
     participants: [],
+    companionMicrophoneMuted: false,
     pendingMobileOffers: [],
     occurredAt: "2026-07-16T00:00:00Z",
   },
@@ -115,6 +116,7 @@ const assistance: V2AssistanceRequestEvent = {
   remoteRevision: snapshot.snapshot.remoteRevision,
   question: "Can the caller use the after-hours key drop?",
   context: "Existing customer",
+  transferOffered: false,
   expiresAt: 2_000_000_000,
 };
 

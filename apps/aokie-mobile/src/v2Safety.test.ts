@@ -103,6 +103,7 @@ const endSnapshot: V2CallSnapshotEvent = {
       takeoverEnabled: true,
     },
     participants: [],
+    companionMicrophoneMuted: false,
     pendingMobileOffers: [],
     occurredAt: "2026-07-16T00:00:00Z",
   },

@@ -222,7 +222,7 @@ fn next_bracket_token(s: &str, from: usize) -> Option<(usize, usize, String)> {
         let window_end = (inner_start + 40).min(bytes.len());
         let mut j = inner_start;
         let mut found: Option<usize> = None;
-        while j < window_end {
+        while j <= window_end && j < bytes.len() {
             if bytes[j] == b'\n' || bytes[j] == b'[' {
                 break;
             }
@@ -284,6 +284,31 @@ pub fn parse_assistance_marker(text: &str) -> Option<String> {
     } else {
         Some(question.to_string())
     }
+}
+
+/// An explicit caller-to-owner handoff request. Unlike the older lookup and
+/// assistance parsers this is deliberately strict: the complete model reply
+/// must be one exact `[[TRANSFER: short reason]]` verdict. That keeps ordinary
+/// prose (including someone merely discussing a transfer) out of the control
+/// plane. The reason fits inside the speech planner's bounded marker window,
+/// contains no nested markup/control characters, and is never itself spoken.
+pub const MAX_TRANSFER_REASON_BYTES: usize = 30;
+
+pub fn parse_transfer_marker(text: &str) -> Option<String> {
+    let verdict = text.trim();
+    let reason = verdict
+        .strip_prefix("[[TRANSFER:")?
+        .strip_suffix("]]")?
+        .trim();
+    if reason.is_empty()
+        || reason.len() > MAX_TRANSFER_REASON_BYTES
+        || reason.chars().any(char::is_control)
+        || reason.contains('[')
+        || reason.contains(']')
+    {
+        return None;
+    }
+    Some(reason.to_owned())
 }
 
 /// Phase 3: extract the manager-action request from a `[[MANAGER: ...]]`
@@ -369,7 +394,7 @@ mod manager_marker_tests {
 
 #[cfg(test)]
 mod lookup_marker_tests {
-    use super::parse_assistance_marker;
+    use super::{parse_assistance_marker, parse_transfer_marker, MAX_TRANSFER_REASON_BYTES};
 
     #[test]
     fn parse_lookup_marker_shapes() {
@@ -403,6 +428,37 @@ mod lookup_marker_tests {
         );
         assert_eq!(parse_assistance_marker("[[ASSISTANCE:]]"), None);
         assert_eq!(parse_assistance_marker("[[ASSISTANCE: unclosed"), None);
+    }
+
+    #[test]
+    fn transfer_marker_is_exact_and_bounded() {
+        assert_eq!(
+            parse_transfer_marker("  [[TRANSFER: caller asked for owner]]\n"),
+            Some("caller asked for owner".into())
+        );
+        for invalid in [
+            "Please wait. [[TRANSFER: caller asked for owner]]",
+            "[[transfer: caller asked for owner]]",
+            "[[TRANSFER:]]",
+            "[[TRANSFER: caller asked for owner]",
+            "[[TRANSFER: caller [asked] for owner]]",
+            "[[TRANSFER: caller asked for owner]] trailing",
+        ] {
+            assert_eq!(parse_transfer_marker(invalid), None, "{invalid}");
+        }
+        let too_long = format!(
+            "[[TRANSFER: {}]]",
+            "x".repeat(MAX_TRANSFER_REASON_BYTES + 1)
+        );
+        assert_eq!(parse_transfer_marker(&too_long), None);
+        let largest = format!("[[TRANSFER: {}]]", "x".repeat(MAX_TRANSFER_REASON_BYTES));
+        assert_eq!(parse_transfer_marker(&largest).unwrap().len(), 30);
+        assert!(super::clean_text(&super::plan_spans(
+            &largest,
+            &super::PaceState::default(),
+            2_500,
+        ))
+        .is_empty());
     }
 }
 

@@ -4,6 +4,8 @@
 //! the selected Companion receive them; the gateway validates and relays the
 //! frames but never handles media.
 
+use std::collections::HashSet;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,10 @@ pub const ENDPOINT_PROOF_MAX_LIFETIME: u64 = 30;
 pub const ENDPOINT_PROOF_CLOCK_SKEW: u64 = 5;
 pub const MOBILE_OFFER_MAX_LIFETIME: u64 = 30;
 pub const MAX_PENDING_MOBILE_OFFERS: usize = 8;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 pub const ENDPOINT_PUBLIC_KEY_BYTES: usize = 32;
 pub const ENDPOINT_SIGNATURE_BYTES: usize = 64;
 pub const MAX_APPROVED_PEER_KEYS: usize = 64;
@@ -374,6 +380,11 @@ pub struct PendingMobileOfferClaims {
     pub owner_epoch: u64,
     pub switchboard_revision: u64,
     pub remote_revision: u64,
+    /// Present only when this signed Takeover invitation is the acceptance
+    /// path for one exact Aokie transfer request. A generic takeover offer
+    /// omits it and therefore cannot accidentally consume the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_transfer_request_id: Option<String>,
     pub required_consent_policy_id: String,
     pub required_consent_policy_version: u32,
     pub required_grants: Vec<Grant>,
@@ -397,6 +408,19 @@ impl PendingMobileOfferClaims {
         safe_integer("ownerEpoch", self.owner_epoch, 0)?;
         safe_integer("switchboardRevision", self.switchboard_revision, 0)?;
         safe_integer("remoteRevision", self.remote_revision, 0)?;
+        if let Some(request_id) = &self.accepted_transfer_request_id {
+            safe_id("acceptedTransferRequestId", request_id)?;
+            if self.offered_mode != LeaseMode::Takeover {
+                return Err(V2ProtocolError::Unsafe(
+                    "accepted transfer requests require takeover offers",
+                ));
+            }
+            if !self.required_grants.contains(&Grant::AssistanceRespond) {
+                return Err(V2ProtocolError::Unsafe(
+                    "accepted transfer offers require AssistanceRespond",
+                ));
+            }
+        }
         safe_id("requiredConsentPolicyId", &self.required_consent_policy_id)?;
         safe_integer(
             "requiredConsentPolicyVersion",
@@ -776,8 +800,17 @@ pub struct AuthoritativeCallSnapshot {
     pub caller: Option<CallerProjection>,
     #[serde(default)]
     pub captions: Vec<Caption>,
+    /// Participant presence authored by the media endpoint. Older plugin
+    /// snapshots omit it; the empty default preserves that wire shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<ParticipantPresence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_levels: Option<Vec<NormalizedAudioLevel>>,
+    /// Authoritative Desktop caller-TX gate for the exact active Companion
+    /// lease. This is distinct from a handset capture preference: when true,
+    /// the plugin itself refuses microphone PCM at the caller/consult seam.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub companion_microphone_muted: bool,
     /// Offers the authority is currently prepared to honour.
     ///
     /// Over the WebSocket carrier the gateway is the lease authority and mints
@@ -822,13 +855,41 @@ impl AuthoritativeCallSnapshot {
             bounded_text("captionText", &caption.text, MAX_CAPTION_BYTES)?;
             bounded_text("occurredAt", &caption.occurred_at, 64)?;
         }
+        if self.participants.len() > MAX_PARTICIPANTS {
+            return Err(V2ProtocolError::Invalid("participants"));
+        }
+        let mut participant_ids = HashSet::new();
+        for participant in &self.participants {
+            participant.validate()?;
+            if !participant_ids.insert(participant.participant_id.as_str()) {
+                return Err(V2ProtocolError::Invalid("participants"));
+            }
+        }
         if let Some(audio_levels) = &self.audio_levels {
             if audio_levels.len() > MAX_AUDIO_LEVELS {
                 return Err(V2ProtocolError::Invalid("audioLevels"));
             }
             for level in audio_levels {
                 level.validate()?;
+                if level.source == AudioLevelSource::Companion
+                    && level
+                        .participant_id
+                        .as_deref()
+                        .is_none_or(|participant_id| !participant_ids.contains(participant_id))
+                {
+                    return Err(V2ProtocolError::Invalid("audioLevels.participantId"));
+                }
             }
+        }
+        if self.companion_microphone_muted
+            && !matches!(
+                self.service_mode,
+                ServiceMode::ConsultActive | ServiceMode::HumanActive
+            )
+        {
+            return Err(V2ProtocolError::Unsafe(
+                "Companion microphone mute requires active Companion media authority",
+            ));
         }
         if self.pending_mobile_offers.len() > MAX_PENDING_MOBILE_OFFERS {
             return Err(V2ProtocolError::Invalid("pendingMobileOffers"));
@@ -884,6 +945,8 @@ pub struct ProjectedCallSnapshot {
     pub participants: Vec<ParticipantPresence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_levels: Option<Vec<NormalizedAudioLevel>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub companion_microphone_muted: bool,
     #[serde(default)]
     pub pending_mobile_offers: Vec<SignedPendingMobileOffer>,
     pub occurred_at: String,
@@ -923,6 +986,16 @@ impl ProjectedCallSnapshot {
             for level in levels {
                 level.validate()?;
             }
+        }
+        if self.companion_microphone_muted
+            && !matches!(
+                self.service_mode,
+                ServiceMode::ConsultActive | ServiceMode::HumanActive
+            )
+        {
+            return Err(V2ProtocolError::Unsafe(
+                "Companion microphone mute requires active Companion media authority",
+            ));
         }
         if self.pending_mobile_offers.len() > MAX_PENDING_MOBILE_OFFERS {
             return Err(V2ProtocolError::Invalid("pendingMobileOffers"));
@@ -1115,6 +1188,8 @@ pub struct LeaseRequestFrame {
     pub rtc_session_id: String,
     pub accepted_offer_id: String,
     pub accepted_offer_jti: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_transfer_request_id: Option<String>,
 }
 
 impl LeaseRequestFrame {
@@ -1135,7 +1210,16 @@ impl LeaseRequestFrame {
         safe_integer("expectedRemoteRevision", self.expected_remote_revision, 0)?;
         safe_id("rtcSessionId", &self.rtc_session_id)?;
         safe_id("acceptedOfferId", &self.accepted_offer_id)?;
-        safe_id("acceptedOfferJti", &self.accepted_offer_jti)
+        safe_id("acceptedOfferJti", &self.accepted_offer_jti)?;
+        if let Some(request_id) = &self.accepted_transfer_request_id {
+            safe_id("acceptedTransferRequestId", request_id)?;
+            if self.mode != LeaseMode::Takeover {
+                return Err(V2ProtocolError::Unsafe(
+                    "accepted transfer requests require takeover mode",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1229,6 +1313,11 @@ pub struct PluginAssistanceRequestFrame {
     pub question: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    /// True only when Aokie is explicitly offering the current caller to an
+    /// owner. Acceptance still uses the ordinary prepared takeover lease; it
+    /// never grants media authority by itself.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transfer_offered: bool,
     pub expires_at: u64,
 }
 
@@ -1256,6 +1345,14 @@ impl PluginAssistanceRequestFrame {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistanceResponseAction {
+    #[default]
+    Answer,
+    Decline,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MobileAssistanceAnswerFrame {
@@ -1270,6 +1367,8 @@ pub struct MobileAssistanceAnswerFrame {
     pub owner_epoch: u64,
     pub switchboard_revision: u64,
     pub remote_revision: u64,
+    #[serde(default)]
+    pub response_action: AssistanceResponseAction,
     pub answer: String,
 }
 
@@ -1304,6 +1403,8 @@ pub struct PluginAssistanceAnswerFrame {
     pub owner_epoch: u64,
     pub switchboard_revision: u64,
     pub remote_revision: u64,
+    #[serde(default)]
+    pub response_action: AssistanceResponseAction,
     pub answer: String,
 }
 
@@ -1333,6 +1434,126 @@ impl LeaseRevokeFrame {
         idempotency_key(&self.idempotency_key)?;
         bounded_text("leaseToken", &self.lease_token, MAX_LEASE_TOKEN_BYTES)?;
         bounded_text("reason", &self.reason, MAX_REASON_BYTES)
+    }
+}
+
+/// Exact active-lease microphone gate. Muting is an authority change at the
+/// Desktop caller-TX seam, not merely a local capture preference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MobileMicrophoneMuteFrame {
+    pub kind: String,
+    pub schema_version: u16,
+    pub app_id: String,
+    pub request_id: String,
+    pub idempotency_key: String,
+    pub lease_token: String,
+    pub rtc_session_id: String,
+    pub call_id: String,
+    pub call_epoch: u64,
+    pub owner_epoch: u64,
+    pub switchboard_revision: u64,
+    pub remote_revision: u64,
+    pub fence: u64,
+    pub muted: bool,
+}
+
+impl MobileMicrophoneMuteFrame {
+    pub fn validate(&self) -> Result<(), V2ProtocolError> {
+        exact("kind", &self.kind, "microphone_mute")?;
+        schema(self.schema_version)?;
+        safe_id("appId", &self.app_id)?;
+        safe_id("requestId", &self.request_id)?;
+        idempotency_key(&self.idempotency_key)?;
+        bounded_text("leaseToken", &self.lease_token, MAX_LEASE_TOKEN_BYTES)?;
+        safe_id("rtcSessionId", &self.rtc_session_id)?;
+        safe_id("callId", &self.call_id)?;
+        safe_integer("callEpoch", self.call_epoch, 1)?;
+        safe_integer("ownerEpoch", self.owner_epoch, 1)?;
+        safe_integer("switchboardRevision", self.switchboard_revision, 0)?;
+        safe_integer("remoteRevision", self.remote_revision, 1)?;
+        safe_integer("fence", self.fence, 0)
+    }
+}
+
+/// Trusted gateway projection of a mobile mute command. The gateway consumes
+/// the bearer token and supplies the exact verified lease identity; the
+/// plugin still rechecks it against local radio/media truth before acting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginMicrophoneMuteFrame {
+    pub kind: String,
+    pub schema_version: u16,
+    pub app_id: String,
+    pub device_id: String,
+    pub request_id: String,
+    pub lease_id: String,
+    pub lease_jti: String,
+    pub rtc_session_id: String,
+    pub call_id: String,
+    pub call_epoch: u64,
+    pub owner_epoch: u64,
+    pub switchboard_revision: u64,
+    pub remote_revision: u64,
+    pub fence: u64,
+    pub muted: bool,
+}
+
+impl PluginMicrophoneMuteFrame {
+    pub fn validate(&self) -> Result<(), V2ProtocolError> {
+        exact("kind", &self.kind, "plugin_microphone_mute")?;
+        schema(self.schema_version)?;
+        safe_id("appId", &self.app_id)?;
+        safe_id("deviceId", &self.device_id)?;
+        safe_id("requestId", &self.request_id)?;
+        safe_id("leaseId", &self.lease_id)?;
+        safe_id("leaseJti", &self.lease_jti)?;
+        safe_id("rtcSessionId", &self.rtc_session_id)?;
+        safe_id("callId", &self.call_id)?;
+        safe_integer("callEpoch", self.call_epoch, 1)?;
+        safe_integer("ownerEpoch", self.owner_epoch, 1)?;
+        safe_integer("switchboardRevision", self.switchboard_revision, 0)?;
+        safe_integer("remoteRevision", self.remote_revision, 1)?;
+        safe_integer("fence", self.fence, 0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginMicrophoneMuteStatusFrame {
+    pub kind: String,
+    pub schema_version: u16,
+    pub app_id: String,
+    pub device_id: String,
+    pub request_id: String,
+    pub lease_id: String,
+    pub lease_jti: String,
+    pub rtc_session_id: String,
+    pub call_id: String,
+    pub call_epoch: u64,
+    pub owner_epoch: u64,
+    pub switchboard_revision: u64,
+    pub remote_revision: u64,
+    pub fence: u64,
+    pub muted: bool,
+}
+
+impl PluginMicrophoneMuteStatusFrame {
+    pub fn validate(&self) -> Result<(), V2ProtocolError> {
+        exact("kind", &self.kind, "microphone_mute_status")?;
+        schema(self.schema_version)?;
+        safe_id("appId", &self.app_id)?;
+        safe_id("deviceId", &self.device_id)?;
+        safe_id("requestId", &self.request_id)?;
+        safe_id("leaseId", &self.lease_id)?;
+        safe_id("leaseJti", &self.lease_jti)?;
+        safe_id("rtcSessionId", &self.rtc_session_id)?;
+        safe_id("callId", &self.call_id)?;
+        safe_integer("callEpoch", self.call_epoch, 1)?;
+        safe_integer("ownerEpoch", self.owner_epoch, 1)?;
+        safe_integer("switchboardRevision", self.switchboard_revision, 0)?;
+        safe_integer("remoteRevision", self.remote_revision, 1)?;
+        safe_integer("fence", self.fence, 0)
     }
 }
 
@@ -2448,6 +2669,7 @@ pub enum MobileInbound {
     LeaseRevoke(LeaseRevokeFrame),
     RtcSignal(MobileRtcSignalFrame),
     AssistanceAnswer(MobileAssistanceAnswerFrame),
+    MicrophoneMute(MobileMicrophoneMuteFrame),
     EndCallerChallengeRequest(MobileEndCallerChallengeRequestFrame),
     EndCallerConfirm(MobileEndCallerConfirmFrame),
 }
@@ -2461,6 +2683,8 @@ pub enum PluginInbound {
     RtcSignal(PluginRtcSignalFrame),
     LeaseRevoke(PluginLeaseRevokeFrame),
     AssistanceRequest(PluginAssistanceRequestFrame),
+    MicrophoneMute(PluginMicrophoneMuteFrame),
+    MicrophoneMuteStatus(PluginMicrophoneMuteStatusFrame),
     EndCallerResult(PluginEndCallerResultFrame),
 }
 
@@ -2481,6 +2705,9 @@ pub fn parse_mobile_frame(encoded: &str) -> Result<MobileInbound, V2ProtocolErro
         "rtc_signal" => parse(value, MobileRtcSignalFrame::validate).map(MobileInbound::RtcSignal),
         "assistance_answer" => {
             parse(value, MobileAssistanceAnswerFrame::validate).map(MobileInbound::AssistanceAnswer)
+        }
+        "microphone_mute" => {
+            parse(value, MobileMicrophoneMuteFrame::validate).map(MobileInbound::MicrophoneMute)
         }
         "end_caller_challenge_request" => {
             parse(value, MobileEndCallerChallengeRequestFrame::validate)
@@ -2516,6 +2743,11 @@ pub fn parse_plugin_frame(encoded: &str) -> Result<PluginInbound, V2ProtocolErro
             })
             .map(PluginInbound::AssistanceRequest)
         }
+        "plugin_microphone_mute" => {
+            parse(value, PluginMicrophoneMuteFrame::validate).map(PluginInbound::MicrophoneMute)
+        }
+        "microphone_mute_status" => parse(value, PluginMicrophoneMuteStatusFrame::validate)
+            .map(PluginInbound::MicrophoneMuteStatus),
         "end_caller_result" => {
             parse(value, PluginEndCallerResultFrame::validate).map(PluginInbound::EndCallerResult)
         }
@@ -3388,7 +3620,9 @@ mod tests {
             },
             caller: None,
             captions: vec![],
+            participants: vec![],
             audio_levels: None,
+            companion_microphone_muted: false,
             pending_mobile_offers: Vec::new(),
             occurred_at: "2026-07-16T00:00:00Z".into(),
         };
@@ -3604,6 +3838,7 @@ mod tests {
             owner_epoch: 3,
             switchboard_revision: 11,
             remote_revision: 13,
+            accepted_transfer_request_id: None,
             required_consent_policy_id: "remote_policy".into(),
             required_consent_policy_version: 3,
             required_grants: vec![Grant::StateRead, Grant::RtcSignal, Grant::Takeover],
@@ -3649,7 +3884,9 @@ mod tests {
             },
             caller: None,
             captions: vec![],
+            participants: vec![],
             audio_levels: None,
+            companion_microphone_muted: false,
             pending_mobile_offers: offers,
             occurred_at: "2026-07-16T00:00:00Z".into(),
         }

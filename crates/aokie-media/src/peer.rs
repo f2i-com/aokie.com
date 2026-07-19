@@ -61,6 +61,35 @@ pub enum PeerEvent {
     ProtocolViolation(&'static str),
 }
 
+/// Current, native WebRTC-reported audio levels for a Companion endpoint.
+///
+/// A missing value means libwebrtc has not reported real samples for that
+/// direction yet. Callers must not turn that absence into an invented zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompanionAudioLevels {
+    pub microphone_level_permille: Option<u16>,
+    pub remote_level_permille: Option<u16>,
+}
+
+/// Cumulative counters from the exact Companion microphone source and its
+/// outbound audio RTP stream. Unmute proof snapshots a post-arm baseline and
+/// requires every counter to advance; old samples from before mute cannot
+/// satisfy that transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MicrophoneSampleProgress {
+    pub samples_captured: u64,
+    pub packets_sent: u64,
+    pub bytes_sent: u64,
+}
+
+impl MicrophoneSampleProgress {
+    pub fn strictly_advanced_from(self, baseline: Self) -> bool {
+        self.samples_captured > baseline.samples_captured
+            && self.packets_sent > baseline.packets_sent
+            && self.bytes_sent > baseline.bytes_sent
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerOptions {
     pub ice_servers: Vec<IceServerConfig>,
@@ -1242,6 +1271,83 @@ impl CompanionPeer {
         devices_from_factory(&self.factory)
     }
 
+    /// Reads the exact peer's current microphone and decoded remote-audio
+    /// levels from native WebRTC statistics. Values are present only after the
+    /// corresponding real sample counters have advanced.
+    pub async fn audio_levels(&self) -> Result<CompanionAudioLevels, MediaError> {
+        self.ensure_open()?;
+        let mut levels = CompanionAudioLevels::default();
+        for stat in self.peer.get_stats().await? {
+            match stat {
+                RtcStats::InboundRtp(stat)
+                    if stat.stream.kind == "audio"
+                        && stat.received.packets_received > 0
+                        && stat.inbound.total_samples_received > 0 =>
+                {
+                    retain_loudest_level(
+                        &mut levels.remote_level_permille,
+                        stat.inbound.audio_level,
+                    );
+                }
+                RtcStats::MediaSource(stat)
+                    if stat.source.kind == "audio" && stat.audio.total_samples_captured > 0 =>
+                {
+                    retain_loudest_level(
+                        &mut levels.microphone_level_permille,
+                        stat.audio.audio_level,
+                    );
+                }
+                _ => {}
+            }
+        }
+        if !self.microphone_active() {
+            levels.microphone_level_permille = None;
+        }
+        Ok(levels)
+    }
+
+    /// Returns real cumulative microphone and outbound RTP counters for this
+    /// exact peer. Both stats families must exist and the microphone must be
+    /// armed; callers use a strict post-arm delta, never mere non-zero history.
+    pub async fn microphone_sample_progress(
+        &self,
+    ) -> Result<Option<MicrophoneSampleProgress>, MediaError> {
+        self.ensure_open()?;
+        if !self.microphone_active() {
+            return Ok(None);
+        }
+        let mut samples_captured: Option<u64> = None;
+        let mut outbound = None;
+        for stat in self.peer.get_stats().await? {
+            match stat {
+                RtcStats::MediaSource(stat) if stat.source.kind == "audio" => {
+                    samples_captured = Some(
+                        samples_captured
+                            .unwrap_or_default()
+                            .max(stat.audio.total_samples_captured),
+                    );
+                }
+                RtcStats::OutboundRtp(stat) if stat.stream.kind == "audio" => {
+                    let current = (stat.sent.packets_sent, stat.sent.bytes_sent);
+                    outbound = Some(outbound.map_or(current, |previous: (u64, u64)| {
+                        (previous.0.max(current.0), previous.1.max(current.1))
+                    }));
+                }
+                _ => {}
+            }
+        }
+        Ok(match (samples_captured, outbound) {
+            (Some(samples_captured), Some((packets_sent, bytes_sent))) => {
+                Some(MicrophoneSampleProgress {
+                    samples_captured,
+                    packets_sent,
+                    bytes_sent,
+                })
+            }
+            _ => None,
+        })
+    }
+
     pub async fn accept_answer(&self, answer: SdpSignal) -> Result<(), MediaError> {
         self.ensure_open()?;
         answer.validate()?;
@@ -1478,6 +1584,19 @@ impl CompanionPeer {
     }
 }
 
+fn retain_loudest_level(current: &mut Option<u16>, level: f64) {
+    let Some(level) = normalized_audio_level_permille(level) else {
+        return;
+    };
+    *current = Some(current.map_or(level, |existing| existing.max(level)));
+}
+
+fn normalized_audio_level_permille(level: f64) -> Option<u16> {
+    level
+        .is_finite()
+        .then(|| (level.clamp(0.0, 1.0) * 1_000.0).round() as u16)
+}
+
 impl Drop for CompanionPeer {
     fn drop(&mut self) {
         self.close();
@@ -1619,6 +1738,48 @@ fn validate_media_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_audio_levels_are_bounded_and_never_invent_non_finite_values() {
+        assert_eq!(normalized_audio_level_permille(0.0), Some(0));
+        assert_eq!(normalized_audio_level_permille(0.421), Some(421));
+        assert_eq!(normalized_audio_level_permille(2.0), Some(1_000));
+        assert_eq!(normalized_audio_level_permille(-1.0), Some(0));
+        assert_eq!(normalized_audio_level_permille(f64::NAN), None);
+        assert_eq!(normalized_audio_level_permille(f64::INFINITY), None);
+
+        let mut loudest = None;
+        retain_loudest_level(&mut loudest, 0.2);
+        retain_loudest_level(&mut loudest, 0.1);
+        retain_loudest_level(&mut loudest, 0.7);
+        assert_eq!(loudest, Some(700));
+    }
+
+    #[test]
+    fn microphone_unmute_proof_requires_fresh_capture_and_rtp_progress() {
+        let baseline = MicrophoneSampleProgress {
+            samples_captured: 1_000,
+            packets_sent: 10,
+            bytes_sent: 2_000,
+        };
+        assert!(MicrophoneSampleProgress {
+            samples_captured: 1_160,
+            packets_sent: 11,
+            bytes_sent: 2_320,
+        }
+        .strictly_advanced_from(baseline));
+        assert!(!MicrophoneSampleProgress {
+            samples_captured: 1_160,
+            ..baseline
+        }
+        .strictly_advanced_from(baseline));
+        assert!(!MicrophoneSampleProgress {
+            packets_sent: 11,
+            bytes_sent: 2_320,
+            ..baseline
+        }
+        .strictly_advanced_from(baseline));
+    }
 
     #[test]
     fn receive_only_modes_require_recvonly_and_talk_requires_sendrecv() {

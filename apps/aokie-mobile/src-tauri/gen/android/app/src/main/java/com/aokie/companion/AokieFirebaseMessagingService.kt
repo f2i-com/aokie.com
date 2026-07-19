@@ -45,7 +45,7 @@ class AokieFirebaseMessagingService : FirebaseMessagingService() {
 
   private fun receiveVoiceOffer(data: Map<String, String>) {
     val offer = AokieVoiceOffer.fromPush(data)
-    if (offer == null || !AokieOfferStore.accept(this, offer)) {
+    if (offer == null || !AokieOfferStore.acceptPush(this, offer)) {
       AokieOfferStore.recordDiagnostic(this, "voice_offer_invalid_or_stale")
       return
     }
@@ -63,16 +63,12 @@ class AokieFirebaseMessagingService : FirebaseMessagingService() {
   }
 
   private fun receiveVoiceOfferCancel(data: Map<String, String>) {
-    val allowed = setOf("aokieClass", "schemaVersion", "eventId", "offerId", "reason")
-    if (data.keys.any { it !in allowed } || data["aokieClass"] != "assistance_offer" || data["schemaVersion"] != "1") {
+    val cancellation = parseVoiceOfferCancel(data)
+    if (cancellation == null) {
       AokieOfferStore.recordDiagnostic(this, "voice_offer_cancel_invalid")
       return
     }
-    val offerId = data["offerId"]?.takeIf(::safeId) ?: return
-    val reason = data["reason"]
-      ?.takeIf { it.length in 1..120 && it.none(Char::isISOControl) }
-      ?: "authoritative_cancel"
-    val cancelled = AokieOfferStore.cancel(this, offerId, reason) ?: return
+    val cancelled = AokieOfferStore.cancel(this, cancellation.offerId, cancellation.reason) ?: return
     startService(
       Intent(this, AokieIncomingCallService::class.java)
         .setAction(AokieIncomingCallService.ACTION_CANCEL)
@@ -130,6 +126,25 @@ class AokieFirebaseMessagingService : FirebaseMessagingService() {
 
   private fun safeText(value: String, maximum: Int): Boolean =
     value.length in 1..maximum && value.none(Char::isISOControl)
+}
+
+internal data class AokieVoiceOfferCancellation(val offerId: String, val reason: String)
+
+internal fun parseVoiceOfferCancel(data: Map<String, String>): AokieVoiceOfferCancellation? {
+  val allowed = setOf("aokieClass", "schemaVersion", "eventId", "offerId", "reason")
+  if (data.keys.any { it !in allowed } || data["aokieClass"] != "voice_offer_cancel" ||
+    data["schemaVersion"] != "1"
+  ) return null
+  data["eventId"]?.takeIf {
+    it.length in 1..200 && it.all { character -> character.isLetterOrDigit() || character in "-_.:" }
+  } ?: return null
+  val offerId = data["offerId"]?.takeIf {
+    it.length in 1..200 && it.all { character -> character.isLetterOrDigit() || character in "-_.:" }
+  } ?: return null
+  val reason = data["reason"]
+    ?.takeIf { it.length in 1..120 && it.none(Char::isISOControl) }
+    ?: "authoritative_cancel"
+  return AokieVoiceOfferCancellation(offerId, reason)
 }
 
 internal object AokiePushRegistration {

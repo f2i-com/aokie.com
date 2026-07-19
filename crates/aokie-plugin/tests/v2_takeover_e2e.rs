@@ -397,13 +397,18 @@ async fn register_endpoints(gateway: &TestGateway) -> (Socket, Socket, Value) {
     assert_eq!(snapshot["snapshot"]["ownerEpoch"], 0);
     assert_eq!(snapshot["snapshot"]["caller"]["maskedNumber"], "***123");
     assert_eq!(snapshot["snapshot"]["captions"][0]["text"], "hello");
-    assert_eq!(
-        snapshot["snapshot"]["pendingMobileOffers"]
-            .as_array()
-            .unwrap()
-            .len(),
-        5
-    );
+    let initial_offers = snapshot["snapshot"]["pendingMobileOffers"]
+        .as_array()
+        .unwrap();
+    assert_eq!(initial_offers.len(), 2);
+    for mode in ["monitor", "takeover"] {
+        assert!(initial_offers.iter().any(|signed| {
+            signed["offer"]["offeredMode"] == mode && signed["offer"]["surface"] == "in_app"
+        }));
+    }
+    assert!(initial_offers
+        .iter()
+        .all(|signed| signed["offer"]["offeredMode"] != "consult"));
     (plugin, mobile, snapshot)
 }
 
@@ -683,7 +688,7 @@ async fn gateway_rotates_two_phase_takeover_and_rejects_every_stale_authority() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_consult_is_assistance_bound_rotated_and_never_caller_authority() {
     let gateway = start_gateway().await;
-    let (mut plugin, mut mobile, offers_snapshot) = register_endpoints(&gateway).await;
+    let (mut plugin, mut mobile, _offers_snapshot) = register_endpoints(&gateway).await;
 
     send(
         &mut plugin,
@@ -699,10 +704,11 @@ async fn private_consult_is_assistance_bound_rotated_and_never_caller_authority(
     .await;
     let assistance = receive_kind(&mut mobile, "assistance_request").await;
     assert_eq!(assistance["requestId"], "assist_request_e2e");
+    let consult_offers_snapshot = receive_kind(&mut mobile, "snapshot").await;
 
     request_lease(
         &mut mobile,
-        &offers_snapshot,
+        &consult_offers_snapshot,
         "consult_request",
         "consult",
         "rtc_consult_e2e",

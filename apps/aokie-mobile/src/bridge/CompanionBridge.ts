@@ -112,6 +112,13 @@ export interface NativeMediaStateEvent {
   reason?: string;
 }
 
+export interface NativeMediaLevelsEvent {
+  session: NativeMediaSession;
+  microphoneLevelPermille?: number;
+  remoteLevelPermille?: number;
+  measuredAt: string;
+}
+
 export interface SyncReady {
   streamNonce: string;
   sequence: number;
@@ -241,7 +248,8 @@ export interface DiscoveryDocument {
 export type CompanionCapability =
   | "state_read" | "caller_read" | "captions_read" | "monitor" | "consult"
   | "takeover" | "resume_aokie" | "rtc_signal" | "assistance_read"
-  | "assistance_respond" | "end_caller";
+  | "assistance_respond" | "end_caller" | "participants_read"
+  | "participant_identity_read" | "audio_levels_read";
 export type CompanionAvailabilityState = "available" | "busy" | "offline" | "do_not_disturb";
 export type CompanionSessionMode = "monitor" | "consult" | "takeover";
 
@@ -420,7 +428,10 @@ export type V2Grant =
   | "takeover"
   | "resume_aokie"
   | "rtc_signal"
-  | "end_caller";
+  | "end_caller"
+  | "participants_read"
+  | "participant_identity_read"
+  | "audio_levels_read";
 
 export type V2LeaseMode = "monitor" | "consult" | "takeover";
 export type V2LeasePhase = "prepared" | "active";
@@ -439,6 +450,7 @@ export interface V2PendingMobileOffer {
     ownerEpoch: number;
     switchboardRevision: number;
     remoteRevision: number;
+    acceptedTransferRequestId?: string;
     requiredConsentPolicyId: string;
     requiredConsentPolicyVersion: number;
     requiredGrants: V2Grant[];
@@ -505,6 +517,7 @@ export interface V2CallSnapshotEvent {
       participantId?: string;
       levelPermille: number;
     }>;
+    companionMicrophoneMuted: boolean;
     pendingMobileOffers: V2PendingMobileOffer[];
     occurredAt: string;
   };
@@ -531,6 +544,7 @@ export interface V2AssistanceRequestEvent {
   remoteRevision: number;
   question: string;
   context?: string;
+  transferOffered: boolean;
   expiresAt: number;
 }
 
@@ -644,6 +658,7 @@ export type BridgeEvent =
   | { type: "local_media"; value: LocalMediaProof | null }
   | { type: "media_signal"; value: NativeMediaSignalEvent }
   | { type: "media_state"; value: NativeMediaStateEvent }
+  | { type: "media_levels"; value: NativeMediaLevelsEvent | null }
   | { type: "v2_snapshot"; value: V2CallSnapshotEvent }
   | { type: "v2_idle_sync"; value: V2IdleSyncEvent }
   | { type: "v2_lease"; value: V2LeaseEvent | null }
@@ -679,9 +694,10 @@ export interface CompanionBridge {
   connect(config: RealtimeConfig): Promise<void>;
   disconnect(): Promise<void>;
   send(command: CommandEnvelope): Promise<void>;
-  requestV2Lease(mode: V2LeaseMode): Promise<V2RequestReceipt>;
+  requestV2Lease(mode: V2LeaseMode, acceptedTransferRequestId?: string): Promise<V2RequestReceipt>;
   revokeV2Lease(reason: string): Promise<V2RequestReceipt>;
-  answerV2Assistance(requestId: string, answer: string): Promise<{ requestId: string; answerId: string }>;
+  answerV2Assistance(requestId: string, answer: string, responseAction?: "answer" | "decline"): Promise<{ requestId: string; answerId: string }>;
+  setV2MicrophoneMuted(muted: boolean): Promise<V2RequestReceipt>;
   prepareEndCaller(): Promise<V2RequestReceipt>;
   confirmEndCaller(confirmationId: string): Promise<V2RequestReceipt>;
   confirmDesktopPeerTrust(challenge: DesktopPeerTrustChallenge, approved: boolean): Promise<void>;

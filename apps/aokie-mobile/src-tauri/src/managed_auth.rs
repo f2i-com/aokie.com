@@ -70,6 +70,9 @@ const MANAGED_ADMISSION_GRANTS: &[&str] = &[
     "resume_aokie",
     "end_caller",
     "rtc_signal",
+    "participants_read",
+    "participant_identity_read",
+    "audio_levels_read",
 ];
 
 #[derive(Clone, Default)]
@@ -1435,9 +1438,7 @@ fn validate_admission(
 /// failing the admission: the transport is additive, and refusing the whole
 /// admission over it would take the Companion surface down harder than simply
 /// not adopting the new path.
-pub(crate) fn usable_relay_endpoints(
-    advertisement: serde_json::Value,
-) -> Option<RelayEndpoints> {
+pub(crate) fn usable_relay_endpoints(advertisement: serde_json::Value) -> Option<RelayEndpoints> {
     let relay: RelayEndpoints = match serde_json::from_value(advertisement) {
         Ok(relay) => relay,
         Err(_) => {
@@ -1913,9 +1914,10 @@ mod tests {
     /// Companion surface down with "managed admission response is invalid".
     #[test]
     fn an_advertised_relay_does_not_fail_the_admission_decoder() {
-        let encoded =
-            serde_json::to_vec(&admission_body(Some(relay_advertisement("https://api.example.test"))))
-                .expect("fixture encodes");
+        let encoded = serde_json::to_vec(&admission_body(Some(relay_advertisement(
+            "https://api.example.test",
+        ))))
+        .expect("fixture encodes");
 
         let admission: AdmissionResponse =
             serde_json::from_slice(&encoded).expect("an advertised relay decodes");

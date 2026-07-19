@@ -15,8 +15,8 @@ mod signal;
 pub use binding::{MediaMode, RouteGate, RoutePermit, SessionBinding};
 pub use pcm::{OwnedAudioFrame, PcmPacketizer};
 pub use peer::{
-    enumerate_platform_audio_devices, CompanionPeer, DesktopPeer, PeerEvent, PeerOptions,
-    PlatformAudioDevice, PlatformAudioDevices,
+    enumerate_platform_audio_devices, CompanionAudioLevels, CompanionPeer, DesktopPeer,
+    MicrophoneSampleProgress, PeerEvent, PeerOptions, PlatformAudioDevice, PlatformAudioDevices,
 };
 pub use signal::{IceCandidateSignal, IceServerConfig, SdpSignal, SdpSignalType};
 

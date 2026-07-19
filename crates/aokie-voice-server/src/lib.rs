@@ -332,10 +332,7 @@ where
 }
 
 fn nonblank(value: &Option<String>) -> Option<&str> {
-    value
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
+    value.as_deref().map(str::trim).filter(|v| !v.is_empty())
 }
 
 /// Merge the three override layers over the defaults. Pure — every source is
@@ -535,14 +532,12 @@ impl VoiceServer {
             .all(|name| dir.join(name).is_file()),
             SttEngineKind::Moonshine => {
                 dir.join("tokenizer.json").is_file()
-                    && detect_quantization(&dir, &MOONSHINE_STEMS, &MOONSHINE_QUANT_ORDER)
-                        .is_some()
+                    && detect_quantization(&dir, &MOONSHINE_STEMS, &MOONSHINE_QUANT_ORDER).is_some()
             }
             SttEngineKind::Qwen3Asr => {
                 dir.join("tokenizer.json").is_file()
                     && dir.join("embed_tokens.bin").is_file()
-                    && detect_quantization(&dir, &QWEN3_ASR_STEMS, &QWEN3_ASR_QUANT_ORDER)
-                        .is_some()
+                    && detect_quantization(&dir, &QWEN3_ASR_STEMS, &QWEN3_ASR_QUANT_ORDER).is_some()
             }
         }
     }
@@ -601,28 +596,26 @@ impl VoiceServer {
                     .map_err(|e| AppError::new(500, format!("STT load failed: {e}")))?,
                 ),
                 SttEngineKind::Moonshine => {
-                    let quant =
-                        detect_quantization(&dir, &MOONSHINE_STEMS, &MOONSHINE_QUANT_ORDER)
-                            .ok_or_else(|| {
-                                AppError::new(
-                                    500,
-                                    "STT load failed: no complete moonshine ONNX set on disk",
-                                )
-                            })?;
+                    let quant = detect_quantization(&dir, &MOONSHINE_STEMS, &MOONSHINE_QUANT_ORDER)
+                        .ok_or_else(|| {
+                            AppError::new(
+                                500,
+                                "STT load failed: no complete moonshine ONNX set on disk",
+                            )
+                        })?;
                     SttBackend::Moonshine(
                         MoonshineTranscribeRuntime::load(&dir, MoonshineVariant::Tiny, quant)
                             .map_err(|e| AppError::new(500, format!("STT load failed: {e}")))?,
                     )
                 }
                 SttEngineKind::Qwen3Asr => {
-                    let quant =
-                        detect_quantization(&dir, &QWEN3_ASR_STEMS, &QWEN3_ASR_QUANT_ORDER)
-                            .ok_or_else(|| {
-                                AppError::new(
-                                    500,
-                                    "STT load failed: no complete qwen3-asr ONNX set on disk",
-                                )
-                            })?;
+                    let quant = detect_quantization(&dir, &QWEN3_ASR_STEMS, &QWEN3_ASR_QUANT_ORDER)
+                        .ok_or_else(|| {
+                            AppError::new(
+                                500,
+                                "STT load failed: no complete qwen3-asr ONNX set on disk",
+                            )
+                        })?;
                     SttBackend::Qwen3Asr(
                         Qwen3AsrTranscribeRuntime::load(&dir, Qwen3AsrVariant::Size0_6B, quant)
                             .map_err(|e| AppError::new(500, format!("STT load failed: {e}")))?,
@@ -630,7 +623,8 @@ impl VoiceServer {
                 }
             };
             eprintln!(
-                "[{}] STT ({}) loaded in {:?}", log_tag(),
+                "[{}] STT ({}) loaded in {:?}",
+                log_tag(),
                 self.config.stt_engine.as_str(),
                 started.elapsed()
             );
@@ -653,7 +647,9 @@ impl VoiceServer {
 
     /// Lock the TTS slot, loading the configured engine on first use (shared
     /// by the buffered WAV path and the streaming PCM path).
-    fn ensure_tts_backend(&self) -> Result<std::sync::MutexGuard<'_, Option<TtsBackend>>, AppError> {
+    fn ensure_tts_backend(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<TtsBackend>>, AppError> {
         let mut guard = self
             .tts
             .lock()
@@ -685,7 +681,8 @@ impl VoiceServer {
             };
             if matches!(backend, TtsBackend::Pocket(_)) {
                 eprintln!(
-                    "[{}] TTS ({}) loaded in {:?}", log_tag(),
+                    "[{}] TTS ({}) loaded in {:?}",
+                    log_tag(),
                     self.config.tts_engine.as_str(),
                     started.elapsed()
                 );
@@ -818,7 +815,8 @@ impl VoiceServer {
             let rt = SherpaOnnxTtsRuntime::load(&cfg)
                 .map_err(|e| AppError::new(500, format!("TTS load failed: {e}")))?;
             eprintln!(
-                "[{}] sherpa bundle {} loaded in {:?}", log_tag(),
+                "[{}] sherpa bundle {} loaded in {:?}",
+                log_tag(),
                 dir.display(),
                 started.elapsed()
             );
@@ -833,7 +831,8 @@ impl VoiceServer {
         let scale = attenuate_hot_signal(&mut audio.samples);
         if scale < 1.0 {
             eprintln!(
-                "[{}] sherpa loudness attenuated x{scale:.3} ({} samples)", log_tag(),
+                "[{}] sherpa loudness attenuated x{scale:.3} ({} samples)",
+                log_tag(),
                 audio.samples.len()
             );
         }
@@ -1204,11 +1203,7 @@ fn quantized_model_path(dir: &Path, stem: &str, quant: &Quantization) -> PathBuf
 }
 
 /// First quantization level (in `order`) for which EVERY stem's file exists.
-fn detect_quantization(
-    dir: &Path,
-    stems: &[&str],
-    order: &[Quantization],
-) -> Option<Quantization> {
+fn detect_quantization(dir: &Path, stems: &[&str], order: &[Quantization]) -> Option<Quantization> {
     order
         .iter()
         .find(|q| {
@@ -1658,8 +1653,8 @@ fn handle_transcriptions(
         (decoded, request.response_format)
     };
     // Validated BEFORE inference — a bad format never burns a transcription.
-    let format = parse_transcription_format(format_field.as_deref())
-        .map_err(|e| AppError::new(400, e))?;
+    let format =
+        parse_transcription_format(format_field.as_deref()).map_err(|e| AppError::new(400, e))?;
 
     let samples = decode_wav_to_f32_16k(&wav_bytes)
         .map_err(|e| AppError::new(400, format!("invalid WAV: {e}")))?;
@@ -1694,7 +1689,11 @@ pub fn parse_speech_format(value: Option<&str>) -> Result<SpeechFormat, String> 
     }
 }
 
-fn handle_speech(server: &VoiceServer, headers: &[Header], body: &[u8]) -> Result<Routed, AppError> {
+fn handle_speech(
+    server: &VoiceServer,
+    headers: &[Header],
+    body: &[u8],
+) -> Result<Routed, AppError> {
     let content_type = header_value(headers, "content-type").unwrap_or("");
     if !content_type.is_empty()
         && !content_type
@@ -2002,8 +2001,7 @@ fn parse_multipart(body: &[u8], content_type: &str) -> Result<MultipartParts, Ap
                     })?;
                     parts.response_format = Some(value.trim().to_string());
                 }
-            } else if lower_headers.contains("name=\"file\"")
-                || lower_headers.contains("filename=")
+            } else if lower_headers.contains("name=\"file\"") || lower_headers.contains("filename=")
             {
                 if parts.file.is_none() {
                     parts.file = Some(body[data_start..data_end].to_vec());
@@ -2249,7 +2247,8 @@ fn stream_pcm_to_client(server: &VoiceServer, stream: &mut TcpStream, req: &PcmS
                 // The 200 head is on the wire — nothing left but an early
                 // close; the client sees a truncated stream.
                 eprintln!(
-                    "[{}] pcm stream failed mid-flight: {}", log_tag(),
+                    "[{}] pcm stream failed mid-flight: {}",
+                    log_tag(),
                     err.message
                 );
             } else if let Err(e) = write_http_response(stream, err.response()) {
@@ -2272,7 +2271,8 @@ impl TcpPcmSink<'_> {
         if !self.disconnected {
             self.disconnected = true;
             eprintln!(
-                "[{}] pcm client disconnected mid-stream - synthesis cancelled: {err}", log_tag()
+                "[{}] pcm client disconnected mid-stream - synthesis cancelled: {err}",
+                log_tag()
             );
         }
     }
@@ -2281,7 +2281,10 @@ impl TcpPcmSink<'_> {
 impl PcmSink for TcpPcmSink<'_> {
     fn begin(&mut self, sample_rate: u32) -> bool {
         self.begun = true;
-        match self.stream.write_all(pcm_stream_head(sample_rate).as_bytes()) {
+        match self
+            .stream
+            .write_all(pcm_stream_head(sample_rate).as_bytes())
+        {
             Ok(()) => true,
             Err(e) => {
                 self.note_disconnect(e);
@@ -3017,10 +3020,7 @@ mod tests {
         assert_eq!(resolve_sherpa_voice("broken", &root), unknown("broken"));
         assert_eq!(resolve_sherpa_voice("twin", &root), unknown("twin"));
         assert_eq!(resolve_sherpa_voice("alba", &root), unknown("alba"));
-        assert_eq!(
-            resolve_sherpa_voice("../jenny", &root),
-            unknown("../jenny")
-        );
+        assert_eq!(resolve_sherpa_voice("../jenny", &root), unknown("../jenny"));
         assert_eq!(
             resolve_sherpa_voice("..\\jenny", &root),
             unknown("..\\jenny")
@@ -3178,7 +3178,10 @@ mod tests {
         }
         fs::write(qdir.join("tokenizer.json"), b"{}").unwrap();
         let value = decode_json(&handle_request(&qserver, "GET", "/health", &[], b"").body);
-        assert_eq!(value["status"], "degraded", "embed_tokens.bin still missing");
+        assert_eq!(
+            value["status"], "degraded",
+            "embed_tokens.bin still missing"
+        );
         fs::write(qdir.join("embed_tokens.bin"), b"x").unwrap();
         let value = decode_json(&handle_request(&qserver, "GET", "/health", &[], b"").body);
         assert_eq!(value["status"], "ok", "{value}");
@@ -3206,22 +3209,17 @@ mod tests {
         assert_eq!(attenuate_hot_signal(&mut empty), 1.0);
 
         // Hot full-scale sine: attenuated so peak <= 0.85 and rms <= 0.12.
-        let mut hot: Vec<f32> = (0..4800)
-            .map(|i| (i as f32 * 0.05).sin() * 0.999)
-            .collect();
+        let mut hot: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.999).collect();
         let scale = attenuate_hot_signal(&mut hot);
         assert!(scale < 1.0, "hot signal must be attenuated, got {scale}");
         let peak = hot.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        let rms = (hot.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
-            / hot.len() as f64)
+        let rms = (hot.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / hot.len() as f64)
             .sqrt() as f32;
         assert!(peak <= 0.85 + 1e-3, "peak {peak}");
         assert!(rms <= 0.12 + 1e-3, "rms {rms}");
 
         // Quiet signal: both targets already met -> untouched.
-        let mut quiet: Vec<f32> = (0..4800)
-            .map(|i| (i as f32 * 0.05).sin() * 0.05)
-            .collect();
+        let mut quiet: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.05).collect();
         let before = quiet.clone();
         assert_eq!(attenuate_hot_signal(&mut quiet), 1.0);
         assert_eq!(quiet, before);
@@ -3594,7 +3592,8 @@ mod tests {
         assert!(parse_speech_format(Some("mp3")).is_err());
 
         let (_tmp, server) = test_server(MAX_BODY_BYTES);
-        let body = br#"{"input":"  hello there ","voice":"3","model":"tts-1","response_format":"pcm"}"#;
+        let body =
+            br#"{"input":"  hello there ","voice":"3","model":"tts-1","response_format":"pcm"}"#;
         match route_request(&server, "POST", "/v1/audio/speech", &json_header(), body) {
             Routed::PcmStream(req) => {
                 assert_eq!(req.input, "hello there", "trimmed + normalized");
