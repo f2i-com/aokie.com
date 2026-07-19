@@ -70,6 +70,7 @@ const COMPANION_CAPABILITIES = new Set<CompanionCapability>([
   "resume_aokie", "rtc_signal", "assistance_read", "assistance_respond", "end_caller",
   "participants_read", "participant_identity_read", "audio_levels_read",
 ]);
+const MAX_COMPANION_CAPABILITIES = COMPANION_CAPABILITIES.size;
 const COMPANION_AVAILABILITY = new Set<CompanionAvailabilityState>(["available", "busy", "offline", "do_not_disturb"]);
 const COMPANION_SESSION_MODES = new Set(["monitor", "consult", "takeover"]);
 const COMPANION_ACTIVITY_TYPES = new Set([
@@ -1072,7 +1073,7 @@ function parseCompanionStaff(value: unknown): CompanionStaffMember[] {
 }
 
 function parseCompanionCapabilities(value: unknown): CompanionCapability[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 11) throw new Error("Invalid Companion capabilities");
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_COMPANION_CAPABILITIES) throw new Error("Invalid Companion capabilities");
   const capabilities = value.map((entry) => {
     if (typeof entry !== "string" || !COMPANION_CAPABILITIES.has(entry as CompanionCapability)) {
       throw new Error("Invalid Companion capability");
