@@ -1283,6 +1283,21 @@ fn tokens_match(minted: &str, presented: &str) -> bool {
         == 0
 }
 
+/// Whether the last emitted lease-status event still denotes live ACTIVE
+/// authority.
+///
+/// `Renewed` is deliberately retained in the relay registry so an at-least-once
+/// heartbeat can replay the current `lease_renewed` frame. It is a lifecycle
+/// event, not a demotion: action gates must therefore accept both the initial
+/// ACTIVE status and every delivered renewal while the signed lease phase and
+/// the session lease book independently remain active.
+fn relay_status_has_active_authority(status: PluginLeaseStatus) -> bool {
+    matches!(
+        status,
+        PluginLeaseStatus::Active | PluginLeaseStatus::Renewed
+    )
+}
+
 fn transfer_opportunity_id(request_id: &str) -> String {
     let digest = Sha256::digest(request_id.as_bytes());
     let suffix = digest[..12]
@@ -2747,6 +2762,25 @@ mod tests {
             &harness.radio,
         );
         active
+    }
+
+    /// Install actionable ACTIVE media for a gateway authority test.
+    ///
+    /// The native test peer intentionally drops its actor receiver, so it
+    /// cannot exercise `renew_lease` itself. Remove the PREPARED-only gateway
+    /// guard after installing the exact active media binding; the tests below
+    /// can then isolate registry renewal and its action gates while the native
+    /// binding remains live for their bounded duration.
+    fn install_actionable_takeover_for_renewal_test(
+        harness: &mut RelayHarness,
+        active: &PluginLeaseStatusFrame,
+    ) {
+        let binding = binding_for_claims(&active.lease);
+        harness
+            .media
+            .install_test_active_talk_peer(binding, 20_000)
+            .expect("the test route reaches exact active physical ownership");
+        harness.session.prepared = None;
     }
 
     /// Exercise the same PREPARED -> ACTIVE delivery rotation as production,
@@ -5010,6 +5044,101 @@ mod tests {
     }
 
     #[test]
+    fn a_renewed_takeover_keeps_exact_microphone_authority() {
+        let mut harness = RelayHarness::new();
+        let active =
+            activate_takeover_without_replacement_peer(&mut harness, "request_renewed_mute");
+        install_actionable_takeover_for_renewal_test(&mut harness, &active);
+
+        let heartbeat = json!({
+            "kind": "lease_heartbeat",
+            "schemaVersion": SCHEMA_VERSION,
+            "appId": "app_a",
+            "requestId": "request_renewed_mute_beat",
+            "idempotencyKey": "idem_renewed_mute_beat",
+            "leaseToken": active.lease_token
+        })
+        .to_string();
+        let renewed_frames = harness.post(&heartbeat);
+        let renewed = harness.granted(&renewed_frames);
+        assert_eq!(renewed.status, PluginLeaseStatus::Renewed);
+        harness.settle(&renewed_frames, TransportDelivery::Delivered);
+        assert_eq!(
+            harness
+                .session
+                .relay_leases
+                .get(&renewed.lease.lease_id)
+                .expect("the renewed relay lease stays current")
+                .status,
+            PluginLeaseStatus::Renewed
+        );
+
+        let remote = harness.media.snapshot();
+        let switchboard_revision = harness.radio.switchboard_revision();
+        let microphone_frame =
+            |request_id: &str,
+             idempotency_key: &str,
+             lease_token: String,
+             remote_revision: u64,
+             muted: bool| MobileMicrophoneMuteFrame {
+                kind: "microphone_mute".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                request_id: request_id.into(),
+                idempotency_key: idempotency_key.into(),
+                lease_token,
+                rtc_session_id: renewed.lease.rtc_session_id.clone(),
+                call_id: renewed.lease.call_id.clone(),
+                call_epoch: renewed.lease.call_epoch,
+                owner_epoch: renewed.lease.owner_epoch,
+                switchboard_revision,
+                remote_revision,
+                fence: renewed.lease.fence,
+                muted,
+            };
+
+        let stale = microphone_frame(
+            "request_renewed_mute_stale",
+            "idem_renewed_mute_stale",
+            active.lease_token,
+            remote.remote_revision,
+            true,
+        );
+        let refused = harness.post(&serde_json::to_string(&stale).unwrap());
+        assert_eq!(harness.rejection(&refused).code, "lease_unknown");
+        assert!(!harness.media.snapshot().microphone_muted);
+
+        let mute = microphone_frame(
+            "request_renewed_mute_on",
+            "idem_renewed_mute_on",
+            renewed.lease_token.clone(),
+            remote.remote_revision,
+            true,
+        );
+        let muted_frames = harness.post(&serde_json::to_string(&mute).unwrap());
+        let muted: PluginMicrophoneMuteStatusFrame =
+            serde_json::from_str(muted_frames.first().expect("mute is confirmed")).unwrap();
+        assert!(muted.muted);
+        assert_eq!(muted.lease_jti, renewed.lease.jti);
+        assert!(harness.media.snapshot().microphone_muted);
+
+        let after_mute = harness.media.snapshot();
+        let unmute = microphone_frame(
+            "request_renewed_mute_off",
+            "idem_renewed_mute_off",
+            renewed.lease_token,
+            after_mute.remote_revision,
+            false,
+        );
+        let unmuted_frames = harness.post(&serde_json::to_string(&unmute).unwrap());
+        let unmuted: PluginMicrophoneMuteStatusFrame =
+            serde_json::from_str(unmuted_frames.first().expect("unmute is confirmed")).unwrap();
+        assert!(!unmuted.muted);
+        assert_eq!(unmuted.lease_jti, renewed.lease.jti);
+        assert!(!harness.media.snapshot().microphone_muted);
+    }
+
+    #[test]
     fn a_dropped_renewal_does_not_extend_authority_and_can_be_retried() {
         let mut harness = RelayHarness::new();
         let granted = harness.claim(LeaseMode::Monitor, "request_renewal_drop");
@@ -6384,17 +6513,30 @@ mod tests {
     }
 
     #[test]
-    fn relay_caller_end_prepare_then_fresh_confirm_queues_one_physical_hangup() {
+    fn relay_caller_end_after_renewal_queues_one_physical_hangup() {
         let mut grants = full_relay_grants();
         grants.insert(Grant::EndCaller);
         let mut harness = RelayHarness::with_grants(grants);
         let active =
             activate_takeover_without_replacement_peer(&mut harness, "request_end_caller_owner");
-        let active_binding = binding_for_claims(&active.lease);
-        harness
-            .media
-            .install_test_active_talk_peer(active_binding, 20_000)
-            .expect("the test route reaches exact active physical ownership");
+        install_actionable_takeover_for_renewal_test(&mut harness, &active);
+
+        let heartbeat = json!({
+            "kind": "lease_heartbeat",
+            "schemaVersion": SCHEMA_VERSION,
+            "appId": "app_a",
+            "requestId": "request_end_before_challenge_beat",
+            "idempotencyKey": "idem_end_before_challenge_beat",
+            "leaseToken": active.lease_token.clone()
+        })
+        .to_string();
+        let renewed_frames = harness.post(&heartbeat);
+        let renewed = harness.granted(&renewed_frames);
+        assert_eq!(renewed.status, PluginLeaseStatus::Renewed);
+        harness.settle(&renewed_frames, TransportDelivery::Delivered);
+        assert_eq!(renewed.lease.lease_id, active.lease.lease_id);
+        assert_ne!(renewed.lease.jti, active.lease.jti);
+
         let remote = harness.media.snapshot();
         let switchboard_revision = harness.radio.switchboard_revision();
 
@@ -6405,13 +6547,13 @@ mod tests {
             app_id: harness.session.app_id.clone(),
             request_id: prepare_request_id.into(),
             idempotency_key: "idem_end_prepare".into(),
-            lease_token: active.lease_token.clone(),
-            call_id: active.lease.call_id.clone(),
-            call_epoch: active.lease.call_epoch,
-            owner_epoch: active.lease.owner_epoch,
+            lease_token: renewed.lease_token.clone(),
+            call_id: renewed.lease.call_id.clone(),
+            call_epoch: renewed.lease.call_epoch,
+            owner_epoch: renewed.lease.owner_epoch,
             switchboard_revision,
             remote_revision: remote.remote_revision,
-            fence: active.lease.fence,
+            fence: renewed.lease.fence,
         };
         let challenge_frames =
             harness.post(&serde_json::to_string(&prepare).expect("prepare encodes"));
@@ -6422,6 +6564,38 @@ mod tests {
         )
         .expect("challenge decodes");
         assert_eq!(challenge.request_id, prepare_request_id);
+        assert_eq!(renewed.lease.lease_id, challenge.lease_id);
+
+        let stale_confirm = MobileEndCallerConfirmFrame {
+            kind: "end_caller_confirm".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: harness.session.app_id.clone(),
+            request_id: "request_end_confirm_stale".into(),
+            idempotency_key: "idem_end_confirm_stale".into(),
+            confirmation_id: challenge.confirmation_id.clone(),
+            nonce: challenge.nonce.clone(),
+            lease_token: active.lease_token.clone(),
+            call_id: challenge.call_id.clone(),
+            call_epoch: challenge.call_epoch,
+            owner_epoch: challenge.owner_epoch,
+            switchboard_revision: challenge.switchboard_revision,
+            remote_revision: challenge.remote_revision,
+            fence: challenge.fence,
+        };
+        let stale_refusal =
+            harness.post(&serde_json::to_string(&stale_confirm).expect("stale confirm encodes"));
+        assert_eq!(
+            harness.rejection(&stale_refusal).code,
+            "not_active_takeover_owner"
+        );
+        assert!(matches!(
+            harness._control_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(harness
+            .session
+            .relay_end_caller_challenges
+            .contains_key(&challenge.confirmation_id));
 
         // The native client deliberately mints a fresh operation/request ID
         // for the destructive confirmation. Confirmation ID + nonce + the
@@ -6437,7 +6611,7 @@ mod tests {
             idempotency_key: "idem_end_confirm".into(),
             confirmation_id: challenge.confirmation_id.clone(),
             nonce: challenge.nonce,
-            lease_token: active.lease_token.clone(),
+            lease_token: renewed.lease_token.clone(),
             call_id: challenge.call_id,
             call_epoch: challenge.call_epoch,
             owner_epoch: challenge.owner_epoch,
@@ -11734,7 +11908,7 @@ impl GatewaySession {
             .find(|lease| {
                 lease.device_id == device_id
                     && lease.phase == LeasePhase::Active
-                    && lease.status == PluginLeaseStatus::Active
+                    && relay_status_has_active_authority(lease.status)
                     && tokens_match(&lease.token, &frame.lease_token)
             })
             .cloned()
@@ -12493,7 +12667,7 @@ impl GatewaySession {
             lease.device_id == device_id
                 && lease.mode == LeaseMode::Takeover
                 && lease.phase == LeasePhase::Active
-                && lease.status == PluginLeaseStatus::Active
+                && relay_status_has_active_authority(lease.status)
                 && tokens_match(&lease.token, lease_token)
         })?;
         let claims = self.leases.get(&relay.current_jti)?.clone();
