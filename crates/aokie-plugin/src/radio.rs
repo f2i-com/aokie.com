@@ -6460,7 +6460,7 @@ fn run_loop(
     // "direct audio only" (no side run) both work — the shared per-turn
     // AUDIO CAPTURE machinery runs when either is on (`audio_capture`).
     #[cfg(feature = "voice")]
-    let (send_audio, audio_transcript, audio_capture) = audio_lane_gates(
+    let (mut send_audio, mut audio_transcript, audio_capture) = audio_lane_gates(
         agent_enabled,
         std::env::var_os("AOKIE_SEND_AUDIO").is_some(),
         std::env::var_os("AOKIE_AUDIO_TRANSCRIPT").is_some(),
@@ -14163,6 +14163,34 @@ fn run_loop(
                     // call; persona/voice/model take effect on the next caller turn.
                     #[cfg(feature = "voice")]
                     {
+                        // The Desktop's two reserved ChatGPT/Codex adapters
+                        // accept text only. An endpoint can change while the
+                        // radio is live, so disable an already-armed audio
+                        // attachment lane before adopting that endpoint. The
+                        // connector separately normalizes persisted
+                        // `sendAudio=false`; this is the in-flight fail-safe.
+                        if matches!(
+                            &endpoint,
+                            EndpointUpdate::Set(value)
+                                if crate::connector::is_codex_live_call_endpoint(value)
+                        ) {
+                            if send_audio {
+                                eprintln!(
+                                    "[aokie-plugin] sendAudio disabled: ChatGPT via Codex live-call adapters are text-only"
+                                );
+                            }
+                            send_audio = false;
+                            if audio_transcript
+                                && std::env::var("AOKIE_AUDIO_TRANSCRIPT_ENDPOINT")
+                                    .ok()
+                                    .is_none_or(|value| value.trim().is_empty())
+                            {
+                                eprintln!(
+                                    "[aokie-plugin] audioTranscript disabled: ChatGPT via Codex is text-only and no separate correction endpoint is configured"
+                                );
+                                audio_transcript = false;
+                            }
+                        }
                         if let Some(g) = g {
                             // Blank = default, never silence (see DEFAULT_GREETING).
                             greeting = if g.trim().is_empty() {
