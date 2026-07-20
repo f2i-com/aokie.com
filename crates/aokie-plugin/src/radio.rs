@@ -10692,14 +10692,58 @@ fn run_loop(
                             lane.output_total_samples = lane
                                 .output_total_samples
                                 .saturating_add(converted.len() as u64);
-                            if let Err(error) = lane.output_pacer.push(&item_id, &converted) {
-                                realtime_failure = Some((
-                                    lane.call_id.clone(),
-                                    lane.begun,
-                                    lane.owner.clone(),
-                                    error,
-                                ));
-                                break;
+                            match lane.output_pacer.push(&item_id, &converted) {
+                                Ok(()) => {}
+                                Err(
+                                    crate::realtime_voice::OutputPacerPushError::CapacityExceeded,
+                                ) => {
+                                    // A provider is allowed to synthesize much faster than
+                                    // wall-clock playout. If even the bounded 30-second
+                                    // reservoir is exhausted, abandon only this exact output
+                                    // item. The session and cellular call remain healthy; the
+                                    // caller can immediately start another turn. The radio-side
+                                    // tombstone and socket parser both discard the ordered late
+                                    // PCM tail until item_done.
+                                    let heard_ms =
+                                        lane.output_pacer.audible_played_ms(Instant::now());
+                                    if let Err(error) =
+                                        lane.session.cancel_output(&item_id, heard_ms)
+                                    {
+                                        realtime_failure = Some((
+                                            lane.call_id.clone(),
+                                            lane.begun,
+                                            lane.owner.clone(),
+                                            error,
+                                        ));
+                                        break;
+                                    }
+                                    eprintln!(
+                                        "[aokie-plugin] Desktop realtime response exceeded the bounded playout reservoir; cancelled exact output item while keeping the call active"
+                                    );
+                                    lane.cancelled_item = Some(item_id);
+                                    bt.flush_tx_audio();
+                                    lane.output_pacer.clear();
+                                    lane.output_resampler =
+                                        crate::realtime_voice::StreamingResampler::new(
+                                            crate::realtime_voice::WIRE_SAMPLE_RATE,
+                                            lane.sco_rate,
+                                        );
+                                    lane.output_transcript = None;
+                                    lane.completed_transcript = None;
+                                    lane.output_total_samples = 0;
+                                    if let Some(overflow_aec) = aec.as_mut() {
+                                        overflow_aec.reset();
+                                    }
+                                }
+                                Err(error) => {
+                                    realtime_failure = Some((
+                                        lane.call_id.clone(),
+                                        lane.begun,
+                                        lane.owner.clone(),
+                                        error.to_string(),
+                                    ));
+                                    break;
+                                }
                             }
                         }
                         crate::realtime_voice::RealtimeEventKind::OutputTranscript {
