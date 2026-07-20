@@ -84,11 +84,38 @@
     }
   }
 
+  function isDesktopRealtimeEndpoint(raw) {
+    try {
+      var parsed = new URL(String(raw || '').trim());
+      var segments = parsed.pathname.split('/');
+      return (
+        parsed.protocol === 'ws:' &&
+        parsed.hostname === '127.0.0.1' &&
+        parsed.port === '17872' &&
+        parsed.username === '' &&
+        parsed.password === '' &&
+        !parsed.search &&
+        !parsed.hash &&
+        segments.length === 8 &&
+        segments[1] === 'api' &&
+        segments[2] === 'ai' &&
+        segments[3] === 'providers' &&
+        /^[A-Za-z0-9._-]{1,128}$/.test(decodeURIComponent(segments[4])) &&
+        segments[5] === 'v1' &&
+        segments[6] === 'realtime' &&
+        segments[7] === 'stream'
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
   function effectiveDestination(raw) {
     var value = String(raw || '').trim();
     if (!value) return '';
     if (isCodexLiveCallEndpoint(value)) return CODEX_DESTINATION;
     if (value === CODEX_DESTINATION) return CODEX_DESTINATION;
+    if (isDesktopRealtimeEndpoint(value)) return '';
     if (isLoopbackUrl(value)) return '';
     try {
       return new URL(value).origin;
@@ -265,7 +292,14 @@
    *  to. Generic loopback processing is local; the two exact Codex broker
    *  routes disclose their stable OpenAI destination instead of a local URL. */
   function uniqueDestinations() {
-    var keys = ['aiEndpoint', 'sttEndpoint', 'ttsEndpoint', 'audioTranscriptEndpoint'];
+    var keys = [
+      'aiEndpoint',
+      'sttEndpoint',
+      'ttsEndpoint',
+      'audioTranscriptEndpoint',
+      'realtimeVoiceEndpoint',
+      'realtimeVoiceDestination',
+    ];
     var out = [];
     for (var i = 0; i < keys.length; i++) {
       var raw = typeof settingsBag[keys[i]] === 'string' ? settingsBag[keys[i]].trim() : '';
@@ -414,6 +448,10 @@
     if (!wizardOpen) return '';
     var dests = consentDestinations();
     var codexConfigured = isCodexLiveCallEndpoint(settingsBag.aiEndpoint);
+    var realtimeConfigured =
+      settingsBag.realtimeVoiceMode === 'desktop_realtime' &&
+      isDesktopRealtimeEndpoint(settingsBag.realtimeVoiceEndpoint) &&
+      effectiveDestination(settingsBag.realtimeVoiceDestination).length > 0;
     var codexChoice = '';
     if (codexProviderAvailable) {
       codexChoice =
@@ -427,6 +465,14 @@
         'Caller audio and account credentials are never included. Select this before choosing a ChatGPT via Codex live-call model.' +
         (codexConfigured ? ' Required by the current LLM source.' : '') +
         '</span></span></label>';
+    }
+    if (realtimeConfigured) {
+      var realtimeDestination = effectiveDestination(settingsBag.realtimeVoiceDestination);
+      codexChoice +=
+        '<p class="rcp-notice rcp-notice--warn" role="note"><strong>Realtime call audio:</strong> ' +
+        'the selected live-call voice provider sends raw caller and assistant audio through FormLogic Desktop to ' +
+        '<code>' + esc(realtimeDestination) + '</code>. The provider credential stays in Desktop, but the audio and transcripts are processed by that destination. ' +
+        'This destination is required by the current Realtime voice mode.</p>';
     }
     var scopeRows = [];
     for (var i = 0; i < SCOPE_ROWS.length; i++) {

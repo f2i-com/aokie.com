@@ -81,6 +81,10 @@ pub trait RadioBackend: Send {
     fn confirm_pairing(&self, address: &str, accept: bool) -> Result<(), String>;
     fn is_connected(&self) -> bool;
     fn get_sample_rate(&self) -> u16;
+    /// Whether this backend can expose bidirectional phone-call PCM to the
+    /// plugin. Desktop Realtime replaces the responder, not this physical
+    /// audio transport, so it must never auto-answer on a control-only link.
+    fn realtime_call_audio_supported(&self) -> bool;
     /// Whether the no-SCO dead-air watchdog (an answered call with no audio
     /// channel for one continuous 8s window gets hung up) applies to this
     /// transport. It is an SCO-link safety net: on the native Windows-stack
@@ -189,6 +193,9 @@ impl RadioBackend for UsbRadioBackend {
     fn sco_dead_air_watchdog(&self) -> bool {
         true
     }
+    fn realtime_call_audio_supported(&self) -> bool {
+        true
+    }
     fn backend_name(&self) -> &'static str {
         "WinUSB dongle"
     }
@@ -288,6 +295,11 @@ impl RadioBackend for NativeRadioBackend {
         self.inner.get_sample_rate()
     }
     fn sco_dead_air_watchdog(&self) -> bool {
+        false
+    }
+    fn realtime_call_audio_supported(&self) -> bool {
+        // Windows 11 25H2 on the supported field host has no HFP-HF service
+        // or usable hands-free endpoint. Native mode is call-control only.
         false
     }
     fn backend_name(&self) -> &'static str {
