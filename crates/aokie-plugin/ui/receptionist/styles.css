@@ -651,6 +651,9 @@ button {
   border-bottom-color: var(--signal);
 }
 
+/* Hidden by the transport mode (the Dongle tab on the native/auto transports). */
+.rcp-tab-btn[hidden] { display: none; }
+
 .rcp-tab-panel {
   display: flex;
   flex-direction: column;
@@ -718,6 +721,9 @@ button {
   max-width: 780px;
   padding: 12px 15px 0;
 }
+
+/* Dongle-only Advanced fields — hidden on the native/auto transports. */
+.set-dongle-only[hidden] { display: none; }
 
 .rcp-group-title {
   margin: 0;

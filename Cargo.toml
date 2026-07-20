@@ -8,6 +8,10 @@ members = [
     "crates/aokie-core",
     "crates/aokie-bluetooth",
     "crates/aokie-dongle",
+    # Native Windows-stack radio backend (WinRT Calls + WASAPI HF + RFCOMM
+    # MAP/PBAP) — the no-driver-install transport. Kept out of
+    # default-members (like aokie-plugin): built explicitly.
+    "crates/aokie-winbt",
     "crates/aokie-audio",
     "crates/aokie-db",
     "crates/aokie-ai",

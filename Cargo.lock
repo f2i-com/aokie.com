@@ -235,6 +235,7 @@ dependencies = [
  "aokie-media",
  "aokie-protocol",
  "aokie-realtime",
+ "aokie-winbt",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -310,6 +311,18 @@ dependencies = [
  "serde",
  "serde_json",
  "transcribe-rs",
+]
+
+[[package]]
+name = "aokie-winbt"
+version = "0.1.0"
+dependencies = [
+ "aokie-bluetooth",
+ "aokie-core",
+ "aokie-dongle",
+ "serde",
+ "serde_json",
+ "windows",
 ]
 
 [[package]]
