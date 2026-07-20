@@ -198,6 +198,16 @@
       "appliesLive": false
     },
     {
+      "key": "transportMode",
+      "type": "enum",
+      "options": [
+        "dongle",
+        "native",
+        "auto"
+      ],
+      "appliesLive": false
+    },
+    {
       "key": "persona",
       "type": "string",
       "maxChars": 4000,

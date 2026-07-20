@@ -709,6 +709,12 @@ impl Plugin {
             .map(|s| s.to_string());
         // Spoken greeting the receptionist plays on answer (voice build).
         let greeting = greeting_from_settings(&self.store.config.settings);
+        // transportMode (2026-07-19 native-Bluetooth arc): which phone-link
+        // backend the radio starts — `dongle` (default, today's WinUSB stack),
+        // `native` (built-in Windows Bluetooth, no driver install), `auto`.
+        let transport_mode = crate::backend::TransportMode::from_setting(
+            self.store.config.settings.get("transportMode"),
+        );
         match crate::radio::spawn(
             self.data_dir.clone(),
             None,
@@ -718,6 +724,7 @@ impl Plugin {
             greeting,
             self.ack_mode,
             self.host_rpc.clone(),
+            transport_mode,
         ) {
             Ok(handle) => {
                 eprintln!(
@@ -3686,6 +3693,16 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     SettingSpec {
         key: "hfpCodec",
         kind: SettingKind::Enum(&["auto", "cvsd", "wbs"]),
+        applies_live: false,
+    },
+    // Phone-link transport: `dongle` = the WinUSB dongle runtime (full
+    // control, switchboard; default — today's behaviour), `native` = the
+    // built-in Windows Bluetooth stack via aokie-winbt (no driver install;
+    // phone must be paired in Windows), `auto` = native when a Windows BT
+    // adapter is present, else dongle. Applies at radio start.
+    SettingSpec {
+        key: "transportMode",
+        kind: SettingKind::Enum(&["dongle", "native", "auto"]),
         applies_live: false,
     },
     SettingSpec {

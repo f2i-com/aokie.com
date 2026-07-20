@@ -32,6 +32,7 @@ pub mod aec;
 #[cfg(feature = "voice")]
 pub mod agent;
 pub mod assistance;
+pub mod backend;
 pub mod call_session;
 pub mod command_journal;
 pub mod companion_gateway;

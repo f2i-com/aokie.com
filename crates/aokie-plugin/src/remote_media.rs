@@ -2043,11 +2043,37 @@ pub fn publish_caption_globally(
 /// Chokepoint used by every Aokie/TTS caller-TX path.  Remote talk audio uses
 /// the explicit routed queue and never calls this predicate.
 pub fn human_reserves_radio_globally() -> bool {
+    // The §12.3 synthetic-audio rig drives the REAL playback engine in an
+    // otherwise radio-less test thread; without an opt-out, a PARALLEL
+    // companion/takeover test holding the process-global ACTIVE_REMOTE_MEDIA
+    // reservation would cancel the rig's playback mid-run (the 2026-07-19
+    // flake: rig tests failing in batches only in some full-suite runs).
+    #[cfg(test)]
+    if test_rig_isolated() {
+        return false;
+    }
     ACTIVE_REMOTE_MEDIA
         .get()
         .and_then(|slot| slot.try_lock().ok())
         .and_then(|active| active.upgrade())
         .is_some_and(|inner| inner.radio_reserved.load(Ordering::Acquire))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RIG_ISOLATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: mark THIS thread as rig-isolated so process-global remote-media
+/// gates read as unreserved. Set by the synthetic-audio rig's driver.
+#[cfg(test)]
+pub(crate) fn set_test_rig_isolated(isolated: bool) {
+    TEST_RIG_ISOLATED.with(|c| c.set(isolated));
+}
+
+#[cfg(test)]
+fn test_rig_isolated() -> bool {
+    TEST_RIG_ISOLATED.with(|c| c.get())
 }
 
 impl RemoteMediaState {

@@ -61,6 +61,10 @@
   var idleTimer = null;
   var windowTimer = null;
   var lastHtml = '';
+  // Transport mode from settings.get — decides the pairing instructions
+  // (native mode pairs in Windows Settings). The dongle copy is the default
+  // until the first settings load lands (missing/unknown = dongle view).
+  var transportMode = 'dongle';
 
   // ---- fetchers -----------------------------------------------------------
 
@@ -98,7 +102,7 @@
   }
 
   function refreshAll() {
-    return Promise.all([pollStatus(), loadBonded()]).then(
+    return Promise.all([pollStatus(), loadBonded(), loadTransport()]).then(
       function () {
         known = true;
         error = null;
@@ -108,6 +112,22 @@
         error = errMsg(e);
         known = true;
         render();
+      }
+    );
+  }
+
+  // Best-effort transport fetch: a settings failure keeps the last-known
+  // mode — it must never break the phone readouts. Also feeds the shared
+  // transport truth in app.js (Dongle-tab visibility).
+  function loadTransport() {
+    return HOST.command('settings.get').then(
+      function (data) {
+        var bag = (data && data.settings) || {};
+        if (TABS.transport && TABS.transport.update) TABS.transport.update(bag);
+        transportMode = TABS.transport && TABS.transport.mode ? TABS.transport.mode() : 'dongle';
+      },
+      function () {
+        /* keep the last-known mode */
       }
     );
   }
@@ -209,7 +229,9 @@
           prevWindowOpen = true;
           HOST.toast(
             'success',
-            'Discoverable for 5 minutes — on your phone: Bluetooth → Pair new device → "Aokie AI Assistant".'
+            transportMode === 'dongle'
+              ? 'Discoverable for 5 minutes — on your phone: Bluetooth → Pair new device → "Aokie AI Assistant".'
+              : 'This PC is discoverable for 5 minutes — finish the pairing in Windows Settings → Bluetooth & devices → Add device.'
           );
         },
         function (e) {
@@ -351,10 +373,18 @@
     }
 
     if (secondsLeft > 0) {
+      // Dongle mode: the phone pairs with the dongle itself. Native mode:
+      // this window only makes the PC discoverable — Windows Settings owns
+      // the actual pairing dialog and the code confirmation.
+      var windowCopy =
+        transportMode === 'dongle'
+          ? 'Discoverable as “Aokie AI Assistant” — <strong>' + esc(formatSeconds(secondsLeft)) + '</strong> left. ' +
+            'On your phone: Bluetooth → Pair new device, then confirm the matching code here.'
+          : 'This PC is discoverable to nearby phones — <strong>' + esc(formatSeconds(secondsLeft)) + '</strong> left. ' +
+            'Finish the pairing in Windows Settings → Bluetooth &amp; devices → Add device; Windows shows the pairing dialog and the code to confirm.';
       return (
         '<div class="rcp-card__body">' +
-        '<p class="rcp-step-meta">Discoverable as “Aokie AI Assistant” — <strong>' + esc(formatSeconds(secondsLeft)) + '</strong> left. ' +
-        'On your phone: Bluetooth → Pair new device, then confirm the matching code here.</p>' +
+        '<p class="rcp-step-meta">' + windowCopy + '</p>' +
         '<div class="rcp-actions">' +
         '<button type="button" class="rcp-button" data-act="pair-stop"' + (busy ? ' disabled' : '') + '>Stop pairing</button>' +
         '</div>' +
@@ -376,10 +406,15 @@
       );
     }
 
+    var idleCopy =
+      transportMode === 'dongle'
+        ? "New phones can't see the dongle until you open a pairing window " +
+          '(already-paired phones reconnect on their own).'
+        : 'Pair the phone in Windows Settings → Bluetooth &amp; devices → Add device — opening a pairing window here makes this PC discoverable while you do ' +
+          '(already-paired phones reconnect on their own).';
     return (
       '<div class="rcp-card__body">' +
-      "<p class=\"rcp-step-meta\">New phones can't see the dongle until you open a pairing window " +
-      '(already-paired phones reconnect on their own).</p>' +
+      '<p class="rcp-step-meta">' + idleCopy + '</p>' +
       '<div class="rcp-actions">' +
       '<button type="button" class="rcp-button is-primary" data-act="pair-start"' + (busy ? ' disabled' : '') + '>' +
       (busy ? 'Opening…' : 'Pair a phone') + '</button>' +
@@ -391,7 +426,9 @@
   function bondedCardBody() {
     if (!known) return '<p class="rcp-loading">Loading…</p>';
     if (bonded.length === 0) {
-      return '<p class="rcp-loading">No phones are bonded yet — open a pairing window above and pair your handset.</p>';
+      return transportMode === 'dongle'
+        ? '<p class="rcp-loading">No phones are bonded yet — open a pairing window above and pair your handset.</p>'
+        : '<p class="rcp-loading">No phones are bonded yet — pair your handset in Windows Settings → Bluetooth &amp; devices → Add device (a pairing window above makes this PC discoverable while you do).</p>';
     }
     var rows = [];
     for (var i = 0; i < bonded.length; i++) {

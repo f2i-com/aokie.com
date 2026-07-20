@@ -1415,7 +1415,7 @@ where
 fn perform_companion_end_caller(
     request: CompanionEndCallerRequest,
     reply: Sender<Result<(), CompanionEndCallerFailure>>,
-    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    bt: &mut dyn crate::backend::RadioBackend,
     tracker: &mut crate::call_session::SessionTracker,
     status: &RadioStatus,
     remote_media: &crate::remote_media::RemoteMediaHandle,
@@ -2451,8 +2451,9 @@ pub fn spawn(
     greeting: Option<String>,
     ack_mode: bool,
     host_rpc: Arc<crate::host_rpc::HostRpc>,
+    transport_mode: crate::backend::TransportMode,
 ) -> Result<RadioHandle, String> {
-    use aokie_dongle::bluetooth::BluetoothManager;
+    use crate::backend::{RadioBackend, TransportMode};
     use std::sync::mpsc;
 
     let (control_tx, control_rx) = mpsc::channel::<RadioControl>();
@@ -2467,13 +2468,23 @@ pub fn spawn(
         // RFCOMM â†’ HFP dispatch overflowed the 1 MiB Windows default.
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
+            // Transport selection (settings.transportMode): the WinUSB dongle
+            // is the proven full-control backend; `native` uses the built-in
+            // Windows Bluetooth stack (aokie-winbt) so no driver install is
+            // needed; `auto` prefers native when a Windows adapter exists.
+            let use_native = match transport_mode {
+                TransportMode::Native => true,
+                TransportMode::Auto => aokie_winbt::runtime::adapter_present(),
+                TransportMode::Dongle => false,
+            };
             // Software "virtual replug": on a cold boot the dongle's SCO iso
             // endpoint is dead until the device is re-enumerated (physically
             // unplug/replug). CM_Reenumerate the device before opening it so a
             // headless receptionist works after boot with no manual replug.
             // Best-effort + gated (settings.reenumerateHwid); settle briefly so
             // the device + WinUSB re-bind before we open it.
-            if let Some(hwid) = reenumerate_hwid.as_deref() {
+            if !use_native {
+                if let Some(hwid) = reenumerate_hwid.as_deref() {
                 match aokie_dongle::winusb::restart_device(hwid) {
                     Ok(()) => {
                         eprintln!("[aokie-plugin] restarted {hwid} (virtual replug: remove + re-add) â€” settling 3s");
@@ -2481,6 +2492,7 @@ pub fn spawn(
                     }
                     Err(e) => eprintln!("[aokie-plugin] virtual replug {hwid} failed (continuing): {e}"),
                 }
+            }
             }
             // Raise this process's timer resolution to 1 ms for the lifetime of
             // the radio (see Cargo.toml note). The SCO iso path services USB
@@ -2490,15 +2502,32 @@ pub fn spawn(
             // this for free via WebView2. timeBeginPeriod is ref-counted and
             // paired with timeEndPeriod below.
             unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
-            let mut bt = match BluetoothManager::new_with_preferred_dongle(preferred_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("[aokie-plugin] radio failed to start: {e}");
-                    *status_thread.last_error.lock().unwrap() = Some(e);
-                    unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
-                    return;
+            let mut bt: Box<dyn RadioBackend> = if use_native {
+                match crate::backend::NativeRadioBackend::start() {
+                    Ok(b) => Box::new(b),
+                    Err(e) => {
+                        eprintln!("[aokie-plugin] radio failed to start (native backend): {e}");
+                        *status_thread.last_error.lock().unwrap() = Some(e);
+                        unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+                        return;
+                    }
+                }
+            } else {
+                match crate::backend::UsbRadioBackend::new(preferred_path) {
+                    Ok(b) => Box::new(b),
+                    Err(e) => {
+                        eprintln!("[aokie-plugin] radio failed to start: {e}");
+                        *status_thread.last_error.lock().unwrap() = Some(e);
+                        unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+                        return;
+                    }
                 }
             };
+            eprintln!(
+                "[aokie-plugin] radio backend: {} (transportMode={})",
+                bt.backend_name(),
+                transport_mode.as_str()
+            );
             // AOK-BT-001: publish the shared pairing window so phone.status can
             // report pairing state lock-free.
             *status_thread.pairing_window.lock().unwrap() = Some(bt.pairing_window());
@@ -2531,7 +2560,7 @@ pub fn spawn(
             let status_exit = status_thread.clone();
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_loop(
-                    &mut bt,
+                    bt.as_mut(),
                     Some((&outbox, mode)),
                     &mut sink,
                     control_rx,
@@ -3255,9 +3284,9 @@ trait AudioLink {
 }
 
 #[cfg(all(target_os = "windows", feature = "voice"))]
-impl AudioLink for aokie_dongle::bluetooth::BluetoothManager {
+impl<'a> AudioLink for dyn crate::backend::RadioBackend + 'a {
     fn try_recv_audio(&mut self) -> Option<Vec<i16>> {
-        aokie_dongle::bluetooth::BluetoothManager::try_recv_audio(self).map(|audio| {
+        crate::backend::RadioBackend::try_recv_audio(self).map(|audio| {
             // The paced TTS loop can own the SCO drain for seconds. Mirror
             // those caller frames into the bounded native media lane here so
             // monitoring/takeover never develops a TTS-sized audio hole.
@@ -3269,9 +3298,9 @@ impl AudioLink for aokie_dongle::bluetooth::BluetoothManager {
         if !crate::remote_media::human_reserves_radio_globally() {
             crate::remote_media::try_capture_caller_output_globally(
                 pcm,
-                aokie_dongle::bluetooth::BluetoothManager::get_sample_rate(self) as u32,
+                crate::backend::RadioBackend::get_sample_rate(self) as u32,
             );
-            aokie_dongle::bluetooth::BluetoothManager::send_audio(self, pcm);
+            let _ = crate::backend::RadioBackend::send_audio(self, pcm);
         }
     }
 }
@@ -3377,9 +3406,9 @@ impl TtsChunkPlayback {
     /// caller talking over us (keeps the AEC reference FIFO aligned with
     /// capture and the scratchpad fed). Runs every paced-loop iteration —
     /// listening never stops, even while synthesis is still decoding.
-    fn poll_mic(
+    fn poll_mic<L: AudioLink + ?Sized>(
         &mut self,
-        link: &mut dyn AudioLink,
+        link: &mut L,
         aec: &mut Option<&mut crate::aec::EchoCanceller>,
         barge_rms: Option<f32>,
         now: std::time::Instant,
@@ -3435,9 +3464,9 @@ impl TtsChunkPlayback {
         }
     }
 
-    fn push(
+    fn push<L: AudioLink + ?Sized>(
         &mut self,
-        link: &mut dyn AudioLink,
+        link: &mut L,
         aec: &mut Option<&mut crate::aec::EchoCanceller>,
         barge_rms: Option<f32>,
         ctl: &mut Option<&mut ControlProbe<'_>>,
@@ -3653,7 +3682,7 @@ impl Drop for SttBusyGuard {
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 fn speak_manager_line(
-    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    bt: &mut dyn crate::backend::RadioBackend,
     synth: &crate::synth::SynthHandle,
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
@@ -4734,7 +4763,7 @@ impl<'a> SttProbeLane<'a> {
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 fn tts_speak(
-    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    bt: &mut dyn crate::backend::RadioBackend,
     synth: &crate::synth::SynthHandle,
     text: &str,
     sample_rate: u16,
@@ -5082,7 +5111,7 @@ struct PlannedSpeech {
 /// it and is returned so the caller can honour it.
 #[cfg(all(target_os = "windows", feature = "voice"))]
 fn speak_announcement(
-    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    bt: &mut dyn crate::backend::RadioBackend,
     synth: &crate::synth::SynthHandle,
     text: &str,
     sample_rate: u16,
@@ -5170,7 +5199,7 @@ fn swap_snapshot(
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 fn settle_swap(
-    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    bt: &mut dyn crate::backend::RadioBackend,
     tracker: &mut crate::call_session::SessionTracker,
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
@@ -5384,7 +5413,7 @@ fn resolve_swap_back_by_indicator(snap: &SwapSnapshot) -> SwapBackVerdict {
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 fn settle_and_judge_swap_back(
-    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    bt: &mut dyn crate::backend::RadioBackend,
     tracker: &mut crate::call_session::SessionTracker,
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
@@ -5434,7 +5463,7 @@ fn settle_and_judge_swap_back(
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 fn speak_planned(
-    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    bt: &mut dyn crate::backend::RadioBackend,
     synth: &crate::synth::SynthHandle,
     raw_text: &str,
     sample_rate: u16,
@@ -5531,7 +5560,7 @@ fn speak_planned(
 #[cfg(all(target_os = "windows", feature = "voice"))]
 fn perform_cancel_action(
     action: CancelAction,
-    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    bt: &mut dyn crate::backend::RadioBackend,
     tracker: &mut crate::call_session::SessionTracker,
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
@@ -5862,7 +5891,7 @@ impl CallVoiceContext {
 // `greeting` is only mutated (via RadioControl::Configure) in the voice build.
 #[cfg_attr(not(feature = "voice"), allow(unused_mut))]
 fn run_loop(
-    bt: &mut aokie_dongle::bluetooth::BluetoothManager,
+    bt: &mut dyn crate::backend::RadioBackend,
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
     control_rx: std::sync::mpsc::Receiver<RadioControl>,
@@ -7217,7 +7246,7 @@ fn run_loop(
                         // exact Desktop mute/lease gate, so an acknowledged
                         // mute cannot race one already-popped PCM frame.
                         let sent = remote_media.send_talk_pcm_if_unmuted(binding, &pcm, || {
-                            aokie_dongle::bluetooth::BluetoothManager::send_audio(bt, &pcm)
+                            crate::backend::RadioBackend::send_audio(bt, &pcm)
                         });
                         if sent {
                             remote_media.try_mirror_companion_output(&pcm, remote_tx_rate);
@@ -9189,14 +9218,23 @@ fn run_loop(
             // The mutex-backed owner proof wins over the cached atomic if a
             // refresh is crossing this exact tick.
             let remote_reserved = aokie_owner.is_none() && remote_media.radio_reserved();
-            match no_sco_watchdog.check(
-                active_call_id.as_deref(),
-                bt.get_sample_rate() > 0,
-                switch_recent,
-                aokie_owner.is_some(),
-                remote_reserved,
-                std::time::Instant::now(),
-            ) {
+            // The no-SCO watchdog is a WinUSB-SCO safety net: on the native
+            // Windows-stack transport the call audio path is Windows-owned
+            // (and may legitimately sit outside our WASAPI pump), so ending
+            // the call there is wrong — the transport opts out.
+            let dead_air_action = if bt.sco_dead_air_watchdog() {
+                no_sco_watchdog.check(
+                    active_call_id.as_deref(),
+                    bt.get_sample_rate() > 0,
+                    switch_recent,
+                    aokie_owner.is_some(),
+                    remote_reserved,
+                    std::time::Instant::now(),
+                )
+            } else {
+                None
+            };
+            match dead_air_action {
                 Some(NoScoAction::RequestRemoteReturn) => {
                     eprintln!(
                         "[aokie-plugin] call audio channel lost during Companion ownership - returning the caller to Aokie before the hardware watchdog may act"
@@ -9393,7 +9431,7 @@ fn run_loop(
                     );
                     if !remote_media.radio_reserved() {
                         remote_media.try_push_caller_output(&tone, sr as u32);
-                        bt.send_audio(&tone);
+                        let _ = crate::backend::RadioBackend::send_audio(bt, &tone);
                     }
                     s.toned = true;
                     idle = false;
@@ -14906,6 +14944,7 @@ pub fn spawn(
     _reenumerate_hwid: Option<String>,
     _greeting: Option<String>,
     _ack_mode: bool,
+    _transport_mode: crate::backend::TransportMode,
 ) -> Result<RadioHandle, String> {
     Err("the Aokie radio is only supported on Windows (WinUSB)".to_string())
 }
@@ -17605,11 +17644,28 @@ mod synthetic_audio {
         sent: Vec<i16>,
     }
 
+    /// Panic-safe guard: the rig drives the real engine WITHOUT a radio, so
+    /// this thread must not observe another (parallel) test's process-global
+    /// remote-media reservation — the 2026-07-19 full-suite flake.
+    struct RigIsolation;
+    impl RigIsolation {
+        fn new() -> Self {
+            crate::remote_media::set_test_rig_isolated(true);
+            Self
+        }
+    }
+    impl Drop for RigIsolation {
+        fn drop(&mut self) {
+            crate::remote_media::set_test_rig_isolated(false);
+        }
+    }
+
     /// Drive one bot utterance through the engine exactly like the paced
     /// loop: 20 ms virtual steps, mic staged before each step from the echo
     /// of what already played plus the caller script, `now` advanced on the
     /// fake clock.
     fn run(t: &Timeline) -> RunResult {
+        let _isolation = RigIsolation::new();
         let mut aec_engine = crate::aec::EchoCanceller::new(SR as u32);
         let mut link = FakeLink::default();
         // The bot signal is generated PHASE-CONTINUOUS with the AEC warm-up

@@ -43,6 +43,7 @@
     bargeIn: false,
     bargeSensitivity: 650,
     hfpCodec: 'auto',
+    transportMode: 'dongle',
     reenumerateHwid: '',
     legacyPairingPin: false,
   };
@@ -85,6 +86,10 @@
           ? src.bargeSensitivity
           : d.bargeSensitivity,
       hfpCodec: codec === 'cvsd' || codec === 'wbs' || codec === 'auto' ? codec : d.hfpCodec,
+      transportMode:
+        src.transportMode === 'native' || src.transportMode === 'auto' || src.transportMode === 'dongle'
+          ? src.transportMode
+          : d.transportMode,
       reenumerateHwid:
         typeof src.reenumerateHwid === 'string' ? src.reenumerateHwid : d.reenumerateHwid,
       legacyPairingPin: boolSetting(src.legacyPairingPin, d.legacyPairingPin),
@@ -432,6 +437,9 @@
         // and an aliased baseline would make every dirty-diff empty.
         baseline = merged;
         settings = withAokieDefaults(merged);
+        // Keep the shared transport truth (the Dongle tab's visibility in
+        // app.js) in step with the plugin's saved settings.
+        if (TABS.transport && TABS.transport.update) TABS.transport.update(merged);
         sources = results[1];
         // A bump between polls that this tab did not cause = the linked app
         // re-applied its record (see the provenance note above).
@@ -484,6 +492,8 @@
           // Separate objects — see the aliasing note in load().
           baseline = merged;
           settings = withAokieDefaults(merged);
+          // The saved mode now drives the Dongle tab's visibility too.
+          if (TABS.transport && TABS.transport.update) TABS.transport.update(merged);
           // OUR bump — never mistake a successful save for the linked app.
           noteConfigVersion((data || {}).configVersion, true);
           // The set response may not carry the catalog side key — keep the
@@ -795,10 +805,24 @@
       // ---- Advanced --------------------------------------------------------
       '<div>' +
       '<h4 class="rcp-group-title">Advanced</h4>' +
+      // Phone connection: the Aokie USB dongle is the only transport offered.
+      // The native Windows-Bluetooth backend (transportMode setting) exists
+      // for advanced use, but Windows 11 25H2 removed the OS hands-free
+      // service — native mode cannot carry call audio there, so the mode is
+      // pinned to the dongle in the UI rather than offered as a choice that
+      // silently breaks calls.
+      hint('Phone connection: Aokie USB dongle.') +
+      // Dongle-only hardware knobs — meaningless on the native Windows
+      // Bluetooth transport, so they hide (in place, order preserved) unless
+      // the mode is dongle. Each keeps its own wrapper so answerTone and the
+      // surrounding layout render exactly as before in dongle mode.
+      '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
       field('Bluetooth audio codec', '<select data-key="hfpCodec">' + codecOpts.join('') + '</select>') +
-      hint('Some dongles only work reliably with CVSD; mSBC gives better speech-recognition accuracy where supported.') +
+      hint('Dongle mode only. Some dongles only work reliably with CVSD; mSBC gives better speech-recognition accuracy where supported.') +
+      '</div>' +
       check('answerTone', 'Play a test tone on answer') +
       hint('Diagnostic: verifies the outbound audio path reaches the caller. Leave off for normal use.') +
+      '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
       field(
         'Re-enumerate hardware id on start',
         '<input type="text" data-key="reenumerateHwid" placeholder="e.g. USB\\VID_0A5C&amp;PID_21EC" value="' +
@@ -807,11 +831,14 @@
       hint(
         "Workaround for dongles whose audio is dead after a cold boot until replugged. Leave blank unless you've hit that issue."
       ) +
+      '</div>' +
+      '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
       check('legacyPairingPin', 'Allow legacy PIN pairing (compatibility)') +
       hint(
         "⚠️ Uses the fixed PIN 0000 for very old devices that can't do modern code-confirmation pairing — it provides no protection against a nearby impostor. Enable only while pairing such a device, then turn it back off.",
         true
       ) +
+      '</div>' +
       '</div>' +
       // ---- Actions ---------------------------------------------------------
       // ⚠️ NOT type="submit": the sandboxed iframe (allow-scripts only, CSP
@@ -905,6 +932,15 @@
     var key = t.getAttribute('data-key');
     if (key != null) {
       settings[key] = t.value;
+      if (key === 'transportMode') {
+        // Live feedback for the working copy: the dongle-only Advanced
+        // fields toggle in place (same pattern as the lane custom-URL rows).
+        // The Dongle tab itself follows the SAVED mode — it flips when this
+        // form saves and the plugin's settings come back.
+        var hideDongleFields = t.value !== 'dongle';
+        var zones = root ? root.querySelectorAll('.set-dongle-only') : [];
+        for (var zi = 0; zi < zones.length; zi++) zones[zi].hidden = hideDongleFields;
+      }
       return;
     }
     var num = t.getAttribute('data-num');
