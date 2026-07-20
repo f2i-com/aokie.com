@@ -24,6 +24,8 @@ pub const ESSENTIAL_EVENTS: &[&str] = &[
     crate::contract::events::CALL_INCOMING,
     crate::contract::events::CALL_ANSWERED,
     crate::contract::events::CALL_TURN_FINAL,
+    crate::contract::events::CALL_TURN_CORRECTED,
+    crate::contract::events::CALL_TRANSCRIPT_SETTLED,
     crate::contract::events::CALL_ENDED,
     crate::contract::events::CALL_ASSISTANCE_REQUESTED,
     crate::contract::events::CALL_ASSISTANCE_RESOLVED,
@@ -378,6 +380,10 @@ mod tests {
         ));
         assert!(is_essential(
             crate::contract::events::CALL_ASSISTANCE_RESOLVED
+        ));
+        assert!(is_essential(crate::contract::events::CALL_TURN_CORRECTED));
+        assert!(is_essential(
+            crate::contract::events::CALL_TRANSCRIPT_SETTLED
         ));
         assert!(is_essential(crate::contract::events::SMS_SENT));
         assert!(is_essential(crate::contract::events::HARDWARE_ERROR));

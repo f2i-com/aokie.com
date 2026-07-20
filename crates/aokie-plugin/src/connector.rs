@@ -894,7 +894,9 @@ impl Plugin {
             gateway.stop();
         }
         let stopped = if let Some(radio) = self.radio.take() {
-            let _ = radio.send(crate::radio::RadioControl::Shutdown);
+            if let Err(error) = radio.shutdown_and_wait() {
+                eprintln!("[aokie-plugin] consent shutdown did not confirm cleanly: {error}");
+            }
             true
         } else {
             false
@@ -1150,7 +1152,11 @@ impl Plugin {
             gateway.stop();
         }
         let radio_stopped = if let Some(radio) = self.radio.take() {
-            let _ = radio.send(crate::radio::RadioControl::Shutdown);
+            if let Err(error) = radio.shutdown_and_wait() {
+                eprintln!(
+                    "[aokie-plugin] consent-revoke shutdown did not confirm cleanly: {error}"
+                );
+            }
             true
         } else {
             false
@@ -1184,13 +1190,29 @@ impl Plugin {
             "plugin.init" => Some(self.handle_init(&id, &msg.params)),
             "plugin.health" => Some(rpc::success_line(&id, self.build_health())),
             "plugin.shutdown" => {
-                self.shutdown_requested = true;
                 if let Some(gateway) = self.companion_gateway.take() {
                     gateway.stop();
                 }
                 if let Some(radio) = self.radio.as_ref() {
-                    let _ = radio.send(crate::radio::RadioControl::Shutdown);
+                    if let Err(error) = radio.shutdown_and_wait() {
+                        // Do not tell `main` to exit while a live radio still
+                        // owns an unflushed transcript settlement. A dead or
+                        // never-initialised radio has no such in-flight work,
+                        // so it is safe to finish shutdown in that case.
+                        if radio.is_initialized() {
+                            return Some(rpc::error_line(
+                                Some(&id),
+                                rpc::COMMAND_ERROR,
+                                "the radio could not complete graceful shutdown",
+                                Some(json!({
+                                    "code": "shutdown_timeout",
+                                    "message": error,
+                                })),
+                            ));
+                        }
+                    }
                 }
+                self.shutdown_requested = true;
                 Some(rpc::success_line(&id, json!({"ok": true})))
             }
             "connector.request" => Some(self.handle_connector_request(&id, &msg.params, sink)),
@@ -2404,24 +2426,44 @@ impl Plugin {
                 call.state = MockCallState::Ended;
                 let (corr, turns) = (call.correlation_id.clone(), call.turns);
                 let call_from = call.caller.clone();
+                let ended_data = json!({
+                    "at": now_iso8601(),
+                    "turns": turns,
+                    "reason": "operator_hangup",
+                    "callId": corr,
+                    "from": call_from,
+                    "callerPhone": call_from,
+                    "durationSeconds": 30,
+                    "outcome": "completed",
+                });
                 let ev = aokie_event(
                     crate::contract::events::CALL_ENDED,
                     &corr,
-                    json!({
-                        "at": now_iso8601(),
-                        "turns": turns,
-                        "reason": "operator_hangup",
-                        "callId": corr,
-                        "from": call_from,
-                        "callerPhone": call_from,
-                        "durationSeconds": 30,
-                        "outcome": "completed",
-                    }),
+                    ended_data.clone(),
                 );
                 emit_event(
                     sink,
                     &self.outbox,
                     &ev,
+                    false,
+                    crate::event_bridge::EmitMode::for_host(
+                        self.ack_mode,
+                        self.dev_mode || crate::event_bridge::legacy_host_allowed(),
+                    ),
+                )
+                .map_err(CmdError::failed)?;
+                let mut settled_data = ended_data;
+                settled_data["transcriptSettledAt"] = json!(now_iso8601());
+                settled_data["transcriptCorrectionTimedOut"] = json!(false);
+                let settled = aokie_event(
+                    crate::contract::events::CALL_TRANSCRIPT_SETTLED,
+                    &corr,
+                    settled_data,
+                );
+                emit_event(
+                    sink,
+                    &self.outbox,
+                    &settled,
                     false,
                     crate::event_bridge::EmitMode::for_host(
                         self.ack_mode,
@@ -3195,21 +3237,33 @@ impl Plugin {
             call.turns = 2;
         }
 
+        let ended_data = json!({
+            "at": now_iso8601(),
+            "durationMs": 42_000,
+            "turns": 2,
+            "callId": corr,
+            "from": caller,
+            "callerPhone": caller,
+            "durationSeconds": 42,
+            "outcome": "completed",
+        });
         emit(
             self,
             aokie_event(
                 crate::contract::events::CALL_ENDED,
                 &corr,
-                json!({
-                    "at": now_iso8601(),
-                    "durationMs": 42_000,
-                    "turns": 2,
-                    "callId": corr,
-                    "from": caller,
-                    "callerPhone": caller,
-                    "durationSeconds": 42,
-                    "outcome": "completed",
-                }),
+                ended_data.clone(),
+            ),
+        )?;
+        let mut settled_data = ended_data;
+        settled_data["transcriptSettledAt"] = json!(now_iso8601());
+        settled_data["transcriptCorrectionTimedOut"] = json!(false);
+        emit(
+            self,
+            aokie_event(
+                crate::contract::events::CALL_TRANSCRIPT_SETTLED,
+                &corr,
+                settled_data,
             ),
         )?;
         if let Some(call) = self.mock.current_call.as_mut() {
@@ -5509,6 +5563,7 @@ mod tests {
             crate::contract::events::CALL_TURN_FINAL,
             crate::contract::events::CALL_TURN_FINAL,
             crate::contract::events::CALL_ENDED,
+            crate::contract::events::CALL_TRANSCRIPT_SETTLED,
             crate::contract::events::SMS_RECEIVED,
         ];
         let events: Vec<Value> = sink.lines.iter().map(|l| parse(l)).collect();
@@ -5532,7 +5587,8 @@ mod tests {
         assert_eq!(key(4), json!(format!("aokie:{corr}:turn.1.final:v1")));
         assert_eq!(key(5), json!(format!("aokie:{corr}:turn.2.final:v1")));
         assert_eq!(key(6), json!(format!("aokie:{corr}:ended:v1")));
-        assert_eq!(key(7), json!(format!("aokie:{corr}:sms.received:v1")));
+        assert_eq!(key(7), json!(format!("aokie:{corr}:transcript.settled:v1")));
+        assert_eq!(key(8), json!(format!("aokie:{corr}:sms.received:v1")));
 
         // Every scripted step landed in the outbox and was marked sent.
         for ev in &events {
@@ -5543,7 +5599,7 @@ mod tests {
                 "outbox missing {k}"
             );
         }
-        assert_eq!(data["outbox"]["sent"], json!(8));
+        assert_eq!(data["outbox"]["sent"], json!(9));
 
         // The mock call ended; the confirmation SMS seeded a thread.
         assert_eq!(
