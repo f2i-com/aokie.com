@@ -1073,7 +1073,7 @@ fn realtime_safe_instructions(persona: &str, allow_finish_call: bool) -> String 
         .take(8_000)
         .collect();
     let finish_rule = if allow_finish_call {
-        "When the caller clearly says they are finished and no question is unanswered, call finish_call. The system will speak the final goodbye and safely end the phone call."
+        "When the caller clearly says they are finished and no question is unanswered, call finish_call without speaking first. The system will speak the final goodbye and safely end the phone call."
     } else {
         "You cannot end the phone call yourself; leave the line open after a polite closing."
     };
@@ -17526,7 +17526,7 @@ mod tests {
         }
         assert!(prompt.contains("use lookup_business_data"));
         assert!(prompt.contains("booking REQUEST"));
-        assert!(prompt.contains("call finish_call"));
+        assert!(prompt.contains("call finish_call without speaking first"));
     }
 
     #[cfg(feature = "voice")]
