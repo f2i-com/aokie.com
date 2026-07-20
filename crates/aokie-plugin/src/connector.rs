@@ -843,10 +843,20 @@ impl Plugin {
         if self.dev_mode || self.radio.is_some() {
             return Ok(());
         }
+        // Consent enforcement intentionally prevents radio construction. It
+        // still blocks every mutating command, but report that policy gate as
+        // the cause instead of falsely diagnosing the dongle/driver. A real
+        // startup failure retains the hardware error below.
         let cause = self
-            .radio_start_error
+            .consent_blocked
             .as_deref()
-            .unwrap_or("no dongle / driver not bound / startup failed");
+            .map(|reason| format!("consent required: {reason}"))
+            .unwrap_or_else(|| {
+                self.radio_start_error
+                    .as_deref()
+                    .unwrap_or("no dongle / driver not bound / startup failed")
+                    .to_string()
+            });
         Err(CmdError::failed(format!(
             "{command}: the radio is not running ({cause}) — command not performed"
         )))
@@ -1848,6 +1858,44 @@ impl Plugin {
                                 },
                             }));
                         }
+                        // A consent-enforced destination change deliberately
+                        // pauses the entire radio before any caller data can
+                        // leave the machine. Diagnostics is read-only, so keep
+                        // it available during that pause: the operator needs
+                        // the outbox counts and an actionable consent status in
+                        // order to recover. This is intentionally narrower than
+                        // the ordinary no-radio path below, which still fails
+                        // typed for missing/broken hardware.
+                        if !self.dev_mode {
+                            if let Some(reason) = self.consent_blocked.as_deref() {
+                                return Ok(json!({
+                                    "radio": {
+                                        "running": false,
+                                        "status": "paused",
+                                        "paused": true,
+                                        "blockedBy": "consent",
+                                        "reason": reason,
+                                        "initialized": false,
+                                        "connected": false,
+                                        "callActive": false,
+                                        "localAddress": null,
+                                        "connectedPhone": null,
+                                        "deviceName": "Aokie AI Assistant",
+                                        "error": format!("consent required: {reason}"),
+                                        "staleSttResults": 0,
+                                        "duplex": null,
+                                        "voiceSttError": null,
+                                        "voiceTtsError": null,
+                                    },
+                                    "outbox": {
+                                        "pending": c.pending,
+                                        "failed": c.failed,
+                                        "dead": c.dead,
+                                        "keyCollisions": self.outbox.collision_count().unwrap_or(0),
+                                    },
+                                }));
+                            }
+                        }
                         Err(CmdError::failed(format!(
                             "dongle.diagnostics is not yet wired to hardware (outbox: {} pending, {} failed, {} dead)",
                             c.pending, c.failed, c.dead
@@ -2120,6 +2168,27 @@ impl Plugin {
                         })
                     });
                     return Ok(json!({"call": call, "companionMedia": media}));
+                }
+                // Consent can intentionally keep the radio absent. Polling the
+                // current call is read-only and must remain usable so the UI
+                // does not turn that safe pause into a 502 loop. Report both
+                // the canonical empty call and why no radio snapshot exists.
+                // Ordinary hardware absence still reaches the strict outage
+                // gate below, and every call mutation retains that same gate.
+                if !self.dev_mode {
+                    if let Some(reason) = self.consent_blocked.as_deref() {
+                        return Ok(json!({
+                            "call": null,
+                            "companionMedia": null,
+                            "radio": {
+                                "running": false,
+                                "status": "paused",
+                                "paused": true,
+                                "blockedBy": "consent",
+                                "reason": reason,
+                            },
+                        }));
+                    }
                 }
                 self.require_radio_or_dev("call.current")?;
                 Ok(json!({"call": self.mock.current_call.as_ref().map(call_json)}))
@@ -5295,6 +5364,94 @@ mod tests {
         assert!(err.message.contains("not yet wired to hardware"));
         // Diagnostics surfaces outbox health even in the error message.
         assert!(err.message.contains("dead"));
+    }
+
+    #[test]
+    fn consent_paused_radio_keeps_status_reads_available_but_mutations_fail_closed() {
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+        let reason = "signed grant does not cover OpenAI ChatGPT via Codex";
+        plugin.consent_blocked = Some(reason.to_string());
+
+        let current = plugin
+            .dispatch_command("call.current", &Value::Null, &mut sink)
+            .unwrap();
+        assert_eq!(
+            current,
+            json!({
+                "call": null,
+                "companionMedia": null,
+                "radio": {
+                    "running": false,
+                    "status": "paused",
+                    "paused": true,
+                    "blockedBy": "consent",
+                    "reason": reason,
+                },
+            })
+        );
+
+        let diagnostics = plugin
+            .dispatch_command("dongle.diagnostics", &Value::Null, &mut sink)
+            .unwrap();
+        assert_eq!(
+            diagnostics["radio"],
+            json!({
+                "running": false,
+                "status": "paused",
+                "paused": true,
+                "blockedBy": "consent",
+                "reason": reason,
+                "initialized": false,
+                "connected": false,
+                "callActive": false,
+                "localAddress": null,
+                "connectedPhone": null,
+                "deviceName": "Aokie AI Assistant",
+                "error": format!("consent required: {reason}"),
+                "staleSttResults": 0,
+                "duplex": null,
+                "voiceSttError": null,
+                "voiceTtsError": null,
+            })
+        );
+        assert_eq!(
+            diagnostics["outbox"],
+            json!({
+                "pending": 0,
+                "failed": 0,
+                "dead": 0,
+                "keyCollisions": 0,
+            })
+        );
+
+        // Only the two status reads above gain a consent-pause path. A command
+        // that could touch the real call remains behind the strict radio gate
+        // and cannot emit a fabricated success/event.
+        let err = plugin
+            .dispatch_command("call.answer", &Value::Null, &mut sink)
+            .unwrap_err();
+        assert_eq!(err.code, "command_failed");
+        assert!(err.message.contains("radio is not running"));
+        assert!(err.message.contains("consent required"));
+        assert!(err.message.contains(reason));
+        assert!(err.message.contains("command not performed"));
+        assert!(sink.lines.is_empty());
+
+        // A plain hardware outage is not mislabeled as a consent pause.
+        plugin.consent_blocked = None;
+        let err = plugin
+            .dispatch_command("call.current", &Value::Null, &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("radio is not running"));
+        assert!(err
+            .message
+            .contains("no dongle / driver not bound / startup failed"));
+        assert!(!err.message.contains("consent required"));
+        let err = plugin
+            .dispatch_command("dongle.diagnostics", &Value::Null, &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("not yet wired to hardware"));
     }
 
     #[test]
