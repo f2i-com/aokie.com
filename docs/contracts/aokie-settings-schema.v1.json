@@ -243,6 +243,58 @@
       "appliesLive": true
     },
     {
+      "key": "realtimeVoiceMode",
+      "type": "enum",
+      "options": [
+        "legacy",
+        "desktop_realtime"
+      ],
+      "appliesLive": false
+    },
+    {
+      "key": "realtimeVoiceEndpoint",
+      "type": "endpointUrl",
+      "appliesLive": false
+    },
+    {
+      "key": "realtimeVoiceDestination",
+      "type": "endpointUrl",
+      "appliesLive": false
+    },
+    {
+      "key": "realtimeVoice",
+      "type": "enum",
+      "options": [
+        "marin",
+        "cedar",
+        "alloy",
+        "ash",
+        "ballad",
+        "coral",
+        "echo",
+        "sage",
+        "shimmer",
+        "verse"
+      ],
+      "appliesLive": false
+    },
+    {
+      "key": "realtimeTurnDetection",
+      "type": "enum",
+      "options": [
+        "server_vad",
+        "semantic_vad"
+      ],
+      "appliesLive": false
+    },
+    {
+      "key": "realtimeMaxOutputTokens",
+      "type": "int",
+      "min": 64,
+      "max": 4096,
+      "appliesLive": false
+    },
+    {
       "key": "sttEndpoint",
       "type": "endpointUrl",
       "appliesLive": true
