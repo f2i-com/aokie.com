@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
 pub const WIRE_SAMPLE_RATE: u32 = 24_000;
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const COMMAND_DEPTH: usize = 32;
 const EVENT_DEPTH: usize = 64;
 const MAX_BINARY_BYTES: usize = 96_000; // two seconds of PCM16 at 24 kHz
@@ -59,6 +60,12 @@ pub struct SessionConfig {
     pub model: Option<String>,
     pub turn_detection: TurnDetection,
     pub max_output_tokens: u32,
+    /// Desktop may expose only its fixed, read-only business lookup tool when
+    /// this trusted plugin capability bit is present.
+    pub allow_business_lookup: bool,
+    /// The physical call-ending tool is advertised only when the operator has
+    /// enabled agentHangup for this receptionist.
+    pub allow_finish_call: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +90,16 @@ pub enum RealtimeEventKind {
         text: String,
     },
     OutputItemDone {
+        item_id: String,
+    },
+    ToolCall {
+        tool_call_id: String,
+        name: String,
+        arguments: Value,
+    },
+    HangupRequested {
+        tool_call_id: String,
+        response_id: String,
         item_id: String,
     },
     Error {
@@ -113,8 +130,19 @@ enum Command {
 #[derive(Debug)]
 enum ControlCommand {
     Begin,
-    CancelOutput { item_id: String, played_ms: u64 },
-    Stop { reason: String },
+    CancelOutput {
+        item_id: String,
+        played_ms: u64,
+    },
+    ToolResult {
+        tool_call_id: String,
+        name: String,
+        ok: bool,
+        output: Value,
+    },
+    Stop {
+        reason: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -136,6 +164,21 @@ struct StartEvent<'a> {
     input_format: &'static str,
     output_format: &'static str,
     sample_rate: u32,
+    allow_business_lookup: bool,
+    allow_finish_call: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolResultEvent<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    call_id: &'a str,
+    generation: u64,
+    tool_call_id: &'a str,
+    name: &'a str,
+    ok: bool,
+    output: &'a Value,
 }
 
 #[derive(Serialize)]
@@ -359,6 +402,40 @@ impl RealtimeVoiceSession {
             .map_err(|_| "Desktop realtime control queue is unavailable".to_string())
     }
 
+    /// Complete exactly one Desktop-relayed, allow-listed provider tool call.
+    /// The socket worker retains the provider call id and Desktop rejects a
+    /// duplicate, stale, renamed, or cross-call result.
+    pub fn complete_tool(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+        ok: bool,
+        output: Value,
+    ) -> Result<(), String> {
+        if tool_call_id.is_empty()
+            || tool_call_id.len() > 256
+            || name.is_empty()
+            || name.len() > 64
+            || tool_call_id.chars().any(char::is_control)
+            || name.chars().any(char::is_control)
+        {
+            return Err("Desktop realtime tool result identity is invalid".to_string());
+        }
+        let encoded = serde_json::to_vec(&output)
+            .map_err(|_| "Desktop realtime tool result is not JSON".to_string())?;
+        if encoded.len() > MAX_TOOL_OUTPUT_BYTES {
+            return Err("Desktop realtime tool result exceeded 8 KiB".to_string());
+        }
+        self.control_tx
+            .send(ControlCommand::ToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                name: name.to_string(),
+                ok,
+                output,
+            })
+            .map_err(|_| "Desktop realtime control queue is unavailable".to_string())
+    }
+
     /// Arm the already-ready upstream session. The caller must send this only
     /// after the exact call is active, SCO is up, screening has completed,
     /// and Aokie still owns the media fence. Merely opening the WebSocket must
@@ -421,6 +498,8 @@ async fn run_socket(
         input_format: "pcm16",
         output_format: "pcm16",
         sample_rate: WIRE_SAMPLE_RATE,
+        allow_business_lookup: config.allow_business_lookup,
+        allow_finish_call: config.allow_finish_call,
     };
     sink.send(Message::Text(
         serde_json::to_string(&start)
@@ -472,6 +551,22 @@ async fn run_socket(
                             // item_done so late PCM can never be mistaken for
                             // a future response.
                             output_state.abandon_exact(&item_id)?;
+                        }
+                        Ok(ControlCommand::ToolResult { tool_call_id, name, ok, output }) => {
+                            if !begun {
+                                return Err("Desktop realtime tool result arrived before begin".to_string());
+                            }
+                            let event = ToolResultEvent {
+                                kind: "formlogic.realtime.tool_result",
+                                call_id: &config.call_id,
+                                generation: config.generation,
+                                tool_call_id: &tool_call_id,
+                                name: &name,
+                                ok,
+                                output: &output,
+                            };
+                            sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
+                                .map_err(|e| format!("Desktop realtime tool result failed: {e}"))?;
                         }
                         Ok(ControlCommand::Stop { reason }) => {
                             let event = StopEvent {
@@ -772,6 +867,54 @@ fn parse_server_text(
             let item_id = item_id()?;
             output_state.finish(&item_id)?;
             Ok(Some(RealtimeEventKind::OutputItemDone { item_id }))
+        }
+        "formlogic.realtime.tool_call" => {
+            let tool_call_id = value
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control))
+                .ok_or_else(|| "Desktop realtime tool call has no valid toolCallId".to_string())?
+                .to_string();
+            let name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| matches!(*name, "lookup_business_data" | "finish_call"))
+                .ok_or_else(|| "Desktop realtime requested an unsupported tool".to_string())?
+                .to_string();
+            let arguments = value
+                .get("arguments")
+                .filter(|arguments| arguments.is_object())
+                .cloned()
+                .ok_or_else(|| "Desktop realtime tool arguments are invalid".to_string())?;
+            if serde_json::to_vec(&arguments)
+                .map_err(|_| "Desktop realtime tool arguments are not JSON".to_string())?
+                .len()
+                > 8 * 1024
+            {
+                return Err("Desktop realtime tool arguments exceeded 8 KiB".to_string());
+            }
+            Ok(Some(RealtimeEventKind::ToolCall {
+                tool_call_id,
+                name,
+                arguments,
+            }))
+        }
+        "formlogic.realtime.hangup_requested" => {
+            let bounded_id = |field: &str| {
+                value
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|id| {
+                        !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+                    })
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("Desktop realtime hangup omitted valid {field}"))
+            };
+            Ok(Some(RealtimeEventKind::HangupRequested {
+                tool_call_id: bounded_id("toolCallId")?,
+                response_id: bounded_id("responseId")?,
+                item_id: bounded_id("itemId")?,
+            }))
         }
         "formlogic.realtime.error" | "error" => {
             let fatal = value.get("fatal").and_then(Value::as_bool).unwrap_or(true);
@@ -1249,6 +1392,63 @@ mod tests {
         );
         assert!(validate_destination_origin("http://api.openai.com").is_err());
         assert!(validate_destination_origin("https://api.openai.com/v1").is_err());
+    }
+
+    #[test]
+    fn tool_and_hangup_controls_are_exactly_fenced_and_allow_listed() {
+        let mut state = OutputParseState::default();
+        let tool = parse_server_text(
+            r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"tool_1","name":"lookup_business_data","arguments":{"question":"Do I have anything on Tuesday?"}}"#,
+            "call_1",
+            7,
+            "https://api.openai.com",
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            tool,
+            RealtimeEventKind::ToolCall {
+                tool_call_id: "tool_1".into(),
+                name: "lookup_business_data".into(),
+                arguments: serde_json::json!({"question": "Do I have anything on Tuesday?"}),
+            }
+        );
+
+        assert!(parse_server_text(
+            r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":8,"toolCallId":"tool_1","name":"lookup_business_data","arguments":{"question":"x"}}"#,
+            "call_1",
+            7,
+            "https://api.openai.com",
+            &mut state,
+        )
+        .is_err());
+        assert!(parse_server_text(
+            r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"tool_2","name":"arbitrary_desktop_action","arguments":{}}"#,
+            "call_1",
+            7,
+            "https://api.openai.com",
+            &mut state,
+        )
+        .is_err());
+
+        let hangup = parse_server_text(
+            r#"{"type":"formlogic.realtime.hangup_requested","callId":"call_1","generation":7,"toolCallId":"tool_3","responseId":"response_3","itemId":"item_3"}"#,
+            "call_1",
+            7,
+            "https://api.openai.com",
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            hangup,
+            RealtimeEventKind::HangupRequested {
+                tool_call_id: "tool_3".into(),
+                response_id: "response_3".into(),
+                item_id: "item_3".into(),
+            }
+        );
     }
 
     #[test]
