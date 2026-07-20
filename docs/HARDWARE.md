@@ -1,9 +1,24 @@
 # Aokie — Supported Hardware
 
-Aokie drives the Bluetooth radio directly over WinUSB, so it is bound to
-specific dongle chipsets rather than to whatever Windows' own Bluetooth stack
-supports. The authoritative list is `crates/aokie-core/src/dongle_catalog.rs`
+**The WinUSB dongle is the only supported phone-link transport for calls.**
+Aokie's userspace Bluetooth host stack drives a supported USB dongle directly
+over WinUSB — that is the only configuration that carries call audio. The
+authoritative dongle list is `crates/aokie-core/src/dongle_catalog.rs`
 (`DEFAULT_CATALOG`) — this document is its human-readable companion.
+
+Why (verified 2026-07-20, see `docs/NATIVE_BLUETOOTH_TRANSPORT_PLAN.md` for the
+full findings): Windows 11 25H2 no longer ships the Bluetooth hands-free-unit
+service (`BthHFSrv.dll`) that exposed call audio to applications, SCO/eSCO
+audio is kernel-mode-only, LE Audio telephony does not engage on the evaluated
+hardware, and Phone Link's call audio is a proprietary network channel — so
+there is no user-mode path to Bluetooth call audio on current Windows.
+
+A **native Windows-Bluetooth backend** (`crates/aokie-winbt`,
+`transportMode=native`) exists for advanced use: with stock Windows drivers it
+provides SMS (MAP), contacts (PBAP), pairing, and call *control* (ring/answer/
+end events) on Windows builds where the hands-free service exists. It is not
+offered in the settings UI because it cannot carry call audio on Windows 11
+25H2 — set it only deliberately via `settings.set`.
 
 ## Dongle compatibility tiers
 

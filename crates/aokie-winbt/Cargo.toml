@@ -1,0 +1,46 @@
+[package]
+name = "aokie-winbt"
+description = "Native Windows Bluetooth backend for the Aokie radio: drives the built-in Windows Bluetooth stack (WinRT Calls API for call control, WASAPI Hands-Free endpoints for audio, WinRT RFCOMM for MAP/PBAP) so the receptionist works with stock Bluetooth drivers — no WinUSB dongle binding. Sits beside the WinUSB backend behind the plugin's RadioBackend seam."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+aokie-core = { path = "../aokie-core" }
+# Event/audio types (BluetoothEvent, AudioData, ContactPair, SmsReceivedPayload)
+# and the reusable byte-stream protocol machines (OBEX/MAP/PBAP/vCard).
+aokie-dongle = { path = "../aokie-dongle" }
+aokie-bluetooth = { path = "../aokie-bluetooth" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Devices_Bluetooth",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_Properties",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_Threading",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Foundation",
+    "Foundation_Collections",
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_Rfcomm",
+    "Devices_Enumeration",
+    "ApplicationModel_Calls",
+    "Networking_Sockets",
+    "Storage_Streams",
+] }

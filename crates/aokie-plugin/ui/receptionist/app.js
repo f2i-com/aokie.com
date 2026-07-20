@@ -106,7 +106,54 @@
     switchTo: function (id) {
       switchTab(id);
     },
+    /** Shared transport-mode truth (dongle vs built-in Windows Bluetooth) —
+     *  tabs read it here and report the settings they load back here. */
+    transport: {
+      mode: function () {
+        return transportMode;
+      },
+      showDongle: function () {
+        return transportMode === 'dongle';
+      },
+      update: function (settingsBag) {
+        setTransportFromSettings(settingsBag);
+      },
+    },
   };
+
+  // ---- transport mode (dongle vs built-in Windows Bluetooth) --------------
+  // `dongle` = the original WinUSB-driver radio; `native`/`auto` = the
+  // built-in Windows Bluetooth transport, where no WinUSB dongle is involved
+  // at all. Native/auto therefore hides every dongle-only surface — the
+  // Dongle tab here; the Settings tab gates its own dongle-only Advanced
+  // fields, and the Phone tab adjusts its pairing instructions. The mode
+  // ALWAYS comes from the loaded plugin settings; a missing or unknown value
+  // means the dongle view (the pre-transportMode behavior — the safe default
+  // while the first settings.get is still in flight).
+
+  var transportMode = 'dongle'; // best-known so far; default = the dongle view
+
+  function normalizeTransportMode(value) {
+    return value === 'native' || value === 'auto' ? value : 'dongle';
+  }
+
+  function setTransportFromSettings(settingsBag) {
+    var next = normalizeTransportMode(settingsBag && settingsBag.transportMode);
+    if (next === transportMode) return;
+    transportMode = next;
+    applyTransportVisibility();
+  }
+
+  /** Hide/show the dongle-only tab button; if the Dongle tab is somehow the
+   *  active one when it becomes hidden, fall back to the Overview. */
+  function applyTransportVisibility() {
+    var showDongle = transportMode === 'dongle';
+    var btns = document.querySelectorAll('.rcp-tab-btn');
+    for (var i = 0; i < btns.length; i++) {
+      if (btns[i].getAttribute('data-tab') === 'dongle') btns[i].hidden = !showDongle;
+    }
+    if (!showDongle && activeTab === 'dongle') switchTab('overview');
+  }
 
   function tabContainer(id) {
     return $('tab-' + id);
@@ -114,6 +161,9 @@
 
   function switchTab(id) {
     if (!id || id === activeTab || !tabContainer(id)) return;
+    // A tab hidden by the transport mode stays unreachable, even
+    // programmatically (data-tabgo links, switchTo).
+    if (id === 'dongle' && transportMode !== 'dongle') return;
 
     // Leave the old tab.
     if (activeTab === 'overview') {
@@ -264,6 +314,7 @@
       function (data) {
         state.settings = data || null;
         state.settingsError = '';
+        setTransportFromSettings(data && data.settings);
       },
       function (e) {
         state.settingsError = errMsg(e);
