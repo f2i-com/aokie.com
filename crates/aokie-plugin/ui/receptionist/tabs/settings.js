@@ -120,15 +120,30 @@
   /** The desktop AI gateway's FIXED loopback base (lock-step with the
    *  console's receptionistPayload.ts AI_GATEWAY_BASE). */
   var AI_GATEWAY_BASE = 'http://127.0.0.1:17872/api/ai/providers/';
+  var CODEX_PROVIDER_LUNA_LOW = 'openai-codex-agent-luna-low';
+  var CODEX_PROVIDER_LUNA_LOW_FAST = 'openai-codex-agent-luna-low-fast';
   var CODEX_PROVIDER_NONE = 'openai-codex-agent-none';
   var CODEX_PROVIDER_LOW = 'openai-codex-agent-low';
   var CODEX_MODEL = 'gpt-5.5';
+  var CODEX_LUNA_MODEL = 'gpt-5.6-luna';
 
   /** Reserved live-call variants. Only their exact provider paths receive
    *  this policy; ordinary providers behind the same gateway stay ordinary. */
   function codexVariant(providerId) {
-    if (providerId === CODEX_PROVIDER_NONE) return 'Reasoning off (fastest)';
-    if (providerId === CODEX_PROVIDER_LOW) return 'Low reasoning';
+    if (providerId === CODEX_PROVIDER_LUNA_LOW) return 'GPT-5.6 Luna · low reasoning (fastest Luna)';
+    if (providerId === CODEX_PROVIDER_LUNA_LOW_FAST) {
+      return 'GPT-5.6 Luna · low reasoning · Fast mode';
+    }
+    if (providerId === CODEX_PROVIDER_NONE) return 'GPT-5.5 · reasoning off';
+    if (providerId === CODEX_PROVIDER_LOW) return 'GPT-5.5 · low reasoning';
+    return null;
+  }
+
+  function codexModel(providerId) {
+    if (providerId === CODEX_PROVIDER_LUNA_LOW || providerId === CODEX_PROVIDER_LUNA_LOW_FAST) {
+      return CODEX_LUNA_MODEL;
+    }
+    if (providerId === CODEX_PROVIDER_NONE || providerId === CODEX_PROVIDER_LOW) return CODEX_MODEL;
     return null;
   }
 
@@ -137,7 +152,12 @@
     return src.indexOf('provider:') === 0 ? codexVariant(src.slice(9)) : null;
   }
 
-  function isCodexLiveCallEndpoint(url) {
+  function codexModelForSource(source) {
+    var src = String(source || '');
+    return src.indexOf('provider:') === 0 ? codexModel(src.slice(9)) : null;
+  }
+
+  function codexProviderForEndpoint(url) {
     try {
       var parsed = new URL(String(url || '').trim());
       var host = parsed.hostname.toLowerCase();
@@ -154,7 +174,7 @@
         segments[7] !== 'completions' ||
         /%(?:2f|5c|00)/i.test(segments[4])
       ) {
-        return false;
+        return null;
       }
       var providerId = decodeURIComponent(segments[4]);
       var loopback =
@@ -169,11 +189,17 @@
         loopback &&
         (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
         parsed.port === '17872' &&
-        (providerId === CODEX_PROVIDER_NONE || providerId === CODEX_PROVIDER_LOW)
-      );
+        codexModel(providerId) &&
+        providerId
+      ) || null;
     } catch (e) {
-      return false;
+      return null;
     }
+  }
+
+  function codexModelForEndpoint(url) {
+    var providerId = codexProviderForEndpoint(url);
+    return providerId ? codexModel(providerId) : null;
   }
 
   /** Compose one lane's saved endpoint URL from a source pick (same rule as
@@ -204,6 +230,14 @@
   function inferLaneSource(savedUrl, lane, sources) {
     var url = String(savedUrl || '').trim();
     if (!url) return '';
+    // The four Desktop-owned Codex adapters accept equivalent loopback URL
+    // spellings. Hydrate them through the exact route parser before the
+    // canonical-prefix fallback below, so localhost/IPv6/userinfo/encoded-id
+    // forms remain the same provider selection.
+    if (lane === 'llm') {
+      var codexProviderId = codexProviderForEndpoint(url);
+      if (codexProviderId) return 'provider:' + codexProviderId;
+    }
     var path = LANE_PATHS[lane];
     for (var i = 0; i < sources.length; i++) {
       var x = sources[i];
@@ -376,7 +410,7 @@
   /** The option list for one lane's source select (Aokie default speech
    *  service first, capability-matching local services, providers on the LLM
    *  lane only, then Custom URL… and Automatic = ''). */
-  function laneSourceOptions(lane, sources) {
+  function laneSourceOptions(lane, sources, currentSource) {
     var cap = LANE_CAPABILITY[lane];
     var def = LANE_DEFAULT_SERVICE[lane];
     var services = sources.filter(function (s) {
@@ -398,17 +432,29 @@
       };
     });
     if (lane === 'llm') {
+      var listed = {};
       for (var i = 0; i < sources.length; i++) {
         var p = sources[i];
         if (p.kind !== 'provider') continue;
         var caps = p.capabilities || [];
         if (caps.length > 0 && caps.indexOf(cap) === -1) continue; // [] = all (legacy)
         var variant = codexVariantForSource(p.id);
+        listed[p.id] = true;
         opts.push({
           value: p.id,
-          // Never surface the connected account identity here. These two
+          // Never surface the connected account identity here. These reserved
           // reserved adapters have stable product + reasoning labels only.
           label: variant ? 'Provider: ChatGPT via Codex — ' + variant : 'Provider: ' + p.name,
+        });
+      }
+      // Source discovery is best-effort and can briefly return no providers
+      // while Desktop is starting. A saved reserved Codex endpoint is still
+      // unambiguous, so keep that exact choice representable instead of
+      // letting the native <select> visually fall through to its first item.
+      if (codexVariantForSource(currentSource) && !listed[currentSource]) {
+        opts.push({
+          value: currentSource,
+          label: 'Provider: ChatGPT via Codex — ' + codexVariantForSource(currentSource),
         });
       }
     }
@@ -422,6 +468,13 @@
   function seedLaneSource(saved, lane, sources) {
     var inferred = inferLaneSource(saved, lane, sources);
     if (inferred === '' || inferred === 'custom') return inferred;
+    // Exact reserved URLs identify stable Desktop-owned adapters. Do not
+    // degrade them to Custom merely because aiSources() raced startup. A
+    // provider-id-looking near miss (for example, a trailing slash) stays
+    // Custom and can never be rewritten by an unrelated save.
+    if (lane === 'llm' && codexVariantForSource(inferred)) {
+      return codexProviderForEndpoint(saved) ? inferred : 'custom';
+    }
     var opts = laneSourceOptions(lane, sources);
     for (var i = 0; i < opts.length; i++) {
       if (opts[i].value === inferred) return inferred;
@@ -443,6 +496,7 @@
   var baseline = withAokieDefaults(null);
   var sources = [];
   var laneSel = { llm: '', stt: '', tts: '' };
+  var baselineLaneSel = { llm: '', stt: '', tts: '' };
   var catalog = null;
   var customDir = false;
   // Provenance watch (live report 2026-07-18: "I changed the greeting and it
@@ -477,7 +531,31 @@
     configVersion = next;
   }
 
-  function load() {
+  /** Lane picks are UI state (the settings bag stores only composed URLs), so
+   *  include them when deciding whether an automatic tab-entry refresh may
+   *  replace the working copy. */
+  function hasUnsavedEdits() {
+    if (Object.keys(settingsPatch(baseline, settings)).length > 0) return true;
+    for (var i = 0; i < LANES.length; i++) {
+      var lane = LANES[i];
+      if (laneSel[lane] !== baselineLaneSel[lane]) return true;
+    }
+    return false;
+  }
+
+  function seededLanes(saved, availableSources) {
+    return {
+      llm: seedLaneSource(saved.aiEndpoint, 'llm', availableSources),
+      stt: seedLaneSource(saved.sttEndpoint, 'stt', availableSources),
+      tts: seedLaneSource(saved.ttsEndpoint, 'tts', availableSources),
+    };
+  }
+
+  function load(preserveEdits) {
+    if (loading) {
+      render();
+      return;
+    }
     loading = true;
     error = null;
     render();
@@ -485,35 +563,44 @@
     // Source listing is best-effort — a failure must not block the form.
     var sourcesP = HOST.aiSources().then(
       function (list) {
-        return Array.isArray(list) ? list : [];
+        return { ok: true, list: Array.isArray(list) ? list : [] };
       },
       function () {
-        return [];
+        return { ok: false, list: [] };
       }
     );
     return Promise.all([settingsP, sourcesP]).then(
       function (results) {
         var data = results[0] || {};
         var merged = withAokieDefaults(data.settings);
+        // A tab-entry refresh must not eat edits that were already present or
+        // were typed while the two reads were in flight. Source metadata may
+        // still refresh safely; the working settings + their old baseline stay
+        // paired until the operator saves or explicitly presses Reload.
+        var keepWorkingCopy = !!preserveEdits && loaded && hasUnsavedEdits();
+        var sourceResult = results[1];
+        if (sourceResult.ok) sources = sourceResult.list;
         // ⚠️ baseline and settings must be SEPARATE objects: the form edits
         // MUTATE `settings` in place (plain DOM, not React state-replace),
         // and an aliased baseline would make every dirty-diff empty.
-        baseline = merged;
-        settings = withAokieDefaults(merged);
+        if (!keepWorkingCopy) {
+          baseline = merged;
+          settings = withAokieDefaults(merged);
+          baselineLaneSel = seededLanes(merged, sources);
+          laneSel = {
+            llm: baselineLaneSel.llm,
+            stt: baselineLaneSel.stt,
+            tts: baselineLaneSel.tts,
+          };
+          customDir = false;
+        }
         // Keep the shared transport truth (the Dongle tab's visibility in
         // app.js) in step with the plugin's saved settings.
         if (TABS.transport && TABS.transport.update) TABS.transport.update(merged);
-        sources = results[1];
         // A bump between polls that this tab did not cause = the linked app
         // re-applied its record (see the provenance note above).
         noteConfigVersion(data.configVersion, false);
         catalog = parseTtsVoiceCatalog(data.ttsVoiceCatalog);
-        customDir = false;
-        laneSel = {
-          llm: seedLaneSource(merged.aiEndpoint, 'llm', sources),
-          stt: seedLaneSource(merged.sttEndpoint, 'stt', sources),
-          tts: seedLaneSource(merged.ttsEndpoint, 'tts', sources),
-        };
         loaded = true;
         loading = false;
         render();
@@ -537,13 +624,14 @@
     current.aiEndpoint = composeLaneUrl(laneSel.llm, settings.aiEndpoint, 'llm', sources);
     current.sttEndpoint = composeLaneUrl(laneSel.stt, settings.sttEndpoint, 'stt', sources);
     current.ttsEndpoint = composeLaneUrl(laneSel.tts, settings.ttsEndpoint, 'tts', sources);
-    if (isCodexLiveCallEndpoint(current.aiEndpoint)) {
+    var selectedCodexModel = codexModelForEndpoint(current.aiEndpoint);
+    if (selectedCodexModel) {
       // The reserved Codex adapters are text-only and pin the raw upstream
       // model. Mirror the connector-side invariant so the saved patch and
       // the visible form are immediately truthful.
-      current.aiModel = CODEX_MODEL;
+      current.aiModel = selectedCodexModel;
       current.sendAudio = false;
-      settings.aiModel = CODEX_MODEL;
+      settings.aiModel = selectedCodexModel;
       settings.sendAudio = false;
     }
     var patch = settingsPatch(baseline, current);
@@ -573,10 +661,11 @@
           var cat = parseTtsVoiceCatalog((data || {}).ttsVoiceCatalog);
           if (cat) catalog = cat;
           customDir = false;
+          baselineLaneSel = seededLanes(merged, sources);
           laneSel = {
-            llm: seedLaneSource(merged.aiEndpoint, 'llm', sources),
-            stt: seedLaneSource(merged.sttEndpoint, 'stt', sources),
-            tts: seedLaneSource(merged.ttsEndpoint, 'tts', sources),
+            llm: baselineLaneSel.llm,
+            stt: baselineLaneSel.stt,
+            tts: baselineLaneSel.tts,
           };
           var stoppedNames = [];
           for (var li = 0; li < LANES.length; li++) {
@@ -752,12 +841,13 @@
     return html.join('');
   }
 
-  function laneRowsHtml() {
+  function laneRowsHtml(lanes) {
+    lanes = lanes || LANES;
     var html = [];
-    for (var i = 0; i < LANES.length; i++) {
-      var lane = LANES[i];
+    for (var i = 0; i < lanes.length; i++) {
+      var lane = lanes[i];
       var key = LANE_SETTING_KEY[lane];
-      var opts = laneSourceOptions(lane, sources);
+      var opts = laneSourceOptions(lane, sources, laneSel[lane]);
       var sel = [];
       for (var o = 0; o < opts.length; o++) {
         sel.push(
@@ -785,6 +875,43 @@
       );
     }
     return html.join('');
+  }
+
+  /** Keep the source immediately above its editable model. Codex adapters own
+   *  an exact model, so they show a concise fixed-model note and no fake input. */
+  function llmModelHtml() {
+    var fixedModel = codexModelForSource(laneSel.llm);
+    return (
+      '<div id="set-llm-model-zone"' + (fixedModel ? ' hidden' : '') + '>' +
+      field(
+        'LLM model',
+        '<input type="text" data-key="aiModel" placeholder="blank = auto-detect" value="' + esc(settings.aiModel) + '" />'
+      ) +
+      hint(
+        'e.g. llama3.1:8b or qwen2.5:7b — leave blank to use the model currently loaded by the selected service.'
+      ) +
+      '</div>' +
+      '<p class="rcp-hint" id="set-llm-fixed-model"' + (fixedModel ? '' : ' hidden') + '>' +
+      (fixedModel
+        ? 'LLM model is fixed to <strong>' + esc(fixedModel) + '</strong> by this ChatGPT via Codex source.'
+        : '') +
+      '</p>'
+    );
+  }
+
+  function syncLlmModelUi() {
+    var fixedModel = codexModelForSource(laneSel.llm);
+    var zone = root && root.querySelector('#set-llm-model-zone');
+    var note = root && root.querySelector('#set-llm-fixed-model');
+    var input = root && root.querySelector('[data-key="aiModel"]');
+    if (zone) zone.hidden = !!fixedModel;
+    if (note) {
+      note.hidden = !fixedModel;
+      note.innerHTML = fixedModel
+        ? 'LLM model is fixed to <strong>' + esc(fixedModel) + '</strong> by this ChatGPT via Codex source.'
+        : '';
+    }
+    if (input) input.value = settings.aiModel;
   }
 
   function formHtml() {
@@ -850,19 +977,14 @@
         'Applies live. Sherpa speaks Piper/VITS/Kokoro voice bundles (much faster than Pocket-TTS); each engine has its own voice list below.'
       ) +
       '<div id="set-voice-zone">' + voiceZoneHtml() + '</div>' +
-      field(
-        'LLM model',
-        '<input type="text" data-key="aiModel" placeholder="blank = auto-detect" value="' + esc(settings.aiModel) + '" />'
-      ) +
-      hint(
-        "e.g. llama3.1:8b or qwen2.5:7b — leave blank to use whatever the desktop's running LLM service has loaded."
-      ) +
-      laneRowsHtml() +
+      laneRowsHtml(['llm']) +
+      llmModelHtml() +
+      laneRowsHtml(['stt', 'tts']) +
       hint(
         'Composed from the selected service now; if the FormLogic receptionist app is connected, its per-call settings take precedence.'
       ) +
       hint(
-        'ChatGPT via Codex choices send transcript text to OpenAI under the signed destination consent. Before first use, open Consent and allow OpenAI ChatGPT via Codex. They are text-only: the model is pinned to gpt-5.5 and caller-audio attachment is disabled.'
+        'ChatGPT via Codex choices send transcript text to OpenAI under the signed destination consent. GPT-5.6 Luna uses low reasoning, its fastest supported setting, and streams its reply sentence by sentence. Fast mode requests Codex priority service, though actual latency still varies. These choices are text-only: the selected model is fixed automatically and caller-audio attachment is disabled.'
       ) +
       '</div>' +
       // ---- Conversation tuning ---------------------------------------------
@@ -929,7 +1051,7 @@
       // event fires — a submit button would be dead. Save rides the click
       // delegate; Enter-to-save rides the keydown handler in wire().
       '<div class="rcp-actions">' +
-      '<button type="button" class="rcp-button is-primary" id="set-save" data-act="set-save"' + (saving ? ' disabled' : '') + '>' +
+      '<button type="button" class="rcp-button is-primary" id="set-save" data-act="set-save"' + (saving || loading ? ' disabled' : '') + '>' +
       (saving ? 'Saving…' : 'Save') +
       '</button>' +
       '<button type="button" class="rcp-button" data-act="set-reload"' + (loading || saving ? ' disabled' : '') + '>Reload</button>' +
@@ -1050,12 +1172,12 @@
       laneSel[lane] = t.value;
       var row = root && root.querySelector('#lane-custom-' + lane);
       if (row) row.hidden = laneSel[lane] !== 'custom';
-      if (lane === 'llm' && codexVariantForSource(laneSel.llm)) {
-        settings.aiModel = CODEX_MODEL;
+      var selectedSourceModel = lane === 'llm' ? codexModelForSource(laneSel.llm) : null;
+      if (selectedSourceModel) {
+        settings.aiModel = selectedSourceModel;
         settings.sendAudio = false;
-        var modelInput = root && root.querySelector('[data-key="aiModel"]');
-        if (modelInput) modelInput.value = CODEX_MODEL;
       }
+      if (lane === 'llm') syncLlmModelUi();
       return;
     }
     if (t.id === 'set-engine' && e.type === 'change') {
@@ -1109,7 +1231,7 @@
       if (!btn || btn.disabled) return;
       var act = btn.getAttribute('data-act');
       if (act === 'set-save') save();
-      else if (act === 'set-reload' || act === 'set-retry') load();
+      else if (act === 'set-reload' || act === 'set-retry') load(false);
     });
   }
 
@@ -1119,8 +1241,12 @@
       wire(el);
       if (loaded) {
         render();
+        // The linked app and provider runtime can both change while another
+        // tab is open. Refresh on every return; preserve a local draft if one
+        // exists, and never turn this read path into an implicit save.
+        load(true);
       } else {
-        load();
+        load(false);
       }
     },
     unmount: function () {

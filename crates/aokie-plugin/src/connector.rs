@@ -424,13 +424,14 @@ impl Plugin {
             std::env::set_var("AOKIE_AI_RECEPTIONIST", "1");
             eprintln!("[aokie-plugin] aiReceptionist ON → in-plugin streaming agent");
         }
-        let codex_live_call_endpoint = self
+        let codex_live_call_model = self
             .store
             .config
             .settings
             .get("aiEndpoint")
             .and_then(Value::as_str)
-            .is_some_and(is_codex_live_call_endpoint);
+            .and_then(codex_live_call_model_for_endpoint);
+        let codex_live_call_endpoint = codex_live_call_model.is_some();
         apply_endpoint_env_from_settings(
             &self.store.config.settings,
             "aiEndpoint",
@@ -449,13 +450,13 @@ impl Plugin {
             "AOKIE_TTS_ENDPOINT",
         );
         // LLM model (`aiModel`); empty = auto-detect the desktop's loaded model.
-        if codex_live_call_endpoint {
-            // The Desktop's two reserved Codex live-call adapters accept the
+        if let Some(codex_live_call_model) = codex_live_call_model {
+            // The Desktop's reserved Codex live-call adapters accept the
             // ordinary OpenAI-compatible request shape, but the raw upstream
             // model is fixed. Never pass through an old local-model name.
-            std::env::set_var("AOKIE_AI_MODEL", CODEX_LIVE_CALL_MODEL);
+            std::env::set_var("AOKIE_AI_MODEL", codex_live_call_model);
             eprintln!(
-                "[aokie-plugin] ChatGPT via Codex selected → AOKIE_AI_MODEL={CODEX_LIVE_CALL_MODEL}"
+                "[aokie-plugin] ChatGPT via Codex selected → AOKIE_AI_MODEL={codex_live_call_model}"
             );
         } else if let Some(m) = self
             .store
@@ -4112,14 +4113,25 @@ pub(crate) const CODEX_LIVE_CALL_ENDPOINT_NONE: &str =
     "http://127.0.0.1:17872/api/ai/providers/openai-codex-agent-none/v1/chat/completions";
 pub(crate) const CODEX_LIVE_CALL_ENDPOINT_LOW: &str =
     "http://127.0.0.1:17872/api/ai/providers/openai-codex-agent-low/v1/chat/completions";
+pub(crate) const CODEX_LIVE_CALL_ENDPOINT_LUNA_LOW: &str =
+    "http://127.0.0.1:17872/api/ai/providers/openai-codex-agent-luna-low/v1/chat/completions";
+pub(crate) const CODEX_LIVE_CALL_ENDPOINT_LUNA_LOW_FAST: &str =
+    "http://127.0.0.1:17872/api/ai/providers/openai-codex-agent-luna-low-fast/v1/chat/completions";
 pub(crate) const CODEX_LIVE_CALL_DESTINATION: &str = "OpenAI ChatGPT via Codex";
 pub(crate) const CODEX_LIVE_CALL_MODEL: &str = "gpt-5.5";
+pub(crate) const CODEX_LIVE_CALL_MODEL_LUNA: &str = "gpt-5.6-luna";
 const CODEX_LIVE_CALL_PATH_NONE: &str =
     "/api/ai/providers/openai-codex-agent-none/v1/chat/completions";
 const CODEX_LIVE_CALL_PATH_LOW: &str =
     "/api/ai/providers/openai-codex-agent-low/v1/chat/completions";
+const CODEX_LIVE_CALL_PATH_LUNA_LOW: &str =
+    "/api/ai/providers/openai-codex-agent-luna-low/v1/chat/completions";
+const CODEX_LIVE_CALL_PATH_LUNA_LOW_FAST: &str =
+    "/api/ai/providers/openai-codex-agent-luna-low-fast/v1/chat/completions";
 const CODEX_PROVIDER_ID_NONE: &str = "openai-codex-agent-none";
 const CODEX_PROVIDER_ID_LOW: &str = "openai-codex-agent-low";
+const CODEX_PROVIDER_ID_LUNA_LOW: &str = "openai-codex-agent-luna-low";
+const CODEX_PROVIDER_ID_LUNA_LOW_FAST: &str = "openai-codex-agent-luna-low-fast";
 
 /// Axum percent-decodes a captured `:id` segment before handing it to the
 /// provider lookup. Match that routing behaviour exactly so `%2D` (or any
@@ -4159,45 +4171,47 @@ fn decoded_codex_provider_id(segment: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-fn is_codex_live_call_path(path: &str) -> bool {
+fn codex_live_call_model_for_path(path: &str) -> Option<&'static str> {
     let Some(path) = path.strip_prefix('/') else {
-        return false;
+        return None;
     };
     let mut segments = path.split('/');
     if segments.next() != Some("api")
         || segments.next() != Some("ai")
         || segments.next() != Some("providers")
     {
-        return false;
+        return None;
     }
     let Some(provider_segment) = segments.next() else {
-        return false;
+        return None;
     };
     if segments.next() != Some("v1")
         || segments.next() != Some("chat")
         || segments.next() != Some("completions")
         || segments.next().is_some()
     {
-        return false;
+        return None;
     }
-    matches!(
-        decoded_codex_provider_id(provider_segment).as_deref(),
-        Some(CODEX_PROVIDER_ID_NONE | CODEX_PROVIDER_ID_LOW)
-    )
+    match decoded_codex_provider_id(provider_segment).as_deref() {
+        Some(CODEX_PROVIDER_ID_NONE | CODEX_PROVIDER_ID_LOW) => Some(CODEX_LIVE_CALL_MODEL),
+        Some(CODEX_PROVIDER_ID_LUNA_LOW | CODEX_PROVIDER_ID_LUNA_LOW_FAST) => {
+            Some(CODEX_LIVE_CALL_MODEL_LUNA)
+        }
+        _ => None,
+    }
 }
 
-pub(crate) fn is_codex_live_call_endpoint(url: &str) -> bool {
+pub(crate) fn codex_live_call_model_for_endpoint(url: &str) -> Option<&'static str> {
     use url::Host;
     let Ok(parsed) = url::Url::parse(url.trim()) else {
-        return false;
+        return None;
     };
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.port_or_known_default() != Some(17872)
-        || !is_codex_live_call_path(parsed.path())
+    let model = codex_live_call_model_for_path(parsed.path())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.port_or_known_default() != Some(17872)
     {
-        return false;
+        return None;
     }
-    match parsed.host() {
+    let loopback = match parsed.host() {
         Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
         Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
         Some(Host::Ipv6(ip)) => {
@@ -4208,7 +4222,12 @@ pub(crate) fn is_codex_live_call_endpoint(url: &str) -> bool {
             ip.is_loopback() || ip.is_unspecified() || mapped_v4_loopback_or_unspecified
         }
         None => false,
-    }
+    };
+    loopback.then_some(model)
+}
+
+pub(crate) fn is_codex_live_call_endpoint(url: &str) -> bool {
+    codex_live_call_model_for_endpoint(url).is_some()
 }
 
 /// Caller audio never rides either reserved Codex route. Transcript
@@ -4332,10 +4351,10 @@ fn normalize_codex_live_call_settings(
         Some(_) => None, // null / blank clears the endpoint
         None => current.get("aiEndpoint").and_then(Value::as_str),
     };
-    if !endpoint.is_some_and(is_codex_live_call_endpoint) {
+    let Some(model) = endpoint.and_then(codex_live_call_model_for_endpoint) else {
         return false;
-    }
-    patch.insert("aiModel".to_string(), json!(CODEX_LIVE_CALL_MODEL));
+    };
+    patch.insert("aiModel".to_string(), json!(model));
     patch.insert("sendAudio".to_string(), json!(false));
     true
 }
@@ -7073,6 +7092,8 @@ mod tests {
         for endpoint in [
             CODEX_LIVE_CALL_ENDPOINT_NONE.to_string(),
             CODEX_LIVE_CALL_ENDPOINT_LOW.to_string(),
+            CODEX_LIVE_CALL_ENDPOINT_LUNA_LOW.to_string(),
+            CODEX_LIVE_CALL_ENDPOINT_LUNA_LOW_FAST.to_string(),
             format!("http://localhost:17872{CODEX_LIVE_CALL_PATH_NONE}?request=1#ignored"),
             format!("http://user:pass@127.0.0.1:17872{CODEX_LIVE_CALL_PATH_LOW}"),
             format!("https://[::1]:17872{CODEX_LIVE_CALL_PATH_NONE}"),
@@ -7083,6 +7104,10 @@ mod tests {
             "http://127.0.0.1:17872/api/ai/providers/openai%2Dcodex-agent-none/v1/chat/completions"
                 .to_string(),
             "http://localhost:17872/api/ai/providers/%6fpenai-codex-agent-low/v1/chat/completions"
+                .to_string(),
+            "http://127.0.0.1:17872/api/ai/providers/openai-codex-agent-luna%2Dlow/v1/chat/completions"
+                .to_string(),
+            "http://localhost:17872/api/ai/providers/openai-codex-agent-luna-low%2Dfast/v1/chat/completions"
                 .to_string(),
         ] {
             assert!(is_codex_live_call_endpoint(&endpoint), "{endpoint}");
@@ -7243,6 +7268,40 @@ mod tests {
             Some(&json!(CODEX_LIVE_CALL_MODEL))
         );
         assert_eq!(equivalent_route_patch.get("sendAudio"), Some(&json!(false)));
+
+        for (endpoint, expected_model) in [
+            (
+                CODEX_LIVE_CALL_ENDPOINT_LUNA_LOW,
+                CODEX_LIVE_CALL_MODEL_LUNA,
+            ),
+            (
+                CODEX_LIVE_CALL_ENDPOINT_LUNA_LOW_FAST,
+                CODEX_LIVE_CALL_MODEL_LUNA,
+            ),
+            (CODEX_LIVE_CALL_ENDPOINT_NONE, CODEX_LIVE_CALL_MODEL),
+            (CODEX_LIVE_CALL_ENDPOINT_LOW, CODEX_LIVE_CALL_MODEL),
+        ] {
+            let mut patch = json!({
+                "aiEndpoint": endpoint,
+                "aiModel": "stale-local-model",
+                "sendAudio": true,
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            assert!(normalize_codex_live_call_settings(&mut patch, &Map::new()));
+            assert_eq!(
+                patch.get("aiModel"),
+                Some(&json!(expected_model)),
+                "{endpoint}"
+            );
+            assert_eq!(patch.get("sendAudio"), Some(&json!(false)), "{endpoint}");
+            assert_eq!(
+                codex_live_call_model_for_endpoint(endpoint),
+                Some(expected_model),
+                "{endpoint}"
+            );
+        }
 
         assert_eq!(
             codex_text_only_audio_policy(true, true, true, false),
