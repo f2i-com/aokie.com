@@ -274,13 +274,30 @@ impl Plugin {
     /// the scripted mock path; a start failure (no dongle / driver not
     /// bound / non-Windows) is logged and simply leaves `radio = None`.
     pub fn ensure_radio_started(&mut self) {
+        // Realtime voice always exports raw caller/assistant PCM to the
+        // configured upstream destination. Selecting it is never itself an
+        // authorization: require a current verified transcription grant and
+        // its exact canonical destination even when the legacy global
+        // consentMode is warn/off.
+        let loaded_consent = self.consent_loaded();
+        if let Err(reason) = validate_realtime_voice_consent(
+            &self.store.config.settings,
+            loaded_consent.grant.as_ref(),
+            &aokie_core::events::now_iso8601(),
+        ) {
+            eprintln!(
+                "[aokie-plugin] radio NOT started — realtime voice consent required: {reason}"
+            );
+            self.block_radio_for_consent(reason);
+            return;
+        }
         // A loopback Desktop broker can still delegate caller data to a
         // remote processor. Recheck the COMPLETE persisted configuration at
         // every start (and even when a radio is already present): an old file,
         // an incomplete signed grant, or a restart must not bypass the same
         // effective-destination gate enforced by settings.set.
         if self.consent_mode() == crate::consent::ConsentMode::Enforce {
-            let grant = self.consent_loaded().grant;
+            let grant = loaded_consent.grant;
             if let Err(reason) =
                 validate_effective_destinations(&self.store.config.settings, grant.as_ref())
             {
@@ -448,6 +465,58 @@ impl Plugin {
             &self.store.config.settings,
             "ttsEndpoint",
             "AOKIE_TTS_ENDPOINT",
+        );
+        let realtime_mode = self
+            .store
+            .config
+            .settings
+            .get("realtimeVoiceMode")
+            .and_then(Value::as_str)
+            .unwrap_or("legacy");
+        if realtime_mode == "desktop_realtime" {
+            std::env::set_var("AOKIE_REALTIME_VOICE_MODE", "desktop_realtime");
+        } else {
+            std::env::remove_var("AOKIE_REALTIME_VOICE_MODE");
+        }
+        apply_endpoint_env_from_settings(
+            &self.store.config.settings,
+            "realtimeVoiceEndpoint",
+            "AOKIE_REALTIME_VOICE_ENDPOINT",
+        );
+        apply_endpoint_env_from_settings(
+            &self.store.config.settings,
+            "realtimeVoiceDestination",
+            "AOKIE_REALTIME_VOICE_DESTINATION",
+        );
+        for (setting, env, fallback) in [
+            ("realtimeVoice", "AOKIE_REALTIME_VOICE", "marin"),
+            (
+                "realtimeTurnDetection",
+                "AOKIE_REALTIME_TURN_DETECTION",
+                "server_vad",
+            ),
+        ] {
+            let value = self
+                .store
+                .config
+                .settings
+                .get(setting)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(fallback);
+            std::env::set_var(env, value);
+        }
+        let realtime_max_tokens = self
+            .store
+            .config
+            .settings
+            .get("realtimeMaxOutputTokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(384)
+            .clamp(64, 4096);
+        std::env::set_var(
+            "AOKIE_REALTIME_MAX_OUTPUT_TOKENS",
+            realtime_max_tokens.to_string(),
         );
         // LLM model (`aiModel`); empty = auto-detect the desktop's loaded model.
         if let Some(codex_live_call_model) = codex_live_call_model {
@@ -2944,10 +3013,18 @@ impl Plugin {
                 for (key, value) in obj {
                     prospective_settings.insert(key.clone(), value.clone());
                 }
+                validate_realtime_voice_settings(&prospective_settings)?;
                 let prospective_mode = self.consent_mode_for_settings(&prospective_settings);
                 let loaded_consent = self.consent_loaded();
-                let destination_block = if prospective_mode == crate::consent::ConsentMode::Enforce
-                {
+                let realtime_block = validate_realtime_voice_consent(
+                    &prospective_settings,
+                    loaded_consent.grant.as_ref(),
+                    &aokie_core::events::now_iso8601(),
+                )
+                .err();
+                let destination_block = if realtime_block.is_some() {
+                    realtime_block
+                } else if prospective_mode == crate::consent::ConsentMode::Enforce {
                     validate_effective_destinations(
                         &prospective_settings,
                         loaded_consent.grant.as_ref(),
@@ -3026,10 +3103,53 @@ impl Plugin {
                     ("aiEndpoint", "AOKIE_AI_ENDPOINT"),
                     ("sttEndpoint", "AOKIE_STT_ENDPOINT"),
                     ("ttsEndpoint", "AOKIE_TTS_ENDPOINT"),
+                    ("realtimeVoiceEndpoint", "AOKIE_REALTIME_VOICE_ENDPOINT"),
+                    (
+                        "realtimeVoiceDestination",
+                        "AOKIE_REALTIME_VOICE_DESTINATION",
+                    ),
                 ] {
                     if obj.contains_key(setting) {
                         apply_endpoint_env_from_settings(&self.store.config.settings, setting, env);
                     }
+                }
+                if obj.contains_key("realtimeVoiceMode") {
+                    if realtime_voice_selected(&self.store.config.settings) {
+                        std::env::set_var("AOKIE_REALTIME_VOICE_MODE", "desktop_realtime");
+                    } else {
+                        std::env::remove_var("AOKIE_REALTIME_VOICE_MODE");
+                    }
+                }
+                for (setting, env, fallback) in [
+                    ("realtimeVoice", "AOKIE_REALTIME_VOICE", "marin"),
+                    (
+                        "realtimeTurnDetection",
+                        "AOKIE_REALTIME_TURN_DETECTION",
+                        "server_vad",
+                    ),
+                ] {
+                    if obj.contains_key(setting) {
+                        let value = self
+                            .store
+                            .config
+                            .settings
+                            .get(setting)
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or(fallback);
+                        std::env::set_var(env, value);
+                    }
+                }
+                if obj.contains_key("realtimeMaxOutputTokens") {
+                    let value = self
+                        .store
+                        .config
+                        .settings
+                        .get("realtimeMaxOutputTokens")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(384)
+                        .clamp(64, 4096);
+                    std::env::set_var("AOKIE_REALTIME_MAX_OUTPUT_TOKENS", value.to_string());
                 }
                 if tts_engine_changed {
                     // Re-stamp BEFORE the Configure below queues the engine
@@ -3340,24 +3460,34 @@ impl Plugin {
                 // must say WHY the receptionist isn't picking up.
                 let stt_err = r.stt_error();
                 let tts_err = r.tts_error();
-                if let Some(e) = &stt_err {
-                    reasons.push(format!("voice: {e}"));
-                }
-                if let Some(e) = &tts_err {
-                    reasons.push(format!("voice: {e}"));
+                let realtime_selected = r.realtime_selected();
+                let realtime_error = r.realtime_error();
+                if realtime_selected {
+                    if let Some(error) = &realtime_error {
+                        reasons.push(format!("realtime voice: {error}"));
+                    }
+                } else {
+                    if let Some(e) = &stt_err {
+                        reasons.push(format!("voice: {e}"));
+                    }
+                    if let Some(e) = &tts_err {
+                        reasons.push(format!("voice: {e}"));
+                    }
                 }
                 // VOICE-001: the loopback self-test — running (None) or failed
                 // both degrade readiness (auto-answer is blocked either way).
                 let self_test = r.self_test();
-                match &self_test {
-                    None => reasons.push(
-                        "voice self-test still running — auto-answer arms once it passes"
-                            .to_string(),
-                    ),
-                    Some(st) if !st.ok => {
-                        reasons.push(format!("voice self-test failed: {}", st.detail))
+                if !realtime_selected {
+                    match &self_test {
+                        None => reasons.push(
+                            "voice self-test still running — auto-answer arms once it passes"
+                                .to_string(),
+                        ),
+                        Some(st) if !st.ok => {
+                            reasons.push(format!("voice self-test failed: {}", st.detail))
+                        }
+                        Some(_) => {}
                     }
-                    Some(_) => {}
                 }
                 json!({
                     "present": true,
@@ -3371,10 +3501,20 @@ impl Plugin {
                     "callWaiting": r.call_waiting_diagnostics(),
                     "error": r.last_error(),
                     "voiceRuntime": {
-                        "ready": stt_err.is_none() && tts_err.is_none()
-                            && self_test.as_ref().is_some_and(|st| st.ok),
+                        "ready": if realtime_selected {
+                            realtime_error.is_none()
+                        } else {
+                            stt_err.is_none() && tts_err.is_none()
+                                && self_test.as_ref().is_some_and(|st| st.ok)
+                        },
                         "sttError": stt_err,
                         "ttsError": tts_err,
+                        "realtime": {
+                            "selected": realtime_selected,
+                            "ready": r.realtime_ready(),
+                            "destination": r.realtime_destination(),
+                            "error": realtime_error,
+                        },
                         "selfTest": self_test.map(|st| json!({
                             "ok": st.ok,
                             "at": st.at,
@@ -3486,8 +3626,16 @@ impl Plugin {
             .get("aiReceptionist")
             .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
             .unwrap_or(false);
+        let realtime_mode = self
+            .store
+            .config
+            .settings
+            .get("realtimeVoiceMode")
+            .and_then(Value::as_str)
+            == Some("desktop_realtime");
         let llm_err = self.radio.as_ref().and_then(|r| r.llm_error());
-        if agent_mode {
+        let realtime_err = self.radio.as_ref().and_then(|r| r.realtime_error());
+        if agent_mode && !realtime_mode {
             if let Some(e) = &llm_err {
                 reasons.push(format!(
                     "responder: {e} — auto-answer is blocked (calls ring through) until the LLM recovers"
@@ -3495,12 +3643,19 @@ impl Plugin {
             }
         }
         let responder = json!({
-            "mode": if agent_mode { "agent" } else { "flow" },
+            "mode": if realtime_mode { "desktop_realtime" } else if agent_mode { "agent" } else { "flow" },
             // Flow mode reads `ready` (the plugin can't disprove it); the note
             // says where the real check lives.
-            "ready": !agent_mode || llm_err.is_none(),
-            "llmError": llm_err,
-            "note": if agent_mode {
+            "ready": if realtime_mode {
+                self.radio.is_some() && realtime_err.is_none()
+            } else {
+                !agent_mode || llm_err.is_none()
+            },
+            "llmError": if realtime_mode { Value::Null } else { json!(llm_err) },
+            "realtimeError": realtime_err,
+            "note": if realtime_mode {
+                json!("raw call PCM is brokered through FormLogic Desktop to the consented provider; local STT/LLM/TTS readiness does not gate normal Realtime callers")
+            } else if agent_mode {
                 Value::Null
             } else {
                 json!("replies are produced by host flows — check the desktop's FormLogic link and the reply flow binding")
@@ -4133,6 +4288,38 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
         applies_live: true,
     },
     SettingSpec {
+        key: "realtimeVoiceMode",
+        kind: SettingKind::Enum(&["legacy", "desktop_realtime"]),
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "realtimeVoiceEndpoint",
+        kind: SettingKind::EndpointUrl,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "realtimeVoiceDestination",
+        kind: SettingKind::EndpointUrl,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "realtimeVoice",
+        kind: SettingKind::Enum(&[
+            "marin", "cedar", "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse",
+        ]),
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "realtimeTurnDetection",
+        kind: SettingKind::Enum(&["server_vad", "semantic_vad"]),
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "realtimeMaxOutputTokens",
+        kind: SettingKind::Int { min: 64, max: 4096 },
+        applies_live: false,
+    },
+    SettingSpec {
         key: "sttEndpoint",
         kind: SettingKind::EndpointUrl,
         applies_live: true,
@@ -4329,6 +4516,12 @@ fn effective_consent_destination(url: &str) -> Result<Option<String>, String> {
     if is_codex_live_call_endpoint(url) {
         return Ok(Some(CODEX_LIVE_CALL_DESTINATION.to_string()));
     }
+    if crate::realtime_voice::validate_endpoint(url).is_ok() {
+        // This is only the local Desktop transport. The separate,
+        // source-discovered realtimeVoiceDestination setting names the actual
+        // upstream processor and is the value bound into signed consent.
+        return Ok(None);
+    }
     if is_loopback_endpoint(url) {
         return Ok(None);
     }
@@ -4346,12 +4539,132 @@ fn normalize_granted_destination(value: &str) -> Result<Option<String>, String> 
     effective_consent_destination(value)
 }
 
-const CONSENT_DESTINATION_SETTING_KEYS: [&str; 4] = [
+const CONSENT_DESTINATION_SETTING_KEYS: [&str; 6] = [
     "aiEndpoint",
     "sttEndpoint",
     "ttsEndpoint",
     "audioTranscriptEndpoint",
+    "realtimeVoiceEndpoint",
+    "realtimeVoiceDestination",
 ];
+
+fn validate_realtime_voice_settings(settings: &Map<String, Value>) -> Result<(), CmdError> {
+    let mode = settings
+        .get("realtimeVoiceMode")
+        .and_then(Value::as_str)
+        .unwrap_or("legacy");
+    if mode != "desktop_realtime" {
+        return Ok(());
+    }
+    let agent_enabled = settings
+        .get("aiReceptionist")
+        .map(|value| {
+            value
+                .as_bool()
+                .unwrap_or_else(|| value.as_str() == Some("true"))
+        })
+        .unwrap_or(false);
+    if !agent_enabled {
+        return Err(CmdError::failed(
+            "realtimeVoiceMode=desktop_realtime requires aiReceptionist=true",
+        ));
+    }
+    let transport_mode = settings
+        .get("transportMode")
+        .and_then(Value::as_str)
+        .unwrap_or("dongle");
+    if transport_mode != "dongle" {
+        return Err(CmdError::failed(
+            "realtimeVoiceMode=desktop_realtime requires transportMode=dongle because Realtime still needs the Aokie SCO phone-audio link",
+        ));
+    }
+    let endpoint = settings
+        .get("realtimeVoiceEndpoint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .ok_or_else(|| {
+            CmdError::failed(
+                "realtimeVoiceEndpoint is required when realtimeVoiceMode=desktop_realtime",
+            )
+        })?;
+    crate::realtime_voice::validate_endpoint(endpoint)
+        .map_err(|error| CmdError::failed(format!("realtimeVoiceEndpoint rejected: {error}")))?;
+    let destination = settings
+        .get("realtimeVoiceDestination")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|destination| !destination.is_empty())
+        .ok_or_else(|| {
+            CmdError::failed(
+                "realtimeVoiceDestination is required when realtimeVoiceMode=desktop_realtime",
+            )
+        })?;
+    let canonical = crate::realtime_voice::validate_destination_origin(destination)
+        .map_err(|error| CmdError::failed(format!("realtimeVoiceDestination rejected: {error}")))?;
+    if canonical != destination {
+        return Err(CmdError::failed(
+            "realtimeVoiceDestination must be stored as a canonical HTTPS origin",
+        ));
+    }
+    Ok(())
+}
+
+fn realtime_voice_selected(settings: &Map<String, Value>) -> bool {
+    settings
+        .get("realtimeVoiceMode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode == "desktop_realtime")
+}
+
+/// Realtime's raw audio export is an always-enforced policy boundary. This
+/// deliberately does not consult the legacy global consentMode: warn/off may
+/// keep local/legacy installations alive, but cannot authorize a new remote
+/// PCM destination.
+fn validate_realtime_voice_consent(
+    settings: &Map<String, Value>,
+    grant: Option<&crate::consent::ConsentGrant>,
+    now_iso: &str,
+) -> Result<(), String> {
+    if !realtime_voice_selected(settings) {
+        return Ok(());
+    }
+    validate_realtime_voice_settings(settings).map_err(|error| error.message)?;
+    match crate::consent::evaluate(
+        grant,
+        crate::consent::CURRENT_CONSENT_VERSION,
+        crate::consent::ConsentMode::Enforce,
+        crate::consent::Scope::Transcription,
+        now_iso,
+    ) {
+        crate::consent::ConsentDecision::Allow => {}
+        crate::consent::ConsentDecision::Warn(reason)
+        | crate::consent::ConsentDecision::Deny(reason) => {
+            return Err(format!(
+                "Realtime voice requires explicit transcription consent: {reason}"
+            ));
+        }
+    }
+    let destination = settings
+        .get("realtimeVoiceDestination")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Realtime voice has no upstream destination".to_string())?;
+    let destination = crate::realtime_voice::validate_destination_origin(destination)?;
+    let granted = grant.is_some_and(|grant| {
+        grant.scopes.destinations.iter().any(|candidate| {
+            crate::realtime_voice::validate_destination_origin(candidate)
+                .ok()
+                .as_deref()
+                == Some(destination.as_str())
+        })
+    });
+    if !granted {
+        return Err(format!(
+            "realtimeVoiceDestination: {destination} is not a consented destination — re-run the FormLogic consent wizard"
+        ));
+    }
+    Ok(())
+}
 
 /// Validate every effective remote destination in one complete settings bag
 /// against one verified/candidate grant. A missing grant has an empty
@@ -4686,6 +4999,11 @@ fn validate_endpoint_setting(key: &str, value: &Value) -> Result<(), CmdError> {
     };
     if raw.is_empty() {
         return Ok(()); // clearing the endpoint is always fine
+    }
+    if key == "realtimeVoiceEndpoint" {
+        return crate::realtime_voice::validate_endpoint(raw)
+            .map(|_| ())
+            .map_err(|error| CmdError::failed(format!("{key} rejected: {error}")));
     }
     if key == "audioTranscriptEndpoint" && is_codex_live_call_endpoint(raw) {
         return Err(CmdError::failed(
@@ -7141,6 +7459,122 @@ mod tests {
         assert!(!is_loopback_endpoint("https://api.example.com/v1"));
         assert!(!is_loopback_endpoint("http://192.168.1.10:8080"));
         assert!(!is_loopback_endpoint("http://localhost.evil.com/v1"));
+    }
+
+    #[test]
+    fn realtime_voice_requires_agent_transcription_and_exact_remote_destination() {
+        let endpoint = "ws://127.0.0.1:17872/api/ai/providers/openai-realtime/v1/realtime/stream";
+        let mut settings = Map::new();
+        settings.insert("aiReceptionist".into(), json!(true));
+        settings.insert("realtimeVoiceMode".into(), json!("desktop_realtime"));
+        settings.insert("realtimeVoiceEndpoint".into(), json!(endpoint));
+        settings.insert(
+            "realtimeVoiceDestination".into(),
+            json!("https://api.openai.com"),
+        );
+        assert!(validate_realtime_voice_settings(&settings).is_ok());
+        assert_eq!(effective_consent_destination(endpoint).unwrap(), None);
+        assert!(
+            validate_realtime_voice_consent(&settings, None, "2026-07-20T00:00:00Z")
+                .unwrap_err()
+                .contains("transcription consent")
+        );
+
+        let grant = crate::consent::ConsentGrant {
+            version: crate::consent::CURRENT_CONSENT_VERSION,
+            scopes: crate::consent::ConsentScopes {
+                transcription: true,
+                destinations: vec!["https://api.openai.com".into()],
+                ..Default::default()
+            },
+            accepted_at: "2026-07-19T00:00:00Z".into(),
+            accepted_by: Some("operator@example.test".into()),
+            expires_at: None,
+            signature: None,
+        };
+        validate_realtime_voice_consent(&settings, Some(&grant), "2026-07-20T00:00:00Z").unwrap();
+
+        let mut wrong = grant.clone();
+        wrong.scopes.destinations = vec!["https://other.example".into()];
+        assert!(
+            validate_realtime_voice_consent(&settings, Some(&wrong), "2026-07-20T00:00:00Z")
+                .unwrap_err()
+                .contains("not a consented destination")
+        );
+
+        settings.insert("aiReceptionist".into(), json!(false));
+        assert!(validate_realtime_voice_settings(&settings)
+            .unwrap_err()
+            .message
+            .contains("requires aiReceptionist=true"));
+
+        settings.insert("aiReceptionist".into(), json!(true));
+        for unsupported in ["native", "auto"] {
+            settings.insert("transportMode".into(), json!(unsupported));
+            assert!(validate_realtime_voice_settings(&settings)
+                .unwrap_err()
+                .message
+                .contains("requires transportMode=dongle"));
+        }
+        settings.insert("transportMode".into(), json!("dongle"));
+        assert!(validate_realtime_voice_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn realtime_health_ignores_unselected_local_pipeline_failures() {
+        let mut plugin = Plugin::ephemeral(true);
+        plugin
+            .store
+            .config
+            .settings
+            .insert("consentMode".into(), json!("off"));
+        plugin
+            .store
+            .config
+            .settings
+            .insert("aiReceptionist".into(), json!(true));
+        plugin
+            .store
+            .config
+            .settings
+            .insert("realtimeVoiceMode".into(), json!("desktop_realtime"));
+        let (radio, _rx) = crate::radio::RadioHandle::test_handle();
+        radio
+            .status
+            .initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        radio
+            .status
+            .connected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        radio
+            .status
+            .realtime_selected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *radio.status.realtime_destination.lock().unwrap() = Some("https://api.openai.com".into());
+        *radio.status.stt_error.lock().unwrap() = Some("local STT stopped".into());
+        *radio.status.tts_error.lock().unwrap() = Some("local TTS stopped".into());
+        *radio.status.llm_error.lock().unwrap() = Some("local LLM stopped".into());
+        *radio.status.self_test.lock().unwrap() = Some(crate::radio::VoiceSelfTest {
+            ok: false,
+            at: "2026-07-20T00:00:00Z".into(),
+            duration_ms: 1,
+            detail: "local loopback failed".into(),
+        });
+        plugin.radio = Some(radio);
+
+        let health = plugin.build_health();
+        let runtime = &health["components"]["radio"]["voiceRuntime"];
+        assert_eq!(runtime["ready"], json!(true));
+        assert_eq!(runtime["realtime"]["selected"], json!(true));
+        assert_eq!(
+            runtime["realtime"]["destination"],
+            json!("https://api.openai.com")
+        );
+        let responder = &health["components"]["responder"];
+        assert_eq!(responder["mode"], json!("desktop_realtime"));
+        assert_eq!(responder["ready"], json!(true));
+        assert_eq!(responder["llmError"], Value::Null);
     }
 
     #[test]

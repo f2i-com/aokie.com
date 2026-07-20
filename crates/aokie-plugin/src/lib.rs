@@ -60,6 +60,7 @@ pub mod outbox;
 pub mod private_consult;
 pub mod radio;
 pub mod realtime;
+pub mod realtime_voice;
 pub mod remote_media;
 pub mod rpc;
 pub mod screen;

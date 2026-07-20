@@ -37,6 +37,12 @@
     ttsModelDir: '',
     aiModel: '',
     aiEndpoint: '',
+    realtimeVoiceMode: 'legacy',
+    realtimeVoiceEndpoint: '',
+    realtimeVoiceDestination: '',
+    realtimeVoice: 'marin',
+    realtimeTurnDetection: 'server_vad',
+    realtimeMaxOutputTokens: 384,
     sttEndpoint: '',
     ttsEndpoint: '',
     sttEndpointMs: 450,
@@ -75,6 +81,31 @@
       ttsModelDir: typeof src.ttsModelDir === 'string' ? src.ttsModelDir : d.ttsModelDir,
       aiModel: typeof src.aiModel === 'string' ? src.aiModel : d.aiModel,
       aiEndpoint: typeof src.aiEndpoint === 'string' ? src.aiEndpoint : d.aiEndpoint,
+      realtimeVoiceMode:
+        src.realtimeVoiceMode === 'desktop_realtime' || src.realtimeVoiceMode === 'legacy'
+          ? src.realtimeVoiceMode
+          : d.realtimeVoiceMode,
+      realtimeVoiceEndpoint:
+        typeof src.realtimeVoiceEndpoint === 'string'
+          ? src.realtimeVoiceEndpoint
+          : d.realtimeVoiceEndpoint,
+      realtimeVoiceDestination:
+        typeof src.realtimeVoiceDestination === 'string'
+          ? src.realtimeVoiceDestination
+          : d.realtimeVoiceDestination,
+      realtimeVoice:
+        ['marin', 'cedar', 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse']
+          .indexOf(src.realtimeVoice) !== -1
+          ? src.realtimeVoice
+          : d.realtimeVoice,
+      realtimeTurnDetection:
+        src.realtimeTurnDetection === 'semantic_vad' || src.realtimeTurnDetection === 'server_vad'
+          ? src.realtimeTurnDetection
+          : d.realtimeTurnDetection,
+      realtimeMaxOutputTokens:
+        typeof src.realtimeMaxOutputTokens === 'number' && isFinite(src.realtimeMaxOutputTokens)
+          ? src.realtimeMaxOutputTokens
+          : d.realtimeMaxOutputTokens,
       sttEndpoint: typeof src.sttEndpoint === 'string' ? src.sttEndpoint : d.sttEndpoint,
       ttsEndpoint: typeof src.ttsEndpoint === 'string' ? src.ttsEndpoint : d.ttsEndpoint,
       sttEndpointMs:
@@ -120,6 +151,8 @@
   /** The desktop AI gateway's FIXED loopback base (lock-step with the
    *  console's receptionistPayload.ts AI_GATEWAY_BASE). */
   var AI_GATEWAY_BASE = 'http://127.0.0.1:17872/api/ai/providers/';
+  var REALTIME_GATEWAY_BASE = 'ws://127.0.0.1:17872/api/ai/providers/';
+  var REALTIME_GATEWAY_SUFFIX = '/v1/realtime/stream';
   var CODEX_PROVIDER_LUNA_LOW = 'openai-codex-agent-luna-low';
   var CODEX_PROVIDER_LUNA_LOW_FAST = 'openai-codex-agent-luna-low-fast';
   var CODEX_PROVIDER_NONE = 'openai-codex-agent-none';
@@ -224,6 +257,136 @@
       return AI_GATEWAY_BASE + encodeURIComponent(src.slice(9)) + LANE_PATHS[lane];
     }
     return url;
+  }
+
+  function canonicalHttpsOrigin(value) {
+    try {
+      var parsed = new URL(String(value || '').trim());
+      if (
+        parsed.protocol !== 'https:' ||
+        parsed.username ||
+        parsed.password ||
+        parsed.pathname !== '/' ||
+        parsed.search ||
+        parsed.hash
+      ) return '';
+      return parsed.origin;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function realtimeProviderBinding(source) {
+    if (!source || source.kind !== 'provider') return null;
+    // Desktop's Realtime bridge currently implements only the OpenAI event
+    // dialect. Never advertise a superficially capable Custom/Anthropic
+    // profile that the bridge will deterministically reject at call time.
+    if (source.protocol !== 'openai') return null;
+    var caps = Array.isArray(source.capabilities) ? source.capabilities : [];
+    var capable =
+      caps.length === 0 ||
+      caps.indexOf('realtime') !== -1 ||
+      caps.indexOf('realtime_voice') !== -1 ||
+      caps.indexOf('audio.realtime') !== -1;
+    var providerId = typeof source.providerId === 'string' ? source.providerId.trim() : '';
+    if (!capable || !/^[A-Za-z0-9._-]{1,128}$/.test(providerId)) return null;
+    var destination = canonicalHttpsOrigin(source.destinationOrigin);
+    var reason = '';
+    if (source.enabled === false) reason = 'disabled';
+    else if (source.hasKey === false) reason = 'API key missing';
+    else if (!destination) reason = 'destination unavailable';
+    return {
+      endpoint: REALTIME_GATEWAY_BASE + encodeURIComponent(providerId) + REALTIME_GATEWAY_SUFFIX,
+      destination: destination,
+      usable: !reason,
+      reason: reason,
+    };
+  }
+
+  function realtimeProviderOptions() {
+    var opts = [{ value: '', label: 'Choose a Desktop realtime provider…' }];
+    var seen = {};
+    for (var i = 0; i < sources.length; i++) {
+      var binding = realtimeProviderBinding(sources[i]);
+      if (!binding || seen[binding.endpoint]) continue;
+      seen[binding.endpoint] = true;
+      opts.push({
+        value: binding.endpoint,
+        destination: binding.destination,
+        disabled: !binding.usable,
+        label:
+          'Provider: ' +
+          (sources[i].name || sources[i].providerId || 'Realtime') +
+          (binding.reason ? ' (' + binding.reason + ')' : ''),
+      });
+    }
+    var current = String(settings.realtimeVoiceEndpoint || '').trim();
+    if (current && !seen[current]) {
+      opts.push({
+        value: current,
+        destination: settings.realtimeVoiceDestination,
+        label: 'Current provider (temporarily unavailable)',
+      });
+    }
+    return opts;
+  }
+
+  function realtimeVoiceHtml() {
+    var modeOptions =
+      '<option value="legacy"' +
+      (settings.realtimeVoiceMode === 'legacy' ? ' selected' : '') +
+      '>Standard STT → LLM → TTS</option>' +
+      '<option value="desktop_realtime"' +
+      (settings.realtimeVoiceMode === 'desktop_realtime' ? ' selected' : '') +
+      '>OpenAI Realtime through FormLogic Desktop</option>';
+    var providers = realtimeProviderOptions();
+    var providerOptions = [];
+    for (var i = 0; i < providers.length; i++) {
+      providerOptions.push(
+        '<option value="' + esc(providers[i].value) + '" data-destination="' +
+          esc(providers[i].destination || '') + '"' +
+          (providers[i].disabled ? ' disabled' : '') +
+          (settings.realtimeVoiceEndpoint === providers[i].value ? ' selected' : '') + '>' +
+          esc(providers[i].label) +
+          '</option>'
+      );
+    }
+    var realtimeVoices = ['marin', 'cedar', 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'];
+    var voiceOptions = realtimeVoices.map(function (voice) {
+      return '<option value="' + voice + '"' +
+        (settings.realtimeVoice === voice ? ' selected' : '') + '>' +
+        voice.charAt(0).toUpperCase() + voice.slice(1) + '</option>';
+    }).join('');
+    var turnOptions =
+      '<option value="server_vad"' +
+      (settings.realtimeTurnDetection === 'server_vad' ? ' selected' : '') +
+      '>Server VAD (quick)</option>' +
+      '<option value="semantic_vad"' +
+      (settings.realtimeTurnDetection === 'semantic_vad' ? ' selected' : '') +
+      '>Semantic VAD (natural turns)</option>';
+    return (
+      field('Live-call voice mode', '<select data-key="realtimeVoiceMode">' + modeOptions + '</select>') +
+      '<div id="set-realtime-zone"' +
+      (settings.realtimeVoiceMode === 'desktop_realtime' ? '' : ' hidden') +
+      '>' +
+      field(
+        'Realtime provider',
+        '<select data-realtime-endpoint="1">' + providerOptions.join('') + '</select>'
+      ) +
+      field('Realtime voice', '<select data-key="realtimeVoice">' + voiceOptions + '</select>') +
+      field('Turn detection', '<select data-key="realtimeTurnDetection">' + turnOptions + '</select>') +
+      field(
+        'Maximum response tokens',
+        '<input type="number" data-num="realtimeMaxOutputTokens" min="64" max="4096" step="32" value="' +
+          esc(settings.realtimeMaxOutputTokens) + '" />'
+      ) +
+      hint(
+        'Streams caller and assistant PCM through the Desktop for low-latency speech-to-speech. The API key stays in Desktop; raw call audio leaves this computer for the selected provider destination' +
+          (settings.realtimeVoiceDestination ? ' (' + esc(settings.realtimeVoiceDestination) + ')' : '') +
+          ' and requires destination consent. Realtime currently handles conversation and staff follow-up only; booking, live lookup, manager PIN, transfer and other action-marker flows stay on the standard voice path. Applies after reconnecting the receptionist.'
+      ) +
+      '</div>'
+    );
   }
 
   /** Reverse of composeLaneUrl for seeding the select from a saved URL. */
@@ -517,6 +680,12 @@
     'ttsVoice',
     'aiModel',
     'aiEndpoint',
+    'realtimeVoiceMode',
+    'realtimeVoiceEndpoint',
+    'realtimeVoiceDestination',
+    'realtimeVoice',
+    'realtimeTurnDetection',
+    'realtimeMaxOutputTokens',
     'sttEndpoint',
     'ttsEndpoint',
     'aiReceptionist',
@@ -980,6 +1149,7 @@
       laneRowsHtml(['llm']) +
       llmModelHtml() +
       laneRowsHtml(['stt', 'tts']) +
+      realtimeVoiceHtml() +
       hint(
         'Composed from the selected service now; if the FormLogic receptionist app is connected, its per-call settings take precedence.'
       ) +
@@ -1137,6 +1307,15 @@
     var key = t.getAttribute('data-key');
     if (key != null) {
       settings[key] = t.value;
+      if (key === 'realtimeVoiceMode') {
+        var realtimeZone = root && root.querySelector('#set-realtime-zone');
+        if (realtimeZone) realtimeZone.hidden = t.value !== 'desktop_realtime';
+        if (t.value === 'desktop_realtime') {
+          settings.aiReceptionist = true;
+          var agentToggle = root && root.querySelector('[data-bool="aiReceptionist"]');
+          if (agentToggle) agentToggle.checked = true;
+        }
+      }
       if (key === 'transportMode') {
         // Live feedback for the working copy: the dongle-only Advanced
         // fields toggle in place (same pattern as the lane custom-URL rows).
@@ -1146,6 +1325,14 @@
         var zones = root ? root.querySelectorAll('.set-dongle-only') : [];
         for (var zi = 0; zi < zones.length; zi++) zones[zi].hidden = hideDongleFields;
       }
+      return;
+    }
+    if (t.getAttribute('data-realtime-endpoint') != null && e.type === 'change') {
+      settings.realtimeVoiceEndpoint = t.value;
+      var selectedRealtime = t.options && t.selectedIndex >= 0 ? t.options[t.selectedIndex] : null;
+      settings.realtimeVoiceDestination = selectedRealtime
+        ? selectedRealtime.getAttribute('data-destination') || ''
+        : '';
       return;
     }
     var num = t.getAttribute('data-num');
