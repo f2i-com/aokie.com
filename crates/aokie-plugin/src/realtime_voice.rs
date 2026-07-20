@@ -23,10 +23,13 @@ const EVENT_DEPTH: usize = 64;
 const MAX_BINARY_BYTES: usize = 96_000; // two seconds of PCM16 at 24 kHz
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_INPUT_CHUNK_SAMPLES: usize = 2_400; // 100 ms
-                                              // OpenAI may deliver audio deltas substantially faster than wall-clock
-                                              // playout. Keep a bounded but realistic burst reservoir here; the separate
-                                              // OutputPacer still releases at most 80 ms ahead into the physical SCO queue.
-const MAX_OUTPUT_BUFFER_MS: u64 = 4_000;
+                                              // Realtime providers commonly generate a complete spoken response much faster
+                                              // than it can be played over SCO. Four seconds was too small even for a normal
+                                              // greeting and turned a healthy provider burst into a terminal call failure.
+                                              // Thirty seconds still bounds the reservoir to about 0.96 MiB at 16 kHz while
+                                              // comfortably covering the configured short-response default. The physical
+                                              // SCO queue remains independently paced to OUTPUT_LEAD_MS.
+const MAX_OUTPUT_BUFFER_MS: u64 = 30_000;
 pub const OUTPUT_LEAD_MS: u64 = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -870,6 +873,24 @@ pub struct OutputPacer {
     item_done: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputPacerPushError {
+    StaleItem,
+    CapacityExceeded,
+}
+
+impl std::fmt::Display for OutputPacerPushError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleItem => {
+                formatter.write_str("Desktop realtime PCM belongs to a stale output item")
+            }
+            Self::CapacityExceeded => formatter
+                .write_str("Desktop realtime output exceeded the 30 second playout reservoir"),
+        }
+    }
+}
+
 impl OutputPacer {
     pub fn new(sample_rate: u32) -> Self {
         Self {
@@ -908,13 +929,13 @@ impl OutputPacer {
         Ok(())
     }
 
-    pub fn push(&mut self, item_id: &str, samples: &[i16]) -> Result<(), String> {
+    pub fn push(&mut self, item_id: &str, samples: &[i16]) -> Result<(), OutputPacerPushError> {
         if self.active_item.as_deref() != Some(item_id) {
-            return Err("Desktop realtime PCM belongs to a stale output item".to_string());
+            return Err(OutputPacerPushError::StaleItem);
         }
         let max_samples = self.sample_rate as usize * MAX_OUTPUT_BUFFER_MS as usize / 1_000;
         if self.queued.len().saturating_add(samples.len()) > max_samples {
-            return Err("Desktop realtime output exceeded the 4 second playout buffer".to_string());
+            return Err(OutputPacerPushError::CapacityExceeded);
         }
         self.queued.extend(samples.iter().copied());
         Ok(())
@@ -1231,23 +1252,49 @@ mod tests {
     }
 
     #[test]
-    fn pacer_caps_sco_lead_and_rejects_unbounded_output() {
+    fn pacer_accepts_fast_normal_output_caps_sco_lead_and_rejects_unbounded_output() {
         let now = Instant::now();
         let mut pacer = OutputPacer::new(16_000);
         pacer.start_item("item", now).unwrap();
-        // A normal provider burst can contain seconds of audio immediately;
-        // accepting it must not dump it into SCO ahead of wall clock.
-        pacer.push("item", &vec![0; 32_000]).unwrap();
-        pacer.push("item", &vec![0; 32_000]).unwrap();
-        assert!(pacer.push("item", &[0]).is_err());
+        // A normal provider burst can contain substantially more than four
+        // seconds of audio immediately; accepting it must not dump it into
+        // SCO ahead of wall clock.
+        pacer.push("item", &vec![0; 16_000 * 8]).unwrap();
         let first_pcm = now + Duration::from_millis(500);
         assert_eq!(pacer.take_ready(first_pcm, usize::MAX).len(), 1_280);
         assert_eq!(pacer.audible_played_ms(first_pcm), 0);
         let later = first_pcm + Duration::from_millis(200);
         assert_eq!(pacer.take_ready(later, usize::MAX).len(), 3_200);
         assert_eq!(pacer.audible_played_ms(later), 200);
-        assert!(pacer.push("item", &[0]).is_ok());
+
+        let capacity = 16_000 * MAX_OUTPUT_BUFFER_MS as usize / 1_000;
+        let remaining = capacity - (16_000 * 8 - 1_280 - 3_200);
+        pacer.push("item", &vec![0; remaining]).unwrap();
+        assert_eq!(
+            pacer.push("item", &[0]),
+            Err(OutputPacerPushError::CapacityExceeded)
+        );
         pacer.clear();
         assert!(pacer.active_item().is_none());
+    }
+
+    #[test]
+    fn pacer_distinguishes_stale_pcm_from_a_recoverable_capacity_limit() {
+        let mut pacer = OutputPacer::new(16_000);
+        assert_eq!(
+            pacer.push("stale", &[0]),
+            Err(OutputPacerPushError::StaleItem)
+        );
+        pacer.start_item("current", Instant::now()).unwrap();
+        pacer
+            .push(
+                "current",
+                &vec![0; 16_000 * MAX_OUTPUT_BUFFER_MS as usize / 1_000],
+            )
+            .unwrap();
+        assert_eq!(
+            pacer.push("current", &[0]),
+            Err(OutputPacerPushError::CapacityExceeded)
+        );
     }
 }
