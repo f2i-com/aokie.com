@@ -114,6 +114,17 @@ fn collect_files(dir: &Path) -> Result<Vec<FileEntry>, String> {
             if rel == MANIFEST_FILE {
                 continue;
             }
+            // Never pin env-var-shaped or runtime-cache paths. 2026-07-20:
+            // something at plugin start writes a copy of Windows' cert cache
+            // into a LITERAL `%SystemDrive%\ProgramData\...\Caches` directory
+            // inside the plugin dir; signed, it broke verification at the next
+            // reboot when Windows rotated the cache (digest mismatch →
+            // quarantined plugin). Loadable or not, an env-var-shaped path
+            // never belongs in a signed bundle.
+            if rel.starts_with('%') {
+                eprintln!("note: skipping env-var-shaped path in bundle: {rel}");
+                continue;
+            }
             let (sha256, size) = sha256_file(&path)?;
             out.push(FileEntry {
                 path: rel,
