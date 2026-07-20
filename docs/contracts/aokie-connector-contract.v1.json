@@ -29,6 +29,7 @@
     "aokie.call.assistance.resolved",
     "aokie.call.waiting",
     "aokie.call.outbound.dialing",
+    "aokie.appointment.requested",
     "aokie.sms.received",
     "aokie.sms.sent",
     "aokie.sms.failed",

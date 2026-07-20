@@ -86,6 +86,13 @@ pub mod events {
     /// completed / no_answer / failed + `direction: "outbound"`), so per-call
     /// serial queues, transcripts, captions and summary flows all just work.
     pub const CALL_OUTBOUND_DIALING: &str = "aokie.call.outbound.dialing";
+    /// A caller-approved new appointment REQUEST captured during the exact
+    /// live call — {requestId, callId, from, callerName, service, date, time,
+    /// agreementTurn, at}. The plugin never writes business records itself;
+    /// the pack's deterministic apply binding validates and idempotently
+    /// creates the requested appointment/follow-up. This is never proof that
+    /// staff confirmed the booking.
+    pub const APPOINTMENT_REQUESTED: &str = "aokie.appointment.requested";
     // ── SMS ─────────────────────────────────────────────────────────
     pub const SMS_RECEIVED: &str = "aokie.sms.received";
     pub const SMS_SENT: &str = "aokie.sms.sent";
@@ -128,6 +135,7 @@ pub mod events {
         CALL_ASSISTANCE_RESOLVED,
         CALL_WAITING,
         CALL_OUTBOUND_DIALING,
+        APPOINTMENT_REQUESTED,
         SMS_RECEIVED,
         SMS_SENT,
         SMS_FAILED,
