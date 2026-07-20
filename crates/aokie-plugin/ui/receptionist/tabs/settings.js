@@ -603,7 +603,15 @@
                 ': saved as Automatic (built-in) — pick it again once the service is running.'
             );
           }
-          HOST.toast('success', 'Receptionist settings saved — takes effect on the next caller turn.');
+          var blocked = data && typeof data.blocked === 'string' ? data.blocked.trim() : '';
+          if (blocked) {
+            HOST.toast(
+              'error',
+              'Settings saved, but the receptionist is paused. Open Consent and accept the new data destination before calls can resume.'
+            );
+          } else {
+            HOST.toast('success', 'Receptionist settings saved — takes effect on the next caller turn.');
+          }
         },
         function (e) {
           error = errMsg(e);
