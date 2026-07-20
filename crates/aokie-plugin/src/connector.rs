@@ -194,6 +194,12 @@ pub struct Plugin {
     /// Direct authenticated v2 signalling socket. It owns no PCM; native
     /// WebRTC peers bridge the radio and Companion independently.
     pub companion_gateway: Option<crate::companion_gateway::CompanionGatewayHandle>,
+    /// Latest host-proofed Companion endpoint identity + approved roster.
+    /// Short-lived gateway bearer/ICE material is stripped before this
+    /// in-memory retry snapshot is retained. It lets an init received while
+    /// consent gates the radio finish successfully and broker fresh admission
+    /// once renewed consent brings the media endpoint back.
+    companion_bootstrap: Option<crate::companion_gateway::CompanionBootstrap>,
 }
 
 impl Plugin {
@@ -229,6 +235,7 @@ impl Plugin {
             consent_blocked: None,
             host_rpc: crate::host_rpc::HostRpc::new(),
             companion_gateway: None,
+            companion_bootstrap: None,
         })
     }
 
@@ -257,6 +264,7 @@ impl Plugin {
             consent_blocked: None,
             host_rpc: crate::host_rpc::HostRpc::new(),
             companion_gateway: None,
+            companion_bootstrap: None,
         }
     }
 
@@ -884,6 +892,47 @@ impl Plugin {
         stopped
     }
 
+    /// Human re-consent can take far longer than the admission bearer/ICE
+    /// lifetime. Retain only durable endpoint identity + approved roster;
+    /// identity-only gateway startup brokers fresh short-lived admission
+    /// material through host_rpc instead of replaying stale credentials.
+    fn identity_only_companion_bootstrap(
+        mut bootstrap: crate::companion_gateway::CompanionBootstrap,
+    ) -> crate::companion_gateway::CompanionBootstrap {
+        bootstrap.gateway_url = None;
+        bootstrap.access_token = None;
+        bootstrap.app_id = None;
+        bootstrap.ice_servers.clear();
+        bootstrap.relay_only = false;
+        bootstrap
+    }
+
+    /// Start the most recently host-provided Companion trust snapshot once a
+    /// consent-gated radio/media endpoint becomes available. The bootstrap is
+    /// never persisted and a failed attempt leaves no signalling authority;
+    /// keeping the validated in-memory snapshot permits a later safe retry.
+    fn try_start_configured_companion_gateway(&mut self) {
+        if self.companion_gateway.is_some() {
+            return;
+        }
+        let (Some(bootstrap), Some(radio)) = (
+            self.companion_bootstrap.clone(),
+            self.radio.as_ref().cloned(),
+        ) else {
+            return;
+        };
+        match crate::companion_gateway::CompanionGatewayHandle::spawn(
+            bootstrap,
+            radio,
+            self.host_rpc.clone(),
+        ) {
+            Ok(gateway) => self.companion_gateway = Some(gateway),
+            Err(error) => {
+                eprintln!("[aokie-plugin] deferred Companion gateway could not start: {error}")
+            }
+        }
+    }
+
     /// CONSENT-001: the Desktop-provided Ed25519 verify key for consent
     /// grants (set by the parent Desktop at spawn). Present ⇒ ONLY grants
     /// signed by THIS Desktop install satisfy the gate — the per-install key
@@ -1015,6 +1064,7 @@ impl Plugin {
             crate::consent::save_signed(&self.data_dir, &envelope).map_err(CmdError::failed)?;
             self.consent_blocked = None;
             self.ensure_radio_started();
+            self.try_start_configured_companion_gateway();
             self.sync_remote_consent();
             return Ok(json!({
                 "recorded": true,
@@ -1059,6 +1109,7 @@ impl Plugin {
         // radio up (idempotent; a no-op if it's already running or unavailable).
         self.consent_blocked = None;
         self.ensure_radio_started();
+        self.try_start_configured_companion_gateway();
         self.sync_remote_consent();
         Ok(json!({
             "recorded": true,
@@ -1149,6 +1200,7 @@ impl Plugin {
         if let Some(existing) = self.companion_gateway.take() {
             existing.stop();
         }
+        self.companion_bootstrap = None;
         let mut companion_bootstrap = None;
         // {desktopVersion, pluginApiVersion, dataDir, devMode} — all
         // advisory except dataDir (re-roots storage) and devMode.
@@ -1234,32 +1286,53 @@ impl Plugin {
         let companion_status = match companion_bootstrap {
             None => Value::Null,
             Some(bootstrap) => {
-                let Some(radio) = self.radio.as_ref().cloned() else {
+                // Retain only the validated, host-provided in-memory snapshot.
+                // A consent block is an expected inert configuration, not a
+                // malformed bootstrap and therefore not a protocol-fatal init
+                // error. Once consent starts the radio, consent.set consumes
+                // this snapshot through try_start_configured_companion_gateway.
+                self.companion_bootstrap =
+                    Some(Self::identity_only_companion_bootstrap(bootstrap.clone()));
+                if let Some(radio) = self.radio.as_ref().cloned() {
+                    match crate::companion_gateway::CompanionGatewayHandle::spawn(
+                        bootstrap,
+                        radio,
+                        self.host_rpc.clone(),
+                    ) {
+                        Ok(gateway) => {
+                            let status = gateway.status();
+                            self.companion_gateway = Some(gateway);
+                            serde_json::to_value(status).unwrap_or(Value::Null)
+                        }
+                        Err(error) => {
+                            self.companion_bootstrap = None;
+                            return rpc::error_line(
+                                Some(id),
+                                rpc::INVALID_PARAMS,
+                                &format!("Companion gateway could not start: {error}"),
+                                None,
+                            );
+                        }
+                    }
+                } else if let Some(reason) = self.consent_blocked.clone() {
+                    json!({
+                        "configured": true,
+                        "connected": false,
+                        "phase": "stopped",
+                        "reconnectAttempt": 0,
+                        "lastError": "deferred until consent permits the Aokie radio/media endpoint",
+                        "changedAt": aokie_core::events::now_iso8601(),
+                        "deferred": true,
+                        "blocked": reason,
+                    })
+                } else {
+                    self.companion_bootstrap = None;
                     return rpc::error_line(
                         Some(id),
                         rpc::INVALID_PARAMS,
                         "privateBootstrap requires a running Aokie radio/media endpoint",
                         None,
                     );
-                };
-                match crate::companion_gateway::CompanionGatewayHandle::spawn(
-                    bootstrap,
-                    radio,
-                    self.host_rpc.clone(),
-                ) {
-                    Ok(gateway) => {
-                        let status = gateway.status();
-                        self.companion_gateway = Some(gateway);
-                        serde_json::to_value(status).unwrap_or(Value::Null)
-                    }
-                    Err(error) => {
-                        return rpc::error_line(
-                            Some(id),
-                            rpc::INVALID_PARAMS,
-                            &format!("Companion gateway could not start: {error}"),
-                            None,
-                        )
-                    }
                 }
             }
         };
@@ -2869,6 +2942,7 @@ impl Plugin {
                 {
                     self.consent_blocked = None;
                     self.ensure_radio_started();
+                    self.try_start_configured_companion_gateway();
                 }
                 // Stamp the live revision into the radio status so the NEXT
                 // call.ended records which configuration it ran under
@@ -3188,11 +3262,15 @@ impl Plugin {
             }
             None => {
                 if !self.dev_mode {
-                    let cause = self
-                        .radio_start_error
-                        .as_deref()
-                        .unwrap_or("no dongle / driver not bound");
-                    reasons.push(format!("radio not running ({cause})"));
+                    if let Some(reason) = self.consent_blocked.as_deref() {
+                        reasons.push(format!("consent required: {reason}"));
+                    } else {
+                        let cause = self
+                            .radio_start_error
+                            .as_deref()
+                            .unwrap_or("no dongle / driver not bound");
+                        reasons.push(format!("radio not running ({cause})"));
+                    }
                 }
                 json!({ "present": false, "startError": self.radio_start_error })
             }
@@ -3256,7 +3334,10 @@ impl Plugin {
         // consent component below — not flagged as degraded, which would be
         // permanent amber noise on every install.
         if let crate::consent::ConsentDecision::Deny(r) = &consent_decision {
-            reasons.push(format!("consent required: {r}"));
+            let reason = format!("consent required: {r}");
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
         }
         let consent = json!({
             "mode": consent_mode.as_str(),
@@ -4728,10 +4809,12 @@ mod tests {
         // Truthful health (audit INT-006): real mode with no radio running is
         // DEGRADED, never a blanket ok — the receptionist cannot answer.
         assert_eq!(parse(&resp)["result"]["status"], json!("degraded"));
-        assert!(parse(&resp)["result"]["detail"]
+        let detail = parse(&resp)["result"]["detail"]
             .as_str()
             .unwrap()
-            .contains("radio"));
+            .to_owned();
+        assert!(detail.contains("consent required"));
+        assert!(detail.contains("no consent has been recorded"));
 
         let resp = plugin
             .handle_rpc(request(3, "plugin.shutdown", json!({})), &mut sink)
@@ -4793,6 +4876,47 @@ mod tests {
             json!(true)
         );
         assert!(plugin.companion_gateway.is_some());
+        assert!(plugin.companion_bootstrap.is_some());
+
+        // Re-init without a trust snapshot explicitly removes both the live
+        // gateway and any retained/deferred bootstrap authority.
+        let response = plugin
+            .handle_rpc(
+                request(
+                    3,
+                    "plugin.init",
+                    json!({"pluginApiVersion": 1, "privateBootstrap": Value::Null}),
+                ),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(parse(&response)["result"]["companionGateway"].is_null());
+        assert!(plugin.companion_gateway.is_none());
+        assert!(plugin.companion_bootstrap.is_none());
+
+        plugin
+            .handle_rpc(
+                request(
+                    4,
+                    "plugin.init",
+                    json!({
+                        "pluginApiVersion": 1,
+                        "privateBootstrap": valid_companion_bootstrap()
+                    }),
+                ),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(plugin.companion_gateway.is_some());
+        assert!(plugin.companion_bootstrap.is_some());
+        plugin
+            .handle_rpc(
+                request(5, "plugin.init", json!({"pluginApiVersion": 1})),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(plugin.companion_gateway.is_none());
+        assert!(plugin.companion_bootstrap.is_none());
     }
 
     #[test]
@@ -4822,6 +4946,7 @@ mod tests {
             .unwrap();
         assert_eq!(parse(&started)["result"]["ok"], json!(true));
         assert!(plugin.companion_gateway.is_some());
+        assert!(plugin.companion_bootstrap.is_some());
 
         let mut malformed = valid_companion_bootstrap();
         malformed["unexpected"] = json!(true);
@@ -4843,12 +4968,21 @@ mod tests {
             json!(rpc::INVALID_PARAMS)
         );
         assert!(plugin.companion_gateway.is_none());
+        assert!(plugin.companion_bootstrap.is_none());
     }
 
     #[test]
     fn explicit_bootstrap_without_radio_fails_closed() {
         let mut plugin = Plugin::ephemeral(false);
         let mut sink = VecSink::default();
+        // Explicit warn isolates an ordinary missing hardware/media endpoint;
+        // enforce with no grant is intentionally classified as consent-blocked
+        // and covered by the deferred-bootstrap regression below.
+        plugin
+            .store
+            .config
+            .settings
+            .insert("consentMode".into(), json!("warn"));
         let response = plugin
             .handle_rpc(
                 request(
@@ -4869,6 +5003,91 @@ mod tests {
             .unwrap()
             .contains("requires a running Aokie radio/media endpoint"));
         assert!(plugin.companion_gateway.is_none());
+    }
+
+    #[test]
+    fn consent_blocked_init_defers_private_bootstrap_then_starts_after_consent() {
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+
+        // Selecting Codex under enforce before destination consent is a valid
+        // inert configuration: settings persist for disclosure, but no radio
+        // or media endpoint may run yet.
+        let selected = plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"aiEndpoint": CODEX_LIVE_CALL_ENDPOINT_NONE}),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(selected["blocked"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(CODEX_LIVE_CALL_DESTINATION)));
+        assert!(plugin.radio.is_none());
+
+        let response = plugin
+            .handle_rpc(
+                request(
+                    1,
+                    "plugin.init",
+                    json!({
+                        "pluginApiVersion": 1,
+                        "privateBootstrap": valid_companion_bootstrap()
+                    }),
+                ),
+                &mut sink,
+            )
+            .unwrap();
+        let parsed = parse(&response);
+        assert_eq!(parsed["result"]["ok"], json!(true));
+        assert_eq!(
+            parsed["result"]["companionGateway"]["deferred"],
+            json!(true)
+        );
+        assert_eq!(
+            parsed["result"]["companionGateway"]["configured"],
+            json!(true)
+        );
+        assert!(!response.contains("test-private-bootstrap-token"));
+        assert!(plugin.companion_gateway.is_none());
+        assert!(plugin.companion_bootstrap.is_some());
+        let retained = plugin.companion_bootstrap.as_ref().unwrap();
+        assert!(retained.gateway_url.is_none());
+        assert!(retained.access_token.is_none());
+        assert!(retained.app_id.is_none());
+        assert!(retained.ice_servers.is_empty());
+        assert!(!retained.relay_only);
+        let health = plugin.build_health();
+        let detail = health["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("consent required"), "{health}");
+        assert!(detail.contains(CODEX_LIVE_CALL_DESTINATION), "{health}");
+        assert!(!detail.contains("no dongle / driver not bound"), "{health}");
+
+        // Unit tests never spawn hardware, so install the same bare live
+        // handle used by the gateway tests. A complete grant then reconciles
+        // the radio and consumes the retained host-proofed snapshot.
+        let (radio, _controls) = crate::radio::RadioHandle::test_handle();
+        plugin.radio = Some(radio);
+        let consent = plugin
+            .dispatch_command(
+                "consent.set",
+                &json!({
+                    "version": crate::consent::CURRENT_CONSENT_VERSION,
+                    "scopes": {
+                        "bluetooth": true,
+                        "transcription": true,
+                        "destinations": [CODEX_LIVE_CALL_DESTINATION]
+                    }
+                }),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(consent["radioStarted"], json!(true));
+        assert!(plugin.consent_blocked.is_none());
+        assert!(plugin.companion_gateway.is_some());
+        if let Some(gateway) = plugin.companion_gateway.take() {
+            gateway.stop();
+        }
     }
 
     #[test]
