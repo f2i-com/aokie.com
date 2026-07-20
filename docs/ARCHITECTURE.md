@@ -55,9 +55,20 @@ Key invariants (each pinned by a test):
 - **Device loss terminates the call exactly once**: a dropped dongle
   synthesizes termination through the same machine (`reason: device_lost`); a
   late real `CallTerminated` lands on an idle tracker and is a no-op.
-- **The caller's final words land before `call.ended`**: on termination the
-  radio drains buffered audio + in-flight STT (bounded 1.5 s) so summaries and
-  after-call flows see the last sentence.
+- **The caller's final on-device STT lands before `call.ended`**: on
+  termination the radio drains buffered audio + in-flight STT (bounded 1.5 s).
+  Optional detached audio-model corrections may arrive later, so transcript-
+  consuming background flows use `call.transcript.settled`, emitted after all
+  correction workers report or the bounded 40 s correction deadline. The
+  ordinary `call.ended` event stays immediate for lifecycle/UI/callback work.
+  Graceful plugin/consent shutdown forces any pending barrier with
+  `transcriptCorrectionTimedOut: true` and waits for its synchronous outbox
+  write before acknowledging shutdown. The correction ledger itself is still
+  process-memory state: an abrupt process/OS/power failure after durable
+  `call.ended` but before the barrier can omit that call's background analysis.
+  The existing outbox cannot safely hold a not-yet-deliverable event (pending
+  rows replay immediately), so crash recovery needs a dedicated persistent
+  delayed-work ledger rather than reusing the delivery outbox.
 
 ## Voice pipeline (voice feature)
 
