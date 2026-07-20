@@ -730,6 +730,16 @@ fn hypothesis_stable(prev: &str, cur: &str) -> bool {
     matches + 1 >= head
 }
 
+/// FormLogic's reserved Codex live-call adapters serialize requests behind a
+/// single in-flight turn gate. A discarded interim-STT generation still owns
+/// that gate until its exact cancellation terminal arrives, so immediately
+/// starting the final generation can otherwise race into `codex_busy`.
+/// Every other provider keeps the latency benefit of speculative generation.
+#[cfg(feature = "voice")]
+fn llm_endpoint_allows_speculative_reply(endpoint: &str) -> bool {
+    !crate::connector::is_codex_live_call_endpoint(endpoint)
+}
+
 /// Guide phase 5: may the speculative generation answer the FINAL turn? The
 /// hypothesis must be a (near-)prefix of the final text — one wobble
 /// tolerated — with at most a short tail the model never saw ("...please").
@@ -10247,7 +10257,9 @@ fn run_loop(
                     if let (Some(prev), Some(cur)) = (live_hyp_prev.as_deref(), live_hyp.as_deref())
                     {
                         if hypothesis_stable(prev, cur) {
-                            if let Some(client) = agent_client.as_ref() {
+                            if let Some(client) = agent_client.as_ref().filter(|client| {
+                                llm_endpoint_allows_speculative_reply(client.endpoint())
+                            }) {
                                 let is_mgr_call = tracker.current().is_some_and(|s| {
                                     !s.outbound && screen_policy.is_manager(s.caller_id.as_deref())
                                 });
@@ -16293,6 +16305,44 @@ mod tests {
             "what time do you open tomorrow",
             "What time do you open tomorrow?"
         ));
+    }
+
+    /// Only the exact FormLogic Codex live-call routes disable interim-STT
+    /// generation. Equivalent loopback spellings and one-pass encoded route
+    /// ids reach the same handler; unrelated providers keep speculation even
+    /// when their hostname, path or query merely contains "codex".
+    #[cfg(feature = "voice")]
+    #[test]
+    fn speculative_llm_route_gate_is_exact() {
+        for endpoint in [
+            crate::connector::CODEX_LIVE_CALL_ENDPOINT_NONE,
+            crate::connector::CODEX_LIVE_CALL_ENDPOINT_LOW,
+            crate::connector::CODEX_LIVE_CALL_ENDPOINT_LUNA_LOW,
+            crate::connector::CODEX_LIVE_CALL_ENDPOINT_LUNA_LOW_FAST,
+            "http://localhost:17872/api/ai/providers/openai-codex-agent-none/v1/chat/completions?request=1#ignored",
+            "https://[::1]:17872/api/ai/providers/openai-codex-agent-low/v1/chat/completions",
+            "http://127.0.0.2:17872/api/ai/providers/openai%2Dcodex-agent-none/v1/chat/completions",
+            "http://[::ffff:127.0.0.1]:17872/api/ai/providers/%6fpenai-codex-agent-luna-low%2Dfast/v1/chat/completions",
+        ] {
+            assert!(
+                !llm_endpoint_allows_speculative_reply(endpoint),
+                "reserved route must not speculate: {endpoint}"
+            );
+        }
+
+        for endpoint in [
+            "http://127.0.0.1:8080/v1/chat/completions?model=codex",
+            "https://codex.example.com/v1/chat/completions",
+            "http://127.0.0.1:17872/api/ai/providers/my-codex-model/v1/chat/completions",
+            "http://127.0.0.1:17872/api/ai/providers/openai-codex-agent-none/v1/chat/completions/",
+            "http://127.0.0.1:17873/api/ai/providers/openai-codex-agent-low/v1/chat/completions",
+            "http://127.0.0.1:17872/api/ai/providers/openai%252Dcodex-agent-none/v1/chat/completions",
+        ] {
+            assert!(
+                llm_endpoint_allows_speculative_reply(endpoint),
+                "ordinary/near-miss provider must keep speculation: {endpoint}"
+            );
+        }
     }
 
     /// Ring-time personalization window: auto-answer waits for +CLIP (short)
