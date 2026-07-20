@@ -26,6 +26,81 @@
   var errMsg = U.errMsg;
   var ICONS = U.icons;
 
+  // The Desktop is a loopback broker, but these two reserved provider routes
+  // delegate transcript text to OpenAI. They therefore share one stable,
+  // account-free effective destination in the signed consent grant. Every
+  // other loopback route remains local.
+  var CODEX_DESTINATION = 'OpenAI ChatGPT via Codex';
+  var CODEX_ID_NONE = 'openai-codex-agent-none';
+  var CODEX_ID_LOW = 'openai-codex-agent-low';
+  var CODEX_PROVIDER_NONE = 'provider:' + CODEX_ID_NONE;
+  var CODEX_PROVIDER_LOW = 'provider:' + CODEX_ID_LOW;
+
+  function isLoopbackUrl(raw) {
+    try {
+      var parsed = new URL(raw);
+      var host = parsed.hostname.toLowerCase();
+      var ipHost = host[0] === '[' && host[host.length - 1] === ']' ? host.slice(1, -1) : host;
+      return (
+        host === 'localhost' ||
+        ipHost === '::1' ||
+        ipHost === '::' ||
+        /^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(ipHost) ||
+        ipHost === '::ffff:0:0' ||
+        host === '0.0.0.0' ||
+        /^127(?:\.[0-9]{1,3}){3}$/.test(host)
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function isCodexLiveCallEndpoint(raw) {
+    try {
+      var parsed = new URL(String(raw || '').trim());
+      var segments = parsed.pathname.split('/');
+      if (
+        segments.length !== 8 ||
+        segments[0] !== '' ||
+        segments[1] !== 'api' ||
+        segments[2] !== 'ai' ||
+        segments[3] !== 'providers' ||
+        segments[5] !== 'v1' ||
+        segments[6] !== 'chat' ||
+        segments[7] !== 'completions' ||
+        /%(?:2f|5c|00)/i.test(segments[4])
+      ) {
+        return false;
+      }
+      var providerId = decodeURIComponent(segments[4]);
+      return (
+        isLoopbackUrl(parsed.href) &&
+        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+        parsed.port === '17872' &&
+        (providerId === CODEX_ID_NONE || providerId === CODEX_ID_LOW)
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function effectiveDestination(raw) {
+    var value = String(raw || '').trim();
+    if (!value) return '';
+    if (isCodexLiveCallEndpoint(value)) return CODEX_DESTINATION;
+    if (value === CODEX_DESTINATION) return CODEX_DESTINATION;
+    if (isLoopbackUrl(value)) return '';
+    try {
+      return new URL(value).origin;
+    } catch (e) {
+      return value;
+    }
+  }
+
+  function isCodexProviderSource(source) {
+    return !!source && (source.id === CODEX_PROVIDER_NONE || source.id === CODEX_PROVIDER_LOW);
+  }
+
   // ---- SCOPE_ROWS — copy VERBATIM from ConsentWizard.tsx ------------------
 
   var SCOPE_ROWS = [
@@ -111,6 +186,9 @@
   var wizardOpen = false;
   var submitting = false;
   var error = null;
+  var codexProviderAvailable = false;
+  var codexDestinationOptIn = false;
+  var destinationSeeded = false;
 
   for (var i = 0; i < SCOPE_ROWS.length; i++) scopes[SCOPE_ROWS[i].key] = SCOPE_ROWS[i].defaultOn;
 
@@ -130,6 +208,18 @@
           }
           scopesSeeded = true;
         }
+        if (!destinationSeeded && s && s.grant && s.grant.scopes) {
+          var grantedDestinations = Array.isArray(s.grant.scopes.destinations)
+            ? s.grant.scopes.destinations
+            : [];
+          for (var d = 0; d < grantedDestinations.length; d++) {
+            if (effectiveDestination(grantedDestinations[d]) === CODEX_DESTINATION) {
+              codexDestinationOptIn = true;
+              break;
+            }
+          }
+          destinationSeeded = true;
+        }
       },
       function (e) {
         if (status === undefined) status = null;
@@ -146,17 +236,49 @@
         settingsBag = {};
       }
     );
-    return Promise.all([consentP, settingsP]).then(render);
+    var sourcesP = HOST.aiSources().then(
+      function (list) {
+        var sources = Array.isArray(list) ? list : [];
+        for (var i = 0; i < sources.length; i++) {
+          if (isCodexProviderSource(sources[i])) {
+            codexProviderAvailable = true;
+            break;
+          }
+        }
+      },
+      function () {
+        // A source-list outage must not hide an already configured or granted
+        // disclosure choice; the reconciliation below preserves those.
+      }
+    );
+    return Promise.all([consentP, settingsP, sourcesP]).then(function () {
+      if (isCodexLiveCallEndpoint(settingsBag.aiEndpoint)) {
+        codexProviderAvailable = true;
+        codexDestinationOptIn = true;
+      }
+      if (codexDestinationOptIn) codexProviderAvailable = true;
+      render();
+    });
   }
 
-  /** The remote destinations this configuration would send data to. Shown
-   *  verbatim; accepted verbatim. */
+  /** The effective remote destinations this configuration would send data
+   *  to. Generic loopback processing is local; the two exact Codex broker
+   *  routes disclose their stable OpenAI destination instead of a local URL. */
   function uniqueDestinations() {
-    var keys = ['aiEndpoint', 'sttEndpoint', 'ttsEndpoint'];
+    var keys = ['aiEndpoint', 'sttEndpoint', 'ttsEndpoint', 'audioTranscriptEndpoint'];
     var out = [];
     for (var i = 0; i < keys.length; i++) {
-      var v = typeof settingsBag[keys[i]] === 'string' ? settingsBag[keys[i]].trim() : '';
+      var raw = typeof settingsBag[keys[i]] === 'string' ? settingsBag[keys[i]].trim() : '';
+      var v = effectiveDestination(raw);
       if (v.length > 0 && out.indexOf(v) === -1) out.push(v);
+    }
+    return out;
+  }
+
+  function consentDestinations() {
+    var out = uniqueDestinations();
+    if (codexDestinationOptIn && out.indexOf(CODEX_DESTINATION) === -1) {
+      out.push(CODEX_DESTINATION);
     }
     return out;
   }
@@ -178,7 +300,7 @@
       remoteConsult: !!scopes.remoteConsult,
       remoteTakeover: !!scopes.remoteTakeover,
       retentionDays: retentionDays,
-      destinations: uniqueDestinations(),
+      destinations: consentDestinations(),
     };
     HOST.consent
       .issue({
@@ -221,8 +343,31 @@
     }
     var grant = status.grant || null;
     var enforced = status.mode === 'enforce';
+    var destinationCurrent = false;
+    if (grant && grant.scopes) {
+      var granted = Array.isArray(grant.scopes.destinations) ? grant.scopes.destinations : [];
+      var required = uniqueDestinations();
+      destinationCurrent = true;
+      for (var di = 0; di < required.length; di++) {
+        var found = false;
+        for (var gi = 0; gi < granted.length; gi++) {
+          if (effectiveDestination(granted[gi]) === required[di]) {
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          destinationCurrent = false;
+          break;
+        }
+      }
+    }
     var needsAction =
-      !grant || grant.version !== status.requiredVersion || !enforced || !!status.note;
+      !grant ||
+      grant.version !== status.requiredVersion ||
+      !enforced ||
+      !destinationCurrent ||
+      !!status.note;
 
     var badge;
     if (grant && enforced && !needsAction) {
@@ -233,7 +378,13 @@
     } else {
       badge =
         '<span class="rcp-badge is-pending" title="' +
-        esc(status.note || status.blocked || 'Consent has not been recorded on this device.') +
+        esc(
+          status.note ||
+            status.blocked ||
+            (!destinationCurrent && grant
+              ? 'A configured data destination has not been accepted yet.'
+              : 'Consent has not been recorded on this device.')
+        ) +
         '">' +
         (status.blocked
           ? 'Consent required — phone offline'
@@ -261,7 +412,22 @@
 
   function wizardHtml() {
     if (!wizardOpen) return '';
-    var dests = uniqueDestinations();
+    var dests = consentDestinations();
+    var codexConfigured = isCodexLiveCallEndpoint(settingsBag.aiEndpoint);
+    var codexChoice = '';
+    if (codexProviderAvailable) {
+      codexChoice =
+        '<label class="rcp-scope-row" style="margin-top: 8px;">' +
+        '<input type="checkbox" data-codex-destination="1"' +
+        (codexDestinationOptIn ? ' checked' : '') +
+        (codexConfigured ? ' disabled' : '') +
+        ' />' +
+        '<span><strong>OpenAI ChatGPT via Codex</strong>' +
+        '<span class="rcp-scope-detail">Allow caller transcript text to be processed by OpenAI through the signed-in Codex agent. ' +
+        'Caller audio and account credentials are never included. Select this before choosing a ChatGPT via Codex live-call model.' +
+        (codexConfigured ? ' Required by the current LLM source.' : '') +
+        '</span></span></label>';
+    }
     var scopeRows = [];
     for (var i = 0; i < SCOPE_ROWS.length; i++) {
       var row = SCOPE_ROWS[i];
@@ -305,6 +471,7 @@
       '<div style="margin-top: 8px;">' + scopeRows.join('') + '</div>' +
       '<div style="margin-top: 12px;">' +
       '<strong style="font-size: 11px;">Where call data goes</strong>' +
+      codexChoice +
       destBlock +
       '</div>' +
       '<label class="rcp-field" style="max-width: 260px;"><span>Record retention (days)</span>' +
@@ -367,6 +534,11 @@
       var scope = t.getAttribute('data-scope');
       if (scope != null) {
         scopes[scope] = !!t.checked;
+        return;
+      }
+      if (t.getAttribute('data-codex-destination') != null) {
+        codexDestinationOptIn = !!t.checked;
+        render();
         return;
       }
       if (t.id === 'cns-retention') {

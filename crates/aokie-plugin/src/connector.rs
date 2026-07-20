@@ -266,12 +266,22 @@ impl Plugin {
     /// the scripted mock path; a start failure (no dongle / driver not
     /// bound / non-Windows) is logged and simply leaves `radio = None`.
     pub fn ensure_radio_started(&mut self) {
-        // Unit tests run on developer/CI machines that may have a real dongle
-        // attached; never grab hardware from a `cargo test` process. Live
-        // behaviour is verified by the E2E harness, not the unit suite.
-        if cfg!(test) || self.dev_mode || self.radio.is_some() {
-            return;
+        // A loopback Desktop broker can still delegate caller data to a
+        // remote processor. Recheck the COMPLETE persisted configuration at
+        // every start (and even when a radio is already present): an old file,
+        // an incomplete signed grant, or a restart must not bypass the same
+        // effective-destination gate enforced by settings.set.
+        if self.consent_mode() == crate::consent::ConsentMode::Enforce {
+            let grant = self.consent_loaded().grant;
+            if let Err(reason) =
+                validate_effective_destinations(&self.store.config.settings, grant.as_ref())
+            {
+                eprintln!("[aokie-plugin] radio NOT started — consent required: {reason}");
+                self.block_radio_for_consent(reason);
+                return;
+            }
         }
+        let radio_was_running = self.radio.is_some();
 
         // AOK-CONSENT-001: the radio is the entry point to ALL sensitive
         // processing (pairing, call audio, STT, MAP/PBAP). Gate its start on
@@ -283,7 +293,7 @@ impl Plugin {
         match self.consent_gate(crate::consent::Scope::Bluetooth) {
             crate::consent::ConsentDecision::Deny(reason) => {
                 eprintln!("[aokie-plugin] radio NOT started — consent required: {reason}");
-                self.consent_blocked = Some(reason);
+                self.block_radio_for_consent(reason);
                 return;
             }
             crate::consent::ConsentDecision::Warn(reason) => {
@@ -306,10 +316,25 @@ impl Plugin {
             crate::consent::ConsentDecision::Deny(reason) => {
                 std::env::set_var("AOKIE_STT_DISABLED", "1");
                 eprintln!("[aokie-plugin] transcription consent denied — STT disabled: {reason}");
+                if radio_was_running {
+                    // A running worker read its STT policy at spawn. Taking it
+                    // is the only fail-closed response to a re-consent grant
+                    // that removes transcription while calls may be live.
+                    self.block_radio_for_consent(reason);
+                    return;
+                }
             }
             _ => {
                 std::env::set_var("AOKIE_STT_DISABLED", "0");
             }
+        }
+        // Unit tests run on developer/CI machines that may have a real dongle
+        // attached; never grab hardware from a `cargo test` process. This
+        // hardware fast path intentionally comes AFTER all policy
+        // reconciliation above so tests and already-live radios cannot bypass
+        // a newly narrowed grant.
+        if cfg!(test) || self.dev_mode || self.radio.is_some() {
+            return;
         }
         // HFP-codec override (settings.hfpCodec: "auto" | "cvsd" | "wbs").
         // Some dongles (e.g. Broadcom BCM20702) need CVSD-only — mSBC's SCO
@@ -391,6 +416,13 @@ impl Plugin {
             std::env::set_var("AOKIE_AI_RECEPTIONIST", "1");
             eprintln!("[aokie-plugin] aiReceptionist ON → in-plugin streaming agent");
         }
+        let codex_live_call_endpoint = self
+            .store
+            .config
+            .settings
+            .get("aiEndpoint")
+            .and_then(Value::as_str)
+            .is_some_and(is_codex_live_call_endpoint);
         apply_endpoint_env_from_settings(
             &self.store.config.settings,
             "aiEndpoint",
@@ -409,7 +441,15 @@ impl Plugin {
             "AOKIE_TTS_ENDPOINT",
         );
         // LLM model (`aiModel`); empty = auto-detect the desktop's loaded model.
-        if let Some(m) = self
+        if codex_live_call_endpoint {
+            // The Desktop's two reserved Codex live-call adapters accept the
+            // ordinary OpenAI-compatible request shape, but the raw upstream
+            // model is fixed. Never pass through an old local-model name.
+            std::env::set_var("AOKIE_AI_MODEL", CODEX_LIVE_CALL_MODEL);
+            eprintln!(
+                "[aokie-plugin] ChatGPT via Codex selected → AOKIE_AI_MODEL={CODEX_LIVE_CALL_MODEL}"
+            );
+        } else if let Some(m) = self
             .store
             .config
             .settings
@@ -491,16 +531,31 @@ impl Plugin {
         // to the LLM request alongside the transcript — for audio-capable
         // models (Gemma 3n / Qwen2-Audio class) served by llama-server.
         // Text-only models ignore or reject the part, so it defaults OFF.
-        let send_audio = self
+        let send_audio_requested = self
             .store
             .config
             .settings
             .get("sendAudio")
             .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
             .unwrap_or(false);
+        let (send_audio, _) = codex_text_only_audio_policy(
+            codex_live_call_endpoint,
+            send_audio_requested,
+            false,
+            false,
+        );
         if send_audio {
             std::env::set_var("AOKIE_SEND_AUDIO", "1");
             eprintln!("[aokie-plugin] sendAudio ON → caller-turn audio rides the LLM request");
+        } else {
+            // A radio can be restarted in the same process, so clear a stale
+            // env stamp as well as refusing the text-only Codex routes.
+            std::env::remove_var("AOKIE_SEND_AUDIO");
+            if send_audio_requested && codex_live_call_endpoint {
+                eprintln!(
+                    "[aokie-plugin] sendAudio ignored: ChatGPT via Codex live-call adapters are text-only"
+                );
+            }
         }
         // audioTranscript: after each caller turn, a small DETACHED request
         // asks the audio-capable model to correct the on-device STT from the
@@ -509,18 +564,41 @@ impl Plugin {
         // INDEPENDENT of sendAudio (2026-07-17): the radio runs the per-turn
         // audio capture whenever EITHER feature is on, so "corrections only"
         // (text-only reply model) works without attaching audio to replies.
-        let audio_transcript = self
+        let audio_transcript_requested = self
             .store
             .config
             .settings
             .get("audioTranscript")
             .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
             .unwrap_or(false);
+        let separate_audio_transcript_endpoint = self
+            .store
+            .config
+            .settings
+            .get("audioTranscriptEndpoint")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty() && !is_codex_live_call_endpoint(value));
+        let (_, audio_transcript) = codex_text_only_audio_policy(
+            codex_live_call_endpoint,
+            false,
+            audio_transcript_requested,
+            separate_audio_transcript_endpoint,
+        );
         if audio_transcript {
             std::env::set_var("AOKIE_AUDIO_TRANSCRIPT", "1");
             eprintln!(
                 "[aokie-plugin] audioTranscript ON → the audio model corrects each caller turn's transcript"
             );
+        } else {
+            std::env::remove_var("AOKIE_AUDIO_TRANSCRIPT");
+            if audio_transcript_requested
+                && codex_live_call_endpoint
+                && !separate_audio_transcript_endpoint
+            {
+                eprintln!(
+                    "[aokie-plugin] audioTranscript ignored: the ChatGPT via Codex reply endpoint is text-only; configure a separate audio correction endpoint"
+                );
+            }
         }
         // Correction-lane overrides (2026-07-17 latency round): an optional
         // SEPARATE endpoint and/or model for the transcript-correction
@@ -771,16 +849,39 @@ impl Plugin {
     /// beta override. Dev mode never enforces — it never touches real
     /// hardware or a real caller.
     fn consent_mode(&self) -> crate::consent::ConsentMode {
+        self.consent_mode_for_settings(&self.store.config.settings)
+    }
+
+    /// Resolve the mode from an arbitrary complete settings bag. `settings.set`
+    /// uses this on its merged prospective bag so `{aiEndpoint, consentMode:
+    /// "enforce"}` cannot be evaluated under the old `warn` posture.
+    fn consent_mode_for_settings(
+        &self,
+        settings: &Map<String, Value>,
+    ) -> crate::consent::ConsentMode {
         if self.dev_mode {
             return crate::consent::ConsentMode::Off;
         }
         crate::consent::ConsentMode::from_setting(
-            self.store
-                .config
-                .settings
-                .get("consentMode")
-                .and_then(Value::as_str),
+            settings.get("consentMode").and_then(Value::as_str),
         )
+    }
+
+    /// Fail closed on a live consent-policy violation. Taking the handle and
+    /// sending Shutdown prevents a running call from retaining the old LLM
+    /// route while an enforce-mode configuration waits for renewed consent.
+    fn block_radio_for_consent(&mut self, reason: String) -> bool {
+        if let Some(gateway) = self.companion_gateway.take() {
+            gateway.stop();
+        }
+        let stopped = if let Some(radio) = self.radio.take() {
+            let _ = radio.send(crate::radio::RadioControl::Shutdown);
+            true
+        } else {
+            false
+        };
+        self.consent_blocked = Some(reason);
+        stopped
     }
 
     /// CONSENT-001: the Desktop-provided Ed25519 verify key for consent
@@ -856,6 +957,35 @@ impl Plugin {
         }))
     }
 
+    fn validate_candidate_consent_destinations(
+        &mut self,
+        grant: &crate::consent::ConsentGrant,
+        signed: bool,
+    ) -> Result<(), CmdError> {
+        let Err(reason) = validate_effective_destinations(&self.store.config.settings, Some(grant))
+        else {
+            return Ok(());
+        };
+
+        // Rejecting a narrower candidate leaves the prior durable grant in
+        // place. If that prior grant already fails the current enforce-mode
+        // configuration (for example after upgrading an old unsafe file), do
+        // not let a live radio survive merely because consent.set returned an
+        // error before ensure_radio_started was reached.
+        if self.consent_mode() == crate::consent::ConsentMode::Enforce {
+            let current = self.consent_loaded().grant;
+            if let Err(current_reason) =
+                validate_effective_destinations(&self.store.config.settings, current.as_ref())
+            {
+                self.block_radio_for_consent(current_reason);
+            }
+        }
+        Err(CmdError::failed(format!(
+            "consent.set: {}grant does not cover the current configuration — {reason}",
+            if signed { "signed " } else { "" }
+        )))
+    }
+
     /// AOK-CONSENT-001 `consent.set`: record a consent grant issued by
     /// FormLogic (the operator accepted the wizard). `accepted_at` is stamped
     /// by the plugin, not trusted from the wire. Once recorded, the radio is
@@ -881,6 +1011,7 @@ impl Plugin {
                     .map_err(|e| CmdError::failed(format!("consent.set invalid envelope: {e}")))?;
             let grant = crate::consent::verify_envelope(&envelope, &key)
                 .map_err(|e| CmdError::failed(format!("consent.set: {e}")))?;
+            self.validate_candidate_consent_destinations(&grant, true)?;
             crate::consent::save_signed(&self.data_dir, &envelope).map_err(CmdError::failed)?;
             self.consent_blocked = None;
             self.ensure_radio_started();
@@ -922,6 +1053,7 @@ impl Plugin {
             expires_at: None,
             signature,
         };
+        self.validate_candidate_consent_destinations(&grant, false)?;
         let saved = crate::consent::save(&self.data_dir, grant).map_err(CmdError::failed)?;
         // Consent may now be satisfied — clear the block and try to bring the
         // radio up (idempotent; a no-op if it's already running or unavailable).
@@ -2604,33 +2736,41 @@ impl Plugin {
                 for (key, value) in obj {
                     validate_setting(key, value)?;
                 }
-                // CONSENT-001 destination enforcement: under `enforce` with a
-                // recorded grant, a NON-LOOPBACK ai/stt/tts endpoint must be
-                // one the operator consented to (grant.scopes.destinations) —
-                // pointing transcripts at a new remote processor is a material
-                // change that requires re-consent, not a silent settings edit.
-                if self.consent_mode() == crate::consent::ConsentMode::Enforce {
-                    if let Some(grant) = self.consent_loaded().grant.as_ref() {
-                        for key in ["aiEndpoint", "sttEndpoint", "ttsEndpoint"] {
-                            let Some(url) = obj.get(key).and_then(Value::as_str) else {
-                                continue;
-                            };
-                            let url = url.trim();
-                            if url.is_empty() || is_loopback_endpoint(url) {
-                                continue; // clearing / local processing needs no destination grant
-                            }
-                            let canonical = canonical_destination(url).map_err(CmdError::failed)?;
-                            if !grant.scopes.destinations.iter().any(|d| {
-                                canonical_destination(d).ok().as_deref() == Some(canonical.as_str())
-                            }) {
-                                return Err(CmdError::failed(format!(
-                                    "{key}: {url} is not a consented destination — re-run the \
-                                     FormLogic consent wizard to add it before use"
-                                )));
-                            }
-                        }
-                    }
+                // The two reserved Desktop adapters are deliberately narrow:
+                // text transcript in, text reply out. Normalize the complete
+                // prospective settings bag so every writer (native UI, linked
+                // FormLogic app, or direct connector call) gets the same raw
+                // model and can never retain/enable caller-audio attachment.
+                let mut normalized_obj = obj.clone();
+                normalize_codex_live_call_settings(
+                    &mut normalized_obj,
+                    &self.store.config.settings,
+                );
+                let obj = &normalized_obj;
+                // CONSENT-001 destination enforcement is evaluated against
+                // the COMPLETE prospective bag and its prospective mode. An
+                // endpoint selected in the same write as `consentMode=enforce`
+                // therefore cannot ride the old `warn` posture. An ungranted
+                // enforce-mode configuration is persisted as an inert setup
+                // (so the wizard can disclose exactly what was selected), but
+                // the live radio is stopped and remains gated until a complete
+                // grant is recorded.
+                let mut prospective_settings = self.store.config.settings.clone();
+                for (key, value) in obj {
+                    prospective_settings.insert(key.clone(), value.clone());
                 }
+                let prospective_mode = self.consent_mode_for_settings(&prospective_settings);
+                let loaded_consent = self.consent_loaded();
+                let destination_block = if prospective_mode == crate::consent::ConsentMode::Enforce
+                {
+                    validate_effective_destinations(
+                        &prospective_settings,
+                        loaded_consent.grant.as_ref(),
+                    )
+                    .err()
+                } else {
+                    None
+                };
                 // AOK-304A: seal the managerPin write BEFORE it touches disk (or
                 // the settings.get readback). Done up front so a seal failure
                 // changes nothing (all-or-nothing, like validation above).
@@ -2650,6 +2790,13 @@ impl Plugin {
                     obj.get(*k)
                         .is_some_and(|new| self.store.config.settings.get(*k) != Some(new))
                 });
+                let destination_blocked = destination_block.is_some();
+                if let Some(reason) = destination_block {
+                    eprintln!(
+                        "[aokie-plugin] enforce-mode configuration blocked pending consent: {reason}"
+                    );
+                    self.block_radio_for_consent(reason);
+                }
                 for (key, value) in obj {
                     if key == "managerPin" {
                         // Never persist the plaintext PIN — store the sealed token.
@@ -2666,6 +2813,30 @@ impl Plugin {
                 }
                 self.store.config.config_version += 1;
                 self.save_config()?;
+                // A warn→enforce transition must reconcile the already-live
+                // radio against the newly active scope gates too. Destination
+                // failures were handled above; Bluetooth/transcription gaps
+                // cannot be allowed to keep processing on a warn-started
+                // runtime.
+                if !destination_blocked
+                    && prospective_mode == crate::consent::ConsentMode::Enforce
+                    && obj.contains_key("consentMode")
+                {
+                    for scope in [
+                        crate::consent::Scope::Bluetooth,
+                        crate::consent::Scope::Transcription,
+                    ] {
+                        if let crate::consent::ConsentDecision::Deny(reason) =
+                            self.consent_gate(scope)
+                        {
+                            eprintln!(
+                                "[aokie-plugin] enforce-mode transition stopped the radio: {reason}"
+                            );
+                            self.block_radio_for_consent(reason);
+                            break;
+                        }
+                    }
+                }
                 for (setting, env) in [
                     ("aiEndpoint", "AOKIE_AI_ENDPOINT"),
                     ("sttEndpoint", "AOKIE_STT_ENDPOINT"),
@@ -2679,6 +2850,25 @@ impl Plugin {
                     // Re-stamp BEFORE the Configure below queues the engine
                     // reload — the synth worker reads env at load time.
                     apply_tts_engine_env(&self.store.config.settings);
+                }
+                // Replacing an inert ungranted endpoint with a destination
+                // the current grant already covers (or explicitly returning
+                // to warn/off) can safely clear that destination-specific
+                // latch and retry normal startup. Scope gates are rechecked by
+                // ensure_radio_started before any hardware is touched.
+                let consent_relevant_change = obj.contains_key("consentMode")
+                    || CONSENT_DESTINATION_SETTING_KEYS
+                        .iter()
+                        .any(|key| obj.contains_key(*key));
+                if !destination_blocked
+                    && consent_relevant_change
+                    && self
+                        .consent_blocked
+                        .as_deref()
+                        .is_some_and(is_effective_destination_block)
+                {
+                    self.consent_blocked = None;
+                    self.ensure_radio_started();
                 }
                 // Stamp the live revision into the radio status so the NEXT
                 // call.ended records which configuration it ran under
@@ -2760,6 +2950,8 @@ impl Plugin {
                     "configVersion": self.store.config.config_version,
                     "appliedLive": applied_live,
                     "appliesAtReconnect": applies_at_reconnect,
+                    "radioStarted": self.radio.is_some(),
+                    "blocked": self.consent_blocked,
                 }))
             }
             other => Err(CmdError::failed(format!("unknown command: {other}"))),
@@ -3761,6 +3953,129 @@ fn setting_spec(key: &str) -> Option<&'static SettingSpec> {
     SETTING_SPECS.iter().find(|s| s.key == key)
 }
 
+/// Reserved Desktop provider routes for live-call use of the signed-in Codex
+/// agent. Matching uses the effective loopback host/port/path: query,
+/// fragment, credentials, IPv6 and localhost aliases cannot turn the same
+/// broker route into a "local" provider. Every other provider/path behind the
+/// Desktop gateway remains local and keeps its own model/audio policy.
+pub(crate) const CODEX_LIVE_CALL_ENDPOINT_NONE: &str =
+    "http://127.0.0.1:17872/api/ai/providers/openai-codex-agent-none/v1/chat/completions";
+pub(crate) const CODEX_LIVE_CALL_ENDPOINT_LOW: &str =
+    "http://127.0.0.1:17872/api/ai/providers/openai-codex-agent-low/v1/chat/completions";
+pub(crate) const CODEX_LIVE_CALL_DESTINATION: &str = "OpenAI ChatGPT via Codex";
+pub(crate) const CODEX_LIVE_CALL_MODEL: &str = "gpt-5.5";
+const CODEX_LIVE_CALL_PATH_NONE: &str =
+    "/api/ai/providers/openai-codex-agent-none/v1/chat/completions";
+const CODEX_LIVE_CALL_PATH_LOW: &str =
+    "/api/ai/providers/openai-codex-agent-low/v1/chat/completions";
+const CODEX_PROVIDER_ID_NONE: &str = "openai-codex-agent-none";
+const CODEX_PROVIDER_ID_LOW: &str = "openai-codex-agent-low";
+
+/// Axum percent-decodes a captured `:id` segment before handing it to the
+/// provider lookup. Match that routing behaviour exactly so `%2D` (or any
+/// other valid one-pass encoding of the reserved ASCII id) cannot turn the
+/// same OpenAI-backed handler into an apparently local destination. Encoded
+/// path separators and NUL are rejected explicitly: they are never a valid
+/// provider id and must not create a path-boundary ambiguity.
+fn decoded_codex_provider_id(segment: &str) -> Option<String> {
+    fn hex(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = if bytes[index] == b'%' {
+            let high = hex(*bytes.get(index + 1)?)?;
+            let low = hex(*bytes.get(index + 2)?)?;
+            index += 3;
+            (high << 4) | low
+        } else {
+            let byte = bytes[index];
+            index += 1;
+            byte
+        };
+        if matches!(byte, b'/' | b'\\' | b'\0') {
+            return None;
+        }
+        decoded.push(byte);
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn is_codex_live_call_path(path: &str) -> bool {
+    let Some(path) = path.strip_prefix('/') else {
+        return false;
+    };
+    let mut segments = path.split('/');
+    if segments.next() != Some("api")
+        || segments.next() != Some("ai")
+        || segments.next() != Some("providers")
+    {
+        return false;
+    }
+    let Some(provider_segment) = segments.next() else {
+        return false;
+    };
+    if segments.next() != Some("v1")
+        || segments.next() != Some("chat")
+        || segments.next() != Some("completions")
+        || segments.next().is_some()
+    {
+        return false;
+    }
+    matches!(
+        decoded_codex_provider_id(provider_segment).as_deref(),
+        Some(CODEX_PROVIDER_ID_NONE | CODEX_PROVIDER_ID_LOW)
+    )
+}
+
+pub(crate) fn is_codex_live_call_endpoint(url: &str) -> bool {
+    use url::Host;
+    let Ok(parsed) = url::Url::parse(url.trim()) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.port_or_known_default() != Some(17872)
+        || !is_codex_live_call_path(parsed.path())
+    {
+        return false;
+    }
+    match parsed.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(Host::Ipv6(ip)) => {
+            let segments = ip.segments();
+            let mapped_v4_loopback_or_unspecified = segments[..5] == [0, 0, 0, 0, 0]
+                && segments[5] == 0xffff
+                && (((segments[6] >> 8) as u8) == 127 || (segments[6] == 0 && segments[7] == 0));
+            ip.is_loopback() || ip.is_unspecified() || mapped_v4_loopback_or_unspecified
+        }
+        None => false,
+    }
+}
+
+/// Caller audio never rides either reserved Codex route. Transcript
+/// correction may remain enabled only when it names its own separate audio
+/// endpoint; otherwise it would silently fall back to the main LLM client.
+fn codex_text_only_audio_policy(
+    codex_endpoint: bool,
+    send_audio_requested: bool,
+    audio_transcript_requested: bool,
+    separate_audio_transcript_endpoint: bool,
+) -> (bool, bool) {
+    (
+        send_audio_requested && !codex_endpoint,
+        audio_transcript_requested && (!codex_endpoint || separate_audio_transcript_endpoint),
+    )
+}
+
 /// Typed validation for settings (audit AK-006/AOK-CONFIG-002): wrong types,
 /// out-of-range numbers, bogus enums and unbounded blobs are rejected BEFORE
 /// persisting — driven entirely by [`SETTING_SPECS`]. Unknown keys stay
@@ -3778,6 +4093,101 @@ fn is_loopback_endpoint(url: &str) -> bool {
 fn canonical_destination(url: &str) -> Result<String, String> {
     aokie_core::url_classification::parse_base_url(url)
         .map(|parsed| parsed.canonical_origin().to_string())
+}
+
+/// Resolve where caller data effectively leaves the machine. Most loopback
+/// endpoints really are local. The two exact Codex adapters are the narrow
+/// exception: Desktop is a local broker for an OpenAI-hosted processor.
+fn effective_consent_destination(url: &str) -> Result<Option<String>, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Ok(None);
+    }
+    if is_codex_live_call_endpoint(url) {
+        return Ok(Some(CODEX_LIVE_CALL_DESTINATION.to_string()));
+    }
+    if is_loopback_endpoint(url) {
+        return Ok(None);
+    }
+    canonical_destination(url).map(Some)
+}
+
+/// Grants issued by the consent UI store the stable human-readable Codex
+/// destination. Also normalize an exact raw reserved URL to the same value so
+/// an already-open wizard cannot create a spelling-dependent authorization.
+fn normalize_granted_destination(value: &str) -> Result<Option<String>, String> {
+    let value = value.trim();
+    if value == CODEX_LIVE_CALL_DESTINATION || is_codex_live_call_endpoint(value) {
+        return Ok(Some(CODEX_LIVE_CALL_DESTINATION.to_string()));
+    }
+    effective_consent_destination(value)
+}
+
+const CONSENT_DESTINATION_SETTING_KEYS: [&str; 4] = [
+    "aiEndpoint",
+    "sttEndpoint",
+    "ttsEndpoint",
+    "audioTranscriptEndpoint",
+];
+
+/// Validate every effective remote destination in one complete settings bag
+/// against one verified/candidate grant. A missing grant has an empty
+/// destination set; it must never authorize a remote processor merely because
+/// the scope gate will also fail later.
+fn validate_effective_destinations(
+    settings: &Map<String, Value>,
+    grant: Option<&crate::consent::ConsentGrant>,
+) -> Result<(), String> {
+    for key in CONSENT_DESTINATION_SETTING_KEYS {
+        let Some(url) = settings.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(destination) = effective_consent_destination(url)? else {
+            continue;
+        };
+        let granted = grant.is_some_and(|grant| {
+            grant.scopes.destinations.iter().any(|candidate| {
+                normalize_granted_destination(candidate)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(destination.as_str())
+            })
+        });
+        if !granted {
+            return Err(format!(
+                "{key}: {destination} is not a consented destination — re-run the \
+                 FormLogic consent wizard to add it before use"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_effective_destination_block(reason: &str) -> bool {
+    CONSENT_DESTINATION_SETTING_KEYS
+        .iter()
+        .any(|key| reason.starts_with(&format!("{key}:")))
+}
+
+/// Normalize the prospective merged configuration for the two text-only
+/// Codex provider variants. This is intentionally performed inside the
+/// connector, not trusted to either UI: all writers get the same invariant.
+fn normalize_codex_live_call_settings(
+    patch: &mut Map<String, Value>,
+    current: &Map<String, Value>,
+) -> bool {
+    let endpoint = match patch.get("aiEndpoint") {
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
+        Some(_) => None, // null / blank clears the endpoint
+        None => current.get("aiEndpoint").and_then(Value::as_str),
+    };
+    if !endpoint.is_some_and(is_codex_live_call_endpoint) {
+        return false;
+    }
+    patch.insert("aiModel".to_string(), json!(CODEX_LIVE_CALL_MODEL));
+    patch.insert("sendAudio".to_string(), json!(false));
+    true
 }
 
 /// Phase 2 outbound guardrail, pure for tests: is `hour` (local, 0-23)
@@ -4053,6 +4463,11 @@ fn validate_endpoint_setting(key: &str, value: &Value) -> Result<(), CmdError> {
     };
     if raw.is_empty() {
         return Ok(()); // clearing the endpoint is always fine
+    }
+    if key == "audioTranscriptEndpoint" && is_codex_live_call_endpoint(raw) {
+        return Err(CmdError::failed(
+            "audioTranscriptEndpoint rejected: ChatGPT via Codex live-call adapters are text-only",
+        ));
     }
     let parsed =
         parse_base_url(raw).map_err(|e| CmdError::failed(format!("{key} rejected: {e}")))?;
@@ -4331,6 +4746,14 @@ mod tests {
         let mut sink = VecSink::default();
         let (radio, _controls) = crate::radio::RadioHandle::test_handle();
         plugin.radio = Some(radio);
+        // This fixture isolates Companion bootstrap behaviour. Explicit warn
+        // mode keeps its synthetic radio alive without fabricating a consent
+        // grant; enforce-mode live-handle teardown has dedicated tests.
+        plugin
+            .store
+            .config
+            .settings
+            .insert("consentMode".into(), json!("warn"));
 
         // This is the production branch that regressed: a ready radio with no
         // approved mobile roster. It must not attempt an identity-less broker
@@ -4378,6 +4801,11 @@ mod tests {
         let mut sink = VecSink::default();
         let (radio, _controls) = crate::radio::RadioHandle::test_handle();
         plugin.radio = Some(radio);
+        plugin
+            .store
+            .config
+            .settings
+            .insert("consentMode".into(), json!("warn"));
 
         let started = plugin
             .handle_rpc(
@@ -5270,6 +5698,24 @@ mod tests {
                 "{why}: rejected URL must not be stored"
             );
         }
+        let err = plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({
+                    "audioTranscriptEndpoint": format!(
+                        "http://localhost:17872{CODEX_LIVE_CALL_PATH_LOW}?correction=1"
+                    )
+                }),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("text-only"), "{}", err.message);
+        assert!(plugin
+            .store
+            .config
+            .settings
+            .get("audioTranscriptEndpoint")
+            .is_none());
     }
 
     /// Audit INT-003: `plugin.init` feature negotiation flips ack mode, and
@@ -5884,6 +6330,47 @@ mod tests {
     }
 
     #[test]
+    fn reconsent_scope_downgrade_stops_an_already_live_radio() {
+        let _env = consent_env_lock();
+        std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+
+        let (radio, _bluetooth_rx) = crate::radio::RadioHandle::test_handle();
+        plugin.radio = Some(radio);
+        let out = plugin
+            .dispatch_command(
+                "consent.set",
+                &json!({
+                    "version": crate::consent::CURRENT_CONSENT_VERSION,
+                    "scopes": {"bluetooth": false, "transcription": true}
+                }),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(out["radioStarted"], json!(false));
+        assert!(plugin.radio.is_none());
+        assert!(plugin.consent_blocked.is_some());
+
+        let (radio, _transcription_rx) = crate::radio::RadioHandle::test_handle();
+        plugin.radio = Some(radio);
+        let out = plugin
+            .dispatch_command(
+                "consent.set",
+                &json!({
+                    "version": crate::consent::CURRENT_CONSENT_VERSION,
+                    "scopes": {"bluetooth": true, "transcription": false}
+                }),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(out["radioStarted"], json!(false));
+        assert!(plugin.radio.is_none());
+        assert!(plugin.consent_blocked.is_some());
+        std::env::remove_var("AOKIE_STT_DISABLED");
+    }
+
+    #[test]
     fn consent_set_requires_signed_envelope_under_a_signing_desktop() {
         use base64::Engine as _;
         use ed25519_dalek::Signer as _;
@@ -5973,20 +6460,23 @@ mod tests {
         );
 
         // CONSENT-001 destinations: with the signed grant recorded, a remote
-        // endpoint NOT in grant.destinations is refused at settings.set…
-        let err = plugin
+        // endpoint NOT in grant.destinations is persisted only as an inert
+        // configuration. The response names the block and no radio can keep
+        // processing while enforce mode is active.
+        let out = plugin
             .dispatch_command(
                 "settings.set",
                 &json!({"aiEndpoint": "https://rogue.example.net/v1"}),
                 &mut sink,
             )
-            .unwrap_err();
+            .unwrap();
         assert!(
-            err.message.contains("not a consented destination"),
-            "{}",
-            err.message
+            out["blocked"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not a consented destination")),
+            "{out}"
         );
-        // …a consented one is accepted, and loopback needs no destination grant.
+        assert_eq!(out["radioStarted"], json!(false));
         plugin
             .dispatch_command(
                 "settings.set",
@@ -5994,6 +6484,24 @@ mod tests {
                 &mut sink,
             )
             .unwrap();
+
+        let out = plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({
+                    "audioTranscriptEndpoint": "https://unconsented-audio.example.net/v1/chat/completions"
+                }),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(
+            out["blocked"].as_str().is_some_and(|reason| {
+                reason.contains("audioTranscriptEndpoint")
+                    && reason.contains("not a consented destination")
+            }),
+            "{out}"
+        );
+        // A consented one is live-eligible, and loopback needs no destination grant.
         plugin
             .dispatch_command(
                 "settings.set",
@@ -6001,6 +6509,159 @@ mod tests {
                 &mut sink,
             )
             .unwrap();
+        plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({
+                    "audioTranscriptEndpoint": "https://api.example.com/v1/audio-correction"
+                }),
+                &mut sink,
+            )
+            .unwrap();
+
+        // Generic loopback remains local, including near-misses around the
+        // reserved Codex route. Exact means exact: a trailing slash does not
+        // silently widen the effective-destination exception.
+        let near_miss = format!("{CODEX_LIVE_CALL_ENDPOINT_NONE}/");
+        let out = plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({
+                    "aiEndpoint": near_miss,
+                    "aiModel": "local-audio-model",
+                    "sendAudio": true,
+                }),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(out["settings"]["aiModel"], json!("local-audio-model"));
+        assert_eq!(out["settings"]["sendAudio"], json!(true));
+
+        // Every URL spelling that reaches the reserved loopback broker route
+        // is effectively remote. Query/fragment are not part of Axum route
+        // matching and localhost is the same loopback destination, so neither
+        // can bypass the disclosure policy.
+        let equivalent_codex_route = "http://localhost:17872/api/ai/providers/openai%2Dcodex-agent-none/v1/chat/completions?request=1#ignored";
+        let out = plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"aiEndpoint": equivalent_codex_route}),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(
+            out["blocked"].as_str().is_some_and(|reason| {
+                reason.contains(CODEX_LIVE_CALL_DESTINATION)
+                    && reason.contains("not a consented destination")
+            }),
+            "{out}"
+        );
+
+        // The canonical broker spelling is remote too. The old
+        // signed grant did not name it, so enforce mode requires a renewed
+        // Desktop-signed destination grant before the inert setting can run.
+        let out = plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"aiEndpoint": CODEX_LIVE_CALL_ENDPOINT_NONE}),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(
+            out["blocked"].as_str().is_some_and(|reason| {
+                reason.contains(CODEX_LIVE_CALL_DESTINATION)
+                    && reason.contains("not a consented destination")
+            }),
+            "{out}"
+        );
+        // A legacy/warn-mode file cannot bypass that renewal by switching
+        // enforcement (or changing an unrelated setting) after the endpoint
+        // is already present: the complete prospective bag is checked.
+        plugin
+            .store
+            .config
+            .settings
+            .insert("aiEndpoint".into(), json!(CODEX_LIVE_CALL_ENDPOINT_NONE));
+        let out = plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"greeting": "This must not bypass destination consent"}),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(
+            out["blocked"].as_str().is_some_and(|reason| {
+                reason.contains(CODEX_LIVE_CALL_DESTINATION)
+                    && reason.contains("not a consented destination")
+            }),
+            "{out}"
+        );
+
+        // A correctly signed but destination-incomplete grant cannot clear
+        // the inert state. The same check runs at startup/restart, before the
+        // cfg(test) hardware short-circuit.
+        let err = plugin
+            .dispatch_command("consent.set", &json!({"envelope": envelope}), &mut sink)
+            .unwrap_err();
+        assert!(
+            err.message.contains("signed grant does not cover")
+                && err.message.contains(CODEX_LIVE_CALL_DESTINATION),
+            "{}",
+            err.message
+        );
+        plugin.consent_blocked = None;
+        plugin.ensure_radio_started();
+        assert!(
+            plugin
+                .consent_blocked
+                .as_deref()
+                .is_some_and(|reason| reason.contains(CODEX_LIVE_CALL_DESTINATION)),
+            "startup must remain gated by the persisted effective destination"
+        );
+
+        let mut renewed = grant.clone();
+        renewed.accepted_at = "2026-07-13T00:00:00Z".into();
+        renewed
+            .scopes
+            .destinations
+            .push(CODEX_LIVE_CALL_DESTINATION.into());
+        let renewed_payload = serde_json::to_vec(&renewed).unwrap();
+        let renewed_sig = key.sign(&renewed_payload);
+        let renewed_envelope = json!({
+            "format": 1,
+            "alg": "Ed25519",
+            "keyId": "desktop-test",
+            "payloadB64": base64::engine::general_purpose::STANDARD.encode(&renewed_payload),
+            "signature": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(renewed_sig.to_bytes()),
+        });
+        plugin
+            .dispatch_command(
+                "consent.set",
+                &json!({"envelope": renewed_envelope}),
+                &mut sink,
+            )
+            .unwrap();
+
+        // All writers are normalized at the connector boundary: raw model is
+        // fixed and caller audio cannot be attached to either text-only route.
+        let out = plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({
+                    "aiEndpoint": CODEX_LIVE_CALL_ENDPOINT_NONE,
+                    "aiModel": "must-not-pass-through",
+                    "sendAudio": true,
+                }),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(
+            out["settings"]["aiEndpoint"],
+            json!(CODEX_LIVE_CALL_ENDPOINT_NONE)
+        );
+        assert_eq!(out["settings"]["aiModel"], json!(CODEX_LIVE_CALL_MODEL));
+        assert_eq!(out["settings"]["sendAudio"], json!(false));
 
         // Revocation stops enforcement satisfaction immediately (no restart):
         // the next sensitive command denies again.
@@ -6029,6 +6690,199 @@ mod tests {
         assert!(!is_loopback_endpoint("https://api.example.com/v1"));
         assert!(!is_loopback_endpoint("http://192.168.1.10:8080"));
         assert!(!is_loopback_endpoint("http://localhost.evil.com/v1"));
+    }
+
+    #[test]
+    fn every_semantically_equivalent_codex_route_has_the_remote_effective_destination() {
+        for endpoint in [
+            CODEX_LIVE_CALL_ENDPOINT_NONE.to_string(),
+            CODEX_LIVE_CALL_ENDPOINT_LOW.to_string(),
+            format!("http://localhost:17872{CODEX_LIVE_CALL_PATH_NONE}?request=1#ignored"),
+            format!("http://user:pass@127.0.0.1:17872{CODEX_LIVE_CALL_PATH_LOW}"),
+            format!("https://[::1]:17872{CODEX_LIVE_CALL_PATH_NONE}"),
+            format!("http://[::]:17872{CODEX_LIVE_CALL_PATH_LOW}"),
+            format!("http://[::ffff:127.0.0.1]:17872{CODEX_LIVE_CALL_PATH_NONE}"),
+            format!("http://127.0.0.2:17872{CODEX_LIVE_CALL_PATH_LOW}"),
+            format!("http://0.0.0.0:17872{CODEX_LIVE_CALL_PATH_NONE}"),
+            "http://127.0.0.1:17872/api/ai/providers/openai%2Dcodex-agent-none/v1/chat/completions"
+                .to_string(),
+            "http://localhost:17872/api/ai/providers/%6fpenai-codex-agent-low/v1/chat/completions"
+                .to_string(),
+        ] {
+            assert!(is_codex_live_call_endpoint(&endpoint), "{endpoint}");
+            assert_eq!(
+                effective_consent_destination(&endpoint).unwrap().as_deref(),
+                Some(CODEX_LIVE_CALL_DESTINATION)
+            );
+            assert_eq!(
+                normalize_granted_destination(&endpoint).unwrap().as_deref(),
+                Some(CODEX_LIVE_CALL_DESTINATION)
+            );
+        }
+        assert_eq!(
+            normalize_granted_destination(CODEX_LIVE_CALL_DESTINATION)
+                .unwrap()
+                .as_deref(),
+            Some(CODEX_LIVE_CALL_DESTINATION)
+        );
+
+        for near_miss in [
+            format!("{CODEX_LIVE_CALL_ENDPOINT_NONE}/"),
+            CODEX_LIVE_CALL_ENDPOINT_NONE.replace("-none", "-NONE"),
+            CODEX_LIVE_CALL_ENDPOINT_LOW.replace(":17872", ":17873"),
+            "http://127.0.0.1:17872/api/ai/providers/another-provider/v1/chat/completions"
+                .to_string(),
+            "http://127.0.0.1:17872/api/ai/providers/openai-codex%2Fagent-none/v1/chat/completions"
+                .to_string(),
+            "http://127.0.0.1:17872/api/ai/providers/openai-codex%5Cagent-low/v1/chat/completions"
+                .to_string(),
+            "http://127.0.0.1:17872/api/ai/providers/openai%252Dcodex-agent-none/v1/chat/completions"
+                .to_string(),
+        ] {
+            assert!(!is_codex_live_call_endpoint(&near_miss), "{near_miss}");
+            assert_eq!(
+                effective_consent_destination(&near_miss).unwrap(),
+                None,
+                "generic loopback must remain local: {near_miss}"
+            );
+        }
+    }
+
+    #[test]
+    fn prospective_enforce_mode_persists_codex_only_as_blocked_until_consent() {
+        let encoded =
+            "http://localhost:17872/api/ai/providers/openai%2Dcodex-agent-low/v1/chat/completions?live=1";
+        let mut sink = VecSink::default();
+
+        // A route already configured under the explicit developer warn mode
+        // cannot remain live when enforcement is turned on later.
+        let mut plugin = Plugin::ephemeral(false);
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+        plugin
+            .dispatch_command("settings.set", &json!({"aiEndpoint": encoded}), &mut sink)
+            .unwrap();
+        let out = plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"consentMode": "enforce"}),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(out["settings"]["consentMode"], json!("enforce"));
+        assert_eq!(out["settings"]["aiModel"], json!(CODEX_LIVE_CALL_MODEL));
+        assert_eq!(out["settings"]["sendAudio"], json!(false));
+        assert_eq!(out["radioStarted"], json!(false));
+        assert!(out["blocked"].as_str().is_some_and(|reason| {
+            reason.contains(CODEX_LIVE_CALL_DESTINATION)
+                && reason.contains("not a consented destination")
+        }));
+
+        // The inert posture is durable: a fresh process re-evaluates the
+        // persisted effective destination before its test/hardware fast path.
+        let data_dir = plugin.data_dir.clone();
+        drop(plugin);
+        let mut restarted = Plugin::new(false, data_dir).unwrap();
+        restarted.ensure_radio_started();
+        assert!(restarted
+            .consent_blocked
+            .as_deref()
+            .is_some_and(|reason| reason.contains(CODEX_LIVE_CALL_DESTINATION)));
+        assert!(restarted.radio.is_none());
+
+        // The same invariant applies when selection + enforcement arrive in
+        // one atomic settings.set request; evaluation never uses the old mode.
+        let mut simultaneous = Plugin::ephemeral(false);
+        simultaneous
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+        let out = simultaneous
+            .dispatch_command(
+                "settings.set",
+                &json!({
+                    "aiEndpoint": encoded,
+                    "consentMode": "enforce",
+                    "sendAudio": true,
+                }),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(out["settings"]["consentMode"], json!("enforce"));
+        assert_eq!(out["settings"]["sendAudio"], json!(false));
+        assert_eq!(out["radioStarted"], json!(false));
+        assert!(out["blocked"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(CODEX_LIVE_CALL_DESTINATION)));
+    }
+
+    #[test]
+    fn codex_setting_normalization_pins_model_and_disables_audio() {
+        let mut current = Map::new();
+        current.insert("aiEndpoint".into(), json!(CODEX_LIVE_CALL_ENDPOINT_LOW));
+        current.insert("aiModel".into(), json!("old-local-model"));
+        current.insert("sendAudio".into(), json!(true));
+        let mut unrelated_patch = json!({"greeting": "Hello"}).as_object().unwrap().clone();
+        assert!(normalize_codex_live_call_settings(
+            &mut unrelated_patch,
+            &current
+        ));
+        assert_eq!(
+            unrelated_patch.get("aiModel"),
+            Some(&json!(CODEX_LIVE_CALL_MODEL))
+        );
+        assert_eq!(unrelated_patch.get("sendAudio"), Some(&json!(false)));
+
+        let mut local_patch = json!({
+            "aiEndpoint": format!("{CODEX_LIVE_CALL_ENDPOINT_LOW}/"),
+            "aiModel": "local-model",
+            "sendAudio": true,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(!normalize_codex_live_call_settings(
+            &mut local_patch,
+            &current
+        ));
+        assert_eq!(local_patch.get("aiModel"), Some(&json!("local-model")));
+        assert_eq!(local_patch.get("sendAudio"), Some(&json!(true)));
+
+        let mut equivalent_route_patch = json!({
+            "aiEndpoint": format!(
+                "http://localhost:17872{CODEX_LIVE_CALL_PATH_LOW}?request=1#ignored"
+            ),
+            "aiModel": "must-not-pass-through",
+            "sendAudio": true,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(normalize_codex_live_call_settings(
+            &mut equivalent_route_patch,
+            &Map::new()
+        ));
+        assert_eq!(
+            equivalent_route_patch.get("aiModel"),
+            Some(&json!(CODEX_LIVE_CALL_MODEL))
+        );
+        assert_eq!(equivalent_route_patch.get("sendAudio"), Some(&json!(false)));
+
+        assert_eq!(
+            codex_text_only_audio_policy(true, true, true, false),
+            (false, false),
+            "neither reply audio nor fallback correction audio may reach Codex"
+        );
+        assert_eq!(
+            codex_text_only_audio_policy(true, true, true, true),
+            (false, true),
+            "a separately addressed audio correction service remains valid"
+        );
+        assert_eq!(
+            codex_text_only_audio_policy(false, true, true, false),
+            (true, true),
+            "ordinary local audio-capable providers keep legacy behaviour"
+        );
     }
 
     #[test]

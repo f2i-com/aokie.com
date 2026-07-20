@@ -41,6 +41,7 @@
     ttsEndpoint: '',
     sttEndpointMs: 450,
     bargeIn: false,
+    sendAudio: false,
     bargeSensitivity: 650,
     hfpCodec: 'auto',
     transportMode: 'dongle',
@@ -81,6 +82,7 @@
           ? src.sttEndpointMs
           : d.sttEndpointMs,
       bargeIn: boolSetting(src.bargeIn, d.bargeIn),
+      sendAudio: boolSetting(src.sendAudio, d.sendAudio),
       bargeSensitivity:
         typeof src.bargeSensitivity === 'number' && isFinite(src.bargeSensitivity)
           ? src.bargeSensitivity
@@ -118,6 +120,61 @@
   /** The desktop AI gateway's FIXED loopback base (lock-step with the
    *  console's receptionistPayload.ts AI_GATEWAY_BASE). */
   var AI_GATEWAY_BASE = 'http://127.0.0.1:17872/api/ai/providers/';
+  var CODEX_PROVIDER_NONE = 'openai-codex-agent-none';
+  var CODEX_PROVIDER_LOW = 'openai-codex-agent-low';
+  var CODEX_MODEL = 'gpt-5.5';
+
+  /** Reserved live-call variants. Only their exact provider paths receive
+   *  this policy; ordinary providers behind the same gateway stay ordinary. */
+  function codexVariant(providerId) {
+    if (providerId === CODEX_PROVIDER_NONE) return 'Reasoning off (fastest)';
+    if (providerId === CODEX_PROVIDER_LOW) return 'Low reasoning';
+    return null;
+  }
+
+  function codexVariantForSource(source) {
+    var src = String(source || '');
+    return src.indexOf('provider:') === 0 ? codexVariant(src.slice(9)) : null;
+  }
+
+  function isCodexLiveCallEndpoint(url) {
+    try {
+      var parsed = new URL(String(url || '').trim());
+      var host = parsed.hostname.toLowerCase();
+      var ipHost = host[0] === '[' && host[host.length - 1] === ']' ? host.slice(1, -1) : host;
+      var segments = parsed.pathname.split('/');
+      if (
+        segments.length !== 8 ||
+        segments[0] !== '' ||
+        segments[1] !== 'api' ||
+        segments[2] !== 'ai' ||
+        segments[3] !== 'providers' ||
+        segments[5] !== 'v1' ||
+        segments[6] !== 'chat' ||
+        segments[7] !== 'completions' ||
+        /%(?:2f|5c|00)/i.test(segments[4])
+      ) {
+        return false;
+      }
+      var providerId = decodeURIComponent(segments[4]);
+      var loopback =
+        host === 'localhost' ||
+        ipHost === '::1' ||
+        ipHost === '::' ||
+        /^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(ipHost) ||
+        ipHost === '::ffff:0:0' ||
+        /^127(?:\.[0-9]{1,3}){3}$/.test(host) ||
+        host === '0.0.0.0';
+      return (
+        loopback &&
+        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+        parsed.port === '17872' &&
+        (providerId === CODEX_PROVIDER_NONE || providerId === CODEX_PROVIDER_LOW)
+      );
+    } catch (e) {
+      return false;
+    }
+  }
 
   /** Compose one lane's saved endpoint URL from a source pick (same rule as
    *  the console's laneUrl; providerOk = the LLM lane only). */
@@ -346,7 +403,13 @@
         if (p.kind !== 'provider') continue;
         var caps = p.capabilities || [];
         if (caps.length > 0 && caps.indexOf(cap) === -1) continue; // [] = all (legacy)
-        opts.push({ value: p.id, label: 'Provider: ' + p.name });
+        var variant = codexVariantForSource(p.id);
+        opts.push({
+          value: p.id,
+          // Never surface the connected account identity here. These two
+          // reserved adapters have stable product + reasoning labels only.
+          label: variant ? 'Provider: ChatGPT via Codex — ' + variant : 'Provider: ' + p.name,
+        });
       }
     }
     opts.push({ value: 'custom', label: 'Custom URL…' });
@@ -474,6 +537,15 @@
     current.aiEndpoint = composeLaneUrl(laneSel.llm, settings.aiEndpoint, 'llm', sources);
     current.sttEndpoint = composeLaneUrl(laneSel.stt, settings.sttEndpoint, 'stt', sources);
     current.ttsEndpoint = composeLaneUrl(laneSel.tts, settings.ttsEndpoint, 'tts', sources);
+    if (isCodexLiveCallEndpoint(current.aiEndpoint)) {
+      // The reserved Codex adapters are text-only and pin the raw upstream
+      // model. Mirror the connector-side invariant so the saved patch and
+      // the visible form are immediately truthful.
+      current.aiModel = CODEX_MODEL;
+      current.sendAudio = false;
+      settings.aiModel = CODEX_MODEL;
+      settings.sendAudio = false;
+    }
     var patch = settingsPatch(baseline, current);
     if (Object.keys(patch).length === 0) {
       HOST.toast('success', 'No changes to save');
@@ -781,6 +853,9 @@
       hint(
         'Composed from the selected service now; if the FormLogic receptionist app is connected, its per-call settings take precedence.'
       ) +
+      hint(
+        'ChatGPT via Codex choices send transcript text to OpenAI under the signed destination consent. Before first use, open Consent and allow OpenAI ChatGPT via Codex. They are text-only: the model is pinned to gpt-5.5 and caller-audio attachment is disabled.'
+      ) +
       '</div>' +
       // ---- Conversation tuning ---------------------------------------------
       '<div>' +
@@ -967,6 +1042,12 @@
       laneSel[lane] = t.value;
       var row = root && root.querySelector('#lane-custom-' + lane);
       if (row) row.hidden = laneSel[lane] !== 'custom';
+      if (lane === 'llm' && codexVariantForSource(laneSel.llm)) {
+        settings.aiModel = CODEX_MODEL;
+        settings.sendAudio = false;
+        var modelInput = root && root.querySelector('[data-key="aiModel"]');
+        if (modelInput) modelInput.value = CODEX_MODEL;
+      }
       return;
     }
     if (t.id === 'set-engine' && e.type === 'change') {
