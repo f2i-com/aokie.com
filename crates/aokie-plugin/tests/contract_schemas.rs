@@ -171,6 +171,7 @@ fn mock_lifecycle_events_validate_against_desktop_event_schema() {
         assert_eq!(event["source"], json!("aokie"));
         seen += 1;
     }
-    // 8 scripted + sms.sent + phone.pairing_started
-    assert_eq!(seen, 10);
+    // 9 scripted (including transcript.settled) + sms.sent +
+    // phone.pairing_started.
+    assert_eq!(seen, 11);
 }

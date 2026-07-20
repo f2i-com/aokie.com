@@ -23,6 +23,7 @@
     "aokie.call.turn.partial",
     "aokie.call.turn.final",
     "aokie.call.turn.corrected",
+    "aokie.call.transcript.settled",
     "aokie.call.ended",
     "aokie.call.assistance.requested",
     "aokie.call.assistance.resolved",

@@ -185,7 +185,13 @@ pub enum RadioControl {
     ConnectedName {
         reply: std::sync::mpsc::Sender<Option<String>>,
     },
-    Shutdown,
+    /// Graceful stop. The optional completion is sent only after terminal
+    /// transcript settlements have been durably outboxed/emitted, so the
+    /// plugin process can acknowledge shutdown without losing background
+    /// after-call work that was waiting on a detached correction.
+    Shutdown {
+        completion: Option<Sender<()>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1075,6 +1081,147 @@ fn agent_hangup_verdict(
     }
 }
 
+/// Detached audio-transcript corrections deliberately yield to the live reply
+/// lane. Keep `call.ended` immediate for lifecycle consumers, then emit one
+/// separate terminal transcript event after every correction for that call has
+/// reported back. A hard deadline prevents a failed/panicked model worker from
+/// suppressing after-call automation forever.
+const TRANSCRIPT_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+
+#[derive(Debug, Clone)]
+struct PendingTranscriptSettlement {
+    data: serde_json::Value,
+    deadline: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ReadyTranscriptSettlement {
+    call_id: String,
+    data: serde_json::Value,
+    correction_timed_out: bool,
+}
+
+#[derive(Debug, Default)]
+struct TranscriptSettleTracker {
+    corrections_in_flight: std::collections::HashMap<String, usize>,
+    ended: std::collections::HashMap<String, PendingTranscriptSettlement>,
+}
+
+impl TranscriptSettleTracker {
+    #[cfg(any(feature = "voice", test))]
+    fn correction_started(&mut self, call_id: &str) {
+        *self
+            .corrections_in_flight
+            .entry(call_id.to_string())
+            .or_default() += 1;
+    }
+
+    #[cfg(any(feature = "voice", test))]
+    fn correction_finished(&mut self, call_id: &str) {
+        let Some(count) = self.corrections_in_flight.get_mut(call_id) else {
+            // A late completion after the bounded timeout is still allowed to
+            // emit its corrected-turn event, but cannot mint a second settled
+            // event for the same call.
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.corrections_in_flight.remove(call_id);
+        }
+    }
+
+    fn call_ended(&mut self, call_id: &str, data: serde_json::Value, now: std::time::Instant) {
+        self.ended
+            .entry(call_id.to_string())
+            .or_insert(PendingTranscriptSettlement {
+                data,
+                deadline: now + TRANSCRIPT_SETTLE_TIMEOUT,
+            });
+    }
+
+    fn ready(&self, now: std::time::Instant) -> Vec<ReadyTranscriptSettlement> {
+        self.ended
+            .iter()
+            .filter_map(|(call_id, pending)| {
+                let correction_pending = self
+                    .corrections_in_flight
+                    .get(call_id)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0;
+                if !correction_pending {
+                    Some(ReadyTranscriptSettlement {
+                        call_id: call_id.clone(),
+                        data: pending.data.clone(),
+                        correction_timed_out: false,
+                    })
+                } else if now >= pending.deadline {
+                    Some(ReadyTranscriptSettlement {
+                        call_id: call_id.clone(),
+                        data: pending.data.clone(),
+                        correction_timed_out: true,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn all_ended_as_timed_out(&self) -> Vec<ReadyTranscriptSettlement> {
+        self.ended
+            .iter()
+            .map(|(call_id, pending)| ReadyTranscriptSettlement {
+                call_id: call_id.clone(),
+                data: pending.data.clone(),
+                correction_timed_out: true,
+            })
+            .collect()
+    }
+
+    fn mark_settled(&mut self, call_id: &str) {
+        self.ended.remove(call_id);
+        self.corrections_in_flight.remove(call_id);
+    }
+
+    #[cfg(test)]
+    fn take_ready(&mut self, now: std::time::Instant) -> Vec<ReadyTranscriptSettlement> {
+        let ready = self.ready(now);
+        for settlement in &ready {
+            self.mark_settled(&settlement.call_id);
+        }
+        ready
+    }
+}
+
+#[cfg(feature = "voice")]
+struct TranscriptCorrectionResult {
+    call_id: String,
+    turn: u32,
+    stt: String,
+    result: Result<String, String>,
+}
+
+// The radio loop is deliberately single-threaded. Keep its bounded settlement
+// ledger thread-local so lifecycle helpers (including device-loss paths) share
+// one ledger without exposing it through RadioStatus or crossing an authority
+// boundary. Detached model workers report completion over `heard_rx`; they
+// never touch this state directly.
+std::thread_local! {
+    static TRANSCRIPT_SETTLEMENTS: std::cell::RefCell<TranscriptSettleTracker> =
+        std::cell::RefCell::new(TranscriptSettleTracker::default());
+}
+
+#[cfg(feature = "voice")]
+fn transcript_correction_started(call_id: &str) {
+    TRANSCRIPT_SETTLEMENTS.with(|tracker| tracker.borrow_mut().correction_started(call_id));
+}
+
+#[cfg(feature = "voice")]
+fn transcript_correction_finished(call_id: &str) {
+    TRANSCRIPT_SETTLEMENTS.with(|tracker| tracker.borrow_mut().correction_finished(call_id));
+}
+
 /// Live radio status, shared (via `Arc`) between the radio thread (writer)
 /// and the main RPC thread (reader) so `phone.status` / `dongle.diagnostics`
 /// answer without round-tripping the radio thread.
@@ -1635,6 +1782,21 @@ impl RadioHandle {
             .map_err(|_| "the radio thread is not running".to_string())
     }
 
+    /// Stop the radio only after its terminal transcript barrier has been
+    /// flushed. The bound is longer than the radio's slowest normal control
+    /// round-trip, but still prevents a wedged driver from hanging the plugin
+    /// RPC thread forever.
+    pub fn shutdown_and_wait(&self) -> Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send(RadioControl::Shutdown {
+            completion: Some(tx),
+        })?;
+        rx.recv_timeout(std::time::Duration::from_secs(15))
+            .map_err(|_| {
+                "the radio did not complete graceful shutdown within 15 seconds".to_string()
+            })
+    }
+
     pub fn is_initialized(&self) -> bool {
         self.status.initialized.load(Ordering::Relaxed)
     }
@@ -2102,6 +2264,21 @@ fn parked_end_intent(
     }
 }
 
+fn manager_number_classification(outbound: bool, caller_id: Option<&str>) -> bool {
+    // Classification only. This bit lets ordinary post-call automation avoid
+    // treating the owner's line as a new customer/booking; it is never proof
+    // of identity and must never grant manager actions. Those still require
+    // the separate per-call PIN challenge and its exact authorization state.
+    manager_classification_flag(
+        outbound,
+        crate::screen::ScreenPolicy::from_env().is_manager(caller_id),
+    )
+}
+
+fn manager_classification_flag(outbound: bool, configured_manager_number: bool) -> bool {
+    !outbound && configured_manager_number
+}
+
 fn emit_call_ended(
     ended: &crate::call_session::EndedCall,
     config_version: u64,
@@ -2116,30 +2293,145 @@ fn emit_call_ended(
     // a duplicate appointment + an active SMS loop + a kickoff text AT THE
     // MANAGER. Env is the same truth the running ScreenPolicy is built from
     // (managerNumbers applies live through apply_screening_env).
-    let manager = false;
+    let manager = manager_number_classification(ended.outbound, ended.caller_id.as_deref());
+    let ended_data = json!({
+        "at": now_iso8601(),
+        "reason": ended.reason,
+        "callId": ended.id,
+        "from": from,
+        "callerPhone": from,
+        "durationSeconds": ended.duration_seconds,
+        "durationMs": ended.duration_ms as u64,
+        "outcome": ended.outcome,
+        // Phase 2 (additive): which way the call went. Outbound
+        // callers' `from` is the DIALED number.
+        "direction": if ended.outbound { "outbound" } else { "inbound" },
+        "manager": manager,
+        "configVersion": config_version,
+    });
     emit(
         outbox,
         sink,
         aokie_event(
             crate::contract::events::CALL_ENDED,
             &ended.id,
-            json!({
-                "at": now_iso8601(),
-                "reason": ended.reason,
-                "callId": ended.id,
-                "from": from,
-                "callerPhone": from,
-                "durationSeconds": ended.duration_seconds,
-                "durationMs": ended.duration_ms as u64,
-                "outcome": ended.outcome,
-                // Phase 2 (additive): which way the call went. Outbound
-                // callers' `from` is the DIALED number.
-                "direction": if ended.outbound { "outbound" } else { "inbound" },
-                "manager": manager,
-                "configVersion": config_version,
-            }),
+            ended_data.clone(),
         ),
     );
+    TRANSCRIPT_SETTLEMENTS.with(|tracker| {
+        tracker
+            .borrow_mut()
+            .call_ended(&ended.id, ended_data, std::time::Instant::now())
+    });
+}
+
+fn emit_ready_transcript_settlements(outbox: OutboxRef<'_>, sink: &mut dyn Sink) -> bool {
+    let ready =
+        TRANSCRIPT_SETTLEMENTS.with(|tracker| tracker.borrow().ready(std::time::Instant::now()));
+    emit_transcript_settlements(ready, outbox, sink)
+}
+
+fn emit_forced_transcript_settlements(outbox: OutboxRef<'_>, sink: &mut dyn Sink) -> bool {
+    let ready = TRANSCRIPT_SETTLEMENTS.with(|tracker| tracker.borrow().all_ended_as_timed_out());
+    emit_transcript_settlements(ready, outbox, sink)
+}
+
+/// Settlement has a stronger success boundary than ordinary best-effort
+/// radio events because graceful shutdown waits on it. Inspect the structured
+/// insert outcome directly: only a fresh insert or a content-identical
+/// duplicate proves the exact barrier is durably replayable. A quarantined
+/// payload or same-key/different-content collision must never masquerade as
+/// success merely because a `dead` row exists under that key.
+fn emit_transcript_settlement_durably(
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+    event: &DesktopEvent,
+) -> bool {
+    let Some((outbox, mode)) = outbox else {
+        let line = crate::rpc::notification_line("event.emit", json!({ "event": event }));
+        return sink.send_line(&line).is_ok();
+    };
+
+    match outbox.insert_pending(event, crate::outbox::TARGET_DESKTOP) {
+        Ok(crate::outbox::InsertOutcome::Inserted | crate::outbox::InsertOutcome::Duplicate) => {
+            // The exact payload is durable now. Delivery may still fail (or
+            // be intentionally held for eventAck), but the normal outbox
+            // replay loop owns it, so settlement can leave the in-memory
+            // tracker and graceful shutdown may acknowledge.
+            if let Err(error) = emit_event(sink, outbox, event, false, mode) {
+                eprintln!(
+                    "[aokie-plugin] transcript settlement {} is durable but delivery is pending: {error}",
+                    event.correlation_id
+                );
+            }
+            true
+        }
+        Ok(crate::outbox::InsertOutcome::PayloadCollision) => {
+            eprintln!(
+                "[aokie-plugin] transcript settlement {} refused: idempotency-key payload collision",
+                event.correlation_id
+            );
+            false
+        }
+        Ok(crate::outbox::InsertOutcome::QuarantinedProtectFailed) => {
+            eprintln!(
+                "[aokie-plugin] transcript settlement {} was quarantined because its payload could not be protected",
+                event.correlation_id
+            );
+            false
+        }
+        Err(error) => {
+            eprintln!(
+                "[aokie-plugin] transcript settlement {} outbox insert failed: {error}",
+                event.correlation_id
+            );
+            false
+        }
+    }
+}
+
+fn emit_transcript_settlements(
+    ready: Vec<ReadyTranscriptSettlement>,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+) -> bool {
+    let mut all_durable = true;
+    for mut settled in ready {
+        if settled.correction_timed_out {
+            eprintln!(
+                "[aokie-plugin] transcript correction settle timed out for {} after {}s",
+                settled.call_id,
+                TRANSCRIPT_SETTLE_TIMEOUT.as_secs()
+            );
+        }
+        if let Some(data) = settled.data.as_object_mut() {
+            data.insert(
+                "transcriptSettledAt".to_string(),
+                json!(aokie_core::events::now_iso8601()),
+            );
+            data.insert(
+                "transcriptCorrectionTimedOut".to_string(),
+                json!(settled.correction_timed_out),
+            );
+        }
+        let event = aokie_core::events::aokie_event(
+            crate::contract::events::CALL_TRANSCRIPT_SETTLED,
+            &settled.call_id,
+            settled.data,
+        );
+        let durable = emit_transcript_settlement_durably(outbox, sink, &event);
+        if durable {
+            TRANSCRIPT_SETTLEMENTS
+                .with(|tracker| tracker.borrow_mut().mark_settled(&settled.call_id));
+        } else {
+            all_durable = false;
+            eprintln!(
+                "[aokie-plugin] transcript settlement for {} was not durably written — retaining it for retry",
+                settled.call_id
+            );
+        }
+    }
+    all_durable
 }
 
 /// AOK-CTRL-001: the authoritative FAILURE record for an accepted call
@@ -2260,6 +2552,153 @@ fn heard_context(history: &[serde_json::Value]) -> String {
         .collect();
     turns.reverse();
     turns.join("\n")
+}
+
+/// Start one detached audio-transcript correction, including for a caller
+/// turn that was flushed by a call boundary. Registration happens on the
+/// radio thread before `call.ended` can settle; the worker only reports its
+/// typed completion back over `heard_tx`.
+#[cfg(feature = "voice")]
+#[allow(clippy::too_many_arguments)]
+fn maybe_spawn_transcript_correction(
+    audio_transcript: bool,
+    call_id: &str,
+    turn: u32,
+    stt: &str,
+    turn_audio: &[i16],
+    prev_heard: Option<&(Vec<i16>, String, Instant)>,
+    history: &[serde_json::Value],
+    setting: &str,
+    heard_client: Option<crate::agent::LlmClient>,
+    transcript_client_cache: &Arc<std::sync::OnceLock<Option<crate::agent::LlmClient>>>,
+    heard_tx: &std::sync::mpsc::Sender<TranscriptCorrectionResult>,
+) -> bool {
+    if !audio_transcript {
+        return false;
+    }
+    let worthwhile = !crate::duplex::is_hesitation(stt) && stt.split_whitespace().count() > 2;
+    if !worthwhile {
+        eprintln!(
+            "[aokie-plugin] audio transcript check skipped [turn {turn}]: hesitation/too short"
+        );
+        return false;
+    }
+    if turn_audio.is_empty() {
+        eprintln!(
+            "[aokie-plugin] audio transcript check skipped [turn {turn}]: no paired audio for this turn"
+        );
+        return false;
+    }
+    let Some(heard_client) = heard_client else {
+        eprintln!(
+            "[aokie-plugin] audio transcript check skipped [turn {turn}]: no connected LLM client yet"
+        );
+        return false;
+    };
+
+    // Split-utterance continuity: a recent previous turn's audio lets the
+    // model hear one sentence across a mid-thought pause; the prompt and
+    // length guard still constrain output to this final STT draft.
+    let (pcm, prev_draft) = match prev_heard {
+        Some((previous_pcm, previous_text, at)) if at.elapsed() < Duration::from_secs(8) => {
+            let mut combined = previous_pcm.clone();
+            append_turn_audio(&mut combined, turn_audio.to_vec());
+            (combined, Some(previous_text.clone()))
+        }
+        _ => (turn_audio.to_vec(), None),
+    };
+    let setting: String = setting
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(160)
+        .collect();
+    let mut correction_context = format!("Setting: {}", setting.trim());
+    let dialogue = heard_context(history);
+    if !dialogue.is_empty() {
+        correction_context.push('\n');
+        correction_context.push_str(&dialogue);
+    }
+
+    let call_id = call_id.to_string();
+    let stt = stt.to_string();
+    let tx = heard_tx.clone();
+    let client_cache = transcript_client_cache.clone();
+    let samples = pcm.len();
+    let includes_previous = prev_draft.is_some();
+    let worker_call_id = call_id.clone();
+    let worker_stt = stt.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("aokie-transcript-{turn}"))
+        .spawn(move || {
+            // Yield the GPU to the live reply first. Corrections update the
+            // transcript in place, so a short delay is preferable to making
+            // the caller wait for an answer.
+            std::thread::sleep(Duration::from_millis(2500));
+            let heard_client = {
+                let override_client = client_cache.get_or_init(|| {
+                    let endpoint =
+                        std::env::var("AOKIE_AUDIO_TRANSCRIPT_ENDPOINT").unwrap_or_default();
+                    let endpoint = endpoint.trim().to_string();
+                    if endpoint.is_empty() {
+                        return None;
+                    }
+                    let model = std::env::var("AOKIE_AUDIO_TRANSCRIPT_MODEL")
+                        .ok()
+                        .map(|model| model.trim().to_string())
+                        .filter(|model| !model.is_empty());
+                    eprintln!(
+                        "[aokie-plugin] transcript corrections → separate endpoint {endpoint}"
+                    );
+                    Some(crate::agent::LlmClient::new(endpoint, model))
+                });
+                match override_client {
+                    Some(client) => client.clone(),
+                    None => match std::env::var("AOKIE_AUDIO_TRANSCRIPT_MODEL") {
+                        Ok(model) if !model.trim().is_empty() => {
+                            heard_client.with_model(model.trim().to_string())
+                        }
+                        _ => heard_client,
+                    },
+                }
+            };
+            let pcm = crate::agent::trim_silence_for_llm(&pcm, 16_000);
+            let wav = crate::agent::LlmClient::wav_base64(&pcm, 16_000);
+            let result = heard_client.transcribe_turn(
+                &wav,
+                &worker_stt,
+                &correction_context,
+                prev_draft.as_deref(),
+            );
+            let _ = tx.send(TranscriptCorrectionResult {
+                call_id: worker_call_id,
+                turn,
+                stt: worker_stt,
+                result,
+            });
+        });
+
+    match spawned {
+        Ok(_) => {
+            transcript_correction_started(&call_id);
+            eprintln!(
+                "[aokie-plugin] audio transcript check spawned [turn {turn}] ({samples} samples{})",
+                if includes_previous {
+                    ", incl. previous-turn audio"
+                } else {
+                    ""
+                }
+            );
+            true
+        }
+        Err(error) => {
+            eprintln!(
+                "[aokie-plugin] transcript correction worker failed to start [turn {turn}]: {error}"
+            );
+            false
+        }
+    }
 }
 
 /// Heuristic self-echo guard for the in-plugin agent: true when `caller` (a fresh
@@ -6476,7 +6915,7 @@ fn run_loop(
         std::env::var_os("AOKIE_AUDIO_TRANSCRIPT").is_some(),
     );
     #[cfg(feature = "voice")]
-    let (heard_tx, heard_rx) = std::sync::mpsc::channel::<(String, u32, String, String)>();
+    let (heard_tx, heard_rx) = std::sync::mpsc::channel::<TranscriptCorrectionResult>();
     // Correction-lane client override (2026-07-17 latency round): an optional
     // separate endpoint for the transcript-correction requests. Built LAZILY
     // inside the first correction's detached thread — LlmClient::new does
@@ -6864,12 +7303,35 @@ fn run_loop(
                     if !p.corr.is_empty() && !p.text.is_empty() {
                         // A turn spoken while the PIN gate is armed IS the
                         // PIN — never let a boundary flush record it.
-                        let recorded = if ctx.manager_gate.awaiting_pin {
+                        let pin_turn = ctx.manager_gate.awaiting_pin;
+                        let recorded = if pin_turn {
                             "[manager PIN redacted]"
                         } else {
                             p.text.as_str()
                         };
                         emit_turn(outbox, sink, &p.corr, ctx.turn_index, "caller", recorded);
+                        if !pin_turn {
+                            let setting = ctx
+                                .call_agent_overlay
+                                .as_ref()
+                                .and_then(|overlay| overlay.persona.as_deref())
+                                .unwrap_or(&agent_persona);
+                            maybe_spawn_transcript_correction(
+                                audio_transcript,
+                                &p.corr,
+                                ctx.turn_index,
+                                &p.text,
+                                &p.audio,
+                                ctx.prev_heard.as_ref(),
+                                &ctx.history,
+                                setting,
+                                agent_client
+                                    .clone()
+                                    .or_else(|| pending_agent_client.lock().unwrap().clone()),
+                                &transcript_client_cache,
+                                &heard_tx,
+                            );
+                        }
                         ctx.turn_index += 1;
                     }
                 }
@@ -8135,31 +8597,47 @@ fn run_loop(
                         "[aokie-plugin] waiting caller {} gave up unserved — recording an honest missed call",
                         leg.call_id
                     );
-                    // ANI alone is never manager authentication. A waiting
-                    // caller who was never served cannot have completed the
-                    // per-call challenge, so the durable event stays ordinary.
-                    let manager = false;
+                    // Classification only: this says the ANI matches the
+                    // configured owner line so customer-facing follow-up can
+                    // stay away. It grants no manager authority; a waiting
+                    // caller never completed the independent PIN challenge.
+                    let manager = manager_number_classification(
+                        false,
+                        if leg.from.is_empty() {
+                            None
+                        } else {
+                            Some(leg.from.as_str())
+                        },
+                    );
+                    let ended_data = json!({
+                        "at": aokie_core::events::now_iso8601(),
+                        "reason": "gave_up_waiting",
+                        "callId": leg.call_id,
+                        "from": leg.from,
+                        "callerPhone": leg.from,
+                        "durationSeconds": 0,
+                        "durationMs": 0,
+                        "outcome": "missed",
+                        "direction": "inbound",
+                        "manager": manager,
+                        "configVersion": status.config_version.load(Ordering::Relaxed),
+                    });
                     emit(
                         outbox,
                         sink,
                         aokie_core::events::aokie_event(
                             crate::contract::events::CALL_ENDED,
                             &leg.call_id,
-                            json!({
-                                "at": aokie_core::events::now_iso8601(),
-                                "reason": "gave_up_waiting",
-                                "callId": leg.call_id,
-                                "from": leg.from,
-                                "callerPhone": leg.from,
-                                "durationSeconds": 0,
-                                "durationMs": 0,
-                                "outcome": "missed",
-                                "direction": "inbound",
-                                "manager": manager,
-                                "configVersion": status.config_version.load(Ordering::Relaxed),
-                            }),
+                            ended_data.clone(),
                         ),
                     );
+                    TRANSCRIPT_SETTLEMENTS.with(|tracker| {
+                        tracker.borrow_mut().call_ended(
+                            &leg.call_id,
+                            ended_data,
+                            std::time::Instant::now(),
+                        )
+                    });
                 }
                 // Entries pushed by a settle pump later in this pass are
                 // appended AFTER this store (same thread) — nothing is lost
@@ -9035,7 +9513,8 @@ fn run_loop(
                 if !p.corr.is_empty() && !p.text.is_empty() {
                     // A turn spoken while the PIN gate was armed IS the PIN —
                     // redact it even on the end-of-call flush.
-                    let recorded = if ctx.manager_gate.awaiting_pin {
+                    let pin_turn = ctx.manager_gate.awaiting_pin;
+                    let recorded = if pin_turn {
                         "[manager PIN redacted]"
                     } else {
                         p.text.as_str()
@@ -9045,6 +9524,28 @@ fn run_loop(
                         content_for_log(recorded)
                     );
                     emit_turn(outbox, sink, &p.corr, ctx.turn_index, "caller", recorded);
+                    if !pin_turn {
+                        let setting = ctx
+                            .call_agent_overlay
+                            .as_ref()
+                            .and_then(|overlay| overlay.persona.as_deref())
+                            .unwrap_or(&agent_persona);
+                        maybe_spawn_transcript_correction(
+                            audio_transcript,
+                            &p.corr,
+                            ctx.turn_index,
+                            &p.text,
+                            &p.audio,
+                            ctx.prev_heard.as_ref(),
+                            &ctx.history,
+                            setting,
+                            agent_client
+                                .clone()
+                                .or_else(|| pending_agent_client.lock().unwrap().clone()),
+                            &transcript_client_cache,
+                            &heard_tx,
+                        );
+                    }
                 }
             }
             voice_call_gen = tracker.generation();
@@ -10428,46 +10929,63 @@ fn run_loop(
             // durable transcript row plus an in-place history patch so
             // follow-up replies read the better text. Corrections for an
             // ended call still emit; only the history patch is current-call.
-            while let Ok((cid, tidx, raw, stt)) = heard_rx.try_recv() {
-                if sanitize_heard(&raw, &stt).is_none() {
-                    // Content-free by design: "agreed" covers unchanged AND
-                    // empty/oversized model output — either way the STT text
-                    // stands and no event is emitted.
-                    eprintln!(
-                        "[aokie-plugin] audio transcript agreed with STT [turn {tidx}] — no correction"
-                    );
-                }
-                if let Some(heard) = sanitize_heard(&raw, &stt) {
-                    eprintln!(
-                        "[aokie-plugin] audio transcript correction [turn {tidx}]: {}",
-                        content_for_log(&heard)
-                    );
-                    emit(
-                        outbox,
-                        sink,
-                        aokie_core::events::aokie_event_with_step(
-                            crate::contract::events::CALL_TURN_CORRECTED,
-                            &cid,
-                            &format!("turn.{tidx}.corrected"),
-                            serde_json::json!({
-                                "callId": cid,
-                                "turn": tidx,
-                                "text": heard,
-                                "sttText": stt,
-                                "at": aokie_core::events::now_iso8601(),
-                            }),
-                        ),
-                    );
-                    if tracker.call_id() == Some(cid.as_str()) {
-                        if let Some(entry) = ctx.history.iter_mut().rev().find(|m| {
-                            m.get("role").and_then(serde_json::Value::as_str) == Some("user")
-                                && m.get("content").and_then(serde_json::Value::as_str)
-                                    == Some(stt.as_str())
-                        }) {
-                            entry["content"] = serde_json::json!(heard);
+            while let Ok(completion) = heard_rx.try_recv() {
+                let TranscriptCorrectionResult {
+                    call_id: cid,
+                    turn: tidx,
+                    stt,
+                    result,
+                } = completion;
+                match result {
+                    Ok(raw) => {
+                        if sanitize_heard(&raw, &stt).is_none() {
+                            // Content-free by design: "agreed" covers unchanged AND
+                            // empty/oversized model output — either way the STT text
+                            // stands and no event is emitted.
+                            eprintln!(
+                                "[aokie-plugin] audio transcript agreed with STT [turn {tidx}] — no correction"
+                            );
+                        }
+                        if let Some(heard) = sanitize_heard(&raw, &stt) {
+                            eprintln!(
+                                "[aokie-plugin] audio transcript correction [turn {tidx}]: {}",
+                                content_for_log(&heard)
+                            );
+                            emit(
+                                outbox,
+                                sink,
+                                aokie_core::events::aokie_event_with_step(
+                                    crate::contract::events::CALL_TURN_CORRECTED,
+                                    &cid,
+                                    &format!("turn.{tidx}.corrected"),
+                                    serde_json::json!({
+                                        "callId": cid,
+                                        "turn": tidx,
+                                        "text": heard,
+                                        "sttText": stt,
+                                        "at": aokie_core::events::now_iso8601(),
+                                    }),
+                                ),
+                            );
+                            if tracker.call_id() == Some(cid.as_str()) {
+                                if let Some(entry) = ctx.history.iter_mut().rev().find(|m| {
+                                    m.get("role").and_then(serde_json::Value::as_str)
+                                        == Some("user")
+                                        && m.get("content").and_then(serde_json::Value::as_str)
+                                            == Some(stt.as_str())
+                                }) {
+                                    entry["content"] = serde_json::json!(heard);
+                                }
+                            }
                         }
                     }
+                    Err(e) => eprintln!("[aokie-plugin] transcript correction failed: {e}"),
                 }
+                // Complete only AFTER a corrected-turn event has been emitted.
+                // The subsequent settled event shares this call's correlation
+                // queue, so Desktop applies the correction first.
+                transcript_correction_finished(&cid);
+                emit_ready_transcript_settlements(outbox, sink);
             }
             // Flush the open turn once its hold expired AND the caller isn't
             // mid-utterance (fresh speech extends the merge window naturally).
@@ -10705,160 +11223,30 @@ fn run_loop(
                             let _ = sink.send_line(&line);
                         }
                     }
-                    // audioTranscript: ask the audio model (DETACHED - the
-                    // reply never waits on this) to correct this turn's STT
-                    // from its audio. The manager PIN gate broke out of
-                    // 'turn_done above, so a PIN utterance structurally
-                    // cannot reach this request. Best-effort: no connected
-                    // client / no captured audio = silent no-op.
-                    // Hesitations and 1-2 word turns are SKIPPED outright:
-                    // there is nothing worth correcting, and near-silent
-                    // audio invites the model to hallucinate a "transcript"
-                    // out of the conversation context instead (live call
-                    // de1834ef: two 'Uh' turns came back as full sentences
-                    // copied from earlier turns).
-                    let heard_worthwhile =
-                        !crate::duplex::is_hesitation(&text) && text.split_whitespace().count() > 2;
-                    if audio_transcript && !heard_worthwhile {
-                        eprintln!(
-                            "[aokie-plugin] audio transcript check skipped [turn {}]: hesitation/too short",
-                                ctx.turn_index
-                        );
-                    }
-                    if audio_transcript && heard_worthwhile {
-                        let heard_client = agent_client
+                    // audioTranscript is detached: the live reply never waits
+                    // for it. The shared helper also covers turns flushed by
+                    // call termination, keeping settlement registration and
+                    // PIN exclusion identical on every path.
+                    let setting = ctx
+                        .call_agent_overlay
+                        .as_ref()
+                        .and_then(|overlay| overlay.persona.as_deref())
+                        .unwrap_or(&agent_persona);
+                    maybe_spawn_transcript_correction(
+                        audio_transcript,
+                        &corr,
+                        ctx.turn_index,
+                        &text,
+                        &ctx.last_turn_audio,
+                        ctx.prev_heard.as_ref(),
+                        &ctx.history,
+                        setting,
+                        agent_client
                             .clone()
-                            .or_else(|| pending_agent_client.lock().unwrap().clone());
-                        // Every skip logs its reason — a silent lane is
-                        // indistinguishable from a broken one (live call
-                        // be56c70c: zero corrections and no way to tell why).
-                        if ctx.last_turn_audio.is_empty() {
-                            eprintln!(
-                                "[aokie-plugin] audio transcript check skipped [turn {}]: no paired audio for this turn",
-                                ctx.turn_index
-                            );
-                        } else if heard_client.is_none() {
-                            eprintln!(
-                                "[aokie-plugin] audio transcript check skipped [turn {}]: no connected LLM client yet",
-                                ctx.turn_index
-                            );
-                        }
-                        if let (Some(hc), false) = (heard_client, ctx.last_turn_audio.is_empty()) {
-                            // Split-utterance continuity (user idea; live
-                            // turns 16/17: a mid-thought pause split one
-                            // sentence into two turns and each fragment
-                            // corrected blind): when the caller's PREVIOUS
-                            // turn ended moments ago, prepend its audio so
-                            // the model hears the sentence continuously —
-                            // the prompt + length guard hold the output to
-                            // the final utterance only.
-                            let (pcm, prev_draft) = match ctx.prev_heard.as_ref() {
-                                Some((ppcm, ptext, at))
-                                    if at.elapsed() < Duration::from_secs(8) =>
-                                {
-                                    let mut combined = ppcm.clone();
-                                    append_turn_audio(&mut combined, ctx.last_turn_audio.clone());
-                                    (combined, Some(ptext.clone()))
-                                }
-                                _ => (ctx.last_turn_audio.clone(), None),
-                            };
-                            let cid = corr.clone();
-                            let stt = text.clone();
-                            // Dialogue context disambiguates unclear audio
-                            // ("ointments" → "appointments"); this turn is
-                            // not yet in history, so this is the PRIOR
-                            // turns. The Setting line names the domain even
-                            // on turn 1, when no dialogue exists yet.
-                            let heard_ctx = {
-                                let setting: String = ctx
-                                    .call_agent_overlay
-                                    .as_ref()
-                                    .and_then(|o| o.persona.as_deref())
-                                    .unwrap_or(&agent_persona)
-                                    .split('.')
-                                    .next()
-                                    .unwrap_or("")
-                                    .chars()
-                                    .take(160)
-                                    .collect();
-                                let mut c = format!("Setting: {}", setting.trim());
-                                let h = heard_context(&ctx.history);
-                                if !h.is_empty() {
-                                    c.push('\n');
-                                    c.push_str(&h);
-                                }
-                                c
-                            };
-                            let tidx = ctx.turn_index;
-                            let tx = heard_tx.clone();
-                            eprintln!(
-                                "[aokie-plugin] audio transcript check spawned [turn {tidx}] ({} samples{})",
-                                pcm.len(),
-                                if prev_draft.is_some() { ", incl. previous-turn audio" } else { "" }
-                            );
-                            let tcache = transcript_client_cache.clone();
-                            std::thread::spawn(move || {
-                                // Yield the GPU to the reply first: the reply
-                                // request is submitted moments after this
-                                // spawn, and on a single-slot llama-server an
-                                // immediately-submitted correction QUEUES
-                                // AHEAD of it and delays the caller's answer.
-                                // Corrections update the transcript in place —
-                                // a few seconds later is fine.
-                                std::thread::sleep(Duration::from_millis(2500));
-                                // Optional separate endpoint / lighter model
-                                // for corrections (audioTranscriptEndpoint /
-                                // audioTranscriptModel settings).
-                                let hc = {
-                                    let override_client = tcache.get_or_init(|| {
-                                        let ep = std::env::var("AOKIE_AUDIO_TRANSCRIPT_ENDPOINT")
-                                            .unwrap_or_default();
-                                        let ep = ep.trim().to_string();
-                                        if ep.is_empty() {
-                                            return None;
-                                        }
-                                        let model =
-                                            std::env::var("AOKIE_AUDIO_TRANSCRIPT_MODEL")
-                                                .ok()
-                                                .map(|m| m.trim().to_string())
-                                                .filter(|m| !m.is_empty());
-                                        eprintln!(
-                                            "[aokie-plugin] transcript corrections → separate endpoint {ep}"
-                                        );
-                                        Some(crate::agent::LlmClient::new(ep, model))
-                                    });
-                                    match override_client {
-                                        Some(c) => c.clone(),
-                                        None => match std::env::var("AOKIE_AUDIO_TRANSCRIPT_MODEL")
-                                        {
-                                            Ok(m) if !m.trim().is_empty() => {
-                                                hc.with_model(m.trim().to_string())
-                                            }
-                                            _ => hc,
-                                        },
-                                    }
-                                };
-                                // Trim silence so the WAV (and the audio
-                                // tokens the model prefetches) covers speech
-                                // only — smaller request, faster correction.
-                                let pcm = crate::agent::trim_silence_for_llm(&pcm, 16_000);
-                                let b64 = crate::agent::LlmClient::wav_base64(&pcm, 16_000);
-                                match hc.transcribe_turn(
-                                    &b64,
-                                    &stt,
-                                    &heard_ctx,
-                                    prev_draft.as_deref(),
-                                ) {
-                                    Ok(raw) => {
-                                        let _ = tx.send((cid, tidx, raw, stt));
-                                    }
-                                    Err(e) => eprintln!(
-                                        "[aokie-plugin] transcript correction failed: {e}"
-                                    ),
-                                }
-                            });
-                        }
-                    }
+                            .or_else(|| pending_agent_client.lock().unwrap().clone()),
+                        &transcript_client_cache,
+                        &heard_tx,
+                    );
                     // Every caller turn with audio becomes the next turn's
                     // continuity context (hesitations included — their audio
                     // is real), tracked AFTER the spawn read the previous one.
@@ -14313,13 +14701,43 @@ fn run_loop(
                 Ok(RadioControl::ConnectedName { reply }) => {
                     let _ = reply.send(bt.connected_name());
                 }
-                Ok(RadioControl::Shutdown) => return,
+                Ok(RadioControl::Shutdown { completion }) => {
+                    // `call.ended` may already be visible while one of its
+                    // detached transcript corrections is still pending. A
+                    // graceful stop must not strand the one-shot barrier that
+                    // owns summary/after-call automation. Mark every such
+                    // call timed out, synchronously outbox/emit it, and only
+                    // then let the main plugin acknowledge shutdown.
+                    if emit_forced_transcript_settlements(outbox, sink) {
+                        if let Some(completion) = completion {
+                            let _ = completion.send(());
+                        }
+                        return;
+                    }
+                    // Keep both the settlement and the shutdown waiter alive
+                    // and retry on the next pass. The caller times out rather
+                    // than receiving a false graceful-shutdown acknowledgement
+                    // if durable storage stays unavailable.
+                    pending_controls.push_front(RadioControl::Shutdown { completion });
+                    break;
+                }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => {
+                    // All handles disappeared (host/process teardown without
+                    // an explicit shutdown request). Best-effort synchronous
+                    // drain while stdout/outbox are still alive.
+                    if emit_forced_transcript_settlements(outbox, sink) {
+                        return;
+                    }
+                    break;
+                }
             }
             idle = false;
         }
 
+        // Corrections normally settle from `heard_rx`; this poll is the hard
+        // deadline path for a worker that never reports back.
+        emit_ready_transcript_settlements(outbox, sink);
         status.loop_phase.store(loop_phase::TAIL, Ordering::Relaxed);
         if idle {
             std::thread::sleep(Duration::from_millis(15));
@@ -14992,6 +15410,190 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manager_terminal_flag_is_number_classification_not_outbound_authority() {
+        assert!(manager_classification_flag(false, true));
+        assert!(!manager_classification_flag(false, false));
+        assert!(!manager_classification_flag(true, true));
+    }
+
+    #[test]
+    fn transcript_settlement_waits_for_every_correction() {
+        let t0 = std::time::Instant::now();
+        let mut tracker = TranscriptSettleTracker::default();
+        tracker.correction_started("call_a");
+        tracker.correction_started("call_a");
+        tracker.call_ended("call_a", json!({"callId": "call_a"}), t0);
+
+        assert!(tracker.take_ready(t0).is_empty());
+        tracker.correction_finished("call_a");
+        assert!(tracker.take_ready(t0).is_empty());
+        tracker.correction_finished("call_a");
+
+        let ready = tracker.take_ready(t0);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].call_id, "call_a");
+        assert!(!ready[0].correction_timed_out);
+        assert!(tracker.take_ready(t0).is_empty(), "settlement is one-shot");
+    }
+
+    #[test]
+    fn transcript_settlement_is_immediate_without_corrections_and_bounded_when_stuck() {
+        let t0 = std::time::Instant::now();
+        let mut tracker = TranscriptSettleTracker::default();
+        tracker.call_ended("call_none", json!({"callId": "call_none"}), t0);
+        let ready = tracker.take_ready(t0);
+        assert_eq!(ready.len(), 1);
+        assert!(!ready[0].correction_timed_out);
+
+        tracker.correction_started("call_stuck");
+        tracker.call_ended("call_stuck", json!({"callId": "call_stuck"}), t0);
+        assert!(tracker
+            .take_ready(t0 + TRANSCRIPT_SETTLE_TIMEOUT - std::time::Duration::from_millis(1))
+            .is_empty());
+        let timed_out = tracker.take_ready(t0 + TRANSCRIPT_SETTLE_TIMEOUT);
+        assert_eq!(timed_out.len(), 1);
+        assert!(timed_out[0].correction_timed_out);
+
+        // A worker can still return and emit its corrected-turn event later,
+        // but it cannot produce a second settlement.
+        tracker.correction_finished("call_stuck");
+        assert!(tracker
+            .take_ready(t0 + TRANSCRIPT_SETTLE_TIMEOUT)
+            .is_empty());
+    }
+
+    #[test]
+    fn transcript_shutdown_drain_emits_one_timed_out_barrier() {
+        use crate::event_bridge::VecSink;
+
+        TRANSCRIPT_SETTLEMENTS.with(|tracker| {
+            let mut tracker = tracker.borrow_mut();
+            *tracker = TranscriptSettleTracker::default();
+            tracker.correction_started("call_shutdown");
+            tracker.call_ended(
+                "call_shutdown",
+                json!({"callId": "call_shutdown", "outcome": "completed"}),
+                std::time::Instant::now(),
+            );
+        });
+
+        let mut sink = VecSink {
+            fail: true,
+            ..Default::default()
+        };
+        assert!(!emit_forced_transcript_settlements(None, &mut sink));
+        assert!(sink.lines.is_empty(), "failed write emitted nothing");
+
+        // A failed durable/write attempt retains the exact settlement; a
+        // later graceful-shutdown pass can complete it before acknowledging.
+        sink.fail = false;
+        assert!(emit_forced_transcript_settlements(None, &mut sink));
+        assert_eq!(sink.lines.len(), 1);
+        let event: serde_json::Value = serde_json::from_str(&sink.lines[0]).unwrap();
+        assert_eq!(
+            event["params"]["event"]["name"],
+            json!(crate::contract::events::CALL_TRANSCRIPT_SETTLED)
+        );
+        assert_eq!(
+            event["params"]["event"]["data"]["transcriptCorrectionTimedOut"],
+            json!(true)
+        );
+
+        assert!(emit_forced_transcript_settlements(None, &mut sink));
+        assert_eq!(sink.lines.len(), 1, "shutdown drain is one-shot");
+    }
+
+    #[test]
+    fn transcript_settlement_outbox_quarantine_is_not_durable_success() {
+        use crate::event_bridge::{EmitMode, VecSink};
+        use crate::outbox::{OutboxStatus, PayloadProtection};
+
+        let outbox = Outbox::open_in_memory_with_protection(PayloadProtection::Unavailable)
+            .expect("in-memory outbox");
+        let event = aokie_core::events::aokie_event(
+            crate::contract::events::CALL_TRANSCRIPT_SETTLED,
+            "call_quarantined",
+            json!({"callId": "call_quarantined"}),
+        );
+        let mut sink = VecSink::default();
+
+        assert!(!emit_transcript_settlement_durably(
+            Some((&outbox, EmitMode::Legacy)),
+            &mut sink,
+            &event,
+        ));
+        assert!(sink.lines.is_empty(), "a quarantined payload must not emit");
+        assert_eq!(
+            outbox.status_of(&event.idempotency_key).unwrap(),
+            Some(OutboxStatus::Dead)
+        );
+    }
+
+    #[test]
+    fn transcript_settlement_outbox_payload_collision_is_not_durable_success() {
+        use crate::event_bridge::{EmitMode, VecSink};
+        use crate::outbox::{InsertOutcome, TARGET_DESKTOP};
+
+        let outbox = Outbox::open_in_memory().expect("in-memory outbox");
+        let first = aokie_core::events::aokie_event(
+            crate::contract::events::CALL_TRANSCRIPT_SETTLED,
+            "call_collision",
+            json!({"callId": "call_collision", "revision": 1}),
+        );
+        assert_eq!(
+            outbox.insert_pending(&first, TARGET_DESKTOP).unwrap(),
+            InsertOutcome::Inserted
+        );
+        let conflicting = aokie_core::events::aokie_event(
+            crate::contract::events::CALL_TRANSCRIPT_SETTLED,
+            "call_collision",
+            json!({"callId": "call_collision", "revision": 2}),
+        );
+        assert_eq!(first.idempotency_key, conflicting.idempotency_key);
+        let mut sink = VecSink::default();
+
+        assert!(!emit_transcript_settlement_durably(
+            Some((&outbox, EmitMode::Legacy)),
+            &mut sink,
+            &conflicting,
+        ));
+        assert!(
+            sink.lines.is_empty(),
+            "the conflicting payload must not emit"
+        );
+        assert_eq!(outbox.collision_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn transcript_settlement_is_durable_when_delivery_fails_after_insert() {
+        use crate::event_bridge::{EmitMode, VecSink};
+        use crate::outbox::OutboxStatus;
+
+        let outbox = Outbox::open_in_memory().expect("in-memory outbox");
+        let event = aokie_core::events::aokie_event(
+            crate::contract::events::CALL_TRANSCRIPT_SETTLED,
+            "call_delivery_pending",
+            json!({"callId": "call_delivery_pending"}),
+        );
+        let mut sink = VecSink {
+            fail: true,
+            ..Default::default()
+        };
+
+        assert!(emit_transcript_settlement_durably(
+            Some((&outbox, EmitMode::AckExpected)),
+            &mut sink,
+            &event,
+        ));
+        assert!(sink.lines.is_empty());
+        assert_eq!(
+            outbox.status_of(&event.idempotency_key).unwrap(),
+            Some(OutboxStatus::Failed),
+            "the durable row remains owned by outbox replay"
+        );
+    }
 
     #[cfg(target_os = "windows")]
     struct CompanionEndCallerFixture {
@@ -16855,6 +17457,9 @@ mod tests {
 
         sink.lines.clear();
         apply!(E::CallTerminated);
+        // Production emits the transcript barrier at the loop tail, after
+        // any generation-change boundary turn has been flushed.
+        emit_ready_transcript_settlements(None, &mut sink);
         assert!(status.current_call_id.lock().unwrap().is_none());
         assert!(status.call_started_at.lock().unwrap().is_none());
         assert!(status.current_caller.lock().unwrap().is_none());
@@ -16870,6 +17475,16 @@ mod tests {
         assert_eq!(v["params"]["event"]["data"]["callId"], json!(call_id));
         assert_eq!(v["params"]["event"]["data"]["outcome"], json!("completed"));
         assert_eq!(v["params"]["event"]["data"]["from"], json!("+61400000001"));
+        let settled: serde_json::Value = serde_json::from_str(&sink.lines[1]).unwrap();
+        assert_eq!(
+            settled["params"]["event"]["name"],
+            json!(crate::contract::events::CALL_TRANSCRIPT_SETTLED)
+        );
+        assert_eq!(settled["params"]["event"]["data"]["callId"], json!(call_id));
+        assert_eq!(
+            settled["params"]["event"]["data"]["transcriptCorrectionTimedOut"],
+            json!(false)
+        );
 
         // The next call gets a FRESH id and a FRESH generation.
         apply!(E::CallIncoming);
