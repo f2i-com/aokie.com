@@ -23,13 +23,13 @@ const COMMAND_DEPTH: usize = 32;
 const EVENT_DEPTH: usize = 64;
 const MAX_BINARY_BYTES: usize = 96_000; // two seconds of PCM16 at 24 kHz
 const MAX_TEXT_BYTES: usize = 64 * 1024;
-const MAX_INPUT_CHUNK_SAMPLES: usize = 2_400; // 100 ms
-                                              // Realtime providers commonly generate a complete spoken response much faster
-                                              // than it can be played over SCO. Four seconds was too small even for a normal
-                                              // greeting and turned a healthy provider burst into a terminal call failure.
-                                              // Thirty seconds still bounds the reservoir to about 0.96 MiB at 16 kHz while
-                                              // comfortably covering the configured short-response default. The physical
-                                              // SCO queue remains independently paced to OUTPUT_LEAD_MS.
+const INPUT_BATCH_SAMPLES: usize = 960; // 40 ms at the 24 kHz wire rate
+                                        // Realtime providers commonly generate a complete spoken response much faster
+                                        // than it can be played over SCO. Four seconds was too small even for a normal
+                                        // greeting and turned a healthy provider burst into a terminal call failure.
+                                        // Thirty seconds still bounds the reservoir to about 0.96 MiB at 16 kHz while
+                                        // comfortably covering the configured short-response default. The physical
+                                        // SCO queue remains independently paced to OUTPUT_LEAD_MS.
 const MAX_OUTPUT_BUFFER_MS: u64 = 30_000;
 pub const OUTPUT_LEAD_MS: u64 = 80;
 
@@ -63,6 +63,10 @@ pub struct SessionConfig {
     /// Desktop may expose only its fixed, read-only business lookup tool when
     /// this trusted plugin capability bit is present.
     pub allow_business_lookup: bool,
+    /// Desktop may expose its fixed appointment-request capture tool. The
+    /// plugin validates the current call/transcript and emits only the
+    /// dedicated durable event; this never grants generic record writes.
+    pub allow_request_appointment: bool,
     /// The physical call-ending tool is advertised only when the operator has
     /// enabled agentHangup for this receptionist.
     pub allow_finish_call: bool,
@@ -139,6 +143,7 @@ enum ControlCommand {
         name: String,
         ok: bool,
         output: Value,
+        continue_response: bool,
     },
     Stop {
         reason: String,
@@ -165,6 +170,7 @@ struct StartEvent<'a> {
     output_format: &'static str,
     sample_rate: u32,
     allow_business_lookup: bool,
+    allow_request_appointment: bool,
     allow_finish_call: bool,
 }
 
@@ -179,6 +185,7 @@ struct ToolResultEvent<'a> {
     name: &'a str,
     ok: bool,
     output: &'a Value,
+    continue_response: bool,
 }
 
 #[derive(Serialize)]
@@ -294,6 +301,7 @@ pub struct RealtimeVoiceSession {
     control_tx: Sender<ControlCommand>,
     event_rx: Receiver<RealtimeEvent>,
     input_resampler: StreamingResampler,
+    input_batch: VecDeque<i16>,
 }
 
 impl RealtimeVoiceSession {
@@ -351,6 +359,7 @@ impl RealtimeVoiceSession {
             control_tx,
             event_rx,
             input_resampler: StreamingResampler::new(WIRE_SAMPLE_RATE, WIRE_SAMPLE_RATE),
+            input_batch: VecDeque::new(),
         })
     }
 
@@ -362,9 +371,9 @@ impl RealtimeVoiceSession {
         self.generation
     }
 
-    /// Resample one SCO chunk to 24 kHz and enqueue bounded raw PCM16LE.
-    /// Queue pressure is a hard failure: silently dropping caller audio would
-    /// let the model answer a different utterance than the caller made.
+    /// Resample SCO to 24 kHz and coalesce tiny hardware packets into ordered
+    /// 40 ms PCM16LE commands. Queue pressure remains a hard failure: silently
+    /// dropping caller audio would let the model answer a different utterance.
     pub fn send_input(&mut self, samples: &[i16], sample_rate: u32) -> Result<(), String> {
         if sample_rate == 0 || samples.is_empty() {
             return Ok(());
@@ -372,10 +381,11 @@ impl RealtimeVoiceSession {
         if self.input_resampler.from_rate() != sample_rate {
             self.input_resampler = StreamingResampler::new(sample_rate, WIRE_SAMPLE_RATE);
         }
-        let converted = self.input_resampler.process(samples);
-        for chunk in converted.chunks(MAX_INPUT_CHUNK_SAMPLES) {
-            let mut bytes = Vec::with_capacity(chunk.len() * 2);
-            for sample in chunk {
+        self.input_batch
+            .extend(self.input_resampler.process(samples));
+        while self.input_batch.len() >= INPUT_BATCH_SAMPLES {
+            let mut bytes = Vec::with_capacity(INPUT_BATCH_SAMPLES * 2);
+            for sample in self.input_batch.iter().take(INPUT_BATCH_SAMPLES) {
                 bytes.extend_from_slice(&sample.to_le_bytes());
             }
             self.audio_tx
@@ -389,6 +399,7 @@ impl RealtimeVoiceSession {
                         "Desktop realtime input stream is closed".to_string()
                     }
                 })?;
+            self.input_batch.drain(..INPUT_BATCH_SAMPLES);
         }
         Ok(())
     }
@@ -411,6 +422,7 @@ impl RealtimeVoiceSession {
         name: &str,
         ok: bool,
         output: Value,
+        continue_response: bool,
     ) -> Result<(), String> {
         if tool_call_id.is_empty()
             || tool_call_id.len() > 256
@@ -432,6 +444,7 @@ impl RealtimeVoiceSession {
                 name: name.to_string(),
                 ok,
                 output,
+                continue_response,
             })
             .map_err(|_| "Desktop realtime control queue is unavailable".to_string())
     }
@@ -499,6 +512,7 @@ async fn run_socket(
         output_format: "pcm16",
         sample_rate: WIRE_SAMPLE_RATE,
         allow_business_lookup: config.allow_business_lookup,
+        allow_request_appointment: config.allow_request_appointment,
         allow_finish_call: config.allow_finish_call,
     };
     sink.send(Message::Text(
@@ -552,7 +566,13 @@ async fn run_socket(
                             // a future response.
                             output_state.abandon_exact(&item_id)?;
                         }
-                        Ok(ControlCommand::ToolResult { tool_call_id, name, ok, output }) => {
+                        Ok(ControlCommand::ToolResult {
+                            tool_call_id,
+                            name,
+                            ok,
+                            output,
+                            continue_response,
+                        }) => {
                             if !begun {
                                 return Err("Desktop realtime tool result arrived before begin".to_string());
                             }
@@ -564,6 +584,7 @@ async fn run_socket(
                                 name: &name,
                                 ok,
                                 output: &output,
+                                continue_response,
                             };
                             sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
                                 .map_err(|e| format!("Desktop realtime tool result failed: {e}"))?;
@@ -878,7 +899,12 @@ fn parse_server_text(
             let name = value
                 .get("name")
                 .and_then(Value::as_str)
-                .filter(|name| matches!(*name, "lookup_business_data" | "finish_call"))
+                .filter(|name| {
+                    matches!(
+                        *name,
+                        "lookup_business_data" | "request_appointment" | "finish_call"
+                    )
+                })
                 .ok_or_else(|| "Desktop realtime requested an unsupported tool".to_string())?
                 .to_string();
             let arguments = value
@@ -1206,6 +1232,56 @@ mod tests {
     }
 
     #[test]
+    fn input_batches_tiny_sco_frames_and_keeps_a_time_sized_queue() {
+        let (audio_tx, audio_rx) = mpsc::sync_channel(COMMAND_DEPTH);
+        let (control_tx, _control_rx) = mpsc::channel();
+        let (_event_tx, event_rx) = mpsc::sync_channel(EVENT_DEPTH);
+        let mut session = RealtimeVoiceSession {
+            call_id: "call_1".into(),
+            generation: 7,
+            audio_tx,
+            control_tx,
+            event_rx,
+            input_resampler: StreamingResampler::new(WIRE_SAMPLE_RATE, WIRE_SAMPLE_RATE),
+            input_batch: VecDeque::new(),
+        };
+
+        // Five 8 ms frames become one ordered 40 ms wire command rather than
+        // five queue entries. This turns depth 32 from ~240 ms on the live
+        // 7.5 ms SCO cadence into a deterministic 1.28 second reservoir.
+        let mut expected = Vec::new();
+        for value in 0..5i16 {
+            let frame = vec![value; 192];
+            expected.extend_from_slice(&frame);
+            session.send_input(&frame, WIRE_SAMPLE_RATE).unwrap();
+            if value < 4 {
+                assert!(matches!(audio_rx.try_recv(), Err(TryRecvError::Empty)));
+            }
+        }
+        let Command::Audio(bytes) = audio_rx.try_recv().unwrap();
+        let actual: Vec<i16> = bytes
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(session.input_batch.is_empty());
+        assert_eq!(
+            COMMAND_DEPTH * INPUT_BATCH_SAMPLES * 1_000 / WIRE_SAMPLE_RATE as usize,
+            1_280
+        );
+
+        for _ in 0..COMMAND_DEPTH {
+            session
+                .send_input(&vec![0; INPUT_BATCH_SAMPLES], WIRE_SAMPLE_RATE)
+                .unwrap();
+        }
+        assert!(session
+            .send_input(&vec![0; INPUT_BATCH_SAMPLES], WIRE_SAMPLE_RATE)
+            .unwrap_err()
+            .contains("input queue is full"));
+    }
+
+    #[test]
     fn recoverable_error_tombstones_late_output_until_exact_done() {
         let mut state = OutputParseState::default();
         assert!(state.pcm_item().is_err());
@@ -1396,6 +1472,40 @@ mod tests {
 
     #[test]
     fn tool_and_hangup_controls_are_exactly_fenced_and_allow_listed() {
+        let start = serde_json::to_value(StartEvent {
+            kind: "formlogic.realtime.start",
+            call_id: "call_1",
+            generation: 7,
+            destination_origin: "https://api.openai.com",
+            instructions: "Receptionist",
+            greeting: "Hello",
+            voice: None,
+            model: None,
+            turn_detection: "server_vad",
+            max_output_tokens: 128,
+            input_format: "pcm16",
+            output_format: "pcm16",
+            sample_rate: WIRE_SAMPLE_RATE,
+            allow_business_lookup: true,
+            allow_request_appointment: true,
+            allow_finish_call: true,
+        })
+        .unwrap();
+        assert_eq!(start["allowRequestAppointment"], true);
+
+        let interrupted = ToolResultEvent {
+            kind: "formlogic.realtime.tool_result",
+            call_id: "call_1",
+            generation: 7,
+            tool_call_id: "tool_1",
+            name: "lookup_business_data",
+            ok: false,
+            output: &serde_json::json!({ "error": "caller continued speaking" }),
+            continue_response: false,
+        };
+        let interrupted = serde_json::to_value(interrupted).unwrap();
+        assert_eq!(interrupted["continueResponse"], false);
+
         let mut state = OutputParseState::default();
         let tool = parse_server_text(
             r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"tool_1","name":"lookup_business_data","arguments":{"question":"Do I have anything on Tuesday?"}}"#,
@@ -1412,6 +1522,30 @@ mod tests {
                 tool_call_id: "tool_1".into(),
                 name: "lookup_business_data".into(),
                 arguments: serde_json::json!({"question": "Do I have anything on Tuesday?"}),
+            }
+        );
+
+        let appointment = parse_server_text(
+            r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"tool_appointment","name":"request_appointment","arguments":{"callerName":"Lance","service":"Lawn mowing","date":"2026-07-22","time":"10:00","agreementPhrase":"Wednesday at 10."}}"#,
+            "call_1",
+            7,
+            "https://api.openai.com",
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            appointment,
+            RealtimeEventKind::ToolCall {
+                tool_call_id: "tool_appointment".into(),
+                name: "request_appointment".into(),
+                arguments: serde_json::json!({
+                    "callerName": "Lance",
+                    "service": "Lawn mowing",
+                    "date": "2026-07-22",
+                    "time": "10:00",
+                    "agreementPhrase": "Wednesday at 10."
+                }),
             }
         );
 

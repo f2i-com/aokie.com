@@ -814,7 +814,10 @@ impl RemoteMediaHandle {
     /// any later Companion claim and may finish after the lock is released.
     /// Advancing the dedicated epoch makes every other stale Aokie decision
     /// fail closed; it does not alter the externally published call epochs.
-    pub fn linearize_aokie_action(&self, expected: &AokieOwnerFence) -> Result<(), String> {
+    pub fn linearize_aokie_action(
+        &self,
+        expected: &AokieOwnerFence,
+    ) -> Result<AokieOwnerFence, String> {
         let mut state = self
             .inner
             .state
@@ -824,7 +827,9 @@ impl RemoteMediaHandle {
             return Err("the exact Aokie caller-owner fence changed".into());
         }
         state.fence_autonomous_aokie_actions();
-        Ok(())
+        state
+            .aokie_owner_fence()
+            .ok_or_else(|| "Aokie no longer owns the exact caller after linearization".to_string())
     }
 
     /// Run one physical caller-ending action while the remote-owner mutex is
@@ -4148,12 +4153,13 @@ mod tests {
         }
         assert!(handle.with_aokie_owner(&original, || ()).is_ok());
 
-        handle
+        let refreshed = handle
             .linearize_aokie_action(&original)
             .expect("the first exact action wins its linearization point");
         let linearized = handle
             .aokie_owner_fence()
             .expect("linearization keeps Aokie as the current owner");
+        assert_eq!(refreshed, linearized);
         assert_eq!(linearized.call_id, original.call_id);
         assert_eq!(linearized.call_epoch, original.call_epoch);
         assert_eq!(linearized.action_epoch, original.action_epoch + 1);
