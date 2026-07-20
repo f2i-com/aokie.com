@@ -318,6 +318,8 @@ impl LlmClient {
         let mut full = String::new();
         let mut buf = String::new();
         let mut aborted = false;
+        let mut saw_stop = false;
+        let mut saw_done = false;
         // True once ANY chunk was handed to synthesis (gates the eager
         // first-clause flush below to the reply's very first words).
         let mut flushed_any = false;
@@ -354,6 +356,12 @@ impl LlmClient {
                 None => continue,
             };
             if data == "[DONE]" {
+                if !saw_stop {
+                    return Err(
+                        "llm stream ended with [DONE] before finish_reason=stop".to_string()
+                    );
+                }
+                saw_done = true;
                 break;
             }
             let v: serde_json::Value = match serde_json::from_str(data) {
@@ -368,15 +376,40 @@ impl LlmClient {
                     continue;
                 }
             };
-            let delta = v
+            let choice = v
                 .get("choices")
                 .and_then(|c| c.get(0))
-                .and_then(|c| c.get("delta"))
+                .unwrap_or(&serde_json::Value::Null);
+            let event_stop = if let Some(reason) = choice
+                .get("finish_reason")
+                .filter(|reason| !reason.is_null())
+            {
+                let reason = reason
+                    .as_str()
+                    .ok_or_else(|| "llm stream returned a non-text finish_reason".to_string())?;
+                if reason != "stop" {
+                    return Err(format!(
+                        "llm stream ended incompletely (finish_reason={reason})"
+                    ));
+                }
+                if saw_stop {
+                    return Err("llm stream repeated finish_reason=stop".to_string());
+                }
+                saw_stop = true;
+                true
+            } else {
+                false
+            };
+            let delta = choice
+                .get("delta")
                 .and_then(|d| d.get("content"))
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
             if delta.is_empty() {
                 continue;
+            }
+            if saw_stop && !event_stop {
+                return Err("llm stream emitted content after finish_reason=stop".to_string());
             }
             if first_delta_at.is_none() {
                 first_delta_at = Some(std::time::Instant::now());
@@ -420,13 +453,58 @@ impl LlmClient {
                 }
             }
         }
-        // Speak any trailing partial sentence.
-        let rest = buf.trim();
-        if !aborted && !rest.is_empty() {
-            on_sentence(rest);
+        // Cancellation remains a local, successful abandon: the caller hung
+        // up or barged and the owner fence already contains every downstream
+        // side effect. Do not require a remote terminal after intentionally
+        // dropping the stream.
+        if aborted {
+            return Ok(full);
+        }
+        if !saw_stop || !saw_done {
+            return Err("llm stream closed before finish_reason=stop and [DONE]".to_string());
+        }
+
+        // A punctuation-free final phrase is safe only after exact successful
+        // terminal proof. If it contains an unclosed bracket token, quarantine
+        // the whole remainder: full-generation control parsing still receives
+        // `full`, but no partial marker can reach TTS.
+        if let Some(rest) = terminal_speech_remainder(&buf) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                on_sentence(rest);
+            }
         }
         Ok(full)
     }
+}
+
+/// Exclusive byte index of a bracket token beginning at `start`.
+///
+/// Both `[[control]]` and single-bracket compatibility forms such as `[WAIT]`
+/// are quarantined. Returning `None` means the token may still be arriving in
+/// a later SSE delta, so no boundary after its opening bracket is safe yet.
+fn bracket_token_end(s: &str, start: usize) -> Option<usize> {
+    let tail = s.get(start..)?;
+    if let Some(inner) = tail.strip_prefix("[[") {
+        inner.find("]]").map(|end| start + 2 + end + 2)
+    } else if let Some(inner) = tail.strip_prefix('[') {
+        inner.find(']').map(|end| start + 1 + end + 1)
+    } else {
+        None
+    }
+}
+
+/// A terminal trailing phrase is speakable only when every bracket token in it
+/// is complete. Complete control tokens remain intact for the radio layer to
+/// strip/interpret; an incomplete one is quarantined while the full generation
+/// is still returned to that layer for fail-safe control parsing.
+fn terminal_speech_remainder(s: &str) -> Option<&str> {
+    let mut from = 0;
+    while let Some(relative) = s.get(from..)?.find('[') {
+        let start = from + relative;
+        from = bracket_token_end(s, start)?;
+    }
+    Some(s)
 }
 
 /// Byte index of the first sentence-ending punctuation, at least a few chars in
@@ -438,13 +516,20 @@ impl LlmClient {
 /// from splitting a chunk mid-token — "…at 9 A." + "M. Sure…" was synthesized
 /// as "Mesure" — and it refuses to split on a period that is merely the last
 /// character received so far (the next delta may continue the token; the
-/// caller's trailing-flush speaks whatever remains at stream end). `\n` is
-/// always a boundary. The per-chunk speech normalizer can only rewrite
+/// caller's terminal-confirmed trailing flush speaks whatever remains). `\n`
+/// is always a boundary outside bracketed control tokens. The per-chunk speech normalizer can only rewrite
 /// "a.m."/"AM" it can SEE, so chunks must never end mid-abbreviation.
 fn sentence_end(s: &str) -> Option<usize> {
     const MIN: usize = 8;
     let mut it = s.char_indices().peekable();
     while let Some((i, c)) = it.next() {
+        if c == '[' {
+            let end = bracket_token_end(s, i)?;
+            while it.peek().is_some_and(|&(next, _)| next < end) {
+                it.next();
+            }
+            continue;
+        }
         if i < MIN {
             continue;
         }
@@ -469,6 +554,13 @@ fn first_clause_end(s: &str) -> Option<usize> {
     const MIN: usize = 24;
     let mut it = s.char_indices().peekable();
     while let Some((i, c)) = it.next() {
+        if c == '[' {
+            let end = bracket_token_end(s, i)?;
+            while it.peek().is_some_and(|&(next, _)| next < end) {
+                it.next();
+            }
+            continue;
+        }
         if i < MIN {
             continue;
         }
@@ -482,8 +574,110 @@ fn first_clause_end(s: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use std::thread;
+
+    use serde_json::json;
+
     use super::sentence_end;
+    use super::terminal_speech_remainder;
     use super::trim_silence_for_llm;
+    use super::LlmClient;
+
+    fn serve_sse(body: String) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test SSE server");
+        let address = listener.local_addr().expect("test SSE address");
+        let endpoint = format!("http://{address}/v1/chat/completions");
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept test SSE request");
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("set request timeout");
+            let mut request = Vec::new();
+            let mut block = [0u8; 4096];
+            loop {
+                let read = socket.read(&mut block).expect("read test request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&block[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write test SSE response");
+            socket.flush().expect("flush test SSE response");
+        });
+        (endpoint, server)
+    }
+
+    fn content_event(text: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": text },
+                    "finish_reason": null
+                }]
+            })
+        )
+    }
+
+    fn finish_event(reason: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": reason
+                }]
+            })
+        )
+    }
+
+    fn run_sse(body: String) -> (Result<String, String>, Vec<String>) {
+        let (endpoint, server) = serve_sse(body);
+        let client = LlmClient::new(endpoint, Some("test-model".to_string()));
+        let cancel = AtomicBool::new(false);
+        let mut chunks = Vec::new();
+        let result = client.stream_reply(
+            json!([{ "role": "user", "content": "test" }]),
+            &cancel,
+            || {},
+            |chunk| {
+                chunks.push(chunk.to_string());
+                true
+            },
+        );
+        server.join().expect("join test SSE server");
+        (result, chunks)
+    }
 
     /// 1 s of silence + 1 s of tone + 2 s of silence + 1 s of tone + 1 s of
     /// silence: the trim must drop the outer silence (minus pad), cap the
@@ -542,12 +736,20 @@ mod tests {
     /// returns the spoken chunks including the eager first clause and the
     /// trailing flush.
     fn chunks(text: &str, delta: usize) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let pieces: Vec<String> = chars
+            .chunks(delta)
+            .map(|piece| piece.iter().collect())
+            .collect();
+        chunks_from_pieces(pieces.iter().map(String::as_str))
+    }
+
+    fn chunks_from_pieces<'a>(pieces: impl IntoIterator<Item = &'a str>) -> Vec<String> {
         let mut buf = String::new();
         let mut out = Vec::new();
         let mut flushed_any = false;
-        let bytes: Vec<char> = text.chars().collect();
-        for piece in bytes.chunks(delta) {
-            buf.extend(piece);
+        for piece in pieces {
+            buf.push_str(piece);
             while let Some(idx) = sentence_end(&buf) {
                 let done: String = buf.drain(..=idx).collect();
                 let done = done.trim();
@@ -567,9 +769,11 @@ mod tests {
                 }
             }
         }
-        let rest = buf.trim();
-        if !rest.is_empty() {
-            out.push(rest.to_string());
+        if let Some(rest) = terminal_speech_remainder(&buf) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                out.push(rest.to_string());
+            }
         }
         out
     }
@@ -614,6 +818,138 @@ mod tests {
             ),
             vec!["The total for the party comes to 1,250 doubloons exactly."]
         );
+    }
+
+    /// Control-plane markers are opaque to the speech boundary detector. Test
+    /// every possible two-delta split as well as every fixed delta width: a
+    /// comma, colon, semicolon, period, question mark or newline in the marker
+    /// payload must never turn its tail into a separate speakable chunk.
+    #[test]
+    fn control_markers_never_split_or_leak_a_suffix_at_any_delta_alignment() {
+        let markers = [
+            "[[ASSISTANCE: Can we accept late arrivals, including after closing?]]",
+            "[[LOOKUP: Is Aug. 1 free?]]",
+            "[[TRANSFER: owner; requested]]",
+            "[[MANAGER: move booking: Friday, after lunch. Please confirm]]",
+            "[[MANAGER: first line\nsecond line]]",
+            "[[ABUSE]]",
+            "[[WAIT]]",
+            "[END_CALL]",
+        ];
+
+        for marker in markers {
+            let expected = vec![marker.to_string()];
+            let chars: Vec<char> = marker.chars().collect();
+            for split in 0..=chars.len() {
+                let left: String = chars[..split].iter().collect();
+                let right: String = chars[split..].iter().collect();
+                let got = chunks_from_pieces([left.as_str(), right.as_str()]);
+                assert_eq!(got, expected, "marker={marker:?}, split={split}");
+            }
+            for width in 1..=chars.len().max(1) {
+                let got = chunks(marker, width);
+                assert_eq!(got, expected, "marker={marker:?}, width={width}");
+            }
+        }
+
+        let farewell = "Thanks, goodbye. [[END_CALL]]";
+        let expected = vec!["Thanks, goodbye.".to_string(), "[[END_CALL]]".to_string()];
+        let chars: Vec<char> = farewell.chars().collect();
+        for split in 0..=chars.len() {
+            let left: String = chars[..split].iter().collect();
+            let right: String = chars[split..].iter().collect();
+            assert_eq!(
+                chunks_from_pieces([left.as_str(), right.as_str()]),
+                expected,
+                "farewell split={split}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_terminal_marker_is_quarantined_not_flushed() {
+        for incomplete in [
+            "[[ASSISTANCE: Can we accept late arrivals, including",
+            "[[LOOKUP: Is Aug. 1 free?",
+            "Please wait [[TRANSFER: owner requested",
+            "[END_CALL",
+        ] {
+            for width in 1..=incomplete.chars().count().max(1) {
+                assert!(
+                    chunks(incomplete, width).is_empty(),
+                    "incomplete={incomplete:?}, width={width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sse_trailing_phrase_requires_stop_then_done() {
+        let text = "A terminal-confirmed trailing phrase";
+        let body = format!(
+            ": heartbeat\n\n{}{}data: [DONE]\n\n",
+            content_event(text),
+            finish_event("stop")
+        );
+        let (result, chunks) = run_sse(body);
+        assert_eq!(result.unwrap(), text);
+        assert_eq!(chunks, vec![text]);
+
+        let incomplete = [
+            ("clean EOF", content_event(text)),
+            (
+                "stop without DONE",
+                format!("{}{}", content_event(text), finish_event("stop")),
+            ),
+            (
+                "DONE without stop",
+                format!("{}data: [DONE]\n\n", content_event(text)),
+            ),
+            (
+                "length finish",
+                format!(
+                    "{}{}data: [DONE]\n\n",
+                    content_event(text),
+                    finish_event("length")
+                ),
+            ),
+        ];
+        for (case, body) in incomplete {
+            let (result, chunks) = run_sse(body);
+            assert!(result.is_err(), "{case} must not be successful");
+            assert!(
+                chunks.is_empty(),
+                "{case} released an unconfirmed trailing phrase: {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn premature_eof_keeps_only_already_complete_sentences() {
+        let (result, chunks) = run_sse(content_event("First sentence. trailing fragment"));
+        assert!(result.is_err());
+        assert_eq!(chunks, vec!["First sentence."]);
+    }
+
+    #[test]
+    fn callback_cancellation_still_abandons_without_remote_terminal() {
+        let text = "First complete sentence. Second complete sentence.";
+        let (endpoint, server) = serve_sse(content_event(text));
+        let client = LlmClient::new(endpoint, Some("test-model".to_string()));
+        let cancel = AtomicBool::new(false);
+        let mut chunks = Vec::new();
+        let result = client.stream_reply(
+            json!([{ "role": "user", "content": "test" }]),
+            &cancel,
+            || {},
+            |chunk| {
+                chunks.push(chunk.to_string());
+                false
+            },
+        );
+        server.join().expect("join test SSE server");
+        assert_eq!(result.unwrap(), text);
+        assert_eq!(chunks, vec!["First complete sentence."]);
     }
 
     /// The live-call bug: "…9 A.M. …" must never split between "A." and "M."
