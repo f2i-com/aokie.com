@@ -220,7 +220,7 @@
     phone: undefined, phoneError: '',
     diag: undefined, diagError: '',
     phones: undefined, phonesError: '',
-    call: undefined, callKnown: false, callError: '',
+    call: undefined, callKnown: false, callError: '', callPauseReason: '',
     settings: undefined, settingsError: '',
     busyCall: false,
     busyPhones: {}, // address -> true while connect/disconnect runs
@@ -266,10 +266,13 @@
         state.diagError = '';
       },
       function (e) {
-        // Expected while the radio is down: the command rejects with an
+        // Ordinary hardware outages reject with an
         // explanatory message (it still names the outbox counts) — show it.
+        // Consent pauses return a successful structured snapshot. A rejection
+        // is a current diagnostics outage, so discard any old paused snapshot
+        // instead of masking a post-consent hardware failure.
         state.diagError = errMsg(e);
-        if (state.diag === undefined) state.diag = null;
+        state.diag = null;
       }
     ).then(function () {
       renderReadiness();
@@ -298,13 +301,22 @@
     return HOST.command('call.current').then(
       function (data) {
         var call = data && data.call;
+        var radio = data && data.radio;
         state.call = call && call.state !== 'ended' ? call : null;
+        state.callPauseReason =
+          radio && radio.paused && radio.blockedBy === 'consent'
+            ? String(radio.reason || 'Consent must be reviewed before the receptionist can resume.')
+            : '';
         state.callKnown = true;
         state.callError = '';
       },
       function (e) {
         state.callError = errMsg(e);
-        if (state.call === undefined) state.call = null;
+        // Hide stale call controls and an old consent-pause explanation when
+        // the authoritative current-call read fails.
+        state.call = null;
+        state.callKnown = false;
+        state.callPauseReason = '';
       }
     ).then(renderLive);
   }
@@ -489,10 +501,12 @@
         items.push({ icon: ICONS.radio, label: 'Radio & dongle', value: 'Unavailable', note: state.diagError || 'no radio diagnostics', ok: false });
         return;
       }
+      var consentPaused = !!radio.paused && radio.blockedBy === 'consent';
       var voiceErr = radio.voiceSttError || radio.voiceTtsError || '';
       var stale = Number(radio.staleSttResults) || 0;
-      var value = radio.initialized ? 'Ready' : 'Not initialised';
+      var value = consentPaused ? 'Paused for consent' : radio.initialized ? 'Ready' : 'Not initialised';
       var note =
+        (consentPaused ? radio.reason : '') ||
         radio.error ||
         voiceErr ||
         (radio.initialized
@@ -503,7 +517,7 @@
         label: 'Radio & dongle',
         value: value,
         note: note,
-        ok: !!radio.initialized && !radio.error && !voiceErr,
+        ok: !consentPaused && !!radio.initialized && !radio.error && !voiceErr,
       });
     })();
 
@@ -597,6 +611,19 @@
       if (!state.callKnown) {
         title.textContent = 'Live call unavailable';
         setHtml(body, '<p class="rcp-error">' + esc(state.callError || 'call.current failed.') + '</p>');
+        return;
+      }
+      if (state.callPauseReason) {
+        title.textContent = 'Receptionist paused';
+        setHtml(
+          body,
+          '<div class="rcp-empty-call">' +
+            '<span class="rcp-empty-call__icon">' + ICONS.alert + '</span>' +
+            '<h4>Consent review required</h4>' +
+            '<p>' + esc(state.callPauseReason) + '</p>' +
+            '<button type="button" class="rcp-link-btn" data-tabgo="consent">Review consent</button>' +
+            '</div>'
+        );
         return;
       }
       title.textContent = 'No active call';
