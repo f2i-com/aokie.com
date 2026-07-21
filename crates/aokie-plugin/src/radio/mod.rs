@@ -53,12 +53,14 @@ mod manager_gate;
 mod reply_stream;
 mod watchdogs;
 mod realtime_lane;
+mod reply_rounds;
 mod reconcile;
 mod realtime_service;
 mod transcript;
 mod status;
 mod handle;
 mod events_emit;
+mod turn_flush;
 mod turns;
 mod spawn;
 mod http_speech;
@@ -119,6 +121,8 @@ use self::reconcile::*;
 #[allow(unused_imports)]
 use self::realtime_service::*;
 #[allow(unused_imports)]
+use self::reply_rounds::*;
+#[allow(unused_imports)]
 use self::reply_stream::*;
 #[allow(unused_imports)]
 use self::run_loop::*;
@@ -128,6 +132,8 @@ use self::speak::*;
 use self::switchboard::*;
 #[allow(unused_imports)]
 use self::transcript::*;
+#[allow(unused_imports)]
+use self::turn_flush::*;
 #[allow(unused_imports)]
 use self::turns::*;
 #[allow(unused_imports)]
