@@ -133,7 +133,14 @@ enum Command {
 
 #[derive(Debug)]
 enum ControlCommand {
-    Begin,
+    Begin {
+        /// Call-personalized overrides resolved at answer time. The session
+        /// connects at RING with the global config; the personalize-caller
+        /// overlay usually lands between ring and answer, so Begin carries
+        /// the freshest values (None keeps the connect-time ones).
+        instructions: Option<String>,
+        greeting: Option<String>,
+    },
     CancelOutput {
         item_id: String,
         played_ms: u64,
@@ -206,6 +213,10 @@ struct BeginEvent<'a> {
     kind: &'static str,
     call_id: &'a str,
     generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    greeting: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -453,9 +464,16 @@ impl RealtimeVoiceSession {
     /// after the exact call is active, SCO is up, screening has completed,
     /// and Aokie still owns the media fence. Merely opening the WebSocket must
     /// never generate a greeting while the phone is still ringing.
-    pub fn begin(&self) -> Result<(), String> {
+    pub fn begin(
+        &self,
+        instructions: Option<String>,
+        greeting: Option<String>,
+    ) -> Result<(), String> {
         self.control_tx
-            .send(ControlCommand::Begin)
+            .send(ControlCommand::Begin {
+                instructions,
+                greeting,
+            })
             .map_err(|_| "Desktop realtime control queue is unavailable".to_string())
     }
 
@@ -533,7 +551,10 @@ async fn run_socket(
                 // Stop/cancel always preempt queued audio.
                 loop {
                     match control_rx.try_recv() {
-                        Ok(ControlCommand::Begin) => {
+                        Ok(ControlCommand::Begin {
+                            instructions,
+                            greeting,
+                        }) => {
                             if begun {
                                 return Err("Desktop realtime session was begun more than once".to_string());
                             }
@@ -542,6 +563,8 @@ async fn run_socket(
                                 kind: "formlogic.realtime.begin",
                                 call_id: &config.call_id,
                                 generation: config.generation,
+                                instructions: instructions.as_deref(),
+                                greeting: greeting.as_deref(),
                             };
                             sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
                                 .map_err(|e| format!("Desktop realtime begin failed: {e}"))?;

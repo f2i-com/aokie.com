@@ -1044,10 +1044,14 @@ fn realtime_runtime_config() -> Result<Option<RealtimeRuntimeConfig>, String> {
         Ok("server_vad") | Err(_) => crate::realtime_voice::TurnDetection::ServerVad,
         Ok(_) => return Err("realtime turn detection is not supported".into()),
     };
+    // 4096 is a runaway ceiling, not a length target — the persona already
+    // says "be concise" and server VAD lets the caller interrupt. The old 384
+    // default truncated real tool responses mid-generation
+    // (incomplete/max_output_tokens) and stalled live calls into dead air.
     let max_output_tokens = std::env::var("AOKIE_REALTIME_MAX_OUTPUT_TOKENS")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(384);
+        .unwrap_or(4_096);
     if !(64..=4_096).contains(&max_output_tokens) {
         return Err("realtime maximum output tokens must be between 64 and 4096".into());
     }
@@ -1283,8 +1287,35 @@ fn realtime_tool_invalidated_by_caller(
     tool_activity_revision: u64,
     current_activity_revision: u64,
 ) -> bool {
-    matches!(name, "lookup_business_data" | "request_appointment")
-        && tool_activity_revision != current_activity_revision
+    // Only the WRITE tool is voided by fresh caller speech: an appointment
+    // must rest on an agreement the caller has not talked past. Read-only
+    // lookups always run — their data cannot go stale from caller audio, and
+    // discarding them froze the conversation in dead air.
+    name == "request_appointment" && tool_activity_revision != current_activity_revision
+}
+
+/// Whether a caller turn completed during the finish/hangup window means the
+/// caller is RESUMING the conversation (cancel the hangup) rather than simply
+/// being polite over the goodbye ("bye", "thanks", "hi" — proceed). Questions,
+/// longer turns, and continue-words always cancel.
+#[cfg(feature = "voice")]
+fn realtime_caller_turn_resumes_conversation(text: &str) -> bool {
+    let normalized = text.to_lowercase();
+    if normalized.contains('?') {
+        return true;
+    }
+    let words: Vec<&str> = normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words.len() > 4 {
+        return true;
+    }
+    const RESUME_WORDS: [&str; 21] = [
+        "wait", "no", "stop", "hold", "hang", "actually", "but", "question", "more", "another",
+        "also", "need", "want", "can", "could", "sorry", "what", "why", "when", "how", "help",
+    ];
+    words.iter().any(|word| RESUME_WORDS.contains(word))
 }
 
 #[cfg(feature = "voice")]
@@ -1293,16 +1324,13 @@ fn realtime_finish_attempt_allowed(
     exact_call: bool,
     human_reserved: bool,
     exact_owner: bool,
-    requested_activity_revision: u64,
-    current_activity_revision: u64,
     attempts: u8,
 ) -> bool {
-    agent_hangup
-        && exact_call
-        && !human_reserved
-        && exact_owner
-        && requested_activity_revision == current_activity_revision
-        && attempts < 3
+    // Caller-activity revisions deliberately do not gate retries: raw signal
+    // energy bumps the revision on any noise, and a courtesy "bye" must not
+    // strand a verified farewell. Cancellation is owned by the transcript
+    // classifier, which clears pending_hangup for a genuinely resumed turn.
+    agent_hangup && exact_call && !human_reserved && exact_owner && attempts < 3
 }
 
 #[cfg(feature = "voice")]
@@ -1330,7 +1358,12 @@ fn realtime_lookup_tool_output(
 ) -> serde_json::Value {
     let original_digest_chars = digest.chars().count();
     let original_spoken_chars = spoken.map(|line| line.chars().count()).unwrap_or(0);
-    let mut digest_chars = original_digest_chars.min(6_000);
+    // A voice model SPEAKS this result. 6,000 chars of calendar digest made
+    // the live model recite the list until it burned the whole output-token
+    // budget (incomplete/max_output_tokens) and the answer never finished.
+    // Keep the head — DIRECT ANSWER and CALLER OWN BOOKINGS lead the digest —
+    // and let the `truncated` instruction own the honesty about the rest.
+    let mut digest_chars = original_digest_chars.min(1_800);
     let mut spoken_chars = spoken
         .map(|line| line.chars().count())
         .unwrap_or(0)
@@ -1423,7 +1456,6 @@ struct RealtimeCallLane {
 struct PendingRealtimeBusinessLookup {
     tool_call_id: String,
     name: String,
-    activity_revision: u64,
     lookup: PendingBusinessLookup,
 }
 
@@ -1443,15 +1475,20 @@ impl DeferredRealtimeInput {
     const MAX_MS: usize = 15_000;
     const FLUSH_MS: usize = 100;
 
-    fn push(&mut self, samples: &[i16], sample_rate: u32) -> Result<(), String> {
+    fn push(&mut self, samples: &[i16], sample_rate: u32) {
+        // Overflow drops the OLDEST samples instead of failing the session: a
+        // long tool wait must never become a call-ending error. Losing the
+        // head of withheld caller audio only degrades the replay; server VAD
+        // re-segments whatever is flushed.
         let max_samples = (sample_rate as usize)
             .saturating_mul(Self::MAX_MS)
-            .saturating_div(1_000);
-        if self.samples.len().saturating_add(samples.len()) > max_samples {
-            return Err("Caller audio exceeded the bounded Realtime tool-wait buffer".to_string());
-        }
+            .saturating_div(1_000)
+            .max(1);
         self.samples.extend(samples.iter().copied());
-        Ok(())
+        if self.samples.len() > max_samples {
+            let excess = self.samples.len() - max_samples;
+            self.samples.drain(..excess);
+        }
     }
 
     fn take_flush_chunk(&mut self, sample_rate: u32) -> Vec<i16> {
@@ -1474,7 +1511,6 @@ struct PendingRealtimeHangup {
     item_id: String,
     requested_at: Instant,
     ready_at: Option<Instant>,
-    activity_revision: u64,
     attempts: u8,
 }
 
@@ -1528,8 +1564,14 @@ impl RealtimeCallLane {
     }
 
     fn note_caller_activity(&mut self) {
-        self.authorized_finish_tool = None;
-        self.pending_hangup = None;
+        // Deliberately does NOT touch the finish/hangup state: raw signal
+        // energy (echo residue, a breath, a courtesy "bye" over the farewell)
+        // must never strand the line open after a verified goodbye — that
+        // exact class was observed live ("ignored stale or unauthorized
+        // hangup request" after the caller's courtesy turn). A completed
+        // NON-courtesy caller turn cancels the finish flow at the transcript
+        // site instead, and provider speech onset delays the first CHUP so
+        // that turn has time to arrive.
         self.caller_activity_revision = self.caller_activity_revision.saturating_add(1);
     }
 }
@@ -4907,7 +4949,10 @@ fn begin_business_lookup(
         host: Arc::clone(host),
         id: Some(id),
         rx,
-        deadline: Instant::now() + std::time::Duration::from_millis(5000),
+        // Slightly beyond the host's own 6000 ms flow timeout so a slow-but-
+        // successful lookup is not locally abandoned as "timed out" while the
+        // host is still delivering its result.
+        deadline: Instant::now() + std::time::Duration::from_millis(6500),
     })
 }
 
@@ -10874,10 +10919,26 @@ fn run_loop(
                             *status.realtime_destination.lock().unwrap() = Some(destination_origin);
                         }
                         crate::realtime_voice::RealtimeEventKind::SpeechStarted => {
-                            // A caller speaking again always vetoes a pending
-                            // model-requested finish, even if the provider had
-                            // already completed its tool call or farewell.
+                            // Caller speech no longer cancels a pending finish
+                            // outright — its COMPLETED transcript decides
+                            // (courtesy proceeds, a resumed turn cancels).
+                            // Onset only DELAYS the first physical CHUP so
+                            // that transcript has time to arrive.
                             lane.note_caller_activity();
+                            if let Some(pending) = lane.pending_hangup.as_mut() {
+                                if pending.attempts == 0 {
+                                    if let Some(ready_at) = pending.ready_at {
+                                        let ceiling =
+                                            pending.requested_at + Duration::from_secs(8);
+                                        let pushed = (Instant::now()
+                                            + Duration::from_millis(1_500))
+                                        .min(ceiling);
+                                        if pushed > ready_at {
+                                            pending.ready_at = Some(pushed);
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(item_id) =
                                 lane.output_pacer.active_item().map(str::to_string)
                             {
@@ -10972,6 +11033,26 @@ fn run_loop(
                                     .store(ctx.turn_index, Ordering::Relaxed);
                                 lane.latest_caller_turn =
                                     Some((ctx.turn_index, text.trim().to_string()));
+                                // Content-aware finish cancellation: a real
+                                // resumed turn cancels the armed hangup; a
+                                // courtesy "bye"/"thanks"/"hi" over the
+                                // farewell lets it proceed instead of
+                                // stranding the line open.
+                                if lane.authorized_finish_tool.is_some()
+                                    || lane.pending_hangup.is_some()
+                                {
+                                    if realtime_caller_turn_resumes_conversation(text.trim()) {
+                                        lane.authorized_finish_tool = None;
+                                        lane.pending_hangup = None;
+                                        eprintln!(
+                                            "[aokie-plugin] caller resumed the conversation; realtime hangup cancelled"
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[aokie-plugin] caller courtesy during the farewell; realtime hangup continues"
+                                        );
+                                    }
+                                }
                                 ctx.turn_index += 1;
                                 if let Some(timer) = ctx.silence_timer.as_mut() {
                                     timer.note_activity(Instant::now());
@@ -10989,16 +11070,85 @@ fn run_loop(
                                 ));
                                 break;
                             }
-                            if let Err(error) =
-                                lane.output_pacer.start_item(&item_id, Instant::now())
-                            {
-                                realtime_failure = Some((
-                                    lane.call_id.clone(),
-                                    lane.begun,
-                                    lane.owner.clone(),
-                                    error,
-                                ));
-                                break;
+                            if lane.output_pacer.start_item(&item_id, Instant::now()).is_err() {
+                                // The predecessor's TAIL is still playing —
+                                // generation runs ahead of real-time playout,
+                                // and bridge-initiated responses (refusals,
+                                // failure retries) can land while it drains.
+                                // Newer speech SUPERSEDES it: record the
+                                // audible prefix truthfully, drop the unplayed
+                                // tail, and play the new item. Ending the live
+                                // call here (the pre-fix behavior) is never
+                                // the right outcome for a playout overlap.
+                                if let Some(previous) =
+                                    lane.output_pacer.active_item().map(str::to_string)
+                                {
+                                    let heard_ms =
+                                        lane.output_pacer.audible_played_ms(Instant::now());
+                                    let total_ms = lane
+                                        .output_total_samples
+                                        .saturating_mul(1_000)
+                                        / lane.sco_rate.max(1) as u64;
+                                    let transcript = lane
+                                        .completed_transcript
+                                        .take()
+                                        .or_else(|| lane.output_transcript.take())
+                                        .filter(|(transcript_item, _)| {
+                                            transcript_item == &previous
+                                        });
+                                    if let Some((_, text)) = transcript {
+                                        let (audible, _) = estimate_audible_prefix(
+                                            text.trim(),
+                                            1.0,
+                                            &CutEstimate {
+                                                audible_ms: heard_ms,
+                                                queued_ms: heard_ms.saturating_add(
+                                                    crate::realtime_voice::OUTPUT_LEAD_MS,
+                                                ),
+                                                synthesized_ms: (total_ms > 0)
+                                                    .then_some(total_ms),
+                                            },
+                                        );
+                                        if !audible.is_empty() {
+                                            emit_turn_with_delivery(
+                                                outbox,
+                                                sink,
+                                                &lane.call_id,
+                                                ctx.turn_index,
+                                                "bot",
+                                                &audible,
+                                                Some("interrupted"),
+                                                None,
+                                            );
+                                            ctx.history.push(serde_json::json!({
+                                                "role": "assistant",
+                                                "content": audible,
+                                            }));
+                                            ctx.turn_index += 1;
+                                        }
+                                    }
+                                    eprintln!(
+                                        "[aokie-plugin] realtime output item {item_id} superseded the still-playing {previous}; its unplayed tail was dropped"
+                                    );
+                                }
+                                bt.flush_tx_audio();
+                                lane.output_pacer.clear();
+                                lane.output_resampler =
+                                    crate::realtime_voice::StreamingResampler::new(
+                                        crate::realtime_voice::WIRE_SAMPLE_RATE,
+                                        lane.sco_rate,
+                                    );
+                                if let Err(error) =
+                                    lane.output_pacer.start_item(&item_id, Instant::now())
+                                {
+                                    realtime_failure = Some((
+                                        lane.call_id.clone(),
+                                        lane.begun,
+                                        lane.owner.clone(),
+                                        error,
+                                    ));
+                                    break;
+                                }
                             }
                             lane.output_transcript = None;
                             lane.completed_transcript = None;
@@ -11157,12 +11307,11 @@ fn run_loop(
                             response_id,
                             item_id,
                         } => {
-                            let authorized_activity_revision = lane
+                            let authorized = lane
                                 .authorized_finish_tool
                                 .as_ref()
-                                .filter(|(authorized, _)| authorized == &tool_call_id)
-                                .map(|(_, activity_revision)| *activity_revision);
-                            if authorized_activity_revision.is_some()
+                                .is_some_and(|(authorized, _)| authorized == &tool_call_id);
+                            if authorized
                                 && lane.pending_hangup.is_none()
                                 && lane.begun
                                 && tracker.current().is_some_and(|call| {
@@ -11177,8 +11326,6 @@ fn run_loop(
                                     item_id,
                                     requested_at: Instant::now(),
                                     ready_at: None,
-                                    activity_revision: authorized_activity_revision
-                                        .expect("checked finish authorization"),
                                     attempts: 0,
                                 });
                             } else {
@@ -11315,7 +11462,29 @@ fn run_loop(
                         } else if can_begin && bt.get_sample_rate() > 0 {
                             if let Some(owner) = aokie_owner_for_call(&remote_media, &lane.call_id)
                             {
-                                match lane.session.begin() {
+                                // The session connected at RING with the
+                                // global persona/greeting; the personalize-
+                                // caller overlay ("Hi Lance!") usually lands
+                                // between ring and answer. Begin carries the
+                                // freshest call-scoped values so the spoken
+                                // greeting is the personalized one.
+                                let begin_instructions = ctx
+                                    .call_agent_overlay
+                                    .as_ref()
+                                    .filter(|overlay| overlay.call_id == lane.call_id)
+                                    .and_then(|overlay| overlay.persona.as_deref())
+                                    .map(|persona| {
+                                        realtime_safe_instructions(persona, agent_hangup)
+                                    });
+                                let begin_greeting = ctx
+                                    .call_agent_overlay
+                                    .as_ref()
+                                    .filter(|overlay| overlay.call_id == lane.call_id)
+                                    .and_then(|overlay| overlay.greeting.as_deref())
+                                    .map(str::trim)
+                                    .filter(|text| !text.is_empty())
+                                    .map(str::to_string);
+                                match lane.session.begin(begin_instructions, begin_greeting) {
                                     Ok(()) => {
                                         let sr = bt.get_sample_rate() as u32;
                                         lane.reset_sco_rate(sr);
@@ -11414,9 +11583,13 @@ fn run_loop(
             }
 
             // Execute at most one provider-requested tool after any spoken
-            // preamble has drained. The provider supplies only the natural
-            // language question; caller identity, call id, manager status,
-            // and media authority always come from trusted plugin state.
+            // preamble has drained. The pacer plays exactly ONE output item at
+            // a time (OutputPacer::start_item hard-fails on overlap), so a
+            // tool continuation delivered while a preamble still plays would
+            // end the call — the gate below is what serializes them. The
+            // provider supplies only the natural language question; caller
+            // identity, call id, manager status, and media authority always
+            // come from trusted plugin state.
             if realtime_failure.is_none() {
                 if let Some(lane) = realtime_lane
                     .as_mut()
@@ -11436,27 +11609,18 @@ fn run_loop(
                                 .pending_business_lookup
                                 .take()
                                 .expect("polled realtime lookup remains current");
-                            let activity_unchanged =
-                                pending.activity_revision == lane.caller_activity_revision;
-                            let available =
-                                activity_unchanged && !digest.starts_with("LOOKUP UNAVAILABLE");
+                            // A lookup is read-only: caller speech never voids
+                            // its data. Deliver the digest with a continuation;
+                            // if a caller-triggered response is already active
+                            // the bridge resolves the collision and the model
+                            // reads the result on its next turn.
+                            let available = !digest.starts_with("LOOKUP UNAVAILABLE");
                             completion = Some((
                                 pending.tool_call_id,
                                 pending.name,
                                 available,
-                                if activity_unchanged {
-                                    realtime_lookup_tool_output(
-                                        available,
-                                        &digest,
-                                        spoken.as_deref(),
-                                    )
-                                } else {
-                                    serde_json::json!({
-                                        "available": false,
-                                        "error": "The caller continued speaking while the lookup was running; answer their latest turn instead."
-                                    })
-                                },
-                                activity_unchanged,
+                                realtime_lookup_tool_output(available, &digest, spoken.as_deref()),
+                                true,
                             ));
                         }
                     } else if let Some((tool_call_id, name, arguments, activity_revision)) =
@@ -11524,7 +11688,6 @@ fn run_loop(
                                         Some(PendingRealtimeBusinessLookup {
                                             tool_call_id,
                                             name,
-                                            activity_revision,
                                             lookup,
                                         });
                                 } else {
@@ -11819,8 +11982,6 @@ fn run_loop(
                             exact_call,
                             human_reserved,
                             exact_owner,
-                            pending.activity_revision,
-                            lane.caller_activity_revision,
                             pending.attempts,
                         ) {
                             let expected = lane
@@ -12985,24 +13146,21 @@ fn run_loop(
                                         // cancels every bounded CHUP retry.
                                         lane.note_caller_activity();
                                     }
-                                    let tool_result_outstanding = lane.pending_tool_call.is_some()
-                                        || lane.pending_business_lookup.is_some();
-                                    let input_result = if tool_result_outstanding {
-                                        // Server VAD automatically creates a
-                                        // response when speech stops. Keep PCM
-                                        // local until the function output has
-                                        // cleared Desktop's pending-tool fence,
-                                        // otherwise a second response can race
-                                        // and close the call as ambiguous.
-                                        lane.deferred_input.push(&cleaned, rate)
-                                    } else if !lane.deferred_input.is_empty() {
+                                    // Caller PCM flows LIVE even while a tool
+                                    // result is outstanding: the Desktop
+                                    // bridge tolerates a VAD-created response
+                                    // during a pending tool, so the caller is
+                                    // never met with a frozen, deaf line while
+                                    // a lookup runs. The deferred buffer only
+                                    // drains a residue left by an earlier
+                                    // withholding build.
+                                    let input_result = if !lane.deferred_input.is_empty() {
                                         // Preserve old-before-new ordering and
                                         // coalesce the catch-up into one bounded
                                         // 100 ms command per incoming SCO frame.
-                                        lane.deferred_input.push(&cleaned, rate).and_then(|()| {
-                                            let chunk = lane.deferred_input.take_flush_chunk(rate);
-                                            lane.session.send_input(&chunk, rate)
-                                        })
+                                        lane.deferred_input.push(&cleaned, rate);
+                                        let chunk = lane.deferred_input.take_flush_chunk(rate);
+                                        lane.session.send_input(&chunk, rate)
                                     } else {
                                         lane.session.send_input(&cleaned, rate)
                                     };
@@ -18146,7 +18304,7 @@ mod tests {
         for frame in 0..133i16 {
             let samples = vec![frame; 120];
             expected.extend_from_slice(&samples);
-            deferred.push(&samples, RATE).unwrap();
+            deferred.push(&samples, RATE);
         }
 
         // Release old audio before new audio and coalesce the tiny 7.5 ms SCO
@@ -18154,7 +18312,7 @@ mod tests {
         // up therefore uses ten commands, not 133 entries in a depth-32 queue.
         let newest = vec![i16::MAX; 120];
         expected.extend_from_slice(&newest);
-        deferred.push(&newest, RATE).unwrap();
+        deferred.push(&newest, RATE);
         let mut actual = Vec::new();
         let mut commands = 0;
         while !deferred.is_empty() {
@@ -18166,9 +18324,16 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(commands, 11);
 
+        // Overflow keeps the NEWEST audio and never fails the session: a long
+        // tool wait drops the oldest deferred samples instead of killing the
+        // call (the pre-fix behavior returned a session-fatal Err here).
         let mut bounded = DeferredRealtimeInput::default();
-        bounded.push(&vec![0; RATE as usize * 15], RATE).unwrap();
-        assert!(bounded.push(&[0], RATE).is_err());
+        bounded.push(&vec![0; RATE as usize * 15], RATE);
+        bounded.push(&[7; 4], RATE);
+        let max_samples = RATE as usize * 15;
+        assert_eq!(bounded.samples.len(), max_samples);
+        let tail: Vec<i16> = bounded.samples.iter().rev().take(4).copied().collect();
+        assert_eq!(tail, vec![7; 4]);
     }
 
     #[cfg(feature = "voice")]
@@ -18184,7 +18349,9 @@ mod tests {
             4,
             5
         ));
-        assert!(realtime_tool_invalidated_by_caller(
+        // Read-only lookups are never voided by caller speech — discarding
+        // them left the caller in dead air while the data was already fetched.
+        assert!(!realtime_tool_invalidated_by_caller(
             "lookup_business_data",
             4,
             5
@@ -18195,18 +18362,41 @@ mod tests {
         assert!(!realtime_finish_call_allowed(true, false, 4, 4));
         assert!(!realtime_finish_call_allowed(true, true, 4, 5));
 
-        assert!(realtime_finish_attempt_allowed(
-            true, true, false, true, 4, 4, 0,
-        ));
-        assert!(!realtime_finish_attempt_allowed(
-            true, true, false, true, 4, 5, 0,
-        ));
-        assert!(!realtime_finish_attempt_allowed(
-            true, true, false, true, 4, 4, 3,
-        ));
-        assert!(!realtime_finish_attempt_allowed(
-            true, true, true, true, 4, 4, 0,
-        ));
+        assert!(realtime_finish_attempt_allowed(true, true, false, true, 0));
+        assert!(!realtime_finish_attempt_allowed(true, true, false, true, 3));
+        assert!(!realtime_finish_attempt_allowed(true, true, true, true, 0));
+        assert!(!realtime_finish_attempt_allowed(false, true, false, true, 0));
+
+        // Courtesy over the farewell proceeds; a resumed turn cancels.
+        for courtesy in [
+            "Hi.",
+            "Bye",
+            "Goodbye!",
+            "Thank you so much",
+            "thanks",
+            "Take care",
+            "you too",
+            "Um",
+        ] {
+            assert!(
+                !realtime_caller_turn_resumes_conversation(courtesy),
+                "courtesy must not cancel the hangup: {courtesy}"
+            );
+        }
+        for resumed in [
+            "Wait",
+            "No, hang on",
+            "Actually one more thing",
+            "Can you also book Monday",
+            "What time was that?",
+            "Hold on a second please",
+            "Sorry, quick question",
+        ] {
+            assert!(
+                realtime_caller_turn_resumes_conversation(resumed),
+                "a resumed turn must cancel the hangup: {resumed}"
+            );
+        }
 
         let oversized = format!("{}{}", "\"é".repeat(8_000), "👋".repeat(8_000));
         let output = realtime_lookup_tool_output(true, &oversized, Some(&oversized));

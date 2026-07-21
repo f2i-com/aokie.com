@@ -47,27 +47,135 @@ fn normalized_speech(value: &str) -> String {
         .to_lowercase()
 }
 
-fn normalized_quote(value: &str) -> String {
-    normalized_speech(value)
-        .replace('‘', "'")
-        .replace('’', "'")
-        .trim_end_matches(|character: char| matches!(character, '.' | '!' | '?'))
-        .trim()
-        .to_string()
+/// Canonical token form for cross-transcriber comparison. The provider quotes
+/// what its own audio model heard while the trusted transcript comes from a
+/// separate transcription model, so formatting routinely diverges ("10 a.m."
+/// vs "10am" vs "ten AM"). Punctuation becomes token boundaries, digit+am/pm
+/// fusions split, spelled a.m./p.m./o'clock unify, and the number words
+/// one..twelve map to digits.
+fn canonical_agreement(value: &str) -> String {
+    let lowered: String = value
+        .to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let mut tokens: Vec<String> = Vec::new();
+    for raw in lowered.split_whitespace() {
+        let fused = raw
+            .strip_suffix("am")
+            .map(|digits| (digits, "am"))
+            .or_else(|| raw.strip_suffix("pm").map(|digits| (digits, "pm")))
+            .filter(|(digits, _)| {
+                !digits.is_empty() && digits.chars().all(|character| character.is_ascii_digit())
+            });
+        if let Some((digits, suffix)) = fused {
+            tokens.push(digits.to_string());
+            tokens.push(suffix.to_string());
+        } else {
+            tokens.push(raw.to_string());
+        }
+    }
+    let mut merged: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if index + 1 < tokens.len()
+            && matches!(tokens[index].as_str(), "a" | "p")
+            && tokens[index + 1] == "m"
+        {
+            merged.push(format!("{}m", tokens[index]));
+            index += 2;
+            continue;
+        }
+        if index + 1 < tokens.len() && tokens[index] == "o" && tokens[index + 1] == "clock" {
+            merged.push("oclock".to_string());
+            index += 2;
+            continue;
+        }
+        merged.push(tokens[index].clone());
+        index += 1;
+    }
+    let mapped: Vec<&str> = merged
+        .iter()
+        .map(|token| match token.as_str() {
+            "one" => "1",
+            "two" => "2",
+            "three" => "3",
+            "four" => "4",
+            "five" => "5",
+            "six" => "6",
+            "seven" => "7",
+            "eight" => "8",
+            "nine" => "9",
+            "ten" => "10",
+            "eleven" => "11",
+            "twelve" => "12",
+            other => other,
+        })
+        .collect();
+    mapped.join(" ")
+}
+
+/// The provider's quoted agreement must still be grounded in the trusted
+/// latest caller turn, but exact string equality between two independent
+/// transcribers is unachievable in practice. Accept the quote when its
+/// canonical form equals the turn, is a token-bounded substring of it, or is
+/// a substantial token subset of it — the provider still cannot fabricate an
+/// agreement out of words the caller never said, and the semantic date/time/
+/// agreement fences below run on the trusted transcript, never the quote.
+fn agreement_matches_latest(agreement: &str, latest: &str) -> bool {
+    let quoted = canonical_agreement(agreement);
+    let trusted = canonical_agreement(latest);
+    if quoted.is_empty() || trusted.is_empty() {
+        return false;
+    }
+    if quoted == trusted {
+        return true;
+    }
+    let quoted_tokens: Vec<&str> = quoted.split(' ').collect();
+    let trusted_token_count = trusted.split(' ').count();
+    let substantial =
+        quoted_tokens.len() >= 3 || quoted_tokens.len().saturating_mul(2) >= trusted_token_count;
+    if !substantial {
+        return false;
+    }
+    if format!(" {trusted} ").contains(&format!(" {quoted} ")) {
+        return true;
+    }
+    let trusted_tokens: std::collections::BTreeSet<&str> = trusted.split(' ').collect();
+    quoted_tokens.len() >= 3
+        && quoted_tokens
+            .iter()
+            .all(|token| trusted_tokens.contains(token))
 }
 
 fn contains_explicit_appointment_intent(value: &str) -> bool {
     let value = normalized_speech(value);
     [
         "appointment",
+        "booking",
         "book me",
         "book an",
         "book a",
+        "book one",
+        "book us",
+        "book it",
+        "book that",
         "make a booking",
         "make an appointment",
         "schedule me",
         "schedule an",
-        "reserve a",
+        "schedule a",
+        "reserve",
+        "come in",
+        "fit me in",
+        "get me in",
+        "put me in",
     ]
     .iter()
     .any(|needle| value.contains(needle))
@@ -110,11 +218,23 @@ fn is_conservative_agreement(value: &str) -> bool {
         "book me",
         "book an",
         "book a",
+        "book one",
+        "book us",
+        "book it",
+        "book that",
+        "book my",
         "make a booking",
         "make an appointment",
         "schedule me",
         "schedule an",
         "put me down",
+        "put me in",
+        "get me in",
+        "fit me in",
+        "come in",
+        "lock it in",
+        "lock in",
+        "pencil me in",
     ]
     .iter()
     .any(|needle| value.contains(needle));
@@ -157,11 +277,23 @@ fn is_conservative_agreement(value: &str) -> bool {
     .any(|day| value.contains(day));
     let concrete_slot = has_day && value.chars().any(|character| character.is_ascii_digit());
 
+    // A concrete slot the caller PROPOSES is agreement even when phrased as a
+    // polite question: "How about tomorrow at 10?" and "Could you do Thursday
+    // at 2?" select a slot, they do not explore availability. Exploration
+    // shapes ("Is Wednesday at 10 available?", "Do you have anything at 3?")
+    // stay read-only because they match none of these openers.
+    let slot_proposal = value.starts_with("how about")
+        || value.starts_with("what about")
+        || value.starts_with("can we do")
+        || value.starts_with("could we do")
+        || value.starts_with("can you do")
+        || value.starts_with("could you do");
+
     // Punctuation in automatic transcripts is not guaranteed. A lexical
     // availability question is never treated as agreement merely because it
     // contains a weekday and a number. A direct booking request is different:
     // "Could you book me Wednesday at 10?" is itself explicit approval.
-    (concrete_slot && (!looks_like_question(&value) || direct_booking_request))
+    (concrete_slot && (!looks_like_question(&value) || direct_booking_request || slot_proposal))
         || (affirmative
             && (!value.ends_with('?') || value.starts_with("yes") || value.starts_with("yeah")))
 }
@@ -283,11 +415,20 @@ pub fn validate(
 
     let (agreement_turn, latest_text) =
         latest_caller_turn.ok_or_else(|| "no final caller agreement is available".to_string())?;
-    if normalized_quote(&agreement) != normalized_quote(latest_text) {
-        return Err("agreement phrase does not match the latest caller turn".into());
+    if !agreement_matches_latest(&agreement, latest_text) {
+        return Err(
+            "agreement phrase does not match the latest caller turn; wait for the caller's next \
+             spoken confirmation of the slot, then call this tool again quoting their words"
+                .into(),
+        );
     }
     if !is_conservative_agreement(latest_text) {
-        return Err("the latest caller turn is not a clear appointment agreement".into());
+        return Err(
+            "the latest caller turn is not a clear appointment agreement; ask the caller to \
+             confirm the slot plainly (for example: 'Yes, book Thursday at 10 AM'), then call \
+             this tool again"
+                .into(),
+        );
     }
     validate_spoken_date(latest_text, parsed_date, today)?;
     validate_spoken_time(latest_text, parsed_time)?;
@@ -431,6 +572,135 @@ mod tests {
             day(),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn live_call_polite_question_bookings_are_accepted() {
+        // call_051404a179974eb59f6685b0011db6aa turn 12: refused live with
+        // "not a clear appointment agreement" before slot proposals counted.
+        let tomorrow = json!({
+            "callerName": "Lance",
+            "service": "Lawn mowing",
+            "date": "2026-07-21",
+            "time": "10:00",
+            "agreementPhrase": "How about tomorrow at 10 a.m.?"
+        });
+        let request = validate(
+            &tomorrow,
+            "call_051404a179974eb59f6685b0011db6aa",
+            Some((12, "How about tomorrow at 10 a.m.?")),
+            &["Hey, can you please check the appointments for me?".into()],
+            day(),
+        )
+        .unwrap();
+        assert_eq!(request.date, "2026-07-21");
+
+        // Turn 14: "book one" was outside the needle list.
+        let thursday = json!({
+            "callerName": "Lance",
+            "service": "Lawn mowing",
+            "date": "2026-07-23",
+            "time": "10:00",
+            "agreementPhrase": "could you book one for Thursday then at 10 a.m.?"
+        });
+        validate(
+            &thursday,
+            "call_051404a179974eb59f6685b0011db6aa",
+            Some((14, "could you book one for Thursday then at 10 a.m.?")),
+            &["Hey, can you please check the appointments for me?".into()],
+            day(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cross_transcriber_quote_divergence_is_tolerated_but_fabrication_is_not() {
+        // The provider quotes its own hearing; the trusted transcript comes
+        // from a different transcription model. Formatting must not refuse.
+        let request = json!({
+            "callerName": "Lance",
+            "service": "Lawn mowing",
+            "date": "2026-07-22",
+            "time": "10:00",
+            "agreementPhrase": "Yes, book it for Wednesday at 10am."
+        });
+        validate(
+            &request,
+            "call_one",
+            Some((6, "Yes book it for Wednesday at ten a.m.")),
+            &["I'd like an appointment.".into()],
+            day(),
+        )
+        .unwrap();
+
+        // A fragment of the turn is an acceptable quote.
+        let fragment = json!({
+            "callerName": "Lance",
+            "service": "Lawn mowing",
+            "date": "2026-07-22",
+            "time": "10:00",
+            "agreementPhrase": "book it for Wednesday at 10"
+        });
+        validate(
+            &fragment,
+            "call_one",
+            Some((6, "Yes please, book it for Wednesday at 10.")),
+            &["I'd like an appointment.".into()],
+            day(),
+        )
+        .unwrap();
+
+        // Words the caller never said still fail closed.
+        let fabricated = json!({
+            "callerName": "Lance",
+            "service": "Lawn mowing",
+            "date": "2026-07-22",
+            "time": "10:00",
+            "agreementPhrase": "Yes, book Wednesday at 10 for a full renovation quote."
+        });
+        assert!(validate(
+            &fabricated,
+            "call_one",
+            Some((6, "Yes, book it for Wednesday at 10.")),
+            &["I'd like an appointment.".into()],
+            day(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn availability_exploration_stays_read_only() {
+        let exploration = json!({
+            "callerName": "Lance",
+            "service": "Lawn mowing",
+            "date": "2026-07-22",
+            "time": "10:00",
+            "agreementPhrase": "Is Wednesday at 10 available?"
+        });
+        assert!(validate(
+            &exploration,
+            "call_one",
+            Some((6, "Is Wednesday at 10 available?")),
+            &["Please make an appointment.".into()],
+            day(),
+        )
+        .is_err());
+
+        let anything = json!({
+            "callerName": "Lance",
+            "service": "Lawn mowing",
+            "date": "2026-07-22",
+            "time": "10:00",
+            "agreementPhrase": "Do you have anything Wednesday at 10?"
+        });
+        assert!(validate(
+            &anything,
+            "call_one",
+            Some((6, "Do you have anything Wednesday at 10?")),
+            &["Please make an appointment.".into()],
+            day(),
+        )
+        .is_err());
     }
 
     #[test]
