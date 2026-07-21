@@ -203,6 +203,83 @@ pub struct OnnxTtsRuntime {
     /// on mismatch so a user who overwrites a voice file in place gets
     /// the new audio on the next call instead of stuck stale state.
     pub voice_cache: std::collections::HashMap<PathBuf, CachedVoiceState>,
+    /// The execution provider the sessions actually registered with:
+    /// `"cuda"` or `"cpu"`. Informational — feeds logs and health output
+    /// so "requested CUDA but silently on CPU" is impossible to miss.
+    pub ep: &'static str,
+    /// The CUDA device the sessions were placed on (AOKIE_TTS_CUDA_DEVICE,
+    /// default 0). Only meaningful when `ep == "cuda"` — the generation
+    /// loop's IoBindings allocate their device-resident state here.
+    pub cuda_device: i32,
+}
+
+/// `AOKIE_TTS_CUDA_DEVICE` — which CUDA device to place the sessions on.
+fn cuda_device_from_env() -> i32 {
+    std::env::var("AOKIE_TTS_CUDA_DEVICE")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(0)
+}
+
+/// Probe whether the CUDA EP can actually be used right now: the build must
+/// carry the `onnx-cuda` feature AND the loaded onnxruntime dylib must have
+/// the CUDA provider compiled in (the CPU-only DLL doesn't). A `true` here
+/// still isn't a guarantee — session creation can fail on a missing cuDNN —
+/// which is why the loader keeps a per-session CPU fallback too.
+#[cfg(feature = "onnx-cuda")]
+fn cuda_ep_usable() -> bool {
+    use ort::execution_providers::{CUDAExecutionProvider, ExecutionProvider};
+    match CUDAExecutionProvider::default().is_available() {
+        Ok(true) => true,
+        Ok(false) => {
+            eprintln!(
+                "[pocket_tts_onnx] AOKIE_TTS_ORT_EP=cuda but the loaded onnxruntime has no CUDA provider (CPU-only DLL?) — staying on CPU"
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("[pocket_tts_onnx] AOKIE_TTS_ORT_EP=cuda but the CUDA provider probe failed ({e}) — staying on CPU");
+            false
+        }
+    }
+}
+
+#[cfg(not(feature = "onnx-cuda"))]
+fn cuda_ep_usable() -> bool {
+    eprintln!(
+        "[pocket_tts_onnx] AOKIE_TTS_ORT_EP=cuda ignored — this build lacks the `onnx-cuda` feature; staying on CPU"
+    );
+    false
+}
+
+/// Register CUDA (with CPU fallback) on a session builder. `error_on_failure`
+/// makes a CUDA registration that can't init (missing cuDNN, driver too old)
+/// surface as an `Err` the loader catches and degrades from — NOT silently
+/// run the fp32 graph on the CPU EP.
+#[cfg(feature = "onnx-cuda")]
+fn with_cuda_eps(
+    builder: ort::session::builder::SessionBuilder,
+    stem: &str,
+) -> Result<ort::session::builder::SessionBuilder, String> {
+    use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider};
+    let device = cuda_device_from_env();
+    builder
+        .with_execution_providers([
+            CUDAExecutionProvider::default()
+                .with_device_id(device)
+                .build()
+                .error_on_failure(),
+            CPUExecutionProvider::default().build(),
+        ])
+        .map_err(|e| format!("register CUDA+CPU EPs ({stem}): {e}"))
+}
+
+#[cfg(not(feature = "onnx-cuda"))]
+fn with_cuda_eps(
+    _builder: ort::session::builder::SessionBuilder,
+    _stem: &str,
+) -> Result<ort::session::builder::SessionBuilder, String> {
+    unreachable!("cuda_active is always false without the onnx-cuda feature")
 }
 
 impl OnnxTtsRuntime {
@@ -240,61 +317,66 @@ impl OnnxTtsRuntime {
         let tokenizer = tokenizer::Tokenizer::open(&tokenizer_path)
             .map_err(|e| format!("open tokenizer.model at {}: {e}", tokenizer_path.display()))?;
 
-        // Default to the int8 variants — ~5× smaller, and the quality loss
-        // is negligible for conversational TTS. Fall back to fp32 only if
-        // the int8 file isn't on disk. Sessions register the CPU EP by
-        // default: these models are small (<=80 MB) and autoregressive, so
-        // CUDA adds launch overhead without a guaranteed speedup — but
-        // LAT-005 makes the experiment one env var away: builds with the
-        // `cuda` cargo feature honor AOKIE_TTS_ORT_EP=cuda (CUDA first, CPU
-        // fallback; also needs a CUDA-enabled onnxruntime dylib + cuDNN on
-        // the deploy box). Builds without the feature log and stay on CPU.
-        let load = |stem: &str| -> Result<ort::session::Session, String> {
+        // Graph + EP selection.
+        //
+        // CPU: default to the int8 variants — ~5× smaller, and the quality
+        // loss is negligible for conversational TTS; fall back to fp32 only
+        // if the int8 file isn't on disk.
+        //
+        // CUDA (AOKIE_TTS_ORT_EP=cuda + the `onnx-cuda` build feature +
+        // a CUDA-enabled onnxruntime dylib): PREFER the fp32 graphs. The
+        // int8 exports are dynamic-quantization graphs (DynamicQuantizeLinear
+        // / MatMulInteger), which the CUDA EP cannot place on the GPU — the
+        // hot ops would silently fall back to CPU with device-copy nodes at
+        // every partition boundary, i.e. all overhead and no speedup. fp32
+        // on a modern GPU is trivially fast at this model size. A CUDA
+        // session that fails to build (missing cuDNN etc.) degrades to CPU
+        // for that and all remaining graphs, loudly.
+        let mut cuda_active = {
+            let want_cuda = std::env::var("AOKIE_TTS_ORT_EP")
+                .map(|v| v.trim().eq_ignore_ascii_case("cuda"))
+                .unwrap_or(false);
+            want_cuda && cuda_ep_usable()
+        };
+
+        let build_session = |stem: &str, use_cuda: bool| -> Result<ort::session::Session, String> {
             use ort::execution_providers::CPUExecutionProvider;
 
             let int8 = bundle_dir.join(format!("{stem}_int8.onnx"));
             let fp32 = bundle_dir.join(format!("{stem}.onnx"));
-            let path = if int8.exists() {
-                int8
-            } else if fp32.exists() {
-                fp32
+            let (primary, fallback) = if use_cuda {
+                (&fp32, &int8)
+            } else {
+                (&int8, &fp32)
+            };
+            let path = if primary.exists() {
+                primary.clone()
+            } else if fallback.exists() {
+                if use_cuda {
+                    eprintln!(
+                        "[pocket_tts_onnx] {stem}: fp32 graph not on disk — using int8 on CUDA (expect CPU fallback for the quantized ops; download the fp32 graphs for full GPU speed)"
+                    );
+                }
+                fallback.clone()
             } else {
                 return Err(format!(
                     "missing: neither {} nor {} exists",
-                    bundle_dir.join(format!("{stem}_int8.onnx")).display(),
-                    bundle_dir.join(format!("{stem}.onnx")).display()
+                    int8.display(),
+                    fp32.display()
                 ));
             };
-            eprintln!("[pocket_tts_onnx] load {}", path.display());
-            let want_cuda = std::env::var("AOKIE_TTS_ORT_EP")
-                .map(|v| v.trim().eq_ignore_ascii_case("cuda"))
-                .unwrap_or(false);
-            let mut builder = ort::session::Session::builder()
+            eprintln!(
+                "[pocket_tts_onnx] load {} ({})",
+                path.display(),
+                if use_cuda { "CUDA" } else { "CPU" }
+            );
+            let builder = ort::session::Session::builder()
                 .map_err(|e| format!("ort builder ({stem}): {e}"))?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
                 .map_err(|e| format!("opt level ({stem}): {e}"))?;
-            #[cfg(feature = "cuda")]
-            let mut builder = if want_cuda {
-                use ort::execution_providers::CUDAExecutionProvider;
-                eprintln!("[pocket_tts_onnx] AOKIE_TTS_ORT_EP=cuda — registering CUDA EP ({stem}, CPU fallback)");
-                builder
-                    .with_execution_providers([
-                        CUDAExecutionProvider::default().build(),
-                        CPUExecutionProvider::default().build(),
-                    ])
-                    .map_err(|e| format!("register CUDA+CPU EPs ({stem}): {e}"))?
+            let mut builder = if use_cuda {
+                with_cuda_eps(builder, stem)?
             } else {
-                builder
-                    .with_execution_providers([CPUExecutionProvider::default().build()])
-                    .map_err(|e| format!("register CPU EP ({stem}): {e}"))?
-            };
-            #[cfg(not(feature = "cuda"))]
-            let mut builder = {
-                if want_cuda {
-                    eprintln!(
-                        "[pocket_tts_onnx] AOKIE_TTS_ORT_EP=cuda ignored — this build lacks the `cuda` feature; staying on CPU"
-                    );
-                }
                 builder
                     .with_execution_providers([CPUExecutionProvider::default().build()])
                     .map_err(|e| format!("register CPU EP ({stem}): {e}"))?
@@ -302,6 +384,21 @@ impl OnnxTtsRuntime {
             builder
                 .commit_from_file(&path)
                 .map_err(|e| format!("commit {} ({}): {e}", path.display(), stem))
+        };
+
+        let mut load = |stem: &str| -> Result<ort::session::Session, String> {
+            if cuda_active {
+                match build_session(stem, true) {
+                    Ok(s) => return Ok(s),
+                    Err(e) => {
+                        eprintln!(
+                            "[pocket_tts_onnx] CUDA session for {stem} failed ({e}) — falling back to CPU for all graphs"
+                        );
+                        cuda_active = false;
+                    }
+                }
+            }
+            build_session(stem, false)
         };
 
         let text_conditioner = load("text_conditioner")?;
@@ -318,6 +415,8 @@ impl OnnxTtsRuntime {
                 None
             }
         };
+        drop(load);
+        let ep = if cuda_active { "cuda" } else { "cpu" };
 
         // We condition voices from a reference wav on demand. Just check
         // that the default prompt is on disk — if not, surface it clearly
@@ -341,7 +440,7 @@ impl OnnxTtsRuntime {
             );
         }
 
-        eprintln!("[pocket_tts_onnx] ready");
+        eprintln!("[pocket_tts_onnx] ready (execution provider: {ep})");
         Ok(Self {
             bundle_dir: bundle_dir.to_path_buf(),
             cfg,
@@ -352,6 +451,8 @@ impl OnnxTtsRuntime {
             mimi_decoder,
             mimi_encoder,
             voice_cache: std::collections::HashMap::new(),
+            ep,
+            cuda_device: cuda_device_from_env(),
         })
     }
 

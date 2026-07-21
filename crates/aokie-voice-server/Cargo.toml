@@ -10,7 +10,7 @@ publish.workspace = true
 # `sherpa` adds the dynamic sherpa-onnx TTS engine (VOX-401) — its DLLs ship
 # next to the exe; ensure_ort_dylib pins the VERSIONED ORT name so sherpa's
 # bundled onnxruntime.dll (1.17.1) never shadows the ort engines' 1.25.0.
-aokie-ai = { path = "../aokie-ai", features = ["onnx", "sherpa"] }
+aokie-ai = { path = "../aokie-ai", features = ["onnx", "sherpa", "onnx-cuda"] }
 aokie-core = { path = "../aokie-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
