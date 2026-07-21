@@ -1271,20 +1271,50 @@ pub(super) fn service_realtime_lane(
                             .latest_caller_turn
                             .as_ref()
                             .map(|(turn, text)| (*turn, text.as_str()));
-                        match crate::realtime_appointment::validate(
+                        // The assistant's own recent spoken turns: a slot the
+                        // agent read back and the caller affirmed is consent
+                        // even when the caller never repeated the details
+                        // (live call 1ce475b2 — "was that July 30 at 3 PM?"
+                        // / "Yeah." was refused four times).
+                        let assistant_recent: Vec<String> = ctx
+                            .history
+                            .iter()
+                            .rev()
+                            .filter(|entry| {
+                                entry.get("role").and_then(serde_json::Value::as_str)
+                                    == Some("assistant")
+                            })
+                            .filter_map(|entry| {
+                                entry
+                                    .get("content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .take(3)
+                            .collect();
+                        match crate::realtime_appointment::validate_with_readback(
                             &arguments,
                             &lane.call_id,
                             latest_caller_turn,
                             &caller_history,
+                            &assistant_recent,
                             chrono::Local::now().date_naive(),
                         ) {
                             Err(error) => {
                                 // The refusal reason must be diagnosable
                                 // post-hoc: live calls needed 2-3 confirm
                                 // rounds and only the model's paraphrase
-                                // hinted at why (2026-07-21).
+                                // hinted at why (2026-07-21). The phrase
+                                // itself is conversation content, so it rides
+                                // the AOKIE_LOG_CONTENT redaction gate.
                                 eprintln!(
-                                    "[aokie-plugin] realtime request_appointment refused: {error}"
+                                    "[aokie-plugin] realtime request_appointment refused: {error} (agreement {})",
+                                    content_for_log(
+                                        arguments
+                                            .get("agreementPhrase")
+                                            .and_then(serde_json::Value::as_str)
+                                            .unwrap_or("")
+                                    )
                                 );
                                 completion = Some((
                                     tool_call_id,
