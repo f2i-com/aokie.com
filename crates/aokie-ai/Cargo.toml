@@ -111,13 +111,19 @@ sherpa = ["dep:sherpa-rs"]
 # aokie-voice-server) so sherpa's onnxruntime.dll never shadows it.
 # Builds need libclang for bindgen (LIBCLANG_PATH in .cargo/config.toml).
 
-# GPU execution providers. Turns on the ML stack it accelerates, then
-# flips the CUDA feature on ort + candle. Requires the CUDA toolkit +
-# matching VS integration; opt-in only.
+# CUDA execution provider for the ort-based engines ONLY. With ort in
+# load-dynamic mode this is build-time free (no CUDA toolkit needed to
+# compile) — it just compiles in the CUDA EP registration API. The GPU
+# onnxruntime dylib + cuDNN are resolved at RUNTIME (ORT_DYLIB_PATH);
+# missing pieces degrade to the CPU EP with a logged warning.
+onnx-cuda = ["onnx", "ort/cuda"]
+
+# Full GPU stack: the ort CUDA EP above PLUS candle's CUDA kernels.
+# Candle CUDA needs the CUDA toolkit + matching VS integration at build
+# time; opt-in only.
 cuda = [
-    "onnx",
+    "onnx-cuda",
     "candle",
-    "ort/cuda",
     "candle-core/cuda",
     "candle-nn/cuda",
     "candle-transformers/cuda",

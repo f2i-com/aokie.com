@@ -335,10 +335,10 @@
     var modeOptions =
       '<option value="legacy"' +
       (settings.realtimeVoiceMode === 'legacy' ? ' selected' : '') +
-      '>Standard STT → LLM → TTS</option>' +
+      '>Local AI on this computer (your STT → LLM → TTS)</option>' +
       '<option value="desktop_realtime"' +
       (settings.realtimeVoiceMode === 'desktop_realtime' ? ' selected' : '') +
-      '>OpenAI Realtime through FormLogic Desktop</option>';
+      '>OpenAI Realtime — cloud voice + brain (via Desktop)</option>';
     var providers = realtimeProviderOptions();
     var providerOptions = [];
     for (var i = 0; i < providers.length; i++) {
@@ -655,6 +655,10 @@
   var loading = false;
   var saving = false;
   var error = null;
+  // Keys the last save reported as applies-at-restart (settings.set's
+  // appliesAtReconnect) — e.g. the live-call voice mode. Non-null renders
+  // the "Restart receptionist now" apply banner.
+  var pendingRestart = null;
   var settings = withAokieDefaults(null);
   var baseline = withAokieDefaults(null);
   var sources = [];
@@ -862,10 +866,20 @@
             );
           }
           var blocked = data && typeof data.blocked === 'string' ? data.blocked.trim() : '';
+          // Start-only keys (the live-call voice mode and friends) are saved
+          // but NOT live until the plugin restarts — surface the apply step
+          // instead of letting the change look silently ignored.
+          var pend = (data || {}).appliesAtReconnect;
+          pendingRestart = pend && pend.length ? pend.slice() : null;
           if (blocked) {
             HOST.toast(
               'error',
               'Settings saved, but the receptionist is paused. Open Consent and accept the new data destination before calls can resume.'
+            );
+          } else if (pendingRestart) {
+            HOST.toast(
+              'success',
+              'Saved — one more step: press "Restart receptionist now" below to apply it to the line.'
             );
           } else {
             HOST.toast('success', 'Receptionist settings saved — takes effect on the next caller turn.');
@@ -1220,6 +1234,12 @@
       // form-action 'none') BLOCKS native form submission BEFORE the submit
       // event fires — a submit button would be dead. Save rides the click
       // delegate; Enter-to-save rides the keydown handler in wire().
+      (pendingRestart
+        ? '<p class="rcp-hint is-warn">Saved — the voice-mode change applies when the receptionist restarts. The phone reconnects automatically (about 15 seconds of downtime).</p>' +
+          '<div class="rcp-actions">' +
+          '<button type="button" class="rcp-button is-primary" data-act="set-apply-restart"' + (saving || loading ? ' disabled' : '') + '>Restart receptionist now</button>' +
+          '</div>'
+        : '') +
       '<div class="rcp-actions">' +
       '<button type="button" class="rcp-button is-primary" id="set-save" data-act="set-save"' + (saving || loading ? ' disabled' : '') + '>' +
       (saving ? 'Saving…' : 'Save') +
@@ -1418,8 +1438,41 @@
       if (!btn || btn.disabled) return;
       var act = btn.getAttribute('data-act');
       if (act === 'set-save') save();
+      else if (act === 'set-apply-restart') applyRestart();
       else if (act === 'set-reload' || act === 'set-retry') load(false);
     });
+  }
+
+  /** Apply start-only settings by restarting THIS plugin through the host
+   *  bridge. The screen keeps running; the plugin (and the phone link)
+   *  reconnect underneath it. Older Desktops without the bridge verb get an
+   *  honest pointer at the manual path. */
+  function applyRestart() {
+    if (typeof HOST.restartPlugin !== 'function') {
+      HOST.toast(
+        'info',
+        'This FormLogic Desktop cannot restart plugins from here yet — restart the Aokie plugin from the Plugins panel to apply.'
+      );
+      return;
+    }
+    pendingRestart = null;
+    render();
+    HOST.toast('info', 'Restarting the receptionist — the phone reconnects automatically.');
+    HOST.restartPlugin().then(
+      function () {
+        HOST.toast('success', 'Receptionist restarted — the saved voice mode is live.');
+        // Give the plugin a beat to finish booting before re-reading
+        // settings (an immediate settings.get can race the connector start).
+        setTimeout(function () {
+          load(true);
+        }, 3000);
+      },
+      function (e) {
+        HOST.toast('error', 'Restart failed: ' + errMsg(e));
+        pendingRestart = ['restart'];
+        render();
+      }
+    );
   }
 
   TABS.register('settings', {
