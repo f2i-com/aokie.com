@@ -240,6 +240,11 @@ enum ControlCommand {
     /// back as CallListEntry events and the switchboard can CONFIRM a swap
     /// took before speaking, instead of assuming.
     QueryCalls,
+    /// `AT+BCC` — ask the AG to (re)establish the call audio channel. A
+    /// self-heal for an ACTIVE call with no SCO (the AG then initiates the
+    /// synchronous link and the normal accept path completes it). Phones
+    /// without HFP-1.6 codec negotiation answer ERROR — harmless.
+    CodecConnect,
     SendAudio(Vec<i16>),
     /// Drain `sco_tx_queue` immediately, dropping any TTS bytes that were
     /// already queued for transmission. Used by "Take Over Call" so the
@@ -623,6 +628,14 @@ impl AokieRuntime {
     pub fn query_calls(&self) -> Result<(), String> {
         self.control_tx
             .send(ControlCommand::QueryCalls)
+            .map_err(|_| "aokie-radio runtime is no longer running".to_string())
+    }
+
+    /// Send `AT+BCC` — ask the AG to (re)establish the call audio channel.
+    /// Best-effort self-heal for an active call with no SCO.
+    pub fn codec_connect(&self) -> Result<(), String> {
+        self.control_tx
+            .send(ControlCommand::CodecConnect)
             .map_err(|_| "aokie-radio runtime is no longer running".to_string())
     }
 
@@ -2448,6 +2461,22 @@ fn run_runtime(
                     for packet in &packets {
                         if let Err(e) = transport.write_acl(packet) {
                             eprintln!("[AokieRadio] queryCalls: {}", e);
+                        }
+                    }
+                }
+                Ok(ControlCommand::CodecConnect) => {
+                    // Audio self-heal — best effort by design: the AG either
+                    // initiates the synchronous link (our accept path then
+                    // completes it) or answers ERROR, which is harmless.
+                    let packets = l2cap_state
+                        .build_hfp_call_control_packets(HfpAtCommand::CodecConnection)?;
+                    eprintln!(
+                        "[AokieRadio] CodecConnect requested — built {} ACL packet(s) for AT+BCC",
+                        packets.len()
+                    );
+                    for packet in &packets {
+                        if let Err(e) = transport.write_acl(packet) {
+                            eprintln!("[AokieRadio] codecConnect: {}", e);
                         }
                     }
                 }

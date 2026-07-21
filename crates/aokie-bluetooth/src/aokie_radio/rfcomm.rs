@@ -1725,6 +1725,7 @@ fn describe_at_command(command: &hfp::HfpAtCommand) -> &'static str {
         hfp::HfpAtCommand::Dial(_) => "ATD",
         hfp::HfpAtCommand::ConfirmCodec(_) => "AT+BCS",
         hfp::HfpAtCommand::ListCurrentCalls => "AT+CLCC",
+        hfp::HfpAtCommand::CodecConnection => "AT+BCC",
     }
 }
 
