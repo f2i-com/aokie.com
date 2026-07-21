@@ -69,6 +69,12 @@ pub trait RadioBackend: Send {
     fn dial(&self, number: String) -> Result<(), String>;
     fn hold_swap(&self) -> Result<(), String>;
     fn query_calls(&self) -> Result<(), String>;
+    /// `AT+BCC` audio self-heal for an active call with no SCO. Backends
+    /// where the OS owns call audio (native Windows stack) keep the default
+    /// refusal — their dead-air watchdog is disabled anyway.
+    fn codec_connect(&self) -> Result<(), String> {
+        Err("codec connection nudge is not supported on this backend".to_string())
+    }
     fn open_pairing_window(&self, seconds: u64);
     fn close_pairing_window(&self);
     fn pairing_window(&self) -> PairingWindow;
@@ -195,6 +201,9 @@ impl RadioBackend for UsbRadioBackend {
     }
     fn realtime_call_audio_supported(&self) -> bool {
         true
+    }
+    fn codec_connect(&self) -> Result<(), String> {
+        self.inner.codec_connect()
     }
     fn backend_name(&self) -> &'static str {
         "WinUSB dongle"
