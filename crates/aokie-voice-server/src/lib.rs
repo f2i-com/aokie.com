@@ -119,6 +119,27 @@ impl TtsEngineKind {
     }
 }
 
+/// Which execution provider the pocket TTS engine runs on. `Cuda` needs the
+/// GPU onnxruntime bundle installed at `<app_data>/ort-cuda/` (see
+/// `prepare_tts_ort`) — when it's missing the server logs and degrades to
+/// CPU rather than refusing to speak. Sherpa ignores this (it bundles its
+/// own CPU-only ORT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TtsEpKind {
+    #[default]
+    Cpu,
+    Cuda,
+}
+
+impl TtsEpKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TtsEpKind::Cpu => "cpu",
+            TtsEpKind::Cuda => "cuda",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub mode: ServerMode,
@@ -133,6 +154,8 @@ pub struct ServerConfig {
     /// VOICE BUNDLE folder (one .onnx + tokens.txt) — `None` scans
     /// `<app_data>/models/tts` alphabetically for the first valid bundle.
     pub tts_model_dir: Option<PathBuf>,
+    /// Execution provider for the pocket TTS engine (cpu | cuda).
+    pub tts_ep: TtsEpKind,
 }
 
 impl Default for ServerConfig {
@@ -144,6 +167,7 @@ impl Default for ServerConfig {
             stt_model_dir: None,
             tts_engine: TtsEngineKind::Pocket,
             tts_model_dir: None,
+            tts_ep: TtsEpKind::Cpu,
         }
     }
 }
@@ -158,6 +182,7 @@ pub struct CliConfig {
     pub stt_model_dir: Option<PathBuf>,
     pub tts_engine: Option<TtsEngineKind>,
     pub tts_model_dir: Option<PathBuf>,
+    pub tts_ep: Option<TtsEpKind>,
     /// `--config PATH` — explicit JSON config file (else `<app_data>/
     /// voice-server.json` is auto-loaded when present).
     pub config_path: Option<PathBuf>,
@@ -174,6 +199,7 @@ pub struct EnvConfig {
     pub stt_model_dir: Option<String>,
     pub tts_engine: Option<String>,
     pub tts_model_dir: Option<String>,
+    pub tts_ep: Option<String>,
 }
 
 impl EnvConfig {
@@ -191,13 +217,14 @@ impl EnvConfig {
             stt_model_dir: get("AOKIE_VOICE_STT_MODEL_DIR"),
             tts_engine: get("AOKIE_VOICE_TTS_ENGINE"),
             tts_model_dir: get("AOKIE_VOICE_TTS_MODEL_DIR"),
+            tts_ep: get("AOKIE_VOICE_TTS_EP"),
         }
     }
 }
 
 /// Flat JSON config file shape: `{"mode","port","sttEngine","sttModelDir",
-/// "ttsEngine","ttsModelDir"}` — all keys optional, unknown keys tolerated
-/// (forward compat).
+/// "ttsEngine","ttsModelDir","ttsEp"}` — all keys optional, unknown keys
+/// tolerated (forward compat).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct FileConfig {
     #[serde(default)]
@@ -212,6 +239,8 @@ pub struct FileConfig {
     pub tts_engine: Option<String>,
     #[serde(default, rename = "ttsModelDir")]
     pub tts_model_dir: Option<String>,
+    #[serde(default, rename = "ttsEp")]
+    pub tts_ep: Option<String>,
 }
 
 pub fn parse_mode(value: &str, source: &str) -> Result<ServerMode, String> {
@@ -243,6 +272,14 @@ pub fn parse_tts_engine(value: &str, source: &str) -> Result<TtsEngineKind, Stri
         other => Err(format!(
             "{source} must be one of pocket|sherpa, got {other:?}"
         )),
+    }
+}
+
+pub fn parse_tts_ep(value: &str, source: &str) -> Result<TtsEpKind, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cpu" => Ok(TtsEpKind::Cpu),
+        "cuda" | "gpu" => Ok(TtsEpKind::Cuda),
+        other => Err(format!("{source} must be one of cpu|cuda, got {other:?}")),
     }
 }
 
@@ -320,6 +357,10 @@ where
                 let v = take_value(&argv, &mut i, "--tts-model-dir", inline)?;
                 cli.tts_model_dir = nonblank_path(v);
             }
+            "--tts-ep" => {
+                let v = take_value(&argv, &mut i, "--tts-ep", inline)?;
+                cli.tts_ep = Some(parse_tts_ep(&v, "--tts-ep")?);
+            }
             "--config" => {
                 let v = take_value(&argv, &mut i, "--config", inline)?;
                 cli.config_path = nonblank_path(v);
@@ -382,6 +423,16 @@ pub fn merge_config(
         TtsEngineKind::Pocket
     };
 
+    let tts_ep = if let Some(ep) = cli.tts_ep {
+        ep
+    } else if let Some(v) = nonblank(&env.tts_ep) {
+        parse_tts_ep(v, "AOKIE_VOICE_TTS_EP")?
+    } else if let Some(v) = nonblank(&file.tts_ep) {
+        parse_tts_ep(v, "config file \"ttsEp\"")?
+    } else {
+        TtsEpKind::Cpu
+    };
+
     let stt_model_dir = cli
         .stt_model_dir
         .clone()
@@ -400,6 +451,7 @@ pub fn merge_config(
         stt_model_dir,
         tts_engine,
         tts_model_dir,
+        tts_ep,
     })
 }
 
@@ -665,7 +717,7 @@ impl VoiceServer {
                             format!("TTS model files are not present under {}", dir.display()),
                         ));
                     }
-                    ensure_ort_dylib();
+                    prepare_tts_ort(self.config.tts_ep, &self.app_data);
                     TtsBackend::Pocket(
                         OnnxTtsRuntime::open(&dir)
                             .map_err(|e| AppError::new(500, format!("TTS load failed: {e}")))?,
@@ -679,12 +731,13 @@ impl VoiceServer {
                     TtsBackend::Sherpa(LruCache::new(SHERPA_BUNDLE_CACHE_CAPACITY))
                 }
             };
-            if matches!(backend, TtsBackend::Pocket(_)) {
+            if let TtsBackend::Pocket(rt) = &backend {
                 eprintln!(
-                    "[{}] TTS ({}) loaded in {:?}",
+                    "[{}] TTS ({}) loaded in {:?} (execution provider: {})",
                     log_tag(),
                     self.config.tts_engine.as_str(),
-                    started.elapsed()
+                    started.elapsed(),
+                    rt.ep
                 );
             }
             *guard = Some(backend);
@@ -701,11 +754,13 @@ impl VoiceServer {
             TtsBackend::Pocket(rt) => {
                 let sample_rate = rt.sample_rate();
                 let mut f32_samples = Vec::new();
-                rt.synthesize_stream(input, voice, |chunk, _rate| {
-                    f32_samples.extend_from_slice(chunk);
-                    true
-                })
-                .map_err(|e| AppError::new(500, format!("TTS synthesize failed: {e}")))?;
+                let stats = rt
+                    .synthesize_stream(input, voice, |chunk, _rate| {
+                        f32_samples.extend_from_slice(chunk);
+                        true
+                    })
+                    .map_err(|e| AppError::new(500, format!("TTS synthesize failed: {e}")))?;
+                log_pocket_stats(&stats, rt.ep);
                 (f32_to_i16(&f32_samples), sample_rate)
             }
             TtsBackend::Sherpa(cache) => {
@@ -757,7 +812,9 @@ impl VoiceServer {
                 if cancelled {
                     return Ok(PcmOutcome::Cancelled);
                 }
-                result.map_err(|e| AppError::new(500, format!("TTS synthesize failed: {e}")))?;
+                let stats =
+                    result.map_err(|e| AppError::new(500, format!("TTS synthesize failed: {e}")))?;
+                log_pocket_stats(&stats, rt.ep);
                 Ok(PcmOutcome::Completed)
             }
             TtsBackend::Sherpa(cache) => {
@@ -1524,12 +1581,14 @@ fn health_response(server: &VoiceServer) -> HttpResponse {
         Some(Ok(dir)) => json!({
             "enabled": true,
             "engine": server.config.tts_engine.as_str(),
+            "ep": server.config.tts_ep.as_str(),
             "modelDir": dir.display().to_string(),
             "ready": true,
         }),
         Some(Err(why)) => json!({
             "enabled": true,
             "engine": server.config.tts_engine.as_str(),
+            "ep": server.config.tts_ep.as_str(),
             "ready": false,
             "error": why,
         }),
@@ -2051,6 +2110,79 @@ fn error_response(status: u16, message: impl Into<String>) -> HttpResponse {
             }
         }),
     )
+}
+
+/// Point the ort engines at the right onnxruntime BEFORE the first session
+/// loads (the dylib binds once per process).
+///
+/// CPU: the standard versioned-name resolution next to the exe.
+///
+/// CUDA: the GPU onnxruntime lives OUTSIDE the signed plugin dir (it's
+/// ~1 GB of provider + cuDNN DLLs) at `<app_data com.aokie.app>/ort-cuda/`.
+/// When present, ORT_DYLIB_PATH points at its onnxruntime.dll, the folder is
+/// prepended to PATH (the CUDA provider + cuDNN DLLs resolve from there;
+/// cuBLAS/cuFFT come from the CUDA toolkit already on PATH), and
+/// AOKIE_TTS_ORT_EP=cuda tells aokie-ai's pocket loader to register the
+/// CUDA EP. Missing bundle = log + degrade to the CPU path — the service
+/// must keep speaking.
+fn prepare_tts_ort(ep: TtsEpKind, app_data: &Path) {
+    match ep {
+        TtsEpKind::Cpu => ensure_ort_dylib(),
+        TtsEpKind::Cuda => {
+            if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+                // Operator override wins — assume they pointed it at a
+                // CUDA-capable build.
+                std::env::set_var("AOKIE_TTS_ORT_EP", "cuda");
+                return;
+            }
+            let gpu_dir = app_data.join("ort-cuda");
+            let dll = gpu_dir.join("onnxruntime.dll");
+            if dll.is_file() {
+                std::env::set_var("ORT_DYLIB_PATH", &dll);
+                prepend_to_path(&gpu_dir);
+                std::env::set_var("AOKIE_TTS_ORT_EP", "cuda");
+                eprintln!(
+                    "[{}] ORT_DYLIB_PATH -> {} (CUDA execution provider requested)",
+                    log_tag(),
+                    dll.display()
+                );
+            } else {
+                eprintln!(
+                    "[{}] ttsEp=cuda but no GPU onnxruntime at {} — staying on CPU. Install the onnxruntime-win-x64-gpu DLLs + cuDNN there to enable GPU synthesis.",
+                    log_tag(),
+                    dll.display()
+                );
+                ensure_ort_dylib();
+            }
+        }
+    }
+}
+
+fn prepend_to_path(dir: &Path) {
+    let old = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths: Vec<PathBuf> = vec![dir.to_path_buf()];
+    paths.extend(std::env::split_paths(&old));
+    if let Ok(joined) = std::env::join_paths(paths) {
+        std::env::set_var("PATH", joined);
+    }
+}
+
+/// One line per pocket synthesis with the numbers that matter for latency
+/// tuning: audio duration vs synth wall time (RTF — below 1.0 is faster
+/// than realtime) and time-to-first-chunk.
+fn log_pocket_stats(stats: &aokie_ai::runtimes::onnx_tts::StreamStats, ep: &str) {
+    if stats.total_samples == 0 || stats.sample_rate == 0 {
+        return;
+    }
+    let audio_ms = stats.total_samples as u64 * 1000 / stats.sample_rate as u64;
+    let rtf = stats.synth_ms as f64 / audio_ms.max(1) as f64;
+    eprintln!(
+        "[{}] pocket synth ({}): {audio_ms}ms of audio in {}ms (RTF {rtf:.2}, first chunk {}ms)",
+        log_tag(),
+        ep,
+        stats.synth_ms,
+        stats.first_chunk_ms
+    );
 }
 
 fn ensure_ort_dylib() {

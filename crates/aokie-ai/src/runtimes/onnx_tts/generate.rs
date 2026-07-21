@@ -28,9 +28,9 @@ use ort::session::Session;
 use ort::value::{DynTensor, Tensor};
 use rand::distributions::Distribution;
 
-use super::state::{state_inputs, update_state_from_outputs};
+use super::state::LiveState;
 use super::voice::build_voice_state;
-use super::{CachedVoiceState, OnnxTtsRuntime, StateBuffers, StateSlot, StreamStats};
+use super::{CachedVoiceState, OnnxTtsRuntime, StateSlot, StreamStats};
 
 /// Euler sub-steps per latent frame. Python ships with 1, i.e. the flow
 /// field is sampled once at s=0→t=1 per frame and applied in a single
@@ -167,26 +167,66 @@ impl OnnxTtsRuntime {
                 },
             );
         }
-        let mut flow_state = clone_state(
+        // The cached voice state stays host-side (cheap to keep, safe to
+        // share); the per-utterance working state is LIVE ort values so the
+        // frame loop never round-trips the KV caches through host memory.
+        let mut flow_state = LiveState::from_buffers(
             &self
                 .voice_cache
                 .get(&voice_path)
                 .expect("just inserted above")
                 .state,
-        );
+            &self.cfg.flow_lm_state_manifest,
+        )?;
+
+        // --- 3b. CUDA: drive the stateful sessions through device-resident
+        // IoBindings (see BoundStepper). A setup failure logs once and falls
+        // back to the plain-run path — still correct, just slower.
+        let mut flow_stepper: Option<BoundStepper> = None;
+        let mut mimi_stepper: Option<BoundStepper> = None;
+        if self.ep == "cuda" {
+            match (
+                BoundStepper::new(&self.flow_lm_main, self.cuda_device),
+                BoundStepper::new(&self.mimi_decoder, self.cuda_device),
+            ) {
+                (Ok(f), Ok(m)) => {
+                    flow_stepper = Some(f);
+                    mimi_stepper = Some(m);
+                }
+                (a, b) => {
+                    let why = a.err().or_else(|| b.err()).unwrap_or_default();
+                    eprintln!(
+                        "[pocket_tts_onnx] io-binding setup failed ({why}) — running CUDA without device-resident state"
+                    );
+                }
+            }
+        }
 
         // --- 4. flow_lm_main conditioning pass with the text embeddings --
         // Sequence is empty here ((1,0,latent_dim)); the model consumes the
         // text and writes into its KV cache. We don't care about the two
         // non-state outputs from this pass, only the updated state.
         let empty_seq = Array3::<f32>::zeros((1, 0, latent_dim));
-        run_flow_main(
-            &mut self.flow_lm_main,
-            &empty_seq,
-            &text_embeddings,
-            &mut flow_state,
-            &self.cfg.flow_lm_state_manifest,
-        )?;
+        match flow_stepper.as_mut() {
+            Some(st) => {
+                run_flow_main_bound(
+                    &mut self.flow_lm_main,
+                    st,
+                    &empty_seq,
+                    &text_embeddings,
+                    &mut flow_state,
+                    &self.cfg.flow_lm_state_manifest,
+                    false,
+                )?;
+            }
+            None => run_flow_main(
+                &mut self.flow_lm_main,
+                &empty_seq,
+                &text_embeddings,
+                &mut flow_state,
+                &self.cfg.flow_lm_state_manifest,
+            )?,
+        }
 
         // --- 5. Autoregressive generation loop ---------------------------
         let frame_limit = estimate_max_frames(token_seq_len).min(MAX_GEN_FRAMES_HARD_CAP);
@@ -208,7 +248,10 @@ impl OnnxTtsRuntime {
             rand_distr::Normal::new(0.0f32, std_dev).map_err(|e| format!("normal distr: {e}"))?;
 
         // --- Streaming decode state (shared across the loop) ------------
-        let mut mimi_state = super::init_state(&self.cfg.mimi_state_manifest)?;
+        let mut mimi_state = LiveState::from_buffers(
+            &super::init_state(&self.cfg.mimi_state_manifest)?,
+            &self.cfg.mimi_state_manifest,
+        )?;
         let mut decoded_frames = 0usize;
         let mut first_chunk_ms = 0u64;
         let mut total_samples = 0usize;
@@ -216,13 +259,25 @@ impl OnnxTtsRuntime {
 
         for step in 0..frame_limit {
             // 5a. flow_lm_main(sequence = curr, text = empty, state = flow_state)
-            let (cond, eos_logit) = run_flow_main_step(
-                &mut self.flow_lm_main,
-                &curr,
-                &empty_text,
-                &mut flow_state,
-                &self.cfg.flow_lm_state_manifest,
-            )?;
+            let (cond, eos_logit) = match flow_stepper.as_mut() {
+                Some(st) => run_flow_main_bound(
+                    &mut self.flow_lm_main,
+                    st,
+                    &curr,
+                    &empty_text,
+                    &mut flow_state,
+                    &self.cfg.flow_lm_state_manifest,
+                    true,
+                )?
+                .expect("want_cond run returns outputs"),
+                None => run_flow_main_step(
+                    &mut self.flow_lm_main,
+                    &curr,
+                    &empty_text,
+                    &mut flow_state,
+                    &self.cfg.flow_lm_state_manifest,
+                )?,
+            };
 
             // 5b. EOS: first-crossing step is noted, then we emit a few
             // extra frames (frames_after_eos) so the tail has room to fade.
@@ -266,12 +321,21 @@ impl OnnxTtsRuntime {
                     all_latents[decoded_frames * latent_dim..end * latent_dim].to_vec(),
                 )
                 .map_err(|e| format!("latent chunk: {e}"))?;
-                let audio = run_mimi_decoder(
-                    &mut self.mimi_decoder,
-                    &chunk,
-                    &mut mimi_state,
-                    &self.cfg.mimi_state_manifest,
-                )?;
+                let audio = match mimi_stepper.as_mut() {
+                    Some(st) => run_mimi_decoder_bound(
+                        &mut self.mimi_decoder,
+                        st,
+                        &chunk,
+                        &mut mimi_state,
+                        &self.cfg.mimi_state_manifest,
+                    )?,
+                    None => run_mimi_decoder(
+                        &mut self.mimi_decoder,
+                        &chunk,
+                        &mut mimi_state,
+                        &self.cfg.mimi_state_manifest,
+                    )?,
+                };
                 if first_chunk_ms == 0 {
                     first_chunk_ms = started.elapsed().as_millis() as u64;
                 }
@@ -297,12 +361,21 @@ impl OnnxTtsRuntime {
                 all_latents[decoded_frames * latent_dim..].to_vec(),
             )
             .map_err(|e| format!("tail chunk: {e}"))?;
-            let audio = run_mimi_decoder(
-                &mut self.mimi_decoder,
-                &chunk,
-                &mut mimi_state,
-                &self.cfg.mimi_state_manifest,
-            )?;
+            let audio = match mimi_stepper.as_mut() {
+                Some(st) => run_mimi_decoder_bound(
+                    &mut self.mimi_decoder,
+                    st,
+                    &chunk,
+                    &mut mimi_state,
+                    &self.cfg.mimi_state_manifest,
+                )?,
+                None => run_mimi_decoder(
+                    &mut self.mimi_decoder,
+                    &chunk,
+                    &mut mimi_state,
+                    &self.cfg.mimi_state_manifest,
+                )?,
+            };
             if first_chunk_ms == 0 {
                 first_chunk_ms = started.elapsed().as_millis() as u64;
             }
@@ -444,26 +517,26 @@ fn run_flow_main(
     session: &mut Session,
     sequence: &Array3<f32>,
     text_embeddings: &Array3<f32>,
-    state: &mut StateBuffers,
+    state: &mut LiveState,
     manifest: &[StateSlot],
 ) -> Result<(), String> {
-    let mut inputs = state_inputs(state, manifest)?;
+    let mut inputs = state.take_inputs(manifest, 2)?;
     inputs.insert(
         "sequence".into(),
         Tensor::from_array(sequence.clone())
             .map_err(|e| format!("wrap sequence: {e}"))?
-            .upcast(),
+            .into(),
     );
     inputs.insert(
         "text_embeddings".into(),
         Tensor::from_array(text_embeddings.clone())
             .map_err(|e| format!("wrap text_emb: {e}"))?
-            .upcast(),
+            .into(),
     );
-    let outputs = session
+    let mut outputs = session
         .run(inputs)
         .map_err(|e| format!("flow_lm_main (cond pass): {e}"))?;
-    update_state_from_outputs(state, &outputs, manifest, 2)
+    state.absorb_outputs(&mut outputs, manifest)
 }
 
 /// Generation step: sequence carries the current latent, text_embeddings is
@@ -472,35 +545,42 @@ fn run_flow_main_step(
     session: &mut Session,
     sequence: &Array3<f32>,
     text_embeddings: &Array3<f32>,
-    state: &mut StateBuffers,
+    state: &mut LiveState,
     manifest: &[StateSlot],
 ) -> Result<(Array3<f32>, f32), String> {
-    let mut inputs = state_inputs(state, manifest)?;
+    let mut inputs = state.take_inputs(manifest, 2)?;
     inputs.insert(
         "sequence".into(),
         Tensor::from_array(sequence.clone())
             .map_err(|e| format!("wrap sequence: {e}"))?
-            .upcast(),
+            .into(),
     );
     inputs.insert(
         "text_embeddings".into(),
         Tensor::from_array(text_embeddings.clone())
             .map_err(|e| format!("wrap text_emb (step): {e}"))?
-            .upcast(),
+            .into(),
     );
-    let outputs = session
+    let mut outputs = session
         .run(inputs)
         .map_err(|e| format!("flow_lm_main step: {e}"))?;
+    let (cond, eos_logit) = identify_cond_eos(&outputs)?;
+    state.absorb_outputs(&mut outputs, manifest)?;
+    Ok((cond, eos_logit))
+}
 
-    // Figure out which output is conditioning and which is the EOS logit.
-    // The reference Python reads them positionally (index 0, 1) but ORT's
-    // `SessionOutputs` iter ordering is not guaranteed to match the graph
-    // declaration order. We identify them by shape instead: the cond
-    // tensor's last dim is `cond_dim` and it has more than one element,
-    // while the eos logit is a scalar (or shape like (1, 1)).
-    //
-    // Also one-shot log the names the first time through a process, so if
-    // we need to debug further we can see them in the terminal.
+/// Figure out which output is conditioning and which is the EOS logit.
+/// The reference Python reads them positionally (index 0, 1) but ORT's
+/// `SessionOutputs` iter ordering is not guaranteed to match the graph
+/// declaration order. We identify them by shape instead: the cond
+/// tensor's last dim is `cond_dim` and it has more than one element,
+/// while the eos logit is a scalar (or shape like (1, 1)).
+///
+/// Also one-shot log the names the first time through a process, so if
+/// we need to debug further we can see them in the terminal.
+fn identify_cond_eos(
+    outputs: &ort::session::SessionOutputs,
+) -> Result<(Array3<f32>, f32), String> {
     static OUTPUT_NAMES_LOGGED: std::sync::Once = std::sync::Once::new();
     OUTPUT_NAMES_LOGGED.call_once(|| {
         let names: Vec<String> = outputs.iter().map(|(name, _)| name.to_string()).collect();
@@ -510,7 +590,7 @@ fn run_flow_main_step(
     let mut cond: Option<Array3<f32>> = None;
     let mut eos_logit: Option<f32> = None;
     for (name, val) in outputs.iter() {
-        // Skip state outputs — they go back through update_state_from_outputs.
+        // Skip state outputs — they go back through absorb_outputs.
         if name.starts_with("out_state_") {
             continue;
         }
@@ -539,8 +619,6 @@ fn run_flow_main_step(
     }
     let cond = cond.ok_or("flow_lm_main: no cond output identified")?;
     let eos_logit = eos_logit.ok_or("flow_lm_main: no eos logit output identified")?;
-
-    update_state_from_outputs(state, &outputs, manifest, 2)?;
     Ok((cond, eos_logit))
 }
 
@@ -605,57 +683,176 @@ fn run_flow_step(
 fn run_mimi_decoder(
     session: &mut Session,
     latents: &Array3<f32>,
-    state: &mut StateBuffers,
+    state: &mut LiveState,
     manifest: &[StateSlot],
 ) -> Result<Vec<f32>, String> {
-    let mut inputs = state_inputs(state, manifest)?;
+    let mut inputs = state.take_inputs(manifest, 1)?;
     inputs.insert(
         "latent".into(),
         Tensor::from_array(latents.clone())
             .map_err(|e| format!("wrap latent: {e}"))?
-            .upcast(),
+            .into(),
     );
-    let outputs = session
+    let mut outputs = session
         .run(inputs)
         .map_err(|e| format!("mimi_decoder: {e}"))?;
+    let pcm = extract_mimi_audio(&outputs)?;
+    state.absorb_outputs(&mut outputs, manifest)?;
+    Ok(pcm)
+}
 
-    // Audio is the single non-state output; state outputs begin at offset 1.
-    let audio = outputs.iter().next().ok_or("mimi no outputs")?.1;
-    let (_shape, data) = audio
-        .try_extract_tensor::<f32>()
-        .map_err(|e| format!("extract audio: {e}"))?;
-    let pcm: Vec<f32> = data.to_vec();
+/// Audio is the single non-state output. Identify it by name (any output
+/// that isn't an `out_state_N`) — iteration order over SessionOutputs is
+/// not guaranteed to put it first.
+fn extract_mimi_audio(outputs: &ort::session::SessionOutputs) -> Result<Vec<f32>, String> {
+    for (name, val) in outputs.iter() {
+        if name.starts_with("out_state_") {
+            continue;
+        }
+        let (_shape, data) = val
+            .try_extract_tensor::<f32>()
+            .map_err(|e| format!("extract audio ({name}): {e}"))?;
+        return Ok(data.to_vec());
+    }
+    Err("mimi no audio output".into())
+}
 
-    update_state_from_outputs(state, &outputs, manifest, 1)?;
+/* --- CUDA fast path: device-resident state via IoBinding ---------------- */
+
+/// Drives a stateful session through an ort IoBinding so the state tensors
+/// STAY on the GPU between runs. Without this, every `session.run` pays a
+/// full host↔device round trip of the flow LM's ~50 MB of KV cache — which
+/// erases the entire GPU win (measured RTF ~0.51 unbound-CUDA vs ~0.42
+/// warm CPU on the same box).
+///
+/// The binding's OUTPUTS are cleared and re-bound before EVERY run. ORT
+/// otherwise reuses a binding's output allocations across runs, which
+/// (a) hard-errors when an output's shape changes ("Tensor size mismatch" —
+/// mimi's audio chunks vary in frame count), and (b) would alias a state
+/// input buffer (the previous run's output) with the buffer the current run
+/// writes — corrupting a rolling KV-cache update. Fresh binds force fresh
+/// arena allocations, which the CUDA arena makes effectively free; the old
+/// state values return to the arena as `absorb_outputs` drops them.
+struct BoundStepper {
+    binding: ort::session::IoBinding,
+    out_names: Vec<String>,
+    dev_out: ort::memory::MemoryInfo,
+    cpu_out: ort::memory::MemoryInfo,
+}
+
+impl BoundStepper {
+    fn new(session: &Session, cuda_device: i32) -> Result<Self, String> {
+        use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
+
+        let dev_out = MemoryInfo::new(
+            AllocationDevice::CUDA,
+            cuda_device,
+            AllocatorType::Device,
+            MemoryType::Default,
+        )
+        .map_err(|e| format!("cuda memory info: {e}"))?;
+        let cpu_out = MemoryInfo::new(
+            AllocationDevice::CPU,
+            0,
+            AllocatorType::Device,
+            MemoryType::Default,
+        )
+        .map_err(|e| format!("cpu memory info: {e}"))?;
+        let out_names: Vec<String> = session
+            .outputs()
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+        let binding = session
+            .create_binding()
+            .map_err(|e| format!("create io binding: {e}"))?;
+        Ok(Self {
+            binding,
+            out_names,
+            dev_out,
+            cpu_out,
+        })
+    }
+
+    /// Reset the binding for a fresh run: clear stale input/output binds and
+    /// bind every output to its target device — state stays device-resident;
+    /// everything else (cond, eos logit, audio) is tiny and needs host reads.
+    fn binding_for_run(&mut self) -> Result<&mut ort::session::IoBinding, String> {
+        let binding = &mut self.binding;
+        binding.clear();
+        for name in &self.out_names {
+            let target = if name.starts_with("out_state_") {
+                &self.dev_out
+            } else {
+                &self.cpu_out
+            };
+            binding
+                .bind_output_to_device(name.as_str(), target)
+                .map_err(|e| format!("bind output {name}: {e}"))?;
+        }
+        Ok(binding)
+    }
+}
+
+/// Bound flow_lm_main run — covers both the conditioning pass
+/// (`want_cond = false`, non-state outputs discarded) and the per-frame
+/// generation step (`want_cond = true`).
+fn run_flow_main_bound(
+    session: &mut Session,
+    stepper: &mut BoundStepper,
+    sequence: &Array3<f32>,
+    text_embeddings: &Array3<f32>,
+    state: &mut LiveState,
+    manifest: &[StateSlot],
+    want_cond: bool,
+) -> Result<Option<(Array3<f32>, f32)>, String> {
+    let binding = stepper.binding_for_run()?;
+    let seq = Tensor::from_array(sequence.clone()).map_err(|e| format!("wrap sequence: {e}"))?;
+    binding
+        .bind_input("sequence", &seq)
+        .map_err(|e| format!("bind sequence: {e}"))?;
+    let emb =
+        Tensor::from_array(text_embeddings.clone()).map_err(|e| format!("wrap text_emb: {e}"))?;
+    binding
+        .bind_input("text_embeddings", &emb)
+        .map_err(|e| format!("bind text_emb: {e}"))?;
+    state.bind_inputs(binding, manifest)?;
+    let mut outputs = session
+        .run_binding(binding)
+        .map_err(|e| format!("flow_lm_main (bound): {e}"))?;
+    let result = if want_cond {
+        Some(identify_cond_eos(&outputs)?)
+    } else {
+        None
+    };
+    state.absorb_outputs(&mut outputs, manifest)?;
+    Ok(result)
+}
+
+/// Bound mimi_decoder run — latents in (host), audio out (host), streaming
+/// conv state device-resident.
+fn run_mimi_decoder_bound(
+    session: &mut Session,
+    stepper: &mut BoundStepper,
+    latents: &Array3<f32>,
+    state: &mut LiveState,
+    manifest: &[StateSlot],
+) -> Result<Vec<f32>, String> {
+    let binding = stepper.binding_for_run()?;
+    let lat = Tensor::from_array(latents.clone()).map_err(|e| format!("wrap latent: {e}"))?;
+    binding
+        .bind_input("latent", &lat)
+        .map_err(|e| format!("bind latent: {e}"))?;
+    state.bind_inputs(binding, manifest)?;
+    let mut outputs = session
+        .run_binding(binding)
+        .map_err(|e| format!("mimi_decoder (bound): {e}"))?;
+    let pcm = extract_mimi_audio(&outputs)?;
+    state.absorb_outputs(&mut outputs, manifest)?;
     Ok(pcm)
 }
 
 /* --- helpers ----------------------------------------------------------- */
-
-/// Deep-copy a StateBuffers so the per-utterance flow_state doesn't mutate
-/// the cached voice state in place.
-fn clone_state(src: &StateBuffers) -> StateBuffers {
-    use super::StateValue;
-    let slots = src
-        .slots
-        .iter()
-        .map(|v| match v {
-            StateValue::F32 { data, shape } => StateValue::F32 {
-                data: data.clone(),
-                shape: shape.clone(),
-            },
-            StateValue::I64 { data, shape } => StateValue::I64 {
-                data: data.clone(),
-                shape: shape.clone(),
-            },
-            StateValue::Bool { data, shape } => StateValue::Bool {
-                data: data.clone(),
-                shape: shape.clone(),
-            },
-        })
-        .collect();
-    StateBuffers { slots }
-}
 
 fn first_output_f32_3d(
     outputs: &ort::session::SessionOutputs,
