@@ -109,6 +109,13 @@ pub enum HfpAtCommand {
     /// calls ended with no caller id at all, 2026-07-13), and the +CLCC
     /// response carries the active call's number deterministically.
     ListCurrentCalls,
+    /// `AT+BCC` — HF-initiated codec connection setup (HFP 1.6+). Asks the
+    /// AG to (re)establish the synchronous audio channel; the AG then pages
+    /// the SCO/eSCO link and the existing accept path completes it. Used as
+    /// a self-heal when an ACTIVE call has no audio channel (observed live
+    /// 2026-07-21: an outbound callback answered with sample_rate=0 after a
+    /// rapid teardown race — the phone never re-offered SCO on its own).
+    CodecConnection,
 }
 
 /// One `+CLCC:` line — `<idx>,<dir>,<stat>,<mode>,<mpty>[,"<number>",<type>]`.
@@ -924,6 +931,7 @@ pub fn build_at_command(command: HfpAtCommand) -> Vec<u8> {
         }
         HfpAtCommand::ConfirmCodec(codec) => format!("AT+BCS={}\r", codec),
         HfpAtCommand::ListCurrentCalls => "AT+CLCC\r".to_string(),
+        HfpAtCommand::CodecConnection => "AT+BCC\r".to_string(),
     };
     line.into_bytes()
 }

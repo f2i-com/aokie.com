@@ -264,6 +264,12 @@ impl BluetoothManager {
         self.runtime.query_calls()
     }
 
+    /// `AT+BCC` — ask the phone to (re)establish the call audio channel.
+    /// Best-effort self-heal for an active call with no SCO.
+    pub fn codec_connect(&self) -> Result<(), String> {
+        self.runtime.codec_connect()
+    }
+
     /// AOK-BT-001: open a bounded, discoverable pairing window for `seconds`.
     /// At rest the radio is connectable-only, so an unknown phone can only
     /// pair while this window is open.
