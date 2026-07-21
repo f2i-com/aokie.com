@@ -393,11 +393,29 @@ mod tests {
     /// manifest, and only then get an emit site.
     #[test]
     fn no_raw_event_literals_outside_the_contract() {
-        for (file, src) in [
-            ("radio.rs", include_str!("radio.rs")),
-            ("connector.rs", include_str!("connector.rs")),
-            ("event_bridge.rs", include_str!("event_bridge.rs")),
-        ] {
+        let mut sources: Vec<(String, String)> = vec![
+            ("connector.rs".into(), include_str!("connector.rs").into()),
+            (
+                "event_bridge.rs".into(),
+                include_str!("event_bridge.rs").into(),
+            ),
+        ];
+        // The radio module is a folder of submodules: scan every file in it so
+        // a future submodule can never fall outside this guarantee.
+        let radio_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/radio");
+        for entry in std::fs::read_dir(&radio_dir).expect("read src/radio") {
+            let path = entry.expect("src/radio entry").path();
+            if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let name = format!("radio/{}", path.file_name().unwrap().to_string_lossy());
+                sources.push((name, std::fs::read_to_string(&path).expect("read radio source")));
+            }
+        }
+        assert!(
+            sources.len() > 20,
+            "expected the split radio/ submodules in the scan set, found {} files",
+            sources.len() - 2
+        );
+        for (file, src) in sources {
             let raw = src.matches("\"aokie.").count();
             assert_eq!(
                 raw, 0,

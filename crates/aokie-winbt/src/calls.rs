@@ -3,7 +3,7 @@
 //! ID)", plan §6 Phase 2: "Calls-API call-control engine → RuntimeEvent
 //! parity"). It watches Bluetooth phone lines, tracks every `PhoneCall`, and
 //! emits the same `BluetoothEvent` stream the plugin's voice pipeline already
-//! consumes, so radio.rs runs unchanged on either transport.
+//! consumes, so the plugin's radio module runs unchanged on either transport.
 //!
 //! Threading model: `start()` runs on the crate's MTA worker thread (blocking
 //! `.get()` is fine there). Watcher/`StatusChanged` handlers fire on arbitrary
