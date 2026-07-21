@@ -137,6 +137,14 @@ fn agreement_matches_latest(agreement: &str, latest: &str) -> bool {
     if quoted == trusted {
         return true;
     }
+    // A quote that is a token-bounded PREFIX of the trusted turn is always
+    // aligned: callers split agreements across quick turns ("Yes." then
+    // "Yes, that'd be good."), and the model may quote the first fragment
+    // while the trusted latest turn carries the completed sentence. The
+    // quote still cannot fabricate — it must literally lead the turn.
+    if format!(" {trusted} ").starts_with(&format!(" {quoted} ")) {
+        return true;
+    }
     let quoted_tokens: Vec<&str> = quoted.split(' ').collect();
     let trusted_token_count = trusted.split(' ').count();
     let substantial =
@@ -192,9 +200,9 @@ fn looks_like_question(value: &str) -> bool {
         .any(|prefix| value.starts_with(prefix))
 }
 
-fn is_conservative_agreement(value: &str) -> bool {
+fn contains_negative(value: &str) -> bool {
     let value = normalized_speech(value);
-    let negative = [
+    [
         "don't",
         "do not",
         "not yet",
@@ -209,10 +217,26 @@ fn is_conservative_agreement(value: &str) -> bool {
         "i am not sure",
     ]
     .iter()
-    .any(|needle| value.contains(needle));
-    if negative {
+    .any(|needle| value.contains(needle))
+}
+
+const DAY_WORDS: [&str; 9] = [
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "today",
+    "tomorrow",
+];
+
+pub(crate) fn is_conservative_agreement(value: &str) -> bool {
+    if contains_negative(value) {
         return false;
     }
+    let value = normalized_speech(value);
 
     let direct_booking_request = [
         "book me",
@@ -339,11 +363,13 @@ fn validate_spoken_time(agreement: &str, time: NaiveTime) -> Result<(), String> 
     static SPOKEN_TIME: OnceLock<Regex> = OnceLock::new();
     let regex = SPOKEN_TIME.get_or_init(|| {
         Regex::new(
-            r"(?i)\bat\s+([01]?\d|2[0-3])(?::([0-5]\d))?\s*(a\.?m\.?|p\.?m\.?|o['’]?clock)?\b",
+            r"(?i)\b(?:at|around|about)\s+([01]?\d|2[0-3])(?::([0-5]\d))?\s*(a\.?m\.?|p\.?m\.?|o['’]?clock)?\b",
         )
         .expect("fixed spoken-time regex")
     });
-    let Some(captures) = regex.captures(agreement) else {
+    // The MOST RECENT spoken time wins: the consent window spans a few turns
+    // and the caller may have revised ("at 9... actually around 10").
+    let Some(captures) = regex.captures_iter(agreement).last() else {
         return Ok(());
     };
     let spoken_hour = captures
@@ -415,23 +441,63 @@ pub fn validate(
 
     let (agreement_turn, latest_text) =
         latest_caller_turn.ok_or_else(|| "no final caller agreement is available".to_string())?;
-    if !agreement_matches_latest(&agreement, latest_text) {
+    // Consent evidence spans the last few caller turns: real callers split a
+    // booking across quick fragments ("book a gardening appointment for
+    // Thursday" ... "Susan, and around 10 a.m."), and the provider may quote
+    // any of them. All turns here come from the trusted final transcripts.
+    let mut recent_newest_first: Vec<&str> = vec![latest_text];
+    for turn in caller_history {
+        if recent_newest_first.len() >= 3 {
+            break;
+        }
+        if turn != latest_text {
+            recent_newest_first.push(turn.as_str());
+        }
+    }
+    let joined_chronological = recent_newest_first
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let quote_matches = recent_newest_first
+        .iter()
+        .any(|turn| agreement_matches_latest(&agreement, turn))
+        || agreement_matches_latest(&agreement, &joined_chronological);
+    if !quote_matches {
         return Err(
-            "agreement phrase does not match the latest caller turn; wait for the caller's next \
-             spoken confirmation of the slot, then call this tool again quoting their words"
+            "agreement phrase does not match the caller's recent turns; ask one short natural \
+             confirmation question (never ask the caller to repeat exact wording), then call \
+             this tool again quoting their answer"
                 .into(),
         );
     }
-    if !is_conservative_agreement(latest_text) {
+    // The caller's consent: either the latest turn is itself a clear
+    // agreement, or it is a plain detail turn (names a time/date, no question,
+    // no refusal) completing an explicit booking request made moments before.
+    let latest_is_agreement = is_conservative_agreement(latest_text);
+    let latest_normalized = normalized_speech(latest_text);
+    let latest_is_detail = !looks_like_question(latest_text)
+        && !contains_negative(latest_text)
+        && (latest_normalized
+            .chars()
+            .any(|character| character.is_ascii_digit())
+            || DAY_WORDS.iter().any(|day| latest_normalized.contains(day)));
+    let booking_request_nearby = recent_newest_first.iter().any(|turn| {
+        contains_explicit_appointment_intent(turn)
+            && !looks_like_question(turn)
+            && !contains_negative(turn)
+    });
+    if !(latest_is_agreement || (latest_is_detail && booking_request_nearby)) {
         return Err(
-            "the latest caller turn is not a clear appointment agreement; ask the caller to \
-             confirm the slot plainly (for example: 'Yes, book Thursday at 10 AM'), then call \
-             this tool again"
+            "the caller has not clearly agreed to this slot yet; ask one short natural \
+             confirmation question (for example: 'Shall I put that request in for Thursday at \
+             10?'), then call this tool again"
                 .into(),
         );
     }
-    validate_spoken_date(latest_text, parsed_date, today)?;
-    validate_spoken_time(latest_text, parsed_time)?;
+    validate_spoken_date(&joined_chronological, parsed_date, today)?;
+    validate_spoken_time(&joined_chronological, parsed_time)?;
     if !caller_history
         .iter()
         .any(|turn| contains_explicit_appointment_intent(turn))
@@ -662,6 +728,151 @@ mod tests {
             &fabricated,
             "call_one",
             Some((6, "Yes, book it for Wednesday at 10.")),
+            &["I'd like an appointment.".into()],
+            day(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn split_agreement_prefix_quote_is_accepted() {
+        // Live Susan call: "Yes." (turn 6) then "Yes, that'd be good."
+        // (turn 7) one second apart — the model quoted the first fragment
+        // while the trusted latest turn carried the completed sentence.
+        let request = json!({
+            "callerName": "Susan",
+            "service": "Gardening",
+            "date": "2026-07-24",
+            "time": "12:00",
+            "agreementPhrase": "Yes."
+        });
+        validate(
+            &request,
+            "call_a635c87c5f1e46478250b0cda20d7124",
+            Some((7, "Yes, that'd be good.")),
+            &["I'd like to book a gardening appointment.".into()],
+            day(),
+        )
+        .unwrap();
+
+        // A quote that does not lead the turn still fails closed.
+        let misleading = json!({
+            "callerName": "Susan",
+            "service": "Gardening",
+            "date": "2026-07-24",
+            "time": "12:00",
+            "agreementPhrase": "good"
+        });
+        assert!(validate(
+            &misleading,
+            "call_one",
+            Some((7, "Nothing good about Friday, cancel it all")),
+            &["I'd like to book a gardening appointment.".into()],
+            day(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn details_split_across_turns_complete_an_explicit_booking_request() {
+        // Live Susan call 2: "I'd like to book a gardening appointment for
+        // Thursday." then "Hello, this is" / "Susan, and around 10 a.m."
+        // split across quick turns — the booking must assemble from the
+        // recent window instead of demanding one perfect final sentence.
+        let request = json!({
+            "callerName": "Susan",
+            "service": "Gardening",
+            "date": "2026-07-23",
+            "time": "10:00",
+            "agreementPhrase": "Hello, this is Susan, and around 10 a.m."
+        });
+        let validated = validate(
+            &request,
+            "call_b76c4460a32e4312923f2ebf1954b4a5",
+            Some((5, "Susan, and around 10 a.m.")),
+            &[
+                "Susan, and around 10 a.m.".into(),
+                "Hello, this is".into(),
+                "I'd like to book a gardening appointment for Thursday.".into(),
+            ],
+            day(),
+        )
+        .unwrap();
+        assert_eq!(validated.date, "2026-07-23");
+        assert_eq!(validated.time, "10:00");
+
+        // A conflicting weekday in the window still fails closed.
+        let mut wrong_day = request.clone();
+        wrong_day["date"] = json!("2026-07-24");
+        assert!(validate(
+            &wrong_day,
+            "call_one",
+            Some((5, "Susan, and around 10 a.m.")),
+            &[
+                "Susan, and around 10 a.m.".into(),
+                "I'd like to book a gardening appointment for Thursday.".into(),
+            ],
+            day(),
+        )
+        .is_err());
+
+        // A conflicting spoken time in the window also fails closed.
+        let mut wrong_time = request;
+        wrong_time["time"] = json!("11:00");
+        assert!(validate(
+            &wrong_time,
+            "call_one",
+            Some((5, "Susan, and around 10 a.m.")),
+            &[
+                "Susan, and around 10 a.m.".into(),
+                "I'd like to book a gardening appointment for Thursday.".into(),
+            ],
+            day(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn relative_day_phrases_validate_against_the_resolved_date() {
+        // day() is Monday 2026-07-20: "this Thursday" resolves to 2026-07-23.
+        let request = json!({
+            "callerName": "Lance",
+            "service": "Lawn mowing",
+            "date": "2026-07-23",
+            "time": "14:00",
+            "agreementPhrase": "Yes, book me in for this Thursday at 2pm"
+        });
+        validate(
+            &request,
+            "call_one",
+            Some((6, "Yes, book me in for this Thursday at 2pm")),
+            &["I'd like an appointment.".into()],
+            day(),
+        )
+        .unwrap();
+
+        // The wrong weekday for the resolved date still fails closed.
+        let mut wrong = json!({
+            "callerName": "Lance",
+            "service": "Lawn mowing",
+            "date": "2026-07-24",
+            "time": "14:00",
+            "agreementPhrase": "Yes, book me in for this Thursday at 2pm"
+        });
+        assert!(validate(
+            &wrong,
+            "call_one",
+            Some((6, "Yes, book me in for this Thursday at 2pm")),
+            &["I'd like an appointment.".into()],
+            day(),
+        )
+        .is_err());
+        wrong["date"] = json!("2026-07-23");
+        wrong["time"] = json!("15:00");
+        assert!(validate(
+            &wrong,
+            "call_one",
+            Some((6, "Yes, book me in for this Thursday at 2pm")),
             &["I'd like an appointment.".into()],
             day(),
         )
