@@ -395,16 +395,86 @@ fn validate_spoken_time(agreement: &str, time: NaiveTime) -> Result<(), String> 
     Ok(())
 }
 
+/// The agent read the exact slot back to the caller and the caller's next
+/// final turn is a plain affirmation. The read-back turns come from the
+/// plugin's own transcript of what the assistant SPOKE, so together with the
+/// affirmation they are consent evidence even when the caller never repeated
+/// the details themselves — live call 1ce475b2 (2026-07-21): "was that July
+/// 30 at 3:00 PM?" — "Yeah." could never satisfy the quote fence, and the
+/// recovery attempts died on a transcription mishear ("lawn mowing" heard as
+/// "oral mount"). The read-back must positively name the service, the day
+/// number and the hour, and must not contradict the requested slot.
+fn readback_confirms(
+    assistant_recent: &[String],
+    service: &str,
+    date: NaiveDate,
+    time: NaiveTime,
+    today: NaiveDate,
+) -> bool {
+    let service_tokens: Vec<String> = normalized_speech(service)
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| token.len() > 2)
+        .map(str::to_string)
+        .collect();
+    let hour = time.hour();
+    let hour_12 = if hour % 12 == 0 { 12 } else { hour % 12 };
+    assistant_recent.iter().take(3).any(|turn| {
+        let speech = normalized_speech(turn);
+        let digit_runs: Vec<&str> = speech
+            .split(|character: char| !character.is_ascii_digit())
+            .filter(|run| !run.is_empty())
+            .collect();
+        let service_named = !service_tokens.is_empty()
+            && service_tokens
+                .iter()
+                .all(|token| speech.contains(token.as_str()));
+        let day_named = digit_runs.iter().any(|run| *run == date.day().to_string());
+        let hour_named = digit_runs
+            .iter()
+            .any(|run| *run == hour.to_string() || *run == hour_12.to_string());
+        service_named
+            && day_named
+            && hour_named
+            && validate_spoken_date(&speech, date, today).is_ok()
+            && validate_spoken_time(&speech, time).is_ok()
+    })
+}
+
 /// Validate one fixed `request_appointment` tool invocation.
 ///
-/// `latest_caller_turn` and `caller_history` must come from final transcript
-/// events owned by the plugin. The provider-supplied `agreementPhrase` is an
-/// exact quote used only as a fence; it is never included in the durable event.
+/// Compatibility shape without the assistant read-back evidence — the fence
+/// then relies purely on the caller's own recent turns.
 pub fn validate(
     arguments: &Value,
     call_id: &str,
     latest_caller_turn: Option<(u32, &str)>,
     caller_history: &[String],
+    today: NaiveDate,
+) -> Result<ValidatedAppointmentRequest, String> {
+    validate_with_readback(
+        arguments,
+        call_id,
+        latest_caller_turn,
+        caller_history,
+        &[],
+        today,
+    )
+}
+
+/// Validate one fixed `request_appointment` tool invocation.
+///
+/// `latest_caller_turn` and `caller_history` must come from final transcript
+/// events owned by the plugin; `assistant_recent` is the plugin's transcript
+/// of the assistant's most recent spoken turns (newest first) so a read-back
+/// affirmed by the caller counts as consent. The provider-supplied
+/// `agreementPhrase` is an exact quote used only as a fence; it is never
+/// included in the durable event.
+pub fn validate_with_readback(
+    arguments: &Value,
+    call_id: &str,
+    latest_caller_turn: Option<(u32, &str)>,
+    caller_history: &[String],
+    assistant_recent: &[String],
     today: NaiveDate,
 ) -> Result<ValidatedAppointmentRequest, String> {
     if call_id.is_empty() || call_id.len() > 256 || call_id.chars().any(char::is_control) {
@@ -445,9 +515,12 @@ pub fn validate(
     // booking across quick fragments ("book a gardening appointment for
     // Thursday" ... "Susan, and around 10 a.m."), and the provider may quote
     // any of them. All turns here come from the trusted final transcripts.
+    // Five turns, not three (live call 1ce475b2): the service is often named
+    // once when the booking starts and has scrolled past a 3-turn window by
+    // the time the date/time/confirmation fragments finish.
     let mut recent_newest_first: Vec<&str> = vec![latest_text];
     for turn in caller_history {
-        if recent_newest_first.len() >= 3 {
+        if recent_newest_first.len() >= 5 {
             break;
         }
         if turn != latest_text {
@@ -464,7 +537,9 @@ pub fn validate(
         .iter()
         .any(|turn| agreement_matches_latest(&agreement, turn))
         || agreement_matches_latest(&agreement, &joined_chronological);
-    if !quote_matches {
+    let readback_affirmed = is_conservative_agreement(latest_text)
+        && readback_confirms(assistant_recent, &service, parsed_date, parsed_time, today);
+    if !quote_matches && !readback_affirmed {
         return Err(
             "agreement phrase does not match the caller's recent turns; ask one short natural \
              confirmation question (never ask the caller to repeat exact wording), then call \
@@ -970,5 +1045,107 @@ mod tests {
             day(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_readback_affirmed_by_the_caller_books_despite_a_transcription_mishear() {
+        // Live call 1ce475b2 (2026-07-21): the caller's service words were
+        // misheard ("lawn mowing" -> "oral mount") in every recent turn, but
+        // the agent read the exact slot back and the caller said "Yeah.".
+        let request = validate_with_readback(
+            &json!({
+                "callerName": "Lance",
+                "service": "Lawn mowing",
+                "date": "2026-07-30",
+                "time": "15:00",
+                "agreementPhrase": "Yes, book lawn mowing on July 30 at 3 PM."
+            }),
+            "call_1ce475b28b2b441fa00400639c783c40",
+            Some((13, "Yeah.")),
+            &[
+                "Yeah.".into(),
+                "Oral mount on July 30th, 3 p.m.".into(),
+                "3 p.m.".into(),
+                "Not the 23rd, the 30th.".into(),
+                "Can you please book me an appointment for...".into(),
+            ],
+            &["Okay, so you want July 30 at 3:00 PM for lawn mowing. Was that right?".into()],
+            NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(request.service, "Lawn mowing");
+        assert_eq!(request.date, "2026-07-30");
+    }
+
+    #[test]
+    fn an_affirmation_without_a_slot_readback_never_books() {
+        assert!(validate_with_readback(
+            &json!({
+                "callerName": "Lance",
+                "service": "Lawn mowing",
+                "date": "2026-07-30",
+                "time": "15:00",
+                "agreementPhrase": "Yes, book lawn mowing on July 30 at 3 PM."
+            }),
+            "call_1ce475b28b2b441fa00400639c783c40",
+            Some((13, "Yeah.")),
+            &[
+                "Yeah.".into(),
+                "Oral mount on July 30th, 3 p.m.".into(),
+                "Can you please book me an appointment for...".into(),
+            ],
+            &["Okay, let me get that request placed for you.".into()],
+            NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_readback_for_a_different_slot_never_books() {
+        // The tool asks for 4 PM but the agent only ever read back 3 PM.
+        assert!(validate_with_readback(
+            &json!({
+                "callerName": "Lance",
+                "service": "Lawn mowing",
+                "date": "2026-07-30",
+                "time": "16:00",
+                "agreementPhrase": "Yes, book lawn mowing on July 30 at 4 PM."
+            }),
+            "call_1ce475b28b2b441fa00400639c783c40",
+            Some((13, "Yeah.")),
+            &[
+                "Yeah.".into(),
+                "Can you please book me an appointment for...".into(),
+            ],
+            &["Okay, so you want July 30 at 3:00 PM for lawn mowing. Was that right?".into()],
+            NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_service_turn_four_back_is_still_quotable() {
+        // The widened five-turn window: the booking request that names the
+        // service often scrolls past three turns of date/time fragments.
+        let request = validate(
+            &json!({
+                "callerName": "Lance",
+                "service": "Lawn mowing",
+                "date": "2026-07-30",
+                "time": "15:00",
+                "agreementPhrase": "Book me a lawn mowing appointment please."
+            }),
+            "call_1ce475b28b2b441fa00400639c783c40",
+            Some((13, "Yeah.")),
+            &[
+                "Yeah.".into(),
+                "3 p.m.".into(),
+                "The 30th.".into(),
+                "Book me a lawn mowing appointment please.".into(),
+            ],
+            NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(request.time, "15:00");
     }
 }
