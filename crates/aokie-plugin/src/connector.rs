@@ -512,7 +512,11 @@ impl Plugin {
             .settings
             .get("realtimeMaxOutputTokens")
             .and_then(Value::as_i64)
-            .unwrap_or(384)
+            // 4096 is a runaway ceiling, not a length target. The old 384
+            // default was proven live to truncate ordinary answers:
+            // audio+text output tokens hit exactly 384 mid-reply
+            // (incomplete/max_output_tokens) and the call went silent.
+            .unwrap_or(4096)
             .clamp(64, 4096);
         std::env::set_var(
             "AOKIE_REALTIME_MAX_OUTPUT_TOKENS",
@@ -3147,7 +3151,7 @@ impl Plugin {
                         .settings
                         .get("realtimeMaxOutputTokens")
                         .and_then(Value::as_i64)
-                        .unwrap_or(384)
+                        .unwrap_or(4096)
                         .clamp(64, 4096);
                     std::env::set_var("AOKIE_REALTIME_MAX_OUTPUT_TOKENS", value.to_string());
                 }
