@@ -11645,7 +11645,14 @@ fn run_loop(
                             &name,
                             activity_revision,
                             lane.caller_activity_revision,
-                        ) {
+                        ) && !lane.latest_caller_turn.as_ref().is_some_and(|(_, text)| {
+                            // "Yes." followed a beat later by "Yes, that'd be
+                            // good." must not void the booking: when the
+                            // caller's NEWEST completed turn is itself a clear
+                            // agreement, consent is fresher than the snapshot
+                            // and validate() runs against that newest turn.
+                            crate::realtime_appointment::is_conservative_agreement(text)
+                        }) {
                             completion = Some((
                                 tool_call_id,
                                 name,
