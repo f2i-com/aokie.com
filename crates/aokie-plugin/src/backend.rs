@@ -1,5 +1,5 @@
 //! `RadioBackend` — the transport seam between the plugin's voice pipeline
-//! (`radio.rs`, transport-ignorant) and a phone-link engine. Two backends:
+//! (the `radio` module, transport-ignorant) and a phone-link engine. Two backends:
 //!
 //! - [`UsbRadioBackend`] — the WinUSB dongle runtime (full AT/HFP control:
 //!   switchboard, call waiting, codec forcing). Today this is the only
