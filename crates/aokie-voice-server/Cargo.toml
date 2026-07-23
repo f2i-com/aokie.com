@@ -3,6 +3,7 @@ name = "aokie-voice-server"
 description = "Loopback-only OpenAI-compatible STT/TTS HTTP service for Aokie's local ONNX voice runtimes."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

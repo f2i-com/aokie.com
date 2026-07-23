@@ -45,6 +45,9 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# MSRV (audit AK-19) — verified with cargo +1.88.0 check on the shipping crates;
+# the -Msrv gate in scripts/check-release.ps1 re-verifies.
+rust-version = "1.88"
 license = "LicenseRef-Proprietary"
 publish = false
 

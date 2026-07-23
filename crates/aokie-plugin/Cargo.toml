@@ -3,6 +3,7 @@ name = "aokie-plugin"
 description = "Aokie as a FormLogic Desktop plugin: JSON-RPC 2.0 NDJSON process over stdio (docs/FORMLOGIC_PLUGIN_CONTRACT.md). Binary entry per manifest.json; all native logic lives in aokie-core."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

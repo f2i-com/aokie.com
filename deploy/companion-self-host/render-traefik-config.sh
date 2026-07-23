@@ -18,6 +18,11 @@ printf '%s' "$ACME_EMAIL" | grep -Eq '^[A-Za-z0-9.!#$%&*+/=?^_`{|}~-]+@[A-Za-z0-
   || fail "ACME_EMAIL is not a safe email address"
 
 umask 077
+# In the container these are the mounted /templates and /rendered volumes;
+# render-test.sh (audit AK-14) overrides them to exercise this exact script
+# against temp dirs.
+TEMPLATE_DIR="${TEMPLATE_DIR:-/templates}"
+RENDER_DIR="${RENDER_DIR:-/rendered}"
 # Audit AK-14: an email local part may legally contain `/` and `&` — both are
 # sed metacharacters in an s/// replacement (`/` breaks the delimiter, `&`
 # expands to the matched placeholder). Splice with awk index/substr instead,
@@ -29,7 +34,7 @@ awk -v repl="$ACME_EMAIL" '{
     $0 = substr($0, 1, i - 1) repl substr($0, i + 14)
   }
   print
-}' /templates/traefik-static.template.yml > /rendered/traefik.yml
+}' "$TEMPLATE_DIR/traefik-static.template.yml" > "$RENDER_DIR/traefik.yml"
 sed -e "s/__SIGNAL_HOST__/$SIGNAL_HOST/g" -e "s/__TURN_HOST__/$TURN_HOST/g" \
-  /templates/traefik-dynamic.template.yml > /rendered/dynamic.yml
-chmod 0600 /rendered/traefik.yml /rendered/dynamic.yml
+  "$TEMPLATE_DIR/traefik-dynamic.template.yml" > "$RENDER_DIR/dynamic.yml"
+chmod 0600 "$RENDER_DIR/traefik.yml" "$RENDER_DIR/dynamic.yml"

@@ -1,0 +1,71 @@
+name: Self-host smoke
+
+# Audit AK-14: nothing previously built the self-host Dockerfile, validated
+# the Compose files, or booted the local profile — the exact container
+# artifact (with its own --locked dependency graph) was never exercised.
+# Manual dispatch only, matching this repo's paused-CI usage policy.
+#
+# Scope: template rendering acceptance, compose config validation (both
+# profiles), image build with --pull, local-profile boot to HEALTHY (the
+# coturn healthcheck performs a real STUN transaction), gateway /version,
+# container-lock cargo audit, teardown. The full WebSocket handshake +
+# forced-relay TURN allocation remains the labelled manual step
+# (deploy/companion-self-host/test-forced-relay.ps1).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selfhost:
+    name: self-host container smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/companion-self-host
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Render acceptance (AK-14 email escaping)
+        run: sh render-test.sh
+
+      - name: Temporary secrets
+        run: |
+          umask 077
+          openssl rand -hex 32 > secrets/admission-hmac.txt
+          openssl rand -hex 32 > secrets/lease-hmac.txt
+          openssl rand -hex 32 > secrets/turn-rest.txt
+
+      - name: Compose config — public profile
+        run: |
+          SIGNAL_HOST=signal.example.com TURN_HOST=turn.example.com \
+          ACME_EMAIL=ops/turn@example.com TURN_REALM=turn.example.com \
+          TURN_EXTERNAL_IPV4=203.0.113.10 \
+          docker compose -f compose.yaml config --quiet
+
+      - name: Compose config — local profile
+        run: docker compose -f compose.local.yaml config --quiet
+
+      - name: Build gateway image (--pull, container-locked graph)
+        # The compose file owns the build context (repo root) and RUST_VERSION
+        # build arg — building through it is what production does.
+        run: AOKIE_IMAGE_TAG=smoke docker compose -f compose.local.yaml build --pull
+
+      - name: Boot local profile to healthy
+        run: |
+          AOKIE_IMAGE_TAG=smoke docker compose -f compose.local.yaml up -d --no-build --wait --wait-timeout 120
+
+      - name: Gateway /version
+        run: |
+          curl --fail --silent --show-error http://127.0.0.1:18788/version
+          echo
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f compose.local.yaml down -v --remove-orphans
+
+      - name: Audit the container lockfile (RustSec)
+        run: |
+          docker run --rm -v "$PWD/container-workspace:/w" -w /w rust:1.92.0-slim sh -c \
+            'cargo install cargo-audit --locked >/dev/null 2>&1 && cargo audit'
