@@ -1,20 +1,9 @@
 # cargo-audit configuration (supply-chain gate, audit AOK-CI-001).
 #
-# Advisories accepted here are transitive and cannot be resolved without a
-# dependency migration tracked separately; every NEW advisory still fails CI.
+# Audit AK-12 (2026-07-23): the reqwest 0.11 → 0.12 migration removed the
+# rustls 0.21 / rustls-webpki 0.101.7 stack, so the three RUSTSEC ignores that
+# lived here (2026-0098/-0099/-0104) are GONE — every advisory fails CI again.
 [advisories]
-ignore = [
-    # rustls-webpki 0.101.7 is pulled ONLY by reqwest 0.11 (→ rustls 0.21 →
-    # webpki 0.101). The plugin already carries a patched webpki 0.103 for the
-    # rest of the tree; only reqwest's TLS stack is behind. These three affect
-    # certificate name-constraint handling and CRL parsing on OUTBOUND HTTPS to
-    # the operator's OWN configured AI/STT/TTS endpoints (not an internet-facing
-    # server accepting untrusted certificates), so the practical exposure is low.
-    # Tracked for resolution by upgrading reqwest 0.11 -> 0.12 (rustls 0.23 /
-    # webpki 0.103), which is an API migration that needs its own build+test pass.
-    "RUSTSEC-2026-0098", # name constraints for URI names incorrectly accepted
-    "RUSTSEC-2026-0099", # name constraints accepted for a wildcard certificate
-    "RUSTSEC-2026-0104", # reachable panic in certificate revocation list parsing
-]
+ignore = []
 # Unmaintained crates (backoff, instant, paste, rustls-pemfile) surface as
 # non-failing warnings — left visible so they are not forgotten.
