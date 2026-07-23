@@ -17,7 +17,7 @@ serde_json = { workspace = true }
 async-trait = "0.1"
 # HTTP LLM adapter (streaming SSE) + the llama-server readiness probe.
 # rustls-tls keeps it off system OpenSSL; `stream` powers the SSE body.
-reqwest = { version = "0.11", default-features = false, features = ["stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 # `futures::StreamExt` over the reqwest byte stream in the HTTP adapter.
 futures = "0.3"
 # `tokio::time` for the sidecar readiness poll; `sync::Mutex` for the
