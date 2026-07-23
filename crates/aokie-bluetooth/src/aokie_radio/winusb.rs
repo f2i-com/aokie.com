@@ -763,37 +763,79 @@ unsafe fn register_isoch_buffer(
     Ok(WinUsbIsochBuffer { handle, storage })
 }
 
-/// Cancel the in-flight overlapped I/O backed by `overlapped` and
-/// block until cancellation completes. After this returns the OS no
-/// longer holds a pointer into the overlapped struct, so the caller
-/// can safely let it go out of scope. Errors are best-effort logged
-/// — there's nothing useful to do with a cancellation failure
-/// because the alternative (returning while the I/O is still
-/// pending) is unsound.
+/// Cancel the in-flight overlapped I/O backed by `overlapped` and block
+/// — BOUNDED — until cancellation provably completes (audit AK-01).
+///
+/// `device` is the REAL `CreateFileW` file handle: `CancelIoEx` is
+/// documented against the file handle, and the opaque WinUSB interface
+/// handle this function used to cast into it is NOT a kernel handle —
+/// those cancels silently targeted nothing, so the following
+/// `bWait=TRUE` drain could hang SCO teardown forever. `interface` is
+/// the WinUSB interface handle, used only for
+/// `WinUsb_GetOverlappedResult` (which deliberately takes the opaque
+/// handle). Taking BOTH as distinct parameter types keeps the two from
+/// being confused again at this seam.
+///
+/// Returns `true` when the OS-side pointer into `overlapped` is
+/// PROVABLY retired — only then may the caller reuse the slot or free
+/// its backing storage. Returns `false` when completion could not be
+/// proven within the bound: the caller must treat the slot as poisoned
+/// and LEAK its storage rather than reuse or free it (a kernel
+/// completion write into freed memory corrupts the heap).
 unsafe fn cancel_and_drain_overlapped(
+    device: HANDLE,
     interface: WINUSB_INTERFACE_HANDLE,
     overlapped: &OVERLAPPED,
     operation: &str,
-) {
-    let _ = CancelIoEx(interface as HANDLE, overlapped);
-    // Block synchronously for cancellation to retire the OS-side
-    // pointer to `overlapped`. bWait = TRUE on
-    // WinUsb_GetOverlappedResult does exactly that — if the cancel
-    // already raced to completion this returns immediately.
-    let mut transferred = 0;
-    let ok = WinUsb_GetOverlappedResult(interface, overlapped, &mut transferred, 1);
-    if ok == 0 {
+) -> bool {
+    /// winerror.h ERROR_NOT_FOUND: no pending I/O matched — it already
+    /// completed, which is fine (the drain below retires it instantly).
+    const ERROR_NOT_FOUND_CANCEL: u32 = 1168;
+    if CancelIoEx(device, overlapped) == 0 {
         let err = GetLastError();
-        // ERROR_OPERATION_ABORTED (995) is the expected outcome of a
-        // cancel — anything else means the I/O may still be live, so
-        // surface it so we don't quietly mask a stuck endpoint.
-        if err != 995 {
+        if err != ERROR_NOT_FOUND_CANCEL {
             eprintln!(
-                "[AokieRadio] {} cancel/drain failed: Win32 error {}",
+                "[AokieRadio] {} CancelIoEx failed: Win32 error {}",
                 operation, err
             );
         }
     }
+    // Bounded drain on the slot's completion event (every submit sets
+    // overlapped.hEvent) instead of WinUsb_GetOverlappedResult(bWait=1),
+    // which blocks indefinitely when a cancel is not honoured. 2s is far
+    // beyond any real SCO completion latency.
+    if !overlapped.hEvent.is_null() {
+        let wait = WaitForSingleObject(overlapped.hEvent, 2_000);
+        if wait != WAIT_OBJECT_0 {
+            eprintln!(
+                "[AokieRadio] {} cancellation did not complete within 2s (wait={}) — slot poisoned",
+                operation, wait
+            );
+            return false;
+        }
+    }
+    let mut transferred = 0;
+    let ok = WinUsb_GetOverlappedResult(interface, overlapped, &mut transferred, 0);
+    if ok == 0 {
+        let err = GetLastError();
+        // ERROR_OPERATION_ABORTED (995) is the expected outcome of a
+        // cancel. ERROR_IO_INCOMPLETE (996) after a signalled event means
+        // completion is NOT proven — poison the slot.
+        if err == 996 {
+            eprintln!(
+                "[AokieRadio] {} drain: event signalled but I/O still incomplete — slot poisoned",
+                operation
+            );
+            return false;
+        }
+        if err != 995 {
+            eprintln!(
+                "[AokieRadio] {} cancel/drain completed with Win32 error {}",
+                operation, err
+            );
+        }
+    }
+    true
 }
 
 /// Prime the kernel's iso scheduling clock for `handle`. BTstack
@@ -1088,6 +1130,7 @@ fn log_sco_rx_drain_diag(
 /// to empty.
 fn drain_sco_out_completions(
     buffers: &mut ScoIsochBuffers,
+    device: HANDLE,
     interface: WINUSB_INTERFACE_HANDLE,
     blocking: bool,
 ) -> Result<(), String> {
@@ -1137,16 +1180,26 @@ fn drain_sco_out_completions(
                 break;
             }
             WAIT_TIMEOUT => {
-                // Blocking wait timed out. Cancel the I/O and
-                // synchronously drain the cancellation so the
-                // OS-side pointer to our boxed OVERLAPPED is
-                // retired before we re-use the slot.
-                unsafe {
+                // Blocking wait timed out. Cancel the I/O and drain the
+                // cancellation (bounded) so the OS-side pointer to our
+                // boxed OVERLAPPED is retired before we re-use the slot.
+                let retired = unsafe {
                     cancel_and_drain_overlapped(
+                        device,
                         interface,
                         buffers.out_slots[drain_idx].overlapped.as_ref(),
                         "HCI SCO isoch write (slot)",
-                    );
+                    )
+                };
+                if !retired {
+                    // Completion unproven (audit AK-01): the slot may still
+                    // be written by the kernel — NEVER mark it free. Leave
+                    // it in_use so teardown re-attempts (and leaks the ring
+                    // if still unproven) instead of reusing the storage.
+                    return Err(format!(
+                        "SCO out slot {} could not be cancelled — stream halted pending teardown",
+                        drain_idx
+                    ));
                 }
                 buffers.out_slots[drain_idx].in_use = false;
                 buffers.out_pending -= 1;
@@ -1642,17 +1695,21 @@ impl AokieHciTransport {
         // OVERLAPPED structs, and dropping them while I/O is in
         // flight would corrupt heap memory the next time the OS
         // wrote completion data into them.
+        let mut all_retired = true;
         if let Some(buffers) = self.sco_isoch_buffers.as_mut() {
+            let device = self._device.0;
             let interface = associated.0;
             for slot in &mut buffers.out_slots {
                 if slot.in_use {
-                    unsafe {
+                    let retired = unsafe {
                         cancel_and_drain_overlapped(
+                            device,
                             interface,
                             slot.overlapped.as_ref(),
                             "HCI SCO isoch write (teardown)",
-                        );
-                    }
+                        )
+                    };
+                    all_retired &= retired;
                     slot.in_use = false;
                 }
             }
@@ -1660,19 +1717,33 @@ impl AokieHciTransport {
 
             for slot in &mut buffers.in_slots {
                 if slot.in_use {
-                    unsafe {
+                    let retired = unsafe {
                         cancel_and_drain_overlapped(
+                            device,
                             interface,
                             slot.overlapped.as_ref(),
                             "HCI SCO isoch read (teardown)",
-                        );
-                    }
+                        )
+                    };
+                    all_retired &= retired;
                     slot.in_use = false;
                 }
             }
             buffers.in_pending = 0;
         }
-        self.sco_isoch_buffers = None;
+        if all_retired {
+            self.sco_isoch_buffers = None;
+        } else if let Some(buffers) = self.sco_isoch_buffers.take() {
+            // Completion unproven for at least one slot (audit AK-01): the
+            // kernel may still write into this ring's OVERLAPPED/storage.
+            // Deliberately LEAK the whole ring (a few KiB, once, on an
+            // already-pathological teardown) rather than free memory the
+            // OS can still touch — that is the use-after-free path.
+            eprintln!(
+                "[AokieRadio] SCO teardown: cancellation unproven — leaking the isoch ring instead of freeing it"
+            );
+            std::mem::forget(buffers);
+        }
         unsafe { set_current_alternate_setting(associated.0, 0)? };
         self.pipes.sco_in = None;
         self.pipes.sco_out = None;
@@ -2171,6 +2242,9 @@ impl AokieHciTransport {
         // Control handle for the iso-frame-clock prime BTstack issues
         // before every WriteIsochPipeAsap (`hci_transport_h2_winusb.c:1428`).
         let parent = self.pipe_handle(InterfaceSlot::Control)?;
+        // The REAL file handle — CancelIoEx wants this, never the opaque
+        // WinUSB interface handle (audit AK-01).
+        let device = self._device.0;
         let Some(buffers) = self.sco_isoch_buffers.as_mut() else {
             return Err("HCI SCO isochronous buffers are not registered".to_string());
         };
@@ -2184,14 +2258,14 @@ impl AokieHciTransport {
 
         // Reap any completions opportunistically — non-blocking, just
         // to keep the ring as empty as possible before we add to it.
-        drain_sco_out_completions(buffers, interface, false)?;
+        drain_sco_out_completions(buffers, device, interface, false)?;
 
         // If the ring is still full, block on the oldest in-flight
         // slot. This is the natural backpressure that paces our
         // submissions to the controller's SCO link rate without
         // having to track Number_Of_Completed_Packets.
         if buffers.out_pending >= buffers.out_slots.len() {
-            drain_sco_out_completions(buffers, interface, true)?;
+            drain_sco_out_completions(buffers, device, interface, true)?;
         }
 
         let slot_idx = buffers.out_write_idx;

@@ -22,50 +22,36 @@
 //! re-resolving per utterance.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-static CACHE: OnceLock<Mutex<HashMap<(String, u64, u64), reqwest::blocking::Client>>> =
-    OnceLock::new();
+/// Cached pinned client + when its DNS resolution happened (audit AK-13).
+struct CachedClient {
+    client: reqwest::blocking::Client,
+    resolved_at: std::time::Instant,
+}
 
-/// True only for addresses that are legitimately "the public internet": rejects loopback,
-/// private (RFC 1918 / fc00::/7), link-local (incl. the 169.254.169.254 metadata service),
-/// multicast, broadcast, unspecified and IPv4-mapped forms of any of those.
+/// How long one pinned resolution stays live (audit AK-13). Within the TTL a
+/// call keeps its stable, validated address (the whole point of pinning); after
+/// it, the next request re-resolves and re-validates so legitimate DNS
+/// rotation/failover is honoured without a process restart. Five minutes
+/// comfortably covers a call while still tracking endpoint DNS.
+const CLIENT_TTL: Duration = Duration::from_secs(300);
+
+static CACHE: OnceLock<Mutex<HashMap<(String, u64, u64), CachedClient>>> = OnceLock::new();
+
+/// True only for addresses that are legitimately "the public internet".
+///
+/// Audit AK-06: delegates to the ONE IANA-based classifier in
+/// `aokie_core::url_classification` — the same verdict the settings-time
+/// classification uses, so the two policies can never drift. That shared
+/// classifier also decodes translation/transition forms (IPv4-mapped, NAT64
+/// `64:ff9b::/96`, 6to4 `2002::/16`) and judges the EMBEDDED IPv4, and
+/// rejects Teredo, documentation, ORCHID, benchmarking, CGNAT, and the other
+/// special-purpose ranges outright.
 pub fn ip_is_public_unicast(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => ipv4_is_public_unicast(v4),
-        IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return ipv4_is_public_unicast(mapped);
-            }
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || is_unique_local_v6(&v6)
-                || is_link_local_v6(&v6))
-        }
-    }
-}
-
-fn ipv4_is_public_unicast(v4: Ipv4Addr) -> bool {
-    !(v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_multicast()
-        || v4.is_broadcast()
-        || v4.is_unspecified()
-        || v4.is_documentation()
-        // 100.64.0.0/10 (CGNAT) — "inside the carrier", never a legitimate AI endpoint.
-        || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64))
-}
-
-fn is_unique_local_v6(v6: &Ipv6Addr) -> bool {
-    (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7
-}
-
-fn is_link_local_v6(v6: &Ipv6Addr) -> bool {
-    (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10
+    aokie_core::url_classification::ip_is_global_unicast(ip)
 }
 
 /// Build (or fetch the cached) hardened client for `endpoint`. `Err` means the endpoint
@@ -86,9 +72,19 @@ pub fn client_for(
         connect_timeout.map(|c| c.as_millis() as u64).unwrap_or(0),
     );
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(map) = cache.lock() {
-        if let Some(client) = map.get(&key) {
-            return Ok(client.clone());
+    if let Ok(mut map) = cache.lock() {
+        match map.get(&key) {
+            // Fresh pin: keep the validated address stable (one call, one address).
+            Some(cached) if cached.resolved_at.elapsed() < CLIENT_TTL => {
+                return Ok(cached.client.clone());
+            }
+            // Expired pin (audit AK-13): drop it so the rebuild below re-resolves
+            // and re-validates — endpoint DNS rotation/failover is honoured
+            // instead of being pinned for the process lifetime.
+            Some(_) => {
+                map.remove(&key);
+            }
+            None => {}
         }
     }
 
@@ -140,12 +136,21 @@ pub fn client_for(
         .build()
         .map_err(|e| format!("could not build HTTP client: {e}"))?;
     if let Ok(mut map) = cache.lock() {
-        // Bound the cache: endpoints are operator-configured, so a handful is normal —
-        // wholesale churn (tests, fuzzing) must not grow it without limit.
+        // Bound the cache: evict expired pins first (audit AK-13), then fall
+        // back to the wholesale clear so churn (tests, fuzzing) stays bounded.
         if map.len() > 32 {
-            map.clear();
+            map.retain(|_, cached| cached.resolved_at.elapsed() < CLIENT_TTL);
+            if map.len() > 32 {
+                map.clear();
+            }
         }
-        map.insert(key, client.clone());
+        map.insert(
+            key,
+            CachedClient {
+                client: client.clone(),
+                resolved_at: std::time::Instant::now(),
+            },
+        );
     }
     Ok(client)
 }

@@ -117,13 +117,21 @@ fn log_file() -> Option<&'static Mutex<std::fs::File>> {
     LOG_FILE
         .get_or_init(|| {
             let path = std::env::temp_dir().join("aokie-driver-helper.log");
-            // Truncate per-run: the dispatcher can read it after the
-            // helper exits to surface failures; we don't want stale
-            // lines from a previous install confusing diagnosis.
+            // Audit AK-02: this helper runs ELEVATED while %TEMP% stays writable
+            // by the same user's unelevated processes — a pre-created symlink,
+            // junction, or hardlink at this predictable name would turn the old
+            // truncate-open into an elevated write primitive on a protected
+            // file. Never open a pre-existing object here: delete whatever sits
+            // at the path (remove_file removes the LINK itself, never its
+            // target; a junction/dir makes it fail) and require EXCLUSIVE
+            // creation. Any failure degrades to stdout/stderr-only logging —
+            // the dispatcher still gets the console stream, and the fresh-file
+            // requirement also keeps stale lines from a previous run out of
+            // diagnosis.
+            let _ = std::fs::remove_file(&path);
             std::fs::OpenOptions::new()
-                .create(true)
                 .write(true)
-                .truncate(true)
+                .create_new(true)
                 .open(&path)
                 .ok()
                 .map(Mutex::new)
@@ -223,16 +231,6 @@ fn run() -> Result<(), String> {
 /// (or be blocked from) an otherwise-valid job, so failures degrade to the
 /// per-run log only.
 fn transaction_log(mode: &str, detail: &str) {
-    let dir = match program_data_dir() {
-        Ok(path) => path.join("Aokie"),
-        Err(error) => {
-            log_err!(
-                "[aokie-driver-helper] transaction journal unavailable: {}",
-                error
-            );
-            return;
-        }
-    };
     let entry = format!(
         "{{\"at\":{:?},\"pid\":{},\"mode\":{:?},\"detail\":{:?}}}",
         chrono::Local::now().to_rfc3339(),
@@ -240,15 +238,31 @@ fn transaction_log(mode: &str, detail: &str) {
         mode,
         detail
     );
-    let write = std::fs::create_dir_all(&dir).and_then(|()| {
-        use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("driver-transactions.jsonl"))?;
-        writeln!(f, "{}", entry)?;
-        f.flush()
-    });
+    // Audit AK-02: %ProgramData% subdirectories are user-creatable, so both the
+    // Aokie folder AND the journal file are attacker-pre-creatable objects at an
+    // elevation boundary. The directory is created with the same SYSTEM/Admins-
+    // only DACL as the install staging dir (or validated when it already
+    // exists), and the journal is opened no-follow and verified to be a plain
+    // file — a wrong owner, a reparse point anywhere, or a non-file object
+    // refuses journaling (the per-run log still records the entry).
+    let dir = match validated_journal_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            log_err!(
+                "[aokie-driver-helper] transaction journal unavailable ({}): {}",
+                error,
+                entry
+            );
+            return;
+        }
+    };
+    let write = open_journal_file_no_follow(&dir.join("driver-transactions.jsonl")).and_then(
+        |mut f| {
+            use std::io::Write as _;
+            writeln!(f, "{}", entry)?;
+            f.flush()
+        },
+    );
     if let Err(e) = write {
         log_err!(
             "[aokie-driver-helper] transaction journal write failed ({}): {}",
@@ -256,6 +270,146 @@ fn transaction_log(mode: &str, detail: &str) {
             entry
         );
     }
+}
+
+/// Resolve (creating if needed) %ProgramData%\Aokie with a protected DACL.
+/// A pre-existing directory must be a real directory (no reparse point) and
+/// owned by SYSTEM or the Administrators group — an attacker-planted folder
+/// (permissive DACL, junction, or foreign owner) refuses journaling entirely
+/// rather than handing an elevated append primitive to its planter (AK-02).
+fn validated_journal_dir() -> Result<PathBuf, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let dir = program_data_dir()?.join("Aokie");
+    let sddl: Vec<u16> = "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(format!(
+            "journal security descriptor: Win32 error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    let mut security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let created = unsafe { CreateDirectoryW(wide.as_ptr(), &mut security) } != 0;
+    let create_error = if created { 0 } else { unsafe { GetLastError() } };
+    unsafe {
+        LocalFree(descriptor as _);
+    }
+    if created {
+        return Ok(dir);
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    if create_error != ERROR_ALREADY_EXISTS {
+        return Err(format!(
+            "create protected journal directory: Win32 error {}",
+            create_error
+        ));
+    }
+
+    // Existing directory: must be a plain directory (never a reparse point)…
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let meta = std::fs::symlink_metadata(&dir)
+        .map_err(|e| format!("stat journal directory: {}", e))?;
+    if !meta.is_dir() {
+        return Err("journal path is not a directory".to_string());
+    }
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("journal directory is a reparse point".to_string());
+        }
+    }
+    // …and owned by SYSTEM or Administrators (the owners our own creation
+    // paths produce). A foreign owner means it was planted pre-elevation.
+    if !path_owned_by_system_or_admins(&dir)? {
+        return Err("journal directory has an untrusted owner".to_string());
+    }
+    Ok(dir)
+}
+
+/// True when `path`'s owner SID is LocalSystem or BUILTIN\Administrators.
+fn path_owned_by_system_or_admins(path: &Path) -> Result<bool, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        OWNER_SECURITY_INFORMATION,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut owner_sid = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner_sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(format!("read journal directory owner: Win32 error {}", status));
+    }
+    let trusted = unsafe {
+        IsWellKnownSid(owner_sid, WinLocalSystemSid) != 0
+            || IsWellKnownSid(owner_sid, WinBuiltinAdministratorsSid) != 0
+    };
+    unsafe {
+        LocalFree(descriptor as _);
+    }
+    Ok(trusted)
+}
+
+/// Open the journal for append WITHOUT following a reparse point, and verify
+/// the opened object is a plain file. A symlink pre-planted at the journal
+/// name is opened as the link object itself (never its target) and refused by
+/// the attribute check (AK-02).
+fn open_journal_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other("journal file is a reparse point"));
+    }
+    if !meta.is_file() {
+        return Err(std::io::Error::other("journal path is not a plain file"));
+    }
+    Ok(f)
 }
 
 /// DRIVER-001: install jobs carry every exact-target field, non-empty and

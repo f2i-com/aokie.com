@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Detached audio-transcript corrections deliberately yield to the live reply
 /// lane. Keep `call.ended` immediate for lifecycle consumers, then emit one
@@ -142,6 +143,51 @@ pub(super) fn transcript_correction_started(call_id: &str) {
 #[cfg(feature = "voice")]
 pub(super) fn transcript_correction_finished(call_id: &str) {
     TRANSCRIPT_SETTLEMENTS.with(|tracker| tracker.borrow_mut().correction_finished(call_id));
+}
+
+/// Concurrency ceiling for correction workers (audit AK-07): the live reply
+/// lane always wins the GPU — two background corrections in flight is plenty,
+/// anything beyond it is dropped (never queued: a queued correction of a
+/// minutes-old turn has no value and still pins its PCM copy).
+pub(super) const MAX_CONCURRENT_CORRECTIONS: usize = 2;
+static ACTIVE_CORRECTIONS: AtomicUsize = AtomicUsize::new(0);
+static DROPPED_CORRECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// RAII permit against [`ACTIVE_CORRECTIONS`] — released on every worker exit
+/// path (audit AK-07), so a panicking worker can never leak the slot.
+pub(super) struct CorrectionPermit;
+
+impl CorrectionPermit {
+    pub(super) fn try_acquire() -> Option<Self> {
+        let acquired = ACTIVE_CORRECTIONS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                (active < MAX_CONCURRENT_CORRECTIONS).then_some(active + 1)
+            })
+            .is_ok();
+        acquired.then_some(CorrectionPermit)
+    }
+}
+
+impl Drop for CorrectionPermit {
+    fn drop(&mut self) {
+        ACTIVE_CORRECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Total corrections dropped at the cap — visible in logs for tuning.
+pub(super) fn dropped_corrections() -> u64 {
+    DROPPED_CORRECTIONS.load(Ordering::Relaxed)
+}
+
+/// Origin + path only (audit AK-10): configured endpoints may carry API
+/// tokens or tenant ids in the query string — strip query and fragment
+/// before anything reaches a log line. The request itself still uses the
+/// full configured URL.
+pub(super) fn redact_endpoint_for_log(endpoint: &str) -> String {
+    let end = endpoint
+        .find(['?', '#'])
+        .unwrap_or(endpoint.len());
+    endpoint[..end].to_string()
 }
 
 /// PII gate for conversation content in logs (audit PRIV-001/C-06): stderr is
@@ -297,6 +343,19 @@ pub(super) fn maybe_spawn_transcript_correction(
         correction_context.push_str(&dialogue);
     }
 
+    // Bounded executor (audit AK-07): each worker holds a PCM copy, an OS
+    // thread, and eventually a GPU/HTTP inference slot. A long or rapid call
+    // must not accumulate an unbounded pile of those — at the cap this turn's
+    // correction is DROPPED (the original STT stands; corrections are
+    // best-effort polish), counted, and the radio thread never blocks.
+    let Some(permit) = CorrectionPermit::try_acquire() else {
+        let dropped = DROPPED_CORRECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!(
+            "[aokie-plugin] audio transcript check dropped [turn {turn}]: {MAX_CONCURRENT_CORRECTIONS} corrections already in flight ({dropped} dropped total)"
+        );
+        return false;
+    };
+
     let call_id = call_id.to_string();
     let stt = stt.to_string();
     let tx = heard_tx.clone();
@@ -308,6 +367,9 @@ pub(super) fn maybe_spawn_transcript_correction(
     let spawned = std::thread::Builder::new()
         .name(format!("aokie-transcript-{turn}"))
         .spawn(move || {
+            // The permit lives for the WHOLE worker (sleep + inference) and is
+            // released on every exit path, including panics.
+            let _permit = permit;
             // Yield the GPU to the live reply first. Corrections update the
             // transcript in place, so a short delay is preferable to making
             // the caller wait for an answer.
@@ -324,8 +386,12 @@ pub(super) fn maybe_spawn_transcript_correction(
                         .ok()
                         .map(|model| model.trim().to_string())
                         .filter(|model| !model.is_empty());
+                    // Audit AK-10: log only the redacted origin+path — a
+                    // query-string API token or tenant id in the configured
+                    // endpoint must never enter the plugin/Desktop logs.
                     eprintln!(
-                        "[aokie-plugin] transcript corrections → separate endpoint {endpoint}"
+                        "[aokie-plugin] transcript corrections → separate endpoint {}",
+                        redact_endpoint_for_log(&endpoint)
                     );
                     Some(crate::agent::LlmClient::new(endpoint, model))
                 });
@@ -435,7 +501,7 @@ pub(super) mod heard_context_tests {
 
 #[cfg(all(test, feature = "voice"))]
 pub(super) mod sanitize_heard_tests {
-    use super::sanitize_heard;
+    use super::{redact_endpoint_for_log, sanitize_heard, CorrectionPermit};
 
     #[test]
     fn plain_correction_passes_collapsed() {
@@ -500,6 +566,40 @@ pub(super) mod sanitize_heard_tests {
         assert_eq!(
             sanitize_heard("next Tuesday please", "nex"),
             Some("next Tuesday please".to_string())
+        );
+    }
+
+    /// Audit AK-07: at most MAX_CONCURRENT_CORRECTIONS workers hold permits,
+    /// and a dropped permit frees its slot (RAII — panics included).
+    #[test]
+    fn correction_permits_are_bounded_and_raii() {
+        let a = CorrectionPermit::try_acquire().expect("first permit");
+        let b = CorrectionPermit::try_acquire().expect("second permit");
+        assert!(
+            CorrectionPermit::try_acquire().is_none(),
+            "the third concurrent correction must be refused"
+        );
+        drop(a);
+        let c = CorrectionPermit::try_acquire().expect("released slot is reusable");
+        drop(b);
+        drop(c);
+    }
+
+    /// Audit AK-10: neither the query string (tokens) nor the fragment may
+    /// survive into a log line.
+    #[test]
+    fn endpoint_log_redaction_strips_query_and_fragment() {
+        assert_eq!(
+            redact_endpoint_for_log("https://host/v1/chat?token=secret#x"),
+            "https://host/v1/chat"
+        );
+        assert_eq!(
+            redact_endpoint_for_log("https://host/v1/chat#frag"),
+            "https://host/v1/chat"
+        );
+        assert_eq!(
+            redact_endpoint_for_log("http://127.0.0.1:8080/v1/audio"),
+            "http://127.0.0.1:8080/v1/audio"
         );
     }
 }

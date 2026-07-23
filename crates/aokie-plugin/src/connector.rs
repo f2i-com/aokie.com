@@ -18,7 +18,7 @@ use serde_json::{json, Map, Value};
 use crate::command_journal::{CommandJournal, Prepare as JournalPrepare};
 use crate::config::{ConfigStore, PluginConfig, PreferredDongle};
 use crate::event_bridge::{emit_event, Sink};
-use crate::outbox::Outbox;
+use crate::outbox::{self, Outbox};
 use crate::rpc::{self, RpcMessage};
 
 /// The only connector this plugin serves.
@@ -1250,10 +1250,37 @@ impl Plugin {
             // Notifications get no answer, but `event.ack` IS processed: the
             // host durably received an outboxed event — mark it delivered
             // (audit INT-003; until then the replay thread keeps re-sending).
+            //
+            // Audit AK-05: an ack only means something on an INITIALIZED
+            // session that NEGOTIATED ack mode — a stray pre-init line, or a
+            // session that never enabled acks, must not rewrite outbox state.
+            // Keys are shape-checked, and refused/unknown acks (terminal
+            // dead/quarantined rows, keys we never emitted) change zero rows
+            // and are logged instead of silently masking undelivered events.
             if msg.method == "event.ack" {
+                if !self.initialized || !self.ack_mode {
+                    eprintln!(
+                        "[aokie-plugin] event.ack ignored: session {} (audit AK-05)",
+                        if self.initialized { "did not negotiate ack mode" } else { "is not initialized" }
+                    );
+                    return None;
+                }
                 if let Some(key) = msg.params.get("idempotencyKey").and_then(Value::as_str) {
-                    if let Err(e) = self.outbox.mark_sent(key) {
-                        eprintln!("[aokie-plugin] event.ack for {key} failed to persist: {e}");
+                    if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
+                        eprintln!("[aokie-plugin] event.ack ignored: malformed idempotency key");
+                        return None;
+                    }
+                    match self.outbox.mark_sent(key) {
+                        Ok(outbox::AckOutcome::Marked) | Ok(outbox::AckOutcome::AlreadySent) => {}
+                        Ok(outbox::AckOutcome::RefusedTerminal) => eprintln!(
+                            "[aokie-plugin] event.ack for {key} refused: the row is terminal (dead/quarantined) — not rewritten (audit AK-05)"
+                        ),
+                        Ok(outbox::AckOutcome::Unknown) => eprintln!(
+                            "[aokie-plugin] event.ack for {key} ignored: no such outbox row (audit AK-05)"
+                        ),
+                        Err(e) => {
+                            eprintln!("[aokie-plugin] event.ack for {key} failed to persist: {e}");
+                        }
                     }
                 }
             }

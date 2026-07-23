@@ -191,9 +191,11 @@ pub fn emit_event(
         Ok(()) => {
             if outboxed {
                 match mode {
-                    EmitMode::Legacy => outbox
-                        .mark_sent(&event.idempotency_key)
-                        .map_err(|e| format!("outbox mark_sent failed: {e}"))?,
+                    EmitMode::Legacy => {
+                        outbox
+                            .mark_sent(&event.idempotency_key)
+                            .map_err(|e| format!("outbox mark_sent failed: {e}"))?;
+                    }
                     EmitMode::AckExpected => {
                         outbox
                             .mark_emitted(&event.idempotency_key, None)
