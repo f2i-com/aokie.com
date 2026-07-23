@@ -89,10 +89,29 @@ fn sha256_file(path: &Path) -> Result<(String, u64), String> {
     Ok((hex_encode(&hasher.finalize()), size))
 }
 
+/// Any path component that starts with `%` — an env-var-shaped path. These
+/// only appear when something failed to expand `%SystemDrive%`-style strings
+/// and wrote them literally (e.g. Windows' certificate cache landing inside a
+/// plugin dir spawned without SystemDrive in its environment). They never
+/// belong in a bundle, so signing REFUSES them and verification treats them
+/// as tampering (AK-002: a silent skip here was a blind spot both ways —
+/// an attacker could park `%SystemDrive%/evil.dll` invisibly).
+fn is_env_shaped(rel: &str) -> bool {
+    rel.split('/').any(|component| component.starts_with('%'))
+}
+
 /// Every regular file under `dir` (recursive), relative forward-slash paths,
 /// excluding the manifest itself. Sorted for a deterministic payload.
-fn collect_files(dir: &Path) -> Result<Vec<FileEntry>, String> {
-    fn walk(root: &Path, base: &Path, out: &mut Vec<FileEntry>) -> Result<(), String> {
+/// `for_signing` REJECTS env-var-shaped paths (fix the producing bundle —
+/// never sign around it); verification enumerates them so they FAIL as
+/// unlisted files.
+fn collect_files(dir: &Path, for_signing: bool) -> Result<Vec<FileEntry>, String> {
+    fn walk(
+        root: &Path,
+        base: &Path,
+        for_signing: bool,
+        out: &mut Vec<FileEntry>,
+    ) -> Result<(), String> {
         for entry in
             std::fs::read_dir(root).map_err(|e| format!("read_dir {}: {e}", root.display()))?
         {
@@ -102,27 +121,22 @@ fn collect_files(dir: &Path) -> Result<Vec<FileEntry>, String> {
             if ft.is_symlink() {
                 return Err(format!("refusing to sign a symlink: {}", path.display()));
             }
-            if ft.is_dir() {
-                walk(&path, base, out)?;
-                continue;
-            }
             let rel = path
                 .strip_prefix(base)
                 .map_err(|e| e.to_string())?
                 .to_string_lossy()
                 .replace('\\', "/");
-            if rel == MANIFEST_FILE {
+            if for_signing && is_env_shaped(&rel) {
+                return Err(format!(
+                    "env-var-shaped path in bundle: {rel} — a runtime cache/expansion bug wrote \
+                     into the bundle; clean it and fix the producer (never signed around)"
+                ));
+            }
+            if ft.is_dir() {
+                walk(&path, base, for_signing, out)?;
                 continue;
             }
-            // Never pin env-var-shaped or runtime-cache paths. 2026-07-20:
-            // something at plugin start writes a copy of Windows' cert cache
-            // into a LITERAL `%SystemDrive%\ProgramData\...\Caches` directory
-            // inside the plugin dir; signed, it broke verification at the next
-            // reboot when Windows rotated the cache (digest mismatch →
-            // quarantined plugin). Loadable or not, an env-var-shaped path
-            // never belongs in a signed bundle.
-            if rel.starts_with('%') {
-                eprintln!("note: skipping env-var-shaped path in bundle: {rel}");
+            if rel == MANIFEST_FILE {
                 continue;
             }
             let (sha256, size) = sha256_file(&path)?;
@@ -135,7 +149,7 @@ fn collect_files(dir: &Path) -> Result<Vec<FileEntry>, String> {
         Ok(())
     }
     let mut out = Vec::new();
-    walk(dir, dir, &mut out)?;
+    walk(dir, dir, for_signing, &mut out)?;
     if out.is_empty() {
         return Err(format!("no files to sign under {}", dir.display()));
     }
@@ -151,7 +165,7 @@ pub fn sign_dir(
     seed: &[u8; 32],
     created_at: String,
 ) -> Result<Envelope, String> {
-    let files = collect_files(dir)?;
+    let files = collect_files(dir, true)?;
     let payload = Payload {
         name: name.to_string(),
         version: version.to_string(),
@@ -206,6 +220,9 @@ pub fn verify_dir(dir: &Path, pubkey_b64: &str) -> Result<Payload, String> {
         if f.path.contains("..") {
             return Err(format!("manifest lists a traversal path {:?}", f.path));
         }
+        if is_env_shaped(&f.path) {
+            return Err(format!("manifest lists an env-var-shaped path {:?}", f.path));
+        }
         let disk = dir.join(&f.path);
         let (sha, size) = sha256_file(&disk).map_err(|e| format!("{}: {e}", f.path))?;
         if sha != f.sha256.to_lowercase() || size != f.size {
@@ -213,7 +230,9 @@ pub fn verify_dir(dir: &Path, pubkey_b64: &str) -> Result<Payload, String> {
         }
     }
     // …and no UNLISTED file may exist (a dropped extra binary is a tamper).
-    let on_disk = collect_files(dir)?;
+    // The on-disk sweep enumerates EVERYTHING except the manifest itself —
+    // env-var-shaped paths included (AK-002: no blind spots).
+    let on_disk = collect_files(dir, false)?;
     for d in &on_disk {
         if !payload.files.iter().any(|f| f.path == d.path) {
             return Err(format!("unlisted file present: {}", d.path));
@@ -249,7 +268,8 @@ fn main() {
         "keygen" => keygen(),
         "sign" => cmd_sign(&args),
         "verify" => cmd_verify(&args),
-        _ => Err("usage: package-signer keygen | sign --dir D --name N --version V --key-id ID (--key-file F | --key-env VAR) | verify --dir D --pubkey B64".into()),
+        "pubkey" => cmd_pubkey(&args),
+        _ => Err("usage: package-signer keygen | sign --dir D --name N --version V --key-id ID (--key-file F | --key-env VAR) | verify --dir D --pubkey B64 | pubkey (--key-file F | --key-env VAR)".into()),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -296,6 +316,19 @@ fn cmd_sign(args: &[String]) -> Result<(), String> {
         payload.version,
         payload.files.len(),
         out.display()
+    );
+    Ok(())
+}
+
+/// Print the base64 public key of a signing seed (AK-001: lets CI verify the
+/// EXTRACTED release artifact against the key it just signed with, on stdout
+/// only so scripts can capture it).
+fn cmd_pubkey(args: &[String]) -> Result<(), String> {
+    let seed = load_seed(args)?;
+    println!(
+        "{}",
+        base64::engine::general_purpose::STANDARD
+            .encode(SigningKey::from_bytes(&seed).verifying_key().to_bytes())
     );
     Ok(())
 }
@@ -423,6 +456,67 @@ mod tests {
         );
         let err = verify_dir(&d, &other).unwrap_err();
         assert!(err.contains("signature verification failed"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn env_shaped_paths_refuse_signing_and_fail_verification() {
+        // AK-002: `%…` paths were silently skipped by BOTH signing and the
+        // unlisted-file sweep — an invisible parking spot. Now signing refuses
+        // outright…
+        let d = tmp("envshape");
+        std::fs::write(d.join("plugin.exe"), b"binary bytes").unwrap();
+        std::fs::create_dir_all(d.join("%SystemDrive%").join("ProgramData")).unwrap();
+        std::fs::write(
+            d.join("%SystemDrive%").join("ProgramData").join("evil.dll"),
+            b"hijack",
+        )
+        .unwrap();
+        let err = sign_dir(&d, "b", "1", "k", &SEED, "t0".into()).unwrap_err();
+        assert!(err.contains("env-var-shaped"), "{err}");
+        std::fs::remove_dir_all(d.join("%SystemDrive%")).unwrap();
+
+        // …and a `%…` tree DROPPED AFTER signing fails verification as an
+        // unlisted file (top-level, nested, and case-variant forms).
+        sign_into(&d);
+        for evil in [
+            d.join("%SystemDrive%").join("evil.dll"),
+            d.join("sub").join("%systemdrive%").join("evil.dll"),
+            d.join("%APPDATA%.txt"),
+        ] {
+            if let Some(parent) = evil.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&evil, b"hijack").unwrap();
+            let err = verify_dir(&d, &pubkey()).unwrap_err();
+            assert!(err.contains("unlisted file"), "{}: {err}", evil.display());
+            std::fs::remove_file(&evil).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn manifest_listing_env_shaped_path_fails() {
+        // A signed manifest must not carry env-shaped paths either — a
+        // compromised signer cannot bless them back in.
+        let d = tmp("envmanifest");
+        std::fs::write(d.join("plugin.exe"), b"binary bytes").unwrap();
+        let mut env = sign_dir(&d, "test-bundle", "1.2.3", "test-key", &SEED, "t0".into()).unwrap();
+        let mut payload: Payload =
+            serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(&env.payload_b64).unwrap())
+                .unwrap();
+        payload.files.push(FileEntry {
+            path: "%SystemDrive%/evil.dll".into(),
+            sha256: "00".repeat(32),
+            size: 6,
+        });
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = SigningKey::from_bytes(&SEED).sign(&payload_bytes);
+        env.payload_b64 = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
+        env.signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        std::fs::write(d.join(MANIFEST_FILE), serde_json::to_string(&env).unwrap()).unwrap();
+        let err = verify_dir(&d, &pubkey()).unwrap_err();
+        assert!(err.contains("env-var-shaped"), "{err}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
