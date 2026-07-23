@@ -1,0 +1,47 @@
+# Audit AK-20: every production lockfile in this repo is covered by update
+# automation — the root Cargo workspace, the self-host container's DISTINCT
+# lock (deploy/companion-self-host/container-workspace, which the root
+# workspace tests never exercise), the Companion npm app, and the workflow
+# action pins. Monthly + grouped keeps PR volume low while the account's
+# Actions budget is constrained; security advisories are raised immediately
+# and ungrouped by Dependabot regardless of the schedule.
+version: 2
+updates:
+  # Root Rust workspace (plugin, bluetooth, dongle, voice server, realtime…).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      workspace-minor-patch:
+        update-types: [minor, patch]
+
+  # Self-host gateway container — its own lockfile, deliberately distinct
+  # from the root workspace (the Dockerfile builds this mini-workspace).
+  # Intentional divergence from the root lock shows up as separate PRs here.
+  - package-ecosystem: cargo
+    directory: /deploy/companion-self-host/container-workspace
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      container-minor-patch:
+        update-types: [minor, patch]
+
+  # Companion React/TypeScript app.
+  - package-ecosystem: npm
+    directory: /apps/aokie-mobile
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      companion-npm-minor-patch:
+        update-types: [minor, patch]
+
+  # GitHub Actions workflow pins (already immutable SHAs — these PRs move them).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
