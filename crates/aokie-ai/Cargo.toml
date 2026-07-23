@@ -44,7 +44,7 @@ transcribe-rs = { path = "../transcribe-rs", default-features = false, features 
 
 # ============== candle feature: Candle Whisper STT ==============
 candle-core = { version = "0.8", optional = true }
-candle-nn = { version = "0.8", optional = true }
+candle-nn = { version = "0.11", optional = true }
 candle-transformers = { version = "0.8", optional = true }
 # candle_whisper holds the model behind a parking_lot::Mutex.
 parking_lot = { version = "0.12", optional = true }
