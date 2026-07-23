@@ -932,7 +932,7 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
         );
         send_error(&tx, &error, None);
         let _ = tx.try_send(Message::Close(None));
-        writer_task.abort();
+        drain_writer(tx, writer_task).await;
         return;
     }
     let now = match unix_now() {
@@ -940,7 +940,7 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
         Err(error) => {
             send_error(&tx, &error, None);
             let _ = tx.try_send(Message::Close(None));
-            writer_task.abort();
+            drain_writer(tx, writer_task).await;
             return;
         }
     };
@@ -951,7 +951,7 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
         );
         send_error(&tx, &error, None);
         let _ = tx.try_send(Message::Close(None));
-        writer_task.abort();
+        drain_writer(tx, writer_task).await;
         return;
     };
     let challenge = EndpointChallengeFrame {
@@ -981,21 +981,20 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
             GatewayError::fatal("invalid_admission", "admission endpoint policy is invalid");
         send_error(&tx, &error, None);
         let _ = tx.try_send(Message::Close(None));
-        writer_task.abort();
+        drain_writer(tx, writer_task).await;
         return;
     }
-    if tx
-        .try_send(Message::Text(match serialize(&challenge) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                send_error(&tx, &error, None);
-                writer_task.abort();
-                return;
-            }
-        }))
-        .is_err()
-    {
-        writer_task.abort();
+    let encoded_challenge = match serialize(&challenge) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            send_error(&tx, &error, None);
+            let _ = tx.try_send(Message::Close(None));
+            drain_writer(tx, writer_task).await;
+            return;
+        }
+    };
+    if tx.try_send(Message::Text(encoded_challenge)).is_err() {
+        drain_writer(tx, writer_task).await;
         return;
     }
     let admission_expiry = wait_for_admission_expiry(admission_exp);
@@ -1033,12 +1032,12 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
                 admission.app_id, role_label, admission.subject_id, connection_id
             );
             let _ = tx.try_send(Message::Close(None));
-            writer_task.abort();
             gateway
                 .inner
                 .v2
                 .release_admission(admission_jti.as_deref(), &connection_id)
                 .await;
+            drain_writer(tx, writer_task).await;
             return;
         }
     };
@@ -1117,12 +1116,12 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
         );
         send_error(&tx, &error, None);
         let _ = tx.try_send(Message::Close(None));
-        writer_task.abort();
         gateway
             .inner
             .v2
             .release_admission(admission_jti.as_deref(), &connection_id)
             .await;
+        drain_writer(tx, writer_task).await;
         return;
     }
     eprintln!(
@@ -1204,6 +1203,22 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
         .v2
         .release_admission(admission_jti.as_deref(), &connection_id)
         .await;
+    drop(tx);
+    if tokio::time::timeout(Duration::from_secs(1), &mut writer_task)
+        .await
+        .is_err()
+    {
+        writer_task.abort();
+    }
+}
+
+/// Graceful early exit (audit AK-09): the queued typed error + Close frame
+/// must actually FLUSH before the writer dies — an immediate `abort()` turned
+/// every early refusal into an opaque EOF, so clients could not distinguish
+/// auth/policy failures from transport flaps (and retried the unretryable).
+/// Drop the sender so the writer loop ends after draining, give it a bounded
+/// window, and abort only on timeout (a blocked client can't hold the task).
+async fn drain_writer(tx: mpsc::Sender<Message>, mut writer_task: tokio::task::JoinHandle<()>) {
     drop(tx);
     if tokio::time::timeout(Duration::from_secs(1), &mut writer_task)
         .await

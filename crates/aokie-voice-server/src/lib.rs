@@ -513,6 +513,11 @@ pub struct VoiceServer {
     /// Unknown sherpa voice values already logged — one warning per distinct
     /// value, never per request (bounded; see `warn_unknown_voice`).
     warned_voices: Mutex<HashSet<String>>,
+    /// Last STT/TTS load or inference failure (audit AK-11): /health reports
+    /// it so "assets present but the runtime can't actually run" is visible
+    /// to operators instead of hiding behind a green asset check.
+    last_stt_error: Mutex<Option<String>>,
+    last_tts_error: Mutex<Option<String>>,
 }
 
 impl VoiceServer {
@@ -530,7 +535,50 @@ impl VoiceServer {
             stt: Mutex::new(None),
             tts: Mutex::new(None),
             warned_voices: Mutex::new(HashSet::new()),
+            last_stt_error: Mutex::new(None),
+            last_tts_error: Mutex::new(None),
         }
+    }
+
+    fn record_stt_error(&self, message: &str) {
+        if let Ok(mut slot) = self.last_stt_error.lock() {
+            *slot = Some(message.to_string());
+        }
+    }
+
+    fn record_tts_error(&self, message: &str) {
+        if let Ok(mut slot) = self.last_tts_error.lock() {
+            *slot = Some(message.to_string());
+        }
+    }
+
+    /// Warm every enabled lane in the background at startup (audit AK-11):
+    /// loading the runtimes up front turns "assets present but the model is
+    /// corrupt / the provider DLLs are broken" into a recorded readiness
+    /// failure instead of a surprise on the first live request.
+    pub fn warm_lanes(self: &std::sync::Arc<Self>) {
+        let server = std::sync::Arc::clone(self);
+        std::thread::Builder::new()
+            .name("aokie-voice-warm".into())
+            .spawn(move || {
+                if server.config.mode.stt_enabled() && server.stt_files_present() {
+                    // A zero-length transcription loads the runtime end to end.
+                    if let Err(error) = server.transcribe(&[0.0f32; 16_000]) {
+                        eprintln!("[{}] STT warm-up failed: {}", log_tag(), error.message);
+                    } else {
+                        eprintln!("[{}] STT lane warmed", log_tag());
+                    }
+                }
+                if server.config.mode.tts_enabled() && server.tts_assets().is_ok() {
+                    match server.ensure_tts_backend() {
+                        Ok(_) => eprintln!("[{}] TTS lane warmed", log_tag()),
+                        Err(error) => {
+                            eprintln!("[{}] TTS warm-up failed: {}", log_tag(), error.message)
+                        }
+                    }
+                }
+            })
+            .ok();
     }
 
     pub fn max_body_bytes(&self) -> usize {
@@ -618,6 +666,23 @@ impl VoiceServer {
     }
 
     fn transcribe(&self, samples_16k: &[f32]) -> Result<String, AppError> {
+        // Audit AK-11: every load/inference outcome updates the recorded lane
+        // state so /health can report runtime readiness, not just asset presence.
+        match self.transcribe_inner(samples_16k) {
+            Ok(text) => {
+                if let Ok(mut slot) = self.last_stt_error.lock() {
+                    *slot = None;
+                }
+                Ok(text)
+            }
+            Err(error) => {
+                self.record_stt_error(&error.message);
+                Err(error)
+            }
+        }
+    }
+
+    fn transcribe_inner(&self, samples_16k: &[f32]) -> Result<String, AppError> {
         if !self.stt_files_present() {
             return Err(AppError::new(
                 503,
@@ -698,8 +763,26 @@ impl VoiceServer {
     }
 
     /// Lock the TTS slot, loading the configured engine on first use (shared
-    /// by the buffered WAV path and the streaming PCM path).
+    /// by the buffered WAV path and the streaming PCM path). Load outcomes
+    /// update the recorded lane state for /health (audit AK-11).
     fn ensure_tts_backend(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<TtsBackend>>, AppError> {
+        match self.ensure_tts_backend_inner() {
+            Ok(guard) => {
+                if let Ok(mut slot) = self.last_tts_error.lock() {
+                    *slot = None;
+                }
+                Ok(guard)
+            }
+            Err(error) => {
+                self.record_tts_error(&error.message);
+                Err(error)
+            }
+        }
+    }
+
+    fn ensure_tts_backend_inner(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, Option<TtsBackend>>, AppError> {
         let mut guard = self
@@ -1566,12 +1649,57 @@ fn health_response(server: &VoiceServer) -> HttpResponse {
     let tts_ready = matches!(tts_assets, Some(Ok(_)));
     let healthy = (!mode.stt_enabled() || stt_ready) && (!mode.tts_enabled() || tts_ready);
 
+    // Audit AK-11: liveness ≠ readiness. Beyond asset presence, report the
+    // RUNTIME state: whether the engine actually loaded (try_lock — a held
+    // lock means it is loaded and busy inferring), the ACTUAL execution
+    // provider (pocket can silently fall back CUDA→CPU), and the last
+    // load/inference error. A recorded runtime failure degrades status even
+    // while the assets look fine on disk.
+    let stt_load_state = match server.stt.try_lock() {
+        Ok(guard) => {
+            if guard.is_some() {
+                "loaded"
+            } else {
+                "not_loaded"
+            }
+        }
+        Err(_) => "busy",
+    };
+    let stt_last_error = server
+        .last_stt_error
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let (tts_load_state, tts_active_ep) = match server.tts.try_lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(TtsBackend::Pocket(rt)) => ("loaded", Some(rt.ep.to_string())),
+            Some(TtsBackend::Sherpa(_)) => ("loaded", Some("cpu".to_string())),
+            None => ("not_loaded", None),
+        },
+        Err(_) => ("busy", None),
+    };
+    let tts_last_error = server
+        .last_tts_error
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let requested_ep = server.config.tts_ep.as_str();
+    let tts_fallback_reason = tts_active_ep.as_deref().and_then(|active| {
+        (mode.tts_enabled() && active != requested_ep).then(|| {
+            format!("requested execution provider '{requested_ep}' unavailable — running on '{active}'")
+        })
+    });
+    let healthy = healthy && stt_last_error.is_none() && tts_last_error.is_none();
+
     let stt_lane = if mode.stt_enabled() {
         json!({
             "enabled": true,
             "engine": server.config.stt_engine.as_str(),
             "modelDir": server.stt_dir().display().to_string(),
-            "ready": stt_ready,
+            "ready": stt_ready && stt_last_error.is_none(),
+            "assetsReady": stt_ready,
+            "loadState": stt_load_state,
+            "lastError": stt_last_error,
         })
     } else {
         json!({ "enabled": false })
@@ -1581,15 +1709,26 @@ fn health_response(server: &VoiceServer) -> HttpResponse {
         Some(Ok(dir)) => json!({
             "enabled": true,
             "engine": server.config.tts_engine.as_str(),
-            "ep": server.config.tts_ep.as_str(),
+            "ep": requested_ep,
+            "requestedEp": requested_ep,
+            "activeEp": tts_active_ep,
+            "fallbackReason": tts_fallback_reason,
             "modelDir": dir.display().to_string(),
-            "ready": true,
+            "ready": tts_last_error.is_none(),
+            "assetsReady": true,
+            "loadState": tts_load_state,
+            "lastError": tts_last_error,
         }),
         Some(Err(why)) => json!({
             "enabled": true,
             "engine": server.config.tts_engine.as_str(),
-            "ep": server.config.tts_ep.as_str(),
+            "ep": requested_ep,
+            "requestedEp": requested_ep,
+            "activeEp": tts_active_ep,
             "ready": false,
+            "assetsReady": false,
+            "loadState": tts_load_state,
+            "lastError": tts_last_error,
             "error": why,
         }),
     };
@@ -1930,6 +2069,16 @@ fn base64_value(b: u8) -> Result<u8, String> {
     }
 }
 
+/// Sample-rate window for real recordings (audit AK-03): anything outside is
+/// malformed or an allocation attack — a 1 Hz "rate" turns a modest PCM body
+/// into a gigantic resample output (out ≈ samples × 16000 / rate).
+const MIN_WAV_SAMPLE_RATE: u32 = 8_000;
+const MAX_WAV_SAMPLE_RATE: u32 = 192_000;
+/// Longest clip the decode lane materialises, measured at the TARGET 16 kHz
+/// rate (10 minutes ≈ 38 MiB of f32 — comfortably bounded, far beyond any
+/// real dictation).
+const MAX_WAV_OUTPUT_SAMPLES: usize = 16_000 * 600;
+
 pub fn decode_wav_to_f32_16k(bytes: &[u8]) -> Result<Vec<f32>, String> {
     let cursor = Cursor::new(bytes);
     let mut reader = hound::WavReader::new(cursor).map_err(|e| e.to_string())?;
@@ -1946,8 +2095,25 @@ pub fn decode_wav_to_f32_16k(bytes: &[u8]) -> Result<Vec<f32>, String> {
             spec.channels
         ));
     }
-    if spec.sample_rate == 0 {
-        return Err("sample rate must be non-zero".to_string());
+    // Audit AK-03: enforce a sane rate range and derive the projected output
+    // size from the HEADER before decoding a single sample — every bound is
+    // checked arithmetic, never trusted multiplication.
+    if spec.sample_rate < MIN_WAV_SAMPLE_RATE || spec.sample_rate > MAX_WAV_SAMPLE_RATE {
+        return Err(format!(
+            "unsupported sample rate {} Hz (accepted {}..={} Hz)",
+            spec.sample_rate, MIN_WAV_SAMPLE_RATE, MAX_WAV_SAMPLE_RATE
+        ));
+    }
+    let declared_frames = reader.duration() as u64;
+    let projected_out = declared_frames
+        .saturating_mul(16_000)
+        .checked_div(spec.sample_rate as u64)
+        .unwrap_or(u64::MAX);
+    if projected_out > MAX_WAV_OUTPUT_SAMPLES as u64 {
+        return Err(format!(
+            "audio is too long: {} frames at {} Hz exceeds the {}-sample (10 minute) decode budget",
+            declared_frames, spec.sample_rate, MAX_WAV_OUTPUT_SAMPLES
+        ));
     }
 
     let samples: Vec<i16> = reader
@@ -1970,7 +2136,7 @@ pub fn decode_wav_to_f32_16k(bytes: &[u8]) -> Result<Vec<f32>, String> {
             .map(|frame| ((frame[0] as f32) + (frame[1] as f32)) / (2.0 * 32768.0))
             .collect()
     };
-    Ok(resample_linear(&mono, spec.sample_rate, 16_000))
+    resample_linear(&mono, spec.sample_rate, 16_000)
 }
 
 pub fn write_pcm16_wav(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
@@ -1994,13 +2160,24 @@ pub fn write_pcm16_wav(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, Str
     Ok(cursor.into_inner())
 }
 
-fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
+fn resample_linear(input: &[f32], from: u32, to: u32) -> Result<Vec<f32>, String> {
     if from == to || from == 0 || to == 0 || input.is_empty() {
-        return input.to_vec();
+        return Ok(input.to_vec());
     }
     let ratio = to as f64 / from as f64;
     let out_len = ((input.len() as f64) * ratio).round() as usize;
-    let mut out = Vec::with_capacity(out_len);
+    // Audit AK-03: the output budget is enforced HERE too (defense in depth
+    // against any future caller trusting header math), and the allocation is
+    // fallible — an unservable request answers with an error, never an abort.
+    if out_len > MAX_WAV_OUTPUT_SAMPLES {
+        return Err(format!(
+            "resample output of {} samples exceeds the {}-sample budget",
+            out_len, MAX_WAV_OUTPUT_SAMPLES
+        ));
+    }
+    let mut out: Vec<f32> = Vec::new();
+    out.try_reserve_exact(out_len)
+        .map_err(|_| "resample buffer allocation failed".to_string())?;
     for i in 0..out_len {
         let src = i as f64 / ratio;
         let idx = src.floor() as usize;
@@ -2009,7 +2186,7 @@ fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
         let b = input.get(idx + 1).copied().unwrap_or(a);
         out.push(a + (b - a) * frac);
     }
-    out
+    Ok(out)
 }
 
 /// The multipart fields the transcription route consumes. Unknown parts
@@ -2259,6 +2436,23 @@ pub fn run_from_env() -> Result<(), String> {
 /// while inference is busy.
 const MAX_INFLIGHT: usize = 4;
 
+/// Hard cap on CONCURRENT CONNECTIONS/THREADS (audit AK-04): the permit is
+/// acquired in the accept loop BEFORE a thread is spawned, so a local
+/// slowloris/open-socket client holds at most this many threads — excess
+/// connections get an immediate canned 503 and are dropped. Distinct from
+/// MAX_INFLIGHT, which paces the inference queue after parsing.
+const MAX_CONNECTIONS: usize = 32;
+
+/// RAII decrement for the shared connection/in-flight counters — a panic or
+/// early return can never leak a permit (audit AK-04).
+struct CounterGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for CounterGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub fn run_http(server: VoiceServer, port: u16) -> Result<(), String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2268,7 +2462,12 @@ pub fn run_http(server: VoiceServer, port: u16) -> Result<(), String> {
     eprintln!("[{}] listening on http://127.0.0.1:{port}", log_tag());
 
     let server = Arc::new(server);
+    // Audit AK-11: warm every enabled lane in the background so runtime
+    // load failures (corrupt models, broken provider DLLs, CUDA→CPU
+    // fallback) surface in /health before the first live request.
+    server.warm_lanes();
     let inflight = Arc::new(AtomicUsize::new(0));
+    let connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(stream) => stream,
@@ -2278,21 +2477,42 @@ pub fn run_http(server: VoiceServer, port: u16) -> Result<(), String> {
             }
         };
 
+        // Connection permit BEFORE spawning (audit AK-04): idle/slow sockets
+        // are bounded at the accept loop, not after a thread already exists.
+        if connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            connections.fetch_sub(1, Ordering::SeqCst);
+            // Best-effort canned refusal with a short write deadline so a
+            // non-reading client can't stall the ACCEPT loop.
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+            let _ = stream.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 51\r\nConnection: close\r\n\r\n{\"error\":\"voice server connection limit reached\"}\r\n",
+            );
+            continue;
+        }
+        let connection_permit = CounterGuard(Arc::clone(&connections));
+
         // Thread-per-connection (audit AK-007): a multi-second STT/TTS job
         // must not freeze the accept loop — /health stays responsive during
         // inference, and each connection keeps its own read timeout.
         let server = Arc::clone(&server);
         let inflight = Arc::clone(&inflight);
         std::thread::spawn(move || {
+            let _connection_permit = connection_permit;
             fn respond(stream: &mut TcpStream, response: HttpResponse) {
                 if let Err(e) = write_http_response(stream, response) {
                     eprintln!("[{}] respond failed: {e}", log_tag());
                 }
             }
 
-            let request = match read_http_request(&mut stream, server.max_body_bytes()) {
-                Ok(request) => request,
+            // Staged parse (audit AK-04): headers ride a SHORT deadline with
+            // per-line/aggregate caps; the Origin verdict lands before a
+            // single body byte is read; only then does the (bounded) body
+            // read start under its own deadline.
+            let mut reader = BufReader::new(&mut stream);
+            let head = match read_http_head(&mut reader) {
+                Ok(head) => head,
                 Err(err) => {
+                    drop(reader);
                     respond(&mut stream, err.response());
                     return;
                 }
@@ -2301,14 +2521,28 @@ pub fn run_http(server: VoiceServer, port: u16) -> Result<(), String> {
             // This is a machine-local service for native callers; a
             // browser always sends Origin on POST, so its presence
             // means a web page is probing localhost (DNS-rebinding /
-            // drive-by) — refuse outright (audit AK-007).
-            if header_value(&request.headers, "origin").is_some() {
+            // drive-by) — refuse outright (audit AK-007), and refuse
+            // BEFORE reading the advertised body (audit AK-04).
+            if header_value(&head.headers, "origin").is_some() {
+                drop(reader);
                 respond(
                     &mut stream,
                     AppError::new(403, "browser origins are not served").response(),
                 );
                 return;
             }
+
+            let max_body = server.max_body_bytes();
+            let request = match read_http_body(&mut reader, head, max_body) {
+                Ok(request) => request,
+                Err(err) => {
+                    drop(reader);
+                    respond(&mut stream, err.response());
+                    return;
+                }
+            };
+            drop(reader);
+
             if request.url == "/health" {
                 let response = handle_request(
                     &server,
@@ -2446,18 +2680,48 @@ struct RawHttpRequest {
     body: Vec<u8>,
 }
 
-fn read_http_request(
-    stream: &mut TcpStream,
-    max_body_bytes: usize,
-) -> Result<RawHttpRequest, AppError> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let mut reader = BufReader::new(stream);
+struct RawHttpHead {
+    method: String,
+    url: String,
+    headers: Vec<Header>,
+}
 
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
+/// Header-phase limits (audit AK-04): every line read is BOUNDED (an
+/// unterminated header can no longer grow memory), and the header block has
+/// per-line, aggregate, and count caps plus its own short deadline.
+const MAX_HTTP_LINE_BYTES: usize = 8 * 1024;
+const MAX_HTTP_HEADER_COUNT: usize = 64;
+const MAX_HTTP_HEADER_TOTAL_BYTES: usize = 32 * 1024;
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Read one CRLF/LF-terminated line with a hard byte cap. `take()` bounds the
+/// read so a client that never sends a newline can allocate at most
+/// `max_len` bytes before the 431 lands.
+fn read_line_bounded(
+    reader: &mut BufReader<&mut TcpStream>,
+    max_len: usize,
+) -> Result<String, AppError> {
+    let mut raw = Vec::new();
+    let mut limited = reader.take((max_len + 1) as u64);
+    limited
+        .read_until(b'\n', &mut raw)
         .map_err(|e| AppError::new(400, format!("failed to read request line: {e}")))?;
-    let request_line = request_line.trim_end_matches(['\r', '\n']);
+    if raw.len() > max_len {
+        return Err(AppError::new(431, "request header line is too long"));
+    }
+    let text = String::from_utf8(raw)
+        .map_err(|_| AppError::new(400, "request header is not valid UTF-8"))?;
+    Ok(text.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Read the request line + headers under the short header deadline. The body
+/// is NOT touched here — the caller gets to apply policy (Origin refusal)
+/// before a single advertised body byte is read (audit AK-04).
+fn read_http_head(reader: &mut BufReader<&mut TcpStream>) -> Result<RawHttpHead, AppError> {
+    let _ = reader.get_mut().set_read_timeout(Some(HEADER_READ_TIMEOUT));
+
+    let request_line = read_line_bounded(reader, MAX_HTTP_LINE_BYTES)?;
     if request_line.is_empty() {
         return Err(AppError::new(400, "empty HTTP request"));
     }
@@ -2472,14 +2736,18 @@ fn read_http_request(
         .to_string();
 
     let mut headers = Vec::new();
+    let mut header_bytes = 0usize;
     loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| AppError::new(400, format!("failed to read header: {e}")))?;
-        let line = line.trim_end_matches(['\r', '\n']);
+        let line = read_line_bounded(reader, MAX_HTTP_LINE_BYTES)?;
         if line.is_empty() {
             break;
+        }
+        header_bytes += line.len();
+        if headers.len() >= MAX_HTTP_HEADER_COUNT {
+            return Err(AppError::new(431, "too many request headers"));
+        }
+        if header_bytes > MAX_HTTP_HEADER_TOTAL_BYTES {
+            return Err(AppError::new(431, "request headers are too large"));
         }
         let Some((name, value)) = line.split_once(':') else {
             return Err(AppError::new(400, "malformed HTTP header"));
@@ -2487,7 +2755,20 @@ fn read_http_request(
         headers.push(Header::new(name.trim(), value.trim()));
     }
 
-    if header_value(&headers, "transfer-encoding")
+    Ok(RawHttpHead {
+        method,
+        url,
+        headers,
+    })
+}
+
+/// Read the (bounded) request body under its own, longer deadline.
+fn read_http_body(
+    reader: &mut BufReader<&mut TcpStream>,
+    head: RawHttpHead,
+    max_body_bytes: usize,
+) -> Result<RawHttpRequest, AppError> {
+    if header_value(&head.headers, "transfer-encoding")
         .map(|v| v.to_ascii_lowercase().contains("chunked"))
         .unwrap_or(false)
     {
@@ -2497,7 +2778,7 @@ fn read_http_request(
         ));
     }
 
-    let content_length = match header_value(&headers, "content-length") {
+    let content_length = match header_value(&head.headers, "content-length") {
         Some(value) => value
             .parse::<usize>()
             .map_err(|e| AppError::new(400, format!("invalid Content-Length: {e}")))?,
@@ -2507,15 +2788,19 @@ fn read_http_request(
         return Err(AppError::new(413, "request body exceeds 32 MiB limit"));
     }
 
-    let mut body = vec![0u8; content_length];
+    let _ = reader.get_mut().set_read_timeout(Some(BODY_READ_TIMEOUT));
+    let mut body = Vec::new();
+    body.try_reserve_exact(content_length)
+        .map_err(|_| AppError::new(413, "request body allocation failed"))?;
+    body.resize(content_length, 0);
     reader
         .read_exact(&mut body)
         .map_err(|e| AppError::new(400, format!("failed to read request body: {e}")))?;
 
     Ok(RawHttpRequest {
-        method,
-        url,
-        headers,
+        method: head.method,
+        url: head.url,
+        headers: head.headers,
         body,
     })
 }
@@ -2543,8 +2828,10 @@ fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "HTTP",
@@ -3403,6 +3690,53 @@ mod tests {
         assert!((samples[2] - 0.25).abs() < 0.0001);
         assert!((samples[4] - 0.5).abs() < 0.0001);
         assert!(samples.iter().all(|s| s.is_finite()));
+    }
+
+    // -------------------------------------------------------------------
+    // Audit AK-03: WAV decode/resample allocation bounds
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn wav_decode_rejects_absurdly_low_sample_rate() {
+        // A 1 Hz "rate" turns a tiny PCM body into a gigantic resample
+        // output (samples × 16000) — refused with a typed error, no alloc.
+        let wav = make_wav(&[0, 1, 2, 3], 1);
+        let err = decode_wav_to_f32_16k(&wav).unwrap_err();
+        assert!(err.contains("unsupported sample rate"), "{err}");
+    }
+
+    #[test]
+    fn wav_decode_rejects_absurdly_high_sample_rate() {
+        let wav = make_wav(&[0, 1, 2, 3], 4_000_000);
+        let err = decode_wav_to_f32_16k(&wav).unwrap_err();
+        assert!(err.contains("unsupported sample rate"), "{err}");
+    }
+
+    #[test]
+    fn wav_decode_rejects_header_declared_marathon_duration() {
+        // Forge a header that DECLARES ~2.4h of 16 kHz audio (data chunk size
+        // lies) — the projected-output budget refuses before decoding.
+        let mut wav = make_wav(&[0i16; 16], 16_000);
+        let declared_bytes: u32 = 16_000 * 2 * 60 * 143; // ~143 minutes of PCM16
+        let riff_len = (declared_bytes + 36).to_le_bytes();
+        wav[4..8].copy_from_slice(&riff_len);
+        let data_len = declared_bytes.to_le_bytes();
+        wav[40..44].copy_from_slice(&data_len);
+        let err = decode_wav_to_f32_16k(&wav).unwrap_err();
+        assert!(err.contains("audio is too long"), "{err}");
+    }
+
+    #[test]
+    fn wav_decode_accepts_boundary_rates() {
+        for rate in [MIN_WAV_SAMPLE_RATE, 44_100, MAX_WAV_SAMPLE_RATE] {
+            // Enough source frames that even the 192 kHz → 16 kHz downsample
+            // produces output (the ratio is 1/12).
+            let src: Vec<i16> = (0..48).map(|i| (i * 100) as i16).collect();
+            let wav = make_wav(&src, rate);
+            let samples = decode_wav_to_f32_16k(&wav).unwrap();
+            assert!(!samples.is_empty(), "rate {rate} must decode");
+            assert!(samples.iter().all(|s| s.is_finite()));
+        }
     }
 
     #[test]

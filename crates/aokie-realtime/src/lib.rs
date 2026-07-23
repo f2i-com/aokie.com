@@ -1234,8 +1234,18 @@ async fn handle_socket(gateway: Gateway, admission: Admission, socket: WebSocket
     {
         Ok(Some(Ok(Message::Text(text)))) if text.len() <= MAX_MESSAGE_BYTES => text,
         _ => {
+            // Audit AK-09: let the Close frame FLUSH (bounded) instead of
+            // aborting the writer mid-queue — clients get a clean close, not
+            // an opaque EOF they misclassify as a transport flap.
             let _ = tx.try_send(Message::Close(None));
-            writer_task.abort();
+            drop(peer);
+            drop(tx);
+            if tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer_task)
+                .await
+                .is_err()
+            {
+                writer_task.abort();
+            }
             return;
         }
     };
@@ -1268,8 +1278,17 @@ async fn handle_socket(gateway: Gateway, admission: Admission, socket: WebSocket
         AdmissionRole::Plugin => Err("plugin admissions are only valid on /v2/realtime".into()),
     };
     if registered.is_err() {
+        // Audit AK-09: same bounded drain — the refusal Close must reach the
+        // peer before the writer dies.
         let _ = tx.try_send(Message::Close(None));
-        writer_task.abort();
+        drop(peer);
+        drop(tx);
+        if tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer_task)
+            .await
+            .is_err()
+        {
+            writer_task.abort();
+        }
         return;
     }
 
