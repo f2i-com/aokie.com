@@ -66,7 +66,7 @@ url = "2"
 # (empty descriptors + Win32 87). The original Tauri app gets 1 ms for free via
 # WebView2/Chromium; a headless plugin must ask for it explicitly.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Media", "Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = ["Win32_Media", "Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_Memory"] }
 # Native Windows-stack radio backend (transportMode=native) — the
 # no-driver-install transport sitting beside the WinUSB dongle backend.
 aokie-winbt = { path = "../aokie-winbt" }
