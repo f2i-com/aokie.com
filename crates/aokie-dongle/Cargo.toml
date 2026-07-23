@@ -3,6 +3,7 @@ name = "aokie-dongle"
 description = "Aokie USB-dongle setup: device enumeration, the self-signed WinUSB driver package + PKI, the Linux udev-rule counterpart, and the radio→app Bluetooth event bridge. Tauri-free; depends on aokie-core and aokie-bluetooth."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

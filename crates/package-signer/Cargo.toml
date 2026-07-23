@@ -2,6 +2,7 @@
 name = "package-signer"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 description = "First-party Ed25519 package-manifest signing for Aokie release bundles (TRUST-001)"
 
 [dependencies]
