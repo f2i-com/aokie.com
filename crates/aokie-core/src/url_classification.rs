@@ -169,35 +169,22 @@ fn classify_host(host: &str) -> BaseUrlClassification {
     }
 
     // IPv4 literal.
-    if let Some([a, b, c, d]) = parse_ipv4(host) {
-        if a == 127 {
-            return BaseUrlClassification::Loopback;
-        }
-        if a == 0 && b == 0 && c == 0 && d == 0 {
-            return BaseUrlClassification::Loopback;
-        }
-        if a == 169 && b == 254 {
-            if c == 169 && d == 254 {
-                return BaseUrlClassification::Metadata;
-            }
-            return BaseUrlClassification::LinkLocal;
-        }
-        if a == 10 {
-            return BaseUrlClassification::Private;
-        }
-        if a == 192 && b == 168 {
-            return BaseUrlClassification::Private;
-        }
-        if a == 172 && (16..=31).contains(&b) {
-            return BaseUrlClassification::Private;
-        }
-        return BaseUrlClassification::Public;
+    if let Some(octets) = parse_ipv4(host) {
+        return classify_ipv4_octets(octets);
     }
 
     // IPv6 literal.
     if let Ok(addr) = host.parse::<Ipv6Addr>() {
         if addr.is_loopback() {
             return BaseUrlClassification::Loopback;
+        }
+        // Translation/transition forms EMBED an IPv4 address (audit AK-06):
+        // on NAT64/6to4/mapped networks an attacker-controlled AAAA record can
+        // smuggle a private/link-local/metadata IPv4 inside an apparently
+        // public IPv6 — so the EMBEDDED address is what gets classified.
+        // 64:ff9b::a9fe:a9fe is the metadata service, not "public IPv6".
+        if let Some(embedded) = embedded_ipv4(&addr) {
+            return classify_ipv4_octets(embedded.octets());
         }
         let segs = addr.segments();
         // fe80::/10 — top 10 bits = 1111111010xx. The high byte of
@@ -212,6 +199,15 @@ fn classify_host(host: &str) -> BaseUrlClassification {
         if (first_byte & 0xfe) == 0xfc {
             return BaseUrlClassification::Private;
         }
+        // Remaining IANA special-purpose space (Teredo, documentation,
+        // ORCHID, benchmarking, discard-only, deprecated v4-compatible):
+        // never "true public internet" — bucket with Private so the
+        // settings UI warns instead of silently treating it as public
+        // (audit AK-06). The connection-time gate rejects these outright
+        // via ip_is_global_unicast.
+        if !ipv6_is_global_unicast(&addr) {
+            return BaseUrlClassification::Private;
+        }
         return BaseUrlClassification::Public;
     }
 
@@ -221,6 +217,138 @@ fn classify_host(host: &str) -> BaseUrlClassification {
     // `127.0.0.1.evil.com`, `fcfoo.com`, `10.example.com` all land
     // here.
     BaseUrlClassification::Public
+}
+
+/// The one IPv4 classification, shared by the literal branch and every
+/// embedded-IPv4 transition form (audit AK-06).
+fn classify_ipv4_octets([a, b, c, d]: [u8; 4]) -> BaseUrlClassification {
+    if a == 127 {
+        return BaseUrlClassification::Loopback;
+    }
+    if a == 0 && b == 0 && c == 0 && d == 0 {
+        return BaseUrlClassification::Loopback;
+    }
+    if a == 169 && b == 254 {
+        if c == 169 && d == 254 {
+            return BaseUrlClassification::Metadata;
+        }
+        return BaseUrlClassification::LinkLocal;
+    }
+    if a == 10 {
+        return BaseUrlClassification::Private;
+    }
+    if a == 192 && b == 168 {
+        return BaseUrlClassification::Private;
+    }
+    if a == 172 && (16..=31).contains(&b) {
+        return BaseUrlClassification::Private;
+    }
+    // Remaining special-purpose IPv4 (CGNAT, documentation, benchmarking,
+    // protocol assignments, reserved): warn-worthy, never "true public"
+    // (audit AK-06).
+    if !ipv4_is_global_unicast(std::net::Ipv4Addr::new(a, b, c, d)) {
+        return BaseUrlClassification::Private;
+    }
+    BaseUrlClassification::Public
+}
+
+/// Extract the IPv4 address EMBEDDED in a translation/transition IPv6 form
+/// (audit AK-06): IPv4-mapped `::ffff:a.b.c.d`, NAT64 well-known prefix
+/// `64:ff9b::/96`, and 6to4 `2002::/16`. Returns None for every other form
+/// (including `64:ff9b:1::/48` local-use translation, which is judged
+/// non-global as a whole rather than decoded).
+pub fn embedded_ipv4(v6: &Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let segs = v6.segments();
+    if segs[0] == 0x0064
+        && segs[1] == 0xff9b
+        && segs[2] == 0
+        && segs[3] == 0
+        && segs[4] == 0
+        && segs[5] == 0
+    {
+        return Some(std::net::Ipv4Addr::new(
+            (segs[6] >> 8) as u8,
+            segs[6] as u8,
+            (segs[7] >> 8) as u8,
+            segs[7] as u8,
+        ));
+    }
+    if segs[0] == 0x2002 {
+        return Some(std::net::Ipv4Addr::new(
+            (segs[1] >> 8) as u8,
+            segs[1] as u8,
+            (segs[2] >> 8) as u8,
+            segs[2] as u8,
+        ));
+    }
+    None
+}
+
+/// The ONE IANA-based "globally routable unicast" verdict (audit AK-06),
+/// shared by settings-time classification here and connection-time endpoint
+/// validation in aokie-plugin's endpoint_http — the two must never disagree.
+pub fn ip_is_global_unicast(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => ipv4_is_global_unicast(v4),
+        std::net::IpAddr::V6(v6) => ipv6_is_global_unicast(&v6),
+    }
+}
+
+pub fn ipv4_is_global_unicast(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    !(v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_broadcast()
+        || v4.is_unspecified()
+        || v4.is_documentation()
+        || o[0] == 0 // 0.0.0.0/8 "this network"
+        || (o[0] == 100 && (o[1] & 0b1100_0000) == 64) // 100.64.0.0/10 CGNAT
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol assignments
+        || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking
+        || o[0] >= 240) // 240.0.0.0/4 reserved
+}
+
+pub fn ipv6_is_global_unicast(v6: &Ipv6Addr) -> bool {
+    // Translation/transition forms are judged by their EMBEDDED IPv4.
+    if let Some(embedded) = embedded_ipv4(v6) {
+        return ipv4_is_global_unicast(embedded);
+    }
+    let segs = v6.segments();
+    // 64:ff9b:1::/48 local-use translation — never global.
+    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
+        return false;
+    }
+    if segs[0] == 0x2001 {
+        match segs[1] {
+            0x0000 => return false,                        // Teredo 2001::/32
+            0x0db8 => return false,                        // documentation 2001:db8::/32
+            0x0002 if segs[2] == 0 => return false,        // benchmarking 2001:2::/48
+            s if (0x0010..=0x002f).contains(&s) => return false, // ORCHID(v2) 2001:10::/28 + 2001:20::/28
+            _ => {}
+        }
+    }
+    // Documentation 3fff::/20 (RFC 9637).
+    if segs[0] == 0x3fff && (segs[1] & 0xf000) == 0 {
+        return false;
+    }
+    // Discard-only 100::/64.
+    if segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 {
+        return false;
+    }
+    // Deprecated IPv4-compatible ::a.b.c.d (::/96 beyond ::/128 and ::1).
+    if segs[..6].iter().all(|s| *s == 0) && !v6.is_loopback() && !v6.is_unspecified() {
+        return false;
+    }
+    !(v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
+        || (segs[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+        || (segs[0] & 0xffc0) == 0xfe80) // fe80::/10 link-local
 }
 
 /// Strict IPv4 dotted-decimal parser. Mirrors the TS frontend's
@@ -433,5 +561,59 @@ mod tests {
         let b = parse_base_url("https://example.com:443/other").unwrap();
         assert_eq!(a.canonical_origin(), "https://example.com:443");
         assert_eq!(a.canonical_origin(), b.canonical_origin());
+    }
+
+    /// Audit AK-06: translation/transition IPv6 forms are judged by their
+    /// EMBEDDED IPv4, and IANA special-purpose space is never "public" —
+    /// on BOTH the settings-time and connection-time surfaces.
+    #[test]
+    fn transition_and_special_purpose_space_is_never_public() {
+        use std::net::IpAddr;
+
+        // NAT64 well-known prefix embedding the metadata service.
+        assert_eq!(
+            classify_base_url("http://[64:ff9b::a9fe:a9fe]/v1"),
+            BaseUrlClassification::Metadata
+        );
+        assert!(!ip_is_global_unicast("64:ff9b::a9fe:a9fe".parse::<IpAddr>().unwrap()));
+
+        // 6to4 embedding RFC 1918 (10.0.0.1 → 2002:0a00:0001::).
+        assert_eq!(
+            classify_base_url("http://[2002:a00:1::]/v1"),
+            BaseUrlClassification::Private
+        );
+        assert!(!ip_is_global_unicast("2002:a00:1::".parse::<IpAddr>().unwrap()));
+
+        // Teredo, documentation (both ranges), ORCHID, benchmarking,
+        // discard-only, local-use NAT64, CGNAT/benchmarking IPv4.
+        for special in [
+            "2001::1",          // Teredo
+            "2001:db8::1",      // documentation
+            "3fff::1",          // documentation (RFC 9637)
+            "2001:10::1",       // ORCHID
+            "2001:20::1",       // ORCHIDv2
+            "2001:2::1",        // benchmarking
+            "100::1",           // discard-only
+            "64:ff9b:1::a",     // local-use NAT64 translation
+            "100.64.0.1",       // CGNAT
+            "198.18.0.1",       // benchmarking v4
+            "192.0.0.1",        // IETF protocol assignments
+            "240.0.0.1",        // reserved
+        ] {
+            assert!(
+                !ip_is_global_unicast(special.parse::<IpAddr>().unwrap()),
+                "{special} must not be global"
+            );
+        }
+
+        // Public v4/v6 remain accepted…
+        assert!(ip_is_global_unicast("8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(ip_is_global_unicast("2607:f8b0::1".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            classify_base_url("https://[2607:f8b0::1]/v1"),
+            BaseUrlClassification::Public
+        );
+        // …and NAT64 embedding a PUBLIC v4 stays usable on translation networks.
+        assert!(ip_is_global_unicast("64:ff9b::808:808".parse::<IpAddr>().unwrap()));
     }
 }

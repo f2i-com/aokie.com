@@ -86,6 +86,12 @@ pub fn ensure_required_models() -> ModelInstallReport {
     let downloads_disabled = std::env::var("AOKIE_DISABLE_MODEL_DOWNLOAD").as_deref() == Ok("1");
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(20))
+        // Audit AK-08: an explicit OVERALL deadline — a stalled origin can no
+        // longer hold the install thread forever. One hour comfortably covers
+        // the largest bundle on a slow link (resume picks up where a timeout
+        // cut off), and reqwest 0.11's blocking client has no per-read idle
+        // bound to use instead.
+        .timeout(Duration::from_secs(3600))
         .user_agent(concat!("aokie-plugin/", env!("CARGO_PKG_VERSION")))
         .build();
 
@@ -255,15 +261,32 @@ fn download_file(
 
         let append = offset > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
         if append {
-            let expected = format!("bytes {offset}-");
+            // Audit AK-08: parse the EXACT Content-Range — start must be our
+            // offset AND the total must be the manifest size. "starts_with"
+            // alone let a misbehaving origin append an arbitrary bogus range.
             let valid_range = response
                 .headers()
                 .get(CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with(&expected));
+                .and_then(parse_content_range)
+                .is_some_and(|(start, end, total)| {
+                    start == offset && total == file.size && end + 1 == total
+                });
             if !valid_range {
                 let _ = fs::remove_file(&part);
                 continue;
+            }
+        }
+        // Audit AK-08: the manifest size is enforced WHILE streaming, not only
+        // at EOF. remaining+1 lets exactly one excess byte prove the overflow.
+        let remaining = file.size.saturating_sub(if append { offset } else { 0 });
+        if let Some(declared) = response.content_length() {
+            if declared != remaining {
+                let _ = fs::remove_file(&part);
+                return Err(format!(
+                    "download {} declared {declared} bytes but the manifest expects {remaining}",
+                    file.path
+                ));
             }
         }
         let mut output = OpenOptions::new()
@@ -273,8 +296,17 @@ fn download_file(
             .truncate(!append)
             .open(&part)
             .map_err(|error| format!("open partial {}: {error}", file.path))?;
-        io::copy(&mut response, &mut output)
+        let mut limited = io::Read::take(&mut response, remaining + 1);
+        let written = io::copy(&mut limited, &mut output)
             .map_err(|error| format!("write partial {}: {error}", file.path))?;
+        if written > remaining {
+            drop(output);
+            let _ = fs::remove_file(&part);
+            return Err(format!(
+                "download {} exceeded its manifest size of {} bytes — aborted and discarded",
+                file.path, file.size
+            ));
+        }
         output
             .sync_all()
             .map_err(|error| format!("sync partial {}: {error}", file.path))?;
@@ -288,6 +320,19 @@ fn download_file(
     Err(format!(
         "server would not resume a valid download for {}",
         file.path
+    ))
+}
+
+/// Parse `bytes <start>-<end>/<total>` (audit AK-08). Returns None for the
+/// `*` forms or anything malformed — resume then restarts from scratch.
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    Some((
+        start.trim().parse().ok()?,
+        end.trim().parse().ok()?,
+        total.trim().parse().ok()?,
     ))
 }
 

@@ -258,6 +258,20 @@ pub enum OutboxStatus {
     Dead,
 }
 
+/// Outcome of an acknowledgement (audit AK-05): `sent` and `dead` are both
+/// terminal — see [`Outbox::mark_sent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// pending|failed → sent: this ack delivered the event.
+    Marked,
+    /// The row was already `sent` — a duplicate ack; harmless and idempotent.
+    AlreadySent,
+    /// The row is terminal (`dead`/quarantined) — the ack changed NOTHING.
+    RefusedTerminal,
+    /// No outbox row carries this key — the ack referenced nothing we emitted.
+    Unknown,
+}
+
 /// Outcome of [`Outbox::insert_pending`] (audit AOK-EVENT-001).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertOutcome {
@@ -635,15 +649,26 @@ impl Outbox {
         }
     }
 
-    /// The host durably acknowledged this event. `sent` is terminal — this is
-    /// the only transition into it, and nothing transitions out of it.
-    pub fn mark_sent(&self, idempotency_key: &str) -> rusqlite::Result<()> {
-        self.conn.execute(
+    /// The host durably acknowledged this event. `sent` is terminal, and so is
+    /// `dead` (audit AK-05): the ONLY transition into `sent` is from
+    /// `pending`/`failed` — a stale or stray acknowledgement can no longer
+    /// rewrite a dead/quarantined row into "successfully delivered" (hiding an
+    /// undelivered event), and an ack for an unknown key changes zero rows.
+    /// The typed outcome lets callers log exactly what happened.
+    pub fn mark_sent(&self, idempotency_key: &str) -> rusqlite::Result<AckOutcome> {
+        let changed = self.conn.execute(
             "UPDATE aokie_outbox SET status = 'sent', last_error = NULL, updated_at = ?2
-             WHERE idempotency_key = ?1",
+             WHERE idempotency_key = ?1 AND status IN ('pending', 'failed')",
             params![idempotency_key, now_iso8601()],
         )?;
-        Ok(())
+        if changed == 1 {
+            return Ok(AckOutcome::Marked);
+        }
+        Ok(match self.status_of(idempotency_key)? {
+            Some(OutboxStatus::Sent) => AckOutcome::AlreadySent,
+            Some(_) => AckOutcome::RefusedTerminal,
+            None => AckOutcome::Unknown,
+        })
     }
 
     /// Record an emission failure: increments `attempts`, stores the
@@ -1090,12 +1115,64 @@ mod tests {
         let ob = Outbox::open_in_memory().unwrap();
         let ev = event("call_b", "aokie.call.ended");
         ob.insert_pending(&ev, TARGET_DESKTOP).unwrap();
-        ob.mark_sent(&ev.idempotency_key).unwrap();
+        assert_eq!(
+            ob.mark_sent(&ev.idempotency_key).unwrap(),
+            AckOutcome::Marked
+        );
         assert_eq!(
             ob.status_of(&ev.idempotency_key).unwrap(),
             Some(OutboxStatus::Sent)
         );
         assert_eq!(ob.counts().unwrap().sent, 1);
+    }
+
+    /// Audit AK-05: `sent` and `dead` are both TERMINAL for acknowledgements —
+    /// a stray/duplicate ack can never rewrite a dead (undelivered) row into
+    /// "delivered", and an ack for a key we never emitted changes zero rows.
+    #[test]
+    fn acks_cannot_rewrite_terminal_rows_or_invent_them() {
+        let ob = Outbox::open_in_memory().unwrap();
+
+        // Duplicate ack on a sent row: idempotent, still sent.
+        let sent = event("ack-sent", "aokie.call.ended");
+        ob.insert_pending(&sent, TARGET_DESKTOP).unwrap();
+        assert_eq!(ob.mark_sent(&sent.idempotency_key).unwrap(), AckOutcome::Marked);
+        assert_eq!(
+            ob.mark_sent(&sent.idempotency_key).unwrap(),
+            AckOutcome::AlreadySent
+        );
+
+        // Dead row: an ack must NOT paper over the failure.
+        let dead = event("ack-dead", "aokie.call.ended");
+        ob.insert_pending(&dead, TARGET_DESKTOP).unwrap();
+        for _ in 0..MAX_ATTEMPTS {
+            ob.mark_failed(&dead.idempotency_key, "boom", None).unwrap();
+        }
+        assert_eq!(
+            ob.mark_sent(&dead.idempotency_key).unwrap(),
+            AckOutcome::RefusedTerminal
+        );
+        assert_eq!(
+            ob.status_of(&dead.idempotency_key).unwrap(),
+            Some(OutboxStatus::Dead),
+            "the dead row must stay dead"
+        );
+
+        // Unknown key: nothing moved, typed outcome says so.
+        assert_eq!(
+            ob.mark_sent("never-emitted-key").unwrap(),
+            AckOutcome::Unknown
+        );
+
+        // failed → sent still works (the normal retry-then-ack path).
+        let retried = event("ack-retried", "aokie.call.ended");
+        ob.insert_pending(&retried, TARGET_DESKTOP).unwrap();
+        ob.mark_failed(&retried.idempotency_key, "transient", None)
+            .unwrap();
+        assert_eq!(
+            ob.mark_sent(&retried.idempotency_key).unwrap(),
+            AckOutcome::Marked
+        );
     }
 
     /// Audit OBS-001: operator redrive revives dead rows into the normal
