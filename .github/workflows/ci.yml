@@ -307,11 +307,28 @@ jobs:
         env:
           CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
 
+      # AK-001: EVERY bundle mutation (release-manifest.json above, the
+      # SHA256SUMS.txt convenience checksums here) happens BEFORE the package
+      # manifest is signed, so the signed inventory covers the final tree.
+      # SHA256SUMS.txt excludes itself and package-manifest.json (which does
+      # not exist yet — the signed manifest supersedes it as the integrity
+      # authority); the strict verifier covers SHA256SUMS.txt as a listed file.
+      - name: Checksums
+        shell: pwsh
+        working-directory: bundle
+        run: |
+          Get-ChildItem -File -Recurse | Where-Object { $_.Name -ne 'SHA256SUMS.txt' -and $_.Name -ne 'package-manifest.json' } |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), [IO.Path]::GetRelativePath((Get-Location).Path, $_.Path).Replace('\', '/') } |
+            Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
       # TRUST-001: first-party Ed25519 package manifest over every bundle
       # file. FormLogic Desktop pins the public key (fl-aokie-2026a) and
       # refuses to launch a plugin directory whose signature or digests do
       # not verify. A TAG release without the signing key is a hard failure;
-      # dispatch smoke builds warn and stay unsigned.
+      # dispatch smoke builds warn and stay unsigned. This is the LAST bundle
+      # mutation (AK-001) — anything written after it would unsign the tree.
       - name: Sign package manifest (package-signer)
         shell: pwsh
         env:
@@ -328,15 +345,29 @@ jobs:
           cargo run -p package-signer --release -- sign --dir bundle --name aokie-plugin --version $version --key-id fl-aokie-2026a --key-env AOKIE_PACKAGE_SIGNING_KEY
           if ($LASTEXITCODE -ne 0) { throw "package signing failed" }
 
-      - name: Checksums
+      # AK-001: prove the artifact a customer actually receives verifies —
+      # zip the final tree, extract it into a FRESH directory, and run the
+      # strict verifier over the extraction (catches any post-sign mutation,
+      # archive lossiness, or path-normalisation drift).
+      - name: Verify the extracted final artifact
         shell: pwsh
-        working-directory: bundle
+        env:
+          AOKIE_PACKAGE_SIGNING_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY }}
         run: |
-          Get-ChildItem -File -Recurse | Where-Object Name -ne 'SHA256SUMS.txt' |
-            Get-FileHash -Algorithm SHA256 |
-            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), [IO.Path]::GetRelativePath((Get-Location).Path, $_.Path).Replace('\', '/') } |
-            Set-Content -Encoding ascii SHA256SUMS.txt
-          Get-Content SHA256SUMS.txt
+          if (-not $env:AOKIE_PACKAGE_SIGNING_KEY) {
+            Write-Warning "unsigned smoke bundle — skipping extracted-artifact verification"
+            exit 0
+          }
+          $pub = (cargo run -p package-signer --release --quiet -- pubkey --key-env AOKIE_PACKAGE_SIGNING_KEY | Select-Object -Last 1).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $pub) { throw "could not derive the signing public key" }
+          cargo run -p package-signer --release -- verify --dir bundle --pubkey $pub
+          if ($LASTEXITCODE -ne 0) { throw "final bundle tree failed verification" }
+          Compress-Archive -Path bundle/* -DestinationPath verify-roundtrip.zip -Force
+          Expand-Archive -Path verify-roundtrip.zip -DestinationPath verify-extracted -Force
+          cargo run -p package-signer --release -- verify --dir verify-extracted --pubkey $pub
+          if ($LASTEXITCODE -ne 0) { throw "EXTRACTED artifact failed verification — the shipped zip does not match the signed tree" }
+          Remove-Item verify-roundtrip.zip -Force
+          Remove-Item verify-extracted -Recurse -Force
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
