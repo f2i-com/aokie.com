@@ -42,23 +42,70 @@ jobs:
         run: cargo test --workspace
 
   plugin-voice:
-    name: aokie-plugin (check, voice features)
+    name: aokie-plugin (test + clippy, voice features)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
+        with:
+          components: clippy
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # The voice build compiles a distinct cfg surface (agent, AEC, TTS/STT
-      # runtimes) that the default build never touches — check BOTH, always
-      # (the repo rule since the barge-in work). No release signing gate here:
-      # this is a debug check, not a shippable artifact.
-      - name: Check (voice)
-        run: cargo check -p aokie-plugin --features voice
+      # runtimes) that the default build never touches. Audit AK-15: the
+      # SHIPPING feature set is now TESTED and clippy-linted here, not merely
+      # cargo-checked — a failing #[cfg(feature = "voice")] test or deny-level
+      # lint blocks the release chain (plugin-release depends on this job).
+      # --test-threads=2: the synthetic-audio/QuickJS timing tests are a
+      # documented flake class under full parallel load.
+      - name: Tests (voice)
+        run: cargo test -p aokie-plugin --features voice -- --test-threads=2
+
+      - name: Clippy (voice, deny-level lints)
+        run: cargo clippy -p aokie-plugin --all-targets --features voice
+
+  # Audit AK-18: the documented SHIPPING combination (voice,managed-beta-driver)
+  # compiles as its own gate — a managed-beta-only cfg break used to reach the
+  # release job before anything noticed. Compile-only (the mbd self-sign paths
+  # are runtime-gated and covered by the plugin's own tests).
+  managed-beta:
+    name: managed-beta shipping combination (compile)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Check plugin (voice,managed-beta-driver)
+        run: cargo check -p aokie-plugin --features voice,managed-beta-driver
+      - name: Check driver helper (managed-beta-driver)
+        run: cargo check -p aokie-dongle --features managed-beta-driver --bins
+
+  # Audit AK-16: the Companion React/TypeScript app ships from this repo but
+  # had no CI coverage at all — a TypeScript error or failing Vitest now
+  # blocks the release chain.
+  companion:
+    name: Companion app (TypeScript + Vitest + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: apps/aokie-mobile/package-lock.json
+      - name: Install
+        working-directory: apps/aokie-mobile
+        run: npm ci
+      - name: Tests
+        working-directory: apps/aokie-mobile
+        run: npm test
+      - name: Build (tsc --noEmit + vite build)
+        working-directory: apps/aokie-mobile
+        run: npm run build
 
   # Lint gate (audit FL-CI-001): clippy's deny-level lints (correctness class)
   # block merge across the whole workspace and all targets. Style warnings
@@ -106,7 +153,11 @@ jobs:
   plugin-release:
     name: aokie-plugin release bundle
     runs-on: windows-latest
-    needs: [plugin, plugin-voice]
+    # Audit AK-17: publication depends on EVERY release prerequisite — a manual
+    # dispatch on a tag can no longer upload while clippy, the supply-chain
+    # audit, the Companion frontend, or the shipping-feature gates fail or are
+    # still running.
+    needs: [plugin, plugin-voice, clippy, supply-chain, managed-beta, companion]
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     permissions:
       # gh release create/upload on tag builds — the ONLY write surface in
