@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "id": "aokie",
   "name": "Aokie Phone Bridge",
   "version": "0.1.0",
@@ -48,6 +48,9 @@
     "connector.aokie.consent.get",
     "connector.aokie.consent.set",
     "connector.aokie.consent.revoke"
+  ],
+  "serviceDefinitions": [
+    { "definitionFile": "definitions/phone.json" }
   ],
   "connectors": [
     {
