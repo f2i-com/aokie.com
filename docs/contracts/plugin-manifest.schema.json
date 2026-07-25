@@ -2,11 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://formlogic.com/schemas/plugin-manifest.schema.json",
   "title": "FormLogic Desktop plugin manifest",
-  "description": "manifest.json at the root of a FormLogic Desktop plugin directory (e.g. plugins/aokie/manifest.json). Canonical copy: formlogic-app/docs/contracts/. schemaVersion 2 adds the additive ui/services/commands/data sections; v2-only sections are refused under schemaVersion 1 by the desktop validator.",
+  "description": "manifest.json at the root of a FormLogic Desktop plugin directory (e.g. plugins/aokie/manifest.json). Canonical copy: formlogic-app/docs/contracts/. schemaVersion 2 adds the additive ui/services/commands/data sections; schemaVersion 3 adds serviceDefinitions (SRV-402). A section is refused under an older schemaVersion rather than half-honoured — a host that predates it would silently ignore the section, and a plugin that believes it declared something it did not is worse than one that fails to load.",
   "type": "object",
   "required": ["schemaVersion", "id", "name", "version", "entry"],
   "properties": {
-    "schemaVersion": { "enum": [1, 2] },
+    "schemaVersion": { "enum": [1, 2, 3] },
     "id": {
       "type": "string",
       "description": "Stable plugin id. Also the default connector namespace.",
@@ -184,6 +184,19 @@
         "required": ["templateFile"],
         "properties": {
           "templateFile": { "type": "string", "description": "Package-relative ServiceTemplate JSON path (no '..', no absolute)." }
+        },
+        "additionalProperties": false
+      }
+    },
+    "serviceDefinitions": {
+      "type": "array",
+      "description": "schemaVersion 3 — v3 Service Definitions this plugin contributes (SRV-402). Distinct from \"services\": those are legacy ServiceTemplates the desktop supervises as processes; these are catalog entries whose actions a flow can invoke. The host stamps each contributed definition with its provider (the plugin id), overwriting any provider the file claims, so a definition cannot fake provenance. Ids must be the plugin id or start with \"<plugin-id>.\", built-ins can never be shadowed, and one plugin owns an id.",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "required": ["definitionFile"],
+        "properties": {
+          "definitionFile": { "type": "string", "description": "Package-relative Service Definition v3 JSON path (no '..', no absolute)." }
         },
         "additionalProperties": false
       }
