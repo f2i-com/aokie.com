@@ -4389,6 +4389,20 @@ pub(crate) const CODEX_LIVE_CALL_ENDPOINT_LUNA_LOW: &str =
     "http://127.0.0.1:17872/api/ai/providers/openai-codex-agent-luna-low/v1/chat/completions";
 pub(crate) const CODEX_LIVE_CALL_ENDPOINT_LUNA_LOW_FAST: &str =
     "http://127.0.0.1:17872/api/ai/providers/openai-codex-agent-luna-low-fast/v1/chat/completions";
+/// Loopback ports a Desktop AI gateway is known to listen on: FormLogic
+/// Desktop, then OAIY Desktop.
+///
+/// An allow-list rather than "any loopback port" on purpose. Recognising a URL
+/// as a live-call route does more than pick a model — it forces that model and
+/// REFUSES to send caller audio. Extending the recognition to any local port
+/// would let an unrelated local service inherit a policy written for a
+/// specific, known route; failing to recognise a real one is the safer
+/// direction, because that route keeps its ordinary local-provider handling.
+///
+/// Both hosts serve the same four `openai-codex-agent-*` provider ids, so the
+/// same configured endpoint works against whichever one the user runs.
+const DESKTOP_GATEWAY_PORTS: [u16; 2] = [17872, 17972];
+
 pub(crate) const CODEX_LIVE_CALL_DESTINATION: &str = "OpenAI ChatGPT via Codex";
 pub(crate) const CODEX_LIVE_CALL_MODEL: &str = "gpt-5.5";
 pub(crate) const CODEX_LIVE_CALL_MODEL_LUNA: &str = "gpt-5.6-luna";
@@ -4479,7 +4493,10 @@ pub(crate) fn codex_live_call_model_for_endpoint(url: &str) -> Option<&'static s
         return None;
     };
     let model = codex_live_call_model_for_path(parsed.path())?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.port_or_known_default() != Some(17872)
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed
+            .port_or_known_default()
+            .is_some_and(|port| DESKTOP_GATEWAY_PORTS.contains(&port))
     {
         return None;
     }
@@ -7666,6 +7683,54 @@ mod tests {
                 effective_consent_destination(&near_miss).unwrap(),
                 None,
                 "generic loopback must remain local: {near_miss}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_oaiy_desktop_gateway_port_is_recognised_like_formlogics() {
+        // OAIY Desktop serves the same four openai-codex-agent-* provider ids
+        // on 17972. Recognising the route is what forces the pinned model and
+        // stops caller audio being sent; without this the same endpoint on OAIY
+        // was treated as an ordinary local provider.
+        for path in [
+            CODEX_LIVE_CALL_PATH_NONE,
+            CODEX_LIVE_CALL_PATH_LOW,
+            CODEX_LIVE_CALL_PATH_LUNA_LOW,
+            CODEX_LIVE_CALL_PATH_LUNA_LOW_FAST,
+        ] {
+            let formlogic = format!("http://127.0.0.1:17872{path}");
+            let oaiy = format!("http://127.0.0.1:17972{path}");
+            assert_eq!(
+                codex_live_call_model_for_endpoint(&oaiy),
+                codex_live_call_model_for_endpoint(&formlogic),
+                "both desktops must resolve {path} to the same model"
+            );
+            assert!(is_codex_live_call_endpoint(&oaiy), "{oaiy}");
+        }
+        // The host rules are unchanged — a port allow-list must not become a
+        // way to reach a NON-loopback address.
+        assert!(is_codex_live_call_endpoint(&format!(
+            "http://localhost:17972{CODEX_LIVE_CALL_PATH_LOW}"
+        )));
+        assert!(!is_codex_live_call_endpoint(&format!(
+            "http://192.168.1.10:17972{CODEX_LIVE_CALL_PATH_LOW}"
+        )));
+    }
+
+    #[test]
+    fn an_unlisted_loopback_port_is_still_an_ordinary_local_provider() {
+        // The allow-list is deliberate: recognition forces a model and refuses
+        // caller audio, so an unrelated local service must not inherit a policy
+        // written for a known route. Failing to recognise is the safe
+        // direction; that route just keeps normal local-provider handling.
+        for port in [17871, 17873, 17971, 17973, 8080] {
+            let url = format!("http://127.0.0.1:{port}{CODEX_LIVE_CALL_PATH_NONE}");
+            assert!(!is_codex_live_call_endpoint(&url), "{url}");
+            assert_eq!(
+                effective_consent_destination(&url).unwrap(),
+                None,
+                "generic loopback must remain local: {url}"
             );
         }
     }
