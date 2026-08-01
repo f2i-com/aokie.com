@@ -1894,6 +1894,39 @@ fn end_call_marker_stripping() {
     assert!(!f);
 }
 
+/// The bare tokens are a SUBSTRING of ordinary English, and an unanchored
+/// search hung callers up mid-sentence while mangling the words on the way out:
+/// "I'd recommend calling back" was spoken as "I'd recomming back" and then the
+/// line dropped. Every phrase below is something a receptionist says.
+#[cfg(feature = "voice")]
+#[test]
+fn an_ordinary_sentence_is_never_mistaken_for_the_end_call_marker() {
+    for phrase in [
+        "I'd recommend calling back tomorrow.",
+        "We had a weekend call about that.",
+        "A friend called earlier.",
+        "I can attend calls until five.",
+        "Please recommend calling the office.",
+    ] {
+        let (text, hangup) = strip_end_call_marker(phrase);
+        assert_eq!(text, phrase, "the words must reach the caller unaltered");
+        assert!(!hangup, "{phrase:?} must not hang up the call");
+    }
+
+    // The marker still works when it stands on its own, whatever punctuation
+    // or bracketing surrounds it.
+    for (input, want) in [
+        ("Thanks, goodbye. END_CALL", "Thanks, goodbye."),
+        ("Thanks, goodbye. end call", "Thanks, goodbye."),
+        ("Bye! (END_CALL)", "Bye! ()"),
+        ("Bye now [[end_call]]", "Bye now"),
+    ] {
+        let (text, hangup) = strip_end_call_marker(input);
+        assert_eq!(text, want, "input {input:?}");
+        assert!(hangup, "{input:?} must still end the call");
+    }
+}
+
 /// AK-008: the barge scan must CAPTURE the audio it inspects and remember
 /// where speech started, so the caller's words spoken over Aokie are
 /// prepended to their turn instead of being consumed by detection.
