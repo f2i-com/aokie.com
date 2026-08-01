@@ -99,6 +99,35 @@ pub fn selected_tts_engine() -> &'static str {
     normalize_tts_engine(&std::env::var("AOKIE_TTS_ENGINE").unwrap_or_default())
 }
 
+/// Does this voice belong to the engine that will be asked to speak it?
+///
+/// The two engines name voices in different vocabularies: pocket-tts has its
+/// own presets (`alba`, `eponine`, …) and `.wav` clone paths, while sherpa
+/// speaks through downloaded VITS / Piper / Kokoro BUNDLES (`vits-piper-en_GB-…`).
+/// Handing one engine the other's name is not an error anywhere — pocket looks
+/// the id up in its own `voices/` directory, fails to find it, and quietly
+/// falls back to `reference_sample.wav`. The operator picks a voice, hears a
+/// different one on every call, and nothing says why.
+///
+/// Only the mismatch that actually happens is refused: a BUNDLE name given to
+/// pocket. Sherpa stays permissive, because a bundle may legitimately name its
+/// speakers anything at all and this must not start rejecting valid ids.
+pub fn voice_matches_engine(engine: &str, voice: &str) -> bool {
+    let v = voice.trim().to_ascii_lowercase();
+    if v.is_empty() || normalize_tts_engine(engine) != "pocket" {
+        return true;
+    }
+    // A clone path is pocket's own, whatever it is called.
+    if v.ends_with(".wav") || v.ends_with(".safetensors") {
+        return true;
+    }
+    !(v.starts_with("vits-")
+        || v.starts_with("piper-")
+        || v.starts_with("kokoro-")
+        || v.contains("-piper-")
+        || v.contains("-vits-"))
+}
+
 fn f32_to_i16(samples: &[f32]) -> Vec<i16> {
     samples
         .iter()
@@ -922,5 +951,46 @@ mod tests {
         let p = preflight_decision(false, false, false, true, true, false);
         assert_eq!(p.stt_error, None);
         assert!(p.tts_error.is_some());
+    }
+}
+
+#[cfg(test)]
+mod voice_engine_tests {
+    use super::{normalize_tts_engine, voice_matches_engine};
+
+    /// A Piper/VITS bundle belongs to sherpa. Given to pocket it is not an
+    /// error anywhere — pocket looks it up, misses, and falls back to its
+    /// reference sample — so the operator picks Jenny and hears something else
+    /// on every call with nothing to explain it (live report 2026-08-01).
+    #[test]
+    fn a_bundle_voice_is_refused_for_pocket_and_accepted_for_sherpa() {
+        for bundle in [
+            "vits-piper-en_GB-jenny_dioco-medium",
+            "piper-en_US-amy-low",
+            "kokoro-en-v0_19",
+            "en_GB-piper-alba",
+        ] {
+            assert!(!voice_matches_engine("pocket", bundle), "{bundle} is not a pocket voice");
+            assert!(voice_matches_engine("sherpa", bundle), "{bundle} IS a sherpa voice");
+            // The engine name a graph writes is normalised first.
+            assert!(voice_matches_engine("piper", bundle), "piper is sherpa");
+        }
+    }
+
+    /// Pocket's own vocabulary must keep working: presets, clone paths, and
+    /// blank (which means "the bundle default").
+    #[test]
+    fn pockets_own_voices_are_untouched() {
+        for ok in ["alba", "eponine", "javert", "", r"C:\voices\me.wav", "voices/me.safetensors"] {
+            assert!(voice_matches_engine("pocket", ok), "{ok:?} is a pocket voice");
+        }
+    }
+
+    #[test]
+    fn the_engine_name_is_normalised_the_same_way_everywhere() {
+        assert_eq!(normalize_tts_engine(""), "pocket");
+        assert_eq!(normalize_tts_engine("piper"), "sherpa");
+        assert_eq!(normalize_tts_engine("sherpa-onnx"), "sherpa");
+        assert_eq!(normalize_tts_engine("nonsense"), "pocket");
     }
 }

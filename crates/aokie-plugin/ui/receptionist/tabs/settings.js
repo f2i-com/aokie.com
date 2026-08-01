@@ -492,6 +492,44 @@
     return [''].concat(unique);
   }
 
+  /** Mirror of voice.rs normalize_tts_engine — unknown values are pocket. */
+  function normalizeEngine(raw) {
+    var v = String(raw == null ? '' : raw).trim().toLowerCase();
+    return v === 'sherpa' || v === 'sherpa-onnx' || v === 'piper' ? 'sherpa' : 'pocket';
+  }
+
+  /** Mirror of voice.rs voice_matches_engine — KEEP IN LOCK-STEP. The plugin
+   *  now REFUSES a voice belonging to the other engine and speaks the engine
+   *  default instead, so leaving one selected here would show a voice on screen
+   *  that no caller ever hears. Only the mismatch that actually happens is
+   *  caught: a sherpa BUNDLE name handed to pocket. */
+  function voiceMatchesEngine(engine, voice) {
+    var v = String(voice == null ? '' : voice).trim().toLowerCase();
+    if (v === '' || normalizeEngine(engine) !== 'pocket') return true;
+    if (v.slice(-4) === '.wav' || v.slice(-12) === '.safetensors') return true;
+    return !(
+      v.indexOf('vits-') === 0 ||
+      v.indexOf('piper-') === 0 ||
+      v.indexOf('kokoro-') === 0 ||
+      v.indexOf('-piper-') >= 0 ||
+      v.indexOf('-vits-') >= 0
+    );
+  }
+
+  /** Is the voice usable by the engine given what is actually INSTALLED?
+   *  Better informed than voiceMatchesEngine, which is the plugin-parity rule
+   *  and cannot see the catalog: the plugin must stay permissive for sherpa (a
+   *  bundle may legitimately name a speaker 'alba'), but here the catalog says
+   *  whether a name is a POCKET preset, so switching to sherpa with 'alba'
+   *  selected is a knowable mismatch rather than a guess. */
+  function voiceUsableByEngine(engine, voice, catalog) {
+    if (!voiceMatchesEngine(engine, voice)) return false;
+    var v = String(voice == null ? '' : voice).trim();
+    if (v === '' || normalizeEngine(engine) !== 'sherpa') return true;
+    // index 0 is '' (Default); anything at 1+ is a pocket preset.
+    return pocketVoiceOptions(catalog).indexOf(v) < 1;
+  }
+
   var BUNDLE_ENGINE_TOKENS = { vits: 1, piper: 1, kokoro: 1, matcha: 1, mms: 1, coqui: 1, icefall: 1 };
   var BUNDLE_QUALITY_TOKENS = { low: 1, medium: 1, high: 1, x_low: 1, x_high: 1 };
 
@@ -1389,6 +1427,11 @@
     }
     if (t.id === 'set-engine' && e.type === 'change') {
       settings.ttsEngine = t.value;
+      // A voice belonging to the OTHER engine is refused at synth time and the
+      // engine default speaks instead, so carrying the old pick across an
+      // engine change would leave the form claiming a voice no caller hears.
+      // Reset to the engine default, which is what the picker now offers.
+      if (!voiceUsableByEngine(t.value, settings.ttsVoice, catalog)) settings.ttsVoice = '';
       rerenderVoiceZone();
       return;
     }
