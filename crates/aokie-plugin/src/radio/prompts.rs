@@ -184,16 +184,46 @@ pub(super) fn strip_end_call_marker(s: &str) -> (String, bool) {
     let mut found = false;
     for v in VARIANTS {
         let vl = v.to_lowercase();
+        // A BRACKETED variant is unambiguous anywhere. The bare tokens are not:
+        // "end call" is a substring of ordinary English — "recommend calling",
+        // "weekend call", "a friend called", "attend calls" — and an unanchored
+        // search both cut the word apart before it was spoken ("I'd recommend
+        // calling back" became "I'd recomming back") and hung the caller up
+        // mid-sentence. Only accept a bare token standing on its own.
+        let bare = !v.starts_with('[');
+        let mut from = 0usize;
         loop {
             let lower = out.to_lowercase();
-            match lower.find(&vl) {
-                Some(pos) => {
-                    out.replace_range(pos..pos + v.len(), "");
-                    found = true;
-                }
-                None => break,
+            let Some(rel) = lower[from..].find(&vl) else { break };
+            let pos = from + rel;
+            let end = pos + v.len();
+            if bare && !stands_alone(&lower, pos, end) {
+                // Part of a longer word — leave it alone and keep looking.
+                from = pos + 1;
+                continue;
             }
+            out.replace_range(pos..end, "");
+            found = true;
+            from = pos;
         }
     }
     (out.trim().to_string(), found)
+}
+
+/// Is the slice `[start, end)` a whole token — not spliced out of a longer word?
+///
+/// Boundaries are alphanumeric-only: surrounding punctuation, brackets and
+/// whitespace all still count as standing alone, so "…goodbye. END_CALL" and
+/// "(end call)" are honoured while "recommend calling" is not.
+#[cfg(feature = "voice")]
+fn stands_alone(text: &str, start: usize, end: usize) -> bool {
+    let before_ok = text[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_alphanumeric());
+    let after_ok = text[end..]
+        .chars()
+        .next()
+        .is_none_or(|c| !c.is_alphanumeric());
+    before_ok && after_ok
 }
