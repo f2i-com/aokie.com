@@ -567,11 +567,35 @@ impl Plugin {
             .and_then(|v| v.as_str())
         {
             if !v.trim().is_empty() {
-                std::env::set_var("AOKIE_TTS_VOICE", v.trim());
-                eprintln!(
-                    "[aokie-plugin] ttsVoice setting → AOKIE_TTS_VOICE={}",
-                    v.trim()
+                // The engine about to be loaded, decided the same way the synth
+                // worker decides it, so this check sees what will actually speak.
+                let engine = crate::voice::normalize_tts_engine(
+                    self.store
+                        .config
+                        .settings
+                        .get("ttsEngine")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or_default(),
                 );
+                if crate::voice::voice_matches_engine(engine, v.trim()) {
+                    std::env::set_var("AOKIE_TTS_VOICE", v.trim());
+                    eprintln!(
+                        "[aokie-plugin] ttsVoice setting → AOKIE_TTS_VOICE={}",
+                        v.trim()
+                    );
+                } else {
+                    // A voice belonging to the OTHER engine. Passing it through
+                    // is not an error anywhere downstream — the engine simply
+                    // fails to find it and falls back — so the operator hears a
+                    // voice they did not choose and nothing explains it. Clear
+                    // the stamp so the engine's own default is used, and say so.
+                    std::env::remove_var("AOKIE_TTS_VOICE");
+                    eprintln!(
+                        "[aokie-plugin] ttsVoice {:?} is not a {engine} voice — using the \
+                         {engine} default instead (set ttsEngine=sherpa to use Piper/VITS voices)",
+                        v.trim()
+                    );
+                }
             }
         }
         // In-process TTS engine selection: ttsEngine (blank/pocket = Pocket-TTS,
