@@ -10,74 +10,94 @@
  * ========================================================================== */
 
 :root {
-  /* ---- LIGHT (default) — token values copied from the desktop skin ---- */
-  --bg-0: #ffffff;
-  --surface-1: #ffffff;
-  --surface-2: #f8fafc;
-  --line: #e2e8f0;
-  --line-2: #cbd5e1;
+  /* ---- LIGHT = Paper Circuit, the OAIY host's light theme ----
+     Values tracked from desktop/src/styles.css `:root[data-theme='light']`.
+     Warm paper, not the cold slate this file used to carry: against the host
+     shell the old #ffffff/#f8fafc surfaces read as a foreign window rather
+     than a page of the same app. */
+  --bg-0: #f3f0e9;
+  --surface-1: #fffefa;
+  --surface-2: #f8f5ee;
+  --line: #cec8be;
+  --line-2: #9f998f;
 
-  --ink: #111827;
-  --ink-dim: #475569;
-  --ink-faint: #64748b;
+  --ink: #171717;
+  --ink-dim: #68645e;
+  --ink-faint: #6f6a63;
 
-  --signal: #4f46e5;
-  --signal-bright: #4338ca;
-  --signal-deep: #3730a3;
-  --signal-soft: rgba(79, 70, 229, 0.1);
-  --signal-line: rgba(79, 70, 229, 0.28);
-  --signal-strong: #4338ca;
+  --signal: #2457e6;
+  /* Filled-button hover goes DARKER on paper, not lighter. */
+  --signal-bright: #1a46c4;
+  /* Background for filled accent controls. Separate from --signal because
+     the button label sits ON it: on paper the host's own blue already clears
+     4.5:1 against white, so this matches --signal exactly. */
+  --signal-fill: #2457e6;
+  --signal-soft: rgba(36, 87, 230, 0.1);
+  --signal-line: rgba(36, 87, 230, 0.28);
+  /* Used as a TEXT colour (6 sites), so it is the readable variant rather
+     than the raw accent. */
+  --signal-strong: #1a46c4;
   --signal-ink: #ffffff;
 
-  /* semantic status — fixed hues, never follow the accent */
-  --ok: #16a34a;
-  --ok-soft: rgba(22, 163, 74, 0.12);
-  --ok-line: rgba(22, 163, 74, 0.3);
-  --ok-text: #15803d;
-  --err: #dc2626;
-  --err-soft: rgba(220, 38, 38, 0.1);
-  --err-line: rgba(220, 38, 38, 0.3);
-  --err-text: #b91c1c;
-  --warn: #d97706;
-  --warn-soft: rgba(217, 119, 6, 0.14);
+  /* semantic status - fixed hues, never follow the accent */
+  --ok: #218450;
+  --ok-soft: rgba(33, 132, 80, 0.1);
+  --ok-line: rgba(33, 132, 80, 0.3);
+  --ok-text: #1a6b41;
+  --err: #e94b3c;
+  --err-soft: rgba(233, 75, 60, 0.08);
+  --err-line: rgba(233, 75, 60, 0.3);
+  --err-text: #c2392c;
+  --warn: #9c6a08;
+  --warn-soft: rgba(245, 181, 44, 0.14);
 
-  --hover-wash: rgba(79, 70, 229, 0.07);
+  --hover-wash: rgba(36, 87, 230, 0.07);
   --font-mono: ui-monospace, 'Cascadia Code', Consolas, monospace;
 
   color-scheme: light;
 }
 
 html.fl-dark {
-  --bg-0: #0b1020;
-  --surface-1: #111a2f;
-  --surface-2: #17213a;
-  --line: rgba(148, 163, 184, 0.18);
-  --line-2: rgba(148, 163, 184, 0.28);
+  /* ---- DARK = Prism Lab, the OAIY host's default theme ----
+     Tracked from desktop/src/styles.css `:root`. The accent moves from lime
+     to the host's violet: a lime-on-navy panel inside a violet-on-black shell
+     was the single loudest reason these screens looked bolted on. */
+  --bg-0: #070a12;
+  --surface-1: #0e1422;
+  --surface-2: #131c2d;
+  --line: #202a3c;
+  --line-2: #33425c;
 
-  --ink: #f8fafc;
-  --ink-dim: #cbd5e1;
-  --ink-faint: #94a3b8;
+  --ink: #f4f7ff;
+  --ink-dim: #98a6bd;
+  --ink-faint: #8592ab;
 
-  --signal: #a3e635;
-  --signal-bright: #bef264;
-  --signal-deep: #65a30d;
-  --signal-soft: rgba(163, 230, 53, 0.14);
-  --signal-line: rgba(163, 230, 53, 0.38);
-  --signal-strong: #bef264;
-  --signal-ink: rgb(11 16 32);
+  --signal: #7167ff;
+  --signal-bright: #8d85ff;
+  /* Background for filled accent controls, a shade deeper than --signal.
+     White on the host violet #7167ff is 4.13:1 and these labels are 10.5px,
+     so the raw accent would have made a previously-readable button fail.
+     #6a5cf0 reads as the same violet and clears the floor at 4.8:1. */
+  --signal-fill: #6a5cf0;
+  --signal-soft: rgba(113, 103, 255, 0.14);
+  --signal-line: rgba(113, 103, 255, 0.38);
+  /* Lifted off the raw #7167ff: as TEXT on --surface-1 that is only ~4.5:1,
+     right on the floor. #a99fff clears it at ~8:1. */
+  --signal-strong: #a99fff;
+  --signal-ink: #ffffff;
 
-  --ok: #4ade80;
-  --ok-soft: rgba(74, 222, 128, 0.14);
-  --ok-line: rgba(74, 222, 128, 0.35);
-  --ok-text: #86efac;
-  --err: #f87171;
-  --err-soft: rgba(248, 113, 113, 0.14);
-  --err-line: rgba(248, 113, 113, 0.4);
-  --err-text: #fca5a5;
-  --warn: #fbbf24;
-  --warn-soft: rgba(217, 119, 6, 0.2);
+  --ok: #45d6a2;
+  --ok-soft: rgba(69, 214, 162, 0.12);
+  --ok-line: rgba(69, 214, 162, 0.35);
+  --ok-text: #7de3c0;
+  --err: #ff6e78;
+  --err-soft: rgba(255, 110, 120, 0.1);
+  --err-line: rgba(255, 110, 120, 0.4);
+  --err-text: #ffa0a6;
+  --warn: #f2b84b;
+  --warn-soft: rgba(242, 184, 75, 0.13);
 
-  --hover-wash: rgba(255, 255, 255, 0.06);
+  --hover-wash: rgba(113, 103, 255, 0.12);
 
   color-scheme: dark;
 }
@@ -689,15 +709,18 @@ button {
 /* ── Buttons: variants shared by the tabs ───────────────────────────────── */
 
 .rcp-button.is-primary {
-  border-color: var(--signal);
-  background: var(--signal);
+  border-color: var(--signal-fill);
+  background: var(--signal-fill);
   color: var(--signal-ink);
 }
 
 .rcp-button.is-primary:hover:not(:disabled) {
-  border-color: var(--signal-bright);
-  background: var(--signal-bright);
-  color: var(--signal-ink);
+  /* The host's own primary button does not recolour on hover, it lifts
+     (desktop/src/styles.css `.btn-primary:hover`). Matching that keeps the
+     affordance identical AND keeps the 10.5px label above 4.5:1 -- brightening
+     the fill toward the raw accent drops it to 4.13:1 exactly while the
+     pointer is on it, which is when it is being read. */
+  transform: translateY(-1px);
 }
 
 .rcp-button.is-danger {
