@@ -567,6 +567,21 @@ impl Plugin {
             .and_then(|v| v.as_str())
         {
             if !v.trim().is_empty() {
+                // The pairing check needs `crate::voice`, which only exists in a
+                // voice build (lib.rs gates the module; Cargo's default feature
+                // set is deliberately empty so the light plugin still builds).
+                // Without those engines there is no mismatch to detect, so the
+                // base build passes the value straight through as it always did.
+                #[cfg(not(feature = "voice"))]
+                {
+                    std::env::set_var("AOKIE_TTS_VOICE", v.trim());
+                    eprintln!(
+                        "[aokie-plugin] ttsVoice setting → AOKIE_TTS_VOICE={}",
+                        v.trim()
+                    );
+                }
+                #[cfg(feature = "voice")]
+                {
                 // The engine about to be loaded, decided the same way the synth
                 // worker decides it, so this check sees what will actually speak.
                 let engine = crate::voice::normalize_tts_engine(
@@ -595,6 +610,7 @@ impl Plugin {
                          {engine} default instead (set ttsEngine=sherpa to use Piper/VITS voices)",
                         v.trim()
                     );
+                }
                 }
             }
         }
