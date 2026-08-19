@@ -37,3 +37,14 @@ a downloaded bundle offline with:
 ```
 cargo run -p package-signer -- verify --dir <bundle> --pubkey n832sELL2yC6UksKhiz4C4UY7P9//mf8JfeFJRcuk5s=
 ```
+
+**The bundle directory is immutable.** Verification fails on any file whose
+digest differs AND on any file the manifest does not list, so nothing may be
+written into an installed bundle after signing — not runtime state, not a
+`.bak` left beside a replaced binary. A host that hands the plugin a writable
+directory must place it OUTSIDE the bundle; OAIY Desktop used to use
+`<plugin>/data`, and the plugin's first settings write permanently invalidated
+its own signature (fixed by moving it to `<dataDir>/plugin-data/<id>`). If
+`verify` reports a digest mismatch on `SHA256SUMS.txt` or `release-manifest.json`
+in particular, suspect a local edit that updated one of those without re-signing;
+re-sign only after the directory is back to exactly the files that belong in it.
