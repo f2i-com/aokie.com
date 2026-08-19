@@ -48,6 +48,17 @@ pub(super) fn run_reply_rounds(
     // the result, and regenerates ONCE — bounded to
     // one lookup per caller turn.
     let mut lookup_rounds: u8 = 0;
+    // These two bound the loop below, so they live OUTSIDE it, next to
+    // lookup_rounds. Declared inside, every `continue 'reply_rounds` re-ran the
+    // declaration and cleared the guard the branch had just set one line
+    // earlier -- so "retry ONCE" and "regenerate ONCE, never loop" both meant
+    // "forever". A model stuck emitting empty replies, or repeating [[WAIT]],
+    // regenerated without limit while the branch that would have apologised and
+    // hung up stayed unreachable, leaving the caller in silence until they hung
+    // up themselves. wait_requested stays inside on purpose: it is this round's
+    // answer to "did the model ask to wait", and must reset each time.
+    let mut wait_regen_done = false;
+    let mut empty_retry_done = false;
     'reply_rounds: loop {
         let sr = bt.get_sample_rate();
         // Add the standing instructions at reply time (not by
@@ -196,8 +207,6 @@ pub(super) fn run_reply_rounds(
         // a moment / is thinking). An empty waited reply is NOT
         // dead air, and the floor stays with the caller.
         let mut wait_requested = false;
-        let mut wait_regen_done = false;
-        let mut empty_retry_done = false;
         // Set when the reply carried the [[ABUSE]] marker
         // (Phase 1): the model flagged an abusive caller.
         // DETERMINISTIC code takes over below — notice,
@@ -1647,7 +1656,7 @@ pub(super) fn run_reply_rounds(
             "role": "user",
             "content": "[SYSTEM NOTE - not the caller speaking] You already waited silently once. The caller has spoken again - [[WAIT]] is not available for this reply. Answer them now in one short sentence.",
         }));
-            wait_requested = false;
+            // (no need to clear wait_requested: the next round re-declares it)
             wait_regen_done = true;
             continue 'reply_rounds;
         }
