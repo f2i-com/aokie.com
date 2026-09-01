@@ -50,7 +50,7 @@ url = "2.5"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
-libwebrtc = "=0.3.41"
+libwebrtc = "=0.3.46"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
