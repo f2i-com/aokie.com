@@ -53,6 +53,9 @@ Invoke-Gate 'check: voice,managed-beta-driver (shipping combo)' $repo {
 Invoke-Gate 'check: driver helper (managed-beta-driver)' $repo {
     cargo check -p aokie-dongle --features managed-beta-driver --bins
 }
+Invoke-Gate 'check: ONNX CUDA API and Candle engines' $repo {
+    cargo check -p aokie-ai --features onnx-cuda,candle
+}
 
 # ── Tests ──
 Invoke-Gate 'test: workspace (default features)' $repo { cargo test --workspace }

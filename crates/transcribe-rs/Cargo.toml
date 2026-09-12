@@ -66,7 +66,8 @@ env_logger = "0.10.0"
 derive_builder = { version = "0.20.2" }
 
 # ONNX runtime
-ort = { version = "=2.0.0-rc.12", optional = true }
+# Match Aokie's dynamically loaded ONNX Runtime 1.25; defaults would require a newer DLL.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "api-25"], optional = true }
 ndarray = { version = "0.17", optional = true }
 regex = { version = "1.11.2", optional = true }
 once_cell = { version = "1.21.3", optional = true }

@@ -920,14 +920,20 @@ mod tests {
     }
 
     #[test]
-    fn resample_output_stays_in_bounds() {
-        let extreme: Vec<i16> = (0..200)
-            .map(|i| if i % 2 == 0 { i16::MAX } else { i16::MIN })
-            .collect();
+    fn resample_extremes_preserve_sign_and_midpoints() {
         for rate in [8_000, 44_100, 48_000] {
-            let out = resample_to_16k(&extreme, rate);
-            assert!(out.iter().all(|&s| s >= i16::MIN && s <= i16::MAX));
+            for level in [i16::MIN, i16::MAX] {
+                let out = resample_to_16k(&[level; 200], rate);
+                assert!(!out.is_empty());
+                assert!(out.iter().all(|&sample| sample == level));
+            }
         }
+        // Interpolating across the full signed range must not overflow or
+        // wrap the midpoint. The mean is -0.5, rounded to -1.
+        assert_eq!(
+            resample_to_16k(&[i16::MIN, i16::MAX, i16::MIN], 8_000),
+            [i16::MIN, -1, i16::MAX, -1, i16::MIN]
+        );
     }
 
     #[test]

@@ -31,7 +31,8 @@ rand = "0.8"
 # Gemma-4 GenAI LLM, Pocket-TTS ONNX voice, Parakeet, and (via the
 # vendored transcribe-rs) Moonshine + Qwen3-ASR. `load-dynamic` pulls
 # the ORT DLL at runtime — no CMake in the build. Off by default.
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "half"], optional = true }
+# Keep the API compatible with the bundled ONNX Runtime 1.25 DLL.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "half", "api-25"], optional = true }
 ndarray = { version = "0.17", optional = true }
 half = { version = "2", features = ["num-traits"], optional = true }
 safetensors = { version = "0.4", optional = true }
@@ -43,9 +44,9 @@ rand_distr = { version = "0.4", optional = true }
 transcribe-rs = { path = "../transcribe-rs", default-features = false, features = ["onnx", "qwen3-asr"], optional = true }
 
 # ============== candle feature: Candle Whisper STT ==============
-candle-core = { version = "0.8", optional = true }
-candle-nn = { version = "0.8", optional = true }
-candle-transformers = { version = "0.8", optional = true }
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
 # candle_whisper holds the model behind a parking_lot::Mutex.
 parking_lot = { version = "0.12", optional = true }
 

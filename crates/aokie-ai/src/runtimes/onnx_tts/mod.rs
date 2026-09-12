@@ -228,8 +228,8 @@ fn cuda_device_from_env() -> i32 {
 /// which is why the loader keeps a per-session CPU fallback too.
 #[cfg(feature = "onnx-cuda")]
 fn cuda_ep_usable() -> bool {
-    use ort::execution_providers::{CUDAExecutionProvider, ExecutionProvider};
-    match CUDAExecutionProvider::default().is_available() {
+    use ort::execution_providers::{ExecutionProvider, CUDA};
+    match CUDA::default().is_available() {
         Ok(true) => true,
         Ok(false) => {
             eprintln!(
@@ -261,15 +261,15 @@ fn with_cuda_eps(
     builder: ort::session::builder::SessionBuilder,
     stem: &str,
 ) -> Result<ort::session::builder::SessionBuilder, String> {
-    use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider};
+    use ort::execution_providers::{CPU, CUDA};
     let device = cuda_device_from_env();
     builder
         .with_execution_providers([
-            CUDAExecutionProvider::default()
+            CUDA::default()
                 .with_device_id(device)
                 .build()
                 .error_on_failure(),
-            CPUExecutionProvider::default().build(),
+            CPU::default().build(),
         ])
         .map_err(|e| format!("register CUDA+CPU EPs ({stem}): {e}"))
 }
@@ -340,7 +340,7 @@ impl OnnxTtsRuntime {
         };
 
         let build_session = |stem: &str, use_cuda: bool| -> Result<ort::session::Session, String> {
-            use ort::execution_providers::CPUExecutionProvider;
+            use ort::execution_providers::CPU;
 
             let int8 = bundle_dir.join(format!("{stem}_int8.onnx"));
             let fp32 = bundle_dir.join(format!("{stem}.onnx"));
@@ -378,7 +378,7 @@ impl OnnxTtsRuntime {
                 with_cuda_eps(builder, stem)?
             } else {
                 builder
-                    .with_execution_providers([CPUExecutionProvider::default().build()])
+                    .with_execution_providers([CPU::default().build()])
                     .map_err(|e| format!("register CPU EP ({stem}): {e}"))?
             };
             builder
