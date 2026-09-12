@@ -578,9 +578,7 @@ fn run_flow_main_step(
 ///
 /// Also one-shot log the names the first time through a process, so if
 /// we need to debug further we can see them in the terminal.
-fn identify_cond_eos(
-    outputs: &ort::session::SessionOutputs,
-) -> Result<(Array3<f32>, f32), String> {
+fn identify_cond_eos(outputs: &ort::session::SessionOutputs) -> Result<(Array3<f32>, f32), String> {
     static OUTPUT_NAMES_LOGGED: std::sync::Once = std::sync::Once::new();
     OUTPUT_NAMES_LOGGED.call_once(|| {
         let names: Vec<String> = outputs.iter().map(|(name, _)| name.to_string()).collect();
@@ -736,8 +734,8 @@ fn extract_mimi_audio(outputs: &ort::session::SessionOutputs) -> Result<Vec<f32>
 struct BoundStepper {
     binding: ort::session::IoBinding,
     out_names: Vec<String>,
-    dev_out: ort::memory::MemoryInfo,
-    cpu_out: ort::memory::MemoryInfo,
+    dev_out: ort::memory::MemoryInfo<'static>,
+    cpu_out: ort::memory::MemoryInfo<'static>,
 }
 
 impl BoundStepper {

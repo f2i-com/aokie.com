@@ -142,23 +142,23 @@ impl PeerOptions {
     }
 
     fn rtc_configuration(&self) -> RtcConfiguration {
-        RtcConfiguration {
-            ice_servers: self
-                .ice_servers
-                .iter()
-                .map(|server| IceServer {
-                    urls: server.urls.clone(),
-                    username: server.username.clone(),
-                    password: server.credential.clone(),
-                })
-                .collect(),
-            continual_gathering_policy: ContinualGatheringPolicy::GatherContinually,
-            ice_transport_type: if self.relay_only {
-                IceTransportsType::Relay
-            } else {
-                IceTransportsType::All
-            },
-        }
+        let mut config = RtcConfiguration::default();
+        config.ice_servers = self
+            .ice_servers
+            .iter()
+            .map(|server| IceServer {
+                urls: server.urls.clone(),
+                username: server.username.clone(),
+                password: server.credential.clone(),
+            })
+            .collect();
+        config.continual_gathering_policy = ContinualGatheringPolicy::GatherContinually;
+        config.ice_transport_type = if self.relay_only {
+            IceTransportsType::Relay
+        } else {
+            IceTransportsType::All
+        };
+        config
     }
 }
 

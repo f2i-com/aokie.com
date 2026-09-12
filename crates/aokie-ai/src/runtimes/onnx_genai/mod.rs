@@ -627,32 +627,30 @@ fn build_session(onnx_path: &Path, ep: Ep) -> Result<Session, String> {
     #[cfg(feature = "cuda")]
     let mut builder = match ep {
         Ep::PreferCuda => {
-            use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider};
+            use ort::execution_providers::{CPU, CUDA};
             builder
                 .with_execution_providers([
-                    CUDAExecutionProvider::default().build().error_on_failure(),
-                    CPUExecutionProvider::default().build(),
+                    CUDA::default().build().error_on_failure(),
+                    CPU::default().build(),
                 ])
                 .map_err(|e| format!("ort eps (CUDA failed to register): {}", e))?
         }
         Ep::PreferCudaMath => {
-            use ort::execution_providers::{
-                cuda::AttentionBackend, CPUExecutionProvider, CUDAExecutionProvider,
-            };
+            use ort::execution_providers::{cuda::AttentionBackend, CPU, CUDA};
             builder
                 .with_execution_providers([
-                    CUDAExecutionProvider::default()
+                    CUDA::default()
                         .with_attention_backend(AttentionBackend::MATH)
                         .build()
                         .error_on_failure(),
-                    CPUExecutionProvider::default().build(),
+                    CPU::default().build(),
                 ])
                 .map_err(|e| format!("ort eps (CUDA MATH failed): {}", e))?
         }
         Ep::CpuOnly => {
-            use ort::execution_providers::CPUExecutionProvider;
+            use ort::execution_providers::CPU;
             builder
-                .with_execution_providers([CPUExecutionProvider::default().build()])
+                .with_execution_providers([CPU::default().build()])
                 .map_err(|e| format!("ort eps CPU: {}", e))?
         }
     };

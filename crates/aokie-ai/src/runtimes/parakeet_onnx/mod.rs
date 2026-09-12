@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ndarray::{Array1, Array2, Array3, ArrayD, Ix3, IxDyn};
-use ort::execution_providers::CPUExecutionProvider;
+use ort::execution_providers::CPU;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::{DynTensor, Tensor};
 use tokio::sync::Mutex;
@@ -351,7 +351,7 @@ fn build_session(path: &Path, num_threads: i16, label: &str) -> Result<Session, 
         .map_err(|e| format!("ort opt level: {}", e))?
         .with_intra_threads(num_threads as usize)
         .map_err(|e| format!("ort intra threads: {}", e))?
-        .with_execution_providers([CPUExecutionProvider::default().build()])
+        .with_execution_providers([CPU::default().build()])
         .map_err(|e| format!("ort eps CPU: {}", e))?
         .commit_from_file(path)
         .map_err(|e| format!("ort commit {label}: {}", e))?;
