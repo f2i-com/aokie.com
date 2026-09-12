@@ -7,3 +7,6 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Standalone regression tests for the vendored GLib compatibility fix.
+vendor/glib/Cargo.lock
