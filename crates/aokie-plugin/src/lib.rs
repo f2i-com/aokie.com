@@ -67,6 +67,7 @@ pub mod rpc;
 pub mod screen;
 pub mod speech_plan;
 pub mod speech_wire;
+pub mod conversation_policy;
 #[cfg(feature = "voice")]
 pub mod synth;
 #[cfg(feature = "voice")]

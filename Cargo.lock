@@ -230,6 +230,7 @@ version = "0.1.0"
 dependencies = [
  "aec-rs",
  "aokie-ai",
+ "aokie-audio",
  "aokie-core",
  "aokie-dongle",
  "aokie-media",

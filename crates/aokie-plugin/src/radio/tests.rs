@@ -2584,12 +2584,20 @@ fn stale_terminate_never_kills_a_fresh_dial_and_setup_reattaches() {
     );
     assert!(s.agent_owned, "agent owns the re-attached call");
     assert_eq!(s.caller_id.as_deref(), Some("0491570156"));
+    assert_eq!(
+        status.outbound_call_id.lock().unwrap().as_deref(),
+        Some("call_dial1")
+    );
 
     // Answer clears the in-flight context — a terminate is REAL now.
     handle_event(E::CallAnswered, &mut lost, None, &mut sink, &status);
     assert!(
         status.pending_dial.lock().unwrap().is_none(),
         "context consumed"
+    );
+    assert_eq!(
+        status.outbound_call_id.lock().unwrap().as_deref(),
+        Some("call_dial1")
     );
     handle_event(E::CallTerminated, &mut lost, None, &mut sink, &status);
     assert!(
@@ -3405,4 +3413,50 @@ fn http_speech_fallback_is_sticky_per_call() {
 
     state.configure(Some("   ".to_string()));
     assert_eq!(state.endpoint_for_call(), None);
+}
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[test]
+fn overlap_capture_initializes_without_a_greeting_and_survives_phrases() {
+    let mut aec = None;
+    assert!(!ensure_overlap_capture(&mut aec, true, 0));
+    assert!(!ensure_overlap_capture(&mut aec, false, 8000));
+    assert!(aec.is_none());
+    // The audio channel becomes ready without ever invoking the greeting.
+    assert!(ensure_overlap_capture(&mut aec, true, 8000));
+    assert!(aec.is_some());
+    assert!(!ensure_overlap_capture(&mut aec, true, 8000));
+    // Teardown/takeover clears the session; the next channel reinitializes.
+    aec = None;
+    assert!(ensure_overlap_capture(&mut aec, true, 16000));
+}
+
+#[test]
+fn observed_outgoing_dial_publishes_direction_for_current_call() {
+    use crate::event_bridge::VecSink;
+    use aokie_dongle::bluetooth::BluetoothEvent as E;
+    let status = Arc::new(RadioStatus::default());
+    let mut sink = VecSink::default();
+    let mut tracker = crate::call_session::SessionTracker::new();
+    handle_event(E::OutgoingDialing, &mut tracker, None, &mut sink, &status);
+    let outbound = tracker.current().unwrap();
+    assert!(outbound.outbound);
+    assert!(
+        !outbound.agent_owned,
+        "observing the dial cannot give the AI ownership"
+    );
+    assert_eq!(
+        status.outbound_call_id.lock().unwrap().as_deref(),
+        Some(outbound.id.as_str())
+    );
+    handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
+    assert_eq!(
+        status.outbound_call_id.lock().unwrap().as_deref(),
+        tracker.call_id()
+    );
+    handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
+    handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+    assert_ne!(
+        status.outbound_call_id.lock().unwrap().as_deref(),
+        tracker.call_id()
+    );
 }

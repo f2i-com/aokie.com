@@ -148,6 +148,7 @@ pub(super) fn service_controls(
                         aokie_core::events::now_iso8601(),
                         true,
                     ) {
+                        *status.outbound_call_id.lock().unwrap() = Some(s.id.clone());
                         *status.current_caller.lock().unwrap() = Some(number.clone());
                         *status.current_call_id.lock().unwrap() = Some(s.id.clone());
                         *status.call_started_at.lock().unwrap() =
@@ -172,7 +173,7 @@ pub(super) fn service_controls(
                         ctx.call_agent_overlay = Some(CallAgentOverlay {
                             call_id: call_id.clone(),
                             persona: Some(format!(
-                                "{agent_persona}{}",
+                                "{agent_persona}{}\nYour requested introduction, to use once in your first response: {opening_line}",
                                 outbound_call_block(&number, purpose.as_deref())
                             )),
                             greeting: Some(opening_line.clone()),

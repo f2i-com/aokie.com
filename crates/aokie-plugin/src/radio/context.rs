@@ -27,6 +27,8 @@ pub(super) struct CallVoiceContext {
     /// Caller turn held open across STT utterances (audit AK-008).
     #[cfg(feature = "voice")]
     pub(super) pending_turn: Option<PendingTurn>,
+    #[cfg(feature = "voice")]
+    pub(super) capture_activity: super::capture_activity::CaptureActivity,
     /// Phase 3: the per-call manager PIN gate.
     #[cfg(feature = "voice")]
     pub(super) manager_gate: ManagerGate,
@@ -64,6 +66,8 @@ pub(super) struct CallVoiceContext {
     /// parked with the caller context and destroyed at the call boundary.
     #[cfg(feature = "voice")]
     pub(super) pending_assistance: Option<PendingAssistanceCall>,
+    #[cfg(feature = "voice")]
+    pub(super) queued_appointments: Vec<String>,
     /// The caller was assigned the Desktop Realtime responder. This travels
     /// with a parked caller even though its WebSocket never does: a restore
     /// therefore creates a fresh, call-fenced session instead of silently
@@ -89,6 +93,8 @@ impl CallVoiceContext {
             #[cfg(feature = "voice")]
             pending_turn: None,
             #[cfg(feature = "voice")]
+            capture_activity: super::capture_activity::CaptureActivity::default(),
+            #[cfg(feature = "voice")]
             manager_gate: ManagerGate::default(),
             #[cfg(feature = "voice")]
             call_agent_overlay: None,
@@ -112,6 +118,8 @@ impl CallVoiceContext {
             last_turn_audio: Vec::new(),
             #[cfg(feature = "voice")]
             pending_assistance: None,
+            #[cfg(feature = "voice")]
+            queued_appointments: Vec::new(),
             #[cfg(feature = "voice")]
             desktop_realtime_responder: false,
         }

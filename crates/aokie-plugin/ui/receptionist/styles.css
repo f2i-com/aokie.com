@@ -129,8 +129,8 @@ button {
 .rcp {
   display: flex;
   flex-direction: column;
-  gap: 11px;
-  padding: 2px;
+  gap: 20px;
+  padding: 20px;
 }
 
 /* ── Hero ───────────────────────────────────────────────────────────────── */
@@ -141,7 +141,7 @@ button {
   justify-content: space-between;
   gap: 16px;
   flex-wrap: wrap;
-  padding: 16px 20px;
+  padding: 24px;
   border: 1px solid var(--line-2);
   border-radius: 13px;
   background: linear-gradient(135deg, var(--signal-soft), var(--surface-1));
@@ -156,7 +156,7 @@ button {
 
 .rcp-hero h1 {
   margin: 5px 0 0;
-  font-size: 18px;
+  font-size: clamp(22px, 3vw, 30px);
   font-weight: 700;
   letter-spacing: -0.03em;
 }
@@ -164,7 +164,8 @@ button {
 .rcp-hero p {
   margin: 4px 0 0;
   color: var(--ink-dim);
-  font-size: 11.5px;
+  font-size: 14px;
+  line-height: 1.6;
 }
 
 .rcp-hero__meta {
@@ -517,6 +518,26 @@ button {
 
 .rcp-speak input:disabled { opacity: 0.6; }
 
+.rcp-switchboard {
+  margin: 0 15px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-2);
+}
+.rcp-switchboard__leg {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 5px 12px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.rcp-switchboard__leg + .rcp-switchboard__leg { margin-top: 8px; }
+.rcp-switchboard__leg span { overflow-wrap: anywhere; }
+.rcp-switchboard__transition { margin: 0 0 8px; color: var(--warn); font-size: 11px; line-height: 1.5; }
+.rcp-switchboard .rcp-error { margin: 0; padding: 0; }
+
 /* ── Delivery ───────────────────────────────────────────────────────────── */
 
 .rcp-metrics {
@@ -641,9 +662,10 @@ button {
 
 .rcp-tabs {
   display: flex;
-  flex-wrap: wrap;
-  gap: 2px;
-  padding: 0 2px;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  gap: 4px;
+  padding: 4px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -655,10 +677,11 @@ button {
   margin-bottom: -1px;
   padding: 9px 11px 8px;
   color: var(--ink-faint);
-  font-size: 10.5px;
+  font-size: 13px;
+  min-height: 44px;
   font-weight: 740;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+  letter-spacing: 0;
+  text-transform: none;
   white-space: nowrap;
   cursor: pointer;
   transition: color 130ms ease, border-color 130ms ease;
@@ -677,7 +700,7 @@ button {
 .rcp-tab-panel {
   display: flex;
   flex-direction: column;
-  gap: 11px;
+  gap: 18px;
   min-width: 0;
 }
 
@@ -1248,3 +1271,36 @@ button {
   .rcp-grid { grid-template-columns: 1fr; }
   .rcp-id-grid { grid-template-columns: 1fr; }
 }
+
+/* Comfortable controls inside narrow desktop windows and phone previews. */
+.rcp-tab-btn { flex-shrink: 0; }
+.rcp-tab-btn:focus-visible, .rcp-tab-panel:focus-visible { outline: 2px solid var(--signal-strong); outline-offset: -2px; }
+.rcp-ready p, .rcp-card__body, .rcp-footnote { font-size: 13px; line-height: 1.6; }
+.rcp-ready p, .rcp-ready strong { white-space: normal; overflow-wrap: anywhere; }
+.rcp-ready small { font-size: 11px; }
+.rcp-ready strong { font-size: 14px; }
+.rcp-button, .rcp-link-btn, .rcp-call-action { min-height: 40px; }
+.rcp-card, .rcp-hero__copy, .rcp-ready { min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .rcp { padding: 12px; gap: 14px; }
+  .rcp-hero { padding: 18px; }
+  .rcp-hero__meta { align-items: flex-start; }
+  .rcp-button, .rcp-link-btn, .rcp-call-action { min-height: 44px; }
+  .rcp input, .rcp select, .rcp textarea { font-size: 16px; max-width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0s !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
+.rcp-conversation { margin: 20px 0; }
+.rcp-conversation > .rcp-hint { padding: 0 16px; }
+.rcp-conversation > .rcp-footnote { padding: 12px 16px; }
+.rcp-conversation__turns { padding: 0 16px; }
+.rcp-conversation__turns { max-height: 360px; overflow: auto; overscroll-behavior: contain; }
+.rcp-conversation__turn { padding: 12px 0; border-bottom: 1px solid var(--border, #8884); overflow-wrap: anywhere; }
+.rcp-conversation__turn small { display: block; opacity: .75; margin: 4px 0; }
+.rcp-conversation__turn p { margin: 6px 0 0; white-space: pre-wrap; }

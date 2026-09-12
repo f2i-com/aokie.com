@@ -43,6 +43,8 @@ use crate::outbox::Outbox;
 use crate::contract::DEFAULT_AGENT_PERSONA;
 
 mod audio_reply;
+#[cfg(feature = "voice")]
+mod capture_activity;
 mod control;
 mod events_drain;
 mod greet;

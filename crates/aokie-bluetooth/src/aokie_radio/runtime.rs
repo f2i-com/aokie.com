@@ -5295,9 +5295,9 @@ fn cvsd_tx_plan(
     // and silently stop sending audio.
     let link_max = active_sco_tx_packet_len
         .filter(|&n| n > 0)
-        .unwrap_or(AOKIE_SCO_USB_PAYLOAD_BYTES);
+        .unwrap_or(AOKIE_SCO_USB_PAYLOAD_BYTES * 2);
     let payload_len = manager::max_sco_payload_len(buffer_size)
-        .min(AOKIE_SCO_USB_PAYLOAD_BYTES)
+        .min(AOKIE_SCO_USB_PAYLOAD_BYTES * 2)
         .min(link_max)
         & !1;
     if payload_len == 0 {
@@ -5666,6 +5666,29 @@ fn build_msbc_sco_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cvsd_usb_packets_carry_three_milliseconds_of_pcm() {
+        let buffers = hci::BufferSize {
+            acl_data_packet_length: 1021,
+            sco_data_packet_length: 64,
+            total_num_acl_data_packets: 8,
+            total_num_sco_data_packets: 8,
+        };
+        for negotiated in [Some(60), Some(0), None] {
+            let plan = cvsd_tx_plan(&buffers, negotiated).unwrap();
+            // Three 1-ms USB frames, including the HCI header, must
+            // contain three milliseconds of 8-kHz, 16-bit audio.
+            assert_eq!(plan.payload_len + 3, 3 * 17);
+            assert_eq!(plan.payload_len / 2, 8 * 3);
+            assert_eq!(plan.packet_interval_us, 3_000);
+        }
+        let transparent = msbc_tx_plan(&buffers).unwrap();
+        assert_eq!(transparent.payload_len, 24);
+        assert_eq!(transparent.packet_interval_us, 3_000);
+        let limited = cvsd_tx_plan(&buffers, Some(30)).unwrap();
+        assert_eq!(limited.payload_len, 30);
+    }
 
     #[test]
     fn background_profiles_yield_for_the_entire_call_window() {

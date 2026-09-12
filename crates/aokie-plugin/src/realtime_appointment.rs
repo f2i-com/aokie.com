@@ -324,6 +324,9 @@ pub(crate) fn is_conservative_agreement(value: &str) -> bool {
 
 fn validate_spoken_date(agreement: &str, date: NaiveDate, today: NaiveDate) -> Result<(), String> {
     let speech = normalized_speech(agreement);
+    if crate::conversation_policy::explicit_date(agreement, today).is_some_and(|spoken| spoken != date) {
+        return Err("appointment date does not match the caller's explicit date".into());
+    }
     let relative: Vec<(&str, NaiveDate)> =
         [("today", today), ("tomorrow", today + Duration::days(1))]
             .into_iter()
@@ -363,7 +366,7 @@ fn validate_spoken_time(agreement: &str, time: NaiveTime) -> Result<(), String> 
     static SPOKEN_TIME: OnceLock<Regex> = OnceLock::new();
     let regex = SPOKEN_TIME.get_or_init(|| {
         Regex::new(
-            r"(?i)\b(?:at|around|about)\s+([01]?\d|2[0-3])(?::([0-5]\d))?\s*(a\.?m\.?|p\.?m\.?|o['’]?clock)?\b",
+            r"(?i)\b(?:(?:at|around|about)\s+([01]?\d|2[0-3])(?::([0-5]\d))?\s*(a\.?m\.?|p\.?m\.?|o['’]?clock)?|([01]?\d|2[0-3])(?::([0-5]\d))?\s*(a\.?m\.?|p\.?m\.?))\b",
         )
         .expect("fixed spoken-time regex")
     });
@@ -373,15 +376,15 @@ fn validate_spoken_time(agreement: &str, time: NaiveTime) -> Result<(), String> 
         return Ok(());
     };
     let spoken_hour = captures
-        .get(1)
+        .get(1).or_else(|| captures.get(4))
         .and_then(|value| value.as_str().parse::<u32>().ok())
         .ok_or_else(|| "the caller's selected time was invalid".to_string())?;
     let spoken_minute = captures
-        .get(2)
+        .get(2).or_else(|| captures.get(5))
         .and_then(|value| value.as_str().parse::<u32>().ok())
         .unwrap_or(0);
     let suffix = captures
-        .get(3)
+        .get(3).or_else(|| captures.get(6))
         .map(|value| value.as_str().to_ascii_lowercase().replace('.', ""));
     let hour_matches = match suffix.as_deref() {
         Some("am") => time.hour() == spoken_hour % 12,
@@ -571,7 +574,15 @@ pub fn validate_with_readback(
                 .into(),
         );
     }
-    validate_spoken_date(&joined_chronological, parsed_date, today)?;
+    // A newer date-bearing turn supersedes an earlier selection. Keep multiple
+    // choices within that turn conservative, so "Thursday or Friday" needs clarification.
+    if let Some(selected) = recent_newest_first.iter().find(|turn| {
+        let normalized = normalized_speech(turn);
+        DAY_WORDS.iter().any(|day| normalized.contains(day))
+            || crate::conversation_policy::explicit_date(turn, today).is_some()
+    }) {
+        validate_spoken_date(selected, parsed_date, today)?;
+    }
     validate_spoken_time(&joined_chronological, parsed_time)?;
     if !caller_history
         .iter()
@@ -603,6 +614,31 @@ pub fn validate_with_readback(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn latest_date_correction_and_bare_time_are_grounded() {
+        let latest = "Yes please, Friday 2pm instead.";
+        let mut request = json!({"callerName":"Alex","service":"Gardening","date":"2026-07-24","time":"14:00","agreementPhrase":latest});
+        let history = vec![latest.into(), "Book a gardening appointment Thursday at 10am.".into()];
+        assert!(validate(&request, "call_correction", Some((3, latest)), &history, day()).is_ok());
+        request["date"] = json!("2026-07-23");
+        assert!(validate(&request, "call_correction", Some((3, latest)), &history, day()).is_err());
+        request["date"] = json!("2026-07-24");
+        request["time"] = json!("15:00");
+        assert!(validate(&request, "call_correction", Some((3, latest)), &history, day()).is_err());
+    }
+
+    #[test]
+    fn explicit_date_must_match_and_two_choices_need_clarification() {
+        let mut request = json!({"callerName":"Alex","service":"Gardening","date":"2026-09-12","time":"14:00","agreementPhrase":"Please book September 15 at 2pm."});
+        let latest = "Please book September 15 at 2pm.";
+        let today = chrono::NaiveDate::from_ymd_opt(2026,9,12).unwrap();
+        let history = vec![latest.into(), "I want an appointment for gardening.".into()];
+        assert!(validate(&request, "call_date", Some((3, latest)), &history, today).is_err());
+        request["date"] = json!("2026-09-15");
+        assert!(validate(&request, "call_date", Some((3, latest)), &history, today).is_ok());
+        assert!(validate_spoken_date("Thursday or Friday please", day(), day()).is_err());
+    }
 
     fn day() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 7, 20).unwrap()
