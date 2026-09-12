@@ -19,6 +19,11 @@ pub struct RadioStatus {
     /// termination — this is what lets `call.current` recover a live call
     /// after a page refresh and lets call controls verify a `callId`.
     pub current_call_id: Mutex<Option<String>>,
+    /// Identity of the most recently started outbound call. Compare it with
+    /// current_call_id instead of keeping a bare direction flag, so a new
+    /// incoming call cannot inherit the previous call's outbound state.
+    /// Unlike pending_dial this stays available after the callee answers.
+    pub outbound_call_id: Mutex<Option<String>>,
     /// The settings revision in effect (audit AOK-CONFIG-002): stamped by the
     /// connector at spawn and on every settings.set, embedded in call.ended
     /// so a call record identifies exactly which configuration it ran under.

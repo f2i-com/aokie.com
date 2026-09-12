@@ -1759,6 +1759,10 @@ pub(super) fn run_loop(
         // TTS speech replaces this once outbound audio is confirmed. Gated by
         // settings.answerTone.
         #[cfg(feature = "voice")]
+        if ensure_overlap_capture(&mut aec, barge_in, bt.get_sample_rate()) {
+            eprintln!("[aokie-plugin] overlap capture ready (AEC @ {}Hz, interruption threshold {barge_rms}); independent of greeting", bt.get_sample_rate());
+        }
+        #[cfg(feature = "voice")]
         play_tone_and_greet(
             bt,
             outbox,

@@ -3,7 +3,8 @@ name: Self-host smoke
 # Audit AK-14: nothing previously built the self-host Dockerfile, validated
 # the Compose files, or booted the local profile — the exact container
 # artifact (with its own --locked dependency graph) was never exercised.
-# Manual dispatch only, matching this repo's paused-CI usage policy.
+# Automatic CI is temporarily paused while checks are run manually.
+# Manual dispatch remains available from the Actions tab.
 #
 # Scope: template rendering acceptance, compose config validation (both
 # profiles), image build with --pull, local-profile boot to HEALTHY (the

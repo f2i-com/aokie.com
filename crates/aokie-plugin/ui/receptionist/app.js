@@ -24,7 +24,7 @@
   var HOST = window.PluginHost;
   if (!HOST) {
     document.body.innerHTML =
-      '<p class="rcp-error">The PluginHost bridge is missing — this screen only runs inside FormLogic Desktop.</p>';
+      '<p class="rcp-error">Open this screen in OAIY Desktop to connect to the Aokie plugin.</p>';
     return;
   }
 
@@ -186,6 +186,7 @@
       var on = btns[i].getAttribute('data-tab') === id;
       btns[i].classList.toggle('is-active', on);
       btns[i].setAttribute('aria-selected', on ? 'true' : 'false');
+      btns[i].setAttribute('tabindex', on ? '0' : '-1');
     }
 
     // Enter the new tab.
@@ -210,10 +211,26 @@
     }
   }
 
+  // Manual tab activation: arrows move focus; Enter/Space opens the section.
+  // This avoids mounting a settings panel just while navigating past its tab.
+  $('rcp-tabs').addEventListener('keydown', function (e) {
+    var keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
+    if (keys.indexOf(e.key) < 0) return;
+    var tabs = Array.prototype.filter.call(document.querySelectorAll('.rcp-tab-btn'), function (button) { return !button.hidden; });
+    var index = tabs.indexOf(document.activeElement);
+    if (index < 0) return;
+    e.preventDefault();
+    var next = e.key === 'Home' ? 0 : e.key === 'End' ? tabs.length - 1 : (index + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    tabs.forEach(function (button, i) { button.tabIndex = i === next ? 0 : -1; });
+    tabs[next].focus();
+    tabs[next].scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  });
+
   // ---- state --------------------------------------------------------------
   // `undefined` = first fetch still in flight (cards show "Loading…");
-  // `null` = the fetch failed before ever succeeding (cards show the error);
-  // otherwise the last good payload (kept across transient poll failures).
+  // `null` = the latest fetch failed (cards show the current error);
+  // otherwise the latest successful payload. Connection and control state
+  // must not remain green after the host can no longer verify it.
 
   var state = {
     snap: undefined, snapError: '',
@@ -221,12 +238,77 @@
     diag: undefined, diagError: '',
     phones: undefined, phonesError: '',
     call: undefined, callKnown: false, callError: '', callPauseReason: '',
+    switchboard: undefined, switchboardError: '',
     settings: undefined, settingsError: '',
     busyCall: false,
     busyPhones: {}, // address -> true while connect/disconnect runs
     busyRedrive: false,
     now: Date.now(),
   };
+
+  // Event-only view: bounded to one call; durable delivery stays in the outbox.
+  var conversation = { callId: '', turns: [] };
+  var conversationStartedAt = 0;
+  function renderConversation() {
+    var body = $('conversation-body');
+    var following = body.scrollHeight - body.scrollTop - body.clientHeight < 48;
+    var html = conversation.turns.map(function (turn) {
+      var labels = [];
+      if (turn.overlapped) labels.push('Spoke while Aokie was talking');
+      if (turn.delivery === 'interrupted') labels.push('Reply interrupted');
+      if (turn.delivery === 'error') labels.push('Speech delivery failed');
+      if (turn.delivery === 'operator_ended') labels.push('Stopped by operator');
+      if (turn.kind === 'control') labels.push('Conversation control');
+      if (turn.corrected) labels.push('Transcript corrected');
+      return '<article class="rcp-conversation__turn"><strong>' +
+        (turn.speaker === 'bot' ? 'Aokie' : 'Caller') + '</strong>' +
+        (labels.length ? '<small>' + esc(labels.join(' · ')) + '</small>' : '') +
+        '<p>' + esc(turn.text) + '</p></article>';
+    }).join('');
+    setHtml(body, html || '<p class="rcp-empty">Waiting for finalized speech. Live call transcription must be enabled.</p>');
+    if (following) body.scrollTop = body.scrollHeight;
+  }
+
+  function collectConversation(evt) {
+    var name = evt.name || '';
+    var data = evt.data || {};
+    var callId = data.callId || evt.correlationId;
+    if (typeof callId !== 'string' || !callId) return;
+    if (name === 'aokie.call.incoming' || name === 'aokie.call.outbound.dialing' || name === 'aokie.call.answered') {
+      if (conversation.callId !== callId) {
+        var startedAt = Date.parse(evt.occurredAt || data.at || '');
+        if (Number.isFinite(startedAt) && startedAt <= conversationStartedAt) return;
+        if (Number.isFinite(startedAt)) conversationStartedAt = startedAt;
+        conversation = { callId: callId, turns: [] };
+        renderConversation();
+      }
+      return;
+    }
+    if (name !== 'aokie.call.turn.final' && name !== 'aokie.call.turn.corrected') return;
+    if (conversation.callId && conversation.callId !== callId) return;
+    if (!Number.isInteger(data.turn) || data.turn < 0 || typeof data.text !== 'string') return;
+    conversation.callId = callId;
+    var prior = conversation.turns.find(function (turn) { return turn.turn === data.turn; });
+    if (prior && prior.corrected && name === 'aokie.call.turn.final') return;
+    var turn = Object.assign({}, prior || {}, {
+      turn: data.turn,
+      speaker: data.speaker || (prior && prior.speaker) || 'caller',
+      text: data.text.slice(0, 12000),
+      at: (prior && prior.at) || data.at || evt.occurredAt,
+      overlapped: data.overlapped === true || !!(prior && prior.overlapped),
+      delivery: data.delivery || (prior && prior.delivery),
+      kind: data.kind || (prior && prior.kind),
+      corrected: name === 'aokie.call.turn.corrected',
+    });
+    if (prior) conversation.turns[conversation.turns.indexOf(prior)] = turn;
+    else conversation.turns.push(turn);
+    conversation.turns.sort(function (a, b) {
+      var delta = Date.parse(a.at) - Date.parse(b.at);
+      return Number.isFinite(delta) && delta !== 0 ? delta : a.turn - b.turn;
+    });
+    if (conversation.turns.length > 120) conversation.turns.splice(0, conversation.turns.length - 120);
+    renderConversation();
+  }
 
   // ---- fetchers -----------------------------------------------------------
 
@@ -238,7 +320,7 @@
       },
       function (e) {
         state.snapError = errMsg(e);
-        if (state.snap === undefined) state.snap = null;
+        state.snap = null;
       }
     ).then(function () {
       renderHero();
@@ -254,7 +336,7 @@
       },
       function (e) {
         state.phoneError = errMsg(e);
-        if (state.phone === undefined) state.phone = null;
+        state.phone = null;
       }
     ).then(renderReadiness);
   }
@@ -292,7 +374,7 @@
       },
       function (e) {
         state.phonesError = errMsg(e);
-        if (state.phones === undefined) state.phones = null;
+        state.phones = null;
       }
     ).then(renderPhones);
   }
@@ -330,12 +412,29 @@
       },
       function (e) {
         state.settingsError = errMsg(e);
-        if (state.settings === undefined) state.settings = null;
+        state.settings = null;
       }
     ).then(function () {
       renderSettings();
       renderLive(); // agent-mode gates the operator composer
     });
+  }
+
+  var switchboardRequest = 0;
+  function refreshSwitchboard() {
+    var request = ++switchboardRequest;
+    return HOST.command('call.switchboard').then(function (data) {
+      if (!data || typeof data !== 'object' || !('waiting' in data) || !('parked' in data)) {
+        throw new Error('The plugin did not return a call waiting snapshot.');
+      }
+      if (request !== switchboardRequest) return;
+      state.switchboard = data;
+      state.switchboardError = '';
+    }).catch(function (e) {
+      if (request !== switchboardRequest) return;
+      state.switchboard = null;
+      state.switchboardError = errMsg(e);
+    }).then(renderSwitchboard);
   }
 
   // ---- polling (visibility-aware) -----------------------------------------
@@ -356,6 +455,7 @@
   function fastTick() {
     state.now = Date.now();
     refreshCall();
+    refreshSwitchboard();
   }
 
   function startTimers() {
@@ -385,8 +485,13 @@
   function pluginHealth() {
     var snap = state.snap;
     if (!snap || typeof snap !== 'object') return null;
+    if (snap.lastHealthError) return null;
     // Desktop snapshots carry `lastHealth`; tolerate a plain `health` too.
     return snap.lastHealth || snap.health || null;
+  }
+
+  function pluginIsLive(snap) {
+    return !!(snap && (snap.state === 'running' || snap.state === 'unhealthy'));
   }
 
   function renderHero() {
@@ -412,7 +517,7 @@
       return;
     }
 
-    var running = snap.state === 'running';
+    var running = pluginIsLive(snap);
     var health = pluginHealth();
     var status = health ? String(health.status || '') : '';
 
@@ -420,6 +525,10 @@
       headline.textContent = 'Aokie is not running';
       sub.textContent = snap.reason || 'Start the plugin from the Plugins workspace to take calls.';
       setPill(pill, pillText, snap.state === 'crashed' ? 'is-err' : 'is-neutral', snap.state || 'Stopped');
+    } else if (snap.lastHealthError || (snap.state === 'unhealthy' && !health)) {
+      headline.textContent = 'Running — needs attention';
+      sub.textContent = snap.lastHealthError || snap.reason || 'The plugin is running, but its health could not be verified.';
+      setPill(pill, pillText, 'is-warn', 'Needs attention');
     } else if (!health) {
       headline.textContent = 'Starting up';
       sub.textContent = 'No health report from the plugin yet.';
@@ -438,7 +547,8 @@
       setPill(pill, pillText, status === 'error' ? 'is-err' : 'is-warn', status || 'Unknown');
     }
 
-    version.textContent = snap.version ? 'Aokie v' + snap.version : '';
+    var pluginVersion = snap.version || (snap.manifest && snap.manifest.version);
+    version.textContent = pluginVersion ? 'Aokie v' + pluginVersion : '';
   }
 
   // ---- readiness grid -----------------------------------------------------
@@ -446,7 +556,7 @@
   function readinessItems() {
     var items = [];
     var snap = state.snap;
-    var running = !!(snap && snap.state === 'running');
+    var running = pluginIsLive(snap);
     var health = pluginHealth();
     var phone = state.phone;
     var diag = state.diag;
@@ -461,13 +571,14 @@
         items.push({ icon: ICONS.smartphone, label: 'Phone bridge', value: 'Unavailable', note: state.phoneError || 'phone.status failed', ok: false });
         return;
       }
-      var value = phone.connected ? 'Connected' : phone.paired ? 'Paired, offline' : 'Not paired';
+      var linked = !!phone.connected && !phone.error && !phone.pairingConfirm;
+      var value = phone.error ? 'Needs attention' : phone.pairingConfirm ? 'Confirm pairing' : linked ? 'Bluetooth linked' : phone.paired ? 'Paired, offline' : 'Not paired';
       var device = phone.device || null;
       var note =
-        (device && (device.name || device.address)) ||
         phone.error ||
+        (device && (device.name || device.address)) ||
         'pair a phone with "Aokie AI Assistant"';
-      items.push({ icon: ICONS.smartphone, label: 'Phone bridge', value: value, note: note, ok: !!phone.connected });
+      items.push({ icon: ICONS.smartphone, label: 'Phone bridge', value: value, note: note, ok: linked });
     })();
 
     // AI responder (plugin health components)
@@ -477,8 +588,12 @@
         items.push({ icon: ICONS.server, label: 'AI responder', value: '—', note: 'plugin not running', ok: null });
         return;
       }
+      if (snap.lastHealthError || (snap.state === 'unhealthy' && !health)) {
+        items.push({ icon: ICONS.server, label: 'AI responder', value: 'Unavailable', note: snap.lastHealthError || snap.reason || 'health check unavailable', ok: false });
+        return;
+      }
       if (!responder) {
-        items.push({ icon: ICONS.server, label: 'AI responder', value: '…', note: 'no health report yet', ok: null });
+        items.push({ icon: ICONS.server, label: 'AI responder', value: '…', note: health ? 'no responder details in the latest health report' : 'no health report yet', ok: null });
         return;
       }
       var agent = responder.mode === 'agent';
@@ -572,9 +687,13 @@
   /** Who owns replies right now: 'agent' | 'operator' | 'unknown' (settings
    *  not loaded yet — treat as agent-owned so the composer never lies). */
   function replyOwner() {
-    if (state.settings === undefined) return 'unknown';
     var bag = state.settings && state.settings.settings;
-    return bag && bag.aiReceptionist ? 'agent' : 'operator';
+    if (!bag) return 'unknown';
+    // Older settings stores may contain string booleans. Missing or invalid
+    // values must not enable operator speech while the AI owns the call.
+    if (bag.aiReceptionist === true || bag.aiReceptionist === 'true') return 'agent';
+    if (bag.aiReceptionist === false || bag.aiReceptionist === 'false') return 'operator';
+    return 'unknown';
   }
 
   function callDuration(call) {
@@ -639,21 +758,26 @@
     }
 
     var caller = call.from || 'Unknown caller';
+    var outbound = call.direction === 'outbound';
     title.textContent = caller;
 
     if (call.state === 'ringing') {
-      setPill(pill, pillText, 'is-warn', 'Ringing');
+      setPill(pill, pillText, 'is-warn', outbound ? 'Dialing' : 'Ringing');
       speakRow.hidden = true;
       setHtml(
         body,
         '<div class="rcp-ringing">' +
-          '<small>INCOMING CALL</small>' +
+          '<small>' + (outbound ? 'OUTBOUND CALL' : 'INCOMING CALL') + '</small>' +
           '<h4>' + esc(caller) + '</h4>' +
+          (outbound ? '<p>Waiting for the other person to answer.</p>' : '') +
           '<div class="rcp-call-actions">' +
+          (outbound ?
+          '<button type="button" class="rcp-call-action is-reject" data-act="call-hangup"' + (state.busyCall ? ' disabled' : '') + '>' +
+          ICONS.phone + ' Cancel call</button>' :
           '<button type="button" class="rcp-call-action is-reject" data-act="call-reject"' + (state.busyCall ? ' disabled' : '') + '>' +
           ICONS.x + ' Reject</button>' +
           '<button type="button" class="rcp-call-action is-answer" data-act="call-answer"' + (state.busyCall ? ' disabled' : '') + '>' +
-          ICONS.phone + ' Answer</button>' +
+          ICONS.phone + ' Answer</button>') +
           '</div></div>'
       );
       return;
@@ -671,6 +795,7 @@
     setHtml(
       body,
       '<div class="rcp-active">' +
+        '<small>' + (outbound ? 'OUTBOUND CALL' : 'INCOMING CALL') + '</small>' +
         '<span class="rcp-active__note">' + esc(note) + '</span>' +
         '<button type="button" class="rcp-call-action is-reject" data-act="call-hangup"' + (state.busyCall ? ' disabled' : '') + '>' +
         ICONS.phone + ' Hang up</button>' +
@@ -684,6 +809,27 @@
   }
 
   // ---- delivery -----------------------------------------------------------
+
+  function renderSwitchboard() {
+    var body = $('switchboard-body');
+    var board = state.switchboard;
+    body.hidden = board === undefined || !!(board && !board.waiting && !board.parked && !board.switchInProgress);
+    if (body.hidden) {
+      setHtml(body, '');
+      return;
+    }
+    if (!board) {
+      setHtml(body, '<p class="rcp-error">Call waiting status unavailable: ' + esc(state.switchboardError) + '</p>');
+      return;
+    }
+    var html = board.switchInProgress ? '<p class="rcp-switchboard__transition">Switching callers… Waiting for the phone to confirm.</p>' : '';
+    [['waiting', 'Waiting caller'], ['parked', 'On hold']].forEach(function (entry) {
+      var leg = board[entry[0]];
+      if (!leg) return;
+      html += '<div class="rcp-switchboard__leg"><strong>' + entry[1] + '</strong><span>' + esc(leg.from || 'Unknown number') + '</span></div>';
+    });
+    setHtml(body, html);
+  }
 
   function renderDelivery() {
     var title = $('delivery-title');
@@ -847,6 +993,7 @@
       ['Voice engine', engineLabel(bag.ttsEngine)],
       ['Voice', voice],
       ['Agent mode', agent ? 'On — the AI answers' : 'Off — flows reply'],
+      ['Listen during replies', bag.bargeIn ? 'On — captures overlap and allows interruptions' : 'Off — caller recognition pauses'],
       ['Config version', s.configVersion != null ? 'v' + s.configVersion : '—'],
     ];
     var html =
@@ -993,6 +1140,7 @@
     else if (act === 'call-reject') callAct('call.reject');
     else if (act === 'call-hangup') callAct('call.hangup');
     else if (act === 'redrive') redriveDead();
+    else if (act === 'conversation-clear') { conversation.turns = []; renderConversation(); }
   });
 
   $('speak-send').addEventListener('click', sendSpeech);
@@ -1016,10 +1164,14 @@
     'aokie.phone.disconnected',
     'aokie.phone.paired',
     'aokie.call.incoming',
+    'aokie.call.outbound.dialing',
+    'aokie.call.waiting',
     'aokie.call.answered',
     'aokie.call.caller_id',
     'aokie.call.rejected',
     'aokie.call.ended',
+    'aokie.call.turn.final',
+    'aokie.call.turn.corrected',
   ];
 
   var eventHandle = null;
@@ -1037,12 +1189,15 @@
     }
     if (name.indexOf('aokie.call.') === 0) {
       refreshCall();
+      refreshSwitchboard();
     }
   }
 
   HOST.events
     .subscribe(SUBSCRIBED_EVENTS, function (evt) {
       var name = (evt && evt.name) || '';
+      if (evt) collectConversation(evt);
+      if (name.indexOf('aokie.call.turn.') === 0) return;
       if (activeTab === 'overview') {
         routeOverviewEvent(name);
         return;
@@ -1061,6 +1216,7 @@
     .catch(function (e) {
       // The polls cover everything the feed would tell us — say so once.
       HOST.toast('info', 'Live events unavailable (' + errMsg(e) + ') — falling back to polling.');
+      $('conversation-note').textContent = 'Live transcript unavailable: the event subscription failed. Other status cards continue polling.';
     });
 
   // ---- lifecycle ----------------------------------------------------------

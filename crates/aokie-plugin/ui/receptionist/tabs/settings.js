@@ -148,10 +148,9 @@
     tts: '/v1/audio/speech',
   };
 
-  /** The desktop AI gateway's FIXED loopback base (lock-step with the
-   *  console's receptionistPayload.ts AI_GATEWAY_BASE). */
+  /** Legacy host fallback. Current hosts supply gatewayUrl on provider
+   *  sources so an alternate desktop API port is preserved. */
   var AI_GATEWAY_BASE = 'http://127.0.0.1:17872/api/ai/providers/';
-  var REALTIME_GATEWAY_BASE = 'ws://127.0.0.1:17872/api/ai/providers/';
   var REALTIME_GATEWAY_SUFFIX = '/v1/realtime/stream';
   var CODEX_PROVIDER_LUNA_LOW = 'openai-codex-agent-luna-low';
   var CODEX_PROVIDER_LUNA_LOW_FAST = 'openai-codex-agent-luna-low-fast';
@@ -159,6 +158,31 @@
   var CODEX_PROVIDER_LOW = 'openai-codex-agent-low';
   var CODEX_MODEL = 'gpt-5.5';
   var CODEX_LUNA_MODEL = 'gpt-5.6-luna';
+
+  function providerGatewayUrl(source) {
+    var providerId = String((source && source.providerId) || (source && source.id || '').slice(9));
+    var fallback = AI_GATEWAY_BASE + encodeURIComponent(providerId);
+    if (!source || typeof source.gatewayUrl !== 'string') return fallback;
+    try {
+      var parsed = new URL(source.gatewayUrl);
+      if (
+        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+        !parsed.username && !parsed.password && !parsed.search && !parsed.hash &&
+        parsed.pathname === '/api/ai/providers/' + encodeURIComponent(providerId)
+      ) return parsed.href;
+    } catch (e) { /* keep compatibility with older hosts */ }
+    return fallback;
+  }
+
+  function isKnownGatewayOrigin(parsed) {
+    for (var i = 0; i < (sources || []).length; i++) {
+      if (sources[i].kind !== 'provider' || !sources[i].gatewayUrl) continue;
+      try {
+        if (new URL(providerGatewayUrl(sources[i])).origin === parsed.origin) return true;
+      } catch (e) { /* ignore malformed source metadata */ }
+    }
+    return false;
+  }
 
   /** Reserved live-call variants. Only their exact provider paths receive
    *  this policy; ordinary providers behind the same gateway stay ordinary. */
@@ -221,7 +245,7 @@
       return (
         loopback &&
         (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-        parsed.port === '17872' &&
+        (parsed.port === '17872' || isKnownGatewayOrigin(parsed)) &&
         codexModel(providerId) &&
         providerId
       ) || null;
@@ -254,6 +278,11 @@
     }
     if (src.indexOf('provider:') === 0) {
       if (lane !== 'llm') return '';
+      for (var pi = 0; pi < sources.length; pi++) {
+        if (sources[pi].kind === 'provider' && sources[pi].id === src) {
+          return providerGatewayUrl(sources[pi]) + LANE_PATHS[lane];
+        }
+      }
       return AI_GATEWAY_BASE + encodeURIComponent(src.slice(9)) + LANE_PATHS[lane];
     }
     return url;
@@ -293,10 +322,13 @@
     var destination = canonicalHttpsOrigin(source.destinationOrigin);
     var reason = '';
     if (source.enabled === false) reason = 'disabled';
+    else if (Array.isArray(source.gatewayCapabilities) && source.gatewayCapabilities.indexOf('realtime') === -1) {
+      reason = 'not supported by this Desktop version';
+    }
     else if (source.hasKey === false) reason = 'API key missing';
     else if (!destination) reason = 'destination unavailable';
     return {
-      endpoint: REALTIME_GATEWAY_BASE + encodeURIComponent(providerId) + REALTIME_GATEWAY_SUFFIX,
+      endpoint: providerGatewayUrl(source).replace(/^http/, 'ws') + REALTIME_GATEWAY_SUFFIX,
       destination: destination,
       usable: !reason,
       reason: reason,
@@ -405,6 +437,7 @@
     for (var i = 0; i < sources.length; i++) {
       var x = sources[i];
       if (x.kind === 'service' && x.url && x.url + path === url) return x.id;
+      if (lane === 'llm' && x.kind === 'provider' && providerGatewayUrl(x) + path === url) return x.id;
     }
     if (url.indexOf(AI_GATEWAY_BASE) === 0) {
       var id = url.slice(AI_GATEWAY_BASE.length).split('/')[0];
@@ -1213,21 +1246,21 @@
       '<div>' +
       '<h4 class="rcp-group-title">Conversation tuning</h4>' +
       field(
-        'Reply delay (ms)',
+        'Wait after the caller pauses (ms)',
         '<input type="number" data-num="sttEndpointMs" min="150" max="2000" step="50" value="' +
           esc(settings.sttEndpointMs) + '" />'
       ) +
       hint(
         'How long the caller must pause before Aokie treats their turn as finished. Lower = snappier, but risks cutting off mid-sentence pauses.'
       ) +
-      check('bargeIn', 'Full-duplex (barge-in)') +
-      hint('Let the caller talk over Aokie — it stops the instant they speak, using echo cancellation.') +
+      check('bargeIn', 'Listen while speaking and allow interruptions') +
+      hint('Keep the caller’s words while Aokie talks. Sustained speech or “stop” makes Aokie yield; brief interjections are kept for the next turn. Requires live call transcription. Applies after reconnecting.') +
       field(
-        'Barge-in sensitivity',
+        'Interruption threshold',
         '<input type="number" data-num="bargeSensitivity" min="100" max="2000" step="25" value="' +
           esc(settings.bargeSensitivity) + '" />'
       ) +
-      hint('Lower = easier to interrupt. Only used when barge-in is on.') +
+      hint('Lower = easier to interrupt; too low may react to background noise. Start around 550–650. With listening off, caller recognition is muted during replies.') +
       '</div>' +
       // ---- Advanced --------------------------------------------------------
       '<div>' +
@@ -1494,7 +1527,7 @@
     if (typeof HOST.restartPlugin !== 'function') {
       HOST.toast(
         'info',
-        'This FormLogic Desktop cannot restart plugins from here yet — restart the Aokie plugin from the Plugins panel to apply.'
+        'This OAIY Desktop cannot restart plugins from here yet — restart the Aokie plugin from the Plugins panel to apply.'
       );
       return;
     }

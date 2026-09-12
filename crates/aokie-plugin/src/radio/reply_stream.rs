@@ -118,6 +118,7 @@ pub(super) fn compose_agent_system_prompt(
             "\n\nThe caller interrupted your previous reply. You were about to say: \"{tail}\". Respond to what they just said, weaving that pending point in ONLY if it is still relevant. Never repeat what you already said and never restart the reply."
         ));
     }
+    p.push_str(CONVERSATION_GROUNDING_INSTRUCTION);
     p
 }
 

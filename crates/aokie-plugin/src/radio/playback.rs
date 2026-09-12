@@ -224,6 +224,21 @@ pub(super) fn detect_barge(
 #[cfg(all(target_os = "windows", feature = "voice"))]
 pub(super) const CAPTURE_RMS: f32 = 350.0;
 
+/// Capture must be ready even if an early caller turn skips the greeting.
+/// Keep the same canceller across phrases so its echo reference is retained.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+pub(super) fn ensure_overlap_capture(
+    aec: &mut Option<crate::aec::EchoCanceller>,
+    enabled: bool,
+    sample_rate: u16,
+) -> bool {
+    if !enabled || sample_rate == 0 || aec.is_some() {
+        return false;
+    }
+    *aec = Some(crate::aec::EchoCanceller::new(sample_rate as u32));
+    true
+}
+
 /// Pure scan half of [`detect_barge`] (unit-testable without an AEC): append
 /// `cleaned` to the capture buffer, note the first frame above the CAPTURE
 /// gate (armed or not — the scratchpad always hears), and report whether

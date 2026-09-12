@@ -45,7 +45,7 @@ pub struct VadConfig {
     pub min_speech_duration: f32,
     /// Maximum speech duration (seconds) before forced split
     pub max_speech_duration: f32,
-    /// VAD threshold (0.0-1.0, higher = more sensitive)
+    /// VAD threshold (0.0-1.0, higher = less sensitive)
     pub threshold: f32,
     /// Audio sample rate
     pub sample_rate: u32,
@@ -112,6 +112,10 @@ impl StreamingVad {
         self.vad.accept_waveform(f32_samples);
     }
 
+    pub fn accept_f32_samples(&mut self, samples: &[f32]) {
+        self.vad.accept_waveform(samples.to_vec());
+    }
+
     /// Check if current audio contains speech
     pub fn is_speech(&mut self) -> bool {
         self.vad.is_speech()
@@ -165,6 +169,7 @@ impl StreamingVad {
         Err("VAD requires the `sherpa` cargo feature, which was disabled at build time".to_string())
     }
     pub fn accept_samples(&mut self, _samples: &[i16]) {}
+    pub fn accept_f32_samples(&mut self, _samples: &[f32]) {}
     pub fn is_speech(&mut self) -> bool {
         false
     }

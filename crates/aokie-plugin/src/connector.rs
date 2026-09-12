@@ -170,6 +170,9 @@ pub struct Plugin {
     /// non-Windows build). When `Some`, the `call.* / phone.* / sms.*`
     /// handlers drive the real radio instead of the scripted mock.
     pub radio: Option<crate::radio::RadioHandle>,
+    // Policy captured when this radio was started; repeated Bluetooth-only
+    // setup must not be mistaken for revoking an active transcription grant.
+    radio_transcription_disabled: bool,
     /// Why the last real-mode radio start failed (FL-CONN-001) — surfaced in
     /// command errors, phone.status and plugin.health so an outage is
     /// diagnosable instead of silently degrading to mock behaviour.
@@ -227,6 +230,7 @@ impl Plugin {
             command_journal,
             mock: MockState::default(),
             radio: None,
+            radio_transcription_disabled: false,
             radio_start_error: None,
             initialized: false,
             shutdown_requested: false,
@@ -256,6 +260,7 @@ impl Plugin {
             command_journal: CommandJournal::open_in_memory().expect("in-memory command journal"),
             mock: MockState::default(),
             radio: None,
+            radio_transcription_disabled: false,
             radio_start_error: None,
             initialized: false,
             shutdown_requested: false,
@@ -341,7 +346,7 @@ impl Plugin {
             crate::consent::ConsentDecision::Deny(reason) => {
                 std::env::set_var("AOKIE_STT_DISABLED", "1");
                 eprintln!("[aokie-plugin] transcription consent denied — STT disabled: {reason}");
-                if radio_was_running {
+                if radio_was_running && !self.radio_transcription_disabled {
                     // A running worker read its STT policy at spawn. Taking it
                     // is the only fail-closed response to a re-consent grant
                     // that removes transcription while calls may be live.
@@ -648,6 +653,8 @@ impl Plugin {
         if barge_in {
             std::env::set_var("AOKIE_BARGE_IN", "1");
             eprintln!("[aokie-plugin] bargeIn ON → full-duplex (caller can talk over Aokie)");
+        } else {
+            std::env::remove_var("AOKIE_BARGE_IN");
         }
         // sendAudio: attach the caller turn's AUDIO (base64 WAV content part)
         // to the LLM request alongside the transcript — for audio-capable
@@ -938,6 +945,7 @@ impl Plugin {
                 handle
                     .remote_media()
                     .inspect(|media| media.set_remote_consent(self.remote_consent_gate()));
+                self.radio_transcription_disabled = std::env::var("AOKIE_STT_DISABLED").as_deref() == Ok("1");
                 self.radio = Some(handle);
                 self.radio_start_error = None;
             }
@@ -2319,6 +2327,7 @@ impl Plugin {
                         json!({
                             "callId": call_id,
                             "from": radio.current_caller(),
+                            "direction": radio.call_direction(&call_id),
                             "state": if radio.is_call_active() {
                                 crate::contract::call_state::ACTIVE
                             } else {
@@ -3976,6 +3985,7 @@ fn call_json(call: &MockCall) -> Value {
     json!({
         "callId": call.correlation_id,
         "from": call.caller,
+        "direction": "inbound",
         "state": call.state.canonical(),
         "startedAt": call.started_at,
         "turns": call.turns,
@@ -6804,6 +6814,7 @@ mod tests {
         let call = &data["call"];
         assert!(call["callId"].as_str().unwrap().starts_with("call_"));
         assert_eq!(call["from"], json!("+61412345678"));
+        assert_eq!(call["direction"], json!("inbound"));
         // Internal "incoming" maps to the contract's "ringing".
         assert_eq!(call["state"], json!(crate::contract::call_state::RINGING));
         assert!(call["startedAt"].as_str().is_some());
@@ -6811,6 +6822,57 @@ mod tests {
         assert!(call.get("correlationId").is_none());
         assert!(call.get("caller").is_none());
         assert!(call.get("active").is_none());
+    }
+
+    #[test]
+    fn call_current_and_switchboard_preserve_outbound_direction_after_answer() {
+        let mut plugin = Plugin::ephemeral(true);
+        let (handle, _control_rx) = crate::radio::RadioHandle::test_handle();
+        *handle.status.current_call_id.lock().unwrap() = Some("call_incoming".into());
+        plugin.radio = Some(handle);
+        let mut sink = VecSink::default();
+
+        for (call_id, outbound_id, active, expected) in [
+            ("call_incoming", None, false, "inbound"),
+            ("call_dial", Some("call_dial"), false, "outbound"),
+            ("call_dial", Some("call_dial"), true, "outbound"),
+            // Retained metadata cannot misclassify the next incoming caller.
+            ("call_next", Some("call_dial"), false, "inbound"),
+        ] {
+            let radio = plugin.radio.as_ref().unwrap();
+            *radio.status.current_call_id.lock().unwrap() = Some(call_id.into());
+            *radio.status.outbound_call_id.lock().unwrap() = outbound_id.map(str::to_owned);
+            radio
+                .status
+                .call_active
+                .store(active, std::sync::atomic::Ordering::Relaxed);
+            let current = plugin
+                .dispatch_command("call.current", &Value::Null, &mut sink)
+                .unwrap();
+            let board = plugin
+                .dispatch_command("call.switchboard", &Value::Null, &mut sink)
+                .unwrap();
+            for call in [&current["call"], &board["foreground"]] {
+                assert_eq!(call["callId"], call_id);
+                assert_eq!(call["direction"], expected);
+                assert_eq!(call["state"], if active { "active" } else { "ringing" });
+            }
+        }
+        *plugin
+            .radio
+            .as_ref()
+            .unwrap()
+            .status
+            .current_call_id
+            .lock()
+            .unwrap() = None;
+        let current = plugin
+            .dispatch_command("call.current", &Value::Null, &mut sink)
+            .unwrap();
+        assert!(
+            current["call"].is_null(),
+            "an ended outbound call must disappear"
+        );
     }
 
     /// AOK-CTRL-001: RADIO-backed call controls report ACCEPTANCE (accepted/
@@ -7184,6 +7246,27 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("consent"), "{}", err.message);
         assert!(sink.lines.is_empty(), "no event for a consent-denied send");
+    }
+
+    #[test]
+    fn bluetooth_only_setup_keeps_a_radio_started_without_transcription() {
+        let _env = consent_env_lock();
+        std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+        plugin.dispatch_command("consent.set", &json!({
+            "version": crate::consent::CURRENT_CONSENT_VERSION,
+            "scopes": {"bluetooth": true, "transcription": false}
+        }), &mut sink).unwrap();
+        let (radio, _rx) = crate::radio::RadioHandle::test_handle();
+        plugin.radio = Some(radio);
+        plugin.radio_transcription_disabled = true;
+        plugin.ensure_radio_started();
+        plugin.ensure_radio_started();
+        assert!(plugin.radio.is_some(), "Bluetooth-only pairing must remain available");
+        assert!(plugin.consent_blocked.is_none());
+        assert_eq!(std::env::var("AOKIE_STT_DISABLED").unwrap(), "1");
+        std::env::remove_var("AOKIE_STT_DISABLED");
     }
 
     #[test]

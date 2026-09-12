@@ -13,7 +13,7 @@ default = []
 # the live SCO audio. HEAVY — pulls ort/ndarray/rubato/etc. and needs the ORT DLL
 # + speech models at runtime. Off by default so the base plugin stays light;
 # build the voice plugin with `--features voice`.
-voice = ["dep:aokie-ai", "dep:reqwest", "dep:aec-rs"]
+voice = ["dep:aokie-ai", "dep:aokie-audio", "dep:reqwest", "dep:aec-rs"]
 # Controlled WinUSB self-signing path for administrator-managed beta installs.
 # The runtime still requires AOKIE_ALLOW_SELF_SIGNED_DRIVER=1.
 managed-beta-driver = ["aokie-dongle/managed-beta-driver"]
@@ -40,6 +40,7 @@ aokie-dongle = { path = "../aokie-dongle" }
 # and ensure_ort_dylib pins the ort engines to onnxruntime_1.25.0.dll by
 # explicit name so sherpa's ORT can never shadow it.
 aokie-ai = { path = "../aokie-ai", features = ["onnx", "sherpa"], optional = true }
+aokie-audio = { path = "../aokie-audio", features = ["sherpa"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
@@ -80,3 +81,7 @@ aokie-realtime = { path = "../aokie-realtime" }
 axum = "0.7"
 jsonschema = "0.30"
 tempfile = "3"
+
+[[example]]
+name = "capture_turn_check"
+required-features = ["voice"]

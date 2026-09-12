@@ -4,9 +4,9 @@ name: CI
 # lifecycle, isolation and delivery guarantees were only tested on the dev
 # machine. Runs on Windows because that is the only platform the plugin
 # ships on (WinUSB radio).
-# PAUSED 2026-07-12: automatic triggers (push/PR/tags) disabled while the account is
-# near its GitHub Actions usage limit. Run manually from the Actions tab. Restore the
-# push/pull_request triggers below when usage resets.
+# Automatic CI is temporarily paused while checks are run manually.
+# Keep the workflow available through the Actions tab; restore automatic
+# triggers only when the project is ready to re-enable CI.
 on:
   workflow_dispatch:
   # push:
@@ -269,6 +269,9 @@ jobs:
           Copy-Item target/release/aokie-driver-helper.exe bundle/
           Copy-Item target/release/aokie-voice-server.exe bundle/
           Copy-Item crates/aokie-plugin/manifest.json bundle/
+          # Resolve every declared definition and UI file before inventory/signing.
+          Copy-Item crates/aokie-plugin/definitions bundle/definitions -Recurse
+          Copy-Item crates/aokie-plugin/ui bundle/ui -Recurse
           # DIST-001: the model-bundle manifest (required voice models with
           # pinned digests) rides in every release so installers can verify
           # staged model files byte-for-byte.
@@ -280,6 +283,9 @@ jobs:
           $dll = Get-ChildItem target/release -Filter 'onnxruntime*.dll' -ErrorAction SilentlyContinue
           if (-not $dll) { throw "AOK-REL-002: voice release requires onnxruntime*.dll beside the plugin exe — none found; the packaged receptionist could not transcribe or speak" }
           $dll | Copy-Item -Destination bundle/
+          Copy-Item target/release/sherpa-onnx-c-api.dll bundle/
+          Copy-Item target/release/sherpa-onnx-cxx-api.dll bundle/
+          ./scripts/verify-bundle-assets.ps1 -Bundle bundle -Voice
 
           # Cross-check: the helper bytes being PACKAGED must hash to the pin
           # the plugin was built with — one byte of drift fails the release.
@@ -354,16 +360,18 @@ jobs:
         env:
           AOKIE_PACKAGE_SIGNING_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY }}
         run: |
+          Compress-Archive -Path bundle/* -DestinationPath verify-roundtrip.zip -Force
+          Expand-Archive -Path verify-roundtrip.zip -DestinationPath verify-extracted -Force
+          # Unsigned smoke artifacts must pass the same reference-closure check.
+          ./scripts/verify-bundle-assets.ps1 -Bundle verify-extracted
           if (-not $env:AOKIE_PACKAGE_SIGNING_KEY) {
-            Write-Warning "unsigned smoke bundle — skipping extracted-artifact verification"
+            Write-Warning "asset references verified; unsigned smoke bundle skips signature verification"
             exit 0
           }
           $pub = (cargo run -p package-signer --release --quiet -- pubkey --key-env AOKIE_PACKAGE_SIGNING_KEY | Select-Object -Last 1).Trim()
           if ($LASTEXITCODE -ne 0 -or -not $pub) { throw "could not derive the signing public key" }
           cargo run -p package-signer --release -- verify --dir bundle --pubkey $pub
           if ($LASTEXITCODE -ne 0) { throw "final bundle tree failed verification" }
-          Compress-Archive -Path bundle/* -DestinationPath verify-roundtrip.zip -Force
-          Expand-Archive -Path verify-roundtrip.zip -DestinationPath verify-extracted -Force
           cargo run -p package-signer --release -- verify --dir verify-extracted --pubkey $pub
           if ($LASTEXITCODE -ne 0) { throw "EXTRACTED artifact failed verification — the shipped zip does not match the signed tree" }
           Remove-Item verify-roundtrip.zip -Force

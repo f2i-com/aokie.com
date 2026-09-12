@@ -390,6 +390,13 @@ impl RadioHandle {
     pub fn current_call_id(&self) -> Option<String> {
         self.status.current_call_id.lock().unwrap().clone()
     }
+    pub fn call_direction(&self, call_id: &str) -> &'static str {
+        if self.status.outbound_call_id.lock().unwrap().as_deref() == Some(call_id) {
+            "outbound"
+        } else {
+            "inbound"
+        }
+    }
     pub fn call_started_at(&self) -> Option<String> {
         self.status.call_started_at.lock().unwrap().clone()
     }
@@ -513,6 +520,7 @@ impl RadioHandle {
             json!({
                 "callId": call_id,
                 "from": self.current_caller(),
+                "direction": self.call_direction(&call_id),
                 "state": if self.is_call_active() {
                     crate::contract::call_state::ACTIVE
                 } else {

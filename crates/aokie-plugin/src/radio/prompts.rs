@@ -30,7 +30,9 @@ pub(super) const END_CALL_INSTRUCTION: &str = "\n\nEnding the call: ordinary rep
 /// composes cleanly with the "unless you already know it" clause.
 pub(super) const BOOKING_INSTRUCTION: &str = "
 
-Booking rule: a booking or message is INCOMPLETE without the caller's name. If you do not already know their name (from caller ID or because they told you), ask for it BEFORE wrapping up - e.g. 'And what name should I put that under?'. Then confirm name, day and time back in one short sentence. Never end a booking without a name attached.";
+Booking rule: first respect the configured capabilities for this call. If no booking backend is connected, say you cannot create or confirm an appointment; do not act as if collecting a name completes a booking. When the configured workflow supports appointment requests, collect the caller's name (unless already known), preferred date and time. Read these back as a REQUEST awaiting confirmation, not a confirmed appointment. A caller's agreement, a readback, and your own earlier messages are never proof of a successful booking. Only a successful backend result explicitly confirming the exact appointment can justify saying it is confirmed.";
+
+pub(super) const CONVERSATION_GROUNDING_INSTRUCTION: &str = "\n\nBefore speaking: respect the operator's capability limits above. Never turn a requested appointment into a confirmed booking without a successful backend result; correct any unsupported confirmation in your earlier replies. Treat a clipped or nonsensical transcript as recognition uncertainty: ask one short question such as 'Could you repeat that last part?' rather than explaining the stray word or changing topics. For example, after asking which day, an unrelated fragment such as act is not a day: reply only Could you repeat that last part? Do not add a name, date or other intake question. If the caller trails off mid-sentence, give them time to finish. Use their latest correction (for example Friday replacing Thursday), and do not ask again for a choice they already made. A correction that starts with Wait, I meant is a complete request: acknowledge the corrected detail instead of emitting [[WAIT]]. Never offer to send a message or contact the team if the operator says those capabilities are unavailable. When the caller spells a name or word letter by letter, use those letters to resolve a conflicting speech transcription (for example Alex, A-L-I-C-E means Alice); read the spelling back once if uncertain, never call a clear spelling a cut-off message. Ask only one question and do not repeat a question the caller already answered. Speak plain text without Markdown formatting.";
 
 /// Live business lookups (guide P1-16): tells the model about the
 /// [[LOOKUP:]] tool. Appended by the shared composer, so speculative and
@@ -51,13 +53,13 @@ pub(super) const ASSISTANCE_FILLER_LINE: &str = "One moment - I'm checking that 
 pub(super) const ASSISTANCE_PENDING_LINE: &str =
     "I've already asked the team and I'll let you know as soon as they reply.";
 pub(super) const ASSISTANCE_UNAVAILABLE_LINE: &str =
-    "I can't reach the team just now. I can take a message and have them get back to you.";
+    "I can't contact the team from this call. No message or callback has been arranged.";
 pub(super) const TRANSFER_CHECKING_LINE: &str =
     "I'll check whether the owner is available to take your call. I'll stay with you while we wait.";
 pub(super) const TRANSFER_UNAVAILABLE_LINE: &str =
-    "They aren't available to take the call just now. I can keep helping or take a message for them.";
+    "They aren't available to take the call just now. I can keep helping with the information I have.";
 pub(super) const TRANSFER_REQUEST_INVALID_LINE: &str =
-    "I couldn't send that request just now. I can keep helping or take a message for them.";
+    "I couldn't send that request just now. I can keep helping with the information I have.";
 pub(super) const ASSISTANCE_REQUEST_TTL_SECONDS: u64 = 60;
 pub(super) const TRANSFER_REQUEST_TTL_SECONDS: u64 = 30;
 
@@ -70,9 +72,9 @@ pub(super) const LOOKUP_FILLER_LINE: &str = "One moment - let me check that for 
 /// silent path ended in the technical-difficulties fail-safe on a live call
 /// (73325204).
 pub(super) const LOOKUP_HANDOFF_LINE: &str =
-    "I couldn't find that just now - I'll have the team check and get back to you. Is there anything else I can help with?";
+    "I couldn't verify that information right now. No booking or callback has been arranged.";
 
-pub(super) const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read aloud to the caller by a voice synthesizer.\n- This is a LIVE phone conversation: keep every reply to ONE or TWO short sentences, then let the caller speak. Long replies get talked over and feel rude. Ask at most one question per reply. Only go longer when reading back details the caller asked for.\n- When reading back dates, times or booking details from your notes, copy them EXACTLY as written - never approximate, merge or reorder them. If a detail is not in your notes, say you will have the team confirm it rather than guessing.\n- Phone numbers and codes are automatically read slowly, digit by digit; you do not need to do anything special for them.\n- You may wrap a short critical detail in [[slow]]...[[/slow]] to have it spoken more slowly.\n- Rarely, you may wrap ONE short vital sentence in [[important]]...[[/important]] so a brief overlap does not cut it off. The caller can always stop you by saying stop or wait.\n- If the caller asks you to wait, says they are thinking, or clearly needs a moment, reply with exactly [[WAIT]] and nothing else - staying silent is the right response. Never fill their pause with chatter; when they speak again, continue naturally.\n- If the caller's words were only a brief acknowledgement (yeah, okay, mm-hm) while you were talking, continue where you left off instead of starting over - or reply with [[WAIT]] if nothing needs saying.\n- NEVER reply [[WAIT]] twice in a row: if you already waited once and the caller speaks again, greets you, or checks you are there, ANSWER them.\nThe double-bracket markers are never spoken and never shown to anyone.";
+pub(super) const SPEECH_STYLE_INSTRUCTION: &str = "\n\nSpoken delivery: your words are read aloud to the caller by a voice synthesizer.\n- This is a LIVE phone conversation: keep every reply to ONE or TWO short sentences, then let the caller speak. Long replies get talked over and feel rude. Ask at most one question per reply. Only go longer when reading back details the caller asked for.\n- When reading back dates, times or booking details from your notes, copy them EXACTLY as written - never approximate, merge or reorder them. If a detail is not in your notes, say you will have the team confirm it rather than guessing.\n- Phone numbers and codes are automatically read slowly, digit by digit; you do not need to do anything special for them.\n- You may wrap a short critical detail in [[slow]]...[[/slow]] to have it spoken more slowly.\n- Rarely, you may wrap ONE short vital sentence in [[important]]...[[/important]] so a brief overlap does not cut it off. The caller can always stop you by saying stop or wait.\n- If the caller ONLY asks for time to think or pause, reply with exactly [[WAIT]] and nothing else. Read the ENTIRE utterance first: wait followed by a correction or question is NOT a request for silence; respond to that correction or question. Never fill their pause with chatter; when they speak again, continue naturally.\n- If the caller's words were only a brief acknowledgement (yeah, okay, mm-hm) while you were talking, continue where you left off instead of starting over - or reply with [[WAIT]] if nothing needs saying.\n- NEVER reply [[WAIT]] twice in a row: if you already waited once and the caller speaks again, greets you, or checks you are there, ANSWER them.\nThe double-bracket markers are never spoken and never shown to anyone.";
 
 /// VOICE-001 fail-safe: what the caller hears when the responder breaks
 /// MID-call (LLM died / synthesis went silent) — a plain apology, then a
@@ -143,8 +145,8 @@ pub(super) fn is_exact_abuse_marker(text: &str) -> bool {
 }
 
 /// Phase 2: composes the OUTBOUND CALL persona block for a plugin-dialed
-/// call. The opening line was already spoken via the greeting slot; this
-/// grounds every subsequent reply in the fact that WE rang THEM.
+/// call. The local voice engine listens first; the introduction belongs in its
+/// first reply, never in an unsolicited greeting over the recipient's hello.
 #[cfg(feature = "voice")]
 pub(super) fn outbound_call_block(number: &str, purpose: Option<&str>) -> String {
     let purpose_line = match purpose {
@@ -152,7 +154,7 @@ pub(super) fn outbound_call_block(number: &str, purpose: Option<&str>) -> String
         _ => String::new(),
     };
     format!(
-        "\n\nOUTBOUND CALL: YOU placed this call to {number} - the person answering is NOT a caller, you rang THEM. Your opening line was already spoken when they picked up; never re-introduce the call from scratch.{purpose_line}\nBe brief and polite: accomplish the purpose, answer their questions honestly from your notes, then say a short goodbye ending with [[END_CALL]]. If they are busy, annoyed, or say it is a bad time, apologise briefly and end the call politely with [[END_CALL]]. If you reach VOICEMAIL or an answering machine (a recorded greeting, a beep, no live person), leave ONE short message covering the purpose and end with [[END_CALL]] - never hold a conversation with a recording."
+        "\n\nOUTBOUND CALL: YOU placed this call to {number} - the person answering is NOT a caller, you rang THEM. Wait for the recipient to speak first. If you have not spoken yet, respond naturally to their greeting, identify yourself as Aokie, the AI assistant, and briefly explain why you called. If your introduction is already in the conversation history, do not repeat it.{purpose_line}\nBe brief and polite, one short question at a time. Once they say that is all, all good, or otherwise close the conversation, thank them and end with [[END_CALL]]; do not ask another anything-else question. On an outbound call, NEVER use an anything-else or how-can-I-help follow-up after a closing acknowledgement. Examples: Recipient: All good, thank you so much. Assistant: You are welcome. Have a lovely day! [[END_CALL]] Recipient: That is all, thanks. Assistant: Thanks for your time. Goodbye! [[END_CALL]] Accomplish the purpose, answer their questions honestly from your notes, then say a short goodbye ending with [[END_CALL]]. If they are busy, annoyed, or say it is a bad time, apologise briefly and end the call politely with [[END_CALL]]. Do not promise to call back later: a future callback must be explicitly scheduled and acknowledged first. For a busy recipient say: Sorry to interrupt. Thanks for your time. Goodbye! [[END_CALL]] If you reach VOICEMAIL or an answering machine (a recorded greeting, a beep, no live person), leave ONE short message covering the purpose and end with [[END_CALL]] - never hold a conversation with a recording."
     )
 }
 
