@@ -460,12 +460,43 @@ pub(super) fn looks_like_echo(caller: &str, bot: &str) -> bool {
     if c.len() < 3 {
         return false; // too short to judge (e.g. "yes", "ok")
     }
-    let b: std::collections::HashSet<String> = words(bot).into_iter().collect();
+    let b = words(bot);
     if b.is_empty() {
         return false;
     }
-    let overlap = c.iter().filter(|w| b.contains(*w)).count();
-    (overlap as f32 / c.len() as f32) >= 0.7
+    // Word-set overlap erased normal answers ("yes, I can hear you clearly"
+    // after "can you hear me clearly?") and corrections with a new date/name.
+    // Only a near-verbatim ordered span is plausible textual echo. Meaningful
+    // answers and corrections retain the floor even when most words overlap.
+    if matches!(c.first().map(String::as_str), Some("yes" | "yeah" | "yep" | "no" | "nope" | "actually" | "wait")) {
+        return false;
+    }
+    let mut longest = 0;
+    for start in 0..c.len() {
+        for other in 0..b.len() {
+            let matched = c[start..].iter().zip(&b[other..]).take_while(|(a,b)| a == b).count();
+            longest = longest.max(matched);
+        }
+    }
+    longest >= 3 && longest as f32 / c.len() as f32 >= 0.9
+}
+
+#[cfg(all(test, feature = "voice"))]
+mod echo_response_tests {
+    use super::looks_like_echo;
+    #[test]
+    fn preserves_answers_and_corrections_that_share_the_questions_words() {
+        let question = "Can you hear me clearly? Your appointment is on Friday at three.";
+        for answer in ["Yes, I can hear you clearly", "I can hear you clearly", "No, your appointment is on Friday at three", "My appointment is on Thursday at three", "Wait, your appointment is on Friday at three"] {
+            assert!(!looks_like_echo(answer, question), "caller answer was discarded: {answer}");
+        }
+    }
+    #[test]
+    fn still_rejects_verbatim_leaked_speech() {
+        assert!(looks_like_echo("Can you hear me clearly?", "Hi Lance. Can you hear me clearly?"));
+        assert!(looks_like_echo("I'm calling to test our outbound conversation", "Hi Lance. I'm calling to test our outbound conversation. Can you hear me clearly?"));
+        assert!(!looks_like_echo("yeah", "yeah"));
+    }
 }
 
 #[cfg(all(test, feature = "voice"))]

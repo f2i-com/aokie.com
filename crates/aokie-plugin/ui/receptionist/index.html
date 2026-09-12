@@ -1,7 +1,7 @@
 <!--
   Aokie AI Receptionist — plugin-shipped desktop console (manifest v2 ui.screens).
 
-  This is BODY MARKUP ONLY: the FormLogic Desktop host inlines this fragment,
+  This is BODY MARKUP ONLY: the OAIY Desktop host inlines this fragment,
   styles.css and every .js file (app.js first, then tabs/*.js, in manifest
   files-list order) into a sandboxed iframe (opaque origin, CSP default-src
   'none') and injects window.PluginHost before any script runs.
@@ -15,16 +15,16 @@
 <main class="rcp" id="rcp-root">
   <!-- Tab bar (in-memory tab state — the sandbox has no location.hash) -->
   <nav class="rcp-tabs" id="rcp-tabs" role="tablist" aria-label="Receptionist sections">
-    <button type="button" class="rcp-tab-btn is-active" data-tab="overview" role="tab" aria-selected="true">Overview</button>
-    <button type="button" class="rcp-tab-btn" data-tab="settings" role="tab" aria-selected="false">Settings</button>
-    <button type="button" class="rcp-tab-btn" data-tab="phone" role="tab" aria-selected="false">Phone setup</button>
-    <button type="button" class="rcp-tab-btn" data-tab="companion" role="tab" aria-selected="false">Companion</button>
-    <button type="button" class="rcp-tab-btn" data-tab="consent" role="tab" aria-selected="false">Consent</button>
-    <button type="button" class="rcp-tab-btn" data-tab="dongle" role="tab" aria-selected="false">Dongle</button>
+    <button type="button" class="rcp-tab-btn is-active" data-tab="overview" id="nav-overview" aria-controls="tab-overview" tabindex="0" role="tab" aria-selected="true">Overview</button>
+    <button type="button" class="rcp-tab-btn" data-tab="settings" id="nav-settings" aria-controls="tab-settings" tabindex="-1" role="tab" aria-selected="false">Settings</button>
+    <button type="button" class="rcp-tab-btn" data-tab="phone" id="nav-phone" aria-controls="tab-phone" tabindex="-1" role="tab" aria-selected="false">Phone setup</button>
+    <button type="button" class="rcp-tab-btn" data-tab="companion" id="nav-companion" aria-controls="tab-companion" tabindex="-1" role="tab" aria-selected="false">Companion</button>
+    <button type="button" class="rcp-tab-btn" data-tab="consent" id="nav-consent" aria-controls="tab-consent" tabindex="-1" role="tab" aria-selected="false">Consent</button>
+    <button type="button" class="rcp-tab-btn" data-tab="dongle" id="nav-dongle" aria-controls="tab-dongle" tabindex="-1" role="tab" aria-selected="false">Dongle</button>
   </nav>
 
   <!-- ══ OVERVIEW ══════════════════════════════════════════════════════════ -->
-  <div class="rcp-tab-panel" id="tab-overview">
+  <div class="rcp-tab-panel" id="tab-overview" role="tabpanel" aria-labelledby="nav-overview" tabindex="0">
     <!-- Hero: plugin health + version -->
     <section class="rcp-hero">
       <div class="rcp-hero__copy">
@@ -56,6 +56,7 @@
         <div id="live-body">
           <p class="rcp-loading">Loading&hellip;</p>
         </div>
+        <div id="switchboard-body" class="rcp-switchboard" aria-live="polite" hidden></div>
         <!-- The composer is STATIC so re-renders never eat the operator's typing. -->
         <div class="rcp-speak" id="speak-row" hidden>
           <input
@@ -119,12 +120,26 @@
         </p>
       </section>
     </div>
+  <section class="rcp-card rcp-conversation" aria-labelledby="conversation-title">
+    <div class="rcp-card__heading">
+      <div class="rcp-card__heading-copy">
+        <small>CONVERSATION</small>
+        <h3 id="conversation-title">Live transcript</h3>
+      </div>
+      <button type="button" class="rcp-link-btn" data-act="conversation-clear">Clear view</button>
+    </div>
+    <p class="rcp-hint">Finalized words received while this console is open. Overlapping speech and interrupted replies are labelled. Call events also carry these turns to connected apps.</p>
+    <div id="conversation-body" class="rcp-conversation__turns" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0">
+      <p class="rcp-empty">The next conversation will appear here when live transcription is enabled.</p>
+    </div>
+    <p class="rcp-footnote" id="conversation-note">This view keeps the latest 120 turns of one call. It resets on the next call or when you close the console.</p>
+  </section>
   </div>
 
   <!-- ══ OTHER TABS (mounted by tabs/*.js via the __aokieTabs registry) ═════ -->
-  <div class="rcp-tab-panel" id="tab-settings" hidden></div>
-  <div class="rcp-tab-panel" id="tab-phone" hidden></div>
-  <div class="rcp-tab-panel" id="tab-companion" hidden></div>
-  <div class="rcp-tab-panel" id="tab-consent" hidden></div>
-  <div class="rcp-tab-panel" id="tab-dongle" hidden></div>
+  <div class="rcp-tab-panel" id="tab-settings" role="tabpanel" aria-labelledby="nav-settings" tabindex="0" hidden></div>
+  <div class="rcp-tab-panel" id="tab-phone" role="tabpanel" aria-labelledby="nav-phone" tabindex="0" hidden></div>
+  <div class="rcp-tab-panel" id="tab-companion" role="tabpanel" aria-labelledby="nav-companion" tabindex="0" hidden></div>
+  <div class="rcp-tab-panel" id="tab-consent" role="tabpanel" aria-labelledby="nav-consent" tabindex="0" hidden></div>
+  <div class="rcp-tab-panel" id="tab-dongle" role="tabpanel" aria-labelledby="nav-dongle" tabindex="0" hidden></div>
 </main>

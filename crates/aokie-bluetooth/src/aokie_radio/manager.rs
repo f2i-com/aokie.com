@@ -81,25 +81,11 @@ pub const AOKIE_LEGACY_PIN: &str = "0000";
 // drops most of it before the SCO TX loop drains it. 480k samples ≈
 // 1 MB of memory — fine for a single in-flight call.
 pub const AOKIE_SCO_TX_QUEUE_SAMPLES: usize = 480_000;
-/// HCI SCO payload bytes per outgoing packet — used for both CVSD and
-/// mSBC over USB.
-///
-/// BTStack reference (`btstack/src/hci.c:4877-4885`):
-/// ```c
-/// if (hci_have_usb_transport()){
-///     payload_length = 24;     // hard override, regardless of codec
-/// }
-/// ```
-/// Verified working on Broadcom BCM20702A0 (0a5c:21ec): same dongle on
-/// the same Zadig/libwdi binding carries audible bot audio with 24-byte
-/// payloads via the BTStack-bridge worktree (commit 05e3d51) but goes
-/// silent with our prior 48-byte choice. The earlier 48-byte derivation
-/// in `project_msbc_iso_raw_passthrough.md` was off the spec / CSR8510
-/// dump; the BTStack reference disagrees and BTStack is the path that
-/// actually delivers bytes on this controller family.
-///
-/// 24-byte payload + 3-byte HCI header = 27-byte HCI SCO packet, which
-/// fits in 2 microframes at alt 2 / MPS=17 (2×17=34, 27 < 34).
+/// USB SCO payload units per outgoing packet. BTstack's
+/// `hci_sco_packet_length_for_payload_length_and_voice_setting` uses 24
+/// units, then multiplies by two for CVSD's 16-bit PCM. Transparent mSBC
+/// uses 24 bytes; CVSD uses 48 bytes (24 samples). With the three-byte
+/// HCI header, CVSD fills three 17-byte USB frames in exactly 3 ms.
 pub const AOKIE_SCO_USB_PAYLOAD_BYTES: usize = 24;
 pub const AOKIE_SCO_WRITE_SILENCE_ENV: &str = "AOKIE_RADIO_SCO_TX_SILENCE";
 pub const AOKIE_SCO_WRITE_TONE_ENV: &str = "AOKIE_RADIO_SCO_TX_TONE";
@@ -584,7 +570,7 @@ pub fn listen_runtime_controller_with_options(
                     // alt-2 frames) that avoids the chronic underrun
                     // we hit at 60 bytes.
                     let payload_len = max_sco_payload_len(&init.buffer_size)
-                        .min(AOKIE_SCO_USB_PAYLOAD_BYTES)
+                        .min(AOKIE_SCO_USB_PAYLOAD_BYTES * 2)
                         & !1;
                     if payload_len > 0 {
                         if sco_tx_tone_enabled {

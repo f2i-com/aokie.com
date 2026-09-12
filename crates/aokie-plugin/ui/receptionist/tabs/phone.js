@@ -53,6 +53,9 @@
   var bonded = []; // [{ address, name, connected }]
   var busy = false;
   var error = null;
+  var radioError = null;
+  var statusError = null;
+  var bondedError = null;
   var busyPhones = {};
   var forgetArm = null; // address with the inline Forget confirm open
   var baselineBonds = 0;
@@ -70,6 +73,7 @@
 
   function loadBonded() {
     return HOST.command('phone.listPaired').then(function (data) {
+      bondedError = null;
       var raw = (data && data.devices) || [];
       bonded = [];
       for (var i = 0; i < raw.length; i++) {
@@ -78,17 +82,22 @@
         else if (d && d.address) bonded.push({ address: d.address, name: d.name || null, connected: !!d.connected });
       }
       return bonded;
+    }, function (e) {
+      bondedError = errMsg(e);
+      throw e;
     });
   }
 
   function pollStatus() {
     return HOST.command('phone.status').then(function (data) {
+      statusError = null;
       var d = data || {};
       secondsLeft =
         d.pairingOpen && typeof d.pairingSecondsRemaining === 'number'
           ? d.pairingSecondsRemaining
           : 0;
-      connected = !!d.connected || !!d.paired;
+      radioError = d.error || null;
+      connected = !!d.connected && !radioError && !d.pairingConfirm;
       device = d.device || null;
       // PAIR-001: surface (or clear) the numeric-comparison prompt. The
       // plugin reports it only while the radio actually holds the SSP reply.
@@ -98,6 +107,9 @@
           ? { address: pc.address, numericValue: pc.numericValue }
           : null;
       return { secs: secondsLeft, connected: connected };
+    }, function (e) {
+      statusError = errMsg(e);
+      throw e;
     });
   }
 
@@ -173,7 +185,7 @@
               confirmed = false;
               HOST.toast(
                 'success',
-                'Phone connected — Aokie can take calls from this phone; it reconnects automatically from now on.'
+                'Phone paired. Check the phone connection and receptionist readiness before testing calls.'
               );
               return refreshAll();
             });
@@ -183,7 +195,9 @@
         return null;
       })
       .catch(function () {
-        // Plugin stopping mid-poll — the idle poll recovers.
+        // The idle poll recovers, but stale connection or pairing prompts
+        // must not stay actionable while the current status is unavailable.
+        render();
       });
   }
 
@@ -357,6 +371,7 @@
 
   function pairingCardBody() {
     if (!known) return '<p class="rcp-loading">Loading…</p>';
+    if (statusError) return '<p class="rcp-hint">The phone status could not be verified. Retrying automatically…</p>';
 
     if (confirmPrompt) {
       return (
@@ -397,7 +412,7 @@
         '<div class="rcp-card__body">' +
         '<p class="rcp-status-ok">' + ICONS.check + ' Phone connected' +
         (device && device.address ? ' (' + esc(device.address) + ')' : '') +
-        ' — Aokie can take calls.</p>' +
+        ' — check receptionist readiness before testing calls.</p>' +
         '<div class="rcp-actions">' +
         '<button type="button" class="rcp-button" data-act="pair-start"' + (busy ? ' disabled' : '') + '>' +
         (busy ? 'Opening…' : 'Pair another phone') + '</button>' +
@@ -424,6 +439,7 @@
   }
 
   function bondedCardBody() {
+    if (bondedError) return '<p class="rcp-error">' + esc(bondedError) + '</p>';
     if (!known) return '<p class="rcp-loading">Loading…</p>';
     if (bonded.length === 0) {
       return transportMode === 'dongle'
@@ -473,7 +489,9 @@
       '<div class="rcp-card__heading-copy">' +
       '<small>BLUETOOTH PAIRING</small>' +
       '<h3>' +
-      (confirmPrompt
+      (statusError
+        ? 'Phone status unavailable'
+        : confirmPrompt
         ? 'Confirm the pairing code'
         : secondsLeft > 0
           ? 'Pairing window open'
@@ -482,21 +500,23 @@
             : 'Pair a phone') +
       '</h3>' +
       '</div>' +
-      (secondsLeft > 0
+      (statusError
+        ? '<span class="rcp-pill is-warn"><i></i>Unknown</span>'
+        : secondsLeft > 0
         ? '<span class="rcp-pill is-warn"><i></i>' + esc(formatSeconds(secondsLeft)) + ' left</span>'
         : connected
           ? '<span class="rcp-pill is-ok"><i></i>Connected</span>'
           : '') +
       '</div>' +
       pairingCardBody() +
-      (error ? '<p class="rcp-error">' + esc(error) + '</p>' : '') +
+      (error || statusError || radioError ? '<p class="rcp-error">' + esc(error || statusError || radioError) + '</p>' : '') +
       '</section>' +
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
       '<small>BONDED PHONES</small>' +
       '<h3>' +
-      (known ? bonded.length + ' phone' + (bonded.length === 1 ? '' : 's') + ' bonded' : 'Loading…') +
+      (bondedError ? 'Paired phones unavailable' : known ? bonded.length + ' phone' + (bonded.length === 1 ? '' : 's') + ' bonded' : 'Loading…') +
       '</h3>' +
       '</div>' +
       '</div>' +

@@ -95,6 +95,18 @@ pub struct CallSession {
 }
 
 impl CallSession {
+    /// Start an agent-dialed conversation silently, once the callee has picked
+    /// up and the audio channel is ready. Handset calls and incoming calls keep
+    /// their own greeting policy.
+    pub fn begin_outbound_listening(&mut self, audio_ready: bool) -> bool {
+        if self.outbound && self.agent_owned && self.is_active() && audio_ready && !self.greeted {
+            self.greeted = true;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn is_active(&self) -> bool {
         self.phase == Phase::Active
     }
@@ -581,6 +593,23 @@ mod tests {
     }
 
     // ── Phase 2: outbound sessions ──────────────────────────────────────────
+
+    #[test]
+    fn outbound_listening_requires_pickup_and_audio_and_arms_once() {
+        let mut t = SessionTracker::new();
+        t.dial("outbound-listen".into(), None, "x".into(), true);
+        assert!(!t.current_mut().unwrap().begin_outbound_listening(true));
+        t.answered();
+        assert!(!t.current_mut().unwrap().begin_outbound_listening(false));
+        assert!(t.current_mut().unwrap().begin_outbound_listening(true));
+        assert!(!t.current_mut().unwrap().begin_outbound_listening(true));
+        assert!(t.current().unwrap().greeted, "automatic greeting must stay suppressed");
+        t.terminate();
+        t.dial("handset".into(), None, "x".into(), false);
+        t.answered();
+        assert!(!t.current_mut().unwrap().begin_outbound_listening(true));
+        assert!(!t.current().unwrap().greeted, "handset conversation must stay untouched");
+    }
 
     #[test]
     fn outbound_answered_call_is_a_completion_with_the_dialed_number() {

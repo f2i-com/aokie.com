@@ -59,6 +59,7 @@ pub(super) fn run_reply_rounds(
     // answer to "did the model ask to wait", and must reset each time.
     let mut wait_regen_done = false;
     let mut empty_retry_done = false;
+    let mut appointment_rounds = 0;
     'reply_rounds: loop {
         let sr = bt.get_sample_rate();
         // Add the standing instructions at reply time (not by
@@ -99,12 +100,18 @@ pub(super) fn run_reply_rounds(
         };
         // The nudge tail is CONSUMED here (or below on
         // adoption — the speculation already baked it in).
-        let system_prompt = compose_agent_system_prompt(
+        let mut system_prompt = compose_agent_system_prompt(
             &persona_now,
             agent_hangup,
             ctx.last_cut_context.take().as_deref(),
             is_mgr_call,
         );
+        let remote = remote_media.snapshot();
+        let advice_allowed = remote.consent.assistance_enabled;
+        system_prompt.push_str(&crate::conversation_policy::context(
+            chrono::Local::now().date_naive(), &ctx.history,
+            advice_allowed, remote.consent.takeover_enabled,
+        ));
         let mut messages = vec![
             serde_json::json!({ "role": "system", "content": system_prompt }),
         ];
@@ -219,6 +226,8 @@ pub(super) fn run_reply_rounds(
         // consent-gated request for the current call. The
         // model cannot choose recipients or grants.
         let mut assistance_requested: Option<String> = None;
+        let mut appointment_requested = None;
+        let mut holding_appointment_marker = false;
         // A strict [[TRANSFER:]] verdict offers the caller
         // to the owner. Aokie remains the audio owner until
         // the ordinary takeover path proves HumanActive.
@@ -448,8 +457,19 @@ pub(super) fn run_reply_rounds(
                     // caller never hears it and it never lands in the
                     // transcript; its presence arms the post-reply hangup
                     // REQUEST (validated by agent_hangup_verdict below).
-                    let (spoken_text, had_marker) =
+                    let (mut spoken_text, had_marker) =
                         strip_end_call_marker(&sentence);
+                    holding_appointment_marker |= spoken_text.contains("[[APPOINTMENT");
+                    if holding_appointment_marker {
+                        // JSON can span sentence chunks (e.g. punctuation in
+                        // a service name). No part of the tool payload is speech.
+                        continue;
+                    }
+                    if let Some(replacement) = crate::conversation_policy::guard_sentence(
+                        &spoken_text, &ctx.history, chrono::Local::now().date_naive(), advice_allowed,
+                    ) {
+                        spoken_text = replacement;
+                    }
                     if had_marker {
                         hangup_requested = true;
                     }
@@ -503,6 +523,9 @@ pub(super) fn run_reply_rounds(
                         ) {
                             let _ = sink.send_line(&line);
                         }
+                    }
+                    if spoken_text.contains("[[APPOINTMENT") {
+                        continue;
                     }
                     if spoken_text.contains("[[LOOKUP") {
                         // A lookup marker leaking through
@@ -749,6 +772,7 @@ pub(super) fn run_reply_rounds(
         let mut dead_air_cause: Option<String> = None;
         match outcome {
             Ok(full) => {
+                appointment_requested = crate::conversation_policy::parse_appointment_marker(&full);
                 // Truthful transcript (audit AK-008 + sweep): a
                 // reply cut short records what actually PLAYED,
                 // annotated with WHY — the full generation
@@ -929,6 +953,7 @@ pub(super) fn run_reply_rounds(
                     && manager_requested.is_none()
                     && lookup_requested.is_none()
                     && assistance_requested.is_none()
+                    && (appointment_requested.is_none() || appointment_rounds > 0)
                     && transfer_requested.is_none()
                     && !malformed_transfer_requested
                     && lookup_rounds == 0
@@ -1097,6 +1122,44 @@ pub(super) fn run_reply_rounds(
                         "the assistant failed to reply ({e})"
                     ));
                 }
+            }
+        }
+        if let Some(arguments) = appointment_requested {
+            if !line_dead && !operator_ended && !barged
+                // Yield to newly captured caller speech before committing a
+                // selection that may already have been corrected or withdrawn.
+                && overlap_capture.is_empty()
+                && reply_owner_is_current(&remote_media, reply_owner.as_ref())
+                && appointment_rounds == 0
+            {
+                appointment_rounds += 1;
+                let callers: Vec<String> = ctx.history.iter().rev()
+                    .filter(|m| m["role"] == "user")
+                    .filter_map(|m| m["content"].as_str())
+                    .filter(|s| !s.starts_with("[SYSTEM"))
+                    .map(str::to_string).collect();
+                let assistants: Vec<String> = ctx.history.iter().rev()
+                    .filter(|m| m["role"] == "assistant")
+                    .filter_map(|m| m["content"].as_str()).take(3).map(str::to_string).collect();
+                let result = arguments.and_then(|args| {
+                    crate::realtime_appointment::validate_with_readback(
+                        &args, corr, Some((status.last_caller_turn.load(Ordering::Relaxed), text)),
+                        &callers, &assistants, chrono::Local::now().date_naive(),
+                    )
+                }).and_then(|request| {
+                    if !ctx.queued_appointments.contains(&request.request_id) {
+                        let from = tracker.current().and_then(|c| c.caller_id.as_deref()).unwrap_or("");
+                        emit_realtime_appointment_request(outbox, sink, corr, from, &request)?;
+                        ctx.queued_appointments.push(request.request_id.clone());
+                    }
+                    Ok(format!("Appointment REQUEST queued for {} on {} at {}. Its flow will deliver it to the Aokie app; app storage and staff confirmation are not yet acknowledged. Do not queue it again. Tell the caller only that their request was queued for staff confirmation.", request.caller_name, request.date, request.time))
+                });
+                let note = match result {
+                    Ok(note) => note,
+                    Err(error) => format!("Nothing was queued or booked: {error}. Ask one short clarification question; do not emit another appointment marker this turn."),
+                };
+                ctx.history.push(serde_json::json!({"role":"user","content":format!("[SYSTEM APPOINTMENT RESULT - not caller speech] {note}")}));
+                continue 'reply_rounds;
             }
         }
         // AK-008 + scratchpad: EVERYTHING the caller said over

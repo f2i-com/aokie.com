@@ -149,6 +149,7 @@ pub(super) fn handle_event(
                             "[aokie-plugin] outbound setup attached to our pending dial ({}) — agent owns the call",
                             s.id
                         );
+                        *status.outbound_call_id.lock().unwrap() = Some(s.id.clone());
                         *status.current_caller.lock().unwrap() = Some(number);
                         *status.current_call_id.lock().unwrap() = Some(s.id.clone());
                         *status.call_started_at.lock().unwrap() = Some(s.started_at_iso.clone());
@@ -164,6 +165,7 @@ pub(super) fn handle_event(
                     "[aokie-plugin] OUTBOUND call setup observed ({}) — receptionist stays out of it",
                     s.id
                 );
+                *status.outbound_call_id.lock().unwrap() = Some(s.id.clone());
                 *status.current_caller.lock().unwrap() = None;
                 *status.current_call_id.lock().unwrap() = Some(s.id.clone());
                 *status.call_started_at.lock().unwrap() = Some(s.started_at_iso.clone());

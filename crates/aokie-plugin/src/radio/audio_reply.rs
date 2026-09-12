@@ -228,11 +228,13 @@ pub(super) fn pump_audio_and_reply(
                 }
                 std::borrow::Cow::Borrowed(&frame.samples[..])
             };
-            let rms = crate::voice::frame_rms(&samples);
             let f16 = crate::voice::to_f32_16k(&samples, frame.sample_rate as u32);
             let frame_dur =
                 Duration::from_secs_f32(samples.len() as f32 / frame.sample_rate.max(1) as f32);
-            if rms > SPEECH_RMS {
+            if ctx.capture_activity.detect(&samples, &f16, *stt_had_speech) {
+                if !*stt_had_speech {
+                    ctx.capture_activity.prepend_onset(stt_buf);
+                }
                 *stt_had_speech = true;
                 *stt_silence = Duration::ZERO;
                 // Speech resumed after a speculative send: that spec no
@@ -248,6 +250,8 @@ pub(super) fn pump_audio_and_reply(
             } else if *stt_had_speech {
                 *stt_silence += frame_dur;
                 stt_buf.extend_from_slice(&f16); // keep trailing silence for context
+            } else {
+                ctx.capture_activity.remember_quiet(&f16);
             }
             if stt_buf.len() > 16_000 * 15 {
                 *stt_silence = endpoint; // force-flush a runaway (~15 s) utterance
@@ -436,12 +440,19 @@ pub(super) fn pump_audio_and_reply(
                             // PEEK the nudge tail (never consume — a
                             // discarded speculation must leave it for the
                             // real reply).
-                            let sys = compose_agent_system_prompt(
+                            let mut sys = compose_agent_system_prompt(
                                 &persona_now,
                                 agent_hangup,
                                 ctx.last_cut_context.as_deref(),
                                 is_mgr_call,
                             );
+                            let mut grounding_history = ctx.history.clone();
+                            grounding_history.push(serde_json::json!({"role":"user","content":cur}));
+                            let remote = remote_media.snapshot();
+                            sys.push_str(&crate::conversation_policy::context(
+                                chrono::Local::now().date_naive(), &grounding_history,
+                                remote.consent.assistance_enabled, remote.consent.takeover_enabled,
+                            ));
                             let mut messages =
                                 vec![serde_json::json!({ "role": "system", "content": sys })];
                             messages.extend(ctx.history.iter().cloned());
@@ -551,10 +562,9 @@ pub(super) fn pump_audio_and_reply(
             // caller's mid-barge sentence completes into a single turn;
             // the normal unfinished-tail heuristic handles the rest.
             let overlap_grace = std::mem::take(&mut p.from_overlap);
-            if p.text.len() < CONTINUATION_MAX_CHARS
-                && (turn_looks_unfinished(&p.text) || overlap_grace)
-            {
-                p.flush_at = Instant::now() + CONTINUATION_HOLD;
+            let delay = continuation_delay(&p.text, overlap_grace);
+            if !delay.is_zero() {
+                p.flush_at = Instant::now() + delay;
                 eprintln!(
                     "[aokie-plugin] holding turn open ({}): {}",
                     if overlap_grace && !turn_looks_unfinished(&p.text) {

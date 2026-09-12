@@ -11,6 +11,18 @@ use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// Qwen's chat template requires a user query even during a cold prefix
+/// warmup. This throwaway turn lives only in the warmup request, never in
+/// the actual call history. Existing conversation prefixes remain intact.
+fn warmup_messages(mut messages: serde_json::Value) -> serde_json::Value {
+    if let Some(turns) = messages.as_array_mut() {
+        if !turns.iter().any(|turn| turn["role"] == "user") {
+            turns.push(serde_json::json!({ "role": "user", "content": "Hello." }));
+        }
+    }
+    messages
+}
+
 /// Shrink a caller-turn PCM clip before it rides an LLM request (2026-07-17
 /// latency round): trim leading/trailing silence and collapse long internal
 /// pauses, so the attached WAV — and the audio tokens the model must prefill —
@@ -145,7 +157,7 @@ impl LlmClient {
     /// loop (an on-loop HTTP call delayed the ANSWER once already).
     pub fn warm_prefix(&self, messages: serde_json::Value) -> Result<(), String> {
         let mut body = serde_json::json!({
-            "messages": messages,
+            "messages": warmup_messages(messages),
             "stream": false,
             "max_tokens": 1,
             "temperature": 0.0,
@@ -585,6 +597,20 @@ mod tests {
     use super::terminal_speech_remainder;
     use super::trim_silence_for_llm;
     use super::LlmClient;
+
+    #[test]
+    fn warmup_supplies_a_user_turn_without_changing_real_history() {
+        let history = json!([{ "role": "system", "content": "Receptionist" }]);
+        let warmed = super::warmup_messages(history.clone());
+        assert_eq!(history.as_array().unwrap().len(), 1);
+        assert_eq!(warmed[0], history[0]);
+        assert_eq!(warmed[1]["role"], "user");
+        let conversation = json!([
+            { "role": "system", "content": "Receptionist" },
+            { "role": "user", "content": "Hello" }
+        ]);
+        assert_eq!(super::warmup_messages(conversation.clone()), conversation);
+    }
 
     fn serve_sse(body: String) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test SSE server");

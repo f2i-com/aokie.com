@@ -42,6 +42,16 @@ pub(super) fn play_tone_and_greet(
     #[cfg(feature = "voice")] realtime_legacy_call: &Option<String>,
     #[cfg(feature = "voice")] silence_window: std::time::Duration,
 ) {
+    // Outbound agent calls start like a normal phone conversation: listen for
+    // the recipient's hello, then let the reply engine deliver the introduction
+    // using the call-scoped purpose. Do not inject an inbound greeting or tone.
+    #[cfg(feature = "voice")]
+    if agent_enabled && !realtime_selected {
+        if tracker.current_mut().is_some_and(|call| call.begin_outbound_listening(bt.get_sample_rate() > 0)) {
+            ctx.silence_timer = Some(SilenceTimer::new(silence_window, Instant::now()));
+            eprintln!("[aokie-plugin] outbound ready — listening for the recipient before introducing the call");
+        }
+    }
     #[cfg(feature = "voice")]
     let realtime_blocks_answer_tone = realtime_owns_call(
         realtime_selected,
@@ -57,7 +67,7 @@ pub(super) fn play_tone_and_greet(
     if play_answer_tone {
         let sr = bt.get_sample_rate();
         if let Some(s) = tracker.current_mut() {
-            if !s.toned && sr > 0 {
+            if !s.toned && sr > 0 && !s.outbound {
                 let tone = greeting_tone(sr);
                 eprintln!(
                     "[aokie-plugin] answerTone: sending {} samples @ {}Hz to the caller",

@@ -17,7 +17,8 @@ pub struct EchoCanceller {
     frame: usize,           // samples per 10 ms frame at `rate`
     ref_buf: VecDeque<i16>, // outbound TTS reference, aligned FIFO with the mic
     mic_acc: VecDeque<i16>, // inbound mic accumulator for frame alignment
-    raw_floor: f32,         // per-frame RAW input RMS below this ⇒ output silence
+    raw_floor: f32,         // residual guard while the echo reference is active
+    reference_tail_frames: usize, // protect the filter's 100 ms echo tail
 }
 
 /// Default RAW-input silence floor. Live call 066d2237 (first sherpa/Piper
@@ -61,6 +62,7 @@ impl EchoCanceller {
             ref_buf: VecDeque::with_capacity(rate as usize),
             mic_acc: VecDeque::with_capacity(frame * 8),
             raw_floor,
+            reference_tail_frames: 0,
         }
     }
 
@@ -76,7 +78,7 @@ impl EchoCanceller {
 
     /// Echo-cancel a captured mic chunk → cleaned PCM (a multiple of the frame
     /// size; sub-frame leftovers stash for the next call). With no reference
-    /// queued (Aokie silent) the mic passes through essentially unchanged.
+    /// queued and its 100 ms tail expired, the mic passes through unchanged.
     pub fn process_capture(&mut self, mic: &[i16]) -> Vec<i16> {
         if mic.is_empty() {
             return Vec::new();
@@ -100,7 +102,20 @@ impl EchoCanceller {
             // The filter must still adapt (and the ref FIFO stay aligned)
             // even for frames the residual guard silences below.
             self.aec.cancel_echo(&rec, &echo, &mut clean);
-            if self.raw_floor > 0.0 && frame_rms(&rec) < self.raw_floor {
+            let has_reference = echo.iter().any(|&sample| sample != 0);
+            let echo_active = has_reference || self.reference_tail_frames > 0;
+            if has_reference {
+                self.reference_tail_frames = 10;
+            } else {
+                self.reference_tail_frames = self.reference_tail_frames.saturating_sub(1);
+            }
+            if !echo_active {
+                // When Aokie is silent there is no echo to remove. Applying
+                // the residual gate here erased quiet consonants: a controlled
+                // Parakeet test changed "Lance" to "Lan". Keep the original
+                // microphone samples, including soft word endings and onsets.
+                out.extend_from_slice(&rec);
+            } else if self.raw_floor > 0.0 && frame_rms(&rec) < self.raw_floor {
                 // Residual guard: the RAW frame carried no meaningful audio,
                 // so anything in `clean` was generated inside the filter —
                 // emit true silence instead of a ghost of our own voice.
@@ -116,12 +131,40 @@ impl EchoCanceller {
     pub fn reset(&mut self) {
         self.ref_buf.clear();
         self.mic_acc.clear();
+        self.reference_tail_frames = 0;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_assistant_preserves_quiet_consonants_across_capture_chunks() {
+        let mut ec = EchoCanceller::new(8000);
+        // Speech falls from a vowel to a quiet unvoiced ending below the old
+        // residual floor. Split into the actual 3 ms CVSD packet size.
+        let input: Vec<i16> = (0..1600).map(|i| {
+            let amplitude = if i < 800 { 2000.0 } else { 75.0 };
+            ((i as f32 * 0.61).sin() * amplitude) as i16
+        }).collect();
+        let output: Vec<i16> = input.chunks(24)
+            .flat_map(|chunk| ec.process_capture(chunk)).collect();
+        assert_eq!(output, input, "idle AEC must not gate the caller's phonemes");
+    }
+
+    #[test]
+    fn residual_guard_stays_active_through_the_reference_tail() {
+        let mut ec = EchoCanceller::new(8000);
+        ec.feed_reference(&vec![3000; 80]);
+        assert_eq!(ec.process_capture(&vec![2; 80]), vec![0; 80]);
+        for _ in 0..10 {
+            assert_eq!(ec.process_capture(&vec![2; 80]), vec![0; 80]);
+        }
+        assert_eq!(ec.process_capture(&vec![2; 80]), vec![2; 80]);
+        ec.reset();
+        assert_eq!(ec.process_capture(&vec![75; 80]), vec![75; 80]);
+    }
 
     /// A hot reference against a digitally-silent mic must produce SILENCE —
     /// the exact phantom-capture shape from live call 066d2237: speexdsp's

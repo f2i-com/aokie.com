@@ -16,6 +16,28 @@ pub(super) const CONTINUATION_HOLD: Duration = Duration::from_millis(1400);
 #[cfg(feature = "voice")]
 pub(super) const CONTINUATION_MAX_CHARS: usize = 240;
 
+/// A complete phrase captured over the bot only needs a short chance to
+/// continue. Numbers and unfinished thoughts retain their full breathing room.
+#[cfg(feature = "voice")]
+pub(super) fn continuation_delay(text: &str, from_overlap: bool) -> Duration {
+    if text.len() >= CONTINUATION_MAX_CHARS { Duration::ZERO }
+    else if turn_looks_unfinished(text) { CONTINUATION_HOLD }
+    else if from_overlap { Duration::from_millis(450) }
+    else { Duration::ZERO }
+}
+
+#[cfg(all(test, feature = "voice"))]
+mod continuation_timing_tests {
+    use super::*;
+    #[test]
+    fn completed_answers_resume_quickly_without_rushing_number_groups() {
+        assert_eq!(continuation_delay("Yes, I can hear you clearly.", true), Duration::from_millis(450));
+        assert_eq!(continuation_delay("Hello", false), Duration::ZERO);
+        assert_eq!(continuation_delay("My number is 0412", true), CONTINUATION_HOLD);
+        assert_eq!(continuation_delay("I wanted to ask because", false), CONTINUATION_HOLD);
+    }
+}
+
 /// True when a transcript's tail says "the caller isn't done" (audit AK-008):
 /// it ends in a digit group, a spoken number word, or a connective that
 /// announces one ("my number is …"). Drives the continuation hold above.
