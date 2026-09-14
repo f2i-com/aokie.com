@@ -656,6 +656,12 @@ impl Plugin {
         } else {
             std::env::remove_var("AOKIE_BARGE_IN");
         }
+        if barge_in && self.store.config.settings.get("conversationAcknowledgements")
+            .and_then(serde_json::Value::as_bool).unwrap_or(false) {
+            std::env::set_var("AOKIE_CONVERSATION_ACKS", "1");
+        } else {
+            std::env::remove_var("AOKIE_CONVERSATION_ACKS");
+        }
         // sendAudio: attach the caller turn's AUDIO (base64 WAV content part)
         // to the LLM request alongside the transcript — for audio-capable
         // models (Gemma 3n / Qwen2-Audio class) served by llama-server.
@@ -4134,6 +4140,11 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
     },
     SettingSpec {
         key: "bargeIn",
+        kind: SettingKind::Bool,
+        applies_live: false,
+    },
+    SettingSpec {
+        key: "conversationAcknowledgements",
         kind: SettingKind::Bool,
         applies_live: false,
     },

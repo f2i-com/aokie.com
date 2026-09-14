@@ -18,6 +18,7 @@
 /// This runs ONLY on the text handed to the synthesizer — transcripts, history
 /// and records keep the original wording.
 pub fn normalize_speech_text(input: &str) -> String {
+    let input = &normalize_calendar_dates(input);
     // Currency first (live report 2026-07-14: "$9" in a menu read-back was
     // voiced wrong): "$18" -> "18 dollars", "$1" -> "1 dollar",
     // "$18.50" -> "18 dollars and 50 cents" — the sign becomes a spoken word
@@ -28,8 +29,8 @@ pub fn normalize_speech_text(input: &str) -> String {
     // numbers): "Tue" -> "Tuesday", "Jul" -> "July" when they sit in date
     // context, so the synthesizer reads dates like a person would.
     let input = &expand_date_abbreviations(input);
-    // Clock times next, so the meridiem pass sees the cleaned form:
-    // "10:00 AM" -> "10 AM" -> "10 a em".
+    // Clock times become spoken words before the remaining bare-hour
+    // meridiem pass: "10:05 AM" -> "ten oh five a em".
     let input = &normalize_clock_times(input);
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -93,6 +94,103 @@ pub fn normalize_speech_text(input: &str) -> String {
         cleaned = next;
     }
     cleaned
+}
+
+/// ISO calendar dates are dates, never slow digit-by-digit codes. Only the
+/// synthesizer receives this rendering; stored booking values stay unchanged.
+pub fn normalize_calendar_dates(input: &str) -> String {
+    use chrono::Datelike;
+    calendar_dates_for_year(input, chrono::Local::now().year())
+}
+
+fn iso_date(input: &str) -> Option<chrono::NaiveDate> {
+    let b = input.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-'
+        || !b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()) {
+        return None;
+    }
+    chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d").ok()
+}
+
+/// Used before speech-plan digit segmentation, including punctuation-wrapped
+/// dates. Invalid dates are not guessed or silently repaired.
+pub fn is_calendar_date_token(token: &str) -> bool {
+    iso_date(token.trim_matches(|c: char| matches!(c, '(' | ')' | '.' | ',' | '!' | '?' | ';' | ':' | '*' | '`'))).is_some()
+}
+
+fn calendar_dates_for_year(input: &str, current_year: i32) -> String {
+    use chrono::Datelike;
+    const ORDINALS: [&str; 31] = ["first", "second", "third", "fourth", "fifth",
+        "sixth", "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth",
+        "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth",
+        "eighteenth", "nineteenth", "twentieth", "twenty-first", "twenty-second",
+        "twenty-third", "twenty-fourth", "twenty-fifth", "twenty-sixth",
+        "twenty-seventh", "twenty-eighth", "twenty-ninth", "thirtieth", "thirty-first"];
+    const WEEKDAYS: [&str; 14] = ["Monday", "Tuesday", "Wednesday", "Thursday",
+        "Friday", "Saturday", "Sunday", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let part_of_identifier = |c: char| c.is_alphanumeric() || matches!(c, '_' | '/' | '-' | '+');
+    let mut out = String::with_capacity(input.len());
+    let mut at = 0;
+    while at < input.len() {
+        let candidate = input.get(at..at.saturating_add(10));
+        let left_ok = input[..at].chars().next_back().is_none_or(|c| !part_of_identifier(c));
+        let date = candidate.and_then(iso_date).filter(|_| {
+            left_ok && input[at + 10..].chars().next().is_none_or(|c| !part_of_identifier(c))
+        });
+        if let Some(date) = date {
+            // A model may have supplied a weekday already. Derive it from the
+            // real date instead of saying it twice or repeating a wrong day.
+            let prefix = out.trim_end_matches(|c: char| c.is_whitespace() || c == ',');
+            let word_start = prefix.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+            if WEEKDAYS.iter().any(|day| prefix[word_start..].eq_ignore_ascii_case(day)) {
+                out.truncate(word_start);
+            }
+            out.push_str(&format!("{} the {} of {}", date.format("%A"),
+                ORDINALS[date.day() as usize - 1], date.format("%B")));
+            if date.year() != current_year {
+                out.push_str(&format!(", {}", date.year()));
+            }
+            at += 10;
+        } else {
+            let c = input[at..].chars().next().expect("character boundary");
+            out.push(c);
+            at += c.len_utf8();
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod calendar_date_tests {
+    use super::*;
+    #[test]
+    fn iso_dates_use_real_weekdays_and_ordinals() {
+        assert_eq!(calendar_dates_for_year("On 2026-09-14 at 10:30.", 2026),
+            "On Monday the fourteenth of September at 10:30.");
+        assert_eq!(calendar_dates_for_year("Wednesday, 2026-09-14.", 2026),
+            "Monday the fourteenth of September.");
+        assert_eq!(calendar_dates_for_year("2028-02-29", 2026),
+            "Tuesday the twenty-ninth of February, 2028");
+        assert_eq!(calendar_dates_for_year("2026-09-21 and 2026-09-23", 2026),
+            "Monday the twenty-first of September and Wednesday the twenty-third of September");
+    }
+    #[test]
+    fn dates_do_not_rewrite_codes_urls_or_ambiguous_values() {
+        for text in ["2026-02-29", "2026-13-01", "14/09/2026", "09/10/2026",
+            "ref-2026-09-14", "https://example.test/2026-09-14", "2026-09-14T10:30:00Z",
+            "0412 345 678", "x2026-09-14", "2026-09-140"] {
+            assert_eq!(calendar_dates_for_year(text, 2026), text);
+        }
+        assert_eq!(calendar_dates_for_year("Café (2026-09-14).", 2026),
+            "Café (Monday the fourteenth of September).");
+    }
+    #[test]
+    fn date_speech_is_idempotent() {
+        let text = normalize_speech_text("2026-09-14 at 10:30 AM.");
+        assert!(text.contains("Monday the fourteenth of September"));
+        assert!(!text.contains("2026-09-14"));
+        assert_eq!(normalize_speech_text(&text), text);
+    }
 }
 
 /// Expand abbreviated weekday/month names when they sit in DATE CONTEXT, so
@@ -194,15 +292,6 @@ fn expand_date_abbreviations(input: &str) -> String {
     out
 }
 
-/// Rewrite `H:MM` clock times into forms the TTS reads naturally — the colon
-/// made it spell the minutes out ("10:00" read as "ten zero zero" / colon
-/// noises, live report 2026-07-13):
-///   "10:00" → "10"        (on-the-hour: just the hour)
-///   "10:15" → "10 15"     ("ten fifteen")
-///   "10:05" → "10 oh 5"   ("ten oh five")
-/// Strictly shaped: 1-2 digit hour (0-23), exactly 2-digit minutes (00-59),
-/// no digit on either side — "3:1" (a ratio), "10:154" and "100:30" are
-/// untouched. Runs only on synthesizer text, never on transcripts/records.
 /// `$<amount>` → spoken price: "$18" -> "18 dollars", "$1" -> "1 dollar",
 /// "$1,200" -> "1200 dollars", "$18.50" -> "18 dollars and 50 cents",
 /// "$0.50" -> "50 cents", "$9.5" -> "9 dollars and 50 cents". A `$` not
@@ -271,13 +360,25 @@ fn normalize_currency(input: &str) -> String {
     out
 }
 
+/// Speak H:MM[:SS] as words, convert unambiguous 24-hour times, and preserve
+/// explicit AM/PM. Boundaries prevent rewriting identifiers and timestamps.
+/// Only synthesizer text changes; booking data retains its original value.
 fn normalize_clock_times(input: &str) -> String {
+    fn number(n: u32) -> String {
+        const SMALL: [&str; 20] = ["zero", "one", "two", "three", "four", "five",
+            "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen",
+            "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"];
+        if n < 20 { return SMALL[n as usize].to_string(); }
+        let tens = ["", "", "twenty", "thirty", "forty", "fifty"][(n / 10) as usize];
+        if n % 10 == 0 { tens.to_string() } else { format!("{tens}-{}", SMALL[(n % 10) as usize]) }
+    }
+    let identifier = |c: char| c.is_alphanumeric() || matches!(c, '_' | '/' | ':');
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     while i < chars.len() {
-        // Candidate start: a digit with no digit immediately before it.
-        if chars[i].is_ascii_digit() && (i == 0 || !chars[i - 1].is_ascii_digit()) {
+        // Do not turn timestamp/URL/id fragments into appointment times.
+        if chars[i].is_ascii_digit() && (i == 0 || !identifier(chars[i - 1])) {
             let mut j = i;
             while j < chars.len() && chars[j].is_ascii_digit() {
                 j += 1;
@@ -295,21 +396,49 @@ fn normalize_clock_times(input: &str) -> String {
                 let m1 = chars[j + 1];
                 let m2 = chars[j + 2];
                 let minutes: u32 = format!("{m1}{m2}").parse().unwrap_or(99);
-                if hour <= 23 && minutes <= 59 {
-                    for k in i..j {
-                        out.push(chars[k]);
+                let mut end = j + 3;
+                let mut seconds = 0;
+                let mut valid_seconds = true;
+                if chars.get(end) == Some(&':') {
+                    if chars.get(end + 1).is_some_and(|c| c.is_ascii_digit())
+                        && chars.get(end + 2).is_some_and(|c| c.is_ascii_digit()) {
+                        seconds = chars[end + 1].to_digit(10).unwrap() * 10
+                            + chars[end + 2].to_digit(10).unwrap();
+                        end += 3;
+                        valid_seconds = seconds <= 59;
+                    } else { valid_seconds = false; }
+                }
+                let mut suffix_at = end;
+                while chars.get(suffix_at).is_some_and(|c| c.is_whitespace()) { suffix_at += 1; }
+                let mut meridiem = None;
+                for (token, pm) in [("a.m", false), ("p.m", true), ("am", false), ("pm", true)] {
+                    let n = token.len();
+                    if chars.get(suffix_at..suffix_at + n).is_some_and(|s|
+                        s.iter().collect::<String>().eq_ignore_ascii_case(token))
+                        && chars.get(suffix_at + n).is_none_or(|c| !identifier(*c)) {
+                        meridiem = Some(pm);
+                        end = suffix_at + n;
+                        break;
                     }
-                    if minutes == 0 {
-                        // on the hour: drop ":00" entirely
-                    } else if minutes < 10 {
-                        out.push_str(" oh ");
-                        out.push(m2);
+                }
+                let boundary_ok = chars.get(end).is_none_or(|c| !identifier(*c));
+                if hour <= 23 && minutes <= 59 && valid_seconds && boundary_ok
+                    && (meridiem.is_none() || (1..=12).contains(&hour)) {
+                    if minutes == 0 && seconds == 0 && (hour == 0 || hour == 12 && meridiem.is_some()) {
+                        out.push_str(if hour == 0 || meridiem == Some(false) { "midnight" } else { "noon" });
                     } else {
-                        out.push(' ');
-                        out.push(m1);
-                        out.push(m2);
+                        out.push_str(&number(if hour == 0 { 12 } else if hour > 12 { hour - 12 } else { hour }));
+                        if minutes > 0 {
+                            out.push_str(if minutes < 10 { " oh " } else { " " });
+                            out.push_str(&number(minutes));
+                        }
+                        if seconds > 0 {
+                            out.push_str(&format!(" and {} second{}", number(seconds), if seconds == 1 { "" } else { "s" }));
+                        }
+                        let period = meridiem.or(if hour == 0 { Some(false) } else if hour > 12 { Some(true) } else { None });
+                        if let Some(pm) = period { out.push_str(if pm { " pee em" } else { " a em" }); }
                     }
-                    i = j + 3;
+                    i = end;
                     continue;
                 }
             }
@@ -419,7 +548,7 @@ mod tests {
         );
         assert_eq!(
             normalize_speech_text("at 10:30 PM tonight"),
-            "at 10 30 pee em tonight"
+            "at ten thirty pee em tonight"
         );
         // NOT times — never rewritten.
         assert_eq!(normalize_speech_text("I AM HERE"), "I AM HERE");
@@ -435,16 +564,16 @@ mod tests {
         // The reported bug: "10:00" spoken as "ten zero zero" / colon noise.
         assert_eq!(
             normalize_speech_text("booked for 10:00 AM."),
-            "booked for 10 a em."
+            "booked for ten a em."
         );
         assert_eq!(
             normalize_speech_text("see you at 10:15."),
-            "see you at 10 15."
+            "see you at ten fifteen."
         );
-        assert_eq!(normalize_speech_text("at 10:05 pm"), "at 10 oh 5 pee em");
+        assert_eq!(normalize_speech_text("at 10:05 pm"), "at ten oh five pee em");
         assert_eq!(
             normalize_speech_text("open 9:00 to 17:30"),
-            "open 9 to 17 30"
+            "open nine to five thirty pee em"
         );
         // NOT clock times — untouched.
         assert_eq!(normalize_speech_text("a 3:1 ratio"), "a 3:1 ratio");
@@ -460,6 +589,29 @@ mod tests {
             normalize_speech_text("at 75:00 minutes?"),
             "at 75:00 minutes?"
         );
+    }
+
+    #[test]
+    fn clock_times_cover_midnight_noon_seconds_ranges_and_boundaries() {
+        for (raw, expected) in [
+            ("00:00", "midnight"), ("00:05", "twelve oh five a em"),
+            ("12:00 AM", "midnight"), ("12:00 PM", "noon"),
+            ("12:05 AM", "twelve oh five a em"),
+            ("09:05 a.m.", "nine oh five a em."),
+            ("23:45", "eleven forty-five pee em"),
+            ("14:30:00", "two thirty pee em"),
+            ("14:30:05", "two thirty and five seconds pee em"),
+            ("9:00–17:30", "nine–five thirty pee em"),
+            ("10:30AM", "ten thirty a em"),
+        ] {
+            let actual = normalize_speech_text(raw);
+            assert_eq!(actual, expected, "{raw}");
+            assert_eq!(normalize_speech_text(&actual), actual, "must be safe through two speech layers");
+        }
+        for raw in ["24:00", "09:60", "10:30:99", "10:30:001", "10:30:5",
+            "abc10:30", "2026-09-14T10:30:00Z", "https://host:10/path"] {
+            assert_eq!(normalize_speech_text(raw), raw, "{raw}");
+        }
     }
 
     #[test]
