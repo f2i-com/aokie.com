@@ -201,7 +201,13 @@ jobs:
           if (-not (Test-Path -LiteralPath $driverInf -PathType Leaf) -or -not (Test-Path -LiteralPath $driverCat -PathType Leaf)) {
             throw "AK-DIST-01: release requires the static INF and Microsoft attestation/WHQL-signed CAT under drivers/winusb"
           }
+          # The Windows Kits signtool is needed for DRIVER verification on every
+          # build (signed or not). Its presence is NOT the signal that this
+          # build signs executables — that is $signingEnabled below (audit AK-01:
+          # the unsigned smoke path used to test the tool variable and then
+          # invoke `signtool sign /f $null`).
           $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
+          if (-not $signtool) { throw "AK-DIST-01: signtool.exe (Windows Kits) is required to verify the driver catalog" }
           & $signtool verify /kp /c $driverCat $driverInf
           if ($LASTEXITCODE -ne 0) { throw "AK-DIST-01: catalog is not kernel-policy trusted or does not bind the exact INF" }
           $env:AOKIE_EXPECTED_DRIVER_INF_SHA256 = (Get-FileHash $driverInf -Algorithm SHA256).Hash.ToLower()
@@ -217,46 +223,67 @@ jobs:
           cargo build -p aokie-dongle --bin aokie-driver-helper --release
           if ($LASTEXITCODE -ne 0) { throw "helper build failed" }
 
+          # Signing is gated on an EXPLICIT state — the certificate material
+          # was provided and decoded — never on the driver-verification tool.
+          # The temporary PFX is removed in `finally` even when a later build
+          # or signature check throws (audit AK-01).
+          $signingEnabled = [bool]$env:CERT_B64
           $pfx = $null
-          if ($env:CERT_B64) {
-            $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
-            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
-            $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
-            & $signtool sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/aokie-driver-helper.exe
-            if ($LASTEXITCODE -ne 0) { throw "helper signing failed" }
-            & $signtool verify /pa target/release/aokie-driver-helper.exe
-            if ($LASTEXITCODE -ne 0) { throw "helper signature verification failed" }
-          } else {
-            Write-Warning "no signing certificate configured — UNSIGNED smoke build (never a tag release)"
-          }
-
-          # Hash the FINAL helper bytes (post-sign when a cert exists) and
-          # only now build the plugin, so the embedded pin always matches
-          # what actually ships.
-          $sha = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
-          "final helper sha256 = $sha"
-          $env:AOKIE_EXPECTED_HELPER_SHA256 = $sha
-          cargo build -p aokie-plugin --features voice --release
-          if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
-
-          # DIST-001: the voice SERVER ships in the same bundle — FormLogic's
-          # voice-service template expects aokie-voice-server.exe beside the
-          # plugin, and a bundle without it was a phone with no speech stack.
-          cargo build -p aokie-voice-server --release
-          if ($LASTEXITCODE -ne 0) { throw "voice server build failed" }
-
-          if ($signtool) {
-            foreach ($exe in @('target/release/aokie-plugin.exe', 'target/release/aokie-voice-server.exe')) {
-              & $signtool sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe
-              if ($LASTEXITCODE -ne 0) { throw "signing failed: $exe" }
-              & $signtool verify /pa $exe
-              if ($LASTEXITCODE -ne 0) { throw "signature verification failed: $exe" }
+          $signedExecutables = @()
+          try {
+            if ($signingEnabled) {
+              if (-not $env:CERT_PASS) { throw "TRUST-001: WINDOWS_CERT_PASSWORD is required alongside WINDOWS_CERT_PFX_B64" }
+              $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+              [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
+              & $signtool sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/aokie-driver-helper.exe
+              if ($LASTEXITCODE -ne 0) { throw "helper signing failed" }
+              & $signtool verify /pa target/release/aokie-driver-helper.exe
+              if ($LASTEXITCODE -ne 0) { throw "helper signature verification failed" }
+              $signedExecutables += 'target/release/aokie-driver-helper.exe'
+            } else {
+              Write-Warning "no signing certificate configured — UNSIGNED smoke build (never a tag release)"
             }
-            Remove-Item $pfx
+
+            # Hash the FINAL helper bytes (post-sign when a cert exists) and
+            # only now build the plugin, so the embedded pin always matches
+            # what actually ships.
+            $sha = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
+            "final helper sha256 = $sha"
+            $env:AOKIE_EXPECTED_HELPER_SHA256 = $sha
+            cargo build -p aokie-plugin --features voice --release
+            if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
+
+            # DIST-001: the voice SERVER ships in the same bundle — FormLogic's
+            # voice-service template expects aokie-voice-server.exe beside the
+            # plugin, and a bundle without it was a phone with no speech stack.
+            cargo build -p aokie-voice-server --release
+            if ($LASTEXITCODE -ne 0) { throw "voice server build failed" }
+
+            if ($signingEnabled) {
+              foreach ($exe in @('target/release/aokie-plugin.exe', 'target/release/aokie-voice-server.exe')) {
+                & $signtool sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe
+                if ($LASTEXITCODE -ne 0) { throw "signing failed: $exe" }
+                $signedExecutables += $exe
+              }
+              # Verify EVERY intended final executable before any release
+              # metadata is written; the helper's post-sign pin above is
+              # unchanged because signing the plugin never touches the helper.
+              foreach ($exe in @('target/release/aokie-driver-helper.exe', 'target/release/aokie-plugin.exe', 'target/release/aokie-voice-server.exe')) {
+                & $signtool verify /pa $exe
+                if ($LASTEXITCODE -ne 0) { throw "signature verification failed: $exe" }
+              }
+              if ($signedExecutables.Count -ne 3) { throw "expected 3 signed executables, signed $($signedExecutables.Count)" }
+              $packagedHelper = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
+              if ($packagedHelper -ne $sha) { throw "helper bytes changed after its hash was pinned ($sha -> $packagedHelper)" }
+            }
+          } finally {
+            if ($pfx -and (Test-Path -LiteralPath $pfx)) { Remove-Item -LiteralPath $pfx -Force }
           }
 
-          # Record the pinned hash for the packaging step's cross-check.
+          # Record the pinned hash and the signing state for the packaging
+          # step's cross-check and the release manifest.
           Set-Content -Encoding ascii pinned-helper-sha.txt $sha
+          Set-Content -Encoding ascii signing-state.txt $(if ($signingEnabled) { 'signed' } else { 'unsigned' })
 
       # Audit AOK-REL-002: a voice release without its runtime is a phone
       # that can't hear or speak — missing assets FAIL the release, and the
@@ -294,13 +321,25 @@ jobs:
           if ($pinned -ne $packaged) { throw "helper hash drift: pinned $pinned but packaging $packaged" }
 
           # Release manifest beside the binaries (AOK-REL-001 acceptance).
+          # Signing state as VERIFIED by the build step (every final
+          # executable's signature checked), not merely "a secret existed".
+          $signingState = (Get-Content signing-state.txt -Raw).Trim()
+          if ($signingState -eq 'signed') {
+            $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
+            foreach ($exe in @('bundle/aokie-plugin.exe', 'bundle/aokie-driver-helper.exe', 'bundle/aokie-voice-server.exe')) {
+              & $signtool verify /pa $exe
+              if ($LASTEXITCODE -ne 0) { throw "packaged executable is not signed although the build reported signed: $exe" }
+            }
+          } elseif ('${{ github.ref_type }}' -eq 'tag') {
+            throw "TRUST-001: a tag release cannot package an unsigned build"
+          }
           $manifest = [ordered]@{
             builtAt = (Get-Date).ToUniversalTime().ToString('o')
             ref = $env:GITHUB_SHA
             # The tested compatibility tuple (audit CROSS-COMPAT-001).
             contractVersion = (Get-Content docs/contracts/aokie-connector-contract.v1.json -Raw | ConvertFrom-Json).contractVersion
             flavour = 'voice'
-            signed = [bool]$env:CERT_B64
+            signed = ($signingState -eq 'signed')
             helperSha256 = $packaged
             driverInfSha256 = (Get-FileHash bundle/driver-package/aokie_winusb_bluetooth.inf -Algorithm SHA256).Hash.ToLower()
             driverCatSha256 = (Get-FileHash bundle/driver-package/aokie_winusb_bluetooth.cat -Algorithm SHA256).Hash.ToLower()
@@ -310,8 +349,6 @@ jobs:
             })
           }
           $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding ascii bundle/release-manifest.json
-        env:
-          CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
 
       # AK-001: EVERY bundle mutation (release-manifest.json above, the
       # SHA256SUMS.txt convenience checksums here) happens BEFORE the package
