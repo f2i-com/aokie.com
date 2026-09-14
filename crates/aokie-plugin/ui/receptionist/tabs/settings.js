@@ -47,6 +47,7 @@
     ttsEndpoint: '',
     sttEndpointMs: 450,
     bargeIn: false,
+    conversationAcknowledgements: false,
     sendAudio: false,
     bargeSensitivity: 650,
     hfpCodec: 'auto',
@@ -113,6 +114,7 @@
           ? src.sttEndpointMs
           : d.sttEndpointMs,
       bargeIn: boolSetting(src.bargeIn, d.bargeIn),
+      conversationAcknowledgements: boolSetting(src.conversationAcknowledgements, d.conversationAcknowledgements),
       sendAudio: boolSetting(src.sendAudio, d.sendAudio),
       bargeSensitivity:
         typeof src.bargeSensitivity === 'number' && isFinite(src.bargeSensitivity)
@@ -1255,6 +1257,8 @@
       ) +
       check('bargeIn', 'Listen while speaking and allow interruptions') +
       hint('Keep the caller’s words while Aokie talks. Sustained speech or “stop” makes Aokie yield; brief interjections are kept for the next turn. Requires live call transcription. Applies after reconnecting.') +
+      check('conversationAcknowledgements', 'Let Aokie briefly acknowledge longer explanations') +
+      hint('A short “Mm-hm” at a brief pause lets the caller know Aokie is listening. Their turn stays open, and they can interrupt the acknowledgement. Requires listening while speaking; applies after reconnecting.') +
       field(
         'Interruption threshold',
         '<input type="number" data-num="bargeSensitivity" min="100" max="2000" step="25" value="' +

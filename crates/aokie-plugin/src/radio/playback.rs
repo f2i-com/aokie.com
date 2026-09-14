@@ -376,8 +376,11 @@ impl TtsChunkPlayback {
             barged: false,
             frame: (sample_rate as usize / 100).max(80),
             speech_frames: 0,
-            need: 22,
-            grace: std::time::Duration::from_millis(350),
+            need: 14,
+            // A short settling window plus 140 ms of sustained, cleaned
+            // speech lets a caller interrupt near a sentence's first word.
+            // The old 350 + 220 ms gate swallowed short "wait" interjections.
+            grace: std::time::Duration::from_millis(100),
             captured: Vec::new(),
             speech_start: None,
             sample_rate,

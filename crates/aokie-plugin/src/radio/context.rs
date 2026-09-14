@@ -29,6 +29,8 @@ pub(super) struct CallVoiceContext {
     pub(super) pending_turn: Option<PendingTurn>,
     #[cfg(feature = "voice")]
     pub(super) capture_activity: super::capture_activity::CaptureActivity,
+    #[cfg(feature = "voice")]
+    pub(super) last_acknowledgement: std::time::Instant,
     /// Phase 3: the per-call manager PIN gate.
     #[cfg(feature = "voice")]
     pub(super) manager_gate: ManagerGate,
@@ -94,6 +96,8 @@ impl CallVoiceContext {
             pending_turn: None,
             #[cfg(feature = "voice")]
             capture_activity: super::capture_activity::CaptureActivity::default(),
+            #[cfg(feature = "voice")]
+            last_acknowledgement: std::time::Instant::now(),
             #[cfg(feature = "voice")]
             manager_gate: ManagerGate::default(),
             #[cfg(feature = "voice")]

@@ -260,6 +260,56 @@ pub(super) fn pump_audio_and_reply(
                 }
             }
         }
+        // An optional brief backchannel takes a small pause in a long caller
+        // explanation. It does NOT finalize their turn or execute an action.
+        // Playback still drains the microphone; append that newer audio after
+        // the existing buffer so overlapping words retain their time order.
+        if agent_enabled && barge_in && *stt_had_speech
+            && std::env::var_os("AOKIE_CONVERSATION_ACKS").is_some()
+            && !ctx.dialogue.is_paused() && !ctx.agent_hung_up
+            && !ctx.manager_gate.awaiting_pin && !remote_media.radio_reserved()
+            && !realtime_selected && !ctx.desktop_realtime_responder
+            && tracker.current().is_some_and(|s| s.is_active()
+                && (!s.outbound || s.agent_owned)
+                && !screen_policy.is_manager(s.caller_id.as_deref()))
+            && interjections::acknowledgement_due(
+                ctx.last_acknowledgement.elapsed(), stt_buf.len(), *stt_silence,
+                endpoint, live_hyp.as_deref().unwrap_or_default(),
+                live_hyp_at.map(|at| at.elapsed()).unwrap_or(Duration::MAX))
+        {
+            ctx.last_acknowledgement = Instant::now();
+            let sr = bt.get_sample_rate();
+            if sr > 0 {
+                ensure_overlap_capture(aec, true, sr);
+                let started = Instant::now();
+                let mut probe = ControlProbe::new(control_rx, pending_controls);
+                let out = tts_speak(bt, synth, "Mm-hm.", sr, aec.as_mut(),
+                    Some(barge_rms), Some(&mut probe), ctx.pace.base(), None, None, None);
+                note_tts_outcome(status, &out);
+                if out.barged || out.cancelled { bt.flush_tx_audio(); }
+                if !out.captured_speech.is_empty() {
+                    if let Some(id) = spec_utterance.take() { stale_specs.push(id); }
+                    stt_buf.extend(crate::voice::to_f32_16k(&out.captured_speech, sr as u32));
+                    *stt_silence = Duration::ZERO;
+                    *turn_overlapped = true;
+                    *turn_overlap_at = Some(overlap_backdate(out.captured_speech.len(),
+                        sr as usize, started.elapsed()));
+                }
+                // Partials describe the pre-ack buffer, not its continuation.
+                *live_hyp = None;
+                *live_hyp_prev = None;
+                if out.dur > Duration::ZERO {
+                    let delivery = if out.barged { "interrupted" }
+                        else if out.cancelled { "operator_ended" } else { "complete" };
+                    emit_turn_full(outbox, sink, tracker.call_id().unwrap_or_default(),
+                        ctx.turn_index, "bot", "Mm-hm.", Some(delivery),
+                        Some("backchannel"), *turn_overlapped,
+                        Some(&aokie_core::events::iso8601_ago_ms(started.elapsed().as_millis() as u64)));
+                    ctx.turn_index += 1;
+                }
+                eprintln!("[aokie-plugin] conversational acknowledgement; caller turn kept open");
+            }
+        }
         // Speculative early transcription: 200 ms into the pause (well
         // before the endpoint), ship the buffer as-is. If the caller
         // stays quiet, the endpoint below has NOTHING left to do — the
