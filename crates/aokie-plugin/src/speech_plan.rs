@@ -539,6 +539,9 @@ fn digits_in(token: &str) -> usize {
 /// "0412", "345-678", "(07)", "+61". Times ("10:30") are excluded (the
 /// clock-time normalizer owns those) and so is anything with letters.
 fn is_numeralish(token: &str) -> bool {
+    if aokie_core::speech::is_calendar_date_token(token) {
+        return false;
+    }
     let core = token.trim_matches(|c: char| matches!(c, '.' | ',' | '!' | '?' | ';'));
     !core.is_empty()
         && core.chars().any(|c| c.is_ascii_digit())
@@ -823,7 +826,7 @@ fn push_span(
     };
     spans.push(SpeechSpan {
         text,
-        tts_text,
+        tts_text: aokie_core::speech::normalize_calendar_dates(&tts_text),
         rate,
         policy,
     });
@@ -906,6 +909,23 @@ mod tests {
         assert_eq!(spans[0].text, "How can I help you today?");
         assert_eq!(spans[0].tts_text, spans[0].text);
         assert_eq!(spans[0].rate, 1.0);
+        assert_eq!(spans[0].policy, InterruptPolicy::Yield);
+    }
+
+    #[test]
+    fn dates_are_spoken_naturally_before_digit_expansion_in_all_modes() {
+        for raw in ["Your appointment is 2026-09-14.",
+            "[[slow]]Your appointment is 2026-09-14.[[/slow]]",
+            "[[important]]Your appointment is 2026-09-14.[[/important]]"] {
+            let spans = plan_spans(raw, &pace(), 2500);
+            assert_eq!(spans.len(), 1, "{spans:?}");
+            assert!(spans[0].tts_text.contains("Monday the fourteenth of September"));
+            assert!(spans[0].text.contains("2026-09-14"), "keep source date in records");
+            assert!(!spans[0].tts_text.contains("two zero two six"));
+        }
+        let spans = plan_spans("On 2026-09-14 call 0412 345 678.", &pace(), 2500);
+        assert!(spans[0].tts_text.contains("Monday the fourteenth"));
+        assert!(spans.iter().any(|s| s.tts_text.contains("zero four one two")));
         assert_eq!(spans[0].policy, InterruptPolicy::Yield);
     }
 

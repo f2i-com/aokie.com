@@ -18,6 +18,11 @@
       "appliesLive": false
     },
     {
+      "key": "conversationAcknowledgements",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
       "key": "sendAudio",
       "type": "bool",
       "appliesLive": false

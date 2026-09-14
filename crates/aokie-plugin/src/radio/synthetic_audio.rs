@@ -273,9 +273,9 @@ fn echo_alone_is_cancelled_never_captured() {
 #[test]
 fn caller_onset_trips_barge_at_each_offset() {
     for (onset, lo, hi) in [
-        (100u64, 400u64, 1100u64),
-        (300, 450, 1200),
-        (1000, 1100, 1950),
+        (100u64, 200u64, 500u64),
+        (300, 400, 700),
+        (1000, 1100, 1400),
     ] {
         let r = run(&Timeline {
             caller_onset_ms: Some(onset),
@@ -292,6 +292,30 @@ fn caller_onset_trips_barge_at_each_offset() {
             !r.outcome.captured_speech.is_empty(),
             "onset {onset} ms: overlap not captured"
         );
+    }
+}
+
+#[test]
+fn short_early_caller_interruption_yields_and_keeps_the_first_word() {
+    let r = run(&Timeline {
+        caller_onset_ms: Some(100), caller_dur_ms: 300,
+        ..Timeline::default()
+    });
+    assert!(r.outcome.barged, "a short early interruption must take the floor");
+    assert!(r.stopped_at_ms <= 400, "caller waited {} ms", r.stopped_at_ms);
+    // This includes the quiet lead-in, not just the frame that tripped.
+    assert!(r.outcome.captured_speech.len() >= SR as usize / 5);
+}
+
+#[test]
+fn short_noise_does_not_take_the_floor() {
+    for onset in [100, 600, 1500] {
+        let r = run(&Timeline {
+            caller_onset_ms: Some(onset), caller_dur_ms: 60,
+            ..Timeline::default()
+        });
+        assert!(!r.outcome.barged, "noise burst at {onset} ms cut playback");
+        assert!(r.stopped_at_ms >= 3000);
     }
 }
 
