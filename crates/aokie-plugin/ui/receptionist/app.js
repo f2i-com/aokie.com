@@ -325,6 +325,8 @@
     ).then(function () {
       renderHero();
       renderReadiness();
+      // Delivery falls back to the snapshot's outbox counts, so it follows the snapshot too.
+      if (state.diag !== undefined) renderDelivery();
     });
   }
 
@@ -490,6 +492,16 @@
     return snap.lastHealth || snap.health || null;
   }
 
+  // The outbox counts: dongle.diagnostics' own when it answered, else the
+  // plugin's health report, which carries the same counts without needing
+  // the radio. A missing dongle is a radio outage, not a delivery one.
+  function outboxCounts(diag) {
+    if (diag && diag.outbox) return diag.outbox;
+    var health = pluginHealth();
+    var outbox = health && health.components && health.components.outbox;
+    return outbox && typeof outbox === 'object' ? outbox : null;
+  }
+
   function pluginIsLive(snap) {
     return !!(snap && (snap.state === 'running' || snap.state === 'unhealthy'));
   }
@@ -642,7 +654,7 @@
         items.push({ icon: ICONS.cloud, label: 'Data delivery', value: '…', note: 'checking outbox', ok: null });
         return;
       }
-      var outbox = diag && diag.outbox;
+      var outbox = outboxCounts(diag);
       if (!outbox) {
         items.push({ icon: ICONS.cloud, label: 'Data delivery', value: 'Unknown', note: state.diagError || 'no outbox counts', ok: null });
         return;
@@ -845,7 +857,7 @@
       return;
     }
 
-    var outbox = diag && diag.outbox;
+    var outbox = outboxCounts(diag);
     if (!outbox) {
       title.textContent = 'Outbox unavailable';
       setPill(pill, pillText, 'is-neutral', 'Unknown');
