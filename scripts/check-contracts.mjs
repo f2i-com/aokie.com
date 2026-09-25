@@ -10,7 +10,8 @@
  *
  * Usage:  node scripts/check-contracts.mjs
  * Env:    FORMLOGIC_REPO — path to the formlogic checkout
- *         (default C:/wamp64/www/formlogic-app or ../formlogic-app)
+ *         (default ../formlogic.com, the f2i-com/formlogic.com checkout; then the
+ *         legacy C:/wamp64/www/formlogic-app or ../formlogic-app)
  */
 
 import { spawnSync } from 'node:child_process';
@@ -20,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const formlogicRoot = process.env.FORMLOGIC_REPO
-  || ['C:/wamp64/www/formlogic-app', path.join(repoRoot, '..', 'formlogic-app')]
+  || [path.join(repoRoot, '..', 'formlogic.com'), 'C:/wamp64/www/formlogic-app', path.join(repoRoot, '..', 'formlogic-app')]
     .find((p) => existsSync(p));
 
 const harness = formlogicRoot && path.join(formlogicRoot, 'scripts', 'check-contracts.mjs');
