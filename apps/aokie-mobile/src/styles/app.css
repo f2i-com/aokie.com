@@ -334,6 +334,12 @@ svg { flex: 0 0 auto; }
   line-height: 1.55;
 }
 
+/* The endpoint notice reuses the prototype's banner, whose 9.5px/8px type was
+   sized for the scaled device frame; on the setup card it read as fine print. */
+.native-setup-card .same-phone-warning { gap: 10px; padding: 12px 14px; }
+.native-setup-card .same-phone-warning strong { font-size: 13px; }
+.native-setup-card .same-phone-warning p { font-size: 12px; line-height: 1.5; margin-top: 4px; }
+
 .setup-section-heading {
   display: flex;
   align-items: center;
@@ -1656,6 +1662,11 @@ svg { flex: 0 0 auto; }
   background: var(--surface-soft);
   padding: 14px;
 }
+
+/* The heading's section-divider rule and spacing would open the card with an
+   empty band and a stray line; the card's own padding already spaces it. */
+.setup-desktop-pairing .setup-section-heading { margin: 0; padding-top: 0; border-top: 0; }
+.setup-desktop-pairing > .setup-blocked-copy { margin: 0; }
 
 .pairing-close {
   position: absolute;
