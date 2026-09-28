@@ -178,6 +178,11 @@ pub(super) fn service_controls(
                             )),
                             greeting: Some(opening_line.clone()),
                         });
+                        ctx.outbound_intent = Some(OutboundIntent {
+                            call_id: call_id.clone(),
+                            purpose: purpose.clone(),
+                            opening_line: opening_line.clone(),
+                        });
                     }
                     #[cfg(not(feature = "voice"))]
                     let _ = (&purpose, &opening_line);

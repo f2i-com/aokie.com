@@ -31,6 +31,25 @@ pub(super) struct RealtimeRuntimeConfig {
     pub(super) max_output_tokens: u32,
 }
 
+/// The realtime provider id OAIY Desktop serves calls under: its route is
+/// `ws://127.0.0.1:17872/api/ai/providers/oaiy/v1/realtime/stream`. The
+/// receptionist screen tells the route the same way (`OAIY.callRoute`).
+#[cfg(feature = "voice")]
+pub(super) const OAIY_PROVIDER_ID: &str = "oaiy";
+
+/// The OAIY route: Desktop realtime voice selected with OAIY's provider.
+/// There OAIY hears, speaks and decides for every call Aokie gives it, and
+/// Aokie's own speech stack is normally not downloaded, so no path may
+/// count on it. Decided from the settings alone, so a realtime config that
+/// failed to load is still the OAIY route.
+#[cfg(feature = "voice")]
+pub(super) fn oaiy_route_selected(realtime_selected: bool, endpoint: Option<&str>) -> bool {
+    realtime_selected
+        && endpoint
+            .and_then(|endpoint| crate::realtime_voice::validate_endpoint(endpoint).ok())
+            .is_some_and(|provider| provider == OAIY_PROVIDER_ID)
+}
+
 #[cfg(all(target_os = "windows", feature = "voice"))]
 pub(super) fn realtime_runtime_config() -> Result<Option<RealtimeRuntimeConfig>, String> {
     if std::env::var("AOKIE_REALTIME_VOICE_MODE").as_deref() != Ok("desktop_realtime") {
@@ -271,6 +290,107 @@ pub(super) fn should_speak_legacy_resume(realtime_selected: bool, desktop_realti
 #[cfg(feature = "voice")]
 pub(super) fn screened_call_needs_tts(message: &str) -> bool {
     !message.trim().is_empty()
+}
+
+/// Whether answering a screened caller waits for Aokie's own TTS. Off the
+/// OAIY route a set screen message holds the answer until that TTS is ready
+/// (the call keeps ringing meanwhile). On the OAIY route a screened caller
+/// is never left ringing and never given to OAIY: without Aokie's own voice
+/// the call is refused silently, as with a blank message (answered, then
+/// ended at once by the greeting site's screening).
+#[cfg(feature = "voice")]
+pub(super) fn screened_answer_waits_for_tts(
+    oaiy_route: bool,
+    message: &str,
+    tts_available: bool,
+) -> bool {
+    screened_call_needs_tts(message) && (!oaiy_route || tts_available)
+}
+
+/// Whether a manager-number caller takes Aokie's own manager line. The
+/// PIN-gated manager line speaks with Aokie's own voice, which the OAIY
+/// route does not use: there OAIY answers them like any other caller.
+#[cfg(feature = "voice")]
+pub(super) fn manager_line_is_local(oaiy_route: bool, is_manager: bool) -> bool {
+    is_manager && !oaiy_route
+}
+
+/// Whether a call goes to Aokie's own voice before its caller id is known.
+/// A call the phone's owner dialled on the handset is only observed, on
+/// every route. Elsewhere a call already answered (on the handset, or by
+/// `call.answer` before the realtime session was ready) and a caller
+/// promoted from hold keep Aokie's own voice; on the OAIY route OAIY takes
+/// those too, since Aokie's own voice is not there to speak.
+#[cfg(feature = "voice")]
+pub(super) fn local_voice_before_identity(
+    oaiy_route: bool,
+    handset_dial: bool,
+    already_active: bool,
+    promotion_pending: bool,
+) -> bool {
+    handset_dial || (!oaiy_route && (already_active || promotion_pending))
+}
+
+/// The automatic hold juggle speaks its announcements in Aokie's own voice.
+/// On the OAIY route it runs only when that voice is there; otherwise the
+/// second caller keeps hearing call waiting, and a caller who gives up is a
+/// missed call that OAIY rings back.
+#[cfg(feature = "voice")]
+pub(super) fn auto_hold_has_voice(oaiy_route: bool, tts_available: bool) -> bool {
+    !oaiy_route || tts_available
+}
+
+/// Whether the realtime fail-safe may speak its apology in Aokie's own
+/// voice before hanging up. Off the OAIY route the local TTS must be proven
+/// by the loopback self-test. On the OAIY route that self-test never runs
+/// (OAIY speaks), so an available local TTS (its preflight found it) is the
+/// caller's one chance of an honest line; a silent attempt still ends in
+/// the same prompt hangup.
+#[cfg(feature = "voice")]
+pub(super) fn realtime_apology_can_speak(
+    oaiy_route: bool,
+    sample_rate: u16,
+    tts_error: Option<&str>,
+    self_test: Option<&VoiceSelfTest>,
+) -> bool {
+    sample_rate > 0
+        && if oaiy_route {
+            tts_error.is_none()
+        } else {
+            realtime_failsafe_can_speak(tts_error, self_test)
+        }
+}
+
+/// An agent-placed outbound dial whose realtime session could not start.
+/// Elsewhere it falls back to Aokie's own voice; on the OAIY route that
+/// voice is not there, so the dial is ended before the callee answers.
+#[cfg(feature = "voice")]
+pub(super) fn outbound_falls_back_to_local_voice(oaiy_route: bool) -> bool {
+    !oaiy_route
+}
+
+/// What Aokie knows about a call, for `formlogic.realtime.start`. Only the
+/// OAIY route is given these fields; another provider gets exactly the
+/// event it always had. `callerName` stays unset: Aokie does not learn a
+/// caller's name yet (the phone's +CLIP name field is not parsed and the
+/// phonebook is not looked up).
+#[cfg(feature = "voice")]
+pub(super) fn realtime_call_facts(
+    oaiy_route: bool,
+    call: &crate::call_session::CallSession,
+    outbound: Option<&OutboundIntent>,
+) -> crate::realtime_voice::CallFacts {
+    if !oaiy_route {
+        return crate::realtime_voice::CallFacts::default();
+    }
+    let intent = outbound.filter(|intent| call.outbound && intent.call_id == call.id);
+    crate::realtime_voice::CallFacts {
+        direction: Some(if call.outbound { "outbound" } else { "inbound" }),
+        from: call.caller_id.clone(),
+        caller_name: None,
+        purpose: intent.and_then(|intent| intent.purpose.clone()),
+        opening_line: intent.map(|intent| intent.opening_line.clone()),
+    }
 }
 
 #[cfg(feature = "voice")]

@@ -14,6 +14,7 @@ pub(super) fn service_realtime_lane(
     host_rpc: &Arc<crate::host_rpc::HostRpc>,
     remote_media: &crate::remote_media::RemoteMediaHandle,
     realtime_selected: bool,
+    oaiy_route: bool,
     realtime_config: &Option<RealtimeRuntimeConfig>,
     synth: &crate::synth::SynthHandle,
     stt_tx: &std::sync::mpsc::Sender<SttWork>,
@@ -58,6 +59,13 @@ pub(super) fn service_realtime_lane(
                             .filter(|overlay| overlay.call_id == resume_id)
                             .and_then(|overlay| overlay.persona.as_deref())
                             .unwrap_or(&agent_persona);
+                        let call_facts = tracker
+                            .current()
+                            .filter(|call| call.id == resume_id)
+                            .map(|call| {
+                                realtime_call_facts(oaiy_route, call, ctx.outbound_intent.as_ref())
+                            })
+                            .unwrap_or_default();
                         match crate::realtime_voice::RealtimeVoiceSession::spawn(
                             crate::realtime_voice::SessionConfig {
                                 endpoint: config.endpoint.clone(),
@@ -74,6 +82,7 @@ pub(super) fn service_realtime_lane(
                                 allow_business_lookup: true,
                                 allow_request_appointment: true,
                                 allow_finish_call: agent_hangup,
+                                call: call_facts,
                             },
                         ) {
                             Ok(session) => {
@@ -98,7 +107,12 @@ pub(super) fn service_realtime_lane(
         // stay on the proven legacy path; Realtime serves fresh normal
         // inbound callers AND agent-placed outbound dials (`call.dial` —
         // the opening line rides the overlay greeting into the Realtime
-        // session exactly like a personalized inbound greeting).
+        // session exactly like a personalized inbound greeting). On the
+        // OAIY route only screened callers (refused) and the owner's own
+        // handset dials stay off it: Aokie's own voice is not there, so
+        // managers, already-answered and promoted callers go to OAIY too.
+        // An agent dial whose session cannot start is ended there instead.
+        let mut end_outbound_dial: Option<(String, String)> = None;
         if realtime_lane.is_none()
             && realtime_legacy_call.is_none()
             && realtime_failed_call.is_none()
@@ -107,10 +121,13 @@ pub(super) fn service_realtime_lane(
         {
             if let Some(call) = tracker.current() {
                 let call_id = call.id.clone();
-                if (call.outbound && !call.agent_owned)
-                    || call.is_active()
-                    || promote_greet_for.is_some()
-                {
+                let promoted = promote_greet_for.as_deref() == Some(call.id.as_str());
+                if local_voice_before_identity(
+                    oaiy_route,
+                    call.outbound && !call.agent_owned,
+                    call.is_active(),
+                    promote_greet_for.is_some(),
+                ) {
                     *realtime_legacy_call = Some(call_id);
                     ctx.desktop_realtime_responder = false;
                     if should_prepare_local_speech(realtime_selected, true) {
@@ -123,14 +140,31 @@ pub(super) fn service_realtime_lane(
                         .as_ref()
                         .is_some_and(|overlay| overlay.call_id == call.id);
                     let started = *answer_hold_started.get_or_insert_with(Instant::now);
-                    let wait_for_identity = hold_auto_answer(
-                        call.caller_id.as_deref().is_some_and(|id| !id.is_empty()),
-                        overlay_ready,
-                        started.elapsed(),
-                    );
+                    // A call already answered (only the OAIY route gets
+                    // here with one) has no ring left to personalize in:
+                    // screening still gates `begin` on the settled identity.
+                    let wait_for_identity = !call.is_active()
+                        && hold_auto_answer(
+                            call.caller_id.as_deref().is_some_and(|id| !id.is_empty()),
+                            overlay_ready,
+                            started.elapsed(),
+                        );
                     if !wait_for_identity {
-                        let legacy = screen_policy.is_manager(call.caller_id.as_deref())
+                        let is_manager = screen_policy.is_manager(call.caller_id.as_deref());
+                        let legacy = manager_line_is_local(oaiy_route, is_manager)
                             || screen_policy.verdict(call.caller_id.as_deref()).is_some();
+                        if is_manager && !legacy {
+                            eprintln!(
+                                "[aokie-plugin] manager-number caller on the OAIY route: OAIY answers them like any caller (the PIN-gated manager line needs Aokie's own voice)"
+                            );
+                        }
+                        if call.is_active() && !legacy {
+                            eprintln!(
+                                "[aokie-plugin] call {} was answered before OAIY's session: OAIY takes it{}",
+                                call.id,
+                                if promoted { " with the thanks-for-holding greeting" } else { "" }
+                            );
+                        }
                         ctx.desktop_realtime_responder = !legacy;
                         if legacy {
                             *realtime_legacy_call = Some(call_id);
@@ -147,14 +181,22 @@ pub(super) fn service_realtime_lane(
                                 .filter(|overlay| overlay.call_id == call.id)
                                 .and_then(|overlay| overlay.persona.as_deref())
                                 .unwrap_or(&agent_persona);
-                            let greeting_text = ctx
-                                .call_agent_overlay
-                                .as_ref()
-                                .filter(|overlay| overlay.call_id == call.id)
-                                .and_then(|overlay| overlay.greeting.as_deref())
-                                .or(greeting.as_deref())
-                                .filter(|text| !text.trim().is_empty())
-                                .unwrap_or(DEFAULT_GREETING);
+                            let greeting_text = if promoted {
+                                // A caller promoted from hold (only the
+                                // OAIY route gets here with one) hears the
+                                // line the local greeting would have said.
+                                HOLD_PROMOTED_GREET_LINE
+                            } else {
+                                ctx.call_agent_overlay
+                                    .as_ref()
+                                    .filter(|overlay| overlay.call_id == call.id)
+                                    .and_then(|overlay| overlay.greeting.as_deref())
+                                    .or(greeting.as_deref())
+                                    .filter(|text| !text.trim().is_empty())
+                                    .unwrap_or(DEFAULT_GREETING)
+                            };
+                            let call_facts =
+                                realtime_call_facts(oaiy_route, call, ctx.outbound_intent.as_ref());
                             let session = crate::realtime_voice::RealtimeVoiceSession::spawn(
                                 crate::realtime_voice::SessionConfig {
                                     endpoint: config.endpoint.clone(),
@@ -176,8 +218,12 @@ pub(super) fn service_realtime_lane(
                                     allow_business_lookup: true,
                                     allow_request_appointment: true,
                                     allow_finish_call: agent_hangup,
+                                    call: call_facts,
                                 },
                             );
+                            if promoted {
+                                *promote_greet_for = None;
+                            }
                             match session {
                                 Ok(session) => {
                                     eprintln!(
@@ -187,6 +233,14 @@ pub(super) fn service_realtime_lane(
                                     );
                                     *realtime_lane = Some(RealtimeCallLane::new(session));
                                     *status.realtime_error.lock().unwrap() = None;
+                                }
+                                Err(error)
+                                    if call.outbound
+                                        && !outbound_falls_back_to_local_voice(oaiy_route) =>
+                                {
+                                    *status.realtime_error.lock().unwrap() =
+                                        Some(error.clone());
+                                    end_outbound_dial = Some((call.id.clone(), error));
                                 }
                                 Err(error) if call.outbound => {
                                     // An agent-placed dial must never ring
@@ -214,7 +268,7 @@ pub(super) fn service_realtime_lane(
                                     *realtime_failed_call = Some((call.id.clone(), error));
                                 }
                             }
-                        } else if call.outbound {
+                        } else if call.outbound && outbound_falls_back_to_local_voice(oaiy_route) {
                             // No realtime configuration: agent dials keep
                             // their proven legacy responder.
                             *realtime_legacy_call = Some(call.id.clone());
@@ -232,11 +286,47 @@ pub(super) fn service_realtime_lane(
                                 .unwrap_or_else(|| {
                                     "Desktop realtime configuration is unavailable".into()
                                 });
-                            *realtime_failed_call = Some((call.id.clone(), error));
+                            if call.outbound {
+                                end_outbound_dial = Some((call.id.clone(), error));
+                            } else {
+                                *realtime_failed_call = Some((call.id.clone(), error));
+                            }
                         }
                     }
                 }
             }
+        }
+        // OAIY route: an agent dial with no voice to speak for it is ended
+        // before the callee answers, and reported against the dial. Should
+        // the callee pick up first, the failed-call path below apologises
+        // (when any voice can) and hangs up.
+        if let Some((call_id, error)) = end_outbound_dial {
+            eprintln!(
+                "[aokie-plugin] OAIY's voice could not start for outbound call {call_id} — ending the dial before the callee answers (Aokie's own voice is not used on the OAIY route): {error}"
+            );
+            tracker.note_intent(crate::call_session::TerminationIntent::AgentHangup);
+            let ended = match aokie_owner_for_call(&remote_media, &call_id) {
+                Some(owner) => remote_media
+                    .with_aokie_owner(&owner, || bt.hangup())
+                    .and_then(|result| result),
+                None if remote_media.radio_reserved() => {
+                    Err("a person holds the line".to_string())
+                }
+                None => bt.hangup(),
+            };
+            if let Err(hangup_error) = &ended {
+                eprintln!("[aokie-plugin] ending the outbound dial failed: {hangup_error}");
+            }
+            emit_control_failed(
+                outbox,
+                sink,
+                tracker,
+                "call.dial",
+                None,
+                &format!("OAIY's voice could not start for the call, so the dial was ended: {error}"),
+            );
+            ctx.desktop_realtime_responder = false;
+            *realtime_failed_call = Some((call_id, error));
         }
 
         if let Some(call) = tracker.current().filter(|call| call.is_active()) {
@@ -261,11 +351,16 @@ pub(super) fn service_realtime_lane(
                 .as_ref()
                 .is_some_and(|lane| lane.call_id == call.id)
                 && identity_settled
-                && (screen_policy.is_manager(call.caller_id.as_deref())
-                    || screen_policy.verdict(call.caller_id.as_deref()).is_some());
+                && (manager_line_is_local(
+                    oaiy_route,
+                    screen_policy.is_manager(call.caller_id.as_deref()),
+                ) || screen_policy.verdict(call.caller_id.as_deref()).is_some());
             if became_legacy {
                 let call_id = call.id.clone();
-                let late_manager = screen_policy.is_manager(call.caller_id.as_deref());
+                let late_manager = manager_line_is_local(
+                    oaiy_route,
+                    screen_policy.is_manager(call.caller_id.as_deref()),
+                );
                 let manager_error = late_manager
                     .then(|| {
                         legacy_manager_readiness_error(
@@ -964,7 +1059,10 @@ pub(super) fn service_realtime_lane(
                                 call.agent_owned
                             } else {
                                 screen_policy.verdict(call.caller_id.as_deref()).is_none()
-                                    && !screen_policy.is_manager(call.caller_id.as_deref())
+                                    && !manager_line_is_local(
+                                        oaiy_route,
+                                        screen_policy.is_manager(call.caller_id.as_deref()),
+                                    )
                             }
                     }) && identity_settled;
                     if can_begin && !bt.realtime_call_audio_supported() {
@@ -1608,7 +1706,12 @@ pub(super) fn service_realtime_lane(
 
         if let Some((call_id, _begun, owner, reason)) = realtime_failure {
             if let Some(lane) = realtime_lane.take() {
-                lane.session.stop("realtime voice failed");
+                // OAIY is told why, so its call record says what happened.
+                if oaiy_route {
+                    lane.session.stop(&format!("realtime voice failed: {reason}"));
+                } else {
+                    lane.session.stop("realtime voice failed");
+                }
             }
             bt.flush_tx_audio();
             if let Some(failed_aec) = aec.as_mut() {
@@ -1657,6 +1760,7 @@ pub(super) fn service_realtime_failures(
     sink: &mut dyn Sink,
     control_rx: &std::sync::mpsc::Receiver<RadioControl>,
     status: &Arc<RadioStatus>,
+    oaiy_route: bool,
     remote_media: &crate::remote_media::RemoteMediaHandle,
     synth: &crate::synth::SynthHandle,
     pending_controls: &mut std::collections::VecDeque<RadioControl>,
@@ -1703,9 +1807,14 @@ pub(super) fn service_realtime_failures(
             *realtime_terminal_call = Some((failed_call_id.clone(), Instant::now(), 0));
             let tts_error = status.tts_error.lock().unwrap().clone();
             let self_test = status.self_test.lock().unwrap().clone();
-            let can_speak =
-                sr > 0 && realtime_failsafe_can_speak(tts_error.as_deref(), self_test.as_ref());
+            let can_speak = realtime_apology_can_speak(
+                oaiy_route,
+                sr,
+                tts_error.as_deref(),
+                self_test.as_ref(),
+            );
             let mut operator_ended = false;
+            let mut apologized = false;
             if can_speak {
                 eprintln!(
                     "[aokie-plugin] realtime responder failed mid-call ({cause}) — fixed apology then hangup"
@@ -1726,6 +1835,7 @@ pub(super) fn service_realtime_failures(
                     None,
                 );
                 note_tts_outcome(&status, &spoken);
+                apologized = spoken.dur > Duration::ZERO;
                 if spoken.dur > Duration::ZERO
                     && reply_owner_is_current(&remote_media, Some(&failed_owner))
                 {
@@ -1748,9 +1858,34 @@ pub(super) fn service_realtime_failures(
                     operator_ended = true;
                     *realtime_terminal_call = Some((failed_call_id.clone(), Instant::now(), 3));
                 }
+            } else if oaiy_route {
+                eprintln!(
+                    "[aokie-plugin] OAIY's voice failed mid-call ({cause}); no voice is left to apologise with (OAIY's session is down, and Aokie's own TTS or the call audio is unavailable), hanging up promptly"
+                );
             } else {
                 eprintln!(
                     "[aokie-plugin] realtime responder failed mid-call ({cause}); local apology is not proven, hanging up promptly"
+                );
+            }
+            if oaiy_route {
+                // OAIY (from its event ring) and FormLogic (flows on
+                // hardware.error) see the failure, not only a short call.
+                emit(
+                    outbox,
+                    sink,
+                    aokie_core::events::aokie_event_occurrence(
+                        crate::contract::events::HARDWARE_ERROR,
+                        &failed_call_id,
+                        &aokie_core::events::occurrence_id(),
+                        json!({
+                            "message": format!("OAIY's voice failed during the call: {cause}"),
+                            "code": "realtime_failed",
+                            "callId": failed_call_id,
+                            "route": "oaiy",
+                            "apologized": apologized,
+                            "at": aokie_core::events::now_iso8601(),
+                        }),
+                    ),
                 );
             }
             if !operator_ended && !reply_owner_is_current(&remote_media, Some(&failed_owner)) {

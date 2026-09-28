@@ -70,6 +70,32 @@ pub struct SessionConfig {
     /// The physical call-ending tool is advertised only when the operator has
     /// enabled agentHangup for this receptionist.
     pub allow_finish_call: bool,
+    /// What Aokie knows about the call, sent as additive
+    /// `formlogic.realtime.start` fields. Each is left out when unknown.
+    pub call: CallFacts,
+}
+
+/// Additive `formlogic.realtime.start` fields: `direction`, `from`,
+/// `callerName`, `purpose`, `openingLine`. A field that is unknown (None, or
+/// blank) is left out of the event, never sent as an empty string.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallFacts {
+    /// `"inbound"` or `"outbound"`.
+    pub direction: Option<&'static str>,
+    /// The caller id, or the dialled number on an outbound call.
+    pub from: Option<String>,
+    pub caller_name: Option<String>,
+    /// Outbound calls: what the call is for (`call.dial`'s `purpose`).
+    pub purpose: Option<String>,
+    /// Outbound calls: the exact first words (`call.dial`'s `openingLine`).
+    pub opening_line: Option<String>,
+}
+
+fn known(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +205,44 @@ struct StartEvent<'a> {
     allow_business_lookup: bool,
     allow_request_appointment: bool,
     allow_finish_call: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    purpose: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opening_line: Option<&'a str>,
+}
+
+impl<'a> StartEvent<'a> {
+    fn for_session(config: &'a SessionConfig) -> Self {
+        Self {
+            kind: "formlogic.realtime.start",
+            call_id: &config.call_id,
+            generation: config.generation,
+            destination_origin: &config.expected_destination,
+            instructions: &config.instructions,
+            greeting: &config.greeting,
+            voice: config.voice.as_deref(),
+            model: config.model.as_deref(),
+            turn_detection: config.turn_detection.as_str(),
+            max_output_tokens: config.max_output_tokens.clamp(32, 4_096),
+            input_format: "pcm16",
+            output_format: "pcm16",
+            sample_rate: WIRE_SAMPLE_RATE,
+            allow_business_lookup: config.allow_business_lookup,
+            allow_request_appointment: config.allow_request_appointment,
+            allow_finish_call: config.allow_finish_call,
+            direction: config.call.direction,
+            from: known(&config.call.from),
+            caller_name: known(&config.call.caller_name),
+            purpose: known(&config.call.purpose),
+            opening_line: known(&config.call.opening_line),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -515,24 +579,7 @@ async fn run_socket(
         .await
         .map_err(|e| format!("Desktop realtime connection failed: {e}"))?;
     let (mut sink, mut stream) = socket.split();
-    let start = StartEvent {
-        kind: "formlogic.realtime.start",
-        call_id: &config.call_id,
-        generation: config.generation,
-        destination_origin: &config.expected_destination,
-        instructions: &config.instructions,
-        greeting: &config.greeting,
-        voice: config.voice.as_deref(),
-        model: config.model.as_deref(),
-        turn_detection: config.turn_detection.as_str(),
-        max_output_tokens: config.max_output_tokens.clamp(32, 4_096),
-        input_format: "pcm16",
-        output_format: "pcm16",
-        sample_rate: WIRE_SAMPLE_RATE,
-        allow_business_lookup: config.allow_business_lookup,
-        allow_request_appointment: config.allow_request_appointment,
-        allow_finish_call: config.allow_finish_call,
-    };
+    let start = StartEvent::for_session(&config);
     sink.send(Message::Text(
         serde_json::to_string(&start)
             .map_err(|e| format!("cannot encode realtime start event: {e}"))?
@@ -1493,6 +1540,66 @@ mod tests {
         assert!(validate_destination_origin("https://api.openai.com/v1").is_err());
     }
 
+    fn session_config(call: CallFacts) -> SessionConfig {
+        SessionConfig {
+            endpoint: "ws://127.0.0.1:17872/api/ai/providers/oaiy/v1/realtime/stream".into(),
+            call_id: "call_1".into(),
+            generation: 7,
+            expected_destination: "https://oaiy.localhost".into(),
+            instructions: "Receptionist".into(),
+            greeting: "Hello".into(),
+            voice: None,
+            model: None,
+            turn_detection: TurnDetection::ServerVad,
+            max_output_tokens: 4_096,
+            allow_business_lookup: true,
+            allow_request_appointment: true,
+            allow_finish_call: true,
+            call,
+        }
+    }
+
+    #[test]
+    fn start_carries_what_aokie_knows_and_leaves_out_the_rest() {
+        let config = session_config(CallFacts {
+            direction: Some("outbound"),
+            from: Some("+61400000000".into()),
+            caller_name: None,
+            purpose: Some("Confirm Tuesday's mowing".into()),
+            opening_line: Some("Hi, it's the lawn crew about Tuesday.".into()),
+        });
+        let start = serde_json::to_value(StartEvent::for_session(&config)).unwrap();
+        assert_eq!(start["type"], "formlogic.realtime.start");
+        assert_eq!(start["direction"], "outbound");
+        assert_eq!(start["from"], "+61400000000");
+        assert_eq!(start["purpose"], "Confirm Tuesday's mowing");
+        assert_eq!(start["openingLine"], "Hi, it's the lawn crew about Tuesday.");
+        assert!(start.get("callerName").is_none());
+
+        // Unknown or blank facts are left out, never sent as "".
+        let config = session_config(CallFacts {
+            direction: Some("inbound"),
+            from: Some("  ".into()),
+            caller_name: Some(String::new()),
+            purpose: None,
+            opening_line: None,
+        });
+        let start = serde_json::to_value(StartEvent::for_session(&config)).unwrap();
+        assert_eq!(start["direction"], "inbound");
+        for key in ["from", "callerName", "purpose", "openingLine"] {
+            assert!(start.get(key).is_none(), "{key} must be left out");
+        }
+
+        // A route that is given no facts sends exactly the old event.
+        let start = serde_json::to_value(StartEvent::for_session(&session_config(
+            CallFacts::default(),
+        )))
+        .unwrap();
+        for key in ["direction", "from", "callerName", "purpose", "openingLine"] {
+            assert!(start.get(key).is_none(), "{key} must be left out");
+        }
+    }
+
     #[test]
     fn tool_and_hangup_controls_are_exactly_fenced_and_allow_listed() {
         let start = serde_json::to_value(StartEvent {
@@ -1512,6 +1619,11 @@ mod tests {
             allow_business_lookup: true,
             allow_request_appointment: true,
             allow_finish_call: true,
+            direction: None,
+            from: None,
+            caller_name: None,
+            purpose: None,
+            opening_line: None,
         })
         .unwrap();
         assert_eq!(start["allowRequestAppointment"], true);

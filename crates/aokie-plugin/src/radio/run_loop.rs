@@ -32,6 +32,19 @@ pub(super) fn run_loop(
     #[cfg(feature = "voice")]
     let realtime_selected =
         std::env::var("AOKIE_REALTIME_VOICE_MODE").as_deref() == Ok("desktop_realtime");
+    // The OAIY route: OAIY hears and speaks for every call it is given, and
+    // no path may count on Aokie's own speech stack (see realtime_lane.rs).
+    #[cfg(feature = "voice")]
+    let oaiy_route = oaiy_route_selected(
+        realtime_selected,
+        std::env::var("AOKIE_REALTIME_VOICE_ENDPOINT").ok().as_deref(),
+    );
+    #[cfg(feature = "voice")]
+    if oaiy_route {
+        eprintln!(
+            "[aokie-plugin] call route: OAIY — screened callers are refused and never given to OAIY; managers, answered and promoted callers go to OAIY; Aokie's own voice speaks only where it is available"
+        );
+    }
     #[cfg(feature = "voice")]
     let realtime_config = match realtime_runtime_config() {
         Ok(config) => {
@@ -1086,6 +1099,15 @@ pub(super) fn run_loop(
             }
         }
 
+        // Whether Aokie's own voice can speak the hold lines (the OAIY route
+        // may have none). Bound here, not in the calls' arguments: a lock
+        // guard there would stay held through the whole call, and the hold
+        // announcements record their TTS outcome in the same slot.
+        #[cfg(feature = "voice")]
+        let hold_voice = {
+            let tts_available = status.tts_error.lock().unwrap().is_none();
+            auto_hold_has_voice(oaiy_route, tts_available)
+        };
         #[cfg(feature = "voice")]
         reconcile_switchboard(
             bt,
@@ -1110,7 +1132,10 @@ pub(super) fn run_loop(
             &mut stt_had_speech,
             &mut stt_silence,
             &screen_policy,
-            auto_hold,
+            // The FIFO cascade speaks hold lines in Aokie's own voice: on
+            // the OAIY route without that voice it waits instead (the knock
+            // resolves by itself, then the parked caller is retrieved).
+            auto_hold && hold_voice,
             &mut auto_hold_done_for,
             protected_max_ms,
         );
@@ -1165,6 +1190,7 @@ pub(super) fn run_loop(
             &mut pending_controls,
             &screen_policy,
             auto_hold,
+            hold_voice,
             &mut auto_hold_done_for,
             &mut promote_greet_for,
             &mut resume_line_for,
@@ -1286,6 +1312,16 @@ pub(super) fn run_loop(
                 == tracker.call_id()
             {
                 ctx.call_agent_overlay = prev_ctx.call_agent_overlay;
+            }
+            // The dial's purpose/opening line, set at DIAL time for the same
+            // reason, survives into its own call the same way.
+            if prev_ctx
+                .outbound_intent
+                .as_ref()
+                .map(|intent| intent.call_id.as_str())
+                == tracker.call_id()
+            {
+                ctx.outbound_intent = prev_ctx.outbound_intent;
             }
             if ctx.desktop_realtime_responder {
                 realtime_resume_call = tracker
@@ -1562,6 +1598,7 @@ pub(super) fn run_loop(
             &host_rpc,
             &remote_media,
             realtime_selected,
+            oaiy_route,
             &realtime_config,
             &synth,
             &stt_tx,
@@ -1591,6 +1628,7 @@ pub(super) fn run_loop(
             sink,
             &control_rx,
             &status,
+            oaiy_route,
             &remote_media,
             &synth,
             &mut pending_controls,
@@ -1655,11 +1693,28 @@ pub(super) fn run_loop(
                             let screened = (!s.outbound)
                                 .then(|| screen_policy.verdict(s.caller_id.as_deref()))
                                 .flatten();
+                            let tts_available = status.tts_error.lock().unwrap().is_none();
                             let needs_speech = screened
                                 .map(|reason| {
-                                    screened_call_needs_tts(screen_policy.message_for(reason))
+                                    screened_answer_waits_for_tts(
+                                        oaiy_route,
+                                        screen_policy.message_for(reason),
+                                        tts_available,
+                                    )
                                 })
                                 .unwrap_or(true);
+                            if let Some(reason) = screened {
+                                if oaiy_route
+                                    && !tts_available
+                                    && screened_call_needs_tts(screen_policy.message_for(reason))
+                                    && voice_block_logged_call.as_deref() != Some(s.id.as_str())
+                                {
+                                    eprintln!(
+                                        "[aokie-plugin] screened caller ({reason}) on the OAIY route: Aokie's own voice is unavailable for the screen message, so the call is refused silently (answered and ended at once), never given to OAIY"
+                                    );
+                                    voice_block_logged_call = Some(s.id.clone());
+                                }
+                            }
                             let needs_hearing_and_reasoning = screened.is_none();
                             let tts = needs_speech
                                 .then(|| status.tts_error.lock().unwrap().clone())

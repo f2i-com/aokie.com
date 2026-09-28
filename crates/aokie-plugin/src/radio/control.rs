@@ -20,6 +20,17 @@ pub(super) struct CallAgentOverlay {
     pub(super) greeting: Option<String>,
 }
 
+/// An agent-placed outbound call's `call.dial` facts (purpose, opening
+/// line), kept for the call's realtime start. Separate from the overlay,
+/// which a later `call.configureAgent` may replace; wiped with the call.
+#[cfg(feature = "voice")]
+#[derive(Debug, Clone)]
+pub(super) struct OutboundIntent {
+    pub(super) call_id: String,
+    pub(super) purpose: Option<String>,
+    pub(super) opening_line: String,
+}
+
 pub enum RadioControl {
     /// AOK-CTRL-001: call controls carry the operation id minted by the
     /// connector when it ACCEPTED the command, so the radio can attribute an

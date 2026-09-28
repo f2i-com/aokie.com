@@ -37,6 +37,9 @@ pub(super) struct CallVoiceContext {
     /// §9.3 call-scoped agent overlay (persona/greeting bound to ONE call).
     #[cfg(feature = "voice")]
     pub(super) call_agent_overlay: Option<CallAgentOverlay>,
+    /// The `call.dial` purpose and opening line of an agent-placed call.
+    #[cfg(feature = "voice")]
+    pub(super) outbound_intent: Option<OutboundIntent>,
     /// Call-local speaking pace, mutated live by "slower"/"faster".
     #[cfg(feature = "voice")]
     pub(super) pace: crate::speech_plan::PaceState,
@@ -102,6 +105,8 @@ impl CallVoiceContext {
             manager_gate: ManagerGate::default(),
             #[cfg(feature = "voice")]
             call_agent_overlay: None,
+            #[cfg(feature = "voice")]
+            outbound_intent: None,
             // Pace + floor are strictly per-call: the next caller gets the
             // configured defaults, never the last caller's "slower".
             #[cfg(feature = "voice")]
