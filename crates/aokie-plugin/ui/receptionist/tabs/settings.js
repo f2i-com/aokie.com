@@ -164,6 +164,10 @@
   var SET_IN_OAIY = [
     ['Replies', 'Agent › Front desk project: /brief.md and the knowledge files'],
     ['Call and text instructions', 'Agent › Phone (the phone chip at the top): Answer phone calls, and your instructions for calls and for texts'],
+    // Missed-call callbacks and call screening (who is answered, blocked
+    // numbers) are set only there; they write Aokie's own screening and
+    // outbound keys, so this form does not offer a second copy.
+    ['Callbacks and screening', 'Agent › Phone: missed-call callbacks, who is answered, and blocked numbers'],
     ['Model', 'Agent › Settings › AI providers (the OAIY provider uses the model loaded in Engines)'],
     ['Voice on calls', 'Calendar › Hours & services › Voice on calls'],
     ['Hours, services and booking', 'Calendar › Hours & services — the receptionist looks these up during calls'],
