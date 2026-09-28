@@ -137,7 +137,8 @@
     },
     {
       "key": "reenumerateHwid",
-      "type": "bool",
+      "type": "string",
+      "maxChars": 200,
       "appliesLive": false
     },
     {

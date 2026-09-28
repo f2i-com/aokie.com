@@ -4276,9 +4276,12 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
         kind: SettingKind::Bool,
         applies_live: false,
     },
+    // The dongle's hardware id (e.g. `USB\VID_0A5C&PID_21EC`) to
+    // re-enumerate at radio start; blank = none. A string: the radio reads
+    // it as an id, so a boolean type made every save with an id fail.
     SettingSpec {
         key: "reenumerateHwid",
-        kind: SettingKind::Bool,
+        kind: SettingKind::Str { max_chars: 200 },
         applies_live: false,
     },
     SettingSpec {

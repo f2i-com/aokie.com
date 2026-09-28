@@ -566,11 +566,15 @@
         '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
         field('Bluetooth audio codec', '<select data-key="hfpCodec">' + codecOpts.join('') + '</select>') +
         hint('Dongle mode only. Some dongles only work reliably with CVSD; mSBC gives better speech-recognition accuracy where supported.') +
+        field(
+          'Re-enumerate at start (hardware id)',
+          '<input type="text" data-key="reenumerateHwid" maxlength="200" placeholder="USB\\VID_0A5C&amp;PID_21EC" value="' +
+            esc(settings.reenumerateHwid) + '" />'
+        ) +
+        hint('Dongle mode only. For a dongle whose call audio stays silent after Windows starts: Aokie re-enumerates this device before opening it, as if it were unplugged and plugged back in. Leave blank for none; takes effect the next time the phone line starts.') +
         '</div>' +
         // The test tone is not played on realtime calls, so it only shows
-        // where it does something. reenumerateHwid is not offered: the plugin
-        // reads it as a hardware id but its settings schema types it as a
-        // boolean, so any id typed here would make the whole save fail.
+        // where it does something.
         (viaRealtime
           ? ''
           : check('answerTone', 'Play a test tone on answer') +
