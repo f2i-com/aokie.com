@@ -453,6 +453,9 @@
     setupMode = 'off';
     var rootEl = $('rcp-root');
     if (rootEl) rootEl.classList.remove('is-setup');
+    // The host's mark for a wizard step: not one after all, so the tab bar shows.
+    var htmlEl = document.documentElement;
+    if (htmlEl && htmlEl.removeAttribute) htmlEl.removeAttribute('data-oaiy-setup');
     if (activeTab === 'overview' && !document.hidden) startTimers();
   }
 
