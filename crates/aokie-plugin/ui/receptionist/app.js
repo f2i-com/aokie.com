@@ -137,6 +137,35 @@
     return null;
   }
 
+  /** The voice chosen for calls and the engines' language model, from the
+   *  host (PluginHost.oaiyStatus, OAIY Desktop 52a5a6a and later). Resolves
+   *  null on an older host or a failed read, so callers show a pointer. */
+  function readOaiyStatus() {
+    if (typeof HOST.oaiyStatus !== 'function') return Promise.resolve(null);
+    return HOST.oaiyStatus().then(
+      function (status) {
+        return status && typeof status === 'object' ? status : null;
+      },
+      function () {
+        return null;
+      }
+    );
+  }
+
+  /** "Qwen… · ready" for the engines' model, '' when unknown. */
+  function modelText(status) {
+    var llm = status && status.llm;
+    if (!llm) return '';
+    if (!llm.running) return 'engines stopped';
+    if (!llm.resident) return llm.state ? 'no model loaded · ' + llm.state : '';
+    return llm.resident + (llm.state ? ' · ' + llm.state : '');
+  }
+
+  /** The chosen call voice's name, '' when unknown. */
+  function voiceText(status) {
+    return (status && status.voice && status.voice.chosen) || '';
+  }
+
   var OAIY = {
     providerId: OAIY_PROVIDER_ID,
     endpoint: OAIY_REALTIME_ENDPOINT,
@@ -144,7 +173,25 @@
     realtimeProviderId: realtimeProviderId,
     callRoute: callRoute,
     voiceService: oaiyVoiceService,
+    readStatus: readOaiyStatus,
+    modelText: modelText,
+    voiceText: voiceText,
   };
+
+  // ---- links to the dashboard's own pages ---------------------------------
+  // The frame cannot navigate itself; the host opens its pages for it. On a
+  // host without PluginHost.navigate the same markup reads as plain text.
+
+  var canNavigate = typeof HOST.navigate === 'function';
+  if (!canNavigate) document.documentElement.classList.add('rcp-no-nav');
+
+  /** A link to a dashboard page ('agent', 'calendar', 'engines', ...). */
+  function navLink(view, text) {
+    return (
+      '<button type="button" class="rcp-link-btn" data-nav="' + esc(view) + '"' +
+      (canNavigate ? '' : ' tabindex="-1"') + '>' + esc(text) + '</button>'
+    );
+  }
 
   // ---- tab registry -------------------------------------------------------
   // Each tabs/*.js module registers { mount(el), unmount()?, onEvent(frame)? }.
@@ -161,7 +208,7 @@
       tabRegistry[id] = def || {};
     },
     /** Shared helpers for tab modules (defined above in this file). */
-    util: { esc: esc, errMsg: errMsg, setHtml: setHtml, svg: svg, icons: ICONS },
+    util: { esc: esc, errMsg: errMsg, setHtml: setHtml, svg: svg, icons: ICONS, navLink: navLink },
     /** Where calls go, shared by the Overview, Settings and Consent tabs. */
     oaiy: OAIY,
     switchTo: function (id) {
@@ -302,75 +349,12 @@
     switchboard: undefined, switchboardError: '',
     settings: undefined, settingsError: '',
     sources: undefined, sourcesError: '',
+    oaiy: undefined, // PluginHost.oaiyStatus: null = not available
     busyCall: false,
     busyPhones: {}, // address -> true while connect/disconnect runs
     busyRedrive: false,
     now: Date.now(),
   };
-
-  // Event-only view: bounded to one call; durable delivery stays in the outbox.
-  var conversation = { callId: '', turns: [] };
-  var conversationStartedAt = 0;
-  function renderConversation() {
-    var body = $('conversation-body');
-    var following = body.scrollHeight - body.scrollTop - body.clientHeight < 48;
-    var html = conversation.turns.map(function (turn) {
-      var labels = [];
-      if (turn.overlapped) labels.push('Spoke while Aokie was talking');
-      if (turn.delivery === 'interrupted') labels.push('Reply interrupted');
-      if (turn.delivery === 'error') labels.push('Speech delivery failed');
-      if (turn.delivery === 'operator_ended') labels.push('Stopped by operator');
-      if (turn.kind === 'control') labels.push('Conversation control');
-      if (turn.corrected) labels.push('Transcript corrected');
-      return '<article class="rcp-conversation__turn"><strong>' +
-        (turn.speaker === 'bot' ? 'Aokie' : 'Caller') + '</strong>' +
-        (labels.length ? '<small>' + esc(labels.join(' · ')) + '</small>' : '') +
-        '<p>' + esc(turn.text) + '</p></article>';
-    }).join('');
-    setHtml(body, html || '<p class="rcp-empty">Waiting for finalized speech. Live call transcription must be enabled.</p>');
-    if (following) body.scrollTop = body.scrollHeight;
-  }
-
-  function collectConversation(evt) {
-    var name = evt.name || '';
-    var data = evt.data || {};
-    var callId = data.callId || evt.correlationId;
-    if (typeof callId !== 'string' || !callId) return;
-    if (name === 'aokie.call.incoming' || name === 'aokie.call.outbound.dialing' || name === 'aokie.call.answered') {
-      if (conversation.callId !== callId) {
-        var startedAt = Date.parse(evt.occurredAt || data.at || '');
-        if (Number.isFinite(startedAt) && startedAt <= conversationStartedAt) return;
-        if (Number.isFinite(startedAt)) conversationStartedAt = startedAt;
-        conversation = { callId: callId, turns: [] };
-        renderConversation();
-      }
-      return;
-    }
-    if (name !== 'aokie.call.turn.final' && name !== 'aokie.call.turn.corrected') return;
-    if (conversation.callId && conversation.callId !== callId) return;
-    if (!Number.isInteger(data.turn) || data.turn < 0 || typeof data.text !== 'string') return;
-    conversation.callId = callId;
-    var prior = conversation.turns.find(function (turn) { return turn.turn === data.turn; });
-    if (prior && prior.corrected && name === 'aokie.call.turn.final') return;
-    var turn = Object.assign({}, prior || {}, {
-      turn: data.turn,
-      speaker: data.speaker || (prior && prior.speaker) || 'caller',
-      text: data.text.slice(0, 12000),
-      at: (prior && prior.at) || data.at || evt.occurredAt,
-      overlapped: data.overlapped === true || !!(prior && prior.overlapped),
-      delivery: data.delivery || (prior && prior.delivery),
-      kind: data.kind || (prior && prior.kind),
-      corrected: name === 'aokie.call.turn.corrected',
-    });
-    if (prior) conversation.turns[conversation.turns.indexOf(prior)] = turn;
-    else conversation.turns.push(turn);
-    conversation.turns.sort(function (a, b) {
-      var delta = Date.parse(a.at) - Date.parse(b.at);
-      return Number.isFinite(delta) && delta !== 0 ? delta : a.turn - b.turn;
-    });
-    if (conversation.turns.length > 120) conversation.turns.splice(0, conversation.turns.length - 120);
-    renderConversation();
-  }
 
   // ---- fetchers -----------------------------------------------------------
 
@@ -504,6 +488,13 @@
     });
   }
 
+  function refreshOaiyStatus() {
+    return readOaiyStatus().then(function (status) {
+      state.oaiy = status;
+      renderSettings();
+    });
+  }
+
   var switchboardRequest = 0;
   function refreshSwitchboard() {
     var request = ++switchboardRequest;
@@ -533,7 +524,11 @@
     refreshDiag();
     refreshPhones();
     if (slowTicks % 6 === 0) refreshSettings(); // every ~30 s (and at start)
-    if (slowTicks % 3 === 0) refreshSources(); // every ~15 s (and at start)
+    if (slowTicks % 3 === 0) {
+      // every ~15 s (and at start)
+      refreshSources();
+      refreshOaiyStatus();
+    }
     slowTicks += 1;
   }
 
@@ -804,10 +799,13 @@
         var stateCls = it.ok == null ? 'is-unknown' : it.ok ? 'is-ok' : 'is-bad';
         var stateIcon = it.ok == null ? '' : it.ok ? ICONS.check : ICONS.alert;
         return (
-          '<div class="rcp-ready">' +
+          // The dashboard's status tile: icon, the value (coloured by its
+          // state), what it is, then the detail, clamped with the full text
+          // in its title.
+          '<div class="rcp-ready ' + stateCls + '">' +
           '<span class="rcp-ready__icon">' + it.icon + '</span>' +
-          '<small>' + esc(it.label) + '</small>' +
           '<strong>' + esc(it.value) + '</strong>' +
+          '<small>' + esc(it.label) + '</small>' +
           '<p title="' + esc(it.note) + '">' + esc(it.note) + '</p>' +
           '<span class="rcp-ready__state ' + stateCls + '">' + stateIcon + '</span>' +
           '</div>'
@@ -1137,10 +1135,15 @@
       route === 'flows' ? 'Flow-driven replies' :
       route === 'unknown' ? 'Receptionist settings' : 'Calls do not go to OAIY';
 
-    var rows = [['Calls answered by', ROUTE_LABEL[route]]];
+    // [label, value, page?] — with a page, the value opens the dashboard page
+    // where it is set.
+    var rows = [['Calls answered by', ROUTE_LABEL[route], route === 'oaiy' ? 'agent' : null]];
     if (route === 'oaiy') {
-      rows.push(['OAIY Voice', oaiyVoiceLabel()]);
-      rows.push(['Voice on calls', 'Chosen in OAIY › Calendar']);
+      var voiceName = OAIY.voiceText(state.oaiy);
+      var model = OAIY.modelText(state.oaiy);
+      rows.push(['OAIY Voice', oaiyVoiceLabel(), 'services']);
+      rows.push(['Voice on calls', voiceName || 'Chosen in Calendar', 'calendar']);
+      rows.push(['Model', model || 'Loaded in Engines', 'engines']);
     }
     rows.push(
       ['Greeting', greetingSet ? 'Custom greeting set' : 'Default greeting'],
@@ -1154,7 +1157,7 @@
         .map(function (r) {
           return (
             '<div class="rcp-setting"><small>' + esc(r[0]) + '</small>' +
-            '<span title="' + esc(r[1]) + '">' + esc(r[1]) + '</span></div>'
+            '<span title="' + esc(r[1]) + '">' + (r[2] ? navLink(r[2], r[1]) : esc(r[1])) + '</span></div>'
           );
         })
         .join('') +
@@ -1282,6 +1285,16 @@
       switchTab(tabGo.getAttribute('data-tabgo'));
       return;
     }
+    // Links to the dashboard's own pages (any tab's markup may carry these).
+    var navTo = el && el.closest ? el.closest('[data-nav]') : null;
+    if (navTo) {
+      if (canNavigate) {
+        HOST.navigate(navTo.getAttribute('data-nav')).catch(function (err) {
+          HOST.toast('error', errMsg(err));
+        });
+      }
+      return;
+    }
     // Overview action buttons.
     var btn = el && el.closest ? el.closest('[data-act]') : null;
     if (!btn || btn.disabled) return;
@@ -1292,7 +1305,6 @@
     else if (act === 'call-reject') callAct('call.reject');
     else if (act === 'call-hangup') callAct('call.hangup');
     else if (act === 'redrive') redriveDead();
-    else if (act === 'conversation-clear') { conversation.turns = []; renderConversation(); }
   });
 
   $('speak-send').addEventListener('click', sendSpeech);
@@ -1322,8 +1334,6 @@
     'aokie.call.caller_id',
     'aokie.call.rejected',
     'aokie.call.ended',
-    'aokie.call.turn.final',
-    'aokie.call.turn.corrected',
   ];
 
   var eventHandle = null;
@@ -1348,8 +1358,6 @@
   HOST.events
     .subscribe(SUBSCRIBED_EVENTS, function (evt) {
       var name = (evt && evt.name) || '';
-      if (evt) collectConversation(evt);
-      if (name.indexOf('aokie.call.turn.') === 0) return;
       if (activeTab === 'overview') {
         routeOverviewEvent(name);
         return;
@@ -1368,7 +1376,6 @@
     .catch(function (e) {
       // The polls cover everything the feed would tell us — say so once.
       HOST.toast('info', 'Live events unavailable (' + errMsg(e) + ') — falling back to polling.');
-      $('conversation-note').textContent = 'Live transcript unavailable: the event subscription failed. Other status cards continue polling.';
     });
 
   // ---- lifecycle ----------------------------------------------------------

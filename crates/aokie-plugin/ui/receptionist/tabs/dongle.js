@@ -326,7 +326,7 @@
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
-      '<small>DONGLE SETUP</small>' +
+      '<small>Dongle setup</small>' +
       '<h3>USB Bluetooth dongle driver</h3>' +
       '</div>' +
       '</div>' +

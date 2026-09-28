@@ -1,976 +1,1050 @@
 /* ============================================================================
  * Aokie AI Receptionist — plugin-shipped screen skin.
  *
- * Mirrors the FormLogic Desktop language (white/gray + indigo in light, deep
- * navy + lime in dark) so the sandboxed bundle reads as a native panel. Fonts
- * cannot load under the screen CSP (font-src data: only) — the system-ui
- * stack stands in for DM Sans / Plus Jakarta Sans.
+ * The screen is a page of OAIY Desktop, so it wears the dashboard's own
+ * design: the same tokens (by the same names, from desktop/src/styles.css),
+ * the same section cards, section titles, status tiles, badges, buttons and
+ * form controls. Prism Lab (dark) and Paper Circuit (light) differ only in
+ * these tokens, exactly as on the host.
  *
- * The host toggles class `fl-dark` on <html> and keeps it live on theme flips.
+ * The host stamps `fl-dark` / data-theme on <html> and keeps them live on
+ * theme flips, and supplies its fonts (Public Sans, JetBrains Mono) as data:
+ * URLs — the screen CSP allows no other font source. The document is
+ * transparent and the host draws no frame around it, so the cards sit on the
+ * page canvas like any built-in panel.
  * ========================================================================== */
 
 :root {
-  /* ---- LIGHT = Paper Circuit, the OAIY host's light theme ----
-     Values tracked from desktop/src/styles.css `:root[data-theme='light']`.
-     Warm paper, not the cold slate this file used to carry: against the host
-     shell the old #ffffff/#f8fafc surfaces read as a foreign window rather
-     than a page of the same app. */
-  --bg-0: #f3f0e9;
-  --surface-1: #fffefa;
-  --surface-2: #f8f5ee;
-  --line: #cec8be;
-  --line-2: #9f998f;
+  /* ---- LIGHT = Paper Circuit (desktop/src/styles.css :root[data-theme='light']) */
+  --surface: rgba(255, 254, 250, 0.97);
+  --surface-solid: #fffefa;
+  --surface-raised: #ffffff;
+  --surface-soft: rgba(246, 243, 237, 0.96);
+  --canvas: #f8f5ee;
 
-  --ink: #171717;
-  --ink-dim: #68645e;
-  --ink-faint: #6f6a63;
+  --text: #171717;
+  --muted: #68645e;
+  --faint: #6f6a63;
 
-  --signal: #2457e6;
-  /* Filled-button hover goes DARKER on paper, not lighter. */
-  --signal-bright: #1a46c4;
-  /* Background for filled accent controls. Separate from --signal because
-     the button label sits ON it: on paper the host's own blue already clears
-     4.5:1 against white, so this matches --signal exactly. */
-  --signal-fill: #2457e6;
-  --signal-soft: rgba(36, 87, 230, 0.1);
-  --signal-line: rgba(36, 87, 230, 0.28);
-  /* Used as a TEXT colour (6 sites), so it is the readable variant rather
-     than the raw accent. */
-  --signal-strong: #1a46c4;
-  --signal-ink: #ffffff;
+  --border: #cec8be;
+  --strong-border: #9f998f;
 
-  /* semantic status - fixed hues, never follow the accent */
-  --ok: #218450;
-  --ok-soft: rgba(33, 132, 80, 0.1);
-  --ok-line: rgba(33, 132, 80, 0.3);
-  --ok-text: #1a6b41;
-  --err: #e94b3c;
-  --err-soft: rgba(233, 75, 60, 0.08);
-  --err-line: rgba(233, 75, 60, 0.3);
-  --err-text: #c2392c;
-  --warn: #9c6a08;
-  --warn-soft: rgba(245, 181, 44, 0.14);
+  --primary: #2457e6;
+  --primary-2: #2457e6;
+  --primary-soft: rgba(36, 87, 230, 0.1);
+  --green: #218450;
+  --green-soft: rgba(33, 132, 80, 0.1);
+  --amber: #9c6a08;
+  --amber-soft: rgba(245, 181, 44, 0.14);
+  --danger: #e94b3c;
+  --danger-soft: rgba(233, 75, 60, 0.08);
 
-  --hover-wash: rgba(36, 87, 230, 0.07);
-  --font-mono: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  --focus: #2457e6;
+  /* Paper Circuit's signature: a hard, un-blurred offset instead of a glow. */
+  --shadow-card: 2px 2px 0 rgba(50, 42, 30, 0.045);
+
+  --r-card: 8px;
+  --r-ctl: 7px;
+  --r-sm: 5px;
+
+  --font-body: 'Public Sans', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', Consolas, monospace;
 
   color-scheme: light;
+  accent-color: var(--primary);
 }
 
 html.fl-dark {
-  /* ---- DARK = Prism Lab, the OAIY host's default theme ----
-     Tracked from desktop/src/styles.css `:root`. The accent moves from lime
-     to the host's violet: a lime-on-navy panel inside a violet-on-black shell
-     was the single loudest reason these screens looked bolted on. */
-  --bg-0: #070a12;
-  --surface-1: #0e1422;
-  --surface-2: #131c2d;
-  --line: #202a3c;
-  --line-2: #33425c;
+  /* ---- DARK = Prism Lab (desktop/src/styles.css :root) ---- */
+  --surface: rgba(14, 20, 34, 0.94);
+  --surface-solid: #0e1422;
+  --surface-raised: #131c2d;
+  --surface-soft: rgba(24, 34, 53, 0.7);
+  --canvas: #080d18;
 
-  --ink: #f4f7ff;
-  --ink-dim: #98a6bd;
-  --ink-faint: #8592ab;
+  --text: #f4f7ff;
+  --muted: #98a6bd;
+  --faint: #8592ab;
 
-  --signal: #7167ff;
-  --signal-bright: #8d85ff;
-  /* Background for filled accent controls, a shade deeper than --signal.
-     White on the host violet #7167ff is 4.13:1 and these labels are 10.5px,
-     so the raw accent would have made a previously-readable button fail.
-     #6a5cf0 reads as the same violet and clears the floor at 4.8:1. */
-  --signal-fill: #6a5cf0;
-  --signal-soft: rgba(113, 103, 255, 0.14);
-  --signal-line: rgba(113, 103, 255, 0.38);
-  /* Lifted off the raw #7167ff: as TEXT on --surface-1 that is only ~4.5:1,
-     right on the floor. #a99fff clears it at ~8:1. */
-  --signal-strong: #a99fff;
-  --signal-ink: #ffffff;
+  --border: #202a3c;
+  --strong-border: #33425c;
 
-  --ok: #45d6a2;
-  --ok-soft: rgba(69, 214, 162, 0.12);
-  --ok-line: rgba(69, 214, 162, 0.35);
-  --ok-text: #7de3c0;
-  --err: #ff6e78;
-  --err-soft: rgba(255, 110, 120, 0.1);
-  --err-line: rgba(255, 110, 120, 0.4);
-  --err-text: #ffa0a6;
-  --warn: #f2b84b;
-  --warn-soft: rgba(242, 184, 75, 0.13);
+  --primary: #7167ff;
+  --primary-2: #4d8bff;
+  --primary-soft: rgba(113, 103, 255, 0.14);
+  --green: #45d6a2;
+  --green-soft: rgba(69, 214, 162, 0.12);
+  --amber: #f2b84b;
+  --amber-soft: rgba(242, 184, 75, 0.13);
+  --danger: #ff6e78;
+  --danger-soft: rgba(255, 110, 120, 0.1);
 
-  --hover-wash: rgba(113, 103, 255, 0.12);
+  --focus: #35d4e8;
+  --shadow-card: 0 10px 26px rgba(0, 0, 0, 0.1);
+
+  /* Prism Lab is softer, Paper Circuit squarer. */
+  --r-card: 11px;
+  --r-ctl: 8px;
+  --r-sm: 6px;
 
   color-scheme: dark;
 }
 
+/* ── Base ───────────────────────────────────────────────────────────────── */
+
 * { box-sizing: border-box; }
+
+html,
+body {
+  /* Transparent: the host page's canvas shows through. */
+  background: transparent;
+}
 
 body {
   margin: 0;
-  /* The host iframe is transparent — the desktop canvas shows through. */
-  background: transparent;
-  color: var(--ink);
-  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color: var(--text);
+  font-family: var(--font-body);
   font-size: 13px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-button {
-  font-family: inherit;
-  color: inherit;
-}
+button,
+input,
+select,
+textarea { font: inherit; }
+button { color: inherit; }
+button,
+select { cursor: pointer; }
 
 :focus-visible {
-  outline: 2px solid var(--signal);
+  outline: 2px solid var(--focus);
   outline-offset: 2px;
   border-radius: 4px;
 }
 
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--strong-border) transparent;
+}
+
+h3,
+h4 { margin: 0; }
+
+code { font-family: var(--font-mono); font-size: 0.92em; }
+
 .rcp {
   display: flex;
   flex-direction: column;
-  gap: 20px;
-  padding: 20px;
+  gap: 18px;
+  min-width: 0;
+  /* Card edges line up with the host's page heading above the screen. */
+  padding: 2px 0 24px;
 }
 
-/* ── Hero ───────────────────────────────────────────────────────────────── */
+/* ── Tab bar: the dashboard's segmented control ─────────────────────────── */
 
-.rcp-hero {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-  padding: 24px;
-  border: 1px solid var(--line-2);
-  border-radius: 13px;
-  background: linear-gradient(135deg, var(--signal-soft), var(--surface-1));
-}
-
-.rcp-eyebrow {
-  color: var(--signal-strong);
-  font-size: 9px;
-  font-weight: 760;
-  letter-spacing: 0.13em;
-}
-
-.rcp-hero h1 {
-  margin: 5px 0 0;
-  font-size: clamp(22px, 3vw, 30px);
-  font-weight: 700;
-  letter-spacing: -0.03em;
-}
-
-.rcp-hero p {
-  margin: 4px 0 0;
-  color: var(--ink-dim);
-  font-size: 14px;
-  line-height: 1.6;
-}
-
-.rcp-hero__meta {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 6px;
-}
-
-.rcp-version {
-  color: var(--ink-faint);
-  font-size: 9.5px;
-}
-
-/* ── Status pill ────────────────────────────────────────────────────────── */
-
-.rcp-pill {
+.rcp-tabs {
   display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  min-height: 26px;
-  padding: 0 10px;
-  border-radius: 999px;
-  font-size: 10px;
-  font-weight: 680;
+  flex-wrap: wrap;
+  align-self: flex-start;
+  max-width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+}
+
+.rcp-tab-btn {
+  appearance: none;
+  min-height: 36px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 0 14px;
+  font-size: 12.5px;
+  font-weight: 600;
   white-space: nowrap;
+  transition: background 0.14s, color 0.14s;
 }
 
-.rcp-pill i {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: currentColor;
-}
+.rcp-tab-btn + .rcp-tab-btn { border-left: 1px solid var(--border); }
+.rcp-tab-btn:hover { color: var(--text); }
+.rcp-tab-btn.is-active { background: var(--primary-soft); color: var(--primary); }
+.rcp-tab-btn:focus-visible { outline-offset: -2px; }
 
-.rcp-pill.is-ok { background: var(--ok-soft); color: var(--ok-text); }
-.rcp-pill.is-warn { background: var(--warn-soft); color: var(--warn); }
-.rcp-pill.is-err { background: var(--err-soft); color: var(--err-text); }
-.rcp-pill.is-live { background: var(--err-soft); color: var(--err-text); }
-.rcp-pill.is-neutral { background: var(--hover-wash); color: var(--ink-faint); }
+/* Hidden by the transport mode (the Dongle tab on the native/auto transports). */
+.rcp-tab-btn[hidden] { display: none; }
 
-/* ── Readiness grid ─────────────────────────────────────────────────────── */
+/* ── Tab panels: grids of cards that reflow with the width ──────────────── */
 
-.rcp-grid {
+.rcp-tab-panel {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 9px;
-}
-
-.rcp-ready {
-  position: relative;
-  min-height: 92px;
-  display: grid;
-  grid-template-columns: auto 1fr;
-  align-content: center;
-  column-gap: 10px;
-  padding: 12px;
-  padding-right: 30px;
-  border: 1px solid var(--line);
-  border-radius: 11px;
-  background: var(--surface-1);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
+  gap: 18px;
+  align-items: start;
   min-width: 0;
 }
 
-.rcp-ready__icon {
-  width: 30px;
-  height: 30px;
-  grid-row: 1 / 4;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  align-self: center;
-  border-radius: 8px;
-  background: var(--signal-soft);
-  color: var(--signal-strong);
+.rcp-tab-panel:focus-visible { outline-offset: 4px; }
+.rcp-tab-panel[hidden] { display: none; }
+.rcp-tab-panel > * { min-width: 0; }
+
+/* Cards side by side share a height on the Overview and in the form. */
+.rcp-overview,
+.rcp-form { align-items: stretch; }
+
+.rcp-live-card > #live-body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
 }
 
-.rcp-ready small {
-  color: var(--ink-faint);
-  font-size: 9px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+.rcp-live-card .rcp-empty-call { flex: 1 1 auto; }
 
-.rcp-ready strong {
-  margin-top: 2px;
-  font-size: 11.5px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+/* Full-width rows: a panel's lone card, marked rows, and stacked panels. */
+.rcp-tab-panel > :only-child,
+.rcp-wide,
+.rcp-stack > * { grid-column: 1 / -1; }
 
-.rcp-ready p {
-  margin: 2px 0 0;
-  overflow: hidden;
-  color: var(--ink-dim);
-  font-size: 9.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.rcp-ready__state {
-  position: absolute;
-  top: 9px;
-  right: 9px;
-  display: inline-flex;
-}
-
-.rcp-ready__state.is-ok { color: var(--ok-text); }
-.rcp-ready__state.is-bad { color: var(--warn); }
-.rcp-ready__state.is-unknown { color: var(--ink-faint); }
-
-/* ── Cards ──────────────────────────────────────────────────────────────── */
-
-.rcp-columns {
-  display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
-  gap: 11px;
-}
+/* ── Section card (the dashboard's .service-section) ────────────────────── */
 
 .rcp-card {
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--surface-1);
-  min-width: 0;
   display: flex;
   flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: 15px 16px 17px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  overflow-wrap: anywhere;
 }
 
 .rcp-card__heading {
-  min-height: 52px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.rcp-card__heading-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+
+/* The section title with the dashboard's accent dash. */
+.rcp-card__heading-copy > small,
+.rcp-group-title {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 15px;
-  border-bottom: 1px solid var(--line);
-}
-
-.rcp-card__heading-copy { min-width: 0; }
-
-.rcp-card__heading small {
-  display: block;
-  color: var(--ink-faint);
-  font-size: 8.5px;
-  font-weight: 700;
-  letter-spacing: 0.11em;
-}
-
-.rcp-card__heading h3 {
-  margin: 3px 0 0;
+  gap: 9px;
+  margin: 0;
+  color: var(--text);
   font-size: 12.5px;
   font-weight: 650;
-  letter-spacing: -0.01em;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  letter-spacing: 0.02em;
 }
 
-.rcp-loading {
+.rcp-card__heading-copy > small::before,
+.rcp-group-title::before {
+  flex: none;
+  width: 14px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--primary);
+  content: '';
+}
+
+html.fl-dark .rcp-card__heading-copy > small::before,
+html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
+
+.rcp-card__heading h3 {
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+}
+
+.rcp-card__body { min-width: 0; }
+.rcp-card__body > :first-child { margin-top: 0; }
+.rcp-card__body p { overflow-wrap: anywhere; }
+
+.rcp-loading,
+.rcp-empty,
+.rcp-inline-note {
   margin: 0;
-  padding: 14px 15px;
-  color: var(--ink-faint);
-  font-size: 11px;
+  color: var(--faint);
+  font-size: 12.5px;
+  line-height: 1.55;
 }
 
 .rcp-error {
   margin: 0;
-  padding: 12px 15px;
-  color: var(--err-text);
-  font-size: 10.5px;
-  overflow-wrap: break-word;
+  color: var(--danger);
+  font-size: 12.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 
 .rcp-footnote {
-  margin: 0;
-  padding: 9px 15px 11px;
-  border-top: 1px solid var(--line);
-  color: var(--ink-faint);
-  font-size: 9.5px;
-  line-height: 1.5;
-  margin-top: auto;
+  margin: auto 0 0;
+  padding-top: 11px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
 }
 
-/* ── Buttons ────────────────────────────────────────────────────────────── */
+/* A one-line pointer to somewhere else in OAIY. */
+.rcp-pointer {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
 
-.rcp-button {
-  min-height: 30px;
+/* ── Status card + tiles (the dashboard's "Today" tiles) ────────────────── */
+
+.rcp-status__meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+}
+
+.rcp-version {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.rcp-status__detail {
+  margin: -4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.rcp-grid {
+  display: grid;
+  /* 4-up on a wide window, 2 x 2 on a narrow one, never 3 + 1. */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+  gap: 12px;
+}
+
+.rcp-ready {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+  min-width: 0;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-solid);
+  box-shadow: var(--shadow-card);
+}
+
+.rcp-ready__icon {
   display: inline-flex;
+  margin-bottom: 4px;
+  color: var(--text);
+}
+
+.rcp-ready strong {
+  max-width: 100%;
+  font-size: 21px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+.rcp-ready.is-ok strong { color: var(--green); }
+.rcp-ready.is-bad strong { color: var(--amber); }
+
+.rcp-ready small {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.rcp-ready p {
+  display: -webkit-box;
+  max-width: 100%;
+  margin: 0;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.rcp-ready__state {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  display: inline-flex;
+}
+
+.rcp-ready__state.is-ok { color: var(--green); }
+.rcp-ready__state.is-bad { color: var(--amber); }
+.rcp-ready__state.is-unknown { color: var(--faint); }
+
+/* ── Badges (the dashboard's LED pills) ─────────────────────────────────── */
+
+.rcp-pill,
+.rcp-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--strong-border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  padding: 3px 9px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.rcp-pill i,
+.rcp-badge::before {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  content: '';
+}
+
+.rcp-pill i { display: inline-block; }
+.rcp-badge.is-neutral::before { display: none; }
+
+.rcp-pill.is-ok,
+.rcp-badge.is-ok {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.rcp-pill.is-warn,
+.rcp-badge.is-pending {
+  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.rcp-pill.is-err,
+.rcp-pill.is-live {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+html.fl-dark .rcp-pill.is-ok i,
+html.fl-dark .rcp-badge.is-ok::before { box-shadow: 0 0 7px var(--green); }
+html.fl-dark .rcp-pill.is-err i,
+html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
+
+.rcp-pill.is-live i { animation: rcp-led-pulse 1.3s ease-in-out infinite; }
+
+@keyframes rcp-led-pulse {
+  50% { opacity: 0.35; }
+}
+
+/* An author display rule beats the UA [hidden] styling — restore it. */
+.rcp-pill[hidden],
+.rcp-speak[hidden] { display: none; }
+
+/* ── Buttons (the dashboard's .btn family) ──────────────────────────────── */
+
+.rcp-button,
+.rcp-call-action {
+  display: inline-flex;
+  min-height: 36px;
+  max-width: 100%;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 0 12px;
-  border: 1px solid var(--line-2);
-  border-radius: 8px;
-  background: transparent;
-  color: var(--ink-dim);
-  font-size: 10.5px;
-  font-weight: 670;
-  cursor: pointer;
-  transition: border-color 140ms ease, color 140ms ease, background 140ms ease;
+  gap: 7px;
+  border: 1px solid var(--strong-border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  color: var(--text);
+  padding: 0 13px;
+  font-size: 12px;
+  font-weight: 580;
+  line-height: 1.25;
+  text-align: center;
+  transition: background 0.14s, border-color 0.14s, transform 0.06s, box-shadow 0.14s;
 }
 
-.rcp-button:hover:not(:disabled) {
-  color: var(--ink);
-  border-color: var(--signal-line);
+.rcp-button:hover:not(:disabled),
+.rcp-call-action:hover:not(:disabled) {
+  border-color: var(--primary);
+  background: var(--primary-soft);
 }
 
-.rcp-button:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
+.rcp-button:active:not(:disabled),
+.rcp-call-action:active:not(:disabled) { transform: translateY(1px); }
 
-.rcp-call-action {
-  min-height: 36px;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 15px;
-  border-radius: 9px;
-  font-size: 11px;
-  font-weight: 700;
-  cursor: pointer;
-  transition: filter 130ms ease;
-}
-
-.rcp-call-action:hover:not(:disabled) { filter: brightness(1.06); }
-
+.rcp-button:disabled,
 .rcp-call-action:disabled {
-  opacity: 0.55;
   cursor: not-allowed;
+  opacity: 0.45;
 }
 
+.rcp-button.is-primary {
+  border-color: color-mix(in srgb, var(--primary) 80%, white);
+  background: linear-gradient(115deg, var(--primary), var(--primary-2));
+  box-shadow: 0 8px 22px color-mix(in srgb, var(--primary) 25%, transparent), inset 0 1px rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+
+.rcp-button.is-primary:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--primary) 80%, white);
+  background: linear-gradient(115deg, var(--primary), var(--primary-2));
+  transform: translateY(-1px);
+}
+
+.rcp-button.is-danger,
 .rcp-call-action.is-reject {
-  border: 1px solid var(--err-line);
-  background: var(--err-soft);
-  color: var(--err-text);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.rcp-button.is-danger:hover:not(:disabled),
+.rcp-call-action.is-reject:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.rcp-button.is-warn {
+  border-color: color-mix(in srgb, var(--amber) 45%, var(--border));
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.rcp-button.is-warn:hover:not(:disabled) {
+  border-color: var(--amber);
+  background: var(--amber-soft);
 }
 
 .rcp-call-action.is-answer {
-  border: 1px solid var(--ok);
-  background: var(--ok);
-  color: #ffffff;
+  border-color: var(--green);
+  background: var(--green);
+  color: #fff;
+}
+
+.rcp-call-action.is-answer:hover:not(:disabled) {
+  border-color: var(--green);
+  background: var(--green);
+  transform: translateY(-1px);
+}
+
+.rcp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* A link, in the dashboard's link colour: to another tab of this screen
+   (data-tabgo) or to a dashboard page (data-nav). */
+.rcp-link-btn {
+  appearance: none;
+  display: inline;
+  border: 0;
+  background: none;
+  color: var(--primary);
+  padding: 0;
+  font: inherit;
+  font-weight: 600;
+  text-align: inherit;
+}
+
+.rcp-link-btn:hover { text-decoration: underline; text-underline-offset: 2px; }
+
+/* A host without PluginHost.navigate: page links read as plain text. */
+.rcp-no-nav [data-nav] {
+  color: inherit;
+  font-weight: inherit;
+  text-decoration: none;
+  cursor: default;
+  pointer-events: none;
 }
 
 /* ── Live call ──────────────────────────────────────────────────────────── */
 
-.rcp-empty-call {
-  min-height: 150px;
+.rcp-empty-call,
+.rcp-ringing {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  min-height: 150px;
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-ctl);
   text-align: center;
-  padding: 18px;
 }
 
 .rcp-empty-call__icon {
-  width: 46px;
-  height: 46px;
   display: inline-flex;
+  width: 44px;
+  height: 44px;
   align-items: center;
   justify-content: center;
-  border-radius: 14px;
-  background: var(--signal-soft);
-  color: var(--signal-strong);
+  border-radius: var(--r-card);
+  background: var(--primary-soft);
+  color: var(--primary);
 }
 
 .rcp-empty-call h4 {
-  margin: 12px 0 0;
-  font-size: 13.5px;
-  font-weight: 680;
+  margin-top: 12px;
+  font-size: 14px;
+  font-weight: 650;
 }
 
 .rcp-empty-call p {
-  max-width: 320px;
-  margin: 6px 0 0;
-  color: var(--ink-dim);
-  font-size: 10.5px;
+  max-width: 340px;
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12.5px;
   line-height: 1.55;
 }
 
-.rcp-ringing {
-  min-height: 150px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  padding: 18px;
-}
-
 .rcp-ringing small {
-  color: var(--err-text);
-  font-size: 9px;
-  font-weight: 740;
-  letter-spacing: 0.13em;
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
 }
 
 .rcp-ringing h4 {
-  margin: 5px 0 0;
-  font-size: 17px;
-  font-weight: 700;
+  margin-top: 5px;
+  font-size: 19px;
+  font-weight: 650;
 }
+
+.rcp-ringing p { margin: 5px 0 0; color: var(--muted); font-size: 12.5px; }
 
 .rcp-call-actions {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
   gap: 10px;
   margin-top: 16px;
 }
 
 .rcp-active {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  flex-wrap: wrap;
-  padding: 14px 15px 0;
+}
+
+.rcp-active small {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
 }
 
 .rcp-active__note {
-  color: var(--ink-faint);
-  font-size: 10px;
   min-width: 0;
+  color: var(--muted);
+  font-size: 12.5px;
 }
 
 .rcp-speak {
   display: flex;
   gap: 8px;
-  padding: 12px 15px 14px;
 }
 
-/* An author display rule beats the UA [hidden] styling — restore it. */
-.rcp-speak[hidden],
-.rcp-pill[hidden] { display: none; }
-
-.rcp-speak input {
-  flex: 1;
-  min-width: 0;
-  min-height: 30px;
-  padding: 0 11px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--bg-0);
-  color: var(--ink);
-  font-size: 11.5px;
-  font-family: inherit;
-}
-
-.rcp-speak input:disabled { opacity: 0.6; }
+.rcp-speak input { flex: 1; min-width: 0; }
 
 .rcp-switchboard {
-  margin: 0 15px 12px;
   padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
 }
+
 .rcp-switchboard__leg {
   display: flex;
   flex-wrap: wrap;
   justify-content: space-between;
   gap: 5px 12px;
-  font-size: 11px;
-  line-height: 1.5;
+  font-size: 12.5px;
 }
+
 .rcp-switchboard__leg + .rcp-switchboard__leg { margin-top: 8px; }
 .rcp-switchboard__leg span { overflow-wrap: anywhere; }
-.rcp-switchboard__transition { margin: 0 0 8px; color: var(--warn); font-size: 11px; line-height: 1.5; }
-.rcp-switchboard .rcp-error { margin: 0; padding: 0; }
+.rcp-switchboard__transition { margin: 0 0 8px; color: var(--amber); font-size: 12.5px; }
+.rcp-switchboard[hidden] { display: none; }
 
 /* ── Delivery ───────────────────────────────────────────────────────────── */
 
 .rcp-metrics {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 7px;
-  padding: 12px 15px 0;
+  gap: 10px;
 }
 
 .rcp-metrics span {
-  min-height: 48px;
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  padding: 6px 10px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--surface-2);
+  gap: 2px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
 }
 
 .rcp-metrics strong {
-  font-size: 16px;
-  letter-spacing: -0.03em;
-  font-family: var(--font-mono);
+  font-size: 22px;
+  font-weight: 650;
+  line-height: 1.15;
 }
 
-.rcp-metrics small {
-  margin-top: 1px;
-  color: var(--ink-faint);
-  font-size: 9px;
-}
+.rcp-metrics small { color: var(--muted); font-size: 12px; }
 
 .rcp-delivery-note {
-  margin: 10px 15px 0;
-  font-size: 10px;
+  margin: 0;
+  color: var(--faint);
+  font-size: 12.5px;
   line-height: 1.5;
-  color: var(--ink-faint);
 }
 
-.rcp-delivery-note.is-warn { color: var(--warn); }
+.rcp-delivery-note.is-warn { color: var(--amber); }
 
-.rcp-delivery-actions {
-  padding: 12px 15px 14px;
-}
-
-.rcp-card > :last-child { padding-bottom: 14px; }
-.rcp-card > .rcp-card__heading { padding-bottom: 8px; }
-
-/* ── Paired phones ──────────────────────────────────────────────────────── */
+/* ── Phone rows (the dashboard's list rows) ─────────────────────────────── */
 
 .rcp-phone-list {
   display: flex;
   flex-direction: column;
+  gap: 8px;
 }
 
 .rcp-phone-row {
-  min-height: 52px;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
-  padding: 8px 15px;
+  gap: 8px 10px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-raised);
 }
 
-.rcp-phone-row + .rcp-phone-row { border-top: 1px solid var(--line); }
-
 .rcp-phone-row__id {
-  flex: 1;
+  flex: 1 1 160px;
   min-width: 0;
 }
 
 .rcp-phone-row__id strong {
   display: block;
-  font-size: 11px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  font-size: 13.5px;
+  font-weight: 600;
 }
 
 .rcp-phone-row__id small {
   display: block;
-  color: var(--ink-faint);
-  font-size: 9.5px;
+  color: var(--faint);
   font-family: var(--font-mono);
+  font-size: 11px;
 }
 
-/* ── Settings summary ───────────────────────────────────────────────────── */
+/* ── Settings lists (label · value rows) ────────────────────────────────── */
 
 .rcp-settings-list {
   display: flex;
   flex-direction: column;
-  padding: 4px 0;
 }
 
 .rcp-setting {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 12px;
-  padding: 7px 15px;
+  gap: 4px 16px;
+  padding: 8px 0;
 }
 
-.rcp-setting + .rcp-setting { border-top: 1px solid var(--line); }
+.rcp-setting + .rcp-setting { border-top: 1px solid var(--border); }
 
 .rcp-setting small {
-  color: var(--ink-faint);
-  font-size: 10px;
-  white-space: nowrap;
+  flex: none;
+  color: var(--muted);
+  font-size: 12.5px;
 }
 
 .rcp-setting span {
-  color: var(--ink);
-  font-size: 11px;
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
   font-weight: 600;
   text-align: right;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
-/* Where each part of a call is set in OAIY (Settings tab). The values are
-   directions, so they wrap rather than truncate. */
+/* Where each part of a call is set in OAIY (Settings tab): directions, so
+   left-aligned and wrapping, with a live value first when there is one. */
 .rcp-set-in-oaiy {
-  margin-top: 8px;
-  padding: 0;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface-2);
+  padding: 2px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
 }
 
-.rcp-set-in-oaiy .rcp-setting { padding: 7px 10px; }
-
-.rcp-set-in-oaiy .rcp-setting small {
-  flex: 0 0 150px;
-  white-space: normal;
-}
+.rcp-set-in-oaiy .rcp-setting { justify-content: flex-start; }
+.rcp-set-in-oaiy .rcp-setting small { flex: 0 0 190px; }
 
 .rcp-set-in-oaiy .rcp-setting span {
   flex: 1 1 auto;
-  font-weight: 500;
+  font-weight: 400;
   text-align: left;
-  white-space: normal;
 }
 
-/* ── Tab bar ────────────────────────────────────────────────────────────── */
+.rcp-set-in-oaiy strong { font-weight: 650; }
+.rcp-set-in-oaiy em { color: var(--muted); font-style: normal; }
 
-.rcp-tabs {
-  display: flex;
-  flex-wrap: nowrap;
-  overflow-x: auto;
-  gap: 4px;
-  padding: 4px;
-  border-bottom: 1px solid var(--line);
-}
-
-.rcp-tab-btn {
-  appearance: none;
-  background: transparent;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  padding: 9px 11px 8px;
-  color: var(--ink-faint);
-  font-size: 13px;
-  min-height: 44px;
-  font-weight: 740;
-  letter-spacing: 0;
-  text-transform: none;
-  white-space: nowrap;
-  cursor: pointer;
-  transition: color 130ms ease, border-color 130ms ease;
-}
-
-.rcp-tab-btn:hover { color: var(--ink); }
-
-.rcp-tab-btn.is-active {
-  color: var(--signal-strong);
-  border-bottom-color: var(--signal);
-}
-
-/* Hidden by the transport mode (the Dongle tab on the native/auto transports). */
-.rcp-tab-btn[hidden] { display: none; }
-
-.rcp-tab-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-  min-width: 0;
-}
-
-.rcp-tab-panel[hidden] { display: none; }
-
-/* ── Inline "open tab" link ─────────────────────────────────────────────── */
-
-.rcp-link-btn {
-  appearance: none;
-  background: none;
-  border: 0;
-  padding: 0;
-  color: var(--signal-strong);
-  font: inherit;
-  font-weight: 650;
-  text-decoration: underline;
-  cursor: pointer;
-}
-
-/* ── Card body (generic padded section for the tab cards) ───────────────── */
-
-.rcp-card__body {
-  padding: 12px 15px 0;
-  min-width: 0;
-}
-
-.rcp-card__body p { overflow-wrap: break-word; }
-
-/* ── Buttons: variants shared by the tabs ───────────────────────────────── */
-
-.rcp-button.is-primary {
-  border-color: var(--signal-fill);
-  background: var(--signal-fill);
-  color: var(--signal-ink);
-}
-
-.rcp-button.is-primary:hover:not(:disabled) {
-  /* The host's own primary button does not recolour on hover, it lifts
-     (desktop/src/styles.css `.btn-primary:hover`). Matching that keeps the
-     affordance identical AND keeps the 10.5px label above 4.5:1 -- brightening
-     the fill toward the raw accent drops it to 4.13:1 exactly while the
-     pointer is on it, which is when it is being read. */
-  transform: translateY(-1px);
-}
-
-.rcp-button.is-danger {
-  border-color: var(--err-line);
-  background: var(--err-soft);
-  color: var(--err-text);
-}
-
-.rcp-button.is-warn {
-  border-color: var(--warn);
-  background: var(--warn-soft);
-  color: var(--warn);
-}
-
-/* ── Forms (Settings tab + shared) ──────────────────────────────────────── */
+/* ── Forms (the dashboard's form rows and controls) ─────────────────────── */
 
 .rcp-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
+  gap: 18px;
+  align-items: start;
+  min-width: 0;
+}
+
+.rcp-form > * { min-width: 0; }
+
+.rcp-form__actions {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  max-width: 780px;
-  padding: 12px 15px 0;
+  gap: 10px;
 }
 
 /* Dongle-only Advanced fields — hidden on the native/auto transports. */
 .set-dongle-only[hidden] { display: none; }
 
-.rcp-group-title {
-  margin: 0;
-  font-size: 11.5px;
-  font-weight: 740;
-  letter-spacing: -0.01em;
-}
-
 .rcp-field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  margin-top: 8px;
-}
-
-.rcp-field > span {
-  color: var(--ink-dim);
-  font-size: 10.5px;
-  font-weight: 650;
-}
-
-.rcp-field > span small {
-  color: var(--ink-faint);
-  font-weight: 500;
-}
-
-.rcp-field input[type='text'],
-.rcp-field input[type='number'],
-.rcp-field select,
-.rcp-field textarea,
-.rcp-textarea {
-  min-height: 30px;
-  padding: 5px 10px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--bg-0);
-  color: var(--ink);
-  font-size: 11.5px;
-  font-family: inherit;
+  gap: 6px;
   min-width: 0;
 }
 
-.rcp-field textarea,
-.rcp-textarea {
-  resize: vertical;
-  line-height: 1.5;
+.rcp-field > span {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
-.rcp-field input:focus-visible,
-.rcp-field select:focus-visible,
-.rcp-field textarea:focus-visible {
-  outline: 2px solid var(--signal);
-  outline-offset: 1px;
+.rcp-field > span small {
+  font-weight: 500;
+  text-transform: none;
 }
+
+.rcp input[type='text'],
+.rcp input[type='number'],
+.rcp input:not([type]),
+.rcp select,
+.rcp textarea {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  outline: 0;
+  background: var(--surface-soft);
+  color: var(--text);
+  padding: 0 9px;
+  font-size: 12.5px;
+  transition: border-color 0.14s, box-shadow 0.14s;
+}
+
+.rcp input[type='text'],
+.rcp input[type='number'] { font-family: var(--font-mono); }
+
+.rcp textarea {
+  height: auto;
+  padding: 9px;
+  line-height: 1.55;
+  resize: vertical;
+}
+
+.rcp input::placeholder,
+.rcp textarea::placeholder { color: var(--faint); }
+
+.rcp input:focus,
+.rcp select:focus,
+.rcp textarea:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+
+.rcp input:disabled,
+.rcp select:disabled,
+.rcp textarea:disabled { cursor: not-allowed; opacity: 0.5; }
 
 .rcp-check {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  font-size: 11.5px;
-  font-weight: 600;
+  align-items: flex-start;
+  gap: 9px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 550;
   cursor: pointer;
 }
 
-.rcp-check input { accent-color: var(--signal); }
+.rcp-check input { flex: none; margin: 3px 0 0; accent-color: var(--primary); }
+.rcp-check input:disabled + span { color: var(--muted); }
 
 .rcp-hint {
-  margin: 3px 0 0;
-  color: var(--ink-faint);
-  font-size: 9.5px;
-  line-height: 1.5;
-  overflow-wrap: break-word;
+  margin: 0;
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 
-.rcp-hint.is-warn { color: var(--warn); }
+/* A hint belongs to the control above it: closer than the card's gap. */
+.rcp-card > .rcp-field + .rcp-hint,
+.rcp-card > .rcp-check + .rcp-hint,
+.rcp-card > .rcp-hint + .rcp-hint { margin-top: -6px; }
 
-/* Ownership notice above the settings form: which fields a linked FormLogic
-   app re-applies on every call. The quiet variant states the relationship;
-   the warn variant appears once an external re-apply has been observed. */
+.set-dongle-only {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rcp-hint.is-warn { color: var(--amber); }
+
+/* ── Banners ────────────────────────────────────────────────────────────── */
+
 .rcp-notice {
-  margin: 0 0 12px;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--ink-faint);
-  border-radius: 8px;
-  background: var(--surface-2);
-  color: var(--ink-dim);
-  font-size: 10.5px;
+  margin: 0;
+  padding: 11px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 12.5px;
   line-height: 1.55;
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+
+.rcp-notice strong { color: var(--text); }
+
+.rcp-notice--ok {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+  background: var(--green-soft);
 }
 
 .rcp-notice--warn {
-  border-left-color: var(--warn);
-  color: var(--ink);
+  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+  background: var(--amber-soft);
+  color: var(--text);
 }
 
-.rcp-notice--warn strong { color: var(--warn); }
+.rcp-notice--warn strong { color: var(--amber); }
 
-.rcp-actions {
+.rcp-callout {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-top: 10px;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 11px 14px;
+  border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border));
+  border-radius: var(--r-ctl);
+  background: var(--primary-soft);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.55;
 }
 
-/* ── Badges ─────────────────────────────────────────────────────────────── */
-
-.rcp-badge {
-  display: inline-flex;
-  align-items: center;
-  min-height: 20px;
-  padding: 0 8px;
-  border-radius: 999px;
-  font-size: 9px;
-  font-weight: 700;
-  white-space: nowrap;
+.rcp-callout.is-warn {
+  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+  background: var(--amber-soft);
 }
 
-.rcp-badge.is-ok { background: var(--ok-soft); color: var(--ok-text); }
-.rcp-badge.is-pending { background: var(--warn-soft); color: var(--warn); }
-.rcp-badge.is-neutral { background: var(--hover-wash); color: var(--ink-faint); }
+.rcp-callout svg { flex: none; margin-top: 2px; }
+.rcp-callout.is-warn svg { color: var(--amber); }
 
-/* ── Inline confirm (destructive actions — no host dialog in the sandbox) ── */
-
+/* Inline confirm (destructive actions — no host dialog in the sandbox). */
 .rcp-confirm {
-  margin-top: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--warn);
-  border-radius: 9px;
-  background: var(--warn-soft);
-  font-size: 10.5px;
+  padding: 11px 14px;
+  border: 1px solid color-mix(in srgb, var(--amber) 40%, var(--border));
+  border-radius: var(--r-ctl);
+  background: var(--amber-soft);
+  font-size: 12.5px;
   line-height: 1.55;
 }
 
 .rcp-confirm.is-danger {
-  border-color: var(--err-line);
-  background: var(--err-soft);
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  background: var(--danger-soft);
 }
 
-.rcp-confirm p {
-  margin: 0 0 8px;
-  overflow-wrap: break-word;
-}
-
+.rcp-confirm p { margin: 0 0 8px; overflow-wrap: anywhere; }
 .rcp-confirm .rcp-actions { margin-top: 0; }
 
-/* ── Code / mono ────────────────────────────────────────────────────────── */
+.rcp-status-ok {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--green);
+  font-size: 13px;
+}
+
+/* ── Code / pairing code ────────────────────────────────────────────────── */
 
 .rcp-code {
   display: block;
-  padding: 6px 8px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--surface-2);
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-soft);
   font-family: var(--font-mono);
-  font-size: 9.5px;
-  word-break: break-all;
+  font-size: 11px;
   line-height: 1.5;
+  word-break: break-all;
 }
 
 .rcp-paircode {
   margin: 8px 0;
   font-family: var(--font-mono);
-  font-size: 26px;
-  font-weight: 750;
+  font-size: 28px;
+  font-weight: 700;
   letter-spacing: 6px;
 }
 
-/* ── Wizard rows (Dongle tab) ───────────────────────────────────────────── */
+/* ── Dongle wizard ──────────────────────────────────────────────────────── */
 
 .rcp-step-meta {
   margin: 0;
-  color: var(--ink-dim);
-  font-size: 10.5px;
+  color: var(--muted);
+  font-size: 12.5px;
   line-height: 1.55;
 }
 
@@ -979,352 +1053,230 @@ button {
 .rcp-wizard-list {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 8px;
   margin-top: 10px;
 }
 
 .rcp-wizard-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
-  padding: 9px 11px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  cursor: pointer;
+  gap: 8px 10px;
   min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-raised);
+  cursor: pointer;
 }
 
 .rcp-wizard-row.is-selected {
-  border-color: var(--signal-line);
-  background: var(--signal-soft);
+  border-color: var(--primary);
+  background: var(--primary-soft);
 }
 
-.rcp-wizard-row input { accent-color: var(--signal); }
+.rcp-wizard-row input { accent-color: var(--primary); }
 
 .rcp-wizard-row__name {
-  flex: 1;
+  flex: 1 1 200px;
   min-width: 0;
-  font-size: 11px;
-  font-weight: 650;
-  overflow-wrap: break-word;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .rcp-wizard-row__name small {
-  color: var(--ink-faint);
-  font-weight: 500;
+  color: var(--faint);
   font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
 }
 
-.rcp-wizard-row__badges {
-  display: flex;
-  gap: 5px;
-  flex-wrap: wrap;
-}
+.rcp-wizard-row__badges { display: flex; flex-wrap: wrap; gap: 6px; }
 
-/* ── QR / offer block (Companion tab) ───────────────────────────────────── */
+/* ── Companion: QR, identity, people ────────────────────────────────────── */
 
 .rcp-qr {
   display: flex;
-  gap: 14px;
-  align-items: flex-start;
   flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 16px;
   margin-top: 12px;
 }
 
 .rcp-qr img {
-  width: 170px;
-  height: 170px;
+  width: 180px;
+  height: 180px;
   padding: 8px;
-  border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border: 1px solid var(--strong-border);
+  border-radius: var(--r-card);
   /* Always white behind the QR so it scans in dark mode too. */
   background: #ffffff;
 }
 
-.rcp-qr__meta {
-  flex: 1;
-  min-width: 220px;
-}
-
-.rcp-qr__meta strong { font-size: 11.5px; }
-
-.rcp-qr__meta p {
-  margin: 3px 0 6px;
-  color: var(--ink-dim);
-  font-size: 10px;
-}
+.rcp-qr__meta { flex: 1 1 240px; min-width: 0; }
+.rcp-qr__meta strong { font-size: 13.5px; }
+.rcp-qr__meta p { margin: 3px 0 6px; color: var(--muted); font-size: 12.5px; }
 
 .rcp-qr__meta small {
   display: block;
-  color: var(--ink-faint);
-  font-size: 9px;
   margin-bottom: 3px;
+  color: var(--faint);
+  font-size: 11.5px;
 }
-
-/* ── Identity grid (Companion tab) ──────────────────────────────────────── */
 
 .rcp-id-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+  gap: 10px;
   margin-top: 12px;
 }
 
 .rcp-id-grid > span {
   min-width: 0;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--surface-2);
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
 }
 
 .rcp-id-grid > span.is-wide { grid-column: 1 / -1; }
 
 .rcp-id-grid small {
   display: block;
-  color: var(--ink-faint);
-  font-size: 9px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
-.rcp-id-grid strong { font-size: 11px; }
+.rcp-id-grid strong { font-size: 13.5px; }
 
 .rcp-id-grid code {
   display: block;
-  font-family: var(--font-mono);
-  font-size: 9.5px;
-  word-break: break-all;
+  font-size: 11.5px;
   line-height: 1.45;
+  word-break: break-all;
 }
-
-/* ── People/device rows (Companion lists) ───────────────────────────────── */
 
 .rcp-list { margin-top: 10px; }
-
-.rcp-list h4 {
-  margin: 0 0 2px;
-  font-size: 10.5px;
-  font-weight: 700;
-}
+.rcp-list h4 { margin: 0 0 4px; font-size: 13px; font-weight: 650; }
 
 .rcp-person-row {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 9px 0;
-  border-top: 1px solid var(--line);
   min-width: 0;
+  padding: 9px 0;
+  border-top: 1px solid var(--border);
 }
 
 .rcp-person-row:first-of-type { border-top: 0; }
 
 .rcp-person-row__icon {
-  width: 28px;
-  height: 28px;
-  flex: none;
   display: inline-flex;
+  flex: none;
+  width: 30px;
+  height: 30px;
   align-items: center;
   justify-content: center;
-  border-radius: 8px;
-  background: var(--signal-soft);
-  color: var(--signal-strong);
+  border-radius: var(--r-ctl);
+  background: var(--primary-soft);
+  color: var(--primary);
 }
 
-.rcp-person-row__icon.is-ok {
-  background: var(--ok-soft);
-  color: var(--ok-text);
-}
-
-.rcp-person-row__id {
-  flex: 1;
-  min-width: 0;
-}
-
-.rcp-person-row__id strong {
-  display: block;
-  font-size: 11px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+.rcp-person-row__icon.is-ok { background: var(--green-soft); color: var(--green); }
+.rcp-person-row__id { flex: 1; min-width: 0; }
+.rcp-person-row__id strong { display: block; font-size: 13px; }
 
 .rcp-person-row__id small {
   display: block;
-  color: var(--ink-faint);
-  font-size: 9.5px;
+  color: var(--faint);
   font-family: var(--font-mono);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  font-size: 11px;
+  overflow-wrap: anywhere;
 }
 
 .rcp-person-row__id code {
   display: block;
-  font-family: var(--font-mono);
-  font-size: 9px;
+  color: var(--muted);
+  font-size: 11px;
   word-break: break-all;
-  color: var(--ink-dim);
 }
-
-/* ── Callout (topology / privacy notes) ─────────────────────────────────── */
-
-.rcp-callout {
-  display: flex;
-  gap: 9px;
-  align-items: flex-start;
-  margin-top: 10px;
-  padding: 9px 11px;
-  border: 1px solid var(--signal-line);
-  border-radius: 9px;
-  background: var(--signal-soft);
-  color: var(--ink-dim);
-  font-size: 10px;
-  line-height: 1.55;
-}
-
-.rcp-callout.is-warn {
-  border-color: var(--warn);
-  background: var(--warn-soft);
-  color: var(--warn);
-}
-
-.rcp-callout svg { flex: none; margin-top: 1px; }
-
-/* ── Details/summary (Companion relay test) ─────────────────────────────── */
 
 .rcp-details {
   margin-top: 12px;
-  padding: 8px 12px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
 }
 
 .rcp-details summary {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
   cursor: pointer;
-  font-size: 10.5px;
-  font-weight: 650;
-  color: var(--ink-dim);
 }
 
-.rcp-details p {
-  margin: 8px 0 0;
-  color: var(--ink-faint);
-  font-size: 9.5px;
-  line-height: 1.5;
-}
+.rcp-details p { margin: 8px 0 0; color: var(--faint); font-size: 12px; line-height: 1.5; }
+.rcp-details textarea { margin-top: 8px; font-family: var(--font-mono); font-size: 11.5px; }
 
-.rcp-details textarea {
-  width: 100%;
-  margin-top: 8px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-}
-
-/* ── Consent scope rows ─────────────────────────────────────────────────── */
+/* ── Consent ────────────────────────────────────────────────────────────── */
 
 .rcp-scope-row {
   display: flex;
-  gap: 9px;
   align-items: flex-start;
-  padding: 8px 0;
-  border-top: 1px solid var(--line);
-  font-size: 10.5px;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
   cursor: pointer;
 }
 
 .rcp-scope-row:first-of-type { border-top: 0; }
-
-.rcp-scope-row input {
-  margin-top: 2px;
-  accent-color: var(--signal);
-  flex: none;
-}
-
-.rcp-scope-row strong {
-  display: block;
-  font-size: 11px;
-}
+.rcp-scope-row input { flex: none; margin-top: 3px; accent-color: var(--primary); }
+.rcp-scope-row strong { display: block; font-size: 13px; font-weight: 600; }
 
 .rcp-scope-detail {
   display: block;
-  margin-top: 1px;
-  color: var(--ink-dim);
-  font-size: 9.8px;
-  line-height: 1.5;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 400;
+  line-height: 1.55;
 }
 
-.rcp-dest-list {
-  margin: 6px 0 0;
-  padding-left: 18px;
-  font-size: 10px;
-}
-
+.rcp-dest-list { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; }
 .rcp-dest-list li { margin-top: 3px; }
+.rcp-dest-list code { font-size: 11.5px; word-break: break-all; }
 
-.rcp-dest-list code {
-  font-family: var(--font-mono);
-  font-size: 9.5px;
-  word-break: break-all;
+/* ── Narrow windows ─────────────────────────────────────────────────────── */
+
+@media (max-width: 760px) {
+  .rcp-button,
+  .rcp-call-action,
+  .rcp-tab-btn { min-height: 44px; }
+  .rcp-set-in-oaiy .rcp-setting { flex-wrap: wrap; }
+  .rcp-set-in-oaiy .rcp-setting small { flex-basis: 100%; }
 }
 
-/* ── Status line helpers ────────────────────────────────────────────────── */
-
-.rcp-status-ok {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--ok-text);
-  font-size: 10.5px;
-}
-
-.rcp-inline-note {
-  margin: 0;
-  color: var(--ink-faint);
-  font-size: 10px;
-  line-height: 1.5;
-}
-
-/* ── Responsive ─────────────────────────────────────────────────────────── */
-
-@media (max-width: 899px) {
-  .rcp-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .rcp-columns { grid-template-columns: 1fr; }
-  .rcp-id-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-
-@media (max-width: 559px) {
-  .rcp-grid { grid-template-columns: 1fr; }
-  .rcp-id-grid { grid-template-columns: 1fr; }
-}
-
-/* Comfortable controls inside narrow desktop windows and phone previews. */
-.rcp-tab-btn { flex-shrink: 0; }
-.rcp-tab-btn:focus-visible, .rcp-tab-panel:focus-visible { outline: 2px solid var(--signal-strong); outline-offset: -2px; }
-.rcp-ready p, .rcp-card__body, .rcp-footnote { font-size: 13px; line-height: 1.6; }
-.rcp-ready p, .rcp-ready strong { white-space: normal; overflow-wrap: anywhere; }
-.rcp-ready small { font-size: 11px; }
-.rcp-ready strong { font-size: 14px; }
-.rcp-button, .rcp-link-btn, .rcp-call-action { min-height: 40px; }
-.rcp-card, .rcp-hero__copy, .rcp-ready { min-width: 0; overflow-wrap: anywhere; }
 @media (max-width: 600px) {
-  .rcp { padding: 12px; gap: 14px; }
-  .rcp-hero { padding: 18px; }
-  .rcp-hero__meta { align-items: flex-start; }
-  .rcp-button, .rcp-link-btn, .rcp-call-action { min-height: 44px; }
-  .rcp input, .rcp select, .rcp textarea { font-size: 16px; max-width: 100%; }
+  /* 16px keeps mobile browsers from zooming into a focused field. */
+  .rcp input,
+  .rcp select,
+  .rcp textarea { font-size: 16px; }
+  .rcp-metrics { grid-template-columns: 1fr; }
+  .rcp-status__meta { align-items: flex-start; }
 }
+
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  *,
+  *::before,
+  *::after {
     transition-duration: 0s !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
   }
 }
-.rcp-conversation { margin: 20px 0; }
-.rcp-conversation > .rcp-hint { padding: 0 16px; }
-.rcp-conversation > .rcp-footnote { padding: 12px 16px; }
-.rcp-conversation__turns { padding: 0 16px; }
-.rcp-conversation__turns { max-height: 360px; overflow: auto; overscroll-behavior: contain; }
-.rcp-conversation__turn { padding: 12px 0; border-bottom: 1px solid var(--border, #8884); overflow-wrap: anywhere; }
-.rcp-conversation__turn small { display: block; opacity: .75; margin: 4px 0; }
-.rcp-conversation__turn p { margin: 6px 0 0; white-space: pre-wrap; }

@@ -487,7 +487,7 @@
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
-      '<small>BLUETOOTH PAIRING</small>' +
+      '<small>Bluetooth pairing</small>' +
       '<h3>' +
       (statusError
         ? 'Phone status unavailable'
@@ -514,7 +514,7 @@
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
-      '<small>BONDED PHONES</small>' +
+      '<small>Bonded phones</small>' +
       '<h3>' +
       (bondedError ? 'Paired phones unavailable' : known ? bonded.length + ' phone' + (bonded.length === 1 ? '' : 's') + ' bonded' : 'Loading…') +
       '</h3>' +
