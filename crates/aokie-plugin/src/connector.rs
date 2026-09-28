@@ -1119,6 +1119,125 @@ impl Plugin {
         }
     }
 
+    /// `sms.send` proper. Every refusal before the text reaches the radio (or
+    /// before the dev simulator journals its `aokie.sms.sent`) is
+    /// [`SmsSendError::Refused`]: the phone was never touched, so no radio
+    /// event can follow. A failure after the simulated `aokie.sms.sent` was
+    /// handed to the outbox is [`SmsSendError::AfterSent`]: that event may
+    /// still be delivered, so it must not also be reported failed.
+    fn sms_send(&mut self, payload: &Value, sink: &mut dyn Sink) -> Result<Value, SmsSendError> {
+        let obj = expect_fields(payload, &["to", "body", "messageId"])?;
+        let to = require_str(&obj, "to")?;
+        let body = require_str(&obj, "body")?;
+        let to = validate_sms_recipient(&to).map_err(CmdError::failed)?;
+        let body = validate_sms_body(&body).map_err(CmdError::failed)?;
+        let message_id = payload
+            .get("messageId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("sms_{}", uuid::Uuid::new_v4().simple()));
+        if !is_safe_sms_message_id(&message_id) {
+            return Err(CmdError::failed(
+                "sms.send messageId must be 1..=128 safe identifier characters",
+            )
+            .into());
+        }
+        // AOK-CONSENT-001: sending SMS (MAP) needs the `sms` scope.
+        self.check_consent("sms.send", crate::consent::Scope::Sms)?;
+        if let Some(radio) = self.radio.as_ref() {
+            // The runtime builds the bMessage + PushMessage; the
+            // aokie.sms.sent event (with its handle) is emitted by the
+            // radio thread when the AG acks the PUT. A send error means
+            // the radio thread is gone and never received the control, so
+            // its own `aokie.sms.failed` (radio/controls.rs) cannot follow.
+            radio
+                .send(crate::radio::RadioControl::SendSms {
+                    message_id: message_id.clone(),
+                    to: to.clone(),
+                    body,
+                })
+                .map_err(CmdError::failed)?;
+            return Ok(
+                json!({"messageId": message_id, "to": to, "status": "queued", "via": "radio"}),
+            );
+        }
+        // Real mode with no radio: the message can NOT be sent — a
+        // fabricated "queued" here is the audit's canonical fake
+        // success (a caller was promised an SMS that never existed).
+        self.require_radio_or_dev("sms.send")?;
+        let at = now_iso8601();
+        // Essential event: outboxed before emission. The
+        // correlation id is the SMS handle (contract §3).
+        let ev = aokie_event(
+            crate::contract::events::SMS_SENT,
+            &message_id,
+            json!({"messageId": message_id, "to": to, "at": at, "simulated": true}),
+        );
+        emit_event(
+            sink,
+            &self.outbox,
+            &ev,
+            false,
+            crate::event_bridge::EmitMode::for_host(
+                self.ack_mode,
+                self.dev_mode || crate::event_bridge::legacy_host_allowed(),
+            ),
+        )
+        .map_err(|e| SmsSendError::AfterSent(CmdError::failed(e)))?;
+        let thread = self.mock.thread_for(&to);
+        thread.messages.push(MockSmsMessage {
+            id: message_id.clone(),
+            direction: "out",
+            body,
+            at,
+        });
+        Ok(json!({"messageId": message_id, "status": "queued", "simulated": true}))
+    }
+
+    /// The acknowledgement of a REFUSED `sms.send`: `aokie.sms.failed` with
+    /// the radio failure's data shape (`messageId`, `to`, `reason`, `at`) plus
+    /// `refused: true`, through the same essential outbox path. Its key is a
+    /// per-refusal occurrence (`aokie:<messageId>:sms.failed.<occ>:v1`): a
+    /// refused send can be retried under the same messageId (the command
+    /// journal abandons a refusal), and neither a second refusal nor a later
+    /// radio failure of an accepted retry may collide with it. An emission
+    /// problem is logged, never allowed to replace the refusal itself.
+    fn emit_sms_refused(
+        &self,
+        message_id: &str,
+        payload: &Value,
+        err: &CmdError,
+        sink: &mut dyn Sink,
+    ) {
+        let to = sms_recipient_as_given(payload);
+        let ev = aokie_core::events::aokie_event_occurrence(
+            crate::contract::events::SMS_FAILED,
+            message_id,
+            &aokie_core::events::occurrence_id(),
+            json!({
+                "messageId": message_id,
+                "to": to,
+                "reason": err.message,
+                "at": now_iso8601(),
+                "refused": true,
+            }),
+        );
+        if let Err(e) = emit_event(
+            sink,
+            &self.outbox,
+            &ev,
+            false,
+            crate::event_bridge::EmitMode::for_host(
+                self.ack_mode,
+                self.dev_mode || crate::event_bridge::legacy_host_allowed(),
+            ),
+        ) {
+            eprintln!("[aokie-plugin] sms.send refusal acknowledgement for {message_id}: {e}");
+        }
+    }
+
     /// AOK-CONSENT-001 `consent.get`: the recorded grant (or null), the
     /// required version, the current enforcement mode, and the live gate
     /// decision for the bluetooth scope — so FormLogic can show consent
@@ -2986,75 +3105,22 @@ impl Plugin {
                 Ok(json!({"id": thread.id, "phone": thread.phone, "messages": messages}))
             }
             "sms.send" => {
-                let obj = expect_fields(payload, &["to", "body", "messageId"])?;
-                let to = require_str(&obj, "to")?;
-                let body = require_str(&obj, "body")?;
-                let to = validate_sms_recipient(&to).map_err(CmdError::failed)?;
-                let body = validate_sms_body(&body).map_err(CmdError::failed)?;
-                let message_id = payload
-                    .get("messageId")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("sms_{}", uuid::Uuid::new_v4().simple()));
-                if message_id.len() > 128
-                    || !message_id
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
-                {
-                    return Err(CmdError::failed(
-                        "sms.send messageId must be 1..=128 safe identifier characters",
-                    ));
+                // The caller's own messageId is read FIRST, before anything
+                // can refuse: FormLogic saves the outbound row as `queued`
+                // under this id and only an event moves it on. A refused send
+                // therefore gets its `aokie.sms.failed` too, or the row would
+                // stay queued forever.
+                let supplied_id = supplied_sms_message_id(payload);
+                match self.sms_send(payload, sink) {
+                    Ok(result) => Ok(result),
+                    Err(SmsSendError::Refused(err)) => {
+                        if let Some(message_id) = supplied_id.as_deref() {
+                            self.emit_sms_refused(message_id, payload, &err, sink);
+                        }
+                        Err(err)
+                    }
+                    Err(SmsSendError::AfterSent(err)) => Err(err),
                 }
-                // AOK-CONSENT-001: sending SMS (MAP) needs the `sms` scope.
-                self.check_consent("sms.send", crate::consent::Scope::Sms)?;
-                if let Some(radio) = self.radio.as_ref() {
-                    // The runtime builds the bMessage + PushMessage; the
-                    // aokie.sms.sent event (with its handle) is emitted by the
-                    // radio thread when the AG acks the PUT.
-                    radio
-                        .send(crate::radio::RadioControl::SendSms {
-                            message_id: message_id.clone(),
-                            to: to.clone(),
-                            body,
-                        })
-                        .map_err(CmdError::failed)?;
-                    return Ok(
-                        json!({"messageId": message_id, "to": to, "status": "queued", "via": "radio"}),
-                    );
-                }
-                // Real mode with no radio: the message can NOT be sent — a
-                // fabricated "queued" here is the audit's canonical fake
-                // success (a caller was promised an SMS that never existed).
-                self.require_radio_or_dev("sms.send")?;
-                let at = now_iso8601();
-                // Essential event: outboxed before emission. The
-                // correlation id is the SMS handle (contract §3).
-                let ev = aokie_event(
-                    crate::contract::events::SMS_SENT,
-                    &message_id,
-                    json!({"messageId": message_id, "to": to, "at": at, "simulated": true}),
-                );
-                emit_event(
-                    sink,
-                    &self.outbox,
-                    &ev,
-                    false,
-                    crate::event_bridge::EmitMode::for_host(
-                        self.ack_mode,
-                        self.dev_mode || crate::event_bridge::legacy_host_allowed(),
-                    ),
-                )
-                .map_err(CmdError::failed)?;
-                let thread = self.mock.thread_for(&to);
-                thread.messages.push(MockSmsMessage {
-                    id: message_id.clone(),
-                    direction: "out",
-                    body,
-                    at,
-                });
-                Ok(json!({"messageId": message_id, "status": "queued", "simulated": true}))
             }
             "outbox.redrive" => {
                 // Operator redrive (audit OBS-001 / AOK-OUTBOX-001): TARGETED
@@ -5229,6 +5295,54 @@ fn optional_str(obj: &Map<String, Value>, key: &str) -> Result<Option<String>, C
             json_type_name(other)
         ))),
     }
+}
+
+/// How an `sms.send` failed: before anything was sent (the caller's messageId
+/// is acknowledged with `aokie.sms.failed {refused: true}`) or after the dev
+/// simulator's `aokie.sms.sent` reached the outbox (no second outcome).
+enum SmsSendError {
+    Refused(CmdError),
+    AfterSent(CmdError),
+}
+
+impl From<CmdError> for SmsSendError {
+    fn from(err: CmdError) -> Self {
+        SmsSendError::Refused(err)
+    }
+}
+
+/// An SMS messageId is a correlation id and part of an idempotency key, so it
+/// must be 1..=128 safe identifier characters (the event envelope caps
+/// `correlationId` at 128).
+fn is_safe_sms_message_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+}
+
+/// The messageId the CALLER supplied to `sms.send`, trimmed, when it is one
+/// that can key an event. `None` when absent (Aokie mints its own id and there
+/// is no caller row to acknowledge) or unusable as an id.
+fn supplied_sms_message_id(payload: &Value) -> Option<String> {
+    payload
+        .get("messageId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| is_safe_sms_message_id(id))
+        .map(str::to_string)
+}
+
+/// The `to` of an `sms.send` exactly as given (it may be the invalid value
+/// that got the send refused), capped at 64 characters; `""` when absent or
+/// not a string.
+fn sms_recipient_as_given(payload: &Value) -> String {
+    payload
+        .get("to")
+        .and_then(Value::as_str)
+        .map(|to| to.chars().take(64).collect())
+        .unwrap_or_default()
 }
 
 fn require_str(obj: &Map<String, Value>, key: &str) -> Result<String, CmdError> {
@@ -8252,6 +8366,273 @@ mod tests {
             .dispatch_command("sms.thread", &json!({"threadId": "thread_999"}), &mut sink)
             .unwrap_err();
         assert!(err.message.contains("unknown thread"));
+    }
+
+    // ---- A refused sms.send still acknowledges the caller's messageId ----
+
+    /// The one `aokie.sms.failed` a refused send emitted: the radio failure's
+    /// data fields (`messageId`, `to`, `reason`, `at`) plus `refused: true`
+    /// and nothing else, keyed as a per-refusal occurrence of the messageId.
+    fn sms_refusal_event(sink: &VecSink, message_id: &str) -> Value {
+        let events: Vec<Value> = sink
+            .lines
+            .iter()
+            .map(|line| parse(line)["params"]["event"].clone())
+            .filter(|ev| ev["name"] == json!(crate::contract::events::SMS_FAILED))
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one aokie.sms.failed: {:?}",
+            sink.lines
+        );
+        let ev = events[0].clone();
+        assert_eq!(ev["correlationId"], json!(message_id));
+        let key = ev["idempotencyKey"].as_str().unwrap();
+        assert!(
+            key.starts_with(&format!("aokie:{message_id}:sms.failed.")) && key.ends_with(":v1"),
+            "{key}"
+        );
+        let data = ev["data"].as_object().unwrap();
+        let mut fields: Vec<&str> = data.keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["at", "messageId", "reason", "refused", "to"]);
+        assert_eq!(data["messageId"], json!(message_id));
+        assert_eq!(data["refused"], json!(true));
+        assert!(data["at"].as_str().is_some_and(|at| !at.is_empty()));
+        ev
+    }
+
+    #[test]
+    fn sms_send_refused_for_an_invalid_number_acknowledges_the_message_id() {
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "abc", "body": "test", "messageId": "msg-invalid-1"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "command_failed");
+        assert!(
+            err.message.contains("disallowed characters"),
+            "{}",
+            err.message
+        );
+        let ev = sms_refusal_event(&sink, "msg-invalid-1");
+        assert_eq!(ev["data"]["to"], json!("abc"), "the number as given");
+        assert_eq!(ev["data"]["reason"], json!(err.message));
+        assert_eq!(
+            plugin
+                .outbox
+                .status_of(ev["idempotencyKey"].as_str().unwrap())
+                .unwrap(),
+            Some(OutboxStatus::Pending),
+            "essential: outboxed until the host acknowledges it"
+        );
+    }
+
+    #[test]
+    fn sms_send_refused_without_a_radio_acknowledges_the_message_id() {
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+        sink.lines.clear();
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": " +61432123456 ", "body": "See you at 9:30", "messageId": "msg-noradio-1"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(
+            err.message.contains("radio is not running"),
+            "{}",
+            err.message
+        );
+        let ev = sms_refusal_event(&sink, "msg-noradio-1");
+        assert_eq!(ev["data"]["to"], json!(" +61432123456 "), "as given");
+        assert_eq!(ev["data"]["reason"], json!(err.message));
+    }
+
+    #[test]
+    fn sms_send_refused_for_missing_consent_acknowledges_the_message_id() {
+        let _env = consent_env_lock();
+        std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
+        // Real mode, enforce by default, no grant.
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "+61432123456", "body": "hi", "messageId": "msg-consent-1"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("consent"), "{}", err.message);
+        let ev = sms_refusal_event(&sink, "msg-consent-1");
+        assert_eq!(ev["data"]["to"], json!("+61432123456"));
+        assert_eq!(ev["data"]["reason"], json!(err.message));
+    }
+
+    #[test]
+    fn sms_send_refused_without_a_usable_message_id_emits_nothing() {
+        let _env = consent_env_lock();
+        std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        for payload in [
+            // Invalid number, no messageId.
+            json!({"to": "abc", "body": "test"}),
+            // Consent refusal, no messageId.
+            json!({"to": "+61432123456", "body": "hi"}),
+            // A blank messageId is no messageId.
+            json!({"to": "abc", "body": "test", "messageId": "   "}),
+            // One that cannot be a correlation id cannot be acknowledged.
+            json!({"to": "+61432123456", "body": "hi", "messageId": "not a safe id"}),
+        ] {
+            plugin
+                .dispatch_command("sms.send", &payload, &mut sink)
+                .unwrap_err();
+        }
+        assert!(sink.lines.is_empty(), "{:?}", sink.lines);
+        assert!(plugin.outbox.retryable(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sms_send_refused_when_the_radio_thread_is_gone_acknowledges_the_message_id() {
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+        sink.lines.clear();
+        // The control channel is closed: the radio never gets the text, so
+        // its own failure event cannot follow this one.
+        let (radio, controls) = crate::radio::RadioHandle::test_handle();
+        drop(controls);
+        plugin.radio = Some(radio);
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "+61432123456", "body": "hi", "messageId": "msg-radio-gone-1"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(
+            err.message.contains("radio thread is not running"),
+            "{}",
+            err.message
+        );
+        let ev = sms_refusal_event(&sink, "msg-radio-gone-1");
+        assert_eq!(ev["data"]["reason"], json!(err.message));
+    }
+
+    #[test]
+    fn sms_send_accepted_by_the_radio_leaves_the_outcome_to_the_radio() {
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+        sink.lines.clear();
+        let (radio, controls) = crate::radio::RadioHandle::test_handle();
+        plugin.radio = Some(radio);
+        let data = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "+61432123456", "body": "hi", "messageId": "msg-accepted-1"}),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(data["messageId"], json!("msg-accepted-1"));
+        assert_eq!(data["status"], json!("queued"));
+        assert!(
+            sink.lines.is_empty(),
+            "the radio reports sent or failed, the command does not: {:?}",
+            sink.lines
+        );
+        let sent = controls.try_iter().any(|control| {
+            matches!(
+                control,
+                crate::radio::RadioControl::SendSms { ref message_id, .. }
+                    if message_id == "msg-accepted-1"
+            )
+        });
+        assert!(sent, "the radio got the text under the caller's messageId");
+    }
+
+    #[test]
+    fn sms_send_whose_simulated_sent_event_is_outboxed_is_never_also_failed() {
+        // Dev mode with a broken host pipe: the simulated aokie.sms.sent is
+        // in the outbox and will be delivered, so the failed command must
+        // not add an aokie.sms.failed for the same text.
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink {
+            fail: true,
+            ..Default::default()
+        };
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "+61432123456", "body": "hi", "messageId": "msg-dev-1"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("event.emit failed"), "{}", err.message);
+        let names: Vec<String> = plugin
+            .outbox
+            .retryable(10)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.event_name)
+            .collect();
+        assert_eq!(names, [crate::contract::events::SMS_SENT]);
+    }
+
+    #[test]
+    fn sms_send_refused_twice_under_one_message_id_never_collides() {
+        let _env = consent_env_lock();
+        std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        // A retry under the same messageId, refused for another reason.
+        for payload in [
+            json!({"to": "abc", "body": "x", "messageId": "msg-retry-1"}),
+            json!({"to": "+61432123456", "body": "x", "messageId": "msg-retry-1"}),
+        ] {
+            plugin
+                .dispatch_command("sms.send", &payload, &mut sink)
+                .unwrap_err();
+        }
+        let keys: Vec<String> = sink
+            .lines
+            .iter()
+            .map(|line| {
+                parse(line)["params"]["event"]["idempotencyKey"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(keys.len(), 2, "{:?}", sink.lines);
+        assert_ne!(keys[0], keys[1]);
+        assert!(
+            keys.iter()
+                .all(|key| key != "aokie:msg-retry-1:sms.failed:v1"),
+            "the radio's own failure key stays free for an accepted retry"
+        );
+        assert_eq!(plugin.outbox.collision_count().unwrap(), 0);
     }
 
     #[test]
