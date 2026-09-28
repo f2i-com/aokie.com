@@ -276,8 +276,9 @@
         setupRadio = null;
       }
     ).then(function () {
-      reportSetup();
+      // render() reports the progress first, then the step is done.
       render();
+      reportSetup();
     });
   }
 
@@ -354,8 +355,8 @@
             radioStartError =
               'Aokie started again, but the dongle has not come up yet. Unplug the dongle, plug it back in, then try again.';
           }
-          reportSetup();
           render();
+          reportSetup();
         },
         function (e) {
           radioStarting = false;
