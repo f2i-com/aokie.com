@@ -26,7 +26,7 @@ use crate::aokie_radio::manager::{
     self, AOKIE_SCO_TX_QUEUE_SAMPLES, AOKIE_SCO_USB_PAYLOAD_BYTES, AOKIE_VOICE_SETTING,
     AOKIE_VOICE_SETTING_TRANSPARENT,
 };
-use crate::aokie_radio::map_listing::parse_listing;
+use crate::aokie_radio::map_listing::{msg_attribute_pairs, parse_listing};
 use crate::aokie_radio::map_mas::{
     Folder as MasFolder, Operation as MasOperation, CHARSET_UTF8, MSG_TYPE_KEEP_BOTH_SMS_VARIANTS,
 };
@@ -386,6 +386,14 @@ enum PendingMapOp {
     /// MNS RFCOMM stays open; without this poll, those messages would
     /// stay invisible until the next ACL re-pair.
     PollInbox,
+    /// After a text is handed to the phone: list `folder` (outbox or
+    /// sent) and log where the text is. The phone reports sending
+    /// (SendingSuccess / SendingFailure) only over MNS, which an
+    /// outbound session never gets, and its ack of our PUT means only
+    /// that the text is in its outbox, so the folders are the one way
+    /// to see whether it went out (sent) or is waiting or failed
+    /// (outbox, where the phone also files queued and failed texts).
+    CheckSent { folder: MasFolder },
 }
 
 impl PendingMapOp {
@@ -411,6 +419,7 @@ impl PendingMapOp {
                 )
             }
             PendingMapOp::PollInbox => "PollInbox".to_string(),
+            PendingMapOp::CheckSent { folder } => format!("CheckSent({:?})", folder),
         }
     }
 }
@@ -1585,6 +1594,9 @@ fn run_runtime(
     // falls back to polling once the AG has had time to settle. See
     // `project_pixel_rfcomm_mux_catatonia.md`.
     let mut last_send_reply_at: Option<Instant> = None;
+    // The send whose outbox and sent folders were last looked at (see
+    // PendingMapOp::CheckSent): each text is looked for once.
+    let mut send_checked_for: Option<Instant> = None;
     // Rate-limits the "PollInbox deferred — SendReply was Xs ago" log
     // so the same condition doesn't print every loop iteration. Only
     // useful for visibility; doesn't affect gate behaviour.
@@ -3845,6 +3857,15 @@ fn run_runtime(
                     None => true,
                     Some(ts) => ts.elapsed() >= INBOX_POLL_INTERVAL,
                 };
+                // Where did the last text go? Once the phone has settled
+                // after the PUT, look in its outbox and sent folders.
+                if let Some(sent_at) = last_send_reply_at {
+                    if send_checked_for != Some(sent_at) {
+                        send_checked_for = Some(sent_at);
+                        pending_map_ops.push_back(PendingMapOp::CheckSent { folder: MasFolder::Outbox });
+                        pending_map_ops.push_back(PendingMapOp::CheckSent { folder: MasFolder::Sent });
+                    }
+                }
                 if due {
                     pending_map_ops.push_back(PendingMapOp::PollInbox);
                     last_inbox_poll = Some(Instant::now());
@@ -4725,6 +4746,11 @@ fn pending_op_to_mas_operation(op: &PendingMapOp) -> MasOperation {
             bmessage: bmessage.clone(),
             charset: CHARSET_UTF8,
         },
+        PendingMapOp::CheckSent { folder } => MasOperation::ListMessages {
+            folder: *folder,
+            max_list_count: INBOX_POLL_MAX_LIST,
+            filter_message_type: MSG_TYPE_KEEP_BOTH_SMS_VARIANTS,
+        },
         PendingMapOp::PollInbox => MasOperation::ListMessages {
             folder: MasFolder::Inbox,
             max_list_count: INBOX_POLL_MAX_LIST,
@@ -4869,6 +4895,18 @@ fn handle_map_runtime_event(
                     seed_attempts,
                 );
             }
+            (
+                Some(PendingMapOp::CheckSent { folder }),
+                crate::aokie_radio::map_mas::OperationOutput::Listing(bytes),
+            ) => {
+                let entries = msg_attribute_pairs(&bytes);
+                if entries.is_empty() {
+                    eprintln!("[AokieRadio] sent check: {:?} is empty", folder);
+                }
+                for entry in &entries {
+                    eprintln!("[AokieRadio] sent check: {:?} holds {}", folder, sent_check_line(entry));
+                }
+            }
             (Some(other), unexpected) => {
                 eprintln!(
                     "[AokieRadio] MAP OperationCompleted with mismatched output {:?} for op {}",
@@ -4951,6 +4989,24 @@ fn entry_is_recent(entry: &crate::aokie_radio::map_listing::MessageEntry) -> boo
         .format("%Y%m%dT%H%M%S")
         .to_string();
     prefix >= cutoff.as_str()
+}
+
+/// One listing entry for the sent-check log: its state, with the number
+/// redacted and the text cut to its first words.
+fn sent_check_line(entry: &[(String, String)]) -> String {
+    entry
+        .iter()
+        .map(|(name, value)| match name.as_str() {
+            "recipient_addressing" | "sender_addressing" | "replyto_addressing" => {
+                format!("{}={}", name, aokie_core::redact::Phone(value))
+            }
+            "subject" | "recipient_name" | "sender_name" => {
+                format!("{}={:?}", name, value.chars().take(16).collect::<String>())
+            }
+            _ => format!("{}={}", name, value),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn handle_inbox_listing(
