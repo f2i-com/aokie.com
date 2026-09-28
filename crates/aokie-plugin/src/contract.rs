@@ -251,16 +251,16 @@ pub mod call_state {
 /// (`docs/contracts/aokie-persona.v1.json`, byte-identical in the FormLogic
 /// repo where the pack's DEFAULT_PERSONA is locked to it) resolve to ONE
 /// source. The in-plugin agent and the flow-based reply path can never drift.
-pub const DEFAULT_AGENT_PERSONA: &str = "You are Aokie, a warm, efficient phone receptionist for a small \
-business, speaking out loud on a live phone call. If the caller asks who you are or your name, say \
-you are Aokie, the automated receptionist - never invent a different name for yourself. Reply with ONE short, natural spoken sentence — no \
-lists, markdown, or emoji. Your job: greet the caller, find out their name and how you can help, \
-capture the key details (what they need, and a callback number or time if relevant), and either book \
-them in or take a message. Ask only ONE clear question at a time and keep the conversation moving. \
-IMPORTANT - only promise what actually happens: you take booking REQUESTS and messages for the team \
-to confirm, so say things like I have noted that down and someone will confirm with you - NEVER say \
-you will send a text, SMS, email, or confirmation yourself, and never claim something is booked, \
-sent, or done, because you cannot send messages and bookings are confirmed by a person afterwards.";
+///
+/// It is business context only, the default for an install with no saved
+/// `persona`. The agent that reads it brings its own rules: on the OAIY route
+/// OAIY's call agent (for which this is "the receptionist brief"), and
+/// elsewhere Aokie's own speech-style, booking and grounding instructions.
+/// So it gives the agent no name, no sentence limits and no stock phrases.
+pub const DEFAULT_AGENT_PERSONA: &str = "A small business answers this phone. People call to ask a \
+question, to book a time, or to leave a message for the team. Bookings made on a call are requests: \
+someone from the team confirms each one with the caller afterwards. When someone needs a call back, \
+the team needs their name, what it is about, and a good number and time to reach them.";
 
 #[cfg(test)]
 mod tests {

@@ -508,8 +508,8 @@
         ) +
         hint(
           route === 'oaiy'
-            ? 'Business notes sent with every call, inside Aokie’s fixed call rules. OAIY gives them to the Front desk agent as the receptionist brief; the Front desk’s own /brief.md and call instructions take precedence. Blank = no notes, only the call rules.'
-            : 'Business notes for the receptionist on every call. Blank = the built-in receptionist script.'
+            ? 'Business notes sent with every call, inside Aokie’s fixed call rules. OAIY gives them to the Front desk agent as the receptionist brief; the Front desk’s own /brief.md and call instructions take precedence. Blank = short built-in notes: a small business taking questions, booking requests and messages.'
+            : 'Business notes for the receptionist on every call. Blank = short built-in notes: a small business taking questions, booking requests and messages.'
         )
     );
   }
