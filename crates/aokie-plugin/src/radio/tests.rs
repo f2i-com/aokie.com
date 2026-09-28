@@ -435,6 +435,126 @@ fn realtime_failsafe_never_waits_on_unproven_local_tts() {
 
 #[cfg(feature = "voice")]
 #[test]
+fn oaiy_route_is_told_by_the_provider_id_like_the_receptionist_screen() {
+    let oaiy = "ws://127.0.0.1:17872/api/ai/providers/oaiy/v1/realtime/stream";
+    let other = "ws://127.0.0.1:17872/api/ai/providers/openai-realtime/v1/realtime/stream";
+    assert!(oaiy_route_selected(true, Some(oaiy)));
+    assert!(!oaiy_route_selected(false, Some(oaiy)));
+    assert!(!oaiy_route_selected(true, Some(other)));
+    assert!(!oaiy_route_selected(true, None));
+    assert!(!oaiy_route_selected(
+        true,
+        Some("ws://127.0.0.1:17873/api/ai/providers/oaiy/v1/realtime/stream")
+    ));
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn oaiy_route_never_leaves_a_caller_to_aokies_missing_voice() {
+    // Screening: elsewhere a set message still holds the answer until TTS
+    // works; on the OAIY route a screened caller never rings through — the
+    // message is spoken only by Aokie's own voice, else a silent refusal.
+    assert!(screened_answer_waits_for_tts(false, "This number is blocked.", false));
+    assert!(!screened_answer_waits_for_tts(true, "This number is blocked.", false));
+    assert!(screened_answer_waits_for_tts(true, "This number is blocked.", true));
+    assert!(!screened_answer_waits_for_tts(true, "  ", true));
+    assert!(!screened_answer_waits_for_tts(false, "", false));
+
+    // Managers: the local PIN line elsewhere, OAIY on its route.
+    assert!(manager_line_is_local(false, true));
+    assert!(!manager_line_is_local(true, true));
+    assert!(!manager_line_is_local(false, false));
+
+    // The owner's handset dials are only observed on every route; answered
+    // and promoted callers keep Aokie's voice elsewhere, OAIY on its route.
+    assert!(local_voice_before_identity(true, true, false, false));
+    assert!(local_voice_before_identity(false, false, true, false));
+    assert!(local_voice_before_identity(false, false, false, true));
+    assert!(!local_voice_before_identity(true, false, true, false));
+    assert!(!local_voice_before_identity(true, false, false, true));
+    assert!(!local_voice_before_identity(false, false, false, false));
+
+    // Hold announcements need a voice on the OAIY route.
+    assert!(auto_hold_has_voice(false, false));
+    assert!(!auto_hold_has_voice(true, false));
+    assert!(auto_hold_has_voice(true, true));
+
+    // An agent dial with no session: legacy fallback elsewhere, ended on OAIY.
+    assert!(outbound_falls_back_to_local_voice(false));
+    assert!(!outbound_falls_back_to_local_voice(true));
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn oaiy_failure_apologises_with_any_voice_and_other_routes_still_need_proof() {
+    let skipped = VoiceSelfTest {
+        ok: true,
+        at: "now".into(),
+        duration_ms: 0,
+        detail: "skipped: Desktop realtime selected".into(),
+    };
+    let proven = VoiceSelfTest {
+        detail: "loopback ok - heard test".into(),
+        ..skipped.clone()
+    };
+    assert!(realtime_apology_can_speak(true, 16_000, None, Some(&skipped)));
+    assert!(realtime_apology_can_speak(true, 8_000, None, None));
+    assert!(!realtime_apology_can_speak(true, 16_000, Some("TTS model missing"), Some(&skipped)));
+    assert!(!realtime_apology_can_speak(true, 0, None, Some(&skipped)));
+    assert!(!realtime_apology_can_speak(false, 16_000, None, Some(&skipped)));
+    assert!(realtime_apology_can_speak(false, 16_000, None, Some(&proven)));
+    assert!(!realtime_apology_can_speak(false, 0, None, Some(&proven)));
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn realtime_start_facts_go_only_to_oaiy_and_carry_what_aokie_knows() {
+    let mut tracker = crate::call_session::SessionTracker::new();
+    tracker.dial(
+        "call_out".into(),
+        Some("+61400000000".into()),
+        "2026-09-29T00:00:00Z".into(),
+        true,
+    );
+    let intent = OutboundIntent {
+        call_id: "call_out".into(),
+        purpose: Some("Confirm Tuesday".into()),
+        opening_line: "Hi, it's the lawn crew.".into(),
+    };
+    let call = tracker.current().unwrap();
+    let facts = realtime_call_facts(true, call, Some(&intent));
+    assert_eq!(facts.direction, Some("outbound"));
+    assert_eq!(facts.from.as_deref(), Some("+61400000000"));
+    assert_eq!(facts.purpose.as_deref(), Some("Confirm Tuesday"));
+    assert_eq!(facts.opening_line.as_deref(), Some("Hi, it's the lawn crew."));
+    assert_eq!(facts.caller_name, None);
+    // Another provider gets exactly the start it always had.
+    assert_eq!(
+        realtime_call_facts(false, call, Some(&intent)),
+        crate::realtime_voice::CallFacts::default()
+    );
+    // Another call's intent never leaks into this one.
+    let stale = OutboundIntent {
+        call_id: "call_old".into(),
+        ..intent.clone()
+    };
+    let facts = realtime_call_facts(true, call, Some(&stale));
+    assert_eq!(facts.purpose, None);
+    assert_eq!(facts.opening_line, None);
+
+    let mut inbound = crate::call_session::SessionTracker::new();
+    inbound.ring("call_in".into(), "2026-09-29T00:00:00Z".into());
+    let facts = realtime_call_facts(true, inbound.current().unwrap(), Some(&intent));
+    assert_eq!(facts.direction, Some("inbound"));
+    assert_eq!(facts.from, None, "the caller id is not known yet");
+    assert_eq!(facts.purpose, None);
+    inbound.caller_id("0400111222".into());
+    let facts = realtime_call_facts(true, inbound.current().unwrap(), None);
+    assert_eq!(facts.from.as_deref(), Some("0400111222"));
+}
+
+#[cfg(feature = "voice")]
+#[test]
 fn realtime_keeps_local_audio_and_unsupported_backends_out_of_normal_lane() {
     assert!(!should_prepare_local_speech(true, false));
     assert!(should_prepare_local_speech(true, true));

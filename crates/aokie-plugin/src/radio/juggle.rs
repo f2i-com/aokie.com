@@ -21,6 +21,7 @@ pub(super) fn run_auto_hold_juggle(
     pending_controls: &mut std::collections::VecDeque<RadioControl>,
     screen_policy: &crate::screen::ScreenPolicy,
     auto_hold: bool,
+    hold_voice: bool,
     auto_hold_done_for: &mut Option<String>,
     promote_greet_for: &mut Option<String>,
     resume_line_for: &mut Option<(String, std::time::Instant)>,
@@ -89,6 +90,15 @@ pub(super) fn run_auto_hold_juggle(
                 if let Some(reason) = knock_screen {
                     eprintln!(
                         "[aokie-plugin] AUTO-HOLD: knocking caller is screened ({reason}) — no juggle, no queue spot; they ring out and leave no missed-call record"
+                    );
+                } else if !hold_voice {
+                    // OAIY route without Aokie's own voice: the juggle's
+                    // announcements would be silence (the first caller put
+                    // on hold unannounced, the second answered into a dead
+                    // line). Leave the knock to the network's call waiting.
+                    eprintln!(
+                        "[aokie-plugin] AUTO-HOLD: no voice for the hold announcements on the OAIY route (Aokie's own TTS is unavailable) — {} keeps hearing call waiting; if they give up it is a missed call for OAIY to ring back",
+                        w.call_id
                     );
                 } else if sr == 0 {
                     eprintln!(
