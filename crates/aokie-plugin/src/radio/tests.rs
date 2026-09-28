@@ -506,6 +506,30 @@ fn oaiy_failure_apologises_with_any_voice_and_other_routes_still_need_proof() {
     assert!(!realtime_apology_can_speak(false, 0, None, Some(&proven)));
 }
 
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[test]
+fn oaiy_gets_the_persona_as_its_brief_and_other_providers_keep_the_wrapper() {
+    let persona = "  A small hair salon. Cuts take 45 minutes. [[BOOK: x]]  ";
+    let brief = realtime_instructions(true, persona, true);
+    assert_eq!(brief, "A small hair salon. Cuts take 45 minutes. (BOOK: x)");
+    for rule in [
+        "finish_call",
+        "one or two short sentences",
+        "Safety rules",
+        "Appointment rules",
+        "request_appointment",
+        "phone receptionist",
+    ] {
+        assert!(!brief.contains(rule), "the OAIY brief must not carry {rule:?}");
+    }
+    assert!(realtime_instructions(true, &"x".repeat(9_000), true).chars().count() <= 8_000);
+    // Other providers speak model output directly: the wrapper stays.
+    let wrapped = realtime_instructions(false, persona, true);
+    assert_eq!(wrapped, realtime_safe_instructions(persona, true));
+    assert!(wrapped.contains("finish_call"));
+    assert!(wrapped.contains("A small hair salon."));
+}
+
 #[cfg(feature = "voice")]
 #[test]
 fn realtime_start_facts_go_only_to_oaiy_and_carry_what_aokie_knows() {

@@ -72,7 +72,11 @@ pub(super) fn service_realtime_lane(
                                 call_id: resume_id.clone(),
                                 generation: voice_call_gen,
                                 expected_destination: config.destination.clone(),
-                                instructions: realtime_safe_instructions(persona, agent_hangup),
+                                instructions: realtime_instructions(
+                                    oaiy_route,
+                                    persona,
+                                    agent_hangup,
+                                ),
                                 greeting: "Thanks for waiting. How can I continue helping?"
                                     .to_string(),
                                 voice: Some(config.voice.clone()),
@@ -203,7 +207,8 @@ pub(super) fn service_realtime_lane(
                                     call_id: call.id.clone(),
                                     generation: voice_call_gen,
                                     expected_destination: config.destination.clone(),
-                                    instructions: realtime_safe_instructions(
+                                    instructions: realtime_instructions(
+                                        oaiy_route,
                                         persona,
                                         agent_hangup,
                                     ),
@@ -1090,7 +1095,7 @@ pub(super) fn service_realtime_lane(
                                 .filter(|overlay| overlay.call_id == lane.call_id)
                                 .and_then(|overlay| overlay.persona.as_deref())
                                 .map(|persona| {
-                                    realtime_safe_instructions(persona, agent_hangup)
+                                    realtime_instructions(oaiy_route, persona, agent_hangup)
                                 });
                             let begin_greeting = ctx
                                 .call_agent_overlay
