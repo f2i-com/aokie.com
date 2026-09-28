@@ -517,7 +517,7 @@
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
-      '<small>ACCESS &amp; CONSENT</small>' +
+      '<small>Access &amp; consent</small>' +
       '<h3>Phone receptionist — access &amp; consent</h3>' +
       '</div>' +
       '</div>' +
@@ -555,7 +555,7 @@
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
-      '<small>CONSENT</small>' +
+      '<small>Consent</small>' +
       '<h3>Operator consent &amp; enforcement</h3>' +
       '</div>' +
       '</div>' +

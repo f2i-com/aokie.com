@@ -159,18 +159,20 @@
     { value: 'wbs', label: 'mSBC (16kHz, wideband)' },
   ];
 
-  /** Where each part of a call is set in OAIY Desktop, by the names its
-   *  sidebar and pages use. */
+  /** Where each part of a call is set in OAIY Desktop: [label, page, the
+   *  page's name, the rest of the way there]. The page name is a link to it;
+   *  live values (the voice, the model) follow from oaiyStatus. */
   var SET_IN_OAIY = [
-    ['Replies', 'Agent › Front desk project: /brief.md and the knowledge files'],
-    ['Call and text instructions', 'Agent › Phone (the phone chip at the top): Answer phone calls, and your instructions for calls and for texts'],
+    ['Replies', 'agent', 'Agent', ' › Front desk project: /brief.md and the knowledge files'],
+    ['Call and text instructions', 'agent', 'Agent', ' › Phone (the phone chip at the top): Answer phone calls, and your instructions for calls and for texts'],
     // Missed-call callbacks and call screening (who is answered, blocked
     // numbers) are set only there; they write Aokie's own screening and
     // outbound keys, so this form does not offer a second copy.
-    ['Callbacks and screening', 'Agent › Phone: missed-call callbacks, who is answered, and blocked numbers'],
-    ['Model', 'Agent › Settings › AI providers (the OAIY provider uses the model loaded in Engines)'],
-    ['Voice on calls', 'Calendar › Hours & services › Voice on calls'],
-    ['Hours, services and booking', 'Calendar › Hours & services — the receptionist looks these up during calls'],
+    ['Callbacks and screening', 'agent', 'Agent', ' › Phone: missed-call callbacks, who is answered, and blocked numbers'],
+    ['Speech', 'services', 'Services', ': speech to text, and the call voice'],
+    ['Model', 'engines', 'Engines', ', which the Front desk agent’s OAIY provider follows (Agent › Settings › AI providers)'],
+    ['Voice on calls', 'calendar', 'Calendar', ' › Hours & services › Voice on calls'],
+    ['Hours, services and booking', 'calendar', 'Calendar', ' › Hours & services; the receptionist looks these up during calls'],
   ];
 
   // ======================================================================
@@ -192,6 +194,9 @@
   // The host's AI sources, read for OAIY Voice's running state only.
   // undefined = not read yet; null = the read failed.
   var sources;
+  // PluginHost.oaiyStatus: the chosen call voice and the engines' model.
+  // null = not available (older host or failed read).
+  var oaiyStatus = null;
   // Provenance watch (live report 2026-07-18: "I changed the greeting and it
   // did not take"). A linked FormLogic app re-applies its Receptionist
   // Settings record on EVERY incoming call (the configure-receptionist flow
@@ -237,7 +242,7 @@
             }
           )
         : Promise.resolve(null);
-    return Promise.all([settingsP, sourcesP]).then(
+    return Promise.all([settingsP, sourcesP, OAIY.readStatus()]).then(
       function (results) {
         var data = results[0] || {};
         var merged = withAokieDefaults(data.settings);
@@ -247,6 +252,7 @@
         // explicitly presses Reload.
         var keepWorkingCopy = !!preserveEdits && loaded && hasUnsavedEdits();
         sources = results[1];
+        oaiyStatus = results[2];
         // ⚠️ baseline and settings must be SEPARATE objects: the form edits
         // MUTATE `settings` in place (plain DOM, not React state-replace),
         // and an aliased baseline would make every dirty-diff empty.
@@ -386,6 +392,27 @@
     return voice.status === 'running' ? 'running' : voice.status + ' — start it in OAIY Services';
   }
 
+  /** One section of the form, drawn as a dashboard card. */
+  function section(title, inner, extraClass) {
+    return (
+      '<section class="rcp-card' + (extraClass ? ' ' + extraClass : '') + '">' +
+      '<div class="rcp-card__heading"><div class="rcp-card__heading-copy"><small>' + title + '</small></div></div>' +
+      inner +
+      '</section>'
+    );
+  }
+
+  /** The live value for a "set in OAIY" row, '' when it cannot be read. */
+  function liveValue(label) {
+    if (label === 'Model') return OAIY.modelText(oaiyStatus);
+    if (label === 'Voice on calls') return OAIY.voiceText(oaiyStatus);
+    if (label === 'Speech') {
+      var voice = sources ? OAIY.voiceService(sources) : null;
+      return voice ? 'OAIY Voice ' + voice.status : '';
+    }
+    return '';
+  }
+
   /** Where calls go (from the SAVED settings) and what is set in OAIY. */
   function routeHtml() {
     var route = OAIY.callRoute(baseline);
@@ -394,10 +421,11 @@
       var voice = sources ? OAIY.voiceService(sources) : null;
       var voiceDown = !!voice && voice.status !== 'running';
       html.push(
-        '<p class="rcp-notice' + (voiceDown ? ' rcp-notice--warn' : '') + '" role="status">' +
+        '<p class="rcp-notice' + (voiceDown ? ' rcp-notice--warn' : ' rcp-notice--ok') + '" role="status">' +
           '<strong>Calls go to OAIY.</strong> Aokie streams each call to OAIY Desktop on this computer. ' +
-          'OAIY Voice hears the caller and speaks the replies; the Front desk agent writes them. ' +
-          'OAIY Voice: ' + esc(oaiyVoiceText()) + '.</p>'
+          'OAIY Voice hears the caller and speaks the replies; the Front desk agent writes them.' +
+          (voiceDown ? ' OAIY Voice is ' + esc(voice.status) + ': start it in ' + U.navLink('services', 'Services') + '.' : '') +
+          '</p>'
       );
     } else {
       var where =
@@ -410,7 +438,7 @@
         '<p class="rcp-notice rcp-notice--warn" role="status"><strong>Calls do not go to OAIY.</strong> ' +
           'They are answered by ' + where + '. Sending them to OAIY lets the Front desk agent answer in the OAIY voice; ' +
           'it applies after the receptionist restarts.</p>' +
-          '<div class="rcp-actions" style="margin-top: 0;">' +
+          '<div class="rcp-actions">' +
           '<button type="button" class="rcp-button is-primary" data-act="set-route-oaiy"' +
           (saving || loading ? ' disabled' : '') + '>Send calls to OAIY</button></div>'
       );
@@ -418,10 +446,16 @@
     html.push(
       '<div class="rcp-settings-list rcp-set-in-oaiy">' +
         SET_IN_OAIY.map(function (row) {
-          return '<div class="rcp-setting"><small>' + esc(row[0]) + '</small><span>' + esc(row[1]) + '</span></div>';
+          var live = liveValue(row[0]);
+          var where = U.navLink(row[1], row[2]) + esc(row[3]);
+          return (
+            '<div class="rcp-setting"><small>' + esc(row[0]) + '</small><span>' +
+            (live ? '<strong>' + esc(live) + '</strong> <em>in ' + where + '</em>' : where) +
+            '</span></div>'
+          );
         }).join('') +
         '</div>' +
-        hint('These are set in OAIY Desktop, in the sidebar pages named here. Aokie’s older speech engines, voices and model settings are not used for calls that go to OAIY.')
+        hint('These are set in OAIY Desktop, on the pages linked here. Aokie’s older speech engines, voices and model settings are not used for calls that go to OAIY.')
     );
     return html.join('');
   }
@@ -433,59 +467,81 @@
     var toOaiy = route === 'oaiy';
     var receptionist = toOaiy
       ? '<label class="rcp-check"><input type="checkbox" checked disabled /><span>The AI receptionist answers calls</span></label>' +
-        hint('Always on while calls go to OAIY. To stop the Front desk answering, turn off Answer phone calls in OAIY’s Agent › Phone.')
+        hint('Always on while calls go to OAIY. To stop the Front desk answering, turn off Answer phone calls in ' + U.navLink('agent', 'Agent') + ' › Phone.')
       : check('aiReceptionist', 'The AI receptionist answers calls') +
         hint('When off, Aokie only bridges the call: your flows or you (Speak, on the Overview) talk to the caller.');
-    return (
-      '<div>' +
-      '<h4 class="rcp-group-title">Answering</h4>' +
+    return section(
+      'Answering',
       receptionist +
-      check('autoAnswer', 'Auto-answer incoming calls') +
-      hint(
-        toOaiy
-          ? 'The phone rings until OAIY is ready to answer. If OAIY cannot be reached, it keeps ringing through to you.'
-          : 'Aokie picks up as soon as a call rings.'
+        check('autoAnswer', 'Auto-answer incoming calls') +
+        hint(
+          toOaiy
+            ? 'The phone rings until OAIY is ready to answer. If OAIY cannot be reached, it keeps ringing through to you.'
+            : 'Aokie picks up as soon as a call rings.'
+        ) +
+        check('agentHangup', 'The receptionist can end the call') +
+        hint('Lets the receptionist hang up once the caller is done and the goodbye is said. When off, it leaves the line open for the caller to hang up. Applies after the receptionist restarts.') +
+        (toOaiy
+          ? hint('OAIY Voice decides when the caller has finished and stops a reply when the caller talks over it.')
+          : '')
+    );
+  }
+
+  /** The greeting and the brief Aokie sends with each call. */
+  function greetingHtml(route) {
+    return section(
+      'Greeting &amp; brief',
+      field(
+        'Greeting (spoken first)',
+        '<input type="text" data-key="greeting" placeholder="Thanks for calling! How can I help you today?" value="' +
+          esc(settings.greeting) + '" />'
       ) +
-      check('agentHangup', 'The receptionist can end the call') +
-      hint('Lets the receptionist hang up once the caller is done and the goodbye is said. When off, it leaves the line open for the caller to hang up. Applies after the receptionist restarts.') +
-      (toOaiy
-        ? hint('OAIY Voice decides when the caller has finished and stops a reply when the caller talks over it.')
-        : '') +
-      '</div>'
+        hint(
+          route === 'oaiy'
+            ? 'Spoken first, as soon as the call connects, in the voice chosen in OAIY. Blank = a friendly built-in default.'
+            : 'Spoken first, as soon as the call connects. Blank = a friendly built-in default.'
+        ) +
+        field(
+          'Receptionist brief',
+          '<textarea rows="6" data-key="persona" placeholder="e.g. We are a small hair salon. Cuts take 45 minutes.">' +
+            esc(settings.persona) + '</textarea>'
+        ) +
+        hint(
+          route === 'oaiy'
+            ? 'Business notes sent with every call, inside Aokie’s fixed call rules. OAIY gives them to the Front desk agent as the receptionist brief; the Front desk’s own /brief.md and call instructions take precedence. Blank = no notes, only the call rules.'
+            : 'Business notes for the receptionist on every call. Blank = the built-in receptionist script.'
+        )
     );
   }
 
   /** Aokie's own turn-taking — used only when Aokie's older speech answers. */
   function tuningHtml() {
-    return (
-      '<div>' +
-      '<h4 class="rcp-group-title">Conversation tuning</h4>' +
+    return section(
+      'Conversation tuning',
       hint('These apply to calls Aokie’s own speech answers, not to calls that go to OAIY.') +
-      field(
-        'Wait after the caller pauses (ms)',
-        '<input type="number" data-num="sttEndpointMs" min="150" max="2000" step="50" value="' +
-          esc(settings.sttEndpointMs) + '" />'
-      ) +
-      hint(
-        'How long the caller must pause before Aokie treats their turn as finished. Lower = snappier, but risks cutting off mid-sentence pauses.'
-      ) +
-      check('bargeIn', 'Listen while speaking and allow interruptions') +
-      hint('Keep the caller’s words while Aokie talks. Sustained speech or “stop” makes Aokie yield; brief interjections are kept for the next turn. Requires live call transcription. Applies after reconnecting.') +
-      check('conversationAcknowledgements', 'Let Aokie briefly acknowledge longer explanations') +
-      hint('A short “Mm-hm” at a brief pause lets the caller know Aokie is listening. Their turn stays open, and they can interrupt the acknowledgement. Requires listening while speaking; applies after reconnecting.') +
-      field(
-        'Interruption threshold',
-        '<input type="number" data-num="bargeSensitivity" min="100" max="2000" step="25" value="' +
-          esc(settings.bargeSensitivity) + '" />'
-      ) +
-      hint('Lower = easier to interrupt; too low may react to background noise. Start around 550–650. With listening off, caller recognition is muted during replies.') +
-      '</div>'
+        field(
+          'Wait after the caller pauses (ms)',
+          '<input type="number" data-num="sttEndpointMs" min="150" max="2000" step="50" value="' +
+            esc(settings.sttEndpointMs) + '" />'
+        ) +
+        hint(
+          'How long the caller must pause before Aokie treats their turn as finished. Lower = snappier, but risks cutting off mid-sentence pauses.'
+        ) +
+        check('bargeIn', 'Listen while speaking and allow interruptions') +
+        hint('Keep the caller’s words while Aokie talks. Sustained speech or “stop” makes Aokie yield; brief interjections are kept for the next turn. Requires live call transcription. Applies after reconnecting.') +
+        check('conversationAcknowledgements', 'Let Aokie briefly acknowledge longer explanations') +
+        hint('A short “Mm-hm” at a brief pause lets the caller know Aokie is listening. Their turn stays open, and they can interrupt the acknowledgement. Requires listening while speaking; applies after reconnecting.') +
+        field(
+          'Interruption threshold',
+          '<input type="number" data-num="bargeSensitivity" min="100" max="2000" step="25" value="' +
+            esc(settings.bargeSensitivity) + '" />'
+        ) +
+        hint('Lower = easier to interrupt; too low may react to background noise. Start around 550–650. With listening off, caller recognition is muted during replies.')
     );
   }
 
-  function formHtml() {
-    var route = OAIY.callRoute(baseline);
-    var viaRealtime = route === 'oaiy' || route === 'realtime';
+  /** Hardware: the Bluetooth link. */
+  function advancedHtml(viaRealtime) {
     var codecOpts = [];
     for (var c = 0; c < AOKIE_CODEC_OPTIONS.length; c++) {
       var co = AOKIE_CODEC_OPTIONS[c];
@@ -495,45 +551,8 @@
           '</option>'
       );
     }
-
-    return (
-      '<form class="rcp-form" id="set-form">' +
-      // ---- Where calls go --------------------------------------------------
-      '<div>' +
-      '<h4 class="rcp-group-title">Where calls go</h4>' +
-      routeHtml() +
-      '</div>' +
-      // ---- Answering -------------------------------------------------------
-      answeringHtml(route) +
-      // ---- Greeting & brief ------------------------------------------------
-      '<div>' +
-      '<h4 class="rcp-group-title">Greeting &amp; brief</h4>' +
-      field(
-        'Greeting (spoken first)',
-        '<input type="text" data-key="greeting" placeholder="Thanks for calling! How can I help you today?" value="' +
-          esc(settings.greeting) + '" />'
-      ) +
-      hint(
-        route === 'oaiy'
-          ? 'Spoken first, as soon as the call connects, in the voice chosen in OAIY. Blank = a friendly built-in default.'
-          : 'Spoken first, as soon as the call connects. Blank = a friendly built-in default.'
-      ) +
-      field(
-        'Receptionist brief',
-        '<textarea rows="5" data-key="persona" placeholder="e.g. We are a small hair salon. Cuts take 45 minutes.">' +
-          esc(settings.persona) + '</textarea>'
-      ) +
-      hint(
-        route === 'oaiy'
-          ? 'Business notes sent with every call, inside Aokie’s fixed call rules. OAIY gives them to the Front desk agent as the receptionist brief; the Front desk’s own /brief.md and call instructions take precedence. Blank = no notes, only the call rules.'
-          : 'Business notes for the receptionist on every call. Blank = the built-in receptionist script.'
-      ) +
-      '</div>' +
-      // ---- Conversation tuning (Aokie's own speech only) --------------------
-      (viaRealtime ? '' : tuningHtml()) +
-      // ---- Advanced --------------------------------------------------------
-      '<div>' +
-      '<h4 class="rcp-group-title">Advanced</h4>' +
+    return section(
+      'Advanced',
       // Phone connection: the Aokie USB dongle is the only transport offered.
       // The native Windows-Bluetooth backend (transportMode setting) exists
       // for advanced use, but Windows 11 25H2 removed the OS hands-free
@@ -541,37 +560,51 @@
       // pinned to the dongle in the UI rather than offered as a choice that
       // silently breaks calls.
       hint('Phone connection: Aokie USB dongle.') +
-      // Dongle-only hardware knobs — meaningless on the native Windows
-      // Bluetooth transport, so they hide (in place, order preserved) unless
-      // the mode is dongle. Each keeps its own wrapper so answerTone and the
-      // surrounding layout render exactly as before in dongle mode.
-      '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
-      field('Bluetooth audio codec', '<select data-key="hfpCodec">' + codecOpts.join('') + '</select>') +
-      hint('Dongle mode only. Some dongles only work reliably with CVSD; mSBC gives better speech-recognition accuracy where supported.') +
-      '</div>' +
-      // The test tone is not played on realtime calls, so it only shows
-      // where it does something. reenumerateHwid is not offered: the plugin
-      // reads it as a hardware id but its settings schema types it as a
-      // boolean, so any id typed here would make the whole save fail.
-      (viaRealtime
-        ? ''
-        : check('answerTone', 'Play a test tone on answer') +
-          hint('Diagnostic: verifies the outbound audio path reaches the caller. Leave off for normal use.')) +
-      '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
-      check('legacyPairingPin', 'Allow legacy PIN pairing (compatibility)') +
-      hint(
-        "⚠️ Uses the fixed PIN 0000 for very old devices that can't do modern code-confirmation pairing — it provides no protection against a nearby impostor. Enable only while pairing such a device, then turn it back off.",
-        true
-      ) +
-      '</div>' +
-      '</div>' +
+        // Dongle-only hardware knobs — meaningless on the native Windows
+        // Bluetooth transport, so they hide (in place, order preserved)
+        // unless the mode is dongle.
+        '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
+        field('Bluetooth audio codec', '<select data-key="hfpCodec">' + codecOpts.join('') + '</select>') +
+        hint('Dongle mode only. Some dongles only work reliably with CVSD; mSBC gives better speech-recognition accuracy where supported.') +
+        '</div>' +
+        // The test tone is not played on realtime calls, so it only shows
+        // where it does something. reenumerateHwid is not offered: the plugin
+        // reads it as a hardware id but its settings schema types it as a
+        // boolean, so any id typed here would make the whole save fail.
+        (viaRealtime
+          ? ''
+          : check('answerTone', 'Play a test tone on answer') +
+            hint('Diagnostic: verifies the outbound audio path reaches the caller. Leave off for normal use.')) +
+        '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
+        check('legacyPairingPin', 'Allow legacy PIN pairing (compatibility)') +
+        hint(
+          "⚠️ Uses the fixed PIN 0000 for very old devices that can't do modern code-confirmation pairing — it provides no protection against a nearby impostor. Enable only while pairing such a device, then turn it back off.",
+          true
+        ) +
+        '</div>'
+    );
+  }
+
+  function formHtml() {
+    var route = OAIY.callRoute(baseline);
+    var viaRealtime = route === 'oaiy' || route === 'realtime';
+    return (
+      // A grid of cards that reflows with the width; "Where calls go" and the
+      // actions span it.
+      '<form class="rcp-form rcp-wide" id="set-form">' +
+      section('Where calls go', routeHtml(), 'rcp-wide') +
+      answeringHtml(route) +
+      greetingHtml(route) +
+      (viaRealtime ? '' : tuningHtml()) +
+      advancedHtml(viaRealtime) +
       // ---- Actions ---------------------------------------------------------
       // ⚠️ NOT type="submit": the sandboxed iframe (allow-scripts only, CSP
       // form-action 'none') BLOCKS native form submission BEFORE the submit
       // event fires — a submit button would be dead. Save rides the click
       // delegate; Enter-to-save rides the keydown handler in wire().
+      '<div class="rcp-form__actions rcp-wide">' +
       (pendingRestart
-        ? '<p class="rcp-hint is-warn">Saved — the change applies when the receptionist restarts. The phone reconnects automatically (about 15 seconds of downtime).</p>' +
+        ? '<p class="rcp-notice rcp-notice--warn">Saved — the change applies when the receptionist restarts. The phone reconnects automatically (about 15 seconds of downtime).</p>' +
           '<div class="rcp-actions">' +
           '<button type="button" class="rcp-button is-primary" data-act="set-apply-restart"' + (saving || loading ? ' disabled' : '') + '>Restart receptionist now</button>' +
           '</div>'
@@ -582,6 +615,7 @@
       '</button>' +
       '<button type="button" class="rcp-button" data-act="set-reload"' + (loading || saving ? ' disabled' : '') + '>Reload</button>' +
       '</div>' +
+      '</div>' +
       '</form>'
     );
   }
@@ -590,29 +624,22 @@
     if (!root) return;
     var body;
     if (loading && !loaded) {
-      body = '<p class="rcp-loading">Loading…</p>';
+      body = section('Receptionist settings', '<p class="rcp-loading">Loading…</p>', 'rcp-wide');
     } else if (!loaded) {
-      body =
-        '<div class="rcp-card__body"><p class="rcp-inline-note">Couldn\'t load receptionist settings.' +
-        (error ? ' ' + esc(error) : '') +
-        '</p><div class="rcp-actions"><button type="button" class="rcp-button" data-act="set-retry">Retry</button></div></div>';
+      body = section(
+        'Receptionist settings',
+        '<p class="rcp-inline-note">Couldn\'t load receptionist settings.' +
+          (error ? ' ' + esc(error) : '') +
+          '</p><div class="rcp-actions"><button type="button" class="rcp-button" data-act="set-retry">Retry</button></div>',
+        'rcp-wide'
+      );
     } else {
       body = formHtml();
     }
     root.innerHTML =
-      '<section class="rcp-card">' +
-      '<div class="rcp-card__heading">' +
-      '<div class="rcp-card__heading-copy">' +
-      '<small>CONFIGURE RECEPTIONIST</small>' +
-      '<h3>Receptionist settings</h3>' +
-      '</div>' +
-      '</div>' +
       appManagedNoticeHtml() +
       body +
-      (loaded && error
-        ? '<p class="rcp-error">' + esc(error) + '</p>'
-        : '') +
-      '</section>';
+      (loaded && error ? '<p class="rcp-error rcp-wide">' + esc(error) + '</p>' : '');
   }
 
   /**
@@ -627,7 +654,7 @@
   function appManagedNoticeHtml() {
     if (!loaded || !appManaged) return '';
     return (
-      '<p class="rcp-notice rcp-notice--warn" role="status">' +
+      '<p class="rcp-notice rcp-notice--warn rcp-wide" role="status">' +
       '<strong>Your FormLogic app just re-applied these settings' +
       (typeof configVersion === 'number' ? ' (config v' + configVersion + ')' : '') +
       '.</strong> ' +

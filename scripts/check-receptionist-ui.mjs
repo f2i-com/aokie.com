@@ -21,6 +21,7 @@ const payloads = {
 };
 let failed = false;
 let snapshot = { state: 'running', health: { status: 'ok' } };
+let oaiyStatus = { voice: { chosen: 'receptionist' }, llm: { running: true, state: 'ready', resident: 'engine-model' } };
 let sources = [{ kind: 'service', serviceId: 'oaiy-voice', id: 'service:oaiy-voice', status: 'running', url: 'http://127.0.0.1:8783' }];
 const host = {
   aiSources: async () => {
@@ -38,13 +39,22 @@ const host = {
   },
   events: { subscribe: async () => ({ unsubscribe() {} }) },
   toast() {},
+  navigate: async () => true,
+  oaiyStatus: async () => {
+    if (failed) throw new Error('Host unavailable');
+    return oaiyStatus;
+  },
 };
 const window = { PluginHost: host, addEventListener() {}, setInterval() {}, clearInterval() {} };
-const document = { hidden: true, getElementById: element, addEventListener() {}, querySelectorAll: () => [] };
+const rootClasses = new Set();
+const document = {
+  hidden: true, getElementById: element, addEventListener() {}, querySelectorAll: () => [],
+  documentElement: { classList: { add: (c) => rootClasses.add(c), remove: (c) => rootClasses.delete(c) } },
+};
 const context = vm.createContext({ window, document, URL, setTimeout, clearTimeout });
 const appSource = await readFile(new URL('app.js', base), 'utf8');
 vm.runInContext(appSource.replace(/\}\)\(\);\s*$/, `
-  window.testApp = { state, refreshSnapshot, refreshPhoneStatus, refreshPhones, refreshSettings, refreshSources, refreshSwitchboard, renderLive, replyOwner };
+  window.testApp = { state, refreshSnapshot, refreshPhoneStatus, refreshPhones, refreshSettings, refreshSources, refreshOaiyStatus, refreshSwitchboard, renderLive, replyOwner };
 })();`), context);
 const app = window.testApp;
 app.state.call = { callId: 'fixture', state: 'active' };
@@ -153,9 +163,23 @@ await Promise.all([app.refreshSnapshot(), app.refreshSettings(), app.refreshSour
 assert.match(element('readiness').innerHTML, /OAIY Front desk/);
 assert.match(element('readiness').innerHTML, /OAIY Voice running/);
 assert.match(element('settings-body').innerHTML, /OAIY Front desk/);
-assert.match(element('settings-body').innerHTML, /Chosen in OAIY/);
+assert.match(element('settings-body').innerHTML, /Chosen in Calendar/);
 assert.doesNotMatch(element('settings-body').innerHTML, /Pocket|Sherpa|old-model|LLM/);
 assert.equal(element('settings-title').textContent, 'Calls go to OAIY');
+// The host's live values and links: the chosen voice and the engines' model,
+// each a link to the dashboard page where it is set.
+await app.refreshOaiyStatus();
+assert.match(element('settings-body').innerHTML, /data-nav="calendar">receptionist</);
+assert.match(element('settings-body').innerHTML, /data-nav="engines">engine-model · ready</);
+assert.equal(rootClasses.has('rcp-no-nav'), false);
+oaiyStatus = { voice: null, llm: { running: false, state: null, resident: null } };
+await app.refreshOaiyStatus();
+assert.match(element('settings-body').innerHTML, /Chosen in Calendar/);
+assert.match(element('settings-body').innerHTML, /engines stopped/);
+failed = true;
+await app.refreshOaiyStatus();
+failed = false;
+assert.match(element('settings-body').innerHTML, /Loaded in Engines/);
 sources = [{ ...sources[0], status: 'stopped', url: null }];
 await app.refreshSources();
 assert.match(element('readiness').innerHTML, /OAIY Voice is stopped/);
@@ -193,4 +217,21 @@ assert.match(window.testPhone.bondedCardBody(), /Host unavailable/);
 failed = false;
 await window.testPhone.refreshAll();
 assert.match(window.testPhone.pairingCardBody(), /Phone connected/);
+// An older OAIY Desktop without navigate/oaiyStatus: links read as text and
+// the summary falls back to pointers.
+{
+  const olderClasses = new Set();
+  const olderHost = { ...host, navigate: undefined, oaiyStatus: undefined };
+  const olderWindow = { PluginHost: olderHost, addEventListener() {}, setInterval() {}, clearInterval() {} };
+  const olderDocument = { ...document, documentElement: { classList: { add: (c) => olderClasses.add(c), remove() {} } } };
+  const older = vm.createContext({ window: olderWindow, document: olderDocument, URL, setTimeout, clearTimeout });
+  vm.runInContext(appSource.replace(/\}\)\(\);\s*$/, `
+  window.testApp = { refreshSettings, refreshOaiyStatus };
+})();`), older);
+  assert.equal(olderClasses.has('rcp-no-nav'), true);
+  payloads['settings.get'] = { settings: oaiyBag };
+  await olderWindow.testApp.refreshOaiyStatus();
+  await olderWindow.testApp.refreshSettings();
+  assert.match(element('settings-body').innerHTML, /tabindex="-1">Chosen in Calendar</);
+}
 console.log('Receptionist UI checks passed (isolated host; no live commands).');

@@ -263,7 +263,7 @@
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
-      '<small>COMPANION DEVICE TRUST</small>' +
+      '<small>Companion device trust</small>' +
       '<h3>' + esc(COMPANION_ENROLLMENT_HEADING) + '</h3>' +
       '</div>' +
       '<span id="cmp-pill" class="rcp-pill is-neutral"><i></i><span id="cmp-pill-text">Checking</span></span>' +
