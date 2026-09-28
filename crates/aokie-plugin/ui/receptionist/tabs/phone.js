@@ -15,6 +15,11 @@
  * the window on "connected" slams it shut mid-SSP ("incorrect PIN or
  * passkey"). The confirm prompt stays visible while the plugin holds the SSP
  * reply (~25 s).
+ *
+ * Setup mode (the tab as the pairing step of OAIY's setup wizard, app.js):
+ * the step is done when a BONDED phone is connected and no pairing window or
+ * numeric comparison is open, by the same rule: a connection that comes up
+ * mid-pairing is not yet a paired phone.
  */
 (function () {
   'use strict';
@@ -367,6 +372,28 @@
       });
   }
 
+  // ---- setup mode -----------------------------------------------------------
+
+  /** The bonded phone that is connected now, or null. */
+  function connectedBond() {
+    if (!connected) return null;
+    var live = device && device.address ? String(device.address).toLowerCase() : '';
+    for (var i = 0; i < bonded.length; i++) {
+      var d = bonded[i];
+      if (d.connected || (live && String(d.address || '').toLowerCase() === live)) return d;
+    }
+    return null;
+  }
+
+  /** Setup mode: tell the wizard once a paired phone is connected. */
+  function reportSetup() {
+    var S = TABS.setup;
+    if (!S || !S.active() || !known) return;
+    var bond = !statusError && !bondedError && secondsLeft === 0 && !confirmPrompt ? connectedBond() : null;
+    if (bond) S.done('Paired with ' + (bond.name || (device && device.name) || bond.address));
+    else S.unsatisfied();
+  }
+
   // ---- rendering ----------------------------------------------------------
 
   function pairingCardBody() {
@@ -483,6 +510,7 @@
 
   function render() {
     if (!root) return;
+    reportSetup();
     var html =
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
