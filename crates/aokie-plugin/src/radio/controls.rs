@@ -883,6 +883,30 @@ pub(super) fn service_controls(
             Ok(RadioControl::Connect { address, reply }) => {
                 let _ = reply.send(bt.connect(&address));
             }
+            Ok(RadioControl::ResetDongle { reply }) => {
+                // The connector checked too, but a call may have started
+                // since: the radio thread's own view decides.
+                let call_up = tracker.current().is_some()
+                    || status.call_active.load(Ordering::Relaxed)
+                    || status.waiting_call.lock().unwrap().is_some()
+                    || status.parked_call.lock().unwrap().is_some();
+                let outcome = if call_up {
+                    Err(crate::contract::commands::DONGLE_RESET_DURING_CALL.to_string())
+                } else {
+                    bt.reset_transport().map(|()| {
+                        // Truthful until the controller reports ready again
+                        // (the next Initialized event sets it back).
+                        status.initialized.store(false, Ordering::Relaxed);
+                        eprintln!(
+                            "[aokie-plugin] dongle reset requested: reopening the USB connection, HCI_Reset, then paging the phone back"
+                        );
+                    })
+                };
+                if let Err(error) = &outcome {
+                    eprintln!("[aokie-plugin] dongle reset refused: {error}");
+                }
+                let _ = reply.send(outcome);
+            }
             Ok(RadioControl::ConfirmPairing {
                 address,
                 accept,

@@ -75,6 +75,15 @@ pub trait RadioBackend: Send {
     fn codec_connect(&self) -> Result<(), String> {
         Err("codec connection nudge is not supported on this backend".to_string())
     }
+    /// `dongle.reset`: reset the transport in software (close and reopen
+    /// the USB connection, HCI_Reset, page the phone back). Only the WinUSB
+    /// dongle owns a transport it can reset; the others refuse.
+    fn reset_transport(&self) -> Result<(), String> {
+        Err(format!(
+            "the {} transport cannot be reset in software",
+            self.backend_name()
+        ))
+    }
     fn open_pairing_window(&self, seconds: u64);
     fn close_pairing_window(&self);
     fn pairing_window(&self) -> PairingWindow;
@@ -204,6 +213,9 @@ impl RadioBackend for UsbRadioBackend {
     }
     fn codec_connect(&self) -> Result<(), String> {
         self.inner.codec_connect()
+    }
+    fn reset_transport(&self) -> Result<(), String> {
+        self.inner.reset_transport()
     }
     fn backend_name(&self) -> &'static str {
         "WinUSB dongle"

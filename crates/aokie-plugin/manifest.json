@@ -22,6 +22,7 @@
     "connector.aokie.dongle.restoreDriver",
     "connector.aokie.dongle.removeCerts",
     "connector.aokie.dongle.diagnostics",
+    "connector.aokie.dongle.reset",
     "connector.aokie.phone.status",
     "connector.aokie.phone.startPairing",
     "connector.aokie.phone.stopPairing",
@@ -64,6 +65,7 @@
         "dongle.restoreDriver",
         "dongle.removeCerts",
         "dongle.diagnostics",
+        "dongle.reset",
         "phone.status",
         "phone.startPairing",
         "phone.stopPairing",
@@ -193,6 +195,7 @@
   },
   "commands": {
     "journalled": [
+      "dongle.reset",
       "phone.startPairing",
       "phone.stopPairing",
       "phone.removePaired",

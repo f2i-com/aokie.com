@@ -270,6 +270,14 @@ impl BluetoothManager {
         self.runtime.codec_connect()
     }
 
+    /// Reset the dongle in software: close and reopen the WinUSB handle,
+    /// HCI_Reset, re-initialise, then page back the phone that was
+    /// connected. A call's audio would drop with the link, so callers
+    /// refuse this during a call.
+    pub fn reset_transport(&self) -> Result<(), String> {
+        self.runtime.reset_transport()
+    }
+
     /// AOK-BT-001: open a bounded, discoverable pairing window for `seconds`.
     /// At rest the radio is connectable-only, so an unknown phone can only
     /// pair while this window is open.
