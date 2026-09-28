@@ -1,0 +1,71 @@
+{
+  "$comment": [
+    "PROPOSED v4 additions to manifest.json for OAIY's setup wizard: a fragment for the host side to merge once OAIY reads v4.",
+    "manifest.json stays schemaVersion 3 until then: a v4 manifest would stop the plugin loading on today's host.",
+    "modules: the shape OAIY's modules code reads ({\"provides\": [...]}). Aokie's connector declares every command a phone claim needs (phone.status, sms.send, settings.get, settings.set, call.dial); the calendar needs none.",
+    "setup.steps[].done: the host re-checks this itself; PluginHost.setup.done() from the screen is only a hint to check now. The check shape here ({command, path, equals} or {command, all: [...]}) is a proposal; the host defines the final one.",
+    "Every done/when command is read-only, not journalled (not in commands.journalled), and must be sent with NO payload: dongle.diagnostics with {\"simulate\": \"call\"} runs a simulated call in dev mode. A command that rejects (no radio, plugin restarting) means not done.",
+    "consent: consent.get returns `grant` even when it is an old version or expired, and bluetooth.allowed is true in warn/off mode with no grant, so the check is enforce mode AND bluetooth.allowed AND nothing blocking the radio for consent. In dev mode (FORMLOGIC_DEV_MODE=1) the mode is always \"off\", so this step never checks done there.",
+    "dongle: radio.connected is the PHONE's link (set at ACL connection), not the dongle's; the dongle is ready when radio.initialized is true (the controller answered, aokie.dongle.ready). dongle.diagnostics rejects while no radio exists. On the built-in Windows Bluetooth transport (settings.transportMode native or auto) there is no dongle and radio.initialized only turns true once a phone connects, so the step is skipped there (`when`).",
+    "pair: phone.status.paired is true as soon as a phone's link is up (ACL connection complete), which is a beat BEFORE the numeric comparison of a new pairing, and without a radio it reports the saved config. The check is a live connection with no pairing window and no comparison open; `connected` is absent without a radio.",
+    "The screen (ui/receptionist, setup mode) shows the tab for `view` and calls PluginHost.setup.done() on the same conditions, plus: consent also needs every configured destination covered; pair also needs the connected phone in phone.listPaired."
+  ],
+  "schemaVersion": 4,
+  "modules": {
+    "provides": ["phone", "calendar"]
+  },
+  "setup": {
+    "steps": [
+      {
+        "id": "consent",
+        "title": "Consent",
+        "description": "Choose what the receptionist may access and where call data may go.",
+        "kind": "screen",
+        "screen": "receptionist-home",
+        "view": "consent",
+        "done": {
+          "command": "consent.get",
+          "all": [
+            { "path": "mode", "equals": "enforce" },
+            { "path": "bluetooth.allowed", "equals": true },
+            { "path": "blocked", "equals": null }
+          ]
+        }
+      },
+      {
+        "id": "dongle",
+        "title": "Bluetooth dongle",
+        "description": "Install the dongle's driver so Aokie can open it.",
+        "kind": "screen",
+        "screen": "receptionist-home",
+        "view": "dongle",
+        "when": {
+          "command": "settings.get",
+          "path": "settings.transportMode",
+          "notIn": ["native", "auto"]
+        },
+        "done": {
+          "command": "dongle.diagnostics",
+          "path": "radio.initialized",
+          "equals": true
+        }
+      },
+      {
+        "id": "pair",
+        "title": "Pair your phone",
+        "description": "Pair the business phone and confirm the code.",
+        "kind": "screen",
+        "screen": "receptionist-home",
+        "view": "phone",
+        "done": {
+          "command": "phone.status",
+          "all": [
+            { "path": "connected", "equals": true },
+            { "path": "pairingOpen", "equals": false },
+            { "path": "pairingConfirm", "equals": null }
+          ]
+        }
+      }
+    ]
+  }
+}
