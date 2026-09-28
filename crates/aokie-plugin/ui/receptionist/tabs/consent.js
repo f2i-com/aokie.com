@@ -462,17 +462,28 @@
         ' />' +
         '<span><strong>OpenAI ChatGPT via Codex</strong>' +
         '<span class="rcp-scope-detail">Allow caller transcript text to be processed by OpenAI through the signed-in Codex agent. ' +
-        'Caller audio and account credentials are never included. Select this before choosing a ChatGPT via Codex live-call model.' +
+        'Caller audio and account credentials are never included. Only Aokie’s own older speech path uses it; calls that go to OAIY do not.' +
         (codexConfigured ? ' Required by the current LLM source.' : '') +
         '</span></span></label>';
     }
     if (realtimeConfigured) {
       var realtimeDestination = effectiveDestination(settingsBag.realtimeVoiceDestination);
-      codexChoice +=
-        '<p class="rcp-notice rcp-notice--warn" role="note"><strong>Realtime call audio:</strong> ' +
-        'the selected live-call voice provider sends raw caller and assistant audio through FormLogic Desktop to ' +
-        '<code>' + esc(realtimeDestination) + '</code>. The provider credential stays in Desktop, but the audio and transcripts are processed by that destination. ' +
-        'This destination is required by the current Realtime voice mode.</p>';
+      var oaiy = TABS.oaiy;
+      if (oaiy && oaiy.callRoute(settingsBag) === 'oaiy') {
+        // OAIY's own gateway: the audio goes to OAIY Desktop on this computer,
+        // which names itself by this origin in the signed grant.
+        codexChoice +=
+          '<p class="rcp-notice" role="note"><strong>Call audio goes to OAIY:</strong> ' +
+          'caller and receptionist audio streams to OAIY Desktop on this computer (<code>' +
+          esc(realtimeDestination) + '</code>). OAIY Voice hears and speaks on this machine, and the Front desk ' +
+          'agent writes the replies with the model set in OAIY. Calls need this destination.</p>';
+      } else {
+        codexChoice +=
+          '<p class="rcp-notice rcp-notice--warn" role="note"><strong>Realtime call audio:</strong> ' +
+          'the selected live-call voice provider sends raw caller and assistant audio through OAIY Desktop to ' +
+          '<code>' + esc(realtimeDestination) + '</code>. The provider credential stays in Desktop, but the audio and transcripts are processed by that destination. ' +
+          'This destination is required by the current Realtime voice mode.</p>';
+      }
     }
     var scopeRows = [];
     for (var i = 0; i < SCOPE_ROWS.length; i++) {

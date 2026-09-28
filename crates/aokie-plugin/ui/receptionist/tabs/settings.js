@@ -1,15 +1,20 @@
 /*
  * Settings tab — the editable form over Aokie's live connector settings.
  *
- * Faithful port of FormLogic Desktop's compiled AokieSettingsForm
- * (desktop/src/aokie/AokieCard.tsx) + the pure helpers from
- * desktop/src/aokie/aokieSettings.ts (names/semantics preserved — a parity
- * suite may retarget the cross-repo settings tests at these functions).
+ * Started as a port of FormLogic Desktop's compiled AokieSettingsForm
+ * (desktop/src/aokie/AokieCard.tsx + desktop/src/aokie/aokieSettings.ts).
+ * Under OAIY, calls go to OAIY Desktop's voice gateway: the Front desk agent
+ * writes the replies and OAIY Voice hears and speaks. So this form no longer
+ * offers Aokie's own speech engines, voices, model or endpoint pickers — the
+ * call voice, the model and the replies are set in OAIY, and the form says
+ * where. What Aokie still owns is here: whether it answers, the greeting and
+ * brief it sends with each call, conversation handling and the hardware.
  *
  * Reads via `settings.get`, writes ONLY the fields the operator changed via
  * `settings.set` (the plugin merges per key, so untouched safety keys like
  * autoAnswer and unknown/newer plugin keys are never rewritten by an
- * unrelated edit — audit AOK-SAFE-001). No plugin restart required.
+ * unrelated edit — audit AOK-SAFE-001). Keys the form no longer shows keep
+ * their saved values.
  */
 (function () {
   'use strict';
@@ -20,12 +25,15 @@
   var U = TABS.util;
   var esc = U.esc;
   var errMsg = U.errMsg;
+  var OAIY = TABS.oaiy;
 
   // ======================================================================
-  // Ported pure helpers — desktop/src/aokie/aokieSettings.ts (TS → JS).
-  // Keep function names and semantics in lock-step with that module.
+  // Settings bag helpers (from desktop/src/aokie/aokieSettings.ts).
   // ======================================================================
 
+  // Every key the plugin reports, including the ones this form no longer
+  // shows: the dirty-diff below compares them all, so a hidden key can never
+  // be written by accident.
   var AOKIE_SETTINGS_DEFAULTS = {
     aiReceptionist: false,
     autoAnswer: false,
@@ -54,6 +62,7 @@
     transportMode: 'dongle',
     reenumerateHwid: '',
     legacyPairingPin: false,
+    agentHangup: false,
   };
 
   /** Parse a boolean setting the way the plugin does (legacy "true"/"false"
@@ -128,6 +137,7 @@
       reenumerateHwid:
         typeof src.reenumerateHwid === 'string' ? src.reenumerateHwid : d.reenumerateHwid,
       legacyPairingPin: boolSetting(src.legacyPairingPin, d.legacyPairingPin),
+      agentHangup: boolSetting(src.agentHangup, d.agentHangup),
     };
   }
 
@@ -143,580 +153,21 @@
     return patch;
   }
 
-  /** Conventional OpenAI-compatible path per lane. */
-  var LANE_PATHS = {
-    llm: '/v1/chat/completions',
-    stt: '/v1/audio/transcriptions',
-    tts: '/v1/audio/speech',
-  };
-
-  /** Legacy host fallback. Current hosts supply gatewayUrl on provider
-   *  sources so an alternate desktop API port is preserved. */
-  var AI_GATEWAY_BASE = 'http://127.0.0.1:17872/api/ai/providers/';
-  var REALTIME_GATEWAY_SUFFIX = '/v1/realtime/stream';
-  var CODEX_PROVIDER_LUNA_LOW = 'openai-codex-agent-luna-low';
-  var CODEX_PROVIDER_LUNA_LOW_FAST = 'openai-codex-agent-luna-low-fast';
-  var CODEX_PROVIDER_NONE = 'openai-codex-agent-none';
-  var CODEX_PROVIDER_LOW = 'openai-codex-agent-low';
-  var CODEX_MODEL = 'gpt-5.5';
-  var CODEX_LUNA_MODEL = 'gpt-5.6-luna';
-
-  function providerGatewayUrl(source) {
-    var providerId = String((source && source.providerId) || (source && source.id || '').slice(9));
-    var fallback = AI_GATEWAY_BASE + encodeURIComponent(providerId);
-    if (!source || typeof source.gatewayUrl !== 'string') return fallback;
-    try {
-      var parsed = new URL(source.gatewayUrl);
-      if (
-        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-        !parsed.username && !parsed.password && !parsed.search && !parsed.hash &&
-        parsed.pathname === '/api/ai/providers/' + encodeURIComponent(providerId)
-      ) return parsed.href;
-    } catch (e) { /* keep compatibility with older hosts */ }
-    return fallback;
-  }
-
-  function isKnownGatewayOrigin(parsed) {
-    for (var i = 0; i < (sources || []).length; i++) {
-      if (sources[i].kind !== 'provider' || !sources[i].gatewayUrl) continue;
-      try {
-        if (new URL(providerGatewayUrl(sources[i])).origin === parsed.origin) return true;
-      } catch (e) { /* ignore malformed source metadata */ }
-    }
-    return false;
-  }
-
-  /** Reserved live-call variants. Only their exact provider paths receive
-   *  this policy; ordinary providers behind the same gateway stay ordinary. */
-  function codexVariant(providerId) {
-    if (providerId === CODEX_PROVIDER_LUNA_LOW) return 'GPT-5.6 Luna · low reasoning (fastest Luna)';
-    if (providerId === CODEX_PROVIDER_LUNA_LOW_FAST) {
-      return 'GPT-5.6 Luna · low reasoning · Fast mode';
-    }
-    if (providerId === CODEX_PROVIDER_NONE) return 'GPT-5.5 · reasoning off';
-    if (providerId === CODEX_PROVIDER_LOW) return 'GPT-5.5 · low reasoning';
-    return null;
-  }
-
-  function codexModel(providerId) {
-    if (providerId === CODEX_PROVIDER_LUNA_LOW || providerId === CODEX_PROVIDER_LUNA_LOW_FAST) {
-      return CODEX_LUNA_MODEL;
-    }
-    if (providerId === CODEX_PROVIDER_NONE || providerId === CODEX_PROVIDER_LOW) return CODEX_MODEL;
-    return null;
-  }
-
-  function codexVariantForSource(source) {
-    var src = String(source || '');
-    return src.indexOf('provider:') === 0 ? codexVariant(src.slice(9)) : null;
-  }
-
-  function codexModelForSource(source) {
-    var src = String(source || '');
-    return src.indexOf('provider:') === 0 ? codexModel(src.slice(9)) : null;
-  }
-
-  function codexProviderForEndpoint(url) {
-    try {
-      var parsed = new URL(String(url || '').trim());
-      var host = parsed.hostname.toLowerCase();
-      var ipHost = host[0] === '[' && host[host.length - 1] === ']' ? host.slice(1, -1) : host;
-      var segments = parsed.pathname.split('/');
-      if (
-        segments.length !== 8 ||
-        segments[0] !== '' ||
-        segments[1] !== 'api' ||
-        segments[2] !== 'ai' ||
-        segments[3] !== 'providers' ||
-        segments[5] !== 'v1' ||
-        segments[6] !== 'chat' ||
-        segments[7] !== 'completions' ||
-        /%(?:2f|5c|00)/i.test(segments[4])
-      ) {
-        return null;
-      }
-      var providerId = decodeURIComponent(segments[4]);
-      var loopback =
-        host === 'localhost' ||
-        ipHost === '::1' ||
-        ipHost === '::' ||
-        /^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(ipHost) ||
-        ipHost === '::ffff:0:0' ||
-        /^127(?:\.[0-9]{1,3}){3}$/.test(host) ||
-        host === '0.0.0.0';
-      return (
-        loopback &&
-        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-        (parsed.port === '17872' || isKnownGatewayOrigin(parsed)) &&
-        codexModel(providerId) &&
-        providerId
-      ) || null;
-    } catch (e) {
-      return null;
-    }
-  }
-
-  function codexModelForEndpoint(url) {
-    var providerId = codexProviderForEndpoint(url);
-    return providerId ? codexModel(providerId) : null;
-  }
-
-  /** Compose one lane's saved endpoint URL from a source pick (same rule as
-   *  the console's laneUrl; providerOk = the LLM lane only). */
-  function composeLaneUrl(source, custom, lane, sources) {
-    var src = String(source || '').trim();
-    var url = String(custom || '').trim();
-    if (!src || src === 'custom') return url;
-    if (src.indexOf('service:') === 0) {
-      var svc = null;
-      for (var i = 0; i < sources.length; i++) {
-        if (sources[i].kind === 'service' && sources[i].id === src) {
-          svc = sources[i];
-          break;
-        }
-      }
-      if (!svc || svc.status !== 'running' || !svc.url) return '';
-      return svc.url + LANE_PATHS[lane];
-    }
-    if (src.indexOf('provider:') === 0) {
-      if (lane !== 'llm') return '';
-      for (var pi = 0; pi < sources.length; pi++) {
-        if (sources[pi].kind === 'provider' && sources[pi].id === src) {
-          return providerGatewayUrl(sources[pi]) + LANE_PATHS[lane];
-        }
-      }
-      return AI_GATEWAY_BASE + encodeURIComponent(src.slice(9)) + LANE_PATHS[lane];
-    }
-    return url;
-  }
-
-  function canonicalHttpsOrigin(value) {
-    try {
-      var parsed = new URL(String(value || '').trim());
-      if (
-        parsed.protocol !== 'https:' ||
-        parsed.username ||
-        parsed.password ||
-        parsed.pathname !== '/' ||
-        parsed.search ||
-        parsed.hash
-      ) return '';
-      return parsed.origin;
-    } catch (e) {
-      return '';
-    }
-  }
-
-  function realtimeProviderBinding(source) {
-    if (!source || source.kind !== 'provider') return null;
-    // Desktop's Realtime bridge currently implements only the OpenAI event
-    // dialect. Never advertise a superficially capable Custom/Anthropic
-    // profile that the bridge will deterministically reject at call time.
-    if (source.protocol !== 'openai') return null;
-    var caps = Array.isArray(source.capabilities) ? source.capabilities : [];
-    var capable =
-      caps.length === 0 ||
-      caps.indexOf('realtime') !== -1 ||
-      caps.indexOf('realtime_voice') !== -1 ||
-      caps.indexOf('audio.realtime') !== -1;
-    var providerId = typeof source.providerId === 'string' ? source.providerId.trim() : '';
-    if (!capable || !/^[A-Za-z0-9._-]{1,128}$/.test(providerId)) return null;
-    var destination = canonicalHttpsOrigin(source.destinationOrigin);
-    var reason = '';
-    if (source.enabled === false) reason = 'disabled';
-    else if (Array.isArray(source.gatewayCapabilities) && source.gatewayCapabilities.indexOf('realtime') === -1) {
-      reason = 'not supported by this Desktop version';
-    }
-    else if (source.hasKey === false) reason = 'API key missing';
-    else if (!destination) reason = 'destination unavailable';
-    return {
-      endpoint: providerGatewayUrl(source).replace(/^http/, 'ws') + REALTIME_GATEWAY_SUFFIX,
-      destination: destination,
-      usable: !reason,
-      reason: reason,
-    };
-  }
-
-  function realtimeProviderOptions() {
-    var opts = [{ value: '', label: 'Choose a Desktop realtime provider…' }];
-    var seen = {};
-    for (var i = 0; i < sources.length; i++) {
-      var binding = realtimeProviderBinding(sources[i]);
-      if (!binding || seen[binding.endpoint]) continue;
-      seen[binding.endpoint] = true;
-      opts.push({
-        value: binding.endpoint,
-        destination: binding.destination,
-        disabled: !binding.usable,
-        label:
-          'Provider: ' +
-          (sources[i].name || sources[i].providerId || 'Realtime') +
-          (binding.reason ? ' (' + binding.reason + ')' : ''),
-      });
-    }
-    var current = String(settings.realtimeVoiceEndpoint || '').trim();
-    if (current && !seen[current]) {
-      opts.push({
-        value: current,
-        destination: settings.realtimeVoiceDestination,
-        label: 'Current provider (temporarily unavailable)',
-      });
-    }
-    return opts;
-  }
-
-  function realtimeVoiceHtml() {
-    var modeOptions =
-      '<option value="legacy"' +
-      (settings.realtimeVoiceMode === 'legacy' ? ' selected' : '') +
-      '>Local AI on this computer (your STT → LLM → TTS)</option>' +
-      '<option value="desktop_realtime"' +
-      (settings.realtimeVoiceMode === 'desktop_realtime' ? ' selected' : '') +
-      '>OpenAI Realtime — cloud voice + brain (via Desktop)</option>';
-    var providers = realtimeProviderOptions();
-    var providerOptions = [];
-    for (var i = 0; i < providers.length; i++) {
-      providerOptions.push(
-        '<option value="' + esc(providers[i].value) + '" data-destination="' +
-          esc(providers[i].destination || '') + '"' +
-          (providers[i].disabled ? ' disabled' : '') +
-          (settings.realtimeVoiceEndpoint === providers[i].value ? ' selected' : '') + '>' +
-          esc(providers[i].label) +
-          '</option>'
-      );
-    }
-    var realtimeVoices = ['marin', 'cedar', 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'];
-    var voiceOptions = realtimeVoices.map(function (voice) {
-      return '<option value="' + voice + '"' +
-        (settings.realtimeVoice === voice ? ' selected' : '') + '>' +
-        voice.charAt(0).toUpperCase() + voice.slice(1) + '</option>';
-    }).join('');
-    var turnOptions =
-      '<option value="server_vad"' +
-      (settings.realtimeTurnDetection === 'server_vad' ? ' selected' : '') +
-      '>Server VAD (quick)</option>' +
-      '<option value="semantic_vad"' +
-      (settings.realtimeTurnDetection === 'semantic_vad' ? ' selected' : '') +
-      '>Semantic VAD (natural turns)</option>';
-    return (
-      field('Live-call voice mode', '<select data-key="realtimeVoiceMode">' + modeOptions + '</select>') +
-      '<div id="set-realtime-zone"' +
-      (settings.realtimeVoiceMode === 'desktop_realtime' ? '' : ' hidden') +
-      '>' +
-      field(
-        'Realtime provider',
-        '<select data-realtime-endpoint="1">' + providerOptions.join('') + '</select>'
-      ) +
-      field('Realtime voice', '<select data-key="realtimeVoice">' + voiceOptions + '</select>') +
-      field('Turn detection', '<select data-key="realtimeTurnDetection">' + turnOptions + '</select>') +
-      field(
-        'Maximum response tokens',
-        '<input type="number" data-num="realtimeMaxOutputTokens" min="64" max="4096" step="32" value="' +
-          esc(settings.realtimeMaxOutputTokens) + '" />'
-      ) +
-      hint(
-        'Streams caller and assistant PCM through the Desktop for low-latency speech-to-speech. The API key stays in Desktop; raw call audio leaves this computer for the selected provider destination' +
-          (settings.realtimeVoiceDestination ? ' (' + esc(settings.realtimeVoiceDestination) + ')' : '') +
-          ' and requires destination consent. Realtime currently handles conversation and staff follow-up only; booking, live lookup, manager PIN, transfer and other action-marker flows stay on the standard voice path. Applies after reconnecting the receptionist.'
-      ) +
-      '</div>'
-    );
-  }
-
-  /** Reverse of composeLaneUrl for seeding the select from a saved URL. */
-  function inferLaneSource(savedUrl, lane, sources) {
-    var url = String(savedUrl || '').trim();
-    if (!url) return '';
-    // The four Desktop-owned Codex adapters accept equivalent loopback URL
-    // spellings. Hydrate them through the exact route parser before the
-    // canonical-prefix fallback below, so localhost/IPv6/userinfo/encoded-id
-    // forms remain the same provider selection.
-    if (lane === 'llm') {
-      var codexProviderId = codexProviderForEndpoint(url);
-      if (codexProviderId) return 'provider:' + codexProviderId;
-    }
-    var path = LANE_PATHS[lane];
-    for (var i = 0; i < sources.length; i++) {
-      var x = sources[i];
-      if (x.kind === 'service' && x.url && x.url + path === url) return x.id;
-      if (lane === 'llm' && x.kind === 'provider' && providerGatewayUrl(x) + path === url) return x.id;
-    }
-    if (url.indexOf(AI_GATEWAY_BASE) === 0) {
-      var id = url.slice(AI_GATEWAY_BASE.length).split('/')[0];
-      if (id) {
-        try {
-          return 'provider:' + decodeURIComponent(id);
-        } catch (e) {
-          return 'provider:' + id;
-        }
-      }
-    }
-    return 'custom';
-  }
-
-  /** Legacy fallback pocket voice list (no catalog reported). */
-  var FALLBACK_POCKET_VOICES = ['', 'alba', 'cosette', 'eponine', 'fantine', 'javert', 'jean', 'marius'];
-
-  /** Defensive parse of the settings.get `ttsVoiceCatalog` side key.
-   *  Absent / malformed / empty → null (legacy hardcoded UI). */
-  function parseTtsVoiceCatalog(raw) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-    var engines = raw.engines;
-    if (!Array.isArray(engines)) return null;
-    var out = [];
-    for (var i = 0; i < engines.length; i++) {
-      var e = engines[i];
-      if (!e || typeof e !== 'object' || Array.isArray(e)) continue;
-      if (typeof e.id !== 'string' || !e.id) continue;
-      var entry = {
-        id: e.id,
-        label: typeof e.label === 'string' && e.label ? e.label : e.id,
-      };
-      if (Array.isArray(e.voices)) {
-        var voices = [];
-        for (var v = 0; v < e.voices.length; v++) {
-          if (typeof e.voices[v] === 'string' && e.voices[v] !== '') voices.push(e.voices[v]);
-        }
-        entry.voices = voices;
-      }
-      if (Array.isArray(e.bundles)) {
-        var bundles = [];
-        for (var b = 0; b < e.bundles.length; b++) {
-          var br = e.bundles[b];
-          if (!br || typeof br !== 'object' || Array.isArray(br)) continue;
-          if (typeof br.dir !== 'string' || !br.dir) continue;
-          bundles.push({
-            dir: br.dir,
-            name: typeof br.name === 'string' && br.name ? br.name : br.dir,
-            kind: typeof br.kind === 'string' && br.kind ? br.kind : 'vits',
-          });
-        }
-        entry.bundles = bundles;
-      }
-      if (typeof e.scanRoot === 'string' && e.scanRoot) entry.scanRoot = e.scanRoot;
-      out.push(entry);
-    }
-    return out.length > 0 ? out : null;
-  }
-
-  /** The pocket voice select options: '' (Default) + installed voices
-   *  sorted/deduped; the legacy hardcoded list when no catalog. */
-  function pocketVoiceOptions(catalog) {
-    var pocket = null;
-    if (catalog) {
-      for (var i = 0; i < catalog.length; i++) {
-        if (catalog[i].id === 'pocket') {
-          pocket = catalog[i];
-          break;
-        }
-      }
-    }
-    var voices = (pocket && pocket.voices) || [];
-    if (voices.length === 0) return FALLBACK_POCKET_VOICES;
-    var seen = {};
-    var unique = [];
-    for (var j = 0; j < voices.length; j++) {
-      if (!seen[voices[j]]) {
-        seen[voices[j]] = true;
-        unique.push(voices[j]);
-      }
-    }
-    unique.sort(function (a, b) {
-      return a.localeCompare(b);
-    });
-    return [''].concat(unique);
-  }
-
-  /** Mirror of voice.rs normalize_tts_engine — unknown values are pocket. */
-  function normalizeEngine(raw) {
-    var v = String(raw == null ? '' : raw).trim().toLowerCase();
-    return v === 'sherpa' || v === 'sherpa-onnx' || v === 'piper' ? 'sherpa' : 'pocket';
-  }
-
-  /** Mirror of voice.rs voice_matches_engine — KEEP IN LOCK-STEP. The plugin
-   *  now REFUSES a voice belonging to the other engine and speaks the engine
-   *  default instead, so leaving one selected here would show a voice on screen
-   *  that no caller ever hears. Only the mismatch that actually happens is
-   *  caught: a sherpa BUNDLE name handed to pocket. */
-  function voiceMatchesEngine(engine, voice) {
-    var v = String(voice == null ? '' : voice).trim().toLowerCase();
-    if (v === '' || normalizeEngine(engine) !== 'pocket') return true;
-    if (v.slice(-4) === '.wav' || v.slice(-12) === '.safetensors') return true;
-    return !(
-      v.indexOf('vits-') === 0 ||
-      v.indexOf('piper-') === 0 ||
-      v.indexOf('kokoro-') === 0 ||
-      v.indexOf('-piper-') >= 0 ||
-      v.indexOf('-vits-') >= 0
-    );
-  }
-
-  /** Is the voice usable by the engine given what is actually INSTALLED?
-   *  Better informed than voiceMatchesEngine, which is the plugin-parity rule
-   *  and cannot see the catalog: the plugin must stay permissive for sherpa (a
-   *  bundle may legitimately name a speaker 'alba'), but here the catalog says
-   *  whether a name is a POCKET preset, so switching to sherpa with 'alba'
-   *  selected is a knowable mismatch rather than a guess. */
-  function voiceUsableByEngine(engine, voice, catalog) {
-    if (!voiceMatchesEngine(engine, voice)) return false;
-    var v = String(voice == null ? '' : voice).trim();
-    if (v === '' || normalizeEngine(engine) !== 'sherpa') return true;
-    // index 0 is '' (Default); anything at 1+ is a pocket preset.
-    return pocketVoiceOptions(catalog).indexOf(v) < 1;
-  }
-
-  var BUNDLE_ENGINE_TOKENS = { vits: 1, piper: 1, kokoro: 1, matcha: 1, mms: 1, coqui: 1, icefall: 1 };
-  var BUNDLE_QUALITY_TOKENS = { low: 1, medium: 1, high: 1, x_low: 1, x_high: 1 };
-
-  /** Human label for a sherpa voice-bundle folder name:
-   *  'vits-piper-en_GB-jenny_dioco-medium' → 'Jenny Dioco (en_GB, medium)'. */
-  function prettifyBundleName(name) {
-    var parts = name.split('-').filter(Boolean);
-    var i = 0;
-    while (i < parts.length && BUNDLE_ENGINE_TOKENS[parts[i].toLowerCase()]) i += 1;
-    var rest = parts.slice(i);
-    if (rest.length === 0) return name;
-    var locale = /^[a-z]{2,3}(_[A-Z]{2})?$/.test(rest[0]) ? rest[0] : null;
-    var last = rest[rest.length - 1];
-    var quality = rest.length > 1 && BUNDLE_QUALITY_TOKENS[last.toLowerCase()] ? last.toLowerCase() : null;
-    var voiceTokens = rest.slice(locale ? 1 : 0, quality ? rest.length - 1 : rest.length);
-    if (voiceTokens.length === 0) return name;
-    var voice = voiceTokens
-      .join(' ')
-      .split(/[_\s]+/)
-      .filter(Boolean)
-      .map(function (w) {
-        return w.charAt(0).toUpperCase() + w.slice(1);
-      })
-      .join(' ');
-    var meta = [locale, quality].filter(Boolean).join(', ');
-    return meta ? voice + ' (' + meta + ')' : voice;
-  }
-
-  /** Engine choices when the plugin doesn't report a catalog. */
-  var DEFAULT_ENGINES = [
-    { id: 'pocket', label: 'Pocket-TTS' },
-    { id: 'sherpa', label: 'Sherpa (Piper/VITS/Kokoro)' },
-  ];
-
-  /** Display label for an engine option (parity-locked with the console). */
-  function engineOptionLabel(engine) {
-    if (engine.id === 'pocket') return 'Pocket-TTS (default)';
-    if (engine.id === 'sherpa') return 'Sherpa — Piper/VITS voices (fast)';
-    return engine.label;
-  }
-
-  /** Sentinel <option> value for "Custom folder…" in the bundle picker. */
-  var CUSTOM_BUNDLE_DIR = '__custom__';
-
-  /** State update for a bundle-picker selection (a bundle pick writes
-   *  ttsModelDir AND ttsVoice = the bundle's folder NAME). */
-  function bundleSelectionUpdate(value, bundles) {
-    if (value === CUSTOM_BUNDLE_DIR) return { engine: { customDir: true } };
-    if (value === '') return { engine: { modelDir: '', customDir: false }, voice: '' };
-    var matched = null;
-    for (var i = 0; i < bundles.length; i++) {
-      if (bundles[i].dir === value) {
-        matched = bundles[i];
-        break;
-      }
-    }
-    var name = matched
-      ? matched.name
-      : value.split(/[\\/]/).filter(Boolean).pop() || value;
-    return { engine: { modelDir: value, customDir: false }, voice: name };
-  }
-
-  // ======================================================================
-  // Lane metadata — ported from AokieCard.tsx (CON-301 desktop side).
-  // ======================================================================
-
-  var LANES = ['llm', 'stt', 'tts'];
-  var LANE_CAPABILITY = { llm: 'chat', stt: 'transcription', tts: 'speech' };
-  var LANE_DEFAULT_SERVICE = { llm: null, stt: 'aokie-stt', tts: 'aokie-tts' };
-  var LANE_SETTING_KEY = { llm: 'aiEndpoint', stt: 'sttEndpoint', tts: 'ttsEndpoint' };
-  var LANE_LABEL = { llm: 'LLM source', stt: 'Speech-to-text source', tts: 'Text-to-speech source' };
-
   var AOKIE_CODEC_OPTIONS = [
     { value: 'auto', label: 'Auto' },
     { value: 'cvsd', label: 'CVSD (8kHz)' },
     { value: 'wbs', label: 'mSBC (16kHz, wideband)' },
   ];
 
-  /** The option list for one lane's source select (Aokie default speech
-   *  service first, capability-matching local services, providers on the LLM
-   *  lane only, then Custom URL… and Automatic = ''). */
-  function laneSourceOptions(lane, sources, currentSource) {
-    var cap = LANE_CAPABILITY[lane];
-    var def = LANE_DEFAULT_SERVICE[lane];
-    var services = sources.filter(function (s) {
-      return s.kind === 'service' && (s.capabilities || []).indexOf(cap) !== -1;
-    });
-    var ordered = services
-      .filter(function (s) {
-        return s.serviceId === def;
-      })
-      .concat(
-        services.filter(function (s) {
-          return s.serviceId !== def;
-        })
-      );
-    var opts = ordered.map(function (s) {
-      return {
-        value: s.id,
-        label: 'This computer: ' + s.name + (s.status === 'running' ? '' : ' (stopped)'),
-      };
-    });
-    if (lane === 'llm') {
-      var listed = {};
-      for (var i = 0; i < sources.length; i++) {
-        var p = sources[i];
-        if (p.kind !== 'provider') continue;
-        var caps = p.capabilities || [];
-        if (caps.length > 0 && caps.indexOf(cap) === -1) continue; // [] = all (legacy)
-        var variant = codexVariantForSource(p.id);
-        listed[p.id] = true;
-        opts.push({
-          value: p.id,
-          // Never surface the connected account identity here. These reserved
-          // reserved adapters have stable product + reasoning labels only.
-          label: variant ? 'Provider: ChatGPT via Codex — ' + variant : 'Provider: ' + p.name,
-        });
-      }
-      // Source discovery is best-effort and can briefly return no providers
-      // while Desktop is starting. A saved reserved Codex endpoint is still
-      // unambiguous, so keep that exact choice representable instead of
-      // letting the native <select> visually fall through to its first item.
-      if (codexVariantForSource(currentSource) && !listed[currentSource]) {
-        opts.push({
-          value: currentSource,
-          label: 'Provider: ChatGPT via Codex — ' + codexVariantForSource(currentSource),
-        });
-      }
-    }
-    opts.push({ value: 'custom', label: 'Custom URL…' });
-    opts.push({ value: '', label: 'Automatic (built-in)' });
-    return opts;
-  }
-
-  /** Seed one lane's select from the saved endpoint URL — anything the
-   *  option list can't represent degrades to 'custom' (never silently lost). */
-  function seedLaneSource(saved, lane, sources) {
-    var inferred = inferLaneSource(saved, lane, sources);
-    if (inferred === '' || inferred === 'custom') return inferred;
-    // Exact reserved URLs identify stable Desktop-owned adapters. Do not
-    // degrade them to Custom merely because aiSources() raced startup. A
-    // provider-id-looking near miss (for example, a trailing slash) stays
-    // Custom and can never be rewritten by an unrelated save.
-    if (lane === 'llm' && codexVariantForSource(inferred)) {
-      return codexProviderForEndpoint(saved) ? inferred : 'custom';
-    }
-    var opts = laneSourceOptions(lane, sources);
-    for (var i = 0; i < opts.length; i++) {
-      if (opts[i].value === inferred) return inferred;
-    }
-    return 'custom';
-  }
+  /** Where each part of a call is set in OAIY Desktop, by the names its
+   *  sidebar and pages use. */
+  var SET_IN_OAIY = [
+    ['Replies', 'Agent › Front desk project: /brief.md and the knowledge files'],
+    ['Call and text instructions', 'Agent › Phone (the phone chip at the top): Answer phone calls, and your instructions for calls and for texts'],
+    ['Model', 'Agent › Settings › AI providers (the OAIY provider uses the model loaded in Engines)'],
+    ['Voice on calls', 'Calendar › Hours & services › Voice on calls'],
+    ['Hours, services and booking', 'Calendar › Hours & services — the receptionist looks these up during calls'],
+  ];
 
   // ======================================================================
   // Tab state (module-level — survives tab switches, like the compiled
@@ -729,44 +180,24 @@
   var saving = false;
   var error = null;
   // Keys the last save reported as applies-at-restart (settings.set's
-  // appliesAtReconnect) — e.g. the live-call voice mode. Non-null renders
-  // the "Restart receptionist now" apply banner.
+  // appliesAtReconnect) — e.g. where calls go. Non-null renders the
+  // "Restart receptionist now" apply banner.
   var pendingRestart = null;
   var settings = withAokieDefaults(null);
   var baseline = withAokieDefaults(null);
-  var sources = [];
-  var laneSel = { llm: '', stt: '', tts: '' };
-  var baselineLaneSel = { llm: '', stt: '', tts: '' };
-  var catalog = null;
-  var customDir = false;
+  // The host's AI sources, read for OAIY Voice's running state only.
+  // undefined = not read yet; null = the read failed.
+  var sources;
   // Provenance watch (live report 2026-07-18: "I changed the greeting and it
   // did not take"). A linked FormLogic app re-applies its Receptionist
   // Settings record on EVERY incoming call (the configure-receptionist flow
-  // calls settings.set with persona/greeting/voice/model/endpoints), so an
+  // calls settings.set with the greeting and persona among others), so an
   // edit made here is genuinely saved and then genuinely replaced moments
   // later. The plugin bumps configVersion on every write, so a bump this tab
   // did not cause IS an external writer — we watch for it and say so plainly
   // instead of letting the operator conclude the form is broken.
   var configVersion = null;
   var appManaged = false;
-
-  /** Keys the linked app's configure-receptionist flow re-applies per call. */
-  var APP_MANAGED_KEYS = [
-    'persona',
-    'greeting',
-    'ttsVoice',
-    'aiModel',
-    'aiEndpoint',
-    'realtimeVoiceMode',
-    'realtimeVoiceEndpoint',
-    'realtimeVoiceDestination',
-    'realtimeVoice',
-    'realtimeTurnDetection',
-    'realtimeMaxOutputTokens',
-    'sttEndpoint',
-    'ttsEndpoint',
-    'aiReceptionist',
-  ];
 
   /** True once an external writer has been observed bumping configVersion. */
   function noteConfigVersion(next, ours) {
@@ -777,24 +208,8 @@
     configVersion = next;
   }
 
-  /** Lane picks are UI state (the settings bag stores only composed URLs), so
-   *  include them when deciding whether an automatic tab-entry refresh may
-   *  replace the working copy. */
   function hasUnsavedEdits() {
-    if (Object.keys(settingsPatch(baseline, settings)).length > 0) return true;
-    for (var i = 0; i < LANES.length; i++) {
-      var lane = LANES[i];
-      if (laneSel[lane] !== baselineLaneSel[lane]) return true;
-    }
-    return false;
-  }
-
-  function seededLanes(saved, availableSources) {
-    return {
-      llm: seedLaneSource(saved.aiEndpoint, 'llm', availableSources),
-      stt: seedLaneSource(saved.sttEndpoint, 'stt', availableSources),
-      tts: seedLaneSource(saved.ttsEndpoint, 'tts', availableSources),
-    };
+    return Object.keys(settingsPatch(baseline, settings)).length > 0;
   }
 
   function load(preserveEdits) {
@@ -807,38 +222,33 @@
     render();
     var settingsP = HOST.command('settings.get');
     // Source listing is best-effort — a failure must not block the form.
-    var sourcesP = HOST.aiSources().then(
-      function (list) {
-        return { ok: true, list: Array.isArray(list) ? list : [] };
-      },
-      function () {
-        return { ok: false, list: [] };
-      }
-    );
+    var sourcesP =
+      typeof HOST.aiSources === 'function'
+        ? HOST.aiSources().then(
+            function (list) {
+              return Array.isArray(list) ? list : [];
+            },
+            function () {
+              return null;
+            }
+          )
+        : Promise.resolve(null);
     return Promise.all([settingsP, sourcesP]).then(
       function (results) {
         var data = results[0] || {};
         var merged = withAokieDefaults(data.settings);
         // A tab-entry refresh must not eat edits that were already present or
-        // were typed while the two reads were in flight. Source metadata may
-        // still refresh safely; the working settings + their old baseline stay
-        // paired until the operator saves or explicitly presses Reload.
+        // were typed while the two reads were in flight. The working settings
+        // + their old baseline stay paired until the operator saves or
+        // explicitly presses Reload.
         var keepWorkingCopy = !!preserveEdits && loaded && hasUnsavedEdits();
-        var sourceResult = results[1];
-        if (sourceResult.ok) sources = sourceResult.list;
+        sources = results[1];
         // ⚠️ baseline and settings must be SEPARATE objects: the form edits
         // MUTATE `settings` in place (plain DOM, not React state-replace),
         // and an aliased baseline would make every dirty-diff empty.
         if (!keepWorkingCopy) {
           baseline = merged;
           settings = withAokieDefaults(merged);
-          baselineLaneSel = seededLanes(merged, sources);
-          laneSel = {
-            llm: baselineLaneSel.llm,
-            stt: baselineLaneSel.stt,
-            tts: baselineLaneSel.tts,
-          };
-          customDir = false;
         }
         // Keep the shared transport truth (the Dongle tab's visibility in
         // app.js) in step with the plugin's saved settings.
@@ -846,7 +256,6 @@
         // A bump between polls that this tab did not cause = the linked app
         // re-applied its record (see the provenance note above).
         noteConfigVersion(data.configVersion, false);
-        catalog = parseTtsVoiceCatalog(data.ttsVoiceCatalog);
         loaded = true;
         loading = false;
         render();
@@ -859,41 +268,22 @@
     );
   }
 
+  /** Save the changed keys. Resolves true when the plugin accepted them. */
   function save() {
-    if (saving) return;
-    // Endpoint lanes save the COMPOSED URL (the plugin settings bag stores
-    // URLs, not source ids); a stopped/vanished service composes '' — the
-    // plugin's built-in default — with an honest toast below.
-    var current = {};
-    var keys = Object.keys(settings);
-    for (var i = 0; i < keys.length; i++) current[keys[i]] = settings[keys[i]];
-    current.aiEndpoint = composeLaneUrl(laneSel.llm, settings.aiEndpoint, 'llm', sources);
-    current.sttEndpoint = composeLaneUrl(laneSel.stt, settings.sttEndpoint, 'stt', sources);
-    current.ttsEndpoint = composeLaneUrl(laneSel.tts, settings.ttsEndpoint, 'tts', sources);
-    var selectedCodexModel = codexModelForEndpoint(current.aiEndpoint);
-    if (selectedCodexModel) {
-      // The reserved Codex adapters are text-only and pin the raw upstream
-      // model. Mirror the connector-side invariant so the saved patch and
-      // the visible form are immediately truthful.
-      current.aiModel = selectedCodexModel;
-      current.sendAudio = false;
-      settings.aiModel = selectedCodexModel;
-      settings.sendAudio = false;
-    }
-    var patch = settingsPatch(baseline, current);
+    if (saving) return Promise.resolve(false);
+    var patch = settingsPatch(baseline, settings);
     if (Object.keys(patch).length === 0) {
       HOST.toast('success', 'No changes to save');
-      return;
+      return Promise.resolve(false);
     }
     saving = true;
     error = null;
     render();
-    // Snapshot of the picks as they were at save time (for the stopped-pick
-    // toast — laneSel is reseeded from the saved URLs after the write).
-    var laneSelBefore = { llm: laneSel.llm, stt: laneSel.stt, tts: laneSel.tts };
-    HOST.command('settings.set', patch)
+    var ok = false;
+    return HOST.command('settings.set', patch)
       .then(
         function (data) {
+          ok = true;
           var merged = withAokieDefaults((data || {}).settings);
           // Separate objects — see the aliasing note in load().
           baseline = merged;
@@ -902,46 +292,10 @@
           if (TABS.transport && TABS.transport.update) TABS.transport.update(merged);
           // OUR bump — never mistake a successful save for the linked app.
           noteConfigVersion((data || {}).configVersion, true);
-          // The set response may not carry the catalog side key — keep the
-          // one from the last settings.get rather than dropping to fallback.
-          var cat = parseTtsVoiceCatalog((data || {}).ttsVoiceCatalog);
-          if (cat) catalog = cat;
-          customDir = false;
-          baselineLaneSel = seededLanes(merged, sources);
-          laneSel = {
-            llm: baselineLaneSel.llm,
-            stt: baselineLaneSel.stt,
-            tts: baselineLaneSel.tts,
-          };
-          var stoppedNames = [];
-          for (var li = 0; li < LANES.length; li++) {
-            var lane = LANES[li];
-            if (
-              laneSelBefore[lane] &&
-              laneSelBefore[lane].indexOf('service:') === 0 &&
-              current[LANE_SETTING_KEY[lane]] === ''
-            ) {
-              var name = laneSelBefore[lane].slice(8);
-              for (var si = 0; si < sources.length; si++) {
-                if (sources[si].id === laneSelBefore[lane]) {
-                  name = sources[si].name;
-                  break;
-                }
-              }
-              stoppedNames.push(name);
-            }
-          }
-          if (stoppedNames.length > 0) {
-            HOST.toast(
-              'info',
-              stoppedNames.join(', ') +
-                ': saved as Automatic (built-in) — pick it again once the service is running.'
-            );
-          }
           var blocked = data && typeof data.blocked === 'string' ? data.blocked.trim() : '';
-          // Start-only keys (the live-call voice mode and friends) are saved
-          // but NOT live until the plugin restarts — surface the apply step
-          // instead of letting the change look silently ignored.
+          // Start-only keys (where calls go and friends) are saved but NOT
+          // live until the plugin restarts — surface the apply step instead
+          // of letting the change look silently ignored.
           var pend = (data || {}).appliesAtReconnect;
           pendingRestart = pend && pend.length ? pend.slice() : null;
           if (blocked) {
@@ -955,7 +309,7 @@
               'Saved — one more step: press "Restart receptionist now" below to apply it to the line.'
             );
           } else {
-            HOST.toast('success', 'Receptionist settings saved — takes effect on the next caller turn.');
+            HOST.toast('success', 'Receptionist settings saved — takes effect on the next call.');
           }
         },
         function (e) {
@@ -965,7 +319,29 @@
       .then(function () {
         saving = false;
         render();
+        return ok;
       });
+  }
+
+  var ROUTE_KEYS = ['realtimeVoiceMode', 'realtimeVoiceEndpoint', 'realtimeVoiceDestination', 'aiReceptionist'];
+
+  /** Point calls at OAIY's voice gateway and save. The route keys are
+   *  start-only, so the restart banner follows; a destination the consent
+   *  grant does not cover pauses the line until Consent is reviewed. A
+   *  refused save puts the route keys back, so a later Save of something
+   *  else never retries it unasked. */
+  function routeToOaiy() {
+    var before = {};
+    for (var i = 0; i < ROUTE_KEYS.length; i++) before[ROUTE_KEYS[i]] = settings[ROUTE_KEYS[i]];
+    settings.realtimeVoiceMode = 'desktop_realtime';
+    settings.realtimeVoiceEndpoint = OAIY.endpoint;
+    settings.realtimeVoiceDestination = OAIY.destination;
+    settings.aiReceptionist = true;
+    save().then(function (saved) {
+      if (saved) return;
+      for (var k in before) settings[k] = before[k];
+      render();
+    });
   }
 
   // Number inputs: guard against NaN AND a momentarily-empty field while
@@ -979,8 +355,7 @@
 
   // ======================================================================
   // Rendering (plain DOM). The full form renders on load/save/reload;
-  // the voice zone re-renders on engine/bundle changes; lane custom-URL
-  // rows toggle in place — text inputs never rebuild under a keystroke.
+  // text inputs never rebuild under a keystroke.
   // ======================================================================
 
   function field(labelHtml, controlHtml) {
@@ -998,255 +373,90 @@
     );
   }
 
-  function voiceZoneHtml() {
-    var isSherpa = settings.ttsEngine === 'sherpa';
-    var bundles = [];
-    if (catalog) {
-      for (var i = 0; i < catalog.length; i++) {
-        if (catalog[i].id === 'sherpa' && catalog[i].bundles) bundles = catalog[i].bundles;
-      }
-    }
-    var voiceOptions = pocketVoiceOptions(catalog);
-    var unlistedVoice = settings.ttsVoice !== '' && voiceOptions.indexOf(settings.ttsVoice) === -1;
-    var matchedBundle = null;
-    for (var b = 0; b < bundles.length; b++) {
-      if (bundles[b].dir === settings.ttsModelDir) matchedBundle = bundles[b];
-    }
-    // A stored folder outside the catalog renders as the Custom choice with
-    // the input pre-filled — never silently discarded.
-    var bundleValue =
-      customDir || (settings.ttsModelDir !== '' && !matchedBundle)
-        ? CUSTOM_BUNDLE_DIR
-        : matchedBundle
-          ? matchedBundle.dir
-          : '';
-    var showCustomDir = isSherpa && (bundles.length === 0 || bundleValue === CUSTOM_BUNDLE_DIR);
-    var isKokoro = isSherpa && matchedBundle && matchedBundle.kind === 'kokoro';
+  /** OAIY Voice's state, live from the host's source list. */
+  function oaiyVoiceText() {
+    if (sources === undefined) return 'checking';
+    if (sources === null) return 'unknown — the source list could not be read';
+    var voice = OAIY.voiceService(sources);
+    if (!voice) return 'not installed on this computer';
+    return voice.status === 'running' ? 'running' : voice.status + ' — start it in OAIY Services';
+  }
+
+  /** Where calls go (from the SAVED settings) and what is set in OAIY. */
+  function routeHtml() {
+    var route = OAIY.callRoute(baseline);
     var html = [];
-
-    if (!isSherpa) {
-      var vopts = [];
-      for (var v = 0; v < voiceOptions.length; v++) {
-        var vo = voiceOptions[v];
-        vopts.push(
-          '<option value="' + esc(vo) + '"' + (settings.ttsVoice === vo ? ' selected' : '') + '>' +
-            (vo === '' ? 'Default' : esc(vo.charAt(0).toUpperCase() + vo.slice(1))) +
-            '</option>'
-        );
-      }
-      if (unlistedVoice) {
-        vopts.push('<option value="' + esc(settings.ttsVoice) + '" selected>' + esc(settings.ttsVoice) + ' (current)</option>');
-      }
-      html.push(field('Voice', '<select data-key="ttsVoice">' + vopts.join('') + '</select>'));
+    if (route === 'oaiy') {
+      var voice = sources ? OAIY.voiceService(sources) : null;
+      var voiceDown = !!voice && voice.status !== 'running';
       html.push(
-        hint(
-          catalog
-            ? 'Pocket-TTS voices installed on this machine.'
-            : 'Pocket-TTS voice — the plugin reports its installed list once it runs.'
-        )
+        '<p class="rcp-notice' + (voiceDown ? ' rcp-notice--warn' : '') + '" role="status">' +
+          '<strong>Calls go to OAIY.</strong> Aokie streams each call to OAIY Desktop on this computer. ' +
+          'OAIY Voice hears the caller and speaks the replies; the Front desk agent writes them. ' +
+          'OAIY Voice: ' + esc(oaiyVoiceText()) + '.</p>'
+      );
+    } else {
+      var where =
+        route === 'realtime'
+          ? 'another realtime provider (' + esc(OAIY.realtimeProviderId(baseline.realtimeVoiceEndpoint) || 'unknown') + ')'
+          : route === 'local'
+            ? 'Aokie’s own older speech and model on this computer'
+            : 'no AI receptionist — your flows or you speak to callers';
+      html.push(
+        '<p class="rcp-notice rcp-notice--warn" role="status"><strong>Calls do not go to OAIY.</strong> ' +
+          'They are answered by ' + where + '. Sending them to OAIY lets the Front desk agent answer in the OAIY voice; ' +
+          'it applies after the receptionist restarts.</p>' +
+          '<div class="rcp-actions" style="margin-top: 0;">' +
+          '<button type="button" class="rcp-button is-primary" data-act="set-route-oaiy"' +
+          (saving || loading ? ' disabled' : '') + '>Send calls to OAIY</button></div>'
       );
     }
-
-    if (isSherpa && bundles.length > 0) {
-      var bopts = ['<option value=""' + (bundleValue === '' ? ' selected' : '') + '>Automatic (first installed voice)</option>'];
-      for (var bi = 0; bi < bundles.length; bi++) {
-        bopts.push(
-          '<option value="' + esc(bundles[bi].dir) + '"' +
-            (bundleValue === bundles[bi].dir ? ' selected' : '') + '>' +
-            esc(prettifyBundleName(bundles[bi].name)) +
-            '</option>'
-        );
-      }
-      bopts.push(
-        '<option value="' + CUSTOM_BUNDLE_DIR + '"' + (bundleValue === CUSTOM_BUNDLE_DIR ? ' selected' : '') + '>Custom folder…</option>'
-      );
-      html.push(field('Voice', '<select id="set-bundle">' + bopts.join('') + '</select>'));
-      html.push(
-        hint(
-          "Installed sherpa voice bundles — a pick sets the live voice and the in-process fallback engine's model folder together."
-        )
-      );
-    }
-
-    if (showCustomDir) {
-      html.push(
-        field(
-          'Voice model folder',
-          '<input type="text" data-customdir="1" placeholder="blank = first voice under models\\tts" value="' +
-            esc(settings.ttsModelDir) + '" />'
-        )
-      );
-      html.push(
-        hint(
-          "A sherpa voice bundle folder on this machine (the voice's .onnx + tokens.txt, e.g. vits-piper-en_US-lessac-medium)."
-        )
-      );
-    }
-
-    if (isKokoro) {
-      html.push(
-        field(
-          'Speaker id',
-          '<input type="text" data-key="ttsVoice" inputmode="numeric" placeholder="e.g. 0" value="' +
-            esc(settings.ttsVoice) + '" />'
-        )
-      );
-      html.push(hint('Kokoro bundles hold many speakers — the numeric id picks one.'));
-    }
-
+    html.push(
+      '<div class="rcp-settings-list rcp-set-in-oaiy">' +
+        SET_IN_OAIY.map(function (row) {
+          return '<div class="rcp-setting"><small>' + esc(row[0]) + '</small><span>' + esc(row[1]) + '</span></div>';
+        }).join('') +
+        '</div>' +
+        hint('These are set in OAIY Desktop, in the sidebar pages named here. Aokie’s older speech engines, voices and model settings are not used for calls that go to OAIY.')
+    );
     return html.join('');
   }
 
-  function laneRowsHtml(lanes) {
-    lanes = lanes || LANES;
-    var html = [];
-    for (var i = 0; i < lanes.length; i++) {
-      var lane = lanes[i];
-      var key = LANE_SETTING_KEY[lane];
-      var opts = laneSourceOptions(lane, sources, laneSel[lane]);
-      var sel = [];
-      for (var o = 0; o < opts.length; o++) {
-        sel.push(
-          '<option value="' + esc(opts[o].value) + '"' +
-            (laneSel[lane] === opts[o].value ? ' selected' : '') + '>' +
-            esc(opts[o].label) +
-            '</option>'
-        );
-      }
-      var placeholder =
-        lane === 'llm'
-          ? 'e.g. http://127.0.0.1:8080/v1/chat/completions'
-          : 'e.g. http://127.0.0.1:17920' + (lane === 'stt' ? '/v1/audio/transcriptions' : '/v1/audio/speech');
-      html.push(
-        '<div>' +
-          field(LANE_LABEL[lane], '<select data-lane="' + lane + '">' + sel.join('') + '</select>') +
-          '<div id="lane-custom-' + lane + '"' + (laneSel[lane] === 'custom' ? '' : ' hidden') + '>' +
-          field(
-            'Custom URL',
-            '<input type="text" data-key="' + key + '" placeholder="' + esc(placeholder) + '" value="' +
-              esc(settings[key]) + '" />'
-          ) +
-          '</div>' +
-          '</div>'
-      );
-    }
-    return html.join('');
-  }
-
-  /** Keep the source immediately above its editable model. Codex adapters own
-   *  an exact model, so they show a concise fixed-model note and no fake input. */
-  function llmModelHtml() {
-    var fixedModel = codexModelForSource(laneSel.llm);
+  /** Answering: on the OAIY route the receptionist toggle is locked on (the
+   *  plugin refuses Desktop realtime without it), and OAIY Voice does the
+   *  turn-taking, so Aokie's own pause and interruption settings step aside. */
+  function answeringHtml(route) {
+    var toOaiy = route === 'oaiy';
+    var receptionist = toOaiy
+      ? '<label class="rcp-check"><input type="checkbox" checked disabled /><span>The AI receptionist answers calls</span></label>' +
+        hint('Always on while calls go to OAIY. To stop the Front desk answering, turn off Answer phone calls in OAIY’s Agent › Phone.')
+      : check('aiReceptionist', 'The AI receptionist answers calls') +
+        hint('When off, Aokie only bridges the call: your flows or you (Speak, on the Overview) talk to the caller.');
     return (
-      '<div id="set-llm-model-zone"' + (fixedModel ? ' hidden' : '') + '>' +
-      field(
-        'LLM model',
-        '<input type="text" data-key="aiModel" placeholder="blank = auto-detect" value="' + esc(settings.aiModel) + '" />'
-      ) +
+      '<div>' +
+      '<h4 class="rcp-group-title">Answering</h4>' +
+      receptionist +
+      check('autoAnswer', 'Auto-answer incoming calls') +
       hint(
-        'e.g. llama3.1:8b or qwen2.5:7b — leave blank to use the model currently loaded by the selected service.'
+        toOaiy
+          ? 'The phone rings until OAIY is ready to answer. If OAIY cannot be reached, it keeps ringing through to you.'
+          : 'Aokie picks up as soon as a call rings.'
       ) +
-      '</div>' +
-      '<p class="rcp-hint" id="set-llm-fixed-model"' + (fixedModel ? '' : ' hidden') + '>' +
-      (fixedModel
-        ? 'LLM model is fixed to <strong>' + esc(fixedModel) + '</strong> by this ChatGPT via Codex source.'
+      check('agentHangup', 'The receptionist can end the call') +
+      hint('Lets the receptionist hang up once the caller is done and the goodbye is said. When off, it leaves the line open for the caller to hang up. Applies after the receptionist restarts.') +
+      (toOaiy
+        ? hint('OAIY Voice decides when the caller has finished and stops a reply when the caller talks over it.')
         : '') +
-      '</p>'
+      '</div>'
     );
   }
 
-  function syncLlmModelUi() {
-    var fixedModel = codexModelForSource(laneSel.llm);
-    var zone = root && root.querySelector('#set-llm-model-zone');
-    var note = root && root.querySelector('#set-llm-fixed-model');
-    var input = root && root.querySelector('[data-key="aiModel"]');
-    if (zone) zone.hidden = !!fixedModel;
-    if (note) {
-      note.hidden = !fixedModel;
-      note.innerHTML = fixedModel
-        ? 'LLM model is fixed to <strong>' + esc(fixedModel) + '</strong> by this ChatGPT via Codex source.'
-        : '';
-    }
-    if (input) input.value = settings.aiModel;
-  }
-
-  function formHtml() {
-    var engines = catalog && catalog.length > 0 ? catalog : DEFAULT_ENGINES;
-    // Stored '' and 'pocket' both mean Pocket-TTS — the select's pocket
-    // option keeps the legacy '' value so save semantics never change.
-    var engineValue = settings.ttsEngine === 'pocket' ? '' : settings.ttsEngine;
-    var engineOpts = [];
-    var engineListed = false;
-    for (var i = 0; i < engines.length; i++) {
-      var val = engines[i].id === 'pocket' ? '' : engines[i].id;
-      if (val === engineValue) engineListed = true;
-      engineOpts.push(
-        '<option value="' + esc(val) + '"' + (engineValue === val ? ' selected' : '') + '>' +
-          esc(engineOptionLabel(engines[i])) +
-          '</option>'
-      );
-    }
-    if (!engineListed) {
-      engineOpts.push('<option value="' + esc(engineValue) + '" selected>' + esc(engineValue) + '</option>');
-    }
-
-    var codecOpts = [];
-    for (var c = 0; c < AOKIE_CODEC_OPTIONS.length; c++) {
-      var co = AOKIE_CODEC_OPTIONS[c];
-      codecOpts.push(
-        '<option value="' + co.value + '"' + (settings.hfpCodec === co.value ? ' selected' : '') + '>' +
-          esc(co.label) +
-          '</option>'
-      );
-    }
-
+  /** Aokie's own turn-taking — used only when Aokie's older speech answers. */
+  function tuningHtml() {
     return (
-      '<form class="rcp-form" id="set-form">' +
-      // ---- AI receptionist -------------------------------------------------
-      '<div>' +
-      '<h4 class="rcp-group-title">AI receptionist</h4>' +
-      check('aiReceptionist', 'AI receptionist replies live') +
-      hint(
-        'When on, the plugin answers callers itself in real time (speech-to-text → local LLM → text-to-speech). When off, a FormLogic flow must speak for it.'
-      ) +
-      check('autoAnswer', 'Auto-answer incoming calls') +
-      '</div>' +
-      // ---- Persona & voice -------------------------------------------------
-      '<div>' +
-      '<h4 class="rcp-group-title">Persona &amp; voice</h4>' +
-      field(
-        'Greeting (spoken first)',
-        '<input type="text" data-key="greeting" placeholder="Thanks for calling! How can I help you today?" value="' +
-          esc(settings.greeting) + '" />'
-      ) +
-      hint('Blank = a friendly built-in default.') +
-      field(
-        'Persona / instructions',
-        '<textarea rows="4" data-key="persona" placeholder="e.g. Be warm and concise. Offer to book Mon–Fri 9–5.">' +
-          esc(settings.persona) + '</textarea>'
-      ) +
-      hint(
-        "Blank = the built-in receptionist script (greet, ask the caller's name and reason, capture details, book or take a message)."
-      ) +
-      field('Speech engine', '<select id="set-engine">' + engineOpts.join('') + '</select>') +
-      hint(
-        'Applies live. Sherpa speaks Piper/VITS/Kokoro voice bundles (much faster than Pocket-TTS); each engine has its own voice list below.'
-      ) +
-      '<div id="set-voice-zone">' + voiceZoneHtml() + '</div>' +
-      laneRowsHtml(['llm']) +
-      llmModelHtml() +
-      laneRowsHtml(['stt', 'tts']) +
-      realtimeVoiceHtml() +
-      hint(
-        'Composed from the selected service now; if the FormLogic receptionist app is connected, its per-call settings take precedence.'
-      ) +
-      hint(
-        'ChatGPT via Codex choices send transcript text to OpenAI under the signed destination consent. GPT-5.6 Luna uses low reasoning, its fastest supported setting, and streams its reply sentence by sentence. Fast mode requests Codex priority service, though actual latency still varies. These choices are text-only: the selected model is fixed automatically and caller-audio attachment is disabled.'
-      ) +
-      '</div>' +
-      // ---- Conversation tuning ---------------------------------------------
       '<div>' +
       '<h4 class="rcp-group-title">Conversation tuning</h4>' +
+      hint('These apply to calls Aokie’s own speech answers, not to calls that go to OAIY.') +
       field(
         'Wait after the caller pauses (ms)',
         '<input type="number" data-num="sttEndpointMs" min="150" max="2000" step="50" value="' +
@@ -1265,7 +475,58 @@
           esc(settings.bargeSensitivity) + '" />'
       ) +
       hint('Lower = easier to interrupt; too low may react to background noise. Start around 550–650. With listening off, caller recognition is muted during replies.') +
+      '</div>'
+    );
+  }
+
+  function formHtml() {
+    var route = OAIY.callRoute(baseline);
+    var viaRealtime = route === 'oaiy' || route === 'realtime';
+    var codecOpts = [];
+    for (var c = 0; c < AOKIE_CODEC_OPTIONS.length; c++) {
+      var co = AOKIE_CODEC_OPTIONS[c];
+      codecOpts.push(
+        '<option value="' + co.value + '"' + (settings.hfpCodec === co.value ? ' selected' : '') + '>' +
+          esc(co.label) +
+          '</option>'
+      );
+    }
+
+    return (
+      '<form class="rcp-form" id="set-form">' +
+      // ---- Where calls go --------------------------------------------------
+      '<div>' +
+      '<h4 class="rcp-group-title">Where calls go</h4>' +
+      routeHtml() +
       '</div>' +
+      // ---- Answering -------------------------------------------------------
+      answeringHtml(route) +
+      // ---- Greeting & brief ------------------------------------------------
+      '<div>' +
+      '<h4 class="rcp-group-title">Greeting &amp; brief</h4>' +
+      field(
+        'Greeting (spoken first)',
+        '<input type="text" data-key="greeting" placeholder="Thanks for calling! How can I help you today?" value="' +
+          esc(settings.greeting) + '" />'
+      ) +
+      hint(
+        route === 'oaiy'
+          ? 'Spoken first, as soon as the call connects, in the voice chosen in OAIY. Blank = a friendly built-in default.'
+          : 'Spoken first, as soon as the call connects. Blank = a friendly built-in default.'
+      ) +
+      field(
+        'Receptionist brief',
+        '<textarea rows="5" data-key="persona" placeholder="e.g. We are a small hair salon. Cuts take 45 minutes.">' +
+          esc(settings.persona) + '</textarea>'
+      ) +
+      hint(
+        route === 'oaiy'
+          ? 'Business notes sent with every call, inside Aokie’s fixed call rules. OAIY gives them to the Front desk agent as the receptionist brief; the Front desk’s own /brief.md and call instructions take precedence. Blank = no notes, only the call rules.'
+          : 'Business notes for the receptionist on every call. Blank = the built-in receptionist script.'
+      ) +
+      '</div>' +
+      // ---- Conversation tuning (Aokie's own speech only) --------------------
+      (viaRealtime ? '' : tuningHtml()) +
       // ---- Advanced --------------------------------------------------------
       '<div>' +
       '<h4 class="rcp-group-title">Advanced</h4>' +
@@ -1284,18 +545,14 @@
       field('Bluetooth audio codec', '<select data-key="hfpCodec">' + codecOpts.join('') + '</select>') +
       hint('Dongle mode only. Some dongles only work reliably with CVSD; mSBC gives better speech-recognition accuracy where supported.') +
       '</div>' +
-      check('answerTone', 'Play a test tone on answer') +
-      hint('Diagnostic: verifies the outbound audio path reaches the caller. Leave off for normal use.') +
-      '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
-      field(
-        'Re-enumerate hardware id on start',
-        '<input type="text" data-key="reenumerateHwid" placeholder="e.g. USB\\VID_0A5C&amp;PID_21EC" value="' +
-          esc(settings.reenumerateHwid) + '" />'
-      ) +
-      hint(
-        "Workaround for dongles whose audio is dead after a cold boot until replugged. Leave blank unless you've hit that issue."
-      ) +
-      '</div>' +
+      // The test tone is not played on realtime calls, so it only shows
+      // where it does something. reenumerateHwid is not offered: the plugin
+      // reads it as a hardware id but its settings schema types it as a
+      // boolean, so any id typed here would make the whole save fail.
+      (viaRealtime
+        ? ''
+        : check('answerTone', 'Play a test tone on answer') +
+          hint('Diagnostic: verifies the outbound audio path reaches the caller. Leave off for normal use.')) +
       '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
       check('legacyPairingPin', 'Allow legacy PIN pairing (compatibility)') +
       hint(
@@ -1310,7 +567,7 @@
       // event fires — a submit button would be dead. Save rides the click
       // delegate; Enter-to-save rides the keydown handler in wire().
       (pendingRestart
-        ? '<p class="rcp-hint is-warn">Saved — the voice-mode change applies when the receptionist restarts. The phone reconnects automatically (about 15 seconds of downtime).</p>' +
+        ? '<p class="rcp-hint is-warn">Saved — the change applies when the receptionist restarts. The phone reconnects automatically (about 15 seconds of downtime).</p>' +
           '<div class="rcp-actions">' +
           '<button type="button" class="rcp-button is-primary" data-act="set-apply-restart"' + (saving || loading ? ' disabled' : '') + '>Restart receptionist now</button>' +
           '</div>'
@@ -1358,39 +615,22 @@
    * The honest answer to "I changed the greeting and it did not take".
    *
    * A linked FormLogic app re-applies its Receptionist Settings record on
-   * every incoming call, so edits to the app-managed keys here are saved and
-   * then replaced. Shown as a warning ONCE an external configVersion bump has
-   * actually been observed (so a standalone Aokie, where this form IS the
-   * source of truth, never nags); a quieter always-on line states the
-   * relationship up front.
+   * every incoming call, so a greeting or brief edited here is saved and then
+   * replaced. Shown ONCE an external configVersion bump has actually been
+   * observed, so a receptionist with no linked app, where this form IS the
+   * source of truth, never sees it.
    */
   function appManagedNoticeHtml() {
-    if (!loaded) return '';
-    if (appManaged) {
-      return (
-        '<p class="rcp-notice rcp-notice--warn" role="status">' +
-        '<strong>Your FormLogic app just re-applied these settings' +
-        (typeof configVersion === 'number' ? ' (config v' + configVersion + ')' : '') +
-        '.</strong> ' +
-        'It does that on every incoming call, so greeting, persona, voice, model and endpoints ' +
-        'edited here are replaced by the app&rsquo;s Receptionist Settings record. ' +
-        'Edit them in the app to make them stick — everything else on this page ' +
-        '(call handling, audio, screening, hardware) is owned here.' +
-        '</p>'
-      );
-    }
+    if (!loaded || !appManaged) return '';
     return (
-      '<p class="rcp-notice" role="note">' +
-      'If this receptionist is linked to a FormLogic app, that app re-applies ' +
-      'greeting, persona, voice, model and endpoints on every incoming call — ' +
-      'edit those in the app&rsquo;s Receptionist Settings. The rest of this page is owned here.' +
+      '<p class="rcp-notice rcp-notice--warn" role="status">' +
+      '<strong>Your FormLogic app just re-applied these settings' +
+      (typeof configVersion === 'number' ? ' (config v' + configVersion + ')' : '') +
+      '.</strong> ' +
+      'It does that on every incoming call, so a greeting or brief edited here is replaced by the ' +
+      'app&rsquo;s Receptionist Settings record. Edit them in the app to make them stick.' +
       '</p>'
     );
-  }
-
-  function rerenderVoiceZone() {
-    var zone = root && root.querySelector('#set-voice-zone');
-    if (zone) zone.innerHTML = voiceZoneHtml();
   }
 
   // ---- event wiring (delegated once per container) ------------------------
@@ -1402,32 +642,6 @@
     var key = t.getAttribute('data-key');
     if (key != null) {
       settings[key] = t.value;
-      if (key === 'realtimeVoiceMode') {
-        var realtimeZone = root && root.querySelector('#set-realtime-zone');
-        if (realtimeZone) realtimeZone.hidden = t.value !== 'desktop_realtime';
-        if (t.value === 'desktop_realtime') {
-          settings.aiReceptionist = true;
-          var agentToggle = root && root.querySelector('[data-bool="aiReceptionist"]');
-          if (agentToggle) agentToggle.checked = true;
-        }
-      }
-      if (key === 'transportMode') {
-        // Live feedback for the working copy: the dongle-only Advanced
-        // fields toggle in place (same pattern as the lane custom-URL rows).
-        // The Dongle tab itself follows the SAVED mode — it flips when this
-        // form saves and the plugin's settings come back.
-        var hideDongleFields = t.value !== 'dongle';
-        var zones = root ? root.querySelectorAll('.set-dongle-only') : [];
-        for (var zi = 0; zi < zones.length; zi++) zones[zi].hidden = hideDongleFields;
-      }
-      return;
-    }
-    if (t.getAttribute('data-realtime-endpoint') != null && e.type === 'change') {
-      settings.realtimeVoiceEndpoint = t.value;
-      var selectedRealtime = t.options && t.selectedIndex >= 0 ? t.options[t.selectedIndex] : null;
-      settings.realtimeVoiceDestination = selectedRealtime
-        ? selectedRealtime.getAttribute('data-destination') || ''
-        : '';
       return;
     }
     var num = t.getAttribute('data-num');
@@ -1439,51 +653,9 @@
       setNumberField(num, t.value);
       return;
     }
-    if (t.getAttribute('data-customdir') != null) {
-      customDir = true;
-      settings.ttsModelDir = t.value;
-      return;
-    }
     var boolKey = t.getAttribute('data-bool');
     if (boolKey != null && e.type === 'change') {
       settings[boolKey] = !!t.checked;
-      return;
-    }
-    var lane = t.getAttribute('data-lane');
-    if (lane != null && e.type === 'change') {
-      laneSel[lane] = t.value;
-      var row = root && root.querySelector('#lane-custom-' + lane);
-      if (row) row.hidden = laneSel[lane] !== 'custom';
-      var selectedSourceModel = lane === 'llm' ? codexModelForSource(laneSel.llm) : null;
-      if (selectedSourceModel) {
-        settings.aiModel = selectedSourceModel;
-        settings.sendAudio = false;
-      }
-      if (lane === 'llm') syncLlmModelUi();
-      return;
-    }
-    if (t.id === 'set-engine' && e.type === 'change') {
-      settings.ttsEngine = t.value;
-      // A voice belonging to the OTHER engine is refused at synth time and the
-      // engine default speaks instead, so carrying the old pick across an
-      // engine change would leave the form claiming a voice no caller hears.
-      // Reset to the engine default, which is what the picker now offers.
-      if (!voiceUsableByEngine(t.value, settings.ttsVoice, catalog)) settings.ttsVoice = '';
-      rerenderVoiceZone();
-      return;
-    }
-    if (t.id === 'set-bundle' && e.type === 'change') {
-      var bundles = [];
-      if (catalog) {
-        for (var i = 0; i < catalog.length; i++) {
-          if (catalog[i].id === 'sherpa' && catalog[i].bundles) bundles = catalog[i].bundles;
-        }
-      }
-      var u = bundleSelectionUpdate(t.value, bundles);
-      customDir = !!u.engine.customDir;
-      if (u.engine.modelDir !== undefined) settings.ttsModelDir = u.engine.modelDir;
-      if (u.voice !== undefined) settings.ttsVoice = u.voice;
-      rerenderVoiceZone();
     }
   }
 
@@ -1518,6 +690,7 @@
       if (!btn || btn.disabled) return;
       var act = btn.getAttribute('data-act');
       if (act === 'set-save') save();
+      else if (act === 'set-route-oaiy') routeToOaiy();
       else if (act === 'set-apply-restart') applyRestart();
       else if (act === 'set-reload' || act === 'set-retry') load(false);
     });
@@ -1540,7 +713,7 @@
     HOST.toast('info', 'Restarting the receptionist — the phone reconnects automatically.');
     HOST.restartPlugin().then(
       function () {
-        HOST.toast('success', 'Receptionist restarted — the saved voice mode is live.');
+        HOST.toast('success', 'Receptionist restarted — the saved settings are live.');
         // Give the plugin a beat to finish booting before re-reading
         // settings (an immediate settings.get can race the connector start).
         setTimeout(function () {
@@ -1561,8 +734,8 @@
       wire(el);
       if (loaded) {
         render();
-        // The linked app and provider runtime can both change while another
-        // tab is open. Refresh on every return; preserve a local draft if one
+        // A linked app and OAIY Voice can both change while another tab is
+        // open. Refresh on every return; preserve a local draft if one
         // exists, and never turn this read path into an implicit save.
         load(true);
       } else {
