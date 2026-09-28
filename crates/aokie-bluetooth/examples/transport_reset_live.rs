@@ -70,12 +70,33 @@ fn main() {
     if !wait_for(&mut rt, "controller initialised", 30, &initialized) {
         std::process::exit(1);
     }
-    std::thread::sleep(Duration::from_secs(4));
-    match rt.connect(phone.clone()) {
-        Ok(started) => println!("[live] {} page to {} started={}", stamp(), phone, started),
-        Err(e) => println!("[live] {} page to {} refused: {}", stamp(), phone, e),
+    // Page the phone like the plugin's auto-connect: a page can fail while
+    // the phone still holds the link the previous owner of the dongle left.
+    let mut phone_up = false;
+    for attempt in 1..=4 {
+        std::thread::sleep(Duration::from_secs(4));
+        match rt.connect(phone.clone()) {
+            Ok(started) => println!(
+                "[live] {} page {} to {} started={}",
+                stamp(),
+                attempt,
+                phone,
+                started
+            ),
+            Err(e) => println!(
+                "[live] {} page {} to {} refused: {}",
+                stamp(),
+                attempt,
+                phone,
+                e
+            ),
+        }
+        if wait_for(&mut rt, "phone connected", 25, &connected) {
+            phone_up = true;
+            break;
+        }
     }
-    if !wait_for(&mut rt, "phone connected", 60, &connected) {
+    if !phone_up {
         std::process::exit(2);
     }
     // Let the profiles (HFP SLC, MAP) settle before pulling the rug.
