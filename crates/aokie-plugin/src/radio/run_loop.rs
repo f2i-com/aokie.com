@@ -2013,6 +2013,7 @@ pub(super) fn run_loop(
             protected_max_ms,
             &mut realtime_lane,
             &mut realtime_resume_call,
+            oaiy_route,
         );
         #[cfg(not(feature = "voice"))]
         let keep_running = service_controls(

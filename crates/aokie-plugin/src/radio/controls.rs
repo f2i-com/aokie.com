@@ -43,6 +43,7 @@ pub(super) fn service_controls(
     #[cfg(feature = "voice")] protected_max_ms: u32,
     #[cfg(feature = "voice")] realtime_lane: &mut Option<RealtimeCallLane>,
     #[cfg(feature = "voice")] realtime_resume_call: &mut Option<String>,
+    #[cfg(feature = "voice")] oaiy_route: bool,
 ) -> bool {
     use std::sync::mpsc::TryRecvError;
     status
@@ -172,10 +173,13 @@ pub(super) fn service_controls(
                     {
                         ctx.call_agent_overlay = Some(CallAgentOverlay {
                             call_id: call_id.clone(),
-                            persona: Some(format!(
-                                "{agent_persona}{}\nYour requested introduction, to use once in your first response: {opening_line}",
-                                outbound_call_block(&number, purpose.as_deref())
-                            )),
+                            persona: outbound_overlay_persona(
+                                oaiy_route,
+                                agent_persona,
+                                &number,
+                                purpose.as_deref(),
+                                &opening_line,
+                            ),
                             greeting: Some(opening_line.clone()),
                         });
                         ctx.outbound_intent = Some(OutboundIntent {

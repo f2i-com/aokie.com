@@ -417,6 +417,30 @@ pub(super) fn realtime_brief(persona: &str) -> String {
         .collect()
 }
 
+/// The persona overlay of an agent-placed dial (`call.dial`). Elsewhere it
+/// is the persona plus Aokie's outbound-call rules (identify as Aokie, end
+/// with its end-call marker, one short question at a time) and the
+/// requested introduction. On the OAIY route the overlay is the brief OAIY's
+/// agent reads, and those rules are Aokie's own, so there is none: the
+/// saved persona stays the brief, and the purpose and opening line reach
+/// OAIY as the start's `purpose` and `openingLine` (the opening line is
+/// also the greeting).
+#[cfg(feature = "voice")]
+pub(super) fn outbound_overlay_persona(
+    oaiy_route: bool,
+    agent_persona: &str,
+    number: &str,
+    purpose: Option<&str>,
+    opening_line: &str,
+) -> Option<String> {
+    (!oaiy_route).then(|| {
+        format!(
+            "{agent_persona}{}\nYour requested introduction, to use once in your first response: {opening_line}",
+            outbound_call_block(number, purpose)
+        )
+    })
+}
+
 /// An agent-placed outbound dial whose realtime session could not start.
 /// Elsewhere it falls back to Aokie's own voice; on the OAIY route that
 /// voice is not there, so the dial is ended before the callee answers.
