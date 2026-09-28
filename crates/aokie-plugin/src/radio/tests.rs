@@ -530,6 +530,31 @@ fn oaiy_gets_the_persona_as_its_brief_and_other_providers_keep_the_wrapper() {
     assert!(wrapped.contains("A small hair salon."));
 }
 
+#[cfg(feature = "voice")]
+#[test]
+fn an_agent_dial_gives_oaiy_no_outbound_rules_of_aokies_own() {
+    let persona = "A small hair salon.";
+    // Elsewhere: the persona, Aokie's outbound rules and the introduction.
+    let local = outbound_overlay_persona(
+        false,
+        persona,
+        "+61400000000",
+        Some("Confirm Tuesday"),
+        "Hi, it's the salon.",
+    )
+    .unwrap();
+    assert!(local.starts_with(persona));
+    assert!(local.contains("OUTBOUND CALL"));
+    assert!(local.contains("Purpose of this call: Confirm Tuesday"));
+    assert!(local.contains("Hi, it's the salon."));
+    // OAIY route: no overlay persona, so the saved persona stays the brief;
+    // purpose and opening line travel as start fields instead.
+    assert_eq!(
+        outbound_overlay_persona(true, persona, "+61400000000", Some("x"), "Hi"),
+        None
+    );
+}
+
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[test]
 fn fixed_lines_use_oaiys_speak_mode_on_its_route_and_the_local_voice_elsewhere() {
