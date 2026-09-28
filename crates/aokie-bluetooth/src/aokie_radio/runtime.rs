@@ -40,6 +40,9 @@ use crate::aokie_radio::rfcomm::{
 };
 use crate::aokie_radio::sdp::AOKIE_MNS_RFCOMM_CHANNEL;
 use crate::aokie_radio::transport::{self as winusb, AokieHciTransport};
+use crate::aokie_radio::transport_recovery::{
+    RecoveryAction, TransportRecovery, CAUSE_CORRUPTED_STREAM, REOPEN_RETRY_AFTER_GIVE_UP,
+};
 use crate::aokie_radio::{hci, l2cap, sco, sco_dump};
 use crate::msbc::{H2Decoder, MsbcStreamFramer, MsbcStreamPackager, MSBC_SAMPLES_PER_FRAME};
 
@@ -304,6 +307,11 @@ enum ControlCommand {
         accept: bool,
         reply: stdmpsc::Sender<Result<(), String>>,
     },
+    /// Reset the dongle in software: close the WinUSB handle, reopen it,
+    /// HCI_Reset and re-initialise (the same step the automatic
+    /// transport recovery takes). The phone link drops and auto-reconnect
+    /// pages it back.
+    ResetTransport,
     Shutdown,
 }
 
@@ -540,7 +548,7 @@ impl AokieRuntime {
                 // never touched.
                 let preferred_for_thread = preferred_dongle_path.clone();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_runtime(
+                    run_runtime_supervised(
                         pairing_store_path,
                         preferred_for_thread,
                         event_tx_thread.clone(),
@@ -608,6 +616,15 @@ impl AokieRuntime {
     pub fn reject_or_hangup(&self) -> Result<(), String> {
         self.control_tx
             .send(ControlCommand::RejectOrHangup)
+            .map_err(|_| "aokie-radio runtime is no longer running".to_string())
+    }
+
+    /// Reset the dongle in software — close and reopen the WinUSB handle,
+    /// HCI_Reset, re-initialise — without anyone unplugging it. A live
+    /// call's audio drops with the link; the phone is paged back after.
+    pub fn reset_transport(&self) -> Result<(), String> {
+        self.control_tx
+            .send(ControlCommand::ResetTransport)
             .map_err(|_| "aokie-radio runtime is no longer running".to_string())
     }
 
@@ -1200,12 +1217,28 @@ fn pop_acl_frame(
 ///   marginal without being told a working line is dead.
 /// A soft episode escalates to the hard report if a dense burst follows;
 /// the window emptying re-arms everything, so a relapse re-announces.
+///
+/// 2026-09-29: a dense burst no longer asks for a replug straight away. It
+/// returns `Dense` and the caller runs the software recovery ladder
+/// (`transport_recovery`); only when that is used up does the operator
+/// hear "unplug it". The bursts themselves were traced to the host, not
+/// the controller: 5 ms read timeouts cancelled multi-packet USB transfers
+/// mid-packet and dropped their head (see `QueuedInRead` in winusb.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CorruptionSignal {
+    /// Below both thresholds, or already reported this episode.
+    Quiet,
+    /// Slow accumulation: log that the dongle is marginal but recovering.
+    Marginal,
+    /// Dense burst: run the next recovery step.
+    Dense,
+}
+
 fn note_acl_corruption(
     times: &mut std::collections::VecDeque<Instant>,
     reported: &mut u8,
-    event_tx: &UnboundedSender<RuntimeEvent>,
     now: Instant,
-) {
+) -> CorruptionSignal {
     while times
         .front()
         .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(600))
@@ -1224,12 +1257,7 @@ fn note_acl_corruption(
             .is_some_and(|t| now.duration_since(*t) <= Duration::from_secs(120));
     if dense && *reported < 2 {
         *reported = 2;
-        let _ = event_tx.send(RuntimeEvent::Error(
-            "Bluetooth dongle USB stream corrupted (continuous garbage in reads) - connections \
-             cannot succeed until the dongle is power-cycled: unplug it, wait 5 seconds, plug \
-             it back in"
-                .to_string(),
-        ));
+        CorruptionSignal::Dense
     } else if times.len() >= 3 && *reported == 0 {
         // SOFT tier (2026-07-17, user request): a self-recovered hiccup is
         // NOT an error — the old RuntimeEvent::Error here rippled into a
@@ -1237,13 +1265,221 @@ fn note_acl_corruption(
         // + host ack), a Hardware Events record and TWO console toasts,
         // ~2×/day under normal load, for something already handled. Keep the
         // `reported = 1` latch (it is what makes a FOLLOWING dense burst
-        // raise the hard power-cycle report exactly once) and log locally;
-        // per-incident forensics stay in the per-resync log lines.
+        // trigger recovery exactly once) and log locally; per-incident
+        // forensics stay in the per-resync log lines.
         *reported = 1;
-        eprintln!(
-            "[AokieRadio] ACL corruption: 3 garbage-prefix resyncs inside 10min - dongle \
-             marginal under load but recovered; a dense burst will raise the power-cycle error"
+        CorruptionSignal::Marginal
+    } else {
+        CorruptionSignal::Quiet
+    }
+}
+
+/// Pages sent to bring the phone back after a transport reopen, 25 s apart.
+const RECOVERY_RECONNECT_PAGES: u8 = 3;
+
+/// How `run_runtime` ended without an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeExit {
+    /// Shutdown was requested (or the control channel closed).
+    Shutdown,
+    /// Software recovery: close the transport, wait `delay`, run again.
+    ReopenTransport { delay: Duration },
+}
+
+/// Runs `run_runtime` and, when it asks for a transport reopen (the
+/// recovery ladder or `reset_transport`), closes the dongle, waits, and
+/// runs it again: a fresh WinUSB handle, pipe flush, HCI_Reset and full
+/// initialisation, after which auto-reconnect pages the phone back. The
+/// recovery bookkeeping lives here so it survives the restarts.
+fn run_runtime_supervised(
+    pairing_store_path: PathBuf,
+    preferred_dongle_path: Option<String>,
+    event_tx: UnboundedSender<RuntimeEvent>,
+    audio_tx: Sender<AudioFrame>,
+    control_rx: stdmpsc::Receiver<ControlCommand>,
+    status: Arc<RuntimeStatus>,
+) -> Result<(), String> {
+    let mut recovery = TransportRecovery::default();
+    let mut gave_up = false;
+    // The phone that was on the line when the transport went down; the
+    // next run pages it back.
+    let mut reconnect_to: Option<String> = None;
+    // Why the current recovery started, for the give-up message.
+    let mut cause = CAUSE_CORRUPTED_STREAM.to_string();
+    loop {
+        let run = run_runtime(
+            pairing_store_path.clone(),
+            preferred_dongle_path.clone(),
+            event_tx.clone(),
+            audio_tx.clone(),
+            &control_rx,
+            status.clone(),
+            &mut recovery,
+            reconnect_to.clone(),
         );
+        let initialised = recovery.take_initialized();
+        let wait = match run {
+            Ok(RuntimeExit::Shutdown) => return Ok(()),
+            Ok(RuntimeExit::ReopenTransport { delay }) => {
+                gave_up = false;
+                cause = CAUSE_CORRUPTED_STREAM.to_string();
+                reconnect_to = mark_transport_down(&status, &event_tx).or(reconnect_to);
+                eprintln!(
+                    "[AokieRadio] transport recovery: dongle closed; reopening in {:?}",
+                    delay
+                );
+                delay
+            }
+            // The transport failed mid-session (a USB error, the dongle
+            // resetting under us), or a reopen did not bring it back. A
+            // failure before the first initialisation stays fatal, as before.
+            Err(e) if initialised || recovery.reopen_in_progress() || gave_up => {
+                if initialised {
+                    gave_up = false;
+                    cause = format!("Bluetooth dongle stopped responding ({})", e);
+                    eprintln!(
+                        "[AokieRadio] transport recovery: the radio failed mid-session ({}) - \
+                         reopening the dongle",
+                        e
+                    );
+                }
+                reconnect_to = mark_transport_down(&status, &event_tx).or(reconnect_to);
+                match recovery.next_reopen_after_failed_open(Instant::now()) {
+                    Some(delay) => {
+                        if !initialised {
+                            eprintln!(
+                                "[AokieRadio] transport recovery: reopen failed ({}); next try in {:?}",
+                                e, delay
+                            );
+                        }
+                        delay
+                    }
+                    None => {
+                        if !gave_up {
+                            gave_up = true;
+                            let msg = recovery.give_up_message(&cause, Some(&e));
+                            eprintln!("[AokieRadio] transport recovery gave up: {}", msg);
+                            let _ = event_tx.send(RuntimeEvent::Error(msg));
+                        }
+                        // Keep looking so a replug is picked up without a
+                        // plugin restart (Initialized clears the error).
+                        REOPEN_RETRY_AFTER_GIVE_UP
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        if wait_for_reopen(&control_rx, &event_tx, wait) {
+            return Ok(());
+        }
+    }
+}
+
+/// The transport is closed: drop the connected / call flags and tell the
+/// consumer the phone is gone. Returns the phone that was connected, so
+/// the next run can page it back.
+fn mark_transport_down(
+    status: &RuntimeStatus,
+    event_tx: &UnboundedSender<RuntimeEvent>,
+) -> Option<String> {
+    status.initialized.store(false, Ordering::Relaxed);
+    status.call_active.store(false, Ordering::Relaxed);
+    let remote = status
+        .addresses
+        .write()
+        .map(|mut a| {
+            a.remote_name = None;
+            std::mem::take(&mut a.remote)
+        })
+        .unwrap_or_default();
+    if status.connected.swap(false, Ordering::Relaxed) {
+        let _ = event_tx.send(RuntimeEvent::DeviceDisconnected(remote.clone()));
+        return (!remote.is_empty()).then_some(remote);
+    }
+    None
+}
+
+/// Sleep out a reopen backoff while still answering the control channel.
+/// Returns true when shutdown was requested. Commands that expect an
+/// answer are refused (the radio is closed); a queued text is reported as
+/// failed rather than silently dropped.
+fn wait_for_reopen(
+    control_rx: &stdmpsc::Receiver<ControlCommand>,
+    event_tx: &UnboundedSender<RuntimeEvent>,
+    wait: Duration,
+) -> bool {
+    const BUSY: &str = "the Bluetooth dongle is being reset - try again in a few seconds";
+    let deadline = Instant::now() + wait;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        match control_rx.recv_timeout(deadline - now) {
+            Ok(ControlCommand::Shutdown) => return true,
+            Err(stdmpsc::RecvTimeoutError::Disconnected) => return true,
+            Err(stdmpsc::RecvTimeoutError::Timeout) => return false,
+            Ok(ControlCommand::SendSms {
+                message_id,
+                recipient_phone,
+                ..
+            }) => {
+                let _ = event_tx.send(RuntimeEvent::SmsSendFailed {
+                    message_id,
+                    recipient_phone,
+                    reason: BUSY.to_string(),
+                });
+            }
+            Ok(ControlCommand::RemovePaired { reply, .. })
+            | Ok(ControlCommand::Disconnect { reply, .. })
+            | Ok(ControlCommand::Connect { reply, .. }) => {
+                let _ = reply.send(Err(BUSY.to_string()));
+            }
+            Ok(ControlCommand::ConfirmPairing { reply, .. }) => {
+                let _ = reply.send(Err(BUSY.to_string()));
+            }
+            Ok(_) => {
+                eprintln!("[AokieRadio] control command dropped: {}", BUSY);
+            }
+        }
+    }
+}
+
+/// Before `run_runtime` returns for a reopen: tell the phone the link is
+/// going (so it reconnects at once instead of waiting out a supervision
+/// timeout) and release an armed SCO ring. Best effort — the stream may be
+/// the thing that is broken.
+fn close_link_for_reopen(transport: &mut AokieHciTransport, active_acl_handle: Option<u16>) {
+    if let Some(handle) = active_acl_handle {
+        // 0x13: remote user terminated connection.
+        match transport.write_command(&hci::disconnect_command(handle, 0x13)) {
+            Ok(()) => {
+                let deadline = Instant::now() + Duration::from_millis(800);
+                while Instant::now() < deadline {
+                    match transport.read_event() {
+                        Ok(packet) => {
+                            if matches!(
+                                hci::parse_typed_event(&packet),
+                                Ok(hci::HciEvent::DisconnectionComplete { .. })
+                            ) {
+                                break;
+                            }
+                        }
+                        Err(e) if manager::is_timeout_error(&e) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(e) => eprintln!("[AokieRadio] transport recovery: disconnect failed: {}", e),
+        }
+    }
+    if transport.sco_transport_config().is_some() {
+        if let Err(e) = transport.disable_sco_alt_setting() {
+            eprintln!(
+                "[AokieRadio] transport recovery: SCO teardown failed: {}",
+                e
+            );
+        }
     }
 }
 
@@ -1261,9 +1497,11 @@ fn run_runtime(
     preferred_dongle_path: Option<String>,
     event_tx: UnboundedSender<RuntimeEvent>,
     audio_tx: Sender<AudioFrame>,
-    control_rx: stdmpsc::Receiver<ControlCommand>,
+    control_rx: &stdmpsc::Receiver<ControlCommand>,
     status: Arc<RuntimeStatus>,
-) -> Result<(), String> {
+    recovery: &mut TransportRecovery,
+    reconnect_to: Option<String>,
+) -> Result<RuntimeExit, String> {
     // 1) Find and open an HCI-capable WinUSB radio. If the operator
     //    pinned a specific dongle from Pairing, prefer it; otherwise
     //    fall through to the first interface that passes the diagnose
@@ -1358,6 +1596,15 @@ fn run_runtime(
         .ok();
     status.initialized.store(true, Ordering::Relaxed);
     let _ = event_tx.send(RuntimeEvent::Initialized(init_report.local_address.clone()));
+    if recovery.reopen_in_progress() {
+        let (flushes, reopens) = recovery.attempt_counts();
+        eprintln!(
+            "[AokieRadio] transport recovery: dongle reopened and initialised \
+             ({} pipe flush(es), {} reset(s) in the current window)",
+            flushes, reopens
+        );
+    }
+    recovery.mark_initialized();
 
     // 3) Pairing store — lives across runtime restarts so a previously
     //    paired phone reconnects without prompting again.
@@ -1525,6 +1772,12 @@ fn run_runtime(
     // half-link the phone won't repair on its own — the old
     // AUTO_RECONNECT_OUTBOUND_PAGE symptom).
     let mut manual_connect_pending: Option<(String, Instant)> = None;
+    // Transport recovery: page the phone that was on the line before the
+    // dongle was reopened (HCI_Reset dropped the link, and a phone told
+    // "remote user terminated" does not reconnect by itself). Address, when
+    // the next page is due, pages sent so far.
+    let mut recovery_reconnect: Option<(String, Instant, u8)> =
+        reconnect_to.map(|addr| (addr, Instant::now() + Duration::from_secs(3), 0));
     // After the page lands, WE must drive LMP authentication + encryption
     // before any profile L2CAP traffic — on the inbound path the phone (as
     // the paging master) does this, and a Security-Mode-4 phone that sees
@@ -1706,6 +1959,12 @@ fn run_runtime(
     // burst) stays a log line — it never reaches the threshold.
     let mut acl_corruption_times: std::collections::VecDeque<Instant> = Default::default();
     let mut acl_corruption_reported: u8 = 0;
+    // Transport recovery (see `transport_recovery`): a reopen chosen while
+    // a call was up waits here until the call ends; `reopen_now` carries a
+    // reopen decided inside the ACL drain loop out to where the loop can
+    // close the link and return.
+    let mut reopen_after_call = false;
+    let mut reopen_now: Option<Duration> = None;
     let mut loop_iter: u64 = 0;
     let mut last_heartbeat = Instant::now();
     // LAT-001 (2026-07-17): the heartbeat LINE at a 2s cadence wrapped the
@@ -2381,12 +2640,88 @@ fn run_runtime(
                 }
             }
         }
+        // Transport recovery: carry out a reopen decided last tick (dense
+        // ACL corruption), or one that waited for a call to end.
+        if reopen_after_call && reopen_now.is_none() {
+            let call_up = active_sco_handle.is_some() || status.call_active.load(Ordering::Relaxed);
+            if !call_up {
+                reopen_after_call = false;
+                match recovery.after_call_ended(Instant::now()) {
+                    RecoveryAction::ReopenTransport { delay } => reopen_now = Some(delay),
+                    RecoveryAction::GiveUp => {
+                        if recovery.take_give_up_report() {
+                            let _ = event_tx.send(RuntimeEvent::Error(
+                                recovery.give_up_message(CAUSE_CORRUPTED_STREAM, None),
+                            ));
+                        }
+                    }
+                    RecoveryAction::FlushAclPipe | RecoveryAction::FlushAndReopenAfterCall => {}
+                }
+            }
+        }
+        if let Some(delay) = reopen_now.take() {
+            eprintln!(
+                "[AokieRadio] transport recovery: closing the dongle to reopen it (HCI_Reset + \
+                 re-initialise)"
+            );
+            close_link_for_reopen(&mut transport, active_acl_handle);
+            return Ok(RuntimeExit::ReopenTransport { delay });
+        }
+        // After a reopen: page the phone back (the same page phone.connect
+        // sends; its ConnectionComplete arm drives auth, SDP, RFCOMM, SLC).
+        let mut recovery_reconnect_done = false;
+        if let Some((addr, due, pages)) = recovery_reconnect.as_mut() {
+            if active_acl_handle.is_some() {
+                eprintln!("[AokieRadio] transport recovery: the phone link is back");
+                recovery_reconnect_done = true;
+            } else if Instant::now() >= *due && manual_connect_pending.is_none() {
+                if *pages >= RECOVERY_RECONNECT_PAGES || !pairing_store.contains(addr) {
+                    eprintln!(
+                        "[AokieRadio] transport recovery: {} did not come back after {} page(s) \
+                         - leaving the reconnect to the phone",
+                        addr, pages
+                    );
+                    recovery_reconnect_done = true;
+                } else {
+                    *pages += 1;
+                    *due = Instant::now() + Duration::from_secs(25);
+                    match hci::create_connection_command_default(addr)
+                        .and_then(|cmd| transport.write_command(&cmd))
+                    {
+                        Ok(()) => {
+                            eprintln!(
+                                "[AokieRadio] transport recovery: paging {} to restore the link \
+                                 (page {}/{})",
+                                addr, pages, RECOVERY_RECONNECT_PAGES
+                            );
+                            manual_connect_pending = Some((addr.clone(), Instant::now()));
+                        }
+                        Err(e) => eprintln!(
+                            "[AokieRadio] transport recovery: page to {} failed: {}",
+                            addr, e
+                        ),
+                    }
+                }
+            }
+        }
+        if recovery_reconnect_done {
+            recovery_reconnect = None;
+        }
+
         // 4a) Drain control commands first so a shutdown / answer
         //     queued during the previous tick doesn't sit waiting on
         //     the next read timeout.
         loop {
             match control_rx.try_recv() {
-                Ok(ControlCommand::Shutdown) => return Ok(()),
+                Ok(ControlCommand::Shutdown) => return Ok(RuntimeExit::Shutdown),
+                Ok(ControlCommand::ResetTransport) => {
+                    let delay = recovery.force_reopen(Instant::now());
+                    eprintln!(
+                        "[AokieRadio] transport reset requested - closing the dongle to reopen it"
+                    );
+                    close_link_for_reopen(&mut transport, active_acl_handle);
+                    return Ok(RuntimeExit::ReopenTransport { delay });
+                }
                 Ok(ControlCommand::Answer) => {
                     let packets =
                         l2cap_state.build_hfp_call_control_packets(HfpAtCommand::Answer)?;
@@ -2718,7 +3053,7 @@ fn run_runtime(
                     let _ = reply.send(result);
                 }
                 Err(stdmpsc::TryRecvError::Empty) => break,
-                Err(stdmpsc::TryRecvError::Disconnected) => return Ok(()),
+                Err(stdmpsc::TryRecvError::Disconnected) => return Ok(RuntimeExit::Shutdown),
             }
         }
 
@@ -3595,12 +3930,55 @@ fn run_runtime(
                         buffer_len_before,
                         first32_hex(&first32),
                     );
-                    note_acl_corruption(
+                    match note_acl_corruption(
                         &mut acl_corruption_times,
                         &mut acl_corruption_reported,
-                        &event_tx,
                         Instant::now(),
-                    );
+                    ) {
+                        CorruptionSignal::Quiet => {}
+                        CorruptionSignal::Marginal => eprintln!(
+                            "[AokieRadio] ACL corruption: 3 garbage-prefix resyncs inside 10min - \
+                             dongle marginal under load but recovered; a dense burst starts \
+                             software recovery"
+                        ),
+                        CorruptionSignal::Dense => {
+                            let call_up = active_sco_handle.is_some()
+                                || status.call_active.load(Ordering::Relaxed);
+                            let action = recovery.on_dense_corruption(Instant::now(), call_up);
+                            eprintln!(
+                                "[AokieRadio] ACL corruption: dense burst of garbage-prefix resyncs \
+                                 - transport recovery step {:?}",
+                                action
+                            );
+                            match action {
+                                RecoveryAction::FlushAclPipe
+                                | RecoveryAction::FlushAndReopenAfterCall => {
+                                    if action == RecoveryAction::FlushAndReopenAfterCall {
+                                        reopen_after_call = true;
+                                    }
+                                    acl_buffer.clear();
+                                    acl_partial_since = None;
+                                    transport.flush_acl_in_pipe()?;
+                                    // Re-arm the detector so a relapse
+                                    // reaches the next step.
+                                    acl_corruption_times.clear();
+                                    acl_corruption_reported = 0;
+                                    break;
+                                }
+                                RecoveryAction::ReopenTransport { delay } => {
+                                    reopen_now = Some(delay);
+                                    break;
+                                }
+                                RecoveryAction::GiveUp => {
+                                    if recovery.take_give_up_report() {
+                                        let _ = event_tx.send(RuntimeEvent::Error(
+                                            recovery.give_up_message(CAUSE_CORRUPTED_STREAM, None),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 AclPopOutcome::Flushed {
@@ -5771,30 +6149,41 @@ mod tests {
     }
 
     #[test]
-    fn acl_corruption_dense_burst_demands_a_power_cycle() {
-        // Three resyncs in rapid succession = the wedge signature.
-        let (tx, mut rx) = mpsc::unbounded_channel();
+    fn acl_corruption_dense_burst_starts_recovery_once_per_episode() {
+        // Three resyncs in rapid succession = the dense signature; it now
+        // starts software recovery instead of asking for a replug.
         let mut times = std::collections::VecDeque::new();
         let mut reported: u8 = 0;
         let t0 = Instant::now();
         for _ in 0..2 {
-            note_acl_corruption(&mut times, &mut reported, &tx, t0);
+            assert_eq!(
+                note_acl_corruption(&mut times, &mut reported, t0),
+                CorruptionSignal::Quiet,
+                "below threshold must stay a log line"
+            );
         }
-        assert!(
-            rx.try_recv().is_err(),
-            "below threshold must stay a log line"
+        assert_eq!(
+            note_acl_corruption(&mut times, &mut reported, t0),
+            CorruptionSignal::Dense
         );
-        note_acl_corruption(&mut times, &mut reported, &tx, t0);
-        match rx.try_recv() {
-            Ok(RuntimeEvent::Error(msg)) => {
-                assert!(msg.contains("power-cycled"));
-                assert!(!msg.contains("recovered"));
-            }
-            other => panic!("expected the actionable error, got {other:?}"),
+        // One trigger per episode — continued corruption must not re-fire
+        // until the caller re-arms the detector after a recovery step.
+        assert_eq!(
+            note_acl_corruption(&mut times, &mut reported, t0),
+            CorruptionSignal::Quiet,
+            "no duplicate triggers mid-episode"
+        );
+        // Re-armed (what the runtime does after a flush): a relapse
+        // reaches the next recovery step.
+        times.clear();
+        reported = 0;
+        for _ in 0..2 {
+            note_acl_corruption(&mut times, &mut reported, t0 + Duration::from_secs(5));
         }
-        // One report per episode — continued corruption must not spam.
-        note_acl_corruption(&mut times, &mut reported, &tx, t0);
-        assert!(rx.try_recv().is_err(), "no duplicate reports mid-episode");
+        assert_eq!(
+            note_acl_corruption(&mut times, &mut reported, t0 + Duration::from_secs(5)),
+            CorruptionSignal::Dense
+        );
     }
 
     #[test]
@@ -5804,45 +6193,100 @@ mod tests {
         // the soft tier is LOG-ONLY — a self-recovered hiccup must not
         // degrade health, write a Hardware Events row, or toast (it fired
         // ~2×/day for a non-event). The latch must still arm so a FOLLOWING
-        // dense burst raises the hard power-cycle report exactly once.
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        // dense burst triggers recovery exactly once.
         let mut times = std::collections::VecDeque::new();
         let mut reported: u8 = 0;
         let t0 = Instant::now();
-        note_acl_corruption(&mut times, &mut reported, &tx, t0);
-        note_acl_corruption(
-            &mut times,
-            &mut reported,
-            &tx,
-            t0 + Duration::from_secs(180),
-        );
-        note_acl_corruption(
-            &mut times,
-            &mut reported,
-            &tx,
-            t0 + Duration::from_secs(360),
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "a recovered hiccup must stay off the event channel (soft tier is log-only)"
+        let signals = [
+            note_acl_corruption(&mut times, &mut reported, t0),
+            note_acl_corruption(&mut times, &mut reported, t0 + Duration::from_secs(180)),
+            note_acl_corruption(&mut times, &mut reported, t0 + Duration::from_secs(360)),
+        ];
+        assert_eq!(
+            signals,
+            [
+                CorruptionSignal::Quiet,
+                CorruptionSignal::Quiet,
+                CorruptionSignal::Marginal
+            ]
         );
         assert_eq!(reported, 1, "the escalation latch still arms");
-        // A dense burst AFTER the (silent) soft episode escalates to the
-        // hard report — this is what the latch preserves.
+        // A dense burst AFTER the soft episode escalates — this is what
+        // the latch preserves.
         let burst = t0 + Duration::from_secs(400);
-        note_acl_corruption(&mut times, &mut reported, &tx, burst);
-        note_acl_corruption(
-            &mut times,
-            &mut reported,
-            &tx,
-            burst + Duration::from_secs(1),
+        assert_eq!(
+            note_acl_corruption(&mut times, &mut reported, burst),
+            CorruptionSignal::Quiet
         );
-        match rx.try_recv() {
-            Ok(RuntimeEvent::Error(msg)) => {
-                assert!(msg.contains("power-cycled") && !msg.contains("recovered"))
-            }
-            other => panic!("expected the escalation, got {other:?}"),
+        assert_eq!(
+            note_acl_corruption(&mut times, &mut reported, burst + Duration::from_secs(1)),
+            CorruptionSignal::Dense
+        );
+    }
+
+    #[test]
+    fn transport_down_announces_the_lost_phone_once() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let status = RuntimeStatus::default();
+        status.initialized.store(true, Ordering::Relaxed);
+        status.connected.store(true, Ordering::Relaxed);
+        status.call_active.store(true, Ordering::Relaxed);
+        if let Ok(mut a) = status.addresses.write() {
+            a.remote = "04:C8:B0:E1:3F:F3".to_string();
+            a.remote_name = Some("Pixel".to_string());
         }
+        assert_eq!(
+            mark_transport_down(&status, &tx).as_deref(),
+            Some("04:C8:B0:E1:3F:F3"),
+            "the lost phone is the one the next run pages back"
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(RuntimeEvent::DeviceDisconnected(
+                "04:C8:B0:E1:3F:F3".to_string()
+            ))
+        );
+        assert!(!status.initialized.load(Ordering::Relaxed));
+        assert!(!status.connected.load(Ordering::Relaxed));
+        assert!(!status.call_active.load(Ordering::Relaxed));
+        assert!(status.addresses.read().unwrap().remote_name.is_none());
+        // Nothing connected any more: a second close stays quiet.
+        assert_eq!(mark_transport_down(&status, &tx), None);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn reopen_backoff_refuses_commands_and_fails_queued_texts() {
+        let (control_tx, control_rx) = stdmpsc::channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = stdmpsc::channel();
+        control_tx
+            .send(ControlCommand::SendSms {
+                message_id: "m1".to_string(),
+                recipient_phone: "0400000000".to_string(),
+                body: "hi".to_string(),
+                msg_type: None,
+            })
+            .unwrap();
+        control_tx
+            .send(ControlCommand::Connect {
+                address: "04:C8:B0:E1:3F:F3".to_string(),
+                reply: reply_tx,
+            })
+            .unwrap();
+        assert!(!wait_for_reopen(
+            &control_rx,
+            &tx,
+            Duration::from_millis(50)
+        ));
+        match rx.try_recv() {
+            Ok(RuntimeEvent::SmsSendFailed { message_id, .. }) => assert_eq!(message_id, "m1"),
+            other => panic!("expected the text to be reported failed, got {other:?}"),
+        }
+        assert!(reply_rx.try_recv().unwrap().is_err());
+        // Shutdown during the wait ends it at once.
+        control_tx.send(ControlCommand::Shutdown).unwrap();
+        assert!(wait_for_reopen(&control_rx, &tx, Duration::from_secs(30)));
     }
 
     fn listing_with(handles: &[&str]) -> Vec<u8> {
