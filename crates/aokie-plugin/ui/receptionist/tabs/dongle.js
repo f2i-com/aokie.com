@@ -387,6 +387,16 @@
         '. Press Next to pair your phone.</p>'
       );
     }
+    // Consent keeps the radio off (enforce mode): starting Aokie again would
+    // not open the dongle, so say why instead, as the Overview does.
+    if (setupRadio && setupRadio.paused && setupRadio.blockedBy === 'consent' && !radioStarting) {
+      return (
+        '<div class="rcp-callout is-warn">' + ICONS.alert +
+        '<span>Aokie’s radio is off until consent is given: ' +
+        esc(setupRadio.reason || 'consent must be reviewed before the radio can start') +
+        '. Go back to the consent step, then return here.</span></div>'
+      );
+    }
     var bound = false;
     var conn = connectedDevices();
     for (var i = 0; i < conn.length; i++) {
