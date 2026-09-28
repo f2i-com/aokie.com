@@ -1335,7 +1335,6 @@ fn run_runtime_supervised(
             // failure before the first initialisation stays fatal, as before.
             Err(e) if initialised || recovery.reopen_in_progress() || gave_up => {
                 if initialised {
-                    gave_up = false;
                     cause = format!("Bluetooth dongle stopped responding ({})", e);
                     eprintln!(
                         "[AokieRadio] transport recovery: the radio failed mid-session ({}) - \
@@ -1353,6 +1352,12 @@ fn run_runtime_supervised(
                             );
                         }
                         delay
+                    }
+                    // The dongle opened fine but the session keeps failing:
+                    // reopening again would only drop the phone every
+                    // minute. Stop and report once, as before this change.
+                    None if initialised => {
+                        return Err(recovery.give_up_message(&cause, None));
                     }
                     None => {
                         if !gave_up {
