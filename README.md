@@ -127,6 +127,7 @@ cargo test --workspace
 cargo check -p aokie-plugin --features voice
 cargo test -p aokie-plugin --features voice -- --test-threads=2
 node scripts/check-receptionist-ui.mjs
+node scripts/check-receptionist-setup.mjs
 cargo test -p aokie-protocol -p aokie-mobile
 (cd apps/aokie-mobile && npm ci && npm test && npm run build)
 cargo clippy --workspace --all-targets
