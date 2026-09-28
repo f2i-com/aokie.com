@@ -1256,21 +1256,27 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
  * frame, and the host pads the page (--host-page-pad on body), so the pane
  * adds no gutters or chrome of its own: no tab bar, no Overview, tighter
  * spacing, one column of cards. app.js sets `is-setup` before the first
- * tab mounts. */
+ * tab mounts; OAIY also marks the document `data-oaiy-setup` when it builds
+ * it, so the tab bar is hidden from the first paint, before any script runs. */
 
+html[data-oaiy-setup] .rcp,
 .rcp.is-setup {
   gap: 12px;
   padding: 0;
 }
 
+html[data-oaiy-setup] .rcp > .rcp-tabs,
+html[data-oaiy-setup] .rcp > .rcp-overview,
 .rcp.is-setup > .rcp-tabs,
 .rcp.is-setup > .rcp-overview { display: none; }
 
+html[data-oaiy-setup] .rcp > .rcp-tab-panel,
 .rcp.is-setup > .rcp-tab-panel {
   grid-template-columns: minmax(0, 1fr);
   gap: 12px;
 }
 
+html[data-oaiy-setup] .rcp .rcp-card,
 .rcp.is-setup .rcp-card {
   gap: 10px;
   padding: 13px 14px 14px;
