@@ -203,6 +203,85 @@
   var activeTab = 'overview';
   var activeDef = null; // the mounted module for a non-overview tab
 
+  // ---- setup mode (OAIY's setup wizard) -----------------------------------
+  // OAIY's setup wizard can show this screen as one of its steps. It then
+  // adds PluginHost.setup (absent in normal mode and on older hosts), whose
+  // context() names the view to show. The screen then shows only that tab:
+  // no tab bar, no Overview, no timers of its own; the wizard draws the
+  // title, the step list and Back/Next/Skip around the frame. The tab keeps
+  // its own inner flow and tells the wizard when the step is done.
+  //
+  //   'off'     — the normal screen (no PluginHost.setup: exactly as before);
+  //   'pending' — PluginHost.setup is there, waiting for its context;
+  //   'on'      — one tab, inside the wizard.
+
+  var SETUP = HOST.setup && typeof HOST.setup.context === 'function' ? HOST.setup : null;
+  var setupMode = SETUP ? 'pending' : 'off';
+  var setupStep = '';
+  var setupView = '';
+
+  /** The wizard's view names, and the tab each one shows. */
+  var SETUP_VIEWS = { consent: 'consent', dongle: 'dongle', phone: 'phone' };
+
+  /** Call one PluginHost.setup method. Never throws and never rejects: the
+   *  tabs call it from handlers that may have set a busy flag, so a missing
+   *  method or a refused call must not leave them stuck. */
+  function setupCall(method, args) {
+    if (setupMode !== 'on' || !SETUP || typeof SETUP[method] !== 'function') return Promise.resolve(false);
+    try {
+      return Promise.resolve(SETUP[method].apply(SETUP, args)).then(
+        function () {
+          return true;
+        },
+        function () {
+          return false;
+        }
+      );
+    } catch (e) {
+      return Promise.resolve(false);
+    }
+  }
+
+  var setupDoneSent = false; // done() told for the current satisfied state
+  var setupLastProgress = null;
+
+  /** What the tabs use. In normal mode `active()` is false and every call is
+   *  a no-op, so a tab can call these without checking the mode first. */
+  var setupApi = {
+    active: function () {
+      return setupMode === 'on';
+    },
+    step: function () {
+      return setupStep;
+    },
+    view: function () {
+      return setupView;
+    },
+    /** The step is done (a short detail for the wizard). Told once until
+     *  `unsatisfied()` says the state was lost again. */
+    done: function (detail) {
+      if (setupMode !== 'on' || setupDoneSent) return Promise.resolve(false);
+      setupDoneSent = true;
+      return setupCall('done', detail ? [String(detail)] : []);
+    },
+    /** The step's state is not (or no longer) satisfied. */
+    unsatisfied: function () {
+      setupDoneSent = false;
+    },
+    /** fraction 0..1 or null, and a short text. Repeats are not sent. */
+    progress: function (fraction, text) {
+      var key = String(fraction) + '|' + String(text || '');
+      if (setupMode !== 'on' || key === setupLastProgress) return Promise.resolve(false);
+      setupLastProgress = key;
+      return setupCall('progress', [fraction == null ? null : fraction, String(text || '')]);
+    },
+    /** Only for an error the person must see in the wizard, not one the
+     *  tab already shows and can retry. */
+    fail: function (message) {
+      return setupCall('fail', [String(message || 'This step could not continue.')]);
+    },
+  };
+
   window.__aokieTabs = {
     register: function (id, def) {
       tabRegistry[id] = def || {};
@@ -211,6 +290,9 @@
     util: { esc: esc, errMsg: errMsg, setHtml: setHtml, svg: svg, icons: ICONS, navLink: navLink },
     /** Where calls go, shared by the Overview, Settings and Consent tabs. */
     oaiy: OAIY,
+    /** Setup mode: whether the screen is a step of OAIY's setup wizard, and
+     *  how a tab reports back to it. */
+    setup: setupApi,
     switchTo: function (id) {
       switchTab(id);
     },
@@ -260,18 +342,24 @@
     for (var i = 0; i < btns.length; i++) {
       if (btns[i].getAttribute('data-tab') === 'dongle') btns[i].hidden = !showDongle;
     }
-    if (!showDongle && activeTab === 'dongle') switchTab('overview');
+    // In setup mode the wizard chose the tab; the Dongle tab says itself
+    // that the built-in transport needs no dongle.
+    if (!showDongle && activeTab === 'dongle' && setupMode === 'off') switchTab('overview');
   }
 
   function tabContainer(id) {
     return $('tab-' + id);
   }
 
-  function switchTab(id) {
+  /** `fromSetup`: the one switch setup mode makes, to the wizard's view.
+   *  Every other switch (tab bar, data-tabgo links, switchTo) is ignored
+   *  while setup mode is starting or on: the wizard owns the navigation. */
+  function switchTab(id, fromSetup) {
+    if (setupMode !== 'off' && !fromSetup) return;
     if (!id || id === activeTab || !tabContainer(id)) return;
     // A tab hidden by the transport mode stays unreachable, even
     // programmatically (data-tabgo links, switchTo).
-    if (id === 'dongle' && transportMode !== 'dongle') return;
+    if (id === 'dongle' && transportMode !== 'dongle' && !fromSetup) return;
 
     // Leave the old tab.
     if (activeTab === 'overview') {
@@ -312,11 +400,83 @@
       } catch (e) {
         el.innerHTML =
           '<p class="rcp-error">This tab failed to load: ' + esc(errMsg(e)) + '</p>';
+        setupApi.fail('The Aokie screen for this step failed to load: ' + errMsg(e));
       }
     } else {
       el.innerHTML =
         '<p class="rcp-error">This tab did not register — the screen bundle may be incomplete.</p>';
+      setupApi.fail('The Aokie screen for this step did not load. Reinstall the Aokie plugin, then try again.');
     }
+  }
+
+  /** Run `fn` once every tab module has registered. The context resolves in
+   *  a microtask after THIS script, before the tabs/*.js scripts run. */
+  function afterTabScripts(fn) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', function () {
+        fn();
+      });
+    } else {
+      fn();
+    }
+  }
+
+  /** PluginHost.setup is there: hide the tab bar and the Overview at once,
+   *  then ask which view the wizard wants. */
+  function startSetup() {
+    var rootEl = $('rcp-root');
+    if (rootEl) rootEl.classList.add('is-setup');
+    var context;
+    try {
+      context = Promise.resolve(SETUP.context());
+    } catch (e) {
+      context = Promise.reject(e);
+    }
+    context.then(
+      function (ctx) {
+        if (ctx && ctx.mode === 'setup') {
+          afterTabScripts(function () {
+            enterSetup(ctx);
+          });
+        } else {
+          leaveSetup();
+        }
+      },
+      function () {
+        leaveSetup();
+      }
+    );
+  }
+
+  /** Not a wizard step after all: the normal screen, as without setup. */
+  function leaveSetup() {
+    setupMode = 'off';
+    var rootEl = $('rcp-root');
+    if (rootEl) rootEl.classList.remove('is-setup');
+    if (activeTab === 'overview' && !document.hidden) startTimers();
+  }
+
+  function enterSetup(ctx) {
+    setupMode = 'on';
+    setupStep = String(ctx.step || '');
+    setupView = String(ctx.view || '');
+    var nav = $('rcp-tabs');
+    if (nav) nav.hidden = true;
+    var overview = tabContainer('overview');
+    if (overview) overview.hidden = true;
+    var tabId = Object.prototype.hasOwnProperty.call(SETUP_VIEWS, setupView) ? SETUP_VIEWS[setupView] : '';
+    if (!tabId || !tabContainer(tabId)) {
+      var rootEl = $('rcp-root');
+      if (rootEl) {
+        rootEl.insertAdjacentHTML(
+          'beforeend',
+          '<p class="rcp-error">This version of Aokie has no setup view named “' + esc(setupView) + '”.</p>'
+        );
+      }
+      setupApi.fail('This version of Aokie has no setup view named “' + setupView + '”. Update the Aokie plugin, then try again.');
+      return;
+    }
+    switchTab(tabId, true);
   }
 
   // Manual tab activation: arrows move focus; Enter/Space opens the section.
@@ -1359,7 +1519,8 @@
     .subscribe(SUBSCRIBED_EVENTS, function (evt) {
       var name = (evt && evt.name) || '';
       if (activeTab === 'overview') {
-        routeOverviewEvent(name);
+        // Setup mode never shows the Overview, so it never refreshes it.
+        if (setupMode === 'off') routeOverviewEvent(name);
         return;
       }
       if (activeDef && typeof activeDef.onEvent === 'function') {
@@ -1384,7 +1545,7 @@
     // Overview's timers only run while Overview is the active tab; other
     // tabs' own intervals check document.hidden themselves.
     if (document.hidden) stopTimers();
-    else if (activeTab === 'overview') startTimers();
+    else if (activeTab === 'overview' && setupMode === 'off') startTimers();
   });
 
   window.addEventListener('pagehide', function () {
@@ -1407,5 +1568,6 @@
     }
   });
 
-  if (!document.hidden) startTimers();
+  if (SETUP) startSetup();
+  else if (!document.hidden) startTimers();
 })();
