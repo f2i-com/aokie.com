@@ -33,6 +33,7 @@ pub mod sco;
 pub mod sco_dump;
 pub mod sdp;
 pub mod sdp_client;
+pub(crate) mod transport_recovery;
 pub mod vcard;
 
 #[cfg(target_os = "windows")]

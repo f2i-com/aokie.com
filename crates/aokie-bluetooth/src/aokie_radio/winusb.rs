@@ -33,7 +33,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
 use windows_sys::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 
 /// Process-wide counter for SCO TX `WinUsb_WriteIsochPipeAsap` calls
 /// that returned `ERROR_INVALID_PARAMETER` (Win32 87) and forced us to
@@ -838,6 +838,198 @@ unsafe fn cancel_and_drain_overlapped(
     true
 }
 
+/// Win32 ERROR_OPERATION_ABORTED: a queued read was cancelled by
+/// `WinUsb_AbortPipe` (our own pipe flush).
+const ERROR_OPERATION_ABORTED_READ: u32 = 995;
+
+/// The error a queued read reports when nothing arrived within the wait.
+/// It carries "Win32 error 121" (ERROR_SEM_TIMEOUT), the text
+/// `manager::is_timeout_error` matches, so every caller keeps treating it
+/// as "nothing yet" exactly as it did with the old synchronous reads.
+fn queued_read_timeout(label: &str) -> String {
+    format!(
+        "WinUsb_ReadPipe({}) failed: Win32 error 121 (nothing yet; the read stays queued)",
+        label
+    )
+}
+
+/// Split one event-pipe transfer into HCI events (`code, len, params`).
+///
+/// A transfer normally holds exactly one event: the controller ends it
+/// with a short USB packet. An event whose size is a whole multiple of the
+/// 16-byte packet size ends without one, so the queued read keeps filling
+/// with the next event; the old 5 ms timeout cut such a transfer (and lost
+/// it), the queued read hands both over together. A trailing fragment
+/// shorter than its declared length is kept as-is for the parser to reject.
+fn split_hci_events(mut transfer: Vec<u8>) -> VecDeque<Vec<u8>> {
+    let mut events = VecDeque::new();
+    while transfer.len() >= 2 {
+        let total = 2 + transfer[1] as usize;
+        if transfer.len() <= total {
+            break;
+        }
+        let rest = transfer.split_off(total);
+        events.push_back(std::mem::replace(&mut transfer, rest));
+    }
+    events.push_back(transfer);
+    events
+}
+
+/// One IN transfer kept queued on the HCI event (interrupt) or ACL (bulk)
+/// pipe across poll timeouts — the fix for the "USB stream corrupted"
+/// garbage-prefix incidents.
+///
+/// The runtime polls every pipe with a 5 ms wait so it can keep up with
+/// SCO audio. It used to do that with a synchronous `WinUsb_ReadPipe` and a
+/// 5 ms `PIPE_TRANSFER_TIMEOUT`, and WinUSB cancels a transfer that is still
+/// running when that timeout fires. The BCM20702 is a full-speed device
+/// (bulk max packet 64 bytes), so a 139-byte ACL packet arrives as three
+/// USB packets (64 + 64 + 11). When the timeout landed between them, the
+/// packets the host had already acknowledged were lost — the device never
+/// sends them again, and the read returned an error without their bytes.
+/// The tail of the packet then reached the next read ahead of the next real
+/// header: exactly the logged "garbage prefix" (75 = 139 - 64 and
+/// 11 = 139 - 128 bytes of readable XML, 53 = 117 - 64 bytes of SDP).
+///
+/// Here a poll that times out leaves the transfer queued; the next poll
+/// waits on the same transfer, so no USB packet is ever dropped. The pipe's
+/// own timeout policy is set to 0 (never) for these two pipes — WinUSB
+/// applies `PIPE_TRANSFER_TIMEOUT` to overlapped transfers too.
+struct QueuedInRead {
+    label: &'static str,
+    pipe_id: u8,
+    buffer: Box<[u8]>,
+    overlapped: Box<OVERLAPPED>,
+    event: EventHandle,
+    in_flight: bool,
+    /// A cancel whose completion could not be proven: the kernel may still
+    /// write into `buffer` / `overlapped`, so they are never reused or freed.
+    poisoned: bool,
+}
+
+impl QueuedInRead {
+    unsafe fn new(label: &'static str, pipe_id: u8, len: usize) -> Result<Self, String> {
+        Ok(Self {
+            label,
+            pipe_id,
+            buffer: vec![0u8; len.max(1)].into_boxed_slice(),
+            overlapped: Box::new(zeroed()),
+            event: EventHandle::manual_reset()?,
+            in_flight: false,
+            poisoned: false,
+        })
+    }
+
+    unsafe fn submit(&mut self, interface: WINUSB_INTERFACE_HANDLE) -> Result<(), String> {
+        ResetEvent(self.event.0);
+        *self.overlapped = zeroed();
+        self.overlapped.hEvent = self.event.0;
+        let ok = WinUsb_ReadPipe(
+            interface,
+            self.pipe_id,
+            self.buffer.as_mut_ptr(),
+            self.buffer.len() as u32,
+            null_mut(),
+            self.overlapped.as_ref(),
+        );
+        if ok == 0 {
+            let err = GetLastError();
+            if err != ERROR_IO_PENDING {
+                return Err(format!(
+                    "WinUsb_ReadPipe({}) failed: Win32 error {}",
+                    self.label, err
+                ));
+            }
+        }
+        // Completed at once or pending: either way the event is signalled
+        // on completion and `poll` collects the bytes.
+        self.in_flight = true;
+        Ok(())
+    }
+
+    /// Wait up to `wait_ms` for the queued transfer and return its bytes.
+    /// A timeout leaves the transfer queued for the next call.
+    unsafe fn poll(
+        &mut self,
+        interface: WINUSB_INTERFACE_HANDLE,
+        wait_ms: u32,
+    ) -> Result<Vec<u8>, String> {
+        if self.poisoned {
+            return Err(format!(
+                "WinUsb_ReadPipe({}) halted: a cancelled transfer never completed",
+                self.label
+            ));
+        }
+        if !self.in_flight {
+            self.submit(interface)?;
+        }
+        let wait = WaitForSingleObject(self.event.0, wait_ms);
+        if wait == WAIT_TIMEOUT {
+            return Err(queued_read_timeout(self.label));
+        }
+        if wait != WAIT_OBJECT_0 {
+            return Err(format!(
+                "WaitForSingleObject({}) failed: Win32 error {}",
+                self.label,
+                GetLastError()
+            ));
+        }
+        let mut transferred = 0u32;
+        if WinUsb_GetOverlappedResult(interface, self.overlapped.as_ref(), &mut transferred, 0) == 0
+        {
+            let err = GetLastError();
+            if err == ERROR_IO_INCOMPLETE {
+                return Err(queued_read_timeout(self.label));
+            }
+            self.in_flight = false;
+            if err == ERROR_OPERATION_ABORTED_READ {
+                // Our own pipe flush cancelled it; queue a fresh read next time.
+                return Err(queued_read_timeout(self.label));
+            }
+            return Err(format!(
+                "WinUsb_ReadPipe({}) failed: Win32 error {}",
+                self.label, err
+            ));
+        }
+        self.in_flight = false;
+        let len = (transferred as usize).min(self.buffer.len());
+        Ok(self.buffer[..len].to_vec())
+    }
+
+    /// Cancel the queued transfer (if any) and wait — bounded — until the
+    /// kernel has let go of it. Returns false if that could not be proven;
+    /// the storage is then poisoned and leaked on drop.
+    unsafe fn cancel(&mut self, device: HANDLE, interface: WINUSB_INTERFACE_HANDLE) -> bool {
+        if !self.in_flight || self.poisoned {
+            return !self.poisoned;
+        }
+        let retired =
+            cancel_and_drain_overlapped(device, interface, self.overlapped.as_ref(), self.label);
+        if retired {
+            self.in_flight = false;
+        } else {
+            self.poisoned = true;
+        }
+        retired
+    }
+}
+
+impl Drop for QueuedInRead {
+    fn drop(&mut self) {
+        if self.in_flight || self.poisoned {
+            // The owner could not prove the kernel is done with this
+            // transfer: leak the storage (a few KiB) rather than free
+            // memory a late completion could still write into.
+            let buffer = std::mem::take(&mut self.buffer);
+            std::mem::forget(buffer);
+            let overlapped = std::mem::replace(&mut self.overlapped, Box::new(unsafe { zeroed() }));
+            std::mem::forget(overlapped);
+            let event = std::mem::replace(&mut self.event, EventHandle(null_mut()));
+            std::mem::forget(event);
+        }
+    }
+}
+
 /// Prime the kernel's iso scheduling clock for `handle`. BTstack
 /// (`hci_transport_h2_winusb.c:522,656,930,1428`) calls
 /// `WinUsb_GetCurrentFrameNumber` immediately before every iso submit
@@ -1253,6 +1445,19 @@ pub struct AokieHciTransport {
     /// gets lost — which manifests as "remote BD_ADDR is all zeros"
     /// and missed call-setup transitions.
     deferred_events: std::sync::Mutex<VecDeque<Vec<u8>>>,
+    /// The reads kept queued on the HCI event and ACL IN pipes (see
+    /// `QueuedInRead`): created on first use, never cancelled by a poll
+    /// timeout, only by a pipe flush or by drop.
+    event_reader: std::sync::Mutex<Option<QueuedInRead>>,
+    acl_reader: std::sync::Mutex<Option<QueuedInRead>>,
+    /// Events that arrived in the same transfer as an earlier one (see
+    /// `split_hci_events`), handed out by the next event read.
+    event_spill: std::sync::Mutex<VecDeque<Vec<u8>>>,
+    /// How long `read_event` / `read_acl` wait on their queued read before
+    /// reporting a timeout (`set_read_timeouts`). This replaces the pipes'
+    /// `PIPE_TRANSFER_TIMEOUT`, which cancelled transfers mid-packet.
+    event_wait_ms: AtomicU32,
+    acl_wait_ms: AtomicU32,
 }
 
 impl AokieHciTransport {
@@ -1333,16 +1538,18 @@ impl AokieHciTransport {
             .event_in
             .ok_or_else(|| "WinUSB interface has no HCI event endpoint".to_string())?;
 
+        // Timeout policy 0 = never: WinUSB would otherwise cancel a queued
+        // read mid-packet. The wait lives in `event_wait_ms` / `acl_wait_ms`.
         set_pipe_timeout(
             interface_handle(&control, associated.as_ref(), event_in.slot)?,
             event_in.info.id,
-            5000,
+            0,
         )?;
         if let Some(acl_in) = pipes.acl_in {
             set_pipe_timeout(
                 interface_handle(&control, associated.as_ref(), acl_in.slot)?,
                 acl_in.info.id,
-                5000,
+                0,
             )?;
         }
 
@@ -1357,6 +1564,11 @@ impl AokieHciTransport {
             dump: PacketDump::from_env(),
             command_lock: std::sync::Mutex::new(()),
             deferred_events: std::sync::Mutex::new(VecDeque::new()),
+            event_reader: std::sync::Mutex::new(None),
+            acl_reader: std::sync::Mutex::new(None),
+            event_spill: std::sync::Mutex::new(VecDeque::new()),
+            event_wait_ms: AtomicU32::new(5000),
+            acl_wait_ms: AtomicU32::new(5000),
         })
     }
 
@@ -1393,11 +1605,15 @@ impl AokieHciTransport {
     /// logged — the most common failure is "no transfers in
     /// flight," which is fine.
     pub fn flush_in_pipes(&self) -> Result<(), String> {
-        let pipes: [(&str, Option<PipeEndpoint>); 2] = [
-            ("HCI event in", self.pipes.event_in),
-            ("HCI ACL in", self.pipes.acl_in),
+        let pipes: [(
+            &str,
+            Option<PipeEndpoint>,
+            &std::sync::Mutex<Option<QueuedInRead>>,
+        ); 2] = [
+            ("HCI event in", self.pipes.event_in, &self.event_reader),
+            ("HCI ACL in", self.pipes.acl_in, &self.acl_reader),
         ];
-        for (label, endpoint) in pipes {
+        for (label, endpoint, reader) in pipes {
             let Some(endpoint) = endpoint else { continue };
             let handle = self.pipe_handle(endpoint.slot)?;
             unsafe {
@@ -1407,6 +1623,18 @@ impl AokieHciTransport {
                         label,
                         GetLastError()
                     );
+                }
+                // The abort cancelled our queued read (if one was out);
+                // collect it before the pipe is reset under it.
+                if let Ok(mut guard) = reader.lock() {
+                    if let Some(queued) = guard.as_mut() {
+                        queued.cancel(self._device.0, handle);
+                    }
+                }
+                if std::ptr::eq(reader, &self.event_reader) {
+                    if let Ok(mut spill) = self.event_spill.lock() {
+                        spill.clear();
+                    }
                 }
                 if WinUsb_ResetPipe(handle, endpoint.info.id) == 0 {
                     eprintln!(
@@ -1541,20 +1769,58 @@ impl AokieHciTransport {
                 return Ok(packet);
             }
         }
+        let packet = self.read_event_pipe()?;
+        self.dump.log("evt <", &packet);
+        Ok(packet)
+    }
+
+    /// One HCI event from the event pipe's queued read (never the deferred
+    /// queue). Shared by `read_event` and `read_command_complete` so both
+    /// wait on the same transfer.
+    fn read_event_pipe(&self) -> Result<Vec<u8>, String> {
+        if let Ok(mut spill) = self.event_spill.lock() {
+            if let Some(event) = spill.pop_front() {
+                return Ok(event);
+            }
+        }
         let event_in = self
             .pipes
             .event_in
             .ok_or_else(|| "WinUSB interface has no HCI event endpoint".to_string())?;
-        let packet = unsafe {
-            read_pipe(
-                self.pipe_handle(event_in.slot)?,
-                event_in.info.id,
-                "HCI event",
-                260,
-            )?
-        };
-        self.dump.log("evt <", &packet);
-        Ok(packet)
+        let transfer = self.read_queued(
+            &self.event_reader,
+            event_in,
+            "HCI event",
+            260,
+            self.event_wait_ms.load(AtomicOrdering::Relaxed),
+        )?;
+        let mut events = split_hci_events(transfer);
+        let first = events.pop_front().unwrap_or_default();
+        if !events.is_empty() {
+            if let Ok(mut spill) = self.event_spill.lock() {
+                spill.extend(events);
+            }
+        }
+        Ok(first)
+    }
+
+    fn read_queued(
+        &self,
+        reader: &std::sync::Mutex<Option<QueuedInRead>>,
+        endpoint: PipeEndpoint,
+        label: &'static str,
+        len: usize,
+        wait_ms: u32,
+    ) -> Result<Vec<u8>, String> {
+        let handle = self.pipe_handle(endpoint.slot)?;
+        let mut guard = reader
+            .lock()
+            .map_err(|e| format!("{} reader lock poisoned: {}", label, e))?;
+        if guard.is_none() {
+            *guard = Some(unsafe { QueuedInRead::new(label, endpoint.info.id, len)? });
+        }
+        let queued = guard.as_mut().expect("reader was just created");
+        unsafe { queued.poll(handle, wait_ms) }
     }
 
     pub fn set_read_timeouts(
@@ -1563,23 +1829,13 @@ impl AokieHciTransport {
         acl_timeout_ms: Option<u32>,
         sco_timeout_ms: Option<u32>,
     ) -> Result<(), String> {
-        if let Some(event_in) = self.pipes.event_in {
-            unsafe {
-                set_pipe_timeout_if_supported(
-                    self.pipe_handle(event_in.slot)?,
-                    event_in.info,
-                    event_timeout_ms,
-                )?
-            };
-        }
-        if let (Some(acl_in), Some(timeout_ms)) = (self.pipes.acl_in, acl_timeout_ms) {
-            unsafe {
-                set_pipe_timeout_if_supported(
-                    self.pipe_handle(acl_in.slot)?,
-                    acl_in.info,
-                    timeout_ms,
-                )?
-            };
+        // Event and ACL reads stay queued across waits (`QueuedInRead`), so
+        // these are poll waits, not pipe timeouts that would cancel a
+        // transfer mid-packet.
+        self.event_wait_ms
+            .store(event_timeout_ms, AtomicOrdering::Relaxed);
+        if let Some(timeout_ms) = acl_timeout_ms {
+            self.acl_wait_ms.store(timeout_ms, AtomicOrdering::Relaxed);
         }
         if let (Some(sco_in), Some(timeout_ms)) = (self.pipes.sco_in, sco_timeout_ms) {
             unsafe {
@@ -1860,18 +2116,7 @@ impl AokieHciTransport {
         const MAX_IGNORED_EVENTS: usize = 4096;
         let mut ignored_events = 0;
         loop {
-            let event_in = self
-                .pipes
-                .event_in
-                .ok_or_else(|| "WinUSB interface has no HCI event endpoint".to_string())?;
-            let event = unsafe {
-                read_pipe(
-                    self.pipe_handle(event_in.slot)?,
-                    event_in.info.id,
-                    "HCI event",
-                    260,
-                )?
-            };
+            let event = self.read_event_pipe()?;
             self.dump.log("evt <", &event);
             match crate::aokie_radio::hci::parse_command_complete(&event, opcode) {
                 Ok(_) => return Ok(event),
@@ -1916,14 +2161,15 @@ impl AokieHciTransport {
             .pipes
             .acl_in
             .ok_or_else(|| "WinUSB interface has no HCI ACL in endpoint".to_string())?;
-        let packet = unsafe {
-            read_pipe(
-                self.pipe_handle(endpoint.slot)?,
-                endpoint.info.id,
-                "HCI ACL in",
-                max_len,
-            )?
-        };
+        // A read already queued keeps its original length; the runtime's
+        // accumulator treats the pipe as a byte stream either way.
+        let packet = self.read_queued(
+            &self.acl_reader,
+            endpoint,
+            "HCI ACL in",
+            max_len,
+            self.acl_wait_ms.load(AtomicOrdering::Relaxed),
+        )?;
         self.dump.log("acl <", &packet);
         Ok(packet)
     }
@@ -2401,6 +2647,38 @@ impl PacketDump {
     }
 }
 
+impl Drop for AokieHciTransport {
+    fn drop(&mut self) {
+        // Retire the queued event / ACL reads before their storage and the
+        // WinUSB handles go away (a transfer still queued in the kernel
+        // would complete into freed memory). A read whose cancellation
+        // cannot be proven is leaked by `QueuedInRead::drop` instead.
+        let readers = [
+            (self.pipes.event_in, &self.event_reader),
+            (self.pipes.acl_in, &self.acl_reader),
+        ];
+        for (endpoint, reader) in readers {
+            let Some(endpoint) = endpoint else { continue };
+            let Ok(handle) = self.pipe_handle(endpoint.slot) else {
+                continue;
+            };
+            if let Ok(mut guard) = reader.lock() {
+                if let Some(queued) = guard.as_mut() {
+                    unsafe {
+                        queued.cancel(self._device.0, handle);
+                    }
+                }
+            }
+        }
+        // Same for an SCO iso ring left armed (a transport dropped mid-call).
+        if self.sco_isoch_buffers.is_some() {
+            if let Err(e) = self.disable_sco_alt_setting() {
+                eprintln!("[AokieRadio] SCO teardown on close failed: {}", e);
+            }
+        }
+    }
+}
+
 impl Drop for WinUsbIsochBuffer {
     fn drop(&mut self) {
         unsafe {
@@ -2662,6 +2940,46 @@ fn wide_null(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_queued_read_timeout_reads_as_an_ordinary_timeout() {
+        // Every caller treats "nothing yet" through is_timeout_error; the
+        // queued read must keep matching it or the runtime would exit.
+        assert!(crate::aokie_radio::manager::is_timeout_error(
+            &queued_read_timeout("HCI ACL in")
+        ));
+    }
+
+    #[test]
+    fn one_event_per_transfer_passes_through() {
+        // Command Complete for HCI_Reset: 0e 04 01 03 0c 00.
+        let events = split_hci_events(vec![0x0e, 0x04, 0x01, 0x03, 0x0c, 0x00]);
+        assert_eq!(events, [vec![0x0e, 0x04, 0x01, 0x03, 0x0c, 0x00]]);
+    }
+
+    #[test]
+    fn two_events_in_one_transfer_are_split_in_order() {
+        // A 16-byte event (no short packet to end it) followed by a
+        // Number_Of_Completed_Packets event in the same transfer.
+        let mut first = vec![0x0e, 14];
+        first.extend(1..=14u8);
+        let second = vec![0x13, 0x05, 0x01, 0x0c, 0x00, 0x01, 0x00];
+        let mut transfer = first.clone();
+        transfer.extend(&second);
+        let events = split_hci_events(transfer);
+        assert_eq!(events, [first, second]);
+    }
+
+    #[test]
+    fn a_short_trailing_fragment_is_left_for_the_parser() {
+        let events = split_hci_events(vec![0x0f, 0x04, 0x00, 0x01, 0x05, 0x04, 0x05, 0x0b]);
+        assert_eq!(
+            events,
+            [vec![0x0f, 0x04, 0x00, 0x01, 0x05, 0x04], vec![0x05, 0x0b]]
+        );
+        assert_eq!(split_hci_events(vec![0x0e]), [vec![0x0e]]);
+        assert_eq!(split_hci_events(Vec::new()), [Vec::<u8>::new()]);
+    }
 
     #[test]
     fn classifies_standard_hci_pipes() {
