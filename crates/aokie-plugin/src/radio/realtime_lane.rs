@@ -361,6 +361,38 @@ pub(super) fn realtime_apology_can_speak(
         }
 }
 
+/// The `instructions` a realtime session carries. OAIY's call agent has its
+/// own call rules and reads this as "the receptionist brief", so on the OAIY
+/// route it is the persona alone (the saved one, or the call's overlay):
+/// business context, with action-marker brackets neutralised and bounded as
+/// the wrapper bounds it. Other providers speak model output directly and
+/// get Aokie's full realtime wrapper, as before.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+pub(super) fn realtime_instructions(
+    oaiy_route: bool,
+    persona: &str,
+    allow_finish_call: bool,
+) -> String {
+    if oaiy_route {
+        realtime_brief(persona)
+    } else {
+        realtime_safe_instructions(persona, allow_finish_call)
+    }
+}
+
+/// The persona as business notes: `[[`/`]]` neutralised (no legacy action
+/// marker survives) and at most 8,000 characters.
+#[cfg(feature = "voice")]
+pub(super) fn realtime_brief(persona: &str) -> String {
+    persona
+        .trim()
+        .replace("[[", "(")
+        .replace("]]", ")")
+        .chars()
+        .take(8_000)
+        .collect()
+}
+
 /// An agent-placed outbound dial whose realtime session could not start.
 /// Elsewhere it falls back to Aokie's own voice; on the OAIY route that
 /// voice is not there, so the dial is ended before the callee answers.
