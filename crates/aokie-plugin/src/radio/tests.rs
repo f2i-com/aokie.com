@@ -530,6 +530,74 @@ fn oaiy_gets_the_persona_as_its_brief_and_other_providers_keep_the_wrapper() {
     assert!(wrapped.contains("A small hair salon."));
 }
 
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[test]
+fn fixed_lines_use_oaiys_speak_mode_on_its_route_and_the_local_voice_elsewhere() {
+    let config = RealtimeRuntimeConfig {
+        endpoint: "ws://127.0.0.1:17872/api/ai/providers/oaiy/v1/realtime/stream".into(),
+        destination: "https://oaiy.localhost".into(),
+        voice: "marin".into(),
+        turn_detection: crate::realtime_voice::TurnDetection::ServerVad,
+        max_output_tokens: 4_096,
+    };
+    // Elsewhere: Aokie's own TTS exactly as before, whatever the config.
+    let own = LineVoice::for_route(false, Some(&config), false);
+    assert!(own.oaiy.is_none() && own.own_tts && own.can_speak());
+    // OAIY route: OAIY's voice, with the local TTS only as a fallback.
+    let oaiy = LineVoice::for_route(true, Some(&config), false);
+    assert!(oaiy.oaiy.is_some() && !oaiy.own_tts && oaiy.can_speak());
+    assert!(LineVoice::for_route(true, Some(&config), true).own_tts);
+    // No config, no own TTS: no voice, so the hold juggle stays off.
+    let none = LineVoice::for_route(true, None, false);
+    assert!(!none.can_speak());
+    assert!(!auto_hold_has_voice(true, none.can_speak()));
+    assert!(auto_hold_has_voice(true, oaiy.can_speak()));
+
+    // A speak session: the line as the greeting, speak mode, nothing else.
+    let say = oaiy_say_config(&config, "call_1", 9, "Please hold for a moment.");
+    assert!(say.speak_only);
+    assert_eq!(say.greeting, "Please hold for a moment.");
+    assert_eq!(say.call_id, "call_1");
+    assert!(say.instructions.is_empty());
+    assert!(!say.allow_business_lookup && !say.allow_request_appointment && !say.allow_finish_call);
+    assert_eq!(say.call, crate::realtime_voice::CallFacts::default());
+    assert_eq!(say.expected_destination, "https://oaiy.localhost");
+
+    // A line that played (or was cut by the operator) is never repeated in
+    // another voice; one that never sounded falls back.
+    let silent = OaiySaid {
+        dur: Duration::ZERO,
+        cancelled: false,
+        error: Some("no audio from OAIY within 2500 ms".into()),
+    };
+    assert!(!silent.settled());
+    assert!(OaiySaid {
+        dur: Duration::from_millis(40),
+        ..silent.clone()
+    }
+    .settled());
+    assert!(OaiySaid {
+        cancelled: true,
+        ..silent.clone()
+    }
+    .settled());
+    assert!(OAIY_APOLOGY_FIRST_AUDIO < OAIY_SAY_FIRST_AUDIO);
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn a_mid_call_oaiy_failure_says_in_whose_voice_the_caller_heard_the_apology() {
+    let with_oaiy = realtime_failed_payload("call_1", "stream closed", Some("oaiy"));
+    assert_eq!(with_oaiy["code"], "realtime_failed");
+    assert_eq!(with_oaiy["callId"], "call_1");
+    assert_eq!(with_oaiy["route"], "oaiy");
+    assert_eq!(with_oaiy["apologized"], true);
+    assert_eq!(with_oaiy["apologizedWith"], "oaiy");
+    let silent = realtime_failed_payload("call_1", "stream closed", None);
+    assert_eq!(silent["apologized"], false);
+    assert!(silent.get("apologizedWith").is_none());
+}
+
 #[cfg(feature = "voice")]
 #[test]
 fn realtime_start_facts_go_only_to_oaiy_and_carry_what_aokie_knows() {

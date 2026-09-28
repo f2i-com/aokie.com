@@ -41,6 +41,9 @@ pub(super) fn play_tone_and_greet(
     #[cfg(feature = "voice")] voice_call_gen: u64,
     #[cfg(feature = "voice")] realtime_legacy_call: &Option<String>,
     #[cfg(feature = "voice")] silence_window: std::time::Duration,
+    // The OAIY route's realtime config: its speak mode says a screened
+    // caller's message in OAIY's voice. `None` on every other route.
+    #[cfg(feature = "voice")] oaiy_voice: Option<&RealtimeRuntimeConfig>,
 ) {
     // Outbound agent calls start like a normal phone conversation: listen for
     // the recipient's hello, then let the reply engine deliver the introduction
@@ -240,21 +243,34 @@ pub(super) fn play_tone_and_greet(
                 }
             );
             let screen_tts_ready = status.tts_error.lock().unwrap().is_none();
-            if screened_call_needs_tts(screen_msg) && screen_tts_ready {
+            // The OAIY route says the message in OAIY's voice (its speak
+            // mode: no agent, the caller unheard), falling back to Aokie's
+            // own TTS; every other route speaks it with the local TTS only,
+            // as before.
+            let screen_voice = LineVoice {
+                oaiy: oaiy_voice,
+                own_tts: screen_tts_ready,
+            };
+            if screened_call_needs_tts(screen_msg) && screen_voice.can_speak() {
                 let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls);
-                let _ = speak_planned(
+                let spoken = say_fixed_line(
                     bt,
                     &synth,
+                    screen_voice,
+                    &corr,
                     screen_msg,
                     sr,
-                    None,
-                    None,
-                    Some(&mut probe),
                     &ctx.pace,
                     protected_max_ms,
-                    None,
+                    Some(&mut probe),
                     egress_gate,
+                    OAIY_SAY_FIRST_AUDIO,
                 );
+                if spoken.is_zero() && screen_voice.oaiy.is_some() {
+                    eprintln!(
+                        "[aokie-plugin] screened-call message could not be said in any voice — hanging up silently"
+                    );
+                }
             } else {
                 if screened_call_needs_tts(screen_msg) {
                     eprintln!(

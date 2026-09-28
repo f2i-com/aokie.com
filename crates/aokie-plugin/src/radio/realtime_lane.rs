@@ -295,9 +295,10 @@ pub(super) fn screened_call_needs_tts(message: &str) -> bool {
 /// Whether answering a screened caller waits for Aokie's own TTS. Off the
 /// OAIY route a set screen message holds the answer until that TTS is ready
 /// (the call keeps ringing meanwhile). On the OAIY route a screened caller
-/// is never left ringing and never given to OAIY: without Aokie's own voice
-/// the call is refused silently, as with a blank message (answered, then
-/// ended at once by the greeting site's screening).
+/// is never left ringing and never given to OAIY's agent: the greeting
+/// site's screening says the message in OAIY's voice (its speak mode) or
+/// Aokie's own, and hangs up; with no voice at all the call is refused
+/// silently, as with a blank message.
 #[cfg(feature = "voice")]
 pub(super) fn screened_answer_waits_for_tts(
     oaiy_route: bool,
@@ -331,21 +332,21 @@ pub(super) fn local_voice_before_identity(
     handset_dial || (!oaiy_route && (already_active || promotion_pending))
 }
 
-/// The automatic hold juggle speaks its announcements in Aokie's own voice.
-/// On the OAIY route it runs only when that voice is there; otherwise the
-/// second caller keeps hearing call waiting, and a caller who gives up is a
-/// missed call that OAIY rings back.
+/// The automatic hold juggle speaks announcements. On the OAIY route it runs
+/// only when a voice is there for them (OAIY's speak mode, or Aokie's own
+/// TTS); otherwise the second caller keeps hearing call waiting, and a
+/// caller who gives up is a missed call that OAIY rings back.
 #[cfg(feature = "voice")]
-pub(super) fn auto_hold_has_voice(oaiy_route: bool, tts_available: bool) -> bool {
-    !oaiy_route || tts_available
+pub(super) fn auto_hold_has_voice(oaiy_route: bool, voice_available: bool) -> bool {
+    !oaiy_route || voice_available
 }
 
 /// Whether the realtime fail-safe may speak its apology in Aokie's own
 /// voice before hanging up. Off the OAIY route the local TTS must be proven
-/// by the loopback self-test. On the OAIY route that self-test never runs
-/// (OAIY speaks), so an available local TTS (its preflight found it) is the
-/// caller's one chance of an honest line; a silent attempt still ends in
-/// the same prompt hangup.
+/// by the loopback self-test. On the OAIY route (where OAIY's speak mode is
+/// tried first) that self-test never runs, so an available local TTS (its
+/// preflight found it) is the fallback; a silent attempt still ends in the
+/// same prompt hangup.
 #[cfg(feature = "voice")]
 pub(super) fn realtime_apology_can_speak(
     oaiy_route: bool,
@@ -359,6 +360,29 @@ pub(super) fn realtime_apology_can_speak(
         } else {
             realtime_failsafe_can_speak(tts_error, self_test)
         }
+}
+
+/// `aokie.hardware.error` data for a mid-call OAIY failure: `apologized`
+/// says whether the caller heard the apology, `apologizedWith` in whose
+/// voice (`"oaiy"`: OAIY's speak mode; `"aokie"`: Aokie's own TTS).
+#[cfg(feature = "voice")]
+pub(super) fn realtime_failed_payload(
+    call_id: &str,
+    cause: &str,
+    apologized_with: Option<&'static str>,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "message": format!("OAIY's voice failed during the call: {cause}"),
+        "code": "realtime_failed",
+        "callId": call_id,
+        "route": "oaiy",
+        "apologized": apologized_with.is_some(),
+        "at": aokie_core::events::now_iso8601(),
+    });
+    if let Some(voice) = apologized_with {
+        data["apologizedWith"] = serde_json::json!(voice);
+    }
+    data
 }
 
 /// The `instructions` a realtime session carries. OAIY's call agent has its

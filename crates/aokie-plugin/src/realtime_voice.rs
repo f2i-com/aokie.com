@@ -73,6 +73,11 @@ pub struct SessionConfig {
     /// What Aokie knows about the call, sent as additive
     /// `formlogic.realtime.start` fields. Each is left out when unknown.
     pub call: CallFacts,
+    /// OAIY's speak mode (`"mode": "speak"`): the provider says `greeting`
+    /// once, in its own voice, and nothing else — no agent, no listening,
+    /// not a live call. Aokie's fixed lines (a screen message, a hold
+    /// announcement, the failure apology) on the OAIY route.
+    pub speak_only: bool,
 }
 
 /// Additive `formlogic.realtime.start` fields: `direction`, `from`,
@@ -215,6 +220,8 @@ struct StartEvent<'a> {
     purpose: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     opening_line: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
 }
 
 impl<'a> StartEvent<'a> {
@@ -241,6 +248,7 @@ impl<'a> StartEvent<'a> {
             caller_name: known(&config.call.caller_name),
             purpose: known(&config.call.purpose),
             opening_line: known(&config.call.opening_line),
+            mode: config.speak_only.then_some("speak"),
         }
     }
 }
@@ -1556,6 +1564,7 @@ mod tests {
             allow_request_appointment: true,
             allow_finish_call: true,
             call,
+            speak_only: false,
         }
     }
 
@@ -1595,9 +1604,20 @@ mod tests {
             CallFacts::default(),
         )))
         .unwrap();
-        for key in ["direction", "from", "callerName", "purpose", "openingLine"] {
+        for key in ["direction", "from", "callerName", "purpose", "openingLine", "mode"] {
             assert!(start.get(key).is_none(), "{key} must be left out");
         }
+    }
+
+    #[test]
+    fn a_line_to_say_asks_for_the_speak_mode() {
+        let mut config = session_config(CallFacts::default());
+        config.speak_only = true;
+        config.greeting = "Sorry, we could not take your call.".into();
+        let start = serde_json::to_value(StartEvent::for_session(&config)).unwrap();
+        assert_eq!(start["mode"], "speak");
+        assert_eq!(start["greeting"], "Sorry, we could not take your call.");
+        assert_eq!(start["type"], "formlogic.realtime.start");
     }
 
     #[test]
@@ -1624,9 +1644,11 @@ mod tests {
             caller_name: None,
             purpose: None,
             opening_line: None,
+            mode: None,
         })
         .unwrap();
         assert_eq!(start["allowRequestAppointment"], true);
+        assert!(start.get("mode").is_none());
 
         let interrupted = ToolResultEvent {
             kind: "formlogic.realtime.tool_result",

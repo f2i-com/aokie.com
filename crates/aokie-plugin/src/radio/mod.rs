@@ -68,6 +68,7 @@ mod interjections;
 mod spawn;
 mod http_speech;
 mod juggle;
+mod oaiy_speak;
 mod playback;
 mod lookup;
 mod answer;
@@ -111,6 +112,8 @@ use self::greet::*;
 use self::remote_transitions::*;
 #[allow(unused_imports)]
 use self::juggle::*;
+#[allow(unused_imports)]
+use self::oaiy_speak::*;
 #[allow(unused_imports)]
 use self::lookup::*;
 #[allow(unused_imports)]
