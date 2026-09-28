@@ -48,6 +48,27 @@ and iOS builds; there is no certified-phone matrix yet — establishing one is
 the hardware half of audit task **AOK-E2E-001** (a record/replay radio
 abstraction plus a small supported-device lab).
 
+### Android 17: texts stuck on "Sending…" (Google Messages beta)
+
+`aokie.sms.sent` means the phone accepted the MAP PushMessage into its outbox
+(OBEX `0xA0`), not that the text went out. The phone reports the real result
+only over MNS, which outbound sessions never get. Since 28 Sept 2026 the radio
+logs a **sent check** 20 s after each send: the phone's outbox and sent folder
+listings (`[AokieRadio] sent check: Outbox holds …`). A text still in the
+outbox has not gone out; the phone files queued and failed texts there too.
+
+On the Pixel 9a test phone (Android 17, CP3A.260905.009) every pushed text
+stayed "Still sending" in Google Messages. Android 17 asks the default
+messaging app to "upgrade" texts sent by other apps before sending them
+(`SMSDispatcher: sendText: requesting message upgrade via DMA.` in
+`adb logcat -b radio`). The Google Messages **open beta**
+(`messages.android_20260921_01_RC00.phone.openbeta`) accepted the handover
+(`onMessageUpgradeRequested`) and never sent its copy. Rolling Messages back
+fixed it: `adb shell pm uninstall-system-updates com.google.android.apps.messaging`.
+The factory build declines the upgrade and the phone sends the text itself.
+Leaving the Messages beta in the Play Store keeps it fixed. It was not a
+Bluetooth, SIM or carrier fault; texts typed on the phone always went out.
+
 ## Windows
 
 Windows 10/11 x64. The plugin raises the process timer resolution to 1 ms for

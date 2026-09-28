@@ -73,12 +73,13 @@ pub const CHARSET_NATIVE: u8 = 0x00;
 pub const CHARSET_UTF8: u8 = 0x01;
 
 /// Folders we know how to navigate to. Anything more exotic (drafts,
-/// sent, etc.) can be added when a use case appears; SMS auto-reply
-/// only needs inbox and outbox.
+/// deleted) can be added when a use case appears. SMS auto-reply needs
+/// inbox and outbox; `sent` shows whether a pushed text went out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Folder {
     Inbox,
     Outbox,
+    Sent,
 }
 
 impl Folder {
@@ -86,6 +87,7 @@ impl Folder {
         match self {
             Folder::Inbox => "inbox",
             Folder::Outbox => "outbox",
+            Folder::Sent => "sent",
         }
     }
 }

@@ -89,6 +89,38 @@ pub fn parse_listing(input: &[u8]) -> Vec<MessageEntry> {
     entries
 }
 
+/// Every `<msg>` element's attributes as (name, value) pairs, in order.
+/// For looking at what a folder holds (a sent text's state, say)
+/// beyond the fields `MessageEntry` keeps.
+pub fn msg_attribute_pairs(input: &[u8]) -> Vec<Vec<(String, String)>> {
+    let text = String::from_utf8_lossy(input);
+    let mut out = Vec::new();
+    for piece in text.split("<msg").skip(1) {
+        // `<msg-listing` and the like are other elements.
+        if !piece.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/') {
+            continue;
+        }
+        let section = &piece[..piece.find('>').unwrap_or(piece.len())];
+        let mut pairs = Vec::new();
+        let mut rest = section;
+        while let Some(eq) = rest.find('=') {
+            let name = rest[..eq].trim().rsplit(char::is_whitespace).next().unwrap_or("").to_string();
+            let after = rest[eq + 1..].trim_start();
+            let Some(quote) = after.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                break;
+            };
+            let body = &after[1..];
+            let Some(close) = body.find(quote) else {
+                break;
+            };
+            pairs.push((name, body[..close].to_string()));
+            rest = &body[close + 1..];
+        }
+        out.push(pairs);
+    }
+    out
+}
+
 fn parse_msg_attributes(section: &str) -> Option<MessageEntry> {
     let mut handle: Option<String> = None;
     let mut datetime = None;
@@ -204,6 +236,17 @@ fn find_byte(haystack: &[u8], needle: u8, from: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attribute_pairs_of_each_msg() {
+        let xml = br#"<?xml version="1.0"?><MAP-msg-listing version="1.0"><msg handle="0400000000000033" subject="OAIY test 3" datetime="20260928T182849" recipient_addressing="+61400000000" type="SMS_GSM" sent="no" read='yes'/><msg handle="04000000000031" sent="yes" /></MAP-msg-listing>"#;
+        let all = msg_attribute_pairs(xml);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0][0], ("handle".to_string(), "0400000000000033".to_string()));
+        assert!(all[0].contains(&("sent".to_string(), "no".to_string())));
+        assert!(all[0].contains(&("read".to_string(), "yes".to_string())));
+        assert_eq!(all[1], vec![("handle".to_string(), "04000000000031".to_string()), ("sent".to_string(), "yes".to_string())]);
+    }
 
     const SAMPLE: &str = r#"<?xml version="1.0"?>
 <MAP-msg-listing version="1.0">
