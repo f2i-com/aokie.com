@@ -2080,6 +2080,69 @@ impl Plugin {
                     }
                 }
             }
+            "dongle.reset" => {
+                // The software recovery for a dongle that stopped answering:
+                // close and reopen the USB connection, HCI_Reset, page the
+                // phone back (AokieRuntime::reset_transport). Never during a
+                // call — the reset drops the link and the call with it.
+                expect_fields(payload, &[])?;
+                self.check_consent("dongle.reset", crate::consent::Scope::Bluetooth)?;
+                self.require_radio_or_dev("dongle.reset")?;
+                if let Some(radio) = self.radio.as_ref() {
+                    if radio.current_call_id().is_some() || radio.is_call_active() {
+                        return Err(CmdError::failed(
+                            crate::contract::commands::DONGLE_RESET_DURING_CALL,
+                        ));
+                    }
+                    let phone_was_connected = radio.is_connected();
+                    let ready_epoch = radio.dongle_ready_epoch();
+                    // Bounded well inside the 20 s the receptionist screen
+                    // waits for an answer (and Desktop's 30 s): requests
+                    // queue behind this one on the stdio loop meanwhile.
+                    let deadline = std::time::Instant::now() + DONGLE_RESET_WAIT;
+                    radio.reset_dongle().map_err(CmdError::failed)?;
+                    let phone_reconnected =
+                        radio.wait_after_dongle_reset(ready_epoch, phone_was_connected, deadline);
+                    eprintln!(
+                        "[aokie-plugin] dongle reset done: controller {}, phone {}",
+                        if radio.dongle_ready_epoch() != ready_epoch {
+                            "ready again"
+                        } else {
+                            "not ready yet"
+                        },
+                        if phone_reconnected {
+                            "reconnected"
+                        } else if phone_was_connected {
+                            "not reconnected yet"
+                        } else {
+                            "was not connected"
+                        }
+                    );
+                    return Ok(json!({
+                        "accepted": true,
+                        "via": "software",
+                        "phoneReconnected": phone_reconnected,
+                    }));
+                }
+                // Dev mock: the same refusal during a mock call, else an
+                // immediate simulated success.
+                if self
+                    .mock
+                    .current_call
+                    .as_ref()
+                    .is_some_and(|call| call.state != MockCallState::Ended)
+                {
+                    return Err(CmdError::failed(
+                        crate::contract::commands::DONGLE_RESET_DURING_CALL,
+                    ));
+                }
+                Ok(json!({
+                    "accepted": true,
+                    "via": "software",
+                    "phoneReconnected": true,
+                    "simulated": true,
+                }))
+            }
             "phone.status" => {
                 expect_fields(payload, &[])?;
                 if let Some(radio) = self.radio.as_ref() {
@@ -4050,12 +4113,17 @@ fn operation_id() -> String {
     format!("op_{}", uuid::Uuid::new_v4().simple())
 }
 
+/// How long `dongle.reset` waits for the controller and the phone to come
+/// back before it answers. The receptionist screen gives a command 20 s.
+const DONGLE_RESET_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Commands that can cause an observable phone/radio effect. These require a
 /// Desktop-supplied request id and pass through the persistent ledger above.
 fn is_journalled_command(command: &str) -> bool {
     matches!(
         command,
-        "phone.startPairing"
+        "dongle.reset"
+            | "phone.startPairing"
             | "phone.stopPairing"
             | "phone.removePaired"
             | "phone.disconnect"
@@ -6716,6 +6784,45 @@ mod tests {
             health["detail"]
         );
         assert_eq!(health["components"]["outbox"]["ackMode"], json!(true));
+    }
+
+    /// `dongle.reset {}`: the dev mock answers the canonical shape, the
+    /// command takes no fields, a call in progress is refused with the exact
+    /// message, and without a radio (no dev mode) it never fakes success.
+    #[test]
+    fn dongle_reset_shape_and_refusal_during_a_call() {
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink::default();
+        let ok = plugin
+            .dispatch_command("dongle.reset", &json!({}), &mut sink)
+            .unwrap();
+        assert_eq!(ok["accepted"], json!(true));
+        assert_eq!(ok["via"], json!("software"));
+        assert!(ok["phoneReconnected"].is_boolean());
+        assert!(plugin
+            .dispatch_command("dongle.reset", &json!({"force": true}), &mut sink)
+            .is_err());
+
+        plugin.mock.current_call = Some(MockCall {
+            correlation_id: "call_live".into(),
+            caller: "+61400000000".into(),
+            state: MockCallState::Active,
+            started_at: "2026-09-29T00:00:00Z".into(),
+            turns: 0,
+        });
+        let err = plugin
+            .dispatch_command("dongle.reset", &json!({}), &mut sink)
+            .unwrap_err();
+        assert_eq!(err.code, crate::contract::errors::COMMAND_FAILED);
+        assert_eq!(
+            err.message,
+            crate::contract::commands::DONGLE_RESET_DURING_CALL
+        );
+
+        let mut no_radio = Plugin::ephemeral(false);
+        assert!(no_radio
+            .dispatch_command("dongle.reset", &json!({}), &mut sink)
+            .is_err());
     }
 
     /// Audit C-01: call controls accept an optional `callId`; a stale one

@@ -185,6 +185,7 @@ pub mod commands {
         "dongle.restoreDriver",
         "dongle.removeCerts",
         "dongle.diagnostics",
+        "dongle.reset",
         "phone.status",
         "phone.startPairing",
         "phone.stopPairing",
@@ -212,6 +213,11 @@ pub mod commands {
         "consent.set",
         "consent.revoke",
     ];
+
+    /// `dongle.reset`'s refusal (typed `command_failed`) while a call is
+    /// ringing or active: the reset drops the link and with it the call.
+    pub const DONGLE_RESET_DURING_CALL: &str =
+        "a call is in progress: reset the dongle after it ends";
 }
 
 /// Typed connector error codes (`error.data.code`).

@@ -611,6 +611,50 @@ impl RadioHandle {
             .map_err(|_| "the radio did not answer the connect request".to_string())?
     }
 
+    /// `dongle.reset`: ask the radio thread to reset the dongle in software.
+    /// `Err` when a call is up (the radio's own check) or the transport
+    /// cannot be reset; `Ok` means the reset started.
+    pub fn reset_dongle(&self) -> Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send(RadioControl::ResetDongle { reply: tx })?;
+        rx.recv_timeout(std::time::Duration::from_secs(3))
+            .map_err(|_| "the radio did not answer the reset request".to_string())?
+    }
+
+    /// The controller-ready count `dongle.reset` waits to see move.
+    pub fn dongle_ready_epoch(&self) -> u64 {
+        self.status.dongle_ready_epoch.load(Ordering::Relaxed)
+    }
+
+    /// After a started reset: wait, at most until `deadline`, for the
+    /// controller to report ready again (`ready_epoch` moved on) and, when
+    /// a phone was connected before, for the phone to reconnect. Returns
+    /// whether a phone is connected when the wait ends.
+    pub fn wait_after_dongle_reset(
+        &self,
+        ready_epoch: u64,
+        phone_was_connected: bool,
+        deadline: std::time::Instant,
+    ) -> bool {
+        // The reset drops the phone link first; until that is seen, a
+        // "connected" reading is the old link, not the reconnected one.
+        let mut phone_dropped = !phone_was_connected;
+        loop {
+            let controller_back = self.dongle_ready_epoch() != ready_epoch;
+            let connected = self.is_connected();
+            if !connected {
+                phone_dropped = true;
+            }
+            if controller_back && (!phone_was_connected || (phone_dropped && connected)) {
+                return connected;
+            }
+            if std::time::Instant::now() >= deadline {
+                return connected && phone_dropped;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// PAIR-001: the held SSP numeric comparison awaiting the operator, if
     /// any (lock-free slot read; expired prompts read as None).
     pub fn pending_pairing_confirm(

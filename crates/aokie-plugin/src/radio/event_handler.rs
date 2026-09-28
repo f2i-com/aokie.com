@@ -26,6 +26,7 @@ pub(super) fn handle_event(
     match ev {
         E::Initialized(addr) => {
             status.initialized.store(true, Ordering::Relaxed);
+            status.dongle_ready_epoch.fetch_add(1, Ordering::Relaxed);
             *status.local_address.lock().unwrap() = Some(addr.clone());
             *status.last_error.lock().unwrap() = None;
             emit(

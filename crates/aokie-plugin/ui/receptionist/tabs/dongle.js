@@ -9,6 +9,10 @@
  * (`dongle.list` / `dongle.installDriver` / `dongle.restoreDriver`); this
  * tab only sequences it and narrates what to expect.
  *
+ * A second card, "Reset the dongle", runs `dongle.reset`: the plugin's
+ * software recovery (reopen the USB connection, reset the controller, page
+ * the phone back), refused by the plugin while a call is up.
+ *
  * Sandbox deltas: the wizard renders as a whole tab (never collapsed), the
  * restore confirm is INLINE (no host dialog), and the done step points at
  * the Phone setup TAB (pairing no longer lives "below" on the same card).
@@ -41,6 +45,11 @@
   // rebind re-enumerates it) — "Check again" and a remount mid-verify must
   // still know which device they're waiting on.
   var verifyTarget = null;
+  // "Reset the dongle" (dongle.reset): its own busy flag and last outcome,
+  // separate from the driver wizard's.
+  var resetting = false;
+  var resetError = null;
+  var resetNote = null;
 
   function key(d) {
     return d.vid + ':' + d.pid;
@@ -175,6 +184,38 @@
       )
       .then(function () {
         busy = false;
+        render();
+      });
+  }
+
+  /** Reset the dongle in software (dongle.reset): the plugin closes and
+   *  reopens the USB connection, resets the Bluetooth controller and pages
+   *  the phone back, then answers within about 15 seconds. It refuses
+   *  during a call, with a message that says so. */
+  function resetDongle() {
+    if (resetting) return;
+    resetting = true;
+    resetError = null;
+    resetNote = null;
+    render();
+    HOST.command('dongle.reset', {})
+      .then(
+        function (data) {
+          var back = !!(data && data.phoneReconnected);
+          resetNote = {
+            ok: back,
+            text: back
+              ? 'The dongle was reset and the phone is connected again.'
+              : 'The dongle was reset. The phone has not reconnected yet; it usually does within a minute (see the Phone setup tab).',
+          };
+          HOST.toast(back ? 'success' : 'info', back ? 'Dongle reset — the phone is connected again.' : 'Dongle reset — waiting for the phone to reconnect.');
+        },
+        function (e) {
+          resetError = errMsg(e);
+        }
+      )
+      .then(function () {
+        resetting = false;
         render();
       });
   }
@@ -345,7 +386,38 @@
       '</div>' +
       '<p class="rcp-footnote">All device work happens in the plugin and its elevated helper — this screen only ' +
       'sequences it. Restoring the Windows driver at any time hands the dongle back to BTHUSB.</p>' +
-      '</section>';
+      '</section>' +
+      resetCardHtml();
+  }
+
+  /** The "Reset the dongle" card: software recovery without unplugging. */
+  function resetCardHtml() {
+    return (
+      '<section class="rcp-card">' +
+      '<div class="rcp-card__heading">' +
+      '<div class="rcp-card__heading-copy">' +
+      '<small>Recovery</small>' +
+      '<h3>Reset the dongle</h3>' +
+      '</div>' +
+      '</div>' +
+      '<div class="rcp-card__body">' +
+      '<p class="rcp-inline-note">When calls or texts stop getting through and the dongle seems stuck, reset it ' +
+      'here instead of unplugging it: Aokie closes and reopens its USB connection, resets the Bluetooth ' +
+      'controller and reconnects the phone. The phone drops off for a few seconds. It cannot be done during a call.</p>' +
+      '<div class="rcp-actions">' +
+      '<button type="button" class="rcp-button" data-act="dg-reset"' + (resetting ? ' disabled' : '') + '>' +
+      (resetting ? 'Resetting the dongle…' : 'Reset the dongle') +
+      '</button>' +
+      '</div>' +
+      (resetNote && !resetting
+        ? resetNote.ok
+          ? '<p class="rcp-status-ok">' + ICONS.check + ' ' + esc(resetNote.text) + '</p>'
+          : '<p class="rcp-step-meta">' + esc(resetNote.text) + '</p>'
+        : '') +
+      (resetError && !resetting ? '<div class="rcp-error" style="padding: 10px 0 0;">' + esc(resetError) + '</div>' : '') +
+      '</div>' +
+      '</section>'
+    );
   }
 
   // ---- wiring -------------------------------------------------------------
@@ -391,6 +463,8 @@
         // current selection.
         var target = verifyTarget || selectedDevice();
         if (target) verifySelected(target);
+      } else if (act === 'dg-reset') {
+        resetDongle();
       } else if (act === 'dg-again') {
         step = 'select';
         error = null;

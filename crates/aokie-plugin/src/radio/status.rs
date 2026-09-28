@@ -9,6 +9,10 @@ use super::*;
 #[derive(Default)]
 pub struct RadioStatus {
     pub initialized: AtomicBool,
+    /// Counts the controller's `Initialized` reports (first open, a replug,
+    /// a software reset), so `dongle.reset` can tell the controller came
+    /// back rather than never left.
+    pub dongle_ready_epoch: AtomicU64,
     pub connected: AtomicBool,
     pub call_active: AtomicBool,
     pub local_address: Mutex<Option<String>>,

@@ -139,6 +139,14 @@ pub enum RadioControl {
         address: String,
         reply: std::sync::mpsc::Sender<Result<bool, String>>,
     },
+    /// `dongle.reset`: reset the dongle in software (the backend's
+    /// `reset_transport`). Refused while any call is ringing or active —
+    /// the reset drops the link and the call's audio with it. `Ok` means
+    /// the reset started; the controller's return is the next
+    /// `dongle.ready` and the phone's is `phone.connected`.
+    ResetDongle {
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
     /// PAIR-001: resolve the held SSP numeric comparison for `address` —
     /// `accept` completes the bond, `false` refuses it.
     ConfirmPairing {
