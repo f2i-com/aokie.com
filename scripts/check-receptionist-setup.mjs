@@ -497,6 +497,25 @@ const radioDown = { radio: { initialized: false, connected: false, localAddress:
 }
 
 {
+  // Consent keeps the radio off: no restart offer, the reason instead.
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const paused = {
+    radio: { running: false, status: 'paused', paused: true, blockedBy: 'consent', reason: 'no consent has been recorded for this device', initialized: false, connected: false },
+    outbox: { pending: 0, failed: 0, dead: 0 },
+  };
+  const page = await openScreen({
+    setup,
+    payloads: { 'settings.get': { settings: {} }, 'dongle.diagnostics': paused, 'dongle.list': { connected: [boundDongle] } },
+    restartPlugin: async () => {
+      throw new Error('must not restart');
+    },
+  });
+  assert.doesNotMatch(page.el('tab-dongle').innerHTML, /data-act="dg-setup-start"/);
+  assert.match(page.el('tab-dongle').innerHTML, /off until consent is given: no consent has been recorded/);
+  assert.deepEqual(doneCalls(setup), []);
+}
+
+{
   // Built-in Windows Bluetooth: no dongle to set up, and the view stays.
   const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
   const page = await openScreen({
