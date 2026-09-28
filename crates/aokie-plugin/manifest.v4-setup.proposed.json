@@ -1,5 +1,6 @@
 {
-  "$comment": [
+  "_notes": [
+    "_notes is not part of the manifest: drop it when merging.",
     "PROPOSED v4 additions to manifest.json for OAIY's setup wizard: a fragment for the host side to merge once OAIY reads v4.",
     "manifest.json stays schemaVersion 3 until then: a v4 manifest would stop the plugin loading on today's host.",
     "modules: the shape OAIY's modules code reads ({\"provides\": [...]}). Aokie's connector declares every command a phone claim needs (phone.status, sms.send, settings.get, settings.set, call.dial); the calendar needs none.",
