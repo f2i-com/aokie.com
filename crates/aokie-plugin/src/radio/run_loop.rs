@@ -1099,15 +1099,19 @@ pub(super) fn run_loop(
             }
         }
 
-        // Whether Aokie's own voice can speak the hold lines (the OAIY route
-        // may have none). Bound here, not in the calls' arguments: a lock
-        // guard there would stay held through the whole call, and the hold
-        // announcements record their TTS outcome in the same slot.
+        // The voice for the hold and queue lines: on the OAIY route OAIY's
+        // speak mode, with Aokie's own TTS as the fallback where present;
+        // elsewhere Aokie's own TTS as before. Bound here, not in the calls'
+        // arguments: a lock guard there would stay held through the whole
+        // call, and the hold announcements record their TTS outcome in the
+        // same slot.
         #[cfg(feature = "voice")]
-        let hold_voice = {
+        let line_voice = {
             let tts_available = status.tts_error.lock().unwrap().is_none();
-            auto_hold_has_voice(oaiy_route, tts_available)
+            LineVoice::for_route(oaiy_route, realtime_config.as_ref(), tts_available)
         };
+        #[cfg(feature = "voice")]
+        let hold_voice = auto_hold_has_voice(oaiy_route, line_voice.can_speak());
         #[cfg(feature = "voice")]
         reconcile_switchboard(
             bt,
@@ -1132,12 +1136,13 @@ pub(super) fn run_loop(
             &mut stt_had_speech,
             &mut stt_silence,
             &screen_policy,
-            // The FIFO cascade speaks hold lines in Aokie's own voice: on
-            // the OAIY route without that voice it waits instead (the knock
-            // resolves by itself, then the parked caller is retrieved).
+            // The FIFO cascade speaks hold lines: on the OAIY route with no
+            // voice for them it waits instead (the knock resolves by itself,
+            // then the parked caller is retrieved).
             auto_hold && hold_voice,
             &mut auto_hold_done_for,
             protected_max_ms,
+            line_voice,
         );
         #[cfg(not(feature = "voice"))]
         reconcile_switchboard(
@@ -1191,6 +1196,7 @@ pub(super) fn run_loop(
             &screen_policy,
             auto_hold,
             hold_voice,
+            line_voice,
             &mut auto_hold_done_for,
             &mut promote_greet_for,
             &mut resume_line_for,
@@ -1420,6 +1426,8 @@ pub(super) fn run_loop(
                         protected_max_ms,
                         &control_rx,
                         &mut pending_controls,
+                        line_voice,
+                        id.as_str(),
                     );
                     emit_turn(
                         outbox,
@@ -1629,6 +1637,7 @@ pub(super) fn run_loop(
             &control_rx,
             &status,
             oaiy_route,
+            &realtime_config,
             &remote_media,
             &synth,
             &mut pending_controls,
@@ -1710,7 +1719,7 @@ pub(super) fn run_loop(
                                     && voice_block_logged_call.as_deref() != Some(s.id.as_str())
                                 {
                                     eprintln!(
-                                        "[aokie-plugin] screened caller ({reason}) on the OAIY route: Aokie's own voice is unavailable for the screen message, so the call is refused silently (answered and ended at once), never given to OAIY"
+                                        "[aokie-plugin] screened caller ({reason}) on the OAIY route: answering to refuse it — OAIY's speak mode says the screen message (no agent, the caller unheard), silence if it cannot; the call is never given to OAIY's agent"
                                     );
                                     voice_block_logged_call = Some(s.id.clone());
                                 }
@@ -1853,6 +1862,7 @@ pub(super) fn run_loop(
             voice_call_gen,
             &realtime_legacy_call,
             silence_window,
+            realtime_config.as_ref().filter(|_| oaiy_route),
         );
         #[cfg(not(feature = "voice"))]
         play_tone_and_greet(

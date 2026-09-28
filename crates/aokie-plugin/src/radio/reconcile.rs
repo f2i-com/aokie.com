@@ -33,6 +33,7 @@ pub(super) fn reconcile_switchboard(
     #[cfg(feature = "voice")] auto_hold: bool,
     #[cfg(feature = "voice")] auto_hold_done_for: &mut Option<String>,
     #[cfg(feature = "voice")] protected_max_ms: u32,
+    #[cfg(feature = "voice")] line_voice: LineVoice<'_>,
 ) {
     // ── Phase 4 switchboard reconciliation (only while a caller is
     // parked — normal calls never enter this block). The phone's
@@ -262,6 +263,8 @@ pub(super) fn reconcile_switchboard(
                                     protected_max_ms,
                                     &control_rx,
                                     &mut *pending_controls,
+                                    line_voice,
+                                    tracker.call_id().unwrap_or("radio"),
                                 );
                                 emit_turn(
                                     outbox,

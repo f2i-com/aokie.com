@@ -87,6 +87,7 @@ pub(super) fn service_realtime_lane(
                                 allow_request_appointment: true,
                                 allow_finish_call: agent_hangup,
                                 call: call_facts,
+                                speak_only: false,
                             },
                         ) {
                             Ok(session) => {
@@ -224,6 +225,7 @@ pub(super) fn service_realtime_lane(
                                     allow_request_appointment: true,
                                     allow_finish_call: agent_hangup,
                                     call: call_facts,
+                                    speak_only: false,
                                 },
                             );
                             if promoted {
@@ -1766,6 +1768,7 @@ pub(super) fn service_realtime_failures(
     control_rx: &std::sync::mpsc::Receiver<RadioControl>,
     status: &Arc<RadioStatus>,
     oaiy_route: bool,
+    realtime_config: &Option<RealtimeRuntimeConfig>,
     remote_media: &crate::remote_media::RemoteMediaHandle,
     synth: &crate::synth::SynthHandle,
     pending_controls: &mut std::collections::VecDeque<RadioControl>,
@@ -1812,36 +1815,75 @@ pub(super) fn service_realtime_failures(
             *realtime_terminal_call = Some((failed_call_id.clone(), Instant::now(), 0));
             let tts_error = status.tts_error.lock().unwrap().clone();
             let self_test = status.self_test.lock().unwrap().clone();
+            // Aokie's own TTS: proven by the self-test off the OAIY route,
+            // present (its preflight found it) on it.
             let can_speak = realtime_apology_can_speak(
                 oaiy_route,
                 sr,
                 tts_error.as_deref(),
                 self_test.as_ref(),
             );
+            // On the OAIY route OAIY's speak mode says it first, if OAIY is
+            // still reachable: its call session just failed, so one short try.
+            let oaiy_apology = realtime_config
+                .as_ref()
+                .filter(|_| oaiy_route && sr > 0);
             let mut operator_ended = false;
-            let mut apologized = false;
-            if can_speak {
-                eprintln!(
-                    "[aokie-plugin] realtime responder failed mid-call ({cause}) — fixed apology then hangup"
-                );
+            let mut apologized_with: Option<&'static str> = None;
+            if oaiy_apology.is_some() || can_speak {
                 let started = Instant::now();
                 let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls);
-                let spoken = tts_speak(
-                    bt,
-                    &synth,
-                    FALLBACK_LINE,
-                    sr,
-                    None,
-                    None,
-                    Some(&mut probe),
-                    1.0,
-                    None,
-                    None,
-                    None,
-                );
-                note_tts_outcome(&status, &spoken);
-                apologized = spoken.dur > Duration::ZERO;
-                if spoken.dur > Duration::ZERO
+                if let Some(config) = oaiy_apology {
+                    eprintln!(
+                        "[aokie-plugin] OAIY's voice failed mid-call ({cause}) — trying the apology in OAIY's speak mode, then hangup"
+                    );
+                    let said = say_in_oaiy_voice(
+                        bt,
+                        config,
+                        &failed_call_id,
+                        FALLBACK_LINE,
+                        sr,
+                        OAIY_APOLOGY_FIRST_AUDIO,
+                        Some(&mut probe),
+                        None,
+                    );
+                    if said.dur > Duration::ZERO {
+                        apologized_with = Some("oaiy");
+                    } else if !said.cancelled {
+                        eprintln!(
+                            "[aokie-plugin] OAIY could not say the apology ({}){}",
+                            said.error.as_deref().unwrap_or("unknown"),
+                            if can_speak {
+                                "; saying it with Aokie's own voice"
+                            } else {
+                                "; no other voice, hanging up promptly"
+                            }
+                        );
+                    }
+                }
+                if apologized_with.is_none() && probe.action.is_none() && can_speak {
+                    eprintln!(
+                        "[aokie-plugin] realtime responder failed mid-call ({cause}) — fixed apology then hangup"
+                    );
+                    let spoken = tts_speak(
+                        bt,
+                        &synth,
+                        FALLBACK_LINE,
+                        sr,
+                        None,
+                        None,
+                        Some(&mut probe),
+                        1.0,
+                        None,
+                        None,
+                        None,
+                    );
+                    note_tts_outcome(&status, &spoken);
+                    if spoken.dur > Duration::ZERO {
+                        apologized_with = Some("aokie");
+                    }
+                }
+                if apologized_with.is_some()
                     && reply_owner_is_current(&remote_media, Some(&failed_owner))
                 {
                     emit_turn_with_delivery(
@@ -1865,7 +1907,7 @@ pub(super) fn service_realtime_failures(
                 }
             } else if oaiy_route {
                 eprintln!(
-                    "[aokie-plugin] OAIY's voice failed mid-call ({cause}); no voice is left to apologise with (OAIY's session is down, and Aokie's own TTS or the call audio is unavailable), hanging up promptly"
+                    "[aokie-plugin] OAIY's voice failed mid-call ({cause}); no voice is left to apologise with (no call audio, or no realtime config and no own TTS), hanging up promptly"
                 );
             } else {
                 eprintln!(
@@ -1882,14 +1924,7 @@ pub(super) fn service_realtime_failures(
                         crate::contract::events::HARDWARE_ERROR,
                         &failed_call_id,
                         &aokie_core::events::occurrence_id(),
-                        json!({
-                            "message": format!("OAIY's voice failed during the call: {cause}"),
-                            "code": "realtime_failed",
-                            "callId": failed_call_id,
-                            "route": "oaiy",
-                            "apologized": apologized,
-                            "at": aokie_core::events::now_iso8601(),
-                        }),
+                        realtime_failed_payload(&failed_call_id, &cause, apologized_with),
                     ),
                 );
             }

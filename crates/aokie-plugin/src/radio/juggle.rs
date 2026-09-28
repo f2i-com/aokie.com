@@ -22,6 +22,7 @@ pub(super) fn run_auto_hold_juggle(
     screen_policy: &crate::screen::ScreenPolicy,
     auto_hold: bool,
     hold_voice: bool,
+    line_voice: LineVoice<'_>,
     auto_hold_done_for: &mut Option<String>,
     promote_greet_for: &mut Option<String>,
     resume_line_for: &mut Option<(String, std::time::Instant)>,
@@ -92,12 +93,13 @@ pub(super) fn run_auto_hold_juggle(
                         "[aokie-plugin] AUTO-HOLD: knocking caller is screened ({reason}) — no juggle, no queue spot; they ring out and leave no missed-call record"
                     );
                 } else if !hold_voice {
-                    // OAIY route without Aokie's own voice: the juggle's
-                    // announcements would be silence (the first caller put
-                    // on hold unannounced, the second answered into a dead
-                    // line). Leave the knock to the network's call waiting.
+                    // OAIY route with no voice for the announcements (OAIY's
+                    // speak mode unavailable, Aokie's own TTS absent): they
+                    // would be silence (the first caller put on hold
+                    // unannounced, the second answered into a dead line).
+                    // Leave the knock to the network's call waiting.
                     eprintln!(
-                        "[aokie-plugin] AUTO-HOLD: no voice for the hold announcements on the OAIY route (Aokie's own TTS is unavailable) — {} keeps hearing call waiting; if they give up it is a missed call for OAIY to ring back",
+                        "[aokie-plugin] AUTO-HOLD: no voice for the hold announcements on the OAIY route (OAIY's speak mode unavailable, Aokie's own TTS absent) — {} keeps hearing call waiting; if they give up it is a missed call for OAIY to ring back",
                         w.call_id
                     );
                 } else if sr == 0 {
@@ -148,6 +150,8 @@ pub(super) fn run_auto_hold_juggle(
                         protected_max_ms,
                         &control_rx,
                         &mut *pending_controls,
+                        line_voice,
+                        tracker.call_id().unwrap_or("radio"),
                     );
                     if let Some(action) = cancel {
                         // The primary hung up during the ask — honour it and
@@ -281,6 +285,8 @@ pub(super) fn run_auto_hold_juggle(
                                         protected_max_ms,
                                         &control_rx,
                                         &mut *pending_controls,
+                                        line_voice,
+                                        tracker.call_id().unwrap_or("radio"),
                                     );
                                     emit_turn(
                                         outbox,
@@ -823,6 +829,8 @@ pub(super) fn run_auto_hold_juggle(
                                         protected_max_ms,
                                         &control_rx,
                                         &mut *pending_controls,
+                                        line_voice,
+                                        tracker.call_id().unwrap_or("radio"),
                                     );
                                 }
                             }

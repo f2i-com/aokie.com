@@ -694,20 +694,25 @@ pub(super) fn speak_announcement(
     protected_max_ms: u32,
     control_rx: &std::sync::mpsc::Receiver<RadioControl>,
     pending_controls: &mut std::collections::VecDeque<RadioControl>,
+    // Whose line it is and in which voice: on the OAIY route OAIY's speak
+    // mode says it (Aokie's own TTS only as a fallback); elsewhere
+    // `LineVoice::own()`, the local TTS as before.
+    voice: LineVoice<'_>,
+    call_id: &str,
 ) -> Option<CancelAction> {
     let mut probe = ControlProbe::new(control_rx, pending_controls);
-    let _ = speak_planned(
+    let _ = say_fixed_line(
         bt,
         synth,
+        voice,
+        call_id,
         text,
         sample_rate,
-        None,
-        None,
-        Some(&mut probe),
         pace,
         protected_max_ms,
+        Some(&mut probe),
         None,
-        None,
+        OAIY_SAY_FIRST_AUDIO,
     );
     probe.action.take()
 }
