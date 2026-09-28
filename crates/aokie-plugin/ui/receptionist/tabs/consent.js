@@ -216,6 +216,7 @@
   var codexProviderAvailable = false;
   var codexDestinationOptIn = false;
   var destinationSeeded = false;
+  var setupFormOpened = false; // setup mode has opened the form once
 
   for (var i = 0; i < SCOPE_ROWS.length; i++) scopes[SCOPE_ROWS[i].key] = SCOPE_ROWS[i].defaultOn;
 
@@ -285,6 +286,7 @@
       }
       if (codexDestinationOptIn) codexProviderAvailable = true;
       render();
+      reportSetup();
     });
   }
 
@@ -366,17 +368,11 @@
 
   // ---- rendering ----------------------------------------------------------
 
-  function statusCardHtml() {
-    if (status === undefined) return '<p class="rcp-loading">Loading…</p>';
-    if (status === null) {
-      return (
-        '<p class="rcp-error">' +
-        esc(error || 'consent.get failed — is the plugin running?') +
-        '</p>'
-      );
-    }
-    var grant = status.grant || null;
-    var enforced = status.mode === 'enforce';
+  /** How a consent.get status stands against this configuration. `ok` is
+   *  the green "Consent vN · enforced" state. */
+  function review(s) {
+    var grant = s.grant || null;
+    var enforced = s.mode === 'enforce';
     var destinationCurrent = false;
     if (grant && grant.scopes) {
       var granted = Array.isArray(grant.scopes.destinations) ? grant.scopes.destinations : [];
@@ -398,10 +394,54 @@
     }
     var needsAction =
       !grant ||
-      grant.version !== status.requiredVersion ||
+      grant.version !== s.requiredVersion ||
       !enforced ||
       !destinationCurrent ||
-      !!status.note;
+      !!s.note;
+    return {
+      grant: grant,
+      enforced: enforced,
+      destinationCurrent: destinationCurrent,
+      needsAction: needsAction,
+      ok: !!grant && enforced && !needsAction,
+    };
+  }
+
+  /** Setup mode: tell the wizard once consent is recorded and enforced (and
+   *  nothing blocks the radio for consent). The first time it is not, open
+   *  the consent form at once: that form is what this step is for. */
+  function reportSetup() {
+    var S = TABS.setup;
+    if (!S || !S.active() || !status) return;
+    var r = review(status);
+    if (r.ok && !status.blocked) {
+      S.done('Consent v' + r.grant.version + ' recorded and enforced');
+      return;
+    }
+    S.unsatisfied();
+    if (!setupFormOpened) {
+      setupFormOpened = true;
+      if (!wizardOpen) {
+        wizardOpen = true;
+        render();
+      }
+    }
+  }
+
+  function statusCardHtml() {
+    if (status === undefined) return '<p class="rcp-loading">Loading…</p>';
+    if (status === null) {
+      return (
+        '<p class="rcp-error">' +
+        esc(error || 'consent.get failed — is the plugin running?') +
+        '</p>'
+      );
+    }
+    var r = review(status);
+    var grant = r.grant;
+    var enforced = r.enforced;
+    var destinationCurrent = r.destinationCurrent;
+    var needsAction = r.needsAction;
 
     var badge;
     if (grant && enforced && !needsAction) {
