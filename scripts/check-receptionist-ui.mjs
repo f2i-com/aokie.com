@@ -21,7 +21,12 @@ const payloads = {
 };
 let failed = false;
 let snapshot = { state: 'running', health: { status: 'ok' } };
+let sources = [{ kind: 'service', serviceId: 'oaiy-voice', id: 'service:oaiy-voice', status: 'running', url: 'http://127.0.0.1:8783' }];
 const host = {
+  aiSources: async () => {
+    if (failed) throw new Error('Host unavailable');
+    return sources;
+  },
   snapshot: async () => {
     if (failed) throw new Error('Host unavailable');
     return snapshot;
@@ -39,7 +44,7 @@ const document = { hidden: true, getElementById: element, addEventListener() {},
 const context = vm.createContext({ window, document, URL, setTimeout, clearTimeout });
 const appSource = await readFile(new URL('app.js', base), 'utf8');
 vm.runInContext(appSource.replace(/\}\)\(\);\s*$/, `
-  window.testApp = { state, refreshSnapshot, refreshPhoneStatus, refreshPhones, refreshSettings, refreshSwitchboard, renderLive, replyOwner };
+  window.testApp = { state, refreshSnapshot, refreshPhoneStatus, refreshPhones, refreshSettings, refreshSources, refreshSwitchboard, renderLive, replyOwner };
 })();`), context);
 const app = window.testApp;
 app.state.call = { callId: 'fixture', state: 'active' };
@@ -125,28 +130,55 @@ payloads['call.switchboard'] = { waiting: null, parked: null, switchInProgress: 
 await app.refreshSwitchboard();
 assert.equal(element('switchboard-body').hidden, true);
 
+// Where calls go: OAIY's own gateway, another realtime provider, Aokie's
+// older local speech, or no AI receptionist.
+const oaiy = window.__aokieTabs.oaiy;
+const oaiyBag = { aiReceptionist: true, realtimeVoiceMode: 'desktop_realtime', realtimeVoiceEndpoint: oaiy.endpoint, realtimeVoiceDestination: oaiy.destination };
+assert.equal(oaiy.endpoint, 'ws://127.0.0.1:17872/api/ai/providers/oaiy/v1/realtime/stream');
+assert.equal(oaiy.realtimeProviderId(oaiy.endpoint), 'oaiy');
+assert.equal(oaiy.realtimeProviderId('http://127.0.0.1:17872/api/ai/providers/oaiy/v1/chat/completions'), '');
+assert.equal(oaiy.callRoute(oaiyBag), 'oaiy');
+assert.equal(oaiy.callRoute({ ...oaiyBag, realtimeVoiceEndpoint: 'ws://127.0.0.1:17872/api/ai/providers/openai/v1/realtime/stream' }), 'realtime');
+assert.equal(oaiy.callRoute({ aiReceptionist: true, realtimeVoiceMode: 'legacy' }), 'local');
+assert.equal(oaiy.callRoute({ aiReceptionist: 'false' }), 'flows');
+assert.equal(oaiy.callRoute(null), 'unknown');
+assert.equal(JSON.stringify(oaiy.voiceService(sources)), JSON.stringify({ status: 'running', url: 'http://127.0.0.1:8783' }));
+assert.equal(oaiy.voiceService([]), null);
+
+// The Overview names OAIY's Front desk, and OAIY Voice's live state, on the
+// OAIY route — and never Aokie's own speech engine or model.
+payloads['settings.get'] = { configVersion: 3, settings: { ...oaiyBag, greeting: 'Hi', persona: '', ttsEngine: '', aiModel: 'old-model' } };
+snapshot = { state: 'running', lastHealth: { status: 'ok', components: { responder: { mode: 'desktop_realtime', ready: true }, radio: { voiceRuntime: { realtime: { error: null } } } } } };
+await Promise.all([app.refreshSnapshot(), app.refreshSettings(), app.refreshSources()]);
+assert.match(element('readiness').innerHTML, /OAIY Front desk/);
+assert.match(element('readiness').innerHTML, /OAIY Voice running/);
+assert.match(element('settings-body').innerHTML, /OAIY Front desk/);
+assert.match(element('settings-body').innerHTML, /Chosen in OAIY/);
+assert.doesNotMatch(element('settings-body').innerHTML, /Pocket|Sherpa|old-model|LLM/);
+assert.equal(element('settings-title').textContent, 'Calls go to OAIY');
+sources = [{ ...sources[0], status: 'stopped', url: null }];
+await app.refreshSources();
+assert.match(element('readiness').innerHTML, /OAIY Voice is stopped/);
+snapshot.lastHealth.components.responder.realtimeError = 'gateway refused';
+await app.refreshSnapshot();
+assert.match(element('readiness').innerHTML, /last call: gateway refused/);
+payloads['settings.get'] = { settings: { ...oaiyBag, realtimeVoiceEndpoint: 'ws://127.0.0.1:17872/api/ai/providers/openai/v1/realtime/stream' } };
+delete snapshot.lastHealth.components.responder.realtimeError;
+await app.refreshSettings();
+assert.match(element('readiness').innerHTML, /Another realtime provider/);
+assert.equal(element('settings-title').textContent, 'Calls do not go to OAIY');
+
 const settingsSource = await readFile(new URL('tabs/settings.js', base), 'utf8');
 vm.runInContext(settingsSource.replace(/\}\)\(\);\s*$/, `
-  window.testSettings = { composeLaneUrl, inferLaneSource, realtimeProviderBinding, codexModelForEndpoint, setSources: function(list) { sources = list; } };
+  window.testSettings = { settingsPatch, withAokieDefaults };
 })();`), context);
 const settings = window.testSettings;
-const provider = { kind: 'provider', id: 'provider:local-test', providerId: 'local-test', gatewayUrl: 'http://127.0.0.1:17972/api/ai/providers/local-test' };
-const endpoint = `${provider.gatewayUrl}/v1/chat/completions`;
-assert.equal(settings.composeLaneUrl(provider.id, '', 'llm', [provider]), endpoint);
-assert.equal(settings.inferLaneSource(endpoint, 'llm', [provider]), provider.id);
-assert.equal(settings.composeLaneUrl('custom', 'http://127.0.0.1:8088/v1/chat/completions', 'llm', [provider]), 'http://127.0.0.1:8088/v1/chat/completions');
-assert.equal(settings.composeLaneUrl(provider.id, '', 'llm', [{ ...provider, gatewayUrl: undefined }]), 'http://127.0.0.1:17872/api/ai/providers/local-test/v1/chat/completions');
-assert.equal(settings.composeLaneUrl(provider.id, '', 'llm', [{ ...provider, gatewayUrl: 'http://127.0.0.1:17972/wrong-route' }]), 'http://127.0.0.1:17872/api/ai/providers/local-test/v1/chat/completions');
-const codex = { kind: 'provider', id: 'provider:openai-codex-agent-low', providerId: 'openai-codex-agent-low', gatewayUrl: 'http://127.0.0.1:17972/api/ai/providers/openai-codex-agent-low' };
-settings.setSources([codex]);
-assert.equal(settings.codexModelForEndpoint(`${codex.gatewayUrl}/v1/chat/completions`), 'gpt-5.5');
-assert.equal(settings.codexModelForEndpoint('http://127.0.0.1:9999/api/ai/providers/openai-codex-agent-low/v1/chat/completions'), null);
-const realtime = settings.realtimeProviderBinding({ ...provider, protocol: 'openai', capabilities: ['realtime'], destinationOrigin: 'https://api.openai.com', hasKey: true });
-assert.equal(realtime.endpoint, 'ws://127.0.0.1:17972/api/ai/providers/local-test/v1/realtime/stream');
-assert.equal(realtime.usable, true);
-const unsupportedRealtime = settings.realtimeProviderBinding({ ...provider, protocol: 'openai', capabilities: ['realtime'], gatewayCapabilities: ['chat'], destinationOrigin: 'https://api.openai.com', hasKey: true });
-assert.equal(unsupportedRealtime.usable, false);
-assert.equal(unsupportedRealtime.reason, 'not supported by this Desktop version');
+// Keys the form no longer shows keep their saved values: an edit to the
+// greeting patches the greeting and nothing else.
+const saved = settings.withAokieDefaults({ ...oaiyBag, aiModel: 'old-model', ttsEngine: 'sherpa', agentHangup: true });
+assert.equal(saved.agentHangup, true);
+assert.equal(settings.withAokieDefaults({}).agentHangup, false);
+assert.equal(JSON.stringify(settings.settingsPatch(saved, { ...saved, greeting: 'Hello' })), JSON.stringify({ greeting: 'Hello' }));
 const phoneSource = await readFile(new URL('tabs/phone.js', base), 'utf8');
 vm.runInContext(phoneSource.replace(/\}\)\(\);\s*$/, `
   window.testPhone = { refreshAll, pairingCardBody, bondedCardBody };
@@ -161,4 +193,4 @@ assert.match(window.testPhone.bondedCardBody(), /Host unavailable/);
 failed = false;
 await window.testPhone.refreshAll();
 assert.match(window.testPhone.pairingCardBody(), /Phone connected/);
-console.log('72 receptionist UI checks passed (isolated host; no live commands).');
+console.log('Receptionist UI checks passed (isolated host; no live commands).');

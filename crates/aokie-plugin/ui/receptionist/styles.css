@@ -658,6 +658,30 @@ button {
   white-space: nowrap;
 }
 
+/* Where each part of a call is set in OAIY (Settings tab). The values are
+   directions, so they wrap rather than truncate. */
+.rcp-set-in-oaiy {
+  margin-top: 8px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.rcp-set-in-oaiy .rcp-setting { padding: 7px 10px; }
+
+.rcp-set-in-oaiy .rcp-setting small {
+  flex: 0 0 150px;
+  white-space: normal;
+}
+
+.rcp-set-in-oaiy .rcp-setting span {
+  flex: 1 1 auto;
+  font-weight: 500;
+  text-align: left;
+  white-space: normal;
+}
+
 /* ── Tab bar ────────────────────────────────────────────────────────────── */
 
 .rcp-tabs {

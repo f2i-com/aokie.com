@@ -3,12 +3,12 @@
  * ui.screens). CORE module: boot, shared helpers, the tab registry/switcher,
  * the declared-events subscription, and the Overview tab.
  *
- * Runs inside FormLogic Desktop's sandboxed plugin-screen iframe. The host
+ * Runs inside OAIY Desktop's sandboxed plugin-screen iframe. The host
  * injects `window.PluginHost` (postMessage RPC) before this file executes;
  * there is NO network, NO framework and NO build step here — plain DOM.
  *
- * The host CONCATENATES every .js file in manifest files-list order with
- * '\n;' separators — this file runs FIRST and defines `window.__aokieTabs`
+ * The host runs every .js file in manifest files-list order, one <script>
+ * per file — this file runs FIRST and defines `window.__aokieTabs`
  * (a registration API); each tabs/*.js file is an IIFE that registers
  * itself. This file mounts/unmounts tabs on switch and forwards subscribed
  * plugin events to the active tab.
@@ -87,6 +87,65 @@
     alert: svg('<path d="m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>', 14),
   };
 
+  // ---- where calls go -----------------------------------------------------
+  // Calls reach OAIY when the plugin streams them to OAIY Desktop's own voice
+  // gateway: Desktop realtime mode with the provider "oaiy". There OAIY's
+  // Front desk agent writes the replies and OAIY Voice hears and speaks, so
+  // Aokie's own speech engines, model and voice lists play no part.
+
+  var OAIY_PROVIDER_ID = 'oaiy';
+  var OAIY_REALTIME_ENDPOINT = 'ws://127.0.0.1:17872/api/ai/providers/oaiy/v1/realtime/stream';
+  var OAIY_DESTINATION = 'https://oaiy.localhost';
+
+  /** The provider id in a Desktop realtime route, '' for anything else. */
+  function realtimeProviderId(endpoint) {
+    try {
+      var seg = new URL(String(endpoint || '').trim()).pathname.split('/');
+      if (
+        seg.length === 8 && seg[1] === 'api' && seg[2] === 'ai' && seg[3] === 'providers' &&
+        seg[5] === 'v1' && seg[6] === 'realtime' && seg[7] === 'stream'
+      ) return decodeURIComponent(seg[4]);
+    } catch (e) { /* not a URL */ }
+    return '';
+  }
+
+  /** Where the saved settings send calls:
+   *  'oaiy'     — OAIY's voice gateway (the Front desk agent answers);
+   *  'realtime' — another Desktop realtime provider;
+   *  'local'    — Aokie's own older speech stack on this computer;
+   *  'flows'    — no AI receptionist: flows or the operator speak;
+   *  'unknown'  — settings not loaded. */
+  function callRoute(bag) {
+    if (!bag || typeof bag !== 'object') return 'unknown';
+    if (bag.realtimeVoiceMode === 'desktop_realtime') {
+      return realtimeProviderId(bag.realtimeVoiceEndpoint) === OAIY_PROVIDER_ID ? 'oaiy' : 'realtime';
+    }
+    if (bag.aiReceptionist === true || bag.aiReceptionist === 'true') return 'local';
+    if (bag.aiReceptionist === false || bag.aiReceptionist === 'false') return 'flows';
+    return 'unknown';
+  }
+
+  /** OAIY Voice (speech to text and speech) as the host's source list reports
+   *  it: { status, url } or null when the list has no such service. */
+  function oaiyVoiceService(sources) {
+    var list = Array.isArray(sources) ? sources : [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].kind === 'service' && list[i].serviceId === 'oaiy-voice') {
+        return { status: String(list[i].status || 'unknown'), url: list[i].url || '' };
+      }
+    }
+    return null;
+  }
+
+  var OAIY = {
+    providerId: OAIY_PROVIDER_ID,
+    endpoint: OAIY_REALTIME_ENDPOINT,
+    destination: OAIY_DESTINATION,
+    realtimeProviderId: realtimeProviderId,
+    callRoute: callRoute,
+    voiceService: oaiyVoiceService,
+  };
+
   // ---- tab registry -------------------------------------------------------
   // Each tabs/*.js module registers { mount(el), unmount()?, onEvent(frame)? }.
   // The Overview tab is owned by THIS file (static markup + the timers below);
@@ -103,6 +162,8 @@
     },
     /** Shared helpers for tab modules (defined above in this file). */
     util: { esc: esc, errMsg: errMsg, setHtml: setHtml, svg: svg, icons: ICONS },
+    /** Where calls go, shared by the Overview, Settings and Consent tabs. */
+    oaiy: OAIY,
     switchTo: function (id) {
       switchTab(id);
     },
@@ -240,6 +301,7 @@
     call: undefined, callKnown: false, callError: '', callPauseReason: '',
     switchboard: undefined, switchboardError: '',
     settings: undefined, settingsError: '',
+    sources: undefined, sourcesError: '',
     busyCall: false,
     busyPhones: {}, // address -> true while connect/disconnect runs
     busyRedrive: false,
@@ -418,7 +480,27 @@
       }
     ).then(function () {
       renderSettings();
+      renderReadiness(); // the call route names who answers
       renderLive(); // agent-mode gates the operator composer
+    });
+  }
+
+  /** The host's AI sources — read for OAIY Voice's running state. Older hosts
+   *  without aiSources simply leave it unknown. */
+  function refreshSources() {
+    if (typeof HOST.aiSources !== 'function') return Promise.resolve();
+    return HOST.aiSources().then(
+      function (list) {
+        state.sources = Array.isArray(list) ? list : [];
+        state.sourcesError = '';
+      },
+      function (e) {
+        state.sourcesError = errMsg(e);
+        state.sources = null;
+      }
+    ).then(function () {
+      renderReadiness();
+      renderSettings();
     });
   }
 
@@ -451,6 +533,7 @@
     refreshDiag();
     refreshPhones();
     if (slowTicks % 6 === 0) refreshSettings(); // every ~30 s (and at start)
+    if (slowTicks % 3 === 0) refreshSources(); // every ~15 s (and at start)
     slowTicks += 1;
   }
 
@@ -593,28 +676,63 @@
       items.push({ icon: ICONS.smartphone, label: 'Phone bridge', value: value, note: note, ok: linked });
     })();
 
-    // AI responder (plugin health components)
+    // Who answers, from the plugin's health report. Its realtime error is the
+    // last failed call's and stays until a call connects again; `ready` is
+    // only true inside a call, so neither is a probe of the gateway.
     (function () {
+      var label = 'Calls answered by';
       var responder = health && health.components && health.components.responder;
       if (!running) {
-        items.push({ icon: ICONS.server, label: 'AI responder', value: '—', note: 'plugin not running', ok: null });
+        items.push({ icon: ICONS.server, label: label, value: '—', note: 'plugin not running', ok: null });
         return;
       }
       if (snap.lastHealthError || (snap.state === 'unhealthy' && !health)) {
-        items.push({ icon: ICONS.server, label: 'AI responder', value: 'Unavailable', note: snap.lastHealthError || snap.reason || 'health check unavailable', ok: false });
+        items.push({ icon: ICONS.server, label: label, value: 'Unavailable', note: snap.lastHealthError || snap.reason || 'health check unavailable', ok: false });
         return;
       }
       if (!responder) {
-        items.push({ icon: ICONS.server, label: 'AI responder', value: '…', note: health ? 'no responder details in the latest health report' : 'no health report yet', ok: null });
+        items.push({ icon: ICONS.server, label: label, value: '…', note: health ? 'no responder details in the latest health report' : 'no health report yet', ok: null });
+        return;
+      }
+      if (responder.mode === 'desktop_realtime') {
+        var radioHealth = health.components.radio;
+        var realtime = radioHealth && radioHealth.voiceRuntime && radioHealth.voiceRuntime.realtime;
+        var lastError = responder.realtimeError || (realtime && realtime.error) || '';
+        var failure = lastError ? 'last call: ' + lastError : '';
+        var bag = state.settings && state.settings.settings;
+        var toOaiy = OAIY.realtimeProviderId(bag && bag.realtimeVoiceEndpoint) === OAIY.providerId;
+        if (!toOaiy) {
+          items.push({
+            icon: ICONS.server,
+            label: label,
+            value: bag ? 'Another realtime provider' : 'Realtime provider',
+            note: failure || (bag ? 'not OAIY — send calls to OAIY in Settings' : 'checking where calls go'),
+            ok: failure ? false : null,
+          });
+          return;
+        }
+        // OAIY Voice hears and speaks for every call; without it the Front
+        // desk cannot answer. Unknown (no source list) is not a failure.
+        var voice = state.sources ? OAIY.voiceService(state.sources) : null;
+        var voiceDown = !!voice && voice.status !== 'running';
+        items.push({
+          icon: ICONS.server,
+          label: label,
+          value: 'OAIY Front desk',
+          note:
+            failure ||
+            (voiceDown ? 'OAIY Voice is ' + voice.status + ' — start it in OAIY Services' : '') ||
+            (voice ? 'OAIY Voice running · the Front desk agent replies' : 'the Front desk agent replies through OAIY'),
+          ok: failure || voiceDown ? false : voice ? true : null,
+        });
         return;
       }
       var agent = responder.mode === 'agent';
       var value = agent ? (responder.ready ? 'LLM ready' : 'LLM down') : 'Flow replies';
       var note =
         responder.llmError ||
-        responder.note ||
-        (agent ? 'local LLM answering' : 'replies come from FormLogic flows');
-      items.push({ icon: ICONS.server, label: 'AI responder', value: value, note: note, ok: responder.ready !== false });
+        (agent ? 'Aokie’s own speech and model, not OAIY' : 'no AI receptionist: flows or you reply');
+      items.push({ icon: ICONS.server, label: label, value: value, note: note, ok: responder.ready !== false });
     })();
 
     // Radio & dongle (dongle.diagnostics)
@@ -629,8 +747,13 @@
         return;
       }
       var consentPaused = !!radio.paused && radio.blockedBy === 'consent';
-      var voiceErr = radio.voiceSttError || radio.voiceTtsError || '';
-      var stale = Number(radio.staleSttResults) || 0;
+      // Aokie's own speech models (and their stale results) only serve calls
+      // its older local speech answers; on the realtime route OAIY Voice
+      // hears and speaks, so a missing local model is not a radio fault.
+      var responder = health && health.components && health.components.responder;
+      var localSpeech = !(responder && responder.mode === 'desktop_realtime');
+      var voiceErr = localSpeech ? radio.voiceSttError || radio.voiceTtsError || '' : '';
+      var stale = localSpeech ? Number(radio.staleSttResults) || 0 : 0;
       var value = consentPaused ? 'Paused for consent' : radio.initialized ? 'Ready' : 'Not initialised';
       var note =
         (consentPaused ? radio.reason : '') ||
@@ -970,11 +1093,21 @@
 
   // ---- settings summary (read-only) ---------------------------------------
 
-  function engineLabel(v) {
-    if (v === 'sherpa') return 'Sherpa (Piper/VITS voices)';
-    if (v === 'pocket') return 'Pocket-TTS';
-    if (!v) return 'Pocket-TTS (default)';
-    return String(v);
+  var ROUTE_LABEL = {
+    oaiy: 'OAIY Front desk',
+    realtime: 'Another realtime provider',
+    local: 'Aokie’s own speech (not OAIY)',
+    flows: 'Flows or you',
+    unknown: '—',
+  };
+
+  /** OAIY Voice's state from the host's source list, as a summary value. */
+  function oaiyVoiceLabel() {
+    if (state.sources === undefined) return 'Checking…';
+    if (state.sources === null) return 'Unknown';
+    var voice = OAIY.voiceService(state.sources);
+    if (!voice) return 'Not installed';
+    return voice.status === 'running' ? 'Running' : voice.status.charAt(0).toUpperCase() + voice.status.slice(1);
   }
 
   function renderSettings() {
@@ -994,20 +1127,27 @@
     }
 
     var bag = s.settings || {};
-    var agent = !!bag.aiReceptionist;
+    var route = OAIY.callRoute(bag);
     var greetingSet = typeof bag.greeting === 'string' && bag.greeting.trim() !== '';
-    var voice = typeof bag.ttsVoice === 'string' && bag.ttsVoice !== '' ? bag.ttsVoice : 'Default';
+    var briefSet = typeof bag.persona === 'string' && bag.persona.trim() !== '';
+    var autoAnswer = bag.autoAnswer === true || bag.autoAnswer === 'true';
 
-    title.textContent = agent ? 'AI receptionist answers calls' : 'Flow-driven replies';
+    title.textContent =
+      route === 'oaiy' ? 'Calls go to OAIY' :
+      route === 'flows' ? 'Flow-driven replies' :
+      route === 'unknown' ? 'Receptionist settings' : 'Calls do not go to OAIY';
 
-    var rows = [
+    var rows = [['Calls answered by', ROUTE_LABEL[route]]];
+    if (route === 'oaiy') {
+      rows.push(['OAIY Voice', oaiyVoiceLabel()]);
+      rows.push(['Voice on calls', 'Chosen in OAIY › Calendar']);
+    }
+    rows.push(
       ['Greeting', greetingSet ? 'Custom greeting set' : 'Default greeting'],
-      ['Voice engine', engineLabel(bag.ttsEngine)],
-      ['Voice', voice],
-      ['Agent mode', agent ? 'On — the AI answers' : 'Off — flows reply'],
-      ['Listen during replies', bag.bargeIn ? 'On — captures overlap and allows interruptions' : 'Off — caller recognition pauses'],
-      ['Config version', s.configVersion != null ? 'v' + s.configVersion : '—'],
-    ];
+      ['Receptionist brief', briefSet ? 'Custom brief set' : 'Built-in brief'],
+      ['Auto-answer', autoAnswer ? 'On' : 'Off'],
+      ['Config version', s.configVersion != null ? 'v' + s.configVersion : '—']
+    );
     var html =
       '<div class="rcp-settings-list">' +
       rows
