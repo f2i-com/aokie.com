@@ -27,6 +27,18 @@ use super::*;
 /// refusal cannot keep the bridge busy for the whole call.
 pub(super) const MAX_TOOL_CALLS_PER_CALL: usize = 24;
 
+/// After the allowance is spent, this many further calls are answered
+/// `tool_limit` (the model may be reading the refusal for the first time); the
+/// next one ends the session. A model that ignores ten refusals in a row is
+/// looping, and every answer restarts the loop.
+pub(super) const MAX_REFUSALS_AFTER_LIMIT: usize = 10;
+
+/// Refusals waiting to be answered. OAIY forwards one tool call at a time and
+/// waits for its result, so a well-behaved bridge never has more than one; a
+/// bridge that keeps sending while they pile up is broken, and the session
+/// ends rather than holding an unbounded queue.
+pub(super) const MAX_QUEUED_REFUSALS: usize = 8;
+
 /// Tool-call ids remembered for duplicate detection. A little more than the
 /// cap: past it every call is refused anyway.
 const REMEMBERED_TOOL_CALL_IDS: usize = 64;
@@ -88,6 +100,11 @@ pub(super) enum ToolAdmission {
     /// without a second result: OAIY takes one result per call id and would
     /// treat a second as a stale one.
     Duplicate,
+    /// The model keeps asking for tools after being told, this many times,
+    /// that its allowance is spent. Answering again would only feed the loop
+    /// (every answer asks the model to continue): the session ends and the
+    /// caller hears the fixed apology, as for any other failed session.
+    EndSession,
 }
 
 /// The tools a call has asked for so far.
@@ -95,6 +112,8 @@ pub(super) enum ToolAdmission {
 pub(super) struct ToolLedger {
     seen: std::collections::VecDeque<String>,
     asked: usize,
+    /// `tool_limit` refusals already given.
+    limit_refusals: usize,
 }
 
 impl ToolLedger {
@@ -115,6 +134,10 @@ impl ToolLedger {
         self.remember(tool_call_id);
         self.asked += 1;
         if self.asked > MAX_TOOL_CALLS_PER_CALL {
+            if self.limit_refusals >= MAX_REFUSALS_AFTER_LIMIT {
+                return ToolAdmission::EndSession;
+            }
+            self.limit_refusals += 1;
             return ToolAdmission::Refuse(ToolRefusal::ToolLimit);
         }
         let Some(class) = tool_class(name, transfer_enabled) else {
@@ -240,6 +263,30 @@ mod tests {
             ToolAdmission::Refuse(ToolRefusal::ToolLimit)
         );
         assert_eq!(ToolRefusal::ToolLimit.output(), serde_json::json!({"error": "tool_limit"}));
+    }
+
+    /// Review finding 8. Every refusal asks the model to continue, so a model
+    /// that ignores `tool_limit` would loop for the rest of the call.
+    #[test]
+    fn a_model_that_ignores_ten_tool_limit_refusals_is_looping_and_the_session_ends() {
+        let mut ledger = ToolLedger::default();
+        for n in 0..MAX_TOOL_CALLS_PER_CALL {
+            let _ = admit(&mut ledger, &format!("ok{n}"), "finish_call");
+        }
+        assert_eq!(MAX_REFUSALS_AFTER_LIMIT, 10);
+        for n in 0..MAX_REFUSALS_AFTER_LIMIT {
+            assert_eq!(
+                admit(&mut ledger, &format!("limit{n}"), "finish_call"),
+                ToolAdmission::Refuse(ToolRefusal::ToolLimit),
+                "refusal {n} is still an answer"
+            );
+        }
+        assert_eq!(admit(&mut ledger, "eleventh", "finish_call"), ToolAdmission::EndSession);
+        // And it stays ended whatever it asks for next; a repeat of an id it
+        // already used is still just a repeat.
+        assert_eq!(admit(&mut ledger, "again", "nonsense_tool"), ToolAdmission::EndSession);
+        assert_eq!(admit(&mut ledger, "again", "nonsense_tool"), ToolAdmission::Duplicate);
+        assert_eq!(admit(&mut ledger, "eleventh", "finish_call"), ToolAdmission::Duplicate);
     }
 
     #[test]

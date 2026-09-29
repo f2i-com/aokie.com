@@ -66,7 +66,12 @@ Every request ends in exactly one of these, in bounded time:
 * **Tool names.** The plugin accepts any name matching `^[a-z][a-z0-9_]{0,63}$`
   from OAIY. A well-formed name it does not know is answered `unsupported`
   (`{"error": "unsupported"}`); a second slot tool while one is in flight is
-  `busy`; a call's 25th tool call is `tool_limit`. None of them ends the call. A
+  `busy`; a call's 25th tool call is `tool_limit`. None of these ends the call
+  by itself, but a model that keeps calling after ten `tool_limit` answers is
+  looping (every answer asks it to continue): the 35th call ends the session,
+  and the caller hears the fixed apology like any failed session. So does a
+  bridge that sends refusable calls faster than they are answered (more than
+  eight waiting); OAIY sends one at a time and waits for each result. A
   name that is not an identifier, a missing tool call id, or a tool call before
   the call began is a protocol violation and ends the stream.
 

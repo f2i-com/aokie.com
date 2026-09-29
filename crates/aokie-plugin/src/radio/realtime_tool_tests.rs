@@ -154,6 +154,52 @@ fn the_twenty_fifth_tool_call_of_a_call_is_tool_limit_not_a_hangup() {
     assert!(lane.pending_tool_call.is_none());
 }
 
+/// Review finding 8, at the lane the service drives.
+#[test]
+fn a_looping_model_ends_the_session_after_ten_refusals_and_the_refusal_queue_is_bounded() {
+    let (mut lane, _detached) = detached_lane(true);
+    for n in 0..MAX_TOOL_CALLS_PER_CALL {
+        lane.accept_tool_call(format!("ok{n}"), "finish_call".into(), serde_json::json!({}))
+            .unwrap();
+        lane.pending_tool_call = None;
+    }
+    // Ten refusals are answered, one at a time, as OAIY does.
+    for n in 0..MAX_REFUSALS_AFTER_LIMIT {
+        lane.accept_tool_call(format!("limit{n}"), "finish_call".into(), serde_json::json!({}))
+            .expect("still an answer");
+        let answers = refused(&mut lane);
+        assert_eq!(answers.len(), 1, "{n}");
+        assert_eq!(answers[0].3, serde_json::json!({"error": "tool_limit"}));
+    }
+    // The next call is the loop the model will not leave: the intake reports a
+    // failure (the service ends the session with the fixed apology) and queues
+    // nothing more.
+    let error = lane
+        .accept_tool_call("eleventh".into(), "finish_call".into(), serde_json::json!({}))
+        .unwrap_err();
+    assert!(error.contains("kept calling tools"), "{error}");
+    assert!(lane.refused_tools.is_empty());
+    assert!(lane.pending_tool_call.is_none());
+
+    // A bridge that sends refusable calls faster than they are answered never
+    // grows the queue without bound.
+    let (mut lane, _detached) = detached_lane(true);
+    for n in 0..MAX_QUEUED_REFUSALS {
+        lane.accept_tool_call(format!("odd{n}"), "not_a_tool".into(), serde_json::json!({}))
+            .expect("queued");
+    }
+    assert_eq!(lane.refused_tools.len(), MAX_QUEUED_REFUSALS);
+    let error = lane
+        .accept_tool_call("one_too_many".into(), "not_a_tool".into(), serde_json::json!({}))
+        .unwrap_err();
+    assert!(error.contains("faster than they were answered"), "{error}");
+    assert_eq!(lane.refused_tools.len(), MAX_QUEUED_REFUSALS, "the queue did not grow");
+    // Answering drains it, and intake carries on.
+    assert_eq!(refused(&mut lane).len(), MAX_QUEUED_REFUSALS);
+    lane.accept_tool_call("after".into(), "not_a_tool".into(), serde_json::json!({}))
+        .expect("room again");
+}
+
 #[test]
 fn a_repeated_tool_call_id_gets_no_second_result_and_a_call_before_begin_is_a_protocol_failure() {
     let (mut lane, _detached) = detached_lane(true);

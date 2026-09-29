@@ -855,7 +855,11 @@ impl RealtimeCallLane {
     /// answered, because no result may be sent yet. Every other call is
     /// either queued to run, or refused with an ordinary `ok: false` result
     /// the model can read (`busy`, `tool_limit`, `unsupported`), or dropped
-    /// when its id repeats. None of those ends the session.
+    /// when its id repeats. None of those ends the session, up to a point: a
+    /// model that keeps calling after `MAX_REFUSALS_AFTER_LIMIT` refusals of
+    /// `tool_limit` is looping (each answer restarts it), and a bridge whose
+    /// refusals pile up unanswered is broken; both end it, as any other failed
+    /// session ends: the caller hears the fixed apology.
     pub(super) fn accept_tool_call(
         &mut self,
         tool_call_id: String,
@@ -882,7 +886,17 @@ impl RealtimeCallLane {
                     "[aokie-plugin] realtime tool call repeated an id already seen on this call; ignored"
                 );
             }
+            ToolAdmission::EndSession => {
+                return Err(
+                    "Desktop realtime kept calling tools after its allowance ran out".into(),
+                );
+            }
             ToolAdmission::Refuse(refusal) => {
+                if self.refused_tools.len() >= MAX_QUEUED_REFUSALS {
+                    return Err(
+                        "Desktop realtime sent tool calls faster than they were answered".into(),
+                    );
+                }
                 eprintln!(
                     "[aokie-plugin] realtime tool {name} refused without running: {}",
                     refusal.code()
