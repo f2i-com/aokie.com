@@ -6893,6 +6893,39 @@ mod tests {
         assert!(!status.transfer_ready.load(Ordering::Relaxed));
     }
 
+    /// The ring-plan fixture's `init` cases are what the plugin reads from
+    /// `plugin.init`: each `params` announces the ring plan or does not.
+    #[test]
+    fn the_ring_plan_fixture_says_which_plugin_init_features_announce_it() {
+        use std::sync::atomic::Ordering;
+        let fixture = crate::transfer::fixture_tests::fixture("transfer-v1.ring-plan.fixture.json");
+        assert_eq!(fixture["init"]["method"], "plugin.init");
+        assert_eq!(fixture["init"]["feature"], "ringPlan");
+        let cases = fixture["init"]["cases"].as_array().unwrap();
+        assert!(cases.iter().any(|case| case["ringPlan"] == true));
+        assert!(cases.iter().any(|case| case["ringPlan"] == false));
+
+        let mut plugin = Plugin::ephemeral(false);
+        let (handle, _rx) = crate::radio::RadioHandle::test_handle();
+        let status = handle.status.clone();
+        plugin.radio = Some(handle);
+        plugin
+            .store
+            .config
+            .settings
+            .insert("consentMode".into(), json!("warn"));
+        let mut sink = VecSink::default();
+        for case in cases {
+            let resp = plugin
+                .handle_rpc(request(1, "plugin.init", case["params"].clone()), &mut sink)
+                .unwrap();
+            assert!(resp.contains("\"ok\":true"), "{case}: {resp}");
+            assert_eq!(plugin.host_ring_plan, case["ringPlan"] == true, "{case}");
+            // With no approved Companion device, announcing it is still not enough.
+            assert!(!status.transfer_ready.load(Ordering::Relaxed), "{case}");
+        }
+    }
+
     /// Audit INT-003: `plugin.init` feature negotiation flips ack mode, and
     /// an `event.ack` NOTIFICATION (no id, no response) marks the outbox row
     /// delivered — the ack path end to end at the dispatch layer.

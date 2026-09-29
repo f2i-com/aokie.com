@@ -288,6 +288,51 @@ host names the same offer that later reaches the phone
 published again under the same id: the id carries a generation that the plugin
 increments on every retirement.
 
+## Every message, and the fixture that fixes it
+
+| Message | Direction | Fixture |
+|---|---|---|
+| `plugin.init` params `features: ["ringPlan"]` | host to plugin | [ring-plan](transfer-v1.ring-plan.fixture.json), `init` |
+| `oaiy.ring.plan` request, and its result for a ring, a message only, a refusal, a plan that names no device | plugin to host | [ring-plan](transfer-v1.ring-plan.fixture.json), `plan` |
+| `oaiy.ring.opened` | plugin to host | [ring-plan](transfer-v1.ring-plan.fixture.json), `opened` |
+| `formlogic.realtime.start` with `allowTransfer`, and with `resume` for `return` and `failback` | plugin to OAIY | [start-ready](transfer-v1.start-ready.fixture.json) |
+| `formlogic.realtime.ready` with `features` | OAIY to plugin | [start-ready](transfer-v1.start-ready.fixture.json) |
+| `formlogic.realtime.tool_call` for `transfer_to_owner` | OAIY to plugin | [tool-call](transfer-v1.tool-call.fixture.json) |
+| `formlogic.realtime.tool_result`: `ringing`, every refusal, the tool intake errors | plugin to OAIY | [tool-result](transfer-v1.tool-result.fixture.json) |
+| `formlogic.realtime.transfer_outcome` for `accepted`, `declined`, `unavailable`, `expired`, `cancelled` | plugin to OAIY | [outcome](transfer-v1.outcome.fixture.json) |
+| `formlogic.realtime.transfer_cancel` | OAIY to plugin | [cancel](transfer-v1.cancel.fixture.json) |
+| `formlogic.realtime.transfer_notice` for `too_late`, `unknown_request` | plugin to OAIY | [cancel](transfer-v1.cancel.fixture.json) |
+| `formlogic.realtime.stop` with `handoff:takeover` | plugin to OAIY | [start-ready](transfer-v1.start-ready.fixture.json), `stop` |
+| the caller-asked phrase check | both ends | [caller-asked](transfer-v1.caller-asked.fixture.json) |
+| the reserved offer id | both ends | [reserved-offer-id](transfer-v1.reserved-offer-id.fixture.json) |
+
+Every `atMs` is Unix epoch milliseconds. `oaiy.ring.opened.expiresAt` is Unix
+seconds, and every duration named `...Seconds` is seconds. A plan's `planId` is
+always non-empty for a plan that rings (`oaiy.ring.opened` repeats it); a plan
+that does not ring (`refused`, `message_only`) may carry any planId, an empty
+one, or none, and the plugin accepts all three.
+
+## The reason vocabulary
+
+Every closed set of words either side sends, in one place. Nothing outside these
+sets is ever echoed to the model or to OAIY.
+
+| Where | Values |
+|---|---|
+| `tool_result` `reason`, given by the host's plan | `disabled`, `initiative_off`, `not_urgent`, `caller_did_not_ask`, `limit_call`, `limit_gap`, `limit_caller`, `limit_global`, `quiet_hours`, `all_do_not_disturb`, `no_endpoint` |
+| `tool_result` `reason`, given by the plugin | `consent`, `pending_request`, `busy`, `bad_arguments`, `plan_unavailable`, `call_changed`; and, from its own checks, `caller_did_not_ask` (the phrase floor, also for `policy_rule`), `not_urgent` (an unconfirmed `urgent`), `limit_call`, `limit_gap`, `limit_caller`, `limit_global` (the plugin's ceilings), `no_endpoint` (a plan that names no device) |
+| `tool_result` `status` | `refused` (do not offer a person), `unavailable` (offer a message) |
+| tool intake errors, `output: {"error": ...}` with no `status` | `busy`, `tool_limit`, `unsupported` |
+| a reason OAIY composes itself, never sent or received by the plugin | `not_offered`: OAIY's own tool result when it never had `transfer_to_owner` for the call (the plugin answers the tool on a session that did not negotiate it `unsupported`) |
+| a plan's `reason` the plugin does not know | becomes `plan_unavailable`: nothing the host says is echoed |
+| `transfer_to_owner` `reason` argument | `caller_asked`, `urgent`, `policy_rule` |
+| `transfer_outcome` `outcome` | `accepted`, `declined`, `unavailable`, `expired`, `cancelled` |
+| `transfer_cancel` `reason` | `owner_declined`, `message_instead`, `gave_up` |
+| `transfer_notice` `notice` | `too_late`, `unknown_request` |
+| `start.resume` `via` | `return`, `failback` |
+| `stop` `reason` for a handoff | `handoff:takeover` (OAIY treats any reason starting `handoff:` as a handoff) |
+| audit `outcome` of `aokie.call.assistance.resolved` | `transferred`, `declined`, `unavailable`, `expired`, `cancelled` |
+
 ## Audit
 
 Two durable events, both existing: `aokie.call.assistance.requested` when the

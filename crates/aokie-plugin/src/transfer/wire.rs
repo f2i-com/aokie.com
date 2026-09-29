@@ -278,18 +278,26 @@ pub fn parse_plan(result: &Value) -> Result<RingPlan, String> {
     let object = result
         .as_object()
         .ok_or_else(|| "ring plan is not an object".to_string())?;
-    let plan_id = object
-        .get("planId")
-        .and_then(Value::as_str)
-        .filter(|id| safe_token(id))
-        .ok_or_else(|| "ring plan has no valid planId".to_string())?
-        .to_string();
     let decision = match object.get("decision").and_then(Value::as_str) {
         Some("ring") => Decision::Ring,
         Some("message_only") => Decision::MessageOnly,
         Some("refused") => Decision::Refused,
         _ => return Err("ring plan has no valid decision".into()),
     };
+    // A plan that rings names itself: `oaiy.ring.opened` repeats the id. One
+    // that does not ring (refused, message only) is only ever a reason, so a
+    // host that mints an id for it is fine and one that leaves it empty or out
+    // is tolerated. A planId that is present and not an identifier is unusable
+    // whatever the decision.
+    let plan_id = match object.get("planId") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(id)) if id.is_empty() => String::new(),
+        Some(Value::String(id)) if safe_token(id) => id.clone(),
+        Some(_) => return Err("ring plan has no valid planId".into()),
+    };
+    if decision == Decision::Ring && plan_id.is_empty() {
+        return Err("ring plan has no valid planId".into());
+    }
     let reason = object
         .get("reason")
         .and_then(Value::as_str)
@@ -700,6 +708,41 @@ mod tests {
         let refused = parse_plan(&json!({"planId": "p", "decision": "refused", "reason": "limit_gap"})).unwrap();
         assert_eq!(refused.decision, Decision::Refused);
         assert_eq!(refused.reason, "limit_gap");
+    }
+
+    /// The host may mint a plan id for every plan, or leave it out of one that
+    /// does not ring. Only a plan that rings has to name itself.
+    #[test]
+    fn a_plan_that_does_not_ring_need_not_name_itself() {
+        for (decision, reason) in [("refused", "limit_gap"), ("message_only", "quiet_hours")] {
+            for plan_id in [json!(null), json!(""), json!("plan_0009")] {
+                let mut result = json!({"decision": decision, "reason": reason});
+                if !plan_id.is_null() {
+                    result["planId"] = plan_id.clone();
+                }
+                let plan = parse_plan(&result).unwrap_or_else(|error| panic!("{result}: {error}"));
+                assert_eq!(plan.reason, reason);
+                assert_eq!(plan.plan_id, plan_id.as_str().unwrap_or_default());
+            }
+            // Missing altogether, too.
+            let plan = parse_plan(&json!({"decision": decision, "reason": reason})).unwrap();
+            assert_eq!(plan.plan_id, "");
+            // Present and not an identifier is unusable for any decision.
+            for bad in [json!("has space"), json!(7), json!(true), json!({"id": 1})] {
+                assert!(
+                    parse_plan(&json!({"planId": bad, "decision": decision})).is_err(),
+                    "{decision} {bad}"
+                );
+            }
+        }
+        // A plan that rings still has to have one.
+        for missing in [json!(null), json!(""), json!(" ")] {
+            let mut result = json!({"decision": "ring", "phones": ["thumb_a"]});
+            if !missing.is_null() {
+                result["planId"] = missing;
+            }
+            assert!(parse_plan(&result).is_err(), "{result}");
+        }
     }
 
     #[test]
