@@ -288,19 +288,24 @@ fn transfer_effects_reach_oaiy_only_as_typed_results_and_outcomes_on_a_negotiate
         None,
         &mut sink,
     );
+    // The outcome goes out at once. The answer to the tool call does not: it is
+    // queued for the completion block, which sends it only once the line the
+    // model spoke before calling has drained, like every other completion.
     assert_eq!(
         detached.drain(),
-        vec![
-            crate::realtime_voice::SentControl::ToolResult {
-                tool_call_id: "tool_1".into(),
-                name: TOOL_NAME.into(),
-                ok: true,
-                output: serde_json::json!({"status": "ringing"}),
-                continue_response: true,
-            },
-            crate::realtime_voice::SentControl::TransferOutcome { frame: outcome.clone() },
-        ]
+        vec![crate::realtime_voice::SentControl::TransferOutcome { frame: outcome.clone() }]
     );
+    assert_eq!(
+        lane.next_queued_answer(),
+        Some((
+            "tool_1".to_string(),
+            TOOL_NAME.to_string(),
+            true,
+            serde_json::json!({"status": "ringing"}),
+            true
+        ))
+    );
+    assert_eq!(lane.next_queued_answer(), None);
     assert_eq!(sink.lines.len(), 1, "the audit event was emitted");
     assert!(sink.lines[0].contains(crate::contract::events::CALL_ASSISTANCE_REQUESTED));
 

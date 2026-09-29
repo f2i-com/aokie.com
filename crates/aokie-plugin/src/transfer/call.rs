@@ -37,7 +37,7 @@ use serde_json::Value;
 use super::{
     caller_asked, opened_params, parse_arguments, parse_plan, plan_params, refusal, ringing,
     sanitize_owner_message, Decision, Outcome, OutcomeFrame, Reason, RefusalStatus, ResumeInfo,
-    ToolAnswer, Via,
+    Targets, ToolAnswer, Via,
 };
 use crate::assistance::{
     AssistanceBroker, AssistanceCallFence, AssistanceResolution, TRANSFER_RESOLUTION_GRACE_SECONDS,
@@ -293,7 +293,7 @@ impl TransferCall {
     pub fn begin(&mut self, env: &mut TransferEnv<'_>, args: BeginArgs<'_>) -> Begin {
         let refused = |status, reason: &str| Begin::Answered(refusal(status, reason));
 
-        let Ok(reason) = parse_arguments(args.arguments) else {
+        let Some(reason) = parse_arguments(args.arguments) else {
             return refused(RefusalStatus::Refused, "bad_arguments");
         };
         if !matches!(self.stage, Stage::Idle) || env.broker.is_busy() {
@@ -373,11 +373,29 @@ impl TransferCall {
     /// another way); an accepted one stays, since its takeover is exactly what
     /// is changing the fence.
     pub fn withdraw_unaccepted(&mut self, env: &mut TransferEnv<'_>) -> Vec<Effect> {
-        let mut effects = Vec::new();
+        // Ask the broker before trusting what was last seen: an endpoint may
+        // have won since the last turn, and that one's takeover must not be
+        // cancelled from under it. Polling also reports its acceptance.
+        let mut effects = self.poll(env);
         if let Stage::Ringing(_) = self.stage {
             if let Stage::Ringing(open) = std::mem::replace(&mut self.stage, Stage::Idle) {
                 self.cancel(open, env, &mut effects, "the caller changed hands another way");
             }
+        }
+        effects
+    }
+
+    /// The call is over (the radio's per-call reset is about to replace this
+    /// call's context). Whatever is open is withdrawn and reported, so OAIY
+    /// hears `cancelled` before the session stops and the audit trail closes
+    /// its request. A plan still being awaited is simply dropped.
+    pub fn end_call(&mut self, env: &mut TransferEnv<'_>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        match std::mem::replace(&mut self.stage, Stage::Idle) {
+            Stage::Ringing(open) | Stage::Accepted(open) => {
+                self.cancel(open, env, &mut effects, "the call ended");
+            }
+            Stage::Planning(_) | Stage::Idle => {}
         }
         effects
     }
@@ -434,13 +452,19 @@ impl TransferCall {
             }
             Decision::Ring => {}
         }
-        // A ring aimed at nobody could only time out, and would tell the
-        // model somebody was being rung.
-        let targets = plan.targets();
-        if targets.is_empty() {
-            answered(effects, &planning, refusal(RefusalStatus::Unavailable, "no_endpoint"));
-            return;
-        }
+        // Who may be offered the request. A ring aimed at nobody could only
+        // time out, and would tell the model somebody was being rung.
+        let broker_targets = match plan.target_rule() {
+            Targets::Only(devices) => Some(devices),
+            // The desktop toast is the ring and the Companion it starts is not
+            // in any list yet: any consented device with a live session may
+            // accept, and none of them is woken.
+            Targets::AnyLive => None,
+            Targets::Nobody => {
+                answered(effects, &planning, refusal(RefusalStatus::Unavailable, "no_endpoint"));
+                return;
+            }
+        };
 
         // The world moved while the host thought about it: check it again.
         let remote = env.media.snapshot();
@@ -461,10 +485,29 @@ impl TransferCall {
         };
         // The request is created while the exact Aokie owner still holds the
         // caller: whoever wins the media-state lock, the AI or a claim,
-        // decides, and a claim that won leaves nothing open.
-        let opened = env.media.with_aokie_owner(&planning.owner, || {
-            env.broker
-                .request_transfer_to(fence.clone(), "", None, plan.ring_seconds, Some(targets.clone()))
+        // decides, and a claim that won leaves nothing open. The fence is read
+        // again here, not reused from the tool call: another AI action of this
+        // call (an appointment request) may have advanced it while the host
+        // thought, which changes nothing about who owns the caller. What must
+        // still hold is the call and its epoch, and that Aokie owns it now.
+        let owner = env
+            .media
+            .aokie_owner_fence()
+            .filter(|owner| {
+                owner.call_id == planning.call_id && owner.call_epoch == planning.owner.call_epoch
+            });
+        let Some(owner) = owner else {
+            answered(effects, &planning, refusal(RefusalStatus::Unavailable, "call_changed"));
+            return;
+        };
+        let opened = env.media.with_aokie_owner(&owner, || {
+            env.broker.request_transfer_to(
+                fence.clone(),
+                "",
+                None,
+                plan.ring_seconds,
+                broker_targets.clone(),
+            )
         });
         let request_id = match opened {
             Ok(Ok(request_id)) => request_id,
@@ -504,9 +547,12 @@ impl TransferCall {
             eprintln!("[aokie-plugin] transfer {request_id}: the host could not be told the ring is open");
         }
         eprintln!(
-            "[aokie-plugin] transfer {request_id} opened: ring {} s, {} target device(s), reason {}",
+            "[aokie-plugin] transfer {request_id} opened: ring {} s, {}, reason {}",
             plan.ring_seconds,
-            targets.len(),
+            match &broker_targets {
+                Some(devices) => format!("{} target device(s)", devices.len()),
+                None => "any live device (desktop toast)".to_string(),
+            },
             planning.reason.as_str()
         );
 
@@ -678,7 +724,15 @@ impl TransferCall {
     /// (`return`) or the media setup failed (`failback`). `None` when there
     /// was no handoff to resume from. Consumes the record.
     pub fn take_resume(&mut self, now: Instant, broker: &AssistanceBroker) -> Option<ResumeInfo> {
-        let started = self.handoff_started.take()?;
+        let resume = self.peek_resume(now, broker)?;
+        self.finish_resume();
+        Some(resume)
+    }
+
+    /// [`take_resume`](Self::take_resume) without consuming the record, for a
+    /// session start that may fail and be tried again.
+    pub fn peek_resume(&self, now: Instant, broker: &AssistanceBroker) -> Option<ResumeInfo> {
+        let started = self.handoff_started?;
         let unresolved_failure = match &self.stage {
             Stage::Ringing(open) | Stage::Accepted(open) => matches!(
                 broker.peek_resolution(&open.request_id),
@@ -695,6 +749,11 @@ impl TransferCall {
             now.saturating_duration_since(started).as_secs(),
             via,
         ))
+    }
+
+    /// The fresh session was started: the handoff is over.
+    pub fn finish_resume(&mut self) {
+        self.handoff_started = None;
     }
 }
 

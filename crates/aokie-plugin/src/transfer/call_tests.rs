@@ -565,12 +565,12 @@ fn a_plan_that_says_no_is_the_tool_answer_with_the_plans_reason() {
 }
 
 #[test]
-fn a_plan_that_rings_nobody_is_no_endpoint_and_opens_nothing() {
+fn a_plan_that_rings_nobody_and_toasts_nobody_is_no_endpoint_and_opens_nothing() {
     let mut rig = Rig::new();
     assert!(matches!(rig.begin("tool_1"), Begin::Planning));
     rig.host_answers(json!({
         "planId": "plan_1", "decision": "ring", "reason": "ok", "ringSeconds": 30,
-        "phones": [], "wake": [], "desktopToast": true, "desktopCompanions": []
+        "phones": [], "wake": [], "desktopToast": false, "desktopCompanions": []
     }));
     let effects = rig.poll();
     let Effect::ToolAnswer { answer, .. } = &effects[0] else {
@@ -578,6 +578,44 @@ fn a_plan_that_rings_nobody_is_no_endpoint_and_opens_nothing() {
     };
     assert_eq!(refused_reason(answer), "no_endpoint");
     assert!(!rig.broker.is_busy());
+}
+
+/// Vector V01 of the design: the owner is at the PC, so the plan is `ring`,
+/// 30 s, with the desktop toast and no phone and no online Windows Companion.
+/// The toast is the ring, and the Companion it opens is not in any list yet.
+#[test]
+fn a_toast_only_plan_opens_the_request_to_any_live_device() {
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    rig.host_answers(json!({
+        "planId": "plan_v01", "decision": "ring", "reason": "ok", "ringSeconds": 30,
+        "phones": [], "wake": [], "desktopToast": true, "desktopCompanions": []
+    }));
+    let effects = rig.poll();
+    let request_id = ringing_request_id(&effects);
+    let Effect::ToolAnswer { answer, .. } = &effects[1] else {
+        panic!("{effects:?}")
+    };
+    assert_eq!(answer.output["ringSeconds"], 30);
+    // Any consented device with a live session may accept: nothing names the
+    // Companion the toast starts, and nothing is pushed to any device.
+    for device in ["thumb_windows_companion", PHONE, "thumb_anything"] {
+        assert!(rig.broker.transfer_admits(&request_id, device), "{device}");
+    }
+    assert!(rig.broker.is_busy());
+}
+
+#[test]
+fn a_plan_that_names_devices_offers_them_and_no_others_even_with_the_toast() {
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    rig.host_answers(json!({
+        "planId": "plan_v26", "decision": "ring", "reason": "ok", "ringSeconds": 30,
+        "phones": [], "wake": [], "desktopToast": true, "desktopCompanions": ["thumb_win1"]
+    }));
+    let request_id = ringing_request_id(&rig.poll());
+    assert!(rig.broker.transfer_admits(&request_id, "thumb_win1"));
+    assert!(!rig.broker.transfer_admits(&request_id, PHONE), "the phone was not planned");
 }
 
 #[test]
@@ -673,6 +711,42 @@ fn a_caller_who_hangs_up_mid_ring_cancels_the_request_and_frees_the_mailbox() {
 }
 
 #[test]
+fn the_first_endpoint_to_accept_wins_and_nobody_else_can_take_or_end_the_request() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    let fence = rig.fence(&request_id);
+    rig.broker.accept_transfer(&request_id, &fence, "device_first").unwrap();
+    // A second endpoint is refused, and so is a decline after the acceptance:
+    // the request belongs to the first.
+    assert!(rig.broker.accept_transfer(&request_id, &fence, "device_second").is_err());
+    let decline = PluginAssistanceAnswerFrame {
+        kind: "assistance_answer".into(),
+        schema_version: SCHEMA_VERSION,
+        app_id: "app_a".into(),
+        device_id: "device_second".into(),
+        request_id: request_id.clone(),
+        answer_id: "answer_late".into(),
+        call_id: fence.call_id.clone(),
+        call_epoch: fence.call_epoch,
+        owner_epoch: fence.owner_epoch,
+        switchboard_revision: fence.switchboard_revision,
+        remote_revision: fence.remote_revision,
+        response_action: AssistanceResponseAction::Decline,
+        answer: "declined".into(),
+    };
+    assert!(rig.broker.accept(decline).is_err());
+    // The winner alone can complete it.
+    assert!(rig.broker.transfer_taken(&request_id, &fence, "device_second").is_err());
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+    assert!(rig.poll().is_empty());
+    rig.broker.transfer_taken(&request_id, &fence, "device_first").unwrap();
+    let effects = rig.poll();
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "transferred".to_string())]);
+    let Effect::Audit(event) = &effects[0] else { panic!() };
+    assert_eq!(event.data["responderDeviceId"], "device_first");
+}
+
+#[test]
 fn an_endpoint_that_drops_before_the_media_is_up_puts_the_request_back_to_ringing() {
     let mut rig = Rig::new();
     let (request_id, _) = rig.ring();
@@ -745,6 +819,19 @@ fn the_ai_resumes_after_a_return_and_after_a_failure_and_only_when_there_was_a_h
     // The record is consumed: a second session for the call is not "after a handoff".
     assert_eq!(rig.machine.take_resume(rig.now, &rig.broker), None);
 
+    // A session start that fails is tried again with the same record: only
+    // finishing the resume consumes it.
+    let mut rig = Rig::new();
+    rig.machine.note_handoff(rig.now);
+    rig.now += Duration::from_secs(3);
+    let first = rig.machine.peek_resume(rig.now, &rig.broker);
+    rig.now += Duration::from_secs(2);
+    let second = rig.machine.peek_resume(rig.now, &rig.broker);
+    assert_eq!(first, Some(ResumeInfo::new(3, Via::Return)));
+    assert_eq!(second, Some(ResumeInfo::new(5, Via::Return)));
+    rig.machine.finish_resume();
+    assert_eq!(rig.machine.peek_resume(rig.now, &rig.broker), None);
+
     // The first note wins: a second stop of the same handoff does not restart the clock.
     let mut rig = Rig::new();
     rig.machine.note_handoff(rig.now);
@@ -755,6 +842,103 @@ fn the_ai_resumes_after_a_return_and_after_a_failure_and_only_when_there_was_a_h
         rig.machine.take_resume(rig.now, &rig.broker),
         Some(ResumeInfo::new(10, Via::Return))
     );
+}
+
+#[test]
+fn another_ai_action_while_the_host_plans_does_not_cost_the_request() {
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    // An appointment request of the same call advances the AI's action epoch
+    // while the host thinks. Aokie still owns the caller.
+    rig.media.linearize_aokie_action(&rig.owner).expect("the AI's own action");
+    rig.host_answers(Rig::ring_plan());
+    let effects = rig.poll();
+    let request_id = ringing_request_id(&effects);
+    assert!(rig.broker.is_busy());
+    assert!(rig.broker.transfer_admits(&request_id, PHONE));
+
+    // A human claim while the host thinks is a different matter: nothing opens.
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    rig.media.observe_physical_call(Some("call_b"), true);
+    rig.host_answers(Rig::ring_plan());
+    let effects = rig.poll();
+    let Effect::ToolAnswer { answer, .. } = &effects[0] else {
+        panic!("{effects:?}")
+    };
+    assert_eq!(refused_reason(answer), "call_changed");
+    assert!(!rig.broker.is_busy());
+}
+
+#[test]
+fn a_call_that_ends_takes_its_open_request_with_it_and_says_so() {
+    // The radio's per-call reset asks the machine to end the call's requests
+    // before it replaces the context that holds them.
+    for accepted in [false, true] {
+        let mut rig = Rig::new();
+        let (request_id, _) = rig.ring();
+        if accepted {
+            rig.accept(&request_id);
+            assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+        }
+        let effects = {
+            let mut env = TransferEnv {
+                broker: &rig.broker,
+                media: &rig.media,
+                host: &rig.host,
+                sink: &mut rig.sink,
+                now: rig.now,
+                active_call_id: None,
+                switchboard_revision: 0,
+                host_ring_plan: true,
+                session_token: 1,
+            };
+            rig.machine.end_call(&mut env)
+        };
+        assert_eq!(outcomes(&effects), vec![(Outcome::Cancelled, None)], "accepted: {accepted}");
+        assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "cancelled".to_string())]);
+        assert!(!rig.broker.is_busy(), "the mailbox is free for the next call");
+        assert!(!rig.machine.is_active());
+    }
+    // A plan still awaited is dropped without a word, and nothing was opened.
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    let effects = {
+        let mut env = TransferEnv {
+            broker: &rig.broker,
+            media: &rig.media,
+            host: &rig.host,
+            sink: &mut rig.sink,
+            now: rig.now,
+            active_call_id: None,
+            switchboard_revision: 0,
+            host_ring_plan: true,
+            session_token: 1,
+        };
+        rig.machine.end_call(&mut env)
+    };
+    assert!(effects.is_empty());
+    assert!(!rig.machine.is_active());
+    assert_eq!(rig.host.pending_count(), 0);
+    // And nothing to end is nothing said.
+    let mut rig = Rig::new();
+    assert!(rig.withdraw().is_empty());
+}
+
+#[test]
+fn a_request_that_an_endpoint_won_since_the_last_turn_is_not_withdrawn_from_under_it() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    // The gateway recorded the acceptance after the machine's last poll, and
+    // the takeover it started is what is changing the owner fence.
+    rig.accept(&request_id);
+    let effects = rig.withdraw();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Accepted, None)], "reported, not cancelled");
+    assert!(rig.broker.is_busy(), "the request stays open for its takeover");
+    assert!(rig.machine.is_active());
+    assert!(!rig.machine.is_ringing_unaccepted());
+    let fence = rig.fence(&request_id);
+    rig.broker.transfer_taken(&request_id, &fence, DEVICE).unwrap();
 }
 
 #[test]

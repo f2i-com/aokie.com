@@ -708,6 +708,9 @@ pub(super) struct RealtimeCallLane {
     /// Calls refused at intake, waiting to be answered as `ok: false` results
     /// (`busy`, `tool_limit`, `unsupported`): (tool call id, name, refusal).
     pub(super) refused_tools: std::collections::VecDeque<(String, String, ToolRefusal)>,
+    /// Tool answers that are ready but were not given in the loop turn that ran
+    /// the tool: (tool call id, name, ok, output).
+    pub(super) queued_answers: std::collections::VecDeque<(String, String, bool, serde_json::Value)>,
     /// This session's start said `allowTransfer`.
     pub(super) allow_transfer_sent: bool,
     /// `transfer_v1` was negotiated for this session: the start said
@@ -816,6 +819,7 @@ impl RealtimeCallLane {
             deferred_input: DeferredRealtimeInput::default(),
             tools: ToolLedger::default(),
             refused_tools: std::collections::VecDeque::new(),
+            queued_answers: std::collections::VecDeque::new(),
             allow_transfer_sent: false,
             transfer_negotiated: false,
             session_token: next_session_token(),
@@ -901,6 +905,29 @@ impl RealtimeCallLane {
     ) -> Option<(String, String, bool, serde_json::Value, bool)> {
         let (tool_call_id, name, refusal) = self.refused_tools.pop_front()?;
         Some((tool_call_id, name, false, refusal.output(), true))
+    }
+
+    /// A tool's answer that is ready but arrived after the call to it (the
+    /// transfer tool asks the host for a plan first). It waits for the same
+    /// drained-output gate every other completion passes, so its continuation
+    /// never cuts the tail of the line the model spoke before calling.
+    pub(super) fn queue_tool_answer(
+        &mut self,
+        tool_call_id: String,
+        name: &str,
+        ok: bool,
+        output: serde_json::Value,
+    ) {
+        self.queued_answers
+            .push_back((tool_call_id, name.to_string(), ok, output));
+    }
+
+    /// The oldest queued answer as a tool completion.
+    pub(super) fn next_queued_answer(
+        &mut self,
+    ) -> Option<(String, String, bool, serde_json::Value, bool)> {
+        let (tool_call_id, name, ok, output) = self.queued_answers.pop_front()?;
+        Some((tool_call_id, name, ok, output, true))
     }
 
     pub(super) fn reset_sco_rate(&mut self, rate: u32) {

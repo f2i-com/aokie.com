@@ -139,6 +139,7 @@ impl ToolLedger {
     }
 
     /// How many tool calls this call has asked for.
+    #[cfg(test)]
     pub(super) fn asked(&self) -> usize {
         self.asked
     }

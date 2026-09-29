@@ -267,6 +267,18 @@ impl GatewaySession {
                     "The accepted transfer crossed its exact assistance fence",
                 ));
             }
+            // A transfer aimed at named devices can be won only by one of
+            // them. On the relay carrier the plugin published the offers to
+            // those devices alone; on the socket carrier the gateway
+            // publishes them, so this is where the plan is enforced.
+            if !self.assistance.transfer_admits(
+                &transfer.request_id,
+                &notice.lease.mobile_key_thumbprint,
+            ) {
+                return Err(WorkerError::reconnect(
+                    "The transfer was not offered to this endpoint",
+                ));
+            }
             self.assistance
                 .accept_transfer(&transfer.request_id, &transfer.fence, &notice.device_id)
                 .map_err(|_| {
