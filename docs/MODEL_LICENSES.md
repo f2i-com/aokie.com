@@ -1,8 +1,13 @@
 # Voice model notices
 
 Aokie's automatic model installer downloads only the immutable revisions and
-files listed in `models-manifest.json`. The application verifies the declared
-file size and SHA-256 digest before it makes a model bundle available.
+files listed in [`models-manifest.json`](models-manifest.json). The application
+verifies the declared file size and SHA-256 digest before it makes a model
+bundle available. This file ships in every release bundle beside that manifest.
+
+These models serve Aokie's own speech stack (the `voice` build). On the OAIY
+route, OAIY Voice hears and speaks for the call and these models are normally
+not downloaded; the models OAIY runs are covered by OAIY's own notices.
 
 ## Parakeet Unified EN 0.6B ONNX
 

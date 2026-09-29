@@ -1,22 +1,33 @@
-# Aokie — Architecture
+# Aokie architecture
 
-Aokie is a FormLogic Desktop **plugin**: a JSON-RPC process (stdio, NDJSON)
-that owns the phone bridge and the voice loop and streams events to FormLogic,
-which owns records, roles, dashboards and flows. This document maps the moving
-parts and the two state machines that matter for correctness.
+Aokie is a desktop **plugin**, hosted by OAIY Desktop or FormLogic Desktop: a
+JSON-RPC process (stdio, NDJSON) that owns the phone bridge and the call loop
+and streams events to its host, which runs its flows and passes them on to
+FormLogic, where records, roles, dashboards and flows live. This document maps
+the moving parts and the two state machines that matter for correctness.
 
 ## Process shape
 
 ```
-FormLogic Desktop (Tauri host)
+OAIY Desktop or FormLogic Desktop (Tauri host)
   └─ spawns  aokie-plugin.exe  (stdio JSON-RPC 2.0, NDJSON)
                 ├─ radio thread            (WinUSB HCI/ACL/SCO, HFP, MAP, PBAP)
                 ├─ STT worker               (Parakeet, generation-stamped jobs)
                 ├─ outbox replay thread     (durable delivery, heartbeat)
                 └─ (voice feature) in-plugin agent: STT → LLM → TTS
-  └─ spawns  aokie-voice-server.exe  (:17920 loopback OpenAI-compatible STT/TTS)
-  └─ spawns  llama-server.exe        (:8080 local LLM the agent reuses)
+  └─ runs the services the plugin calls:
+       OAIY Desktop       its gateway on 127.0.0.1:17872 (the realtime voice
+                          route), OAIY Voice and its model engines
+       FormLogic Desktop  aokie-voice-server.exe (:17920 loopback OpenAI-compatible
+                          STT/TTS) and llama-server.exe (:8080 local LLM)
 ```
+
+The plugin also ships its own screen, `crates/aokie-plugin/ui/receptionist`
+(plain JavaScript, no build step). The host loads it into a sandboxed iframe
+(opaque origin, CSP `default-src 'none'`) and injects `window.PluginHost`, a
+postMessage bridge to the plugin's commands and events. OAIY's setup wizard
+shows single tabs of the same screen as its steps (setup mode; see
+[FORMLOGIC_PLUGIN_CONTRACT.md](FORMLOGIC_PLUGIN_CONTRACT.md#the-receptionist-screen-in-setup-mode)).
 
 The plugin inherits no secrets — only an allow-listed environment. Everything
 it persists lives under the per-plugin data dir handed to it at `plugin.init`.
@@ -70,7 +81,7 @@ Key invariants (each pinned by a test):
   rows replay immediately), so crash recovery needs a dedicated persistent
   delayed-work ledger rather than reusing the delivery outbox.
 
-## Voice pipeline (voice feature)
+## Aokie's own voice pipeline (voice feature)
 
 Per caller turn: energy-VAD segments speech → generation-stamped STT job →
 stream the local LLM (first sentence starts TTS immediately) → per-sentence
@@ -84,6 +95,25 @@ by an error]`), and an `operatorSpeak` that produced no audio records nothing.
 `AudioConnected` carries `armed` — false means the SCO alternate-setting failed
 and the call is silent both ways; the plugin emits `hardware.error
 {sco_unarmed}` with a recovery action rather than reporting a healthy call.
+
+## The OAIY route (Desktop realtime)
+
+With `realtimeVoiceMode=desktop_realtime` and the provider `oaiy`, the call's
+audio streams to OAIY's voice gateway
+(`ws://127.0.0.1:17872/api/ai/providers/oaiy/v1/realtime/stream`). OAIY Voice
+hears and speaks, and OAIY's Front desk agent decides, with the saved persona
+(or the call's `configureAgent` overlay) as its brief. No path counts on
+Aokie's own speech stack, which is normally not downloaded on this route.
+
+Aokie's fixed lines (a screened caller's message, the hold and queue
+announcements, the mid-call failure apology) are said in OAIY's voice through
+its speak mode: a `formlogic.realtime.start` with `"mode": "speak"` and the line
+as its greeting, said once with no agent listening. Where OAIY cannot say a
+line, Aokie's own TTS says it if present. Screened callers are never given to
+OAIY's agent. A mid-call OAIY failure ends in a hangup and
+`aokie.hardware.error {code: "realtime_failed", route: "oaiy", apologized,
+apologizedWith?}`. The full rules are in
+[FORMLOGIC_PLUGIN_CONTRACT.md](FORMLOGIC_PLUGIN_CONTRACT.md#calls-on-the-oaiy-route).
 
 ## Durability (`outbox.rs`)
 
@@ -112,4 +142,4 @@ delivery pipeline degrades readiness rather than silently stalling.
 Events, commands, error codes, the settings schema and the persona are frozen
 in `docs/contracts/*.json`, byte-identical in the FormLogic repo, and each
 repo's tests lock its own artifacts against its copy — see
-`docs/FORMLOGIC_PLUGIN_CONTRACT.md`.
+[FORMLOGIC_PLUGIN_CONTRACT.md](FORMLOGIC_PLUGIN_CONTRACT.md).
