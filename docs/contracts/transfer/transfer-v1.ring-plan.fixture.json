@@ -166,6 +166,32 @@
         }
       },
       {
+        "name": "the host vouches for a reason that is not caller_asked (urgent, or the business rule behind policy_rule)",
+        "result": {
+          "planId": "plan_0006",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 40,
+          "phones": [
+            "thumb_phone_a"
+          ],
+          "wake": [],
+          "desktopToast": false,
+          "desktopCompanions": [],
+          "reasonAllowed": true
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 40,
+          "targets": [
+            "thumb_phone_a"
+          ],
+          "targetRule": "only",
+          "reasonAllowed": true
+        },
+        "plugin": "For urgent and policy_rule the plugin skips its own phrase check (the caller asked for a person) only when the plan says reasonAllowed: true. A plan without it, or with anything but true, leaves the check in force: a ring for those reasons then needs the caller to have asked, and is otherwise refused (not_urgent for urgent, caller_did_not_ask for policy_rule) before anything is opened. caller_asked is unaffected: it is checked before the host is asked and no host word lifts it."
+      },
+      {
         "name": "a desktop toast with no device named is not a target (design vector V01, fail closed)",
         "result": {
           "planId": "plan_0007",

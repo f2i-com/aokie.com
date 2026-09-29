@@ -176,6 +176,9 @@ struct Planning {
     tool_call_id: String,
     call_id: String,
     reason: Reason,
+    /// The phrase check on the caller's recent turns, taken when the tool was
+    /// called (only the verdict is kept, never the turns).
+    caller_asked: bool,
     owner: AokieOwnerFence,
     session_token: u64,
     host: Arc<HostRpc>,
@@ -329,7 +332,8 @@ impl TransferCall {
         if !self.governor.allows(env.now) {
             return refused(RefusalStatus::Refused, "limit_global");
         }
-        if reason == Reason::CallerAsked && !caller_asked(args.recent_caller_turns) {
+        let caller_did_ask = caller_asked(args.recent_caller_turns);
+        if reason == Reason::CallerAsked && !caller_did_ask {
             return refused(RefusalStatus::Refused, "caller_did_not_ask");
         }
         if !env.host_ring_plan {
@@ -353,6 +357,7 @@ impl TransferCall {
             tool_call_id: args.tool_call_id.to_string(),
             call_id: args.call_id.to_string(),
             reason,
+            caller_asked: caller_did_ask,
             owner: args.owner.clone(),
             session_token: env.session_token,
             host: Arc::clone(env.host),
@@ -472,6 +477,23 @@ impl TransferCall {
                 return;
             }
             Decision::Ring => {}
+        }
+        // The phrase floor is not skipped for `urgent` and `policy_rule`
+        // unless the host's plan says the reason holds for this call: the
+        // plugin cannot see an emergency or a business rule, and a model
+        // steered by what a caller says must not be able to ring the owner by
+        // naming a reason nobody checked.
+        if planning.reason != Reason::CallerAsked && !plan.reason_allowed && !planning.caller_asked {
+            eprintln!(
+                "[aokie-plugin] transfer refused: the host did not confirm reason {} and the caller did not ask",
+                planning.reason.as_str()
+            );
+            let code = match planning.reason {
+                Reason::Urgent => "not_urgent",
+                _ => "caller_did_not_ask",
+            };
+            answered(effects, &planning, refusal(RefusalStatus::Refused, code));
+            return;
         }
         // Who may be offered the request: the devices the plan names, and
         // nobody else. A ring aimed at nobody could only time out, and would

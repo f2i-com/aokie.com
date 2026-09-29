@@ -465,11 +465,87 @@ fn a_caller_who_never_asked_is_refused_before_the_host_is_asked() {
     assert_eq!(refused_reason(&answer), "caller_did_not_ask");
     assert_eq!(answer.output["status"], "refused");
     assert!(rig.host_requests().is_empty());
-    // The other reasons do not need the phrase; the host's policy decides them.
+    // The other reasons are not refused at the door: the host is asked, and
+    // its plan decides whether the phrase floor may be skipped for them
+    // (`a_reason_other_than_caller_asked_needs_the_hosts_word_or_the_callers`).
     assert!(matches!(
         rig.begin_with("tool_2", json!({"reason": "urgent"})),
         Begin::Planning
     ));
+}
+
+/// Review finding 7. `urgent` and `policy_rule` used to skip the phrase floor
+/// entirely, so a model steered by what a caller said could ring the owner by
+/// naming a reason nobody checked. The floor now holds for them too unless the
+/// host's plan says the reason holds for this call.
+#[test]
+fn a_reason_other_than_caller_asked_needs_the_hosts_word_or_the_callers() {
+    let plan = |allowed: Value| {
+        let mut plan = Rig::ring_plan();
+        if !allowed.is_null() {
+            plan["reasonAllowed"] = allowed;
+        }
+        plan
+    };
+    let ordinary_talk = || vec!["How much for the front lawn?".to_string(), "and the hedge?".to_string()];
+
+    for (reason, refusal_code) in [("urgent", "not_urgent"), ("policy_rule", "caller_did_not_ask")] {
+        // The caller asked for nothing and the host does not vouch for the
+        // reason: refused, nothing opened, nobody rung, no attempt spent.
+        for allowed in [Value::Null, json!(false), json!("yes"), json!(1)] {
+            let mut rig = Rig::new();
+            rig.turns = ordinary_talk();
+            assert!(matches!(rig.begin_with("t1", json!({"reason": reason})), Begin::Planning));
+            rig.host_answers(plan(allowed.clone()));
+            let effects = rig.poll();
+            let Effect::ToolAnswer { answer, .. } = &effects[0] else {
+                panic!("{effects:?}")
+            };
+            assert_eq!(refused_reason(answer), refusal_code, "{reason} {allowed}");
+            assert_eq!(effects.len(), 1);
+            assert!(!rig.broker.is_busy(), "{reason} {allowed}");
+            assert_eq!(rig.machine.attempts(), 0);
+            assert!(
+                !rig.host_requests().iter().any(|(method, ..)| method == "oaiy.ring.opened"),
+                "{reason} {allowed}"
+            );
+        }
+
+        // The host vouches for it: the phrase floor is not needed.
+        let mut rig = Rig::new();
+        rig.turns = ordinary_talk();
+        assert!(matches!(rig.begin_with("t1", json!({"reason": reason})), Begin::Planning));
+        rig.host_answers(plan(json!(true)));
+        let request_id = ringing_request_id(&rig.poll());
+        assert!(rig.broker.transfer_admits(&request_id, PHONE), "{reason} confirmed by the host");
+
+        // The caller did ask for a person: the plugin's own floor holds, and
+        // the host's plan alone decides the rest.
+        let mut rig = Rig::new();
+        assert!(matches!(rig.begin_with("t1", json!({"reason": reason})), Begin::Planning));
+        rig.host_answers(plan(Value::Null));
+        let request_id = ringing_request_id(&rig.poll());
+        assert!(rig.broker.transfer_admits(&request_id, PHONE), "{reason} after the caller asked");
+    }
+
+    // The host's own refusals still come first.
+    let mut rig = Rig::new();
+    rig.turns = ordinary_talk();
+    assert!(matches!(rig.begin_with("t1", json!({"reason": "urgent"})), Begin::Planning));
+    rig.host_answers(json!({
+        "planId": "plan_no", "decision": "refused", "reason": "quiet_hours", "ringSeconds": 0,
+        "phones": [], "wake": [], "desktopToast": false, "desktopCompanions": [], "reasonAllowed": true
+    }));
+    let effects = rig.poll();
+    let Effect::ToolAnswer { answer, .. } = &effects[0] else { panic!("{effects:?}") };
+    assert_eq!(refused_reason(answer), "quiet_hours");
+
+    // `caller_asked` itself is unchanged: it is decided before the host is asked,
+    // and no host word can lift it.
+    let mut rig = Rig::new();
+    rig.turns = ordinary_talk();
+    assert_eq!(refused_reason(&answer_of(rig.begin("t1"))), "caller_did_not_ask");
+    assert!(rig.host_requests().is_empty());
 }
 
 #[test]
