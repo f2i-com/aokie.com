@@ -18,7 +18,7 @@ step with the OAIY repository's copy. The digests are in [SHA256SUMS](SHA256SUMS
 | [transfer-v1.start-ready.fixture.json](transfer-v1.start-ready.fixture.json) | `start.allowTransfer`, `ready.features`, `start.resume`, the `handoff:takeover` stop, and the compatibility matrix. |
 | [transfer-v1.ring-plan.fixture.json](transfer-v1.ring-plan.fixture.json) | The two plugin-to-host requests `oaiy.ring.plan` and `oaiy.ring.opened`. |
 | [transfer-v1.reserved-offer-id.fixture.json](transfer-v1.reserved-offer-id.fixture.json) | The reserved transfer offer id and its generations (vector V2). |
-| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the rules, 8 positive and 8 negative cases. |
+| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, the rules, 10 positive and 10 negative cases. |
 
 ## How a transfer runs
 
@@ -88,8 +88,18 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    (`limit_gap`), 20 an hour (`limit_global`). The host's ring policy is normally
    stricter (2 a call, a minute apart, 10 an hour by default);
 6. for `caller_asked`, the phrase check on the last three caller turns
-   (`caller_did_not_ask`);
-7. the host's ring plan (`oaiy.ring.plan`); the plan's reasons are `disabled`,
+   (`caller_did_not_ask`), before the host is asked. The turns are normalised
+   first (lower-case, apostrophe look-alikes such as U+2019 become `'`, every
+   run of other characters and of spaces becomes one space), so "speak, to the
+   owner" matches and "I don't want to speak" typed with a curly apostrophe is
+   blocked like its straight twin;
+7. the host's ring plan (`oaiy.ring.plan`). For `urgent` and `policy_rule` the
+   plugin cannot see an emergency or a business rule, so its phrase check is
+   skipped only when the plan carries `"reasonAllowed": true` (the host vouches
+   for the reason for this call). Without it the check stays in force after the
+   plan: the caller must have asked for a person, else the answer is
+   `not_urgent` (`urgent`) or `caller_did_not_ask` (`policy_rule`) and nothing
+   is opened. The plan's reasons are `disabled`,
    `initiative_off`, `not_urgent`, `caller_did_not_ask`, `limit_call`,
    `limit_gap`, `limit_caller`, `limit_global`, `quiet_hours`,
    `all_do_not_disturb` and `no_endpoint`. A `ring` plan with no device named is
@@ -189,6 +199,11 @@ and a responding device id, and no text from the call or the owner.
 * Announce `ringPlan` in `plugin.init.features` only if the host answers
   `oaiy.ring.plan` and `oaiy.ring.opened`. Without it the plugin never offers
   transfer.
+* Run the caller-asked phrase check with the fixture's normaliser (apostrophe
+  look-alikes folded, spaces collapsed), and put `"reasonAllowed": true` in the
+  plan only when the host itself has confirmed the `urgent` or `policy_rule`
+  reason for this call; without it those reasons also need the caller to have
+  asked.
 * Name every device the call may be offered to. A plan that sets the desktop
   toast and names no device (the design's vector V01) is answered `no_endpoint`
   and raises no toast: for the owner at the PC, put the paired Windows

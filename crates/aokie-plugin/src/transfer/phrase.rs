@@ -54,26 +54,41 @@ fn rules() -> &'static Rules {
     })
 }
 
-/// Lower-case, and every run of characters outside `[a-z0-9' ]` becomes one
-/// space, then trim. Existing spaces are kept as they are, exactly as the
-/// reference does.
+/// Characters phones, keyboards and speech engines use for the apostrophe:
+/// left and right single quotation marks, modifier letter apostrophe, single
+/// high-reversed-9 quotation mark, prime, fullwidth apostrophe, grave accent
+/// and acute accent.
+const APOSTROPHES: [char; 8] = [
+    '\u{2018}', '\u{2019}', '\u{02BC}', '\u{201B}', '\u{2032}', '\u{FF07}', '`', '\u{00B4}',
+];
+
+/// Lower-case; the apostrophe look-alikes become `'`; every run of characters
+/// outside `[a-z0-9' ]` becomes one space; every run of spaces becomes one
+/// space; trim. The last two steps together mean punctuation between words
+/// never leaves the double space that would defeat a single-space pattern
+/// ("speak, to the owner"), and a curly apostrophe reads as the straight one
+/// ("I don\u{2019}t want to speak" is blocked like "I don't want to speak").
 pub(crate) fn normalize(turn: &str) -> String {
     let mut out = String::with_capacity(turn.len());
-    let mut in_run = false;
+    let mut after_space = true;
     for character in turn.to_lowercase().chars() {
-        if character.is_ascii_lowercase()
-            || character.is_ascii_digit()
-            || character == '\''
-            || character == ' '
-        {
-            in_run = false;
+        let character = if APOSTROPHES.contains(&character) {
+            '\''
+        } else {
+            character
+        };
+        if character.is_ascii_lowercase() || character.is_ascii_digit() || character == '\'' {
+            after_space = false;
             out.push(character);
-        } else if !in_run {
-            in_run = true;
+        } else if !after_space {
+            after_space = true;
             out.push(' ');
         }
     }
-    out.trim().to_string()
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
 }
 
 /// Whether one of the last three caller turns asks for a person. A turn counts
@@ -127,16 +142,47 @@ mod tests {
     #[test]
     fn normalisation_is_the_reference_normalisation() {
         assert_eq!(normalize("Can I speak to the owner?"), "can i speak to the owner");
-        // A run of punctuation becomes one space; a space that was already there stays.
-        assert_eq!(normalize("  Hello,,, WORLD!! "), "hello  world");
-        assert_eq!(normalize("Hello, WORLD!"), "hello  world");
+        // A run of punctuation becomes one space, and so does a run of spaces:
+        // punctuation between words never leaves a double space behind.
+        assert_eq!(normalize("  Hello,,, WORLD!! "), "hello world");
+        assert_eq!(normalize("Hello, WORLD!"), "hello world");
         assert_eq!(normalize("Hello WORLD!"), "hello world");
+        assert_eq!(normalize("a  b"), "a b");
+        assert_eq!(normalize("a \t\n b"), "a b");
         assert_eq!(normalize("it's fine"), "it's fine");
         // Non-ASCII letters are punctuation to this check.
         assert_eq!(normalize("caf\u{e9}ok"), "caf ok");
-        assert_eq!(normalize("caf\u{e9} ok"), "caf  ok");
-        // Spaces that are already there are not collapsed.
-        assert_eq!(normalize("a  b"), "a  b");
+        assert_eq!(normalize("caf\u{e9} ok"), "caf ok");
+        assert_eq!(normalize(""), "");
+        assert_eq!(normalize(" ,, "), "");
+    }
+
+    #[test]
+    fn every_apostrophe_look_alike_is_the_ascii_apostrophe() {
+        for apostrophe in APOSTROPHES {
+            assert_eq!(
+                normalize(&format!("I don{apostrophe}t want to speak")),
+                "i don't want to speak",
+                "{apostrophe:?}"
+            );
+        }
+        // A curly apostrophe blocks exactly what the straight one does.
+        for apostrophe in ['\'', '\u{2018}', '\u{2019}', '\u{02BC}'] {
+            assert!(
+                !caller_asked(&[format!("I don{apostrophe}t want to speak to anyone")]),
+                "{apostrophe:?}"
+            );
+            assert!(
+                !caller_asked(&[format!("no, I don{apostrophe}t need to talk to a person")]),
+                "{apostrophe:?}"
+            );
+            assert!(
+                caller_asked(&[format!("I{apostrophe}d like to talk to a real person please")]),
+                "{apostrophe:?}"
+            );
+        }
+        // A quote that is not an apostrophe stays punctuation.
+        assert_eq!(normalize("\u{201C}hello\u{201D}"), "hello");
     }
 
     #[test]
@@ -177,7 +223,14 @@ mod tests {
         // A caller repeating what someone else said still asks, as far as the
         // rules can tell.
         assert!(caller_asked(&["they said they would get the owner to call"]));
-        // Doubled spaces from punctuation defeat the single-space patterns.
-        assert!(!caller_asked(&["speak, to the owner"]));
+    }
+
+    /// Review finding 7: punctuation inside a request no longer defeats the
+    /// single-space patterns (this used to be a known gap).
+    #[test]
+    fn punctuation_between_the_words_of_a_request_does_not_defeat_it() {
+        assert!(caller_asked(&["speak, to the owner"]));
+        assert!(caller_asked(&["Can I speak -- to the owner?"]));
+        assert!(caller_asked(&["Can I please talk,   with a person"]));
     }
 }

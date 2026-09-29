@@ -237,8 +237,8 @@ fn the_caller_asked_fixture_passes_and_its_rules_are_the_plugins_rules() {
     let fixture = fixture("transfer-v1.caller-asked.fixture.json");
     assert_eq!(fixture["recentTurns"], 3);
     let turns = |case: &Value| strings(&case["turns"]);
-    assert_eq!(fixture["positive"].as_array().unwrap().len(), 8);
-    assert_eq!(fixture["negative"].as_array().unwrap().len(), 8);
+    assert_eq!(fixture["positive"].as_array().unwrap().len(), 10);
+    assert_eq!(fixture["negative"].as_array().unwrap().len(), 10);
     for case in fixture["positive"].as_array().unwrap() {
         assert!(caller_asked(&turns(case)), "{case}");
     }
@@ -311,6 +311,12 @@ fn the_ring_plan_fixture_is_what_the_plugin_sends_and_reads() {
             assert_eq!(expected["reason"], parsed.reason.as_str(), "{case}");
         }
         assert_eq!(strings(&expected["targets"]), parsed.targets(), "{case}");
+        // The host vouching for a reason other than caller_asked (absent is false).
+        assert_eq!(
+            expected["reasonAllowed"].as_bool().unwrap_or(false),
+            parsed.reason_allowed,
+            "{case}"
+        );
         // How the request is aimed.
         if decision == "ring" {
             let rule = match parsed.target_rule() {

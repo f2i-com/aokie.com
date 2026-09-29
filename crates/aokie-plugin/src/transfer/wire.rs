@@ -196,6 +196,11 @@ pub struct RingPlan {
     pub wake: Vec<String>,
     pub desktop_toast: bool,
     pub desktop_companions: Vec<String>,
+    /// The host confirms the reason the plugin passed (`urgent`, or the
+    /// business rule behind `policy_rule`) holds for this call. Without it the
+    /// plugin's own floor applies to those reasons too: the caller must have
+    /// asked for a person. Absent, or anything but `true`, is `false`.
+    pub reason_allowed: bool,
 }
 
 /// Who a `ring` plan lets the request be offered to.
@@ -307,6 +312,7 @@ pub fn parse_plan(result: &Value) -> Result<RingPlan, String> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         desktop_companions: thumbprint_list(object.get("desktopCompanions"))?,
+        reason_allowed: object.get("reasonAllowed").and_then(Value::as_bool) == Some(true),
     })
 }
 
