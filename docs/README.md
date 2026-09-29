@@ -21,6 +21,7 @@ for what Aokie is, how to build it and how to install it into OAIY.
 |---|---|
 | [contracts/](contracts/) | The JSON schemas and shared contracts: the plugin manifest, the desktop event envelope, connector requests and responses, the connector contract, the settings schema, the default persona, and the Companion realtime protocols (v1 and v2). The shared files are byte-identical with FormLogic's copies and locked by tests in both repos, so change them in both at once. |
 | [contracts/fixtures/](contracts/fixtures/) | Companion protocol messages that the Rust tests (`aokie-protocol`, `aokie-realtime`, Companion) check against the schemas. |
+| [contracts/transfer/](contracts/transfer/) | `transfer_v1`, transferring a live call to the owner on the OAIY route: the contract document and the JSON fixtures (the tool call and result, the outcome frame, start and ready, the ring plan, the reserved offer id, the caller-asked phrase check). The fixtures are shared byte for byte with the OAIY repository; `SHA256SUMS` and `scripts/check-contracts.mjs` keep the two copies in step. |
 | [models-manifest.json](models-manifest.json) | The speech model revisions, file sizes and SHA-256 digests the installer accepts. |
 | [readme-assets/](readme-assets/) | The README's screenshots, and how they were taken. |
 

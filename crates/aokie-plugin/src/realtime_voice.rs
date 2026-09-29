@@ -1848,6 +1848,141 @@ mod tests {
         assert_eq!(start["allowRequestAppointment"], true);
     }
 
+    /// The shared fixtures (`docs/contracts/transfer/`) through the stream's
+    /// own parser and encoders: what OAIY sends parses, and what the plugin
+    /// sends is what the fixtures show.
+    #[test]
+    fn the_transfer_fixtures_round_trip_through_the_stream_types() {
+        use crate::transfer::fixture_tests::fixture;
+        use crate::transfer::{Outcome, OutcomeFrame, ResumeInfo, Via};
+
+        // The tool call OAIY sends.
+        let call = fixture("transfer-v1.tool-call.fixture.json");
+        let mut state = OutputParseState::default();
+        let parsed = parse_server_text(
+            &call["frame"].to_string(),
+            "call_0123",
+            7,
+            "https://oaiy.localhost",
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parsed,
+            RealtimeEventKind::ToolCall {
+                tool_call_id: "tool_0001".into(),
+                name: crate::transfer::TOOL_NAME.into(),
+                arguments: call["frame"]["arguments"].clone(),
+            }
+        );
+        // A tool name that is not an identifier ends the stream, as the fixture says.
+        for bad in call["invalidToolNames"].as_array().unwrap() {
+            let mut frame = call["frame"].clone();
+            frame["name"] = bad.clone();
+            assert!(
+                parse_server_text(&frame.to_string(), "call_0123", 7, "https://oaiy.localhost", &mut state).is_err(),
+                "{bad}"
+            );
+        }
+        for good in call["validToolNames"].as_array().unwrap() {
+            let mut frame = call["frame"].clone();
+            frame["name"] = good.clone();
+            assert!(
+                parse_server_text(&frame.to_string(), "call_0123", 7, "https://oaiy.localhost", &mut state).is_ok(),
+                "{good}"
+            );
+        }
+
+        // The start.
+        let start_ready = fixture("transfer-v1.start-ready.fixture.json");
+        for case in start_ready["start"]["cases"].as_array().unwrap() {
+            let mut config = session_config(CallFacts::default());
+            config.allow_transfer = case["allowTransfer"] == true;
+            if let Some(resume) = case.get("resume") {
+                config.resume = Some(ResumeInfo::new(
+                    resume["handoffSeconds"].as_u64().unwrap(),
+                    match resume["via"].as_str().unwrap() {
+                        "return" => Via::Return,
+                        "failback" => Via::Failback,
+                        other => panic!("{other}"),
+                    },
+                ));
+            }
+            if let Some(greeting) = case.get("greeting") {
+                config.greeting = greeting.as_str().unwrap().into();
+            }
+            let start = serde_json::to_value(StartEvent::for_session(&config)).unwrap();
+            if let Some(has) = case.get("startHas") {
+                for (key, expected) in has.as_object().unwrap() {
+                    assert_eq!(&start[key.as_str()], expected, "{case}: {key}");
+                }
+            }
+            if let Some(omits) = case.get("startOmits") {
+                for key in omits.as_array().unwrap() {
+                    assert!(start.get(key.as_str().unwrap()).is_none(), "{case}: {key}");
+                }
+            }
+        }
+        assert_eq!(start_ready["stop"]["handoffReason"], crate::transfer::STOP_HANDOFF_TAKEOVER);
+        assert!(crate::transfer::STOP_HANDOFF_TAKEOVER.starts_with(start_ready["stop"]["handoffPrefix"].as_str().unwrap()));
+
+        // The ready.
+        for case in start_ready["ready"]["cases"].as_array().unwrap() {
+            let ready = parse_server_text(
+                &case["frame"].to_string(),
+                "call_0123",
+                7,
+                "https://oaiy.localhost",
+                &mut state,
+            )
+            .unwrap()
+            .unwrap();
+            let features: Vec<String> = case["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|feature| feature.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                ready,
+                RealtimeEventKind::Ready {
+                    destination_origin: "https://oaiy.localhost".into(),
+                    features: features.clone(),
+                },
+                "{case}"
+            );
+            assert_eq!(
+                features.iter().any(|feature| feature == crate::transfer::FEATURE),
+                case["negotiatedWhenOffered"] == true,
+                "{case}"
+            );
+        }
+
+        // The outcome frames the plugin sends.
+        let outcomes = fixture("transfer-v1.outcome.fixture.json");
+        for case in outcomes["cases"].as_array().unwrap() {
+            let frame = &case["frame"];
+            let outcome: OutcomeFrame = serde_json::from_value(frame.clone()).unwrap();
+            let sent = serde_json::to_value(TransferOutcomeEvent {
+                kind: "formlogic.realtime.transfer_outcome",
+                call_id: frame["callId"].as_str().unwrap(),
+                generation: frame["generation"].as_u64().unwrap(),
+                frame: &outcome,
+            })
+            .unwrap();
+            assert_eq!(&sent, frame, "{case}");
+            assert!(matches!(
+                outcome.outcome,
+                Outcome::Accepted
+                    | Outcome::Declined
+                    | Outcome::Unavailable
+                    | Outcome::Expired
+                    | Outcome::Cancelled
+            ));
+        }
+    }
+
     #[test]
     fn a_transfer_outcome_is_a_typed_frame_stamped_with_the_call_and_generation() {
         let frame = crate::transfer::OutcomeFrame {
