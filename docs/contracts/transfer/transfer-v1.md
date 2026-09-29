@@ -65,6 +65,13 @@ ends `unavailable` (or a `failback` start); if the owner was already talking to
 the caller the session simply resumes with a fresh `start` and `resume.via =
 "return"`. Consent taken back while the request still rings is `cancelled`.
 
+**A call put on hold behind another caller** (Aokie's hold juggle) withdraws its
+open request first, while its session is still up (the broker is asked, so an
+acceptance wins; OAIY hears `cancelled` before the stop). The session then stops
+with free text, not a `handoff:` reason, because the caller is not going to a
+person: OAIY reads it like any session that ends, and the fresh session for the
+same call after the swap starts without `resume`.
+
 ## Negotiation
 
 * **Start.** `allowTransfer: true`, omitted when false. The plugin offers it only
@@ -323,7 +330,7 @@ sets is ever echoed to the model or to OAIY.
 | `tool_result` `reason`, given by the plugin | `consent`, `pending_request`, `busy`, `bad_arguments`, `plan_unavailable`, `call_changed`; and, from its own checks, `caller_did_not_ask` (the phrase floor, also for `policy_rule`), `not_urgent` (an unconfirmed `urgent`), `limit_call`, `limit_gap`, `limit_caller`, `limit_global` (the plugin's ceilings), `no_endpoint` (a plan that names no device) |
 | `tool_result` `status` | `refused` (do not offer a person), `unavailable` (offer a message) |
 | tool intake errors, `output: {"error": ...}` with no `status` | `busy`, `tool_limit`, `unsupported` |
-| a reason OAIY composes itself, never sent or received by the plugin | `not_offered`: OAIY's own tool result when it never had `transfer_to_owner` for the call (the plugin answers the tool on a session that did not negotiate it `unsupported`) |
+| OAIY's own words, defined by OAIY and never sent or received by the plugin | `not_offered` and `tool_limit`: reasons in the tool result OAIY composes itself for `transfer_to_owner` (`status: "unavailable"`) when this call was not given `allowTransfer`, and when its own tool budget for the call is spent. They are not the plugin's tool-intake errors above, which are `{"error": ...}` with no `status` and answer a call that reached the plugin |
 | a plan's `reason` the plugin does not know | becomes `plan_unavailable`: nothing the host says is echoed |
 | `transfer_to_owner` `reason` argument | `caller_asked`, `urgent`, `policy_rule` |
 | `transfer_outcome` `outcome` | `accepted`, `declined`, `unavailable`, `expired`, `cancelled` |
@@ -368,6 +375,24 @@ and a responding device id, and no text from the call or the owner.
   and raises no toast: for the owner at the PC, put the paired Windows
   Companion's thumbprint in `desktopCompanions` (online or not), and only
   devices whose thumbprints are in `phones` or `desktopCompanions` can accept.
+  Two things follow that the host has to do:
+  * The thumbprint is the one the device's endpoint key proves. The plugin
+    treats every approved endpoint alike (no device kind): on the relay carrier
+    a device is whoever's verified hello registered it (`RelayPeer.
+    holder_key_thumbprint`, which must be in the owner-approved roster), on the
+    socket carrier whoever's signed claim lease it is (`lease.
+    mobile_key_thumbprint`). A Windows Companion that does not hold a key in
+    the owner-approved roster can never be offered or accept, however the plan
+    names it: it has to be enrolled as an approved endpoint like a phone.
+  * List the paired Windows Companion **whether or not it is online**. The
+    design's reference `plan()` puts a Windows Companion in `desktopCompanions`
+    only while it is online (`d.online`); the toast exists to start a Companion
+    that is not running yet, so that plan emits an empty list at exactly the
+    moment it matters and the plugin now answers `no_endpoint`. Drop the online
+    filter for Windows Companions (keep `callAuthority`, `canTake` and the
+    availability rules). A Companion the plan named before it was running is
+    offered the request, on both surfaces and with the reserved id, when its
+    hello registers it inside the ring window.
 * `oaiy.ring.plan` may wait 1.5 s, and the answer to the tool call reaches the
   model only after the line it spoke before calling has drained (like every tool
   result), so the model's "I'll see if they are free" is not cut off.
