@@ -2,12 +2,12 @@
   "contract": "transfer_v1",
   "kind": "transfer_outcome",
   "direction": "aokie_to_oaiy",
-  "about": "How a transfer ended, as a formlogic.realtime.transfer_outcome frame on the call's realtime stream. It is sent only on a session that negotiated transfer_v1. callId and generation are those of the session, like every frame. atMs is Unix epoch milliseconds at which the plugin decided the outcome. message is only ever on declined: the owner's own words for the caller, at most 320 characters, control markers stripped, untrusted. A completed takeover sends no frame: the session stops with reason handoff:takeover instead.",
+  "about": "How a transfer ended, as a formlogic.realtime.transfer_outcome frame on the call's realtime stream. It is sent only on a session that negotiated transfer_v1. callId and generation are those of the session, like every frame. atMs is Unix epoch milliseconds at which the plugin decided the outcome. message is only ever on declined: the owner's own words for the caller, at most 320 characters, control markers stripped, untrusted. A completed takeover sends no frame: the session stops with reason handoff:takeover instead. accepted is sent at the accept, before the media setup that follows (up to 45 s, and it can still fail); on it the agent says one short fixed line and then nothing more until the stop or an unavailable outcome (transfer-v1.md).",
   "outcomes": ["accepted", "declined", "unavailable", "expired", "cancelled"],
   "maxMessageChars": 320,
   "cases": [
     {
-      "name": "an owner endpoint accepted; media setup is running (up to 45 s)",
+      "name": "an owner endpoint accepted (sent at the accept, before the media setup that follows, up to 45 s)",
       "frame": {
         "type": "formlogic.realtime.transfer_outcome",
         "callId": "call_0123",

@@ -988,6 +988,43 @@ fn an_endpoint_that_goes_away_mid_bridge_is_unavailable_and_the_ai_has_the_calle
     assert!(!rig.broker.is_busy());
 }
 
+/// Review finding 11. `accepted` is the accept, not the takeover: it is reported
+/// while the media setup has not even begun, and the request stays open (and
+/// can still fail) for the 45 s that follow.
+#[test]
+fn accepted_is_reported_at_the_accept_before_any_media_setup() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    assert!(rig.poll().is_empty(), "ringing: nothing to say yet");
+    rig.accept(&request_id);
+    // The very next turn, with the mailbox still waiting for the takeover and
+    // nothing recorded about the media, OAIY is told.
+    assert!(rig.broker.is_waiting(&request_id));
+    assert!(rig.broker.peek_resolution(&request_id).is_none());
+    let effects = rig.poll();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Accepted, None)]);
+    assert!(
+        effects.iter().all(|effect| !matches!(effect, Effect::Audit(_))),
+        "the audit closes at the end, not here"
+    );
+    // The setup window is the broker's 45 s; the machine keeps the request open
+    // for it, and it can still fail after the acceptance was reported.
+    assert!(rig.machine.is_active());
+    assert!(rig.broker.is_busy());
+    let fence = rig.fence(&request_id);
+    let mut returned = fence.clone();
+    returned.owner_epoch += 2;
+    returned.remote_revision += 3;
+    rig.broker
+        .transfer_unavailable(&request_id, &fence, returned, Some(DEVICE))
+        .unwrap();
+    assert_eq!(
+        outcomes(&rig.poll()),
+        vec![(Outcome::Unavailable, None)],
+        "and then only the failure follows"
+    );
+}
+
 /// Review finding 3. The gateway returns the media to Aokie first and writes
 /// `TransferUnavailable` a moment later, so the radio can start the fresh
 /// session in between. That session must not be told the owner handed the
