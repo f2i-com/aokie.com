@@ -65,8 +65,8 @@ The editable project contains `.ui` and `.logic` source plus the FormLogic conne
 ## See what is connected in OAIY
 
 <p align="center">
-  <img src="docs/readme-assets/oaiy-receptionist-live.png" alt="Actual OAIY Desktop Aokie console reporting ready for calls, Bluetooth linked, local LLM ready and all events delivered" width="100%" />
-  <br /><sub>Actual locally running OAIY and Aokie console, September 2026. No call content, phone numbers or Bluetooth addresses are shown.</sub>
+  <img src="docs/readme-assets/receptionist-overview-light.png" alt="The Aokie receptionist screen's Overview: ready for calls, calls going to OAIY's Front desk, a live call with a second caller waiting, and all events delivered" width="100%" />
+  <br /><sub>The receptionist screen with a stub host and fictional data, September 2026.</sub>
 </p>
 
 The Overview reports plugin health, phone connection, AI readiness, delivery backlog and live call state. Phone setup guides pairing, Settings selects the voice and AI endpoints, and Consent controls the allowed data use. Failed health checks show the problem instead of leaving the screen on “Starting”. Provider selections use the connected OAIY gateway address, including a custom local port.
