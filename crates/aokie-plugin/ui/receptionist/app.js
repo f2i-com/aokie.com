@@ -46,7 +46,15 @@
   }
 
   function errMsg(e) {
-    return e && e.message ? e.message : String(e);
+    var m = e && e.message ? e.message : String(e);
+    // The host's words when Aokie itself is not running ("503: The "aokie"
+    // connector is not available: its plugin is … Not started yet …"): OAIY
+    // already says so above the screen, with a Start button, so say it once
+    // and plainly here rather than repeat the status code and its internals.
+    if (/connector is not available|not started yet/i.test(m)) {
+      return "Aokie is not running, so this can't be read yet. Start it and this fills in by itself.";
+    }
+    return m;
   }
 
   /** innerHTML with a change guard so a poll re-render never resets hover
