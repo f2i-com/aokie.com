@@ -190,8 +190,9 @@ The plan names devices by endpoint-key thumbprint (`phones` and
 `desktopCompanions`). Two cases:
 
 * **Devices named**: the request is offered to those devices and no others. A
-  device outside the plan is offered no takeover of either surface while the
-  transfer is open, cannot win it, and cannot decline it on the others' behalf.
+  device outside the plan cannot win it on either carrier. What else it can do
+  depends on the carrier (below): on the relay carrier it is offered nothing and
+  cannot decline; on the socket carrier it can end the request with a decline.
 * **No device named**, whatever `desktopToast` says: nothing can be rung, the
   answer is `no_endpoint`, nothing is opened and `oaiy.ring.opened` is not sent.
   A toast is a notification, not a target: opening the request to "any live
@@ -203,12 +204,24 @@ The plan names devices by endpoint-key thumbprint (`phones` and
   connects inside the ring window). A plan that sets `desktopToast` and leaves
   `desktopCompanions` empty gets `no_endpoint` and no toast.
 
-On the relay carrier the plugin publishes the offers, so it publishes them only
-to the named devices. On the self-hosted socket carrier the gateway publishes
-them, so the plan is enforced where a device tries to win: a device outside the
-plan cannot accept (the plugin refuses the claim). A socket-carrier device
-outside the plan may still be shown the request and may send a decline, which the
-plugin cannot attribute to a key there. The signed offer on the native call surface
+On the **relay carrier** the plugin publishes the offers, so it publishes them
+only to the named devices (a device outside the plan is offered no takeover of
+either surface while the transfer is open) and refuses an accept or a decline
+from any other device (`not_a_target`).
+
+On the self-hosted **socket carrier** the gateway publishes the offers to every
+approved device, so the plan is enforced only where a device tries to win: a
+takeover claim from a device outside the plan is refused, because the claim
+carries a signed lease and the plugin knows the key. The decline the gateway
+relays carries a device id but no endpoint key, and the plugin holds no roster of
+device ids to attribute it with. So a device outside the plan that is shown the
+request can end it with a decline, and OAIY is told `declined` (with that
+device's message, bounded and untrusted). That costs the owner availability (the
+ring ends early and the caller is offered a message) and nothing else: it can
+never accept, take the caller, or reach the media. A host that must not be
+exposed to it should use the relay carrier.
+
+The signed offer on the native call surface
 (`voice_system_ui`) has a reserved id, `toffer_` plus 26 characters of base32 of a
 hash of the request id and the device's thumbprint, so a ring hint posted by the
 host names the same offer that later reaches the phone

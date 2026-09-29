@@ -6294,6 +6294,72 @@ fn a_device_outside_the_targets_gets_no_transfer_offer_and_cannot_decline() {
     );
 }
 
+/// Review finding 12, pinned so the contract and the code cannot drift. On the
+/// socket carrier the decline the gateway relays carries a device id and no
+/// endpoint key, so the plugin cannot attribute it to the plan: a device outside
+/// the plan can end the request that way, and nothing more. transfer-v1.md
+/// says so.
+#[test]
+fn on_the_socket_carrier_a_decline_from_a_device_outside_the_plan_ends_the_request_and_can_do_nothing_else() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    let holder_a = holder_of(&harness, "device_a");
+    let remote = harness.media.snapshot();
+    let fence = crate::assistance::AssistanceCallFence {
+        call_id: remote.call_id.clone().unwrap(),
+        call_epoch: remote.call_epoch,
+        owner_epoch: remote.owner_epoch,
+        switchboard_revision: harness.radio.switchboard_revision(),
+        remote_revision: remote.remote_revision,
+    };
+    let request_id = harness
+        .session
+        .assistance
+        .request_transfer_to(
+            fence.clone(),
+            "The caller asked for the owner",
+            None,
+            60,
+            Some(vec![holder_a.clone()]),
+        )
+        .unwrap();
+
+    let decline = |device: &str, answer_id: &str| {
+        serde_json::to_string(&aokie_protocol::v2::PluginAssistanceAnswerFrame {
+            kind: "assistance_answer".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            device_id: device.into(),
+            request_id: request_id.clone(),
+            answer_id: answer_id.into(),
+            call_id: fence.call_id.clone(),
+            call_epoch: fence.call_epoch,
+            owner_epoch: fence.owner_epoch,
+            switchboard_revision: fence.switchboard_revision,
+            remote_revision: fence.remote_revision,
+            response_action: aokie_protocol::v2::AssistanceResponseAction::Decline,
+            answer: "Not now".into(),
+        })
+        .unwrap()
+    };
+    harness
+        .session
+        .handle_inbound(&decline("device_b", "answer_socket_b"), &harness.media, &harness.radio, false, None, None, None)
+        .expect("the gateway's decline is taken as it always was");
+    assert!(
+        matches!(
+            harness.session.assistance.take_resolution(&request_id),
+            Some(crate::assistance::AssistanceResolution::Declined { device_id, .. }) if device_id == "device_b"
+        ),
+        "the request ended, declined by a device that was not in the plan"
+    );
+
+    // That is all it did: the request is over and nothing is left to accept. (A
+    // takeover claim from a device outside the plan is refused separately, where
+    // the claim carries the key: the socket-claim tests.)
+    assert!(harness.session.assistance.pending_transfer("call_a", 1).is_none());
+    assert!(!harness.session.assistance.is_busy());
+}
+
 #[test]
 fn a_transfer_without_targets_offers_every_device_as_it_always_did() {
     let mut harness = RelayHarness::with_grants(transfer_grants());
