@@ -1079,6 +1079,31 @@ fn the_hold_juggle_lays_a_call_aside_only_through_the_withdrawing_helper() {
         raw_swaps, 3,
         "the newcomer's context is kept for the per-call reset; it is the call that continues"
     );
+    // Step 0 withdraws the open request while the session is still up, before
+    // it is stopped and before the hold announcements begin.
+    assert_eq!(source.matches("withdraw_open_transfer(").count(), 1);
+    let withdrawn_at = source.find("withdraw_open_transfer(").unwrap();
+    let stopped_at = source.find("lane.session.stop(\"hold juggle").unwrap();
+    assert!(withdrawn_at < stopped_at, "the request is withdrawn before the session is stopped");
+}
+
+/// The juggle's step 0: the primary's session is still up when its open request
+/// is withdrawn, so OAIY hears `cancelled` on it before the stop.
+#[test]
+fn a_primary_parked_while_its_session_is_up_hears_cancelled_before_the_stop() {
+    let mut laid = laid_aside_with_a_ringing_request();
+    let (mut lane, detached) = negotiated_lane();
+    laid.withdraw(TransferWithdrawal::Parked, Some(&mut lane));
+    lane.session.stop("hold juggle — primary parked");
+    let sent = detached.drain();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(
+        matches!(&sent[0], crate::realtime_voice::SentControl::TransferOutcome { frame } if frame.outcome == Outcome::Cancelled),
+        "{sent:?}"
+    );
+    assert!(matches!(&sent[1], crate::realtime_voice::SentControl::Stop { .. }), "{sent:?}");
+    assert!(!laid.rig.broker.is_busy(), "no phone can accept while the announcements play");
+    assert!(!laid.ctx.transfer.is_active());
 }
 
 /// The per-call reset: OAIY hears `cancelled` on the session that is about to

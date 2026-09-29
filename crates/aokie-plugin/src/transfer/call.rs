@@ -566,9 +566,14 @@ impl TransferCall {
     /// open would keep the single mailbox (and the owner's phone ringing) for
     /// a call that no longer has the line, and could not be reported until the
     /// call came back. It is withdrawn now, and `cancelled` waits for the
-    /// session the call gets when it resumes.
+    /// session the call gets when it resumes. The broker is asked first, as
+    /// for every withdrawal: an acceptance the machine has not seen yet is
+    /// reported before the request is withdrawn from under it, and one that
+    /// ended in the meantime is reported as it ended.
     pub fn park(&mut self, env: &mut TransferEnv<'_>) -> Vec<Effect> {
-        self.withdraw_open(env, "the call was put on hold")
+        let mut effects = self.poll(env);
+        effects.extend(self.withdraw_open(env, "the call was put on hold"));
+        effects
     }
 
     fn withdraw_open(&mut self, env: &mut TransferEnv<'_>, why: &str) -> Vec<Effect> {
