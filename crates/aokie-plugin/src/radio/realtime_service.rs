@@ -889,32 +889,17 @@ pub(super) fn service_realtime_lane(
                         name,
                         arguments,
                     } => {
-                        if !lane.begun
-                            || lane.pending_tool_call.is_some()
-                            || lane.pending_business_lookup.is_some()
-                            || lane.completed_tool_calls.len() >= 8
-                            || lane
-                                .completed_tool_calls
-                                .iter()
-                                .any(|completed| completed == &tool_call_id)
+                        if let Err(error) =
+                            lane.accept_tool_call(tool_call_id, name, arguments)
                         {
                             realtime_failure = Some((
                                 lane.call_id.clone(),
                                 lane.begun,
                                 lane.owner.clone(),
-                                "Desktop realtime repeated or overlapped a tool call".into(),
+                                error,
                             ));
                             break;
                         }
-                        // If the response spoke a short preamble first,
-                        // let its exact PCM drain before beginning the one
-                        // tool. Host lookups are then polled asynchronously.
-                        lane.pending_tool_call = Some((
-                            tool_call_id,
-                            name,
-                            arguments,
-                            lane.caller_activity_revision,
-                        ));
                     }
                     crate::realtime_voice::RealtimeEventKind::HangupRequested {
                         tool_call_id,
@@ -1229,10 +1214,24 @@ pub(super) fn service_realtime_lane(
                 let mut completion: Option<(String, String, bool, serde_json::Value, bool)> =
                     None;
 
+                // While a lookup is polling, the only tool that can be
+                // waiting to run is an instant one (a second slot tool was
+                // refused as `busy` at intake). It runs first; the lookup is
+                // polled again on the next turn.
+                let instant_queued = lane.pending_tool_call.is_some();
+
+                // A call refused at intake is answered before anything
+                // else: it costs nothing and the model is waiting for it.
+                if let Some(refused) = lane.next_refused_tool() {
+                    completion = Some(refused);
                 // A host lookup can legitimately take seconds. Poll it;
                 // never block this radio loop, which also owns continuous
                 // SCO capture, hang-up controls, and Realtime PCM ingress.
-                if let Some(pending) = lane.pending_business_lookup.as_mut() {
+                } else if let Some(pending) = lane
+                    .pending_business_lookup
+                    .as_mut()
+                    .filter(|_| !instant_queued)
+                {
                     if let Some((digest, spoken)) =
                         poll_business_lookup(&mut pending.lookup, Instant::now())
                     {
@@ -1557,11 +1556,14 @@ pub(super) fn service_realtime_lane(
                             true,
                         ));
                     } else {
+                        // Intake already refuses a name the plugin does not
+                        // know; this is the same answer for a tool that got
+                        // past it without a branch here.
                         completion = Some((
                             tool_call_id,
                             name,
                             false,
-                            serde_json::json!({"error": "Unsupported realtime tool."}),
+                            ToolRefusal::Unsupported.output(),
                             true,
                         ));
                     }
@@ -1589,8 +1591,6 @@ pub(super) fn service_realtime_lane(
                     ) {
                         realtime_failure =
                             Some((lane.call_id.clone(), true, lane.owner.clone(), error));
-                    } else {
-                        lane.completed_tool_calls.push(tool_call_id);
                     }
                 }
             }

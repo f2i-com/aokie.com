@@ -68,6 +68,7 @@ pub mod screen;
 pub mod speech_plan;
 pub mod speech_wire;
 pub mod conversation_policy;
+pub mod transfer;
 #[cfg(feature = "voice")]
 pub mod synth;
 #[cfg(feature = "voice")]

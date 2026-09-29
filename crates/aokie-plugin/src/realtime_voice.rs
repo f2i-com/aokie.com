@@ -368,6 +368,24 @@ pub fn validate_destination_origin(destination: &str) -> Result<String, String> 
     Ok(origin)
 }
 
+/// Whether `name` is a bare tool identifier: `^[a-z][a-z0-9_]{0,63}$`.
+///
+/// This is the whole of the parse layer's opinion about a tool name. Which
+/// tools exist, and whether one may run right now, is the radio's decision
+/// (`radio::realtime_tools`); a well-formed name the plugin does not know is
+/// answered with an `unsupported` result and never ends the call. A name that
+/// is not an identifier (upper case, spaces, control characters, a leading
+/// digit, more than 64 characters) could not be echoed back safely in a result,
+/// so it is refused as a protocol violation.
+pub fn is_tool_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
 fn gateway_token_after_validation(endpoint: &str) -> Result<String, String> {
     validate_endpoint(endpoint)?;
     std::env::var("FORMLOGIC_AI_GATEWAY_TOKEN")
@@ -564,6 +582,102 @@ impl RealtimeVoiceSession {
             }
         }
     }
+}
+
+/// What the plugin has sent toward OAIY, read back by radio-level tests from a
+/// session that has no socket behind it.
+#[cfg(test)]
+pub(crate) struct DetachedSession {
+    control_rx: Receiver<ControlCommand>,
+    event_tx: SyncSender<RealtimeEvent>,
+}
+
+#[cfg(test)]
+impl RealtimeVoiceSession {
+    /// A session whose control channel is read by the test instead of a
+    /// WebSocket worker. Nothing is spawned and nothing touches the network.
+    pub(crate) fn detached(call_id: &str, generation: u64) -> (Self, DetachedSession) {
+        let (audio_tx, _audio_rx) = mpsc::sync_channel(COMMAND_DEPTH);
+        let (control_tx, control_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_DEPTH);
+        (
+            Self {
+                call_id: call_id.to_string(),
+                generation,
+                audio_tx,
+                control_tx,
+                event_rx,
+                input_resampler: StreamingResampler::new(WIRE_SAMPLE_RATE, WIRE_SAMPLE_RATE),
+                input_batch: VecDeque::new(),
+            },
+            DetachedSession {
+                control_rx,
+                event_tx,
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+impl DetachedSession {
+    /// Everything the plugin sent since the last call, in order, as
+    /// `(kind, detail)` pairs a test can match on.
+    pub(crate) fn drain(&self) -> Vec<SentControl> {
+        let mut sent = Vec::new();
+        while let Ok(command) = self.control_rx.try_recv() {
+            sent.push(match command {
+                ControlCommand::ToolResult {
+                    tool_call_id,
+                    name,
+                    ok,
+                    output,
+                    continue_response,
+                } => SentControl::ToolResult {
+                    tool_call_id,
+                    name,
+                    ok,
+                    output,
+                    continue_response,
+                },
+                ControlCommand::Stop { reason } => SentControl::Stop { reason },
+                ControlCommand::Begin { .. } => SentControl::Begin,
+                ControlCommand::CancelOutput { item_id, .. } => {
+                    SentControl::CancelOutput { item_id }
+                }
+            });
+        }
+        sent
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn push_event(&self, call_id: &str, generation: u64, kind: RealtimeEventKind) {
+        self.event_tx
+            .try_send(RealtimeEvent {
+                call_id: call_id.to_string(),
+                generation,
+                kind,
+            })
+            .expect("detached event queue has room");
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SentControl {
+    Begin,
+    CancelOutput {
+        item_id: String,
+    },
+    ToolResult {
+        tool_call_id: String,
+        name: String,
+        ok: bool,
+        output: Value,
+        continue_response: bool,
+    },
+    Stop {
+        reason: String,
+    },
 }
 
 async fn run_socket(
@@ -968,6 +1082,12 @@ fn parse_server_text(
             Ok(Some(RealtimeEventKind::OutputItemDone { item_id }))
         }
         "formlogic.realtime.tool_call" => {
+            // The id and the name are the two things a result must repeat
+            // exactly, so a call that cannot be answered (no usable id, or a
+            // name that is not a bare identifier) is a protocol violation.
+            // Everything else about a call is judged later, per tool, and
+            // answered with an ordinary result: the model must never be able
+            // to end the phone call by asking for something odd.
             let tool_call_id = value
                 .get("toolCallId")
                 .and_then(Value::as_str)
@@ -977,26 +1097,20 @@ fn parse_server_text(
             let name = value
                 .get("name")
                 .and_then(Value::as_str)
-                .filter(|name| {
-                    matches!(
-                        *name,
-                        "lookup_business_data" | "request_appointment" | "finish_call"
-                    )
-                })
-                .ok_or_else(|| "Desktop realtime requested an unsupported tool".to_string())?
+                .filter(|name| is_tool_name(name))
+                .ok_or_else(|| "Desktop realtime tool call has no valid tool name".to_string())?
                 .to_string();
+            // Arguments that are not an object, or that are over 8 KiB, reach
+            // the service as JSON null: every tool refuses that as bad
+            // arguments, and the session stays up.
             let arguments = value
                 .get("arguments")
                 .filter(|arguments| arguments.is_object())
+                .filter(|arguments| {
+                    serde_json::to_vec(arguments).is_ok_and(|encoded| encoded.len() <= 8 * 1024)
+                })
                 .cloned()
-                .ok_or_else(|| "Desktop realtime tool arguments are invalid".to_string())?;
-            if serde_json::to_vec(&arguments)
-                .map_err(|_| "Desktop realtime tool arguments are not JSON".to_string())?
-                .len()
-                > 8 * 1024
-            {
-                return Err("Desktop realtime tool arguments exceeded 8 KiB".to_string());
-            }
+                .unwrap_or(Value::Null);
             Ok(Some(RealtimeEventKind::ToolCall {
                 tool_call_id,
                 name,
@@ -1714,14 +1828,25 @@ mod tests {
             &mut state,
         )
         .is_err());
-        assert!(parse_server_text(
-            r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"tool_2","name":"arbitrary_desktop_action","arguments":{}}"#,
-            "call_1",
-            7,
-            "https://api.openai.com",
-            &mut state,
-        )
-        .is_err());
+        // A tool the plugin does not know is no longer a protocol violation:
+        // the name reaches the radio, which answers `unsupported` and keeps
+        // the call up (MOB-01).
+        assert_eq!(
+            parse_server_text(
+                r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"tool_2","name":"arbitrary_desktop_action","arguments":{}}"#,
+                "call_1",
+                7,
+                "https://api.openai.com",
+                &mut state,
+            )
+            .unwrap()
+            .unwrap(),
+            RealtimeEventKind::ToolCall {
+                tool_call_id: "tool_2".into(),
+                name: "arbitrary_desktop_action".into(),
+                arguments: serde_json::json!({}),
+            }
+        );
 
         let hangup = parse_server_text(
             r#"{"type":"formlogic.realtime.hangup_requested","callId":"call_1","generation":7,"toolCallId":"tool_3","responseId":"response_3","itemId":"item_3"}"#,
@@ -1740,6 +1865,120 @@ mod tests {
                 item_id: "item_3".into(),
             }
         );
+    }
+
+    fn parse_tool_call(name: &str, arguments: &str, id: &str) -> Result<Option<RealtimeEventKind>, String> {
+        let text = format!(
+            r#"{{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":{},"name":{},"arguments":{}}}"#,
+            serde_json::to_string(id).unwrap(),
+            serde_json::to_string(name).unwrap(),
+            arguments
+        );
+        parse_server_text(
+            &text,
+            "call_1",
+            7,
+            "https://api.openai.com",
+            &mut OutputParseState::default(),
+        )
+    }
+
+    #[test]
+    fn tool_names_are_bare_identifiers_and_nothing_else() {
+        for good in [
+            "lookup_business_data",
+            "transfer_to_owner",
+            "a",
+            "x9_",
+            &"a".repeat(64),
+        ] {
+            assert!(is_tool_name(good), "{good}");
+            assert!(matches!(
+                parse_tool_call(good, "{}", "tool_1"),
+                Ok(Some(RealtimeEventKind::ToolCall { .. }))
+            ));
+        }
+        // Names that could not be echoed back in a result, or that try to
+        // smuggle something into one, end the stream as a protocol violation.
+        for bad in [
+            "",
+            "Transfer",
+            "transfer-to-owner",
+            "transfer to owner",
+            "9lives",
+            "_lead",
+            "tool\n",
+            "tool\u{0}",
+            "tôol",
+            "tool.name",
+            "../../etc",
+            "a;b",
+            &"a".repeat(65),
+        ] {
+            assert!(!is_tool_name(bad), "{bad:?}");
+            assert!(parse_tool_call(bad, "{}", "tool_1").is_err(), "{bad:?}");
+        }
+        // A missing or non-string name is the same violation.
+        let mut state = OutputParseState::default();
+        for text in [
+            r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"t","arguments":{}}"#,
+            r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"t","name":7,"arguments":{}}"#,
+            r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"t","name":["finish_call"],"arguments":{}}"#,
+        ] {
+            assert!(parse_server_text(text, "call_1", 7, "https://api.openai.com", &mut state).is_err());
+        }
+        // The id is what a result must repeat, so it still has to be usable.
+        for bad_id in ["", "line\nbreak", &"i".repeat(257)] {
+            assert!(parse_tool_call("finish_call", "{}", bad_id).is_err(), "{bad_id:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_tool_arguments_reach_the_radio_as_null_instead_of_ending_the_stream() {
+        for arguments in ["null", "7", r#""text""#, "[1,2]", "true"] {
+            assert_eq!(
+                parse_tool_call("transfer_to_owner", arguments, "tool_1")
+                    .unwrap()
+                    .unwrap(),
+                RealtimeEventKind::ToolCall {
+                    tool_call_id: "tool_1".into(),
+                    name: "transfer_to_owner".into(),
+                    arguments: Value::Null,
+                },
+                "{arguments}"
+            );
+        }
+        // A missing `arguments` member is the same.
+        let mut state = OutputParseState::default();
+        let missing = parse_server_text(
+            r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"tool_1","name":"finish_call"}"#,
+            "call_1",
+            7,
+            "https://api.openai.com",
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            missing,
+            RealtimeEventKind::ToolCall { arguments: Value::Null, .. }
+        ));
+        // Over 8 KiB of arguments is refused the same way, not fatally.
+        let big = serde_json::json!({"question": "x".repeat(9 * 1024)}).to_string();
+        assert!(matches!(
+            parse_tool_call("lookup_business_data", &big, "tool_1")
+                .unwrap()
+                .unwrap(),
+            RealtimeEventKind::ToolCall { arguments: Value::Null, .. }
+        ));
+        // Exactly what fits stays as sent.
+        let fits = serde_json::json!({"question": "x".repeat(1024)});
+        assert!(matches!(
+            parse_tool_call("lookup_business_data", &fits.to_string(), "tool_1")
+                .unwrap()
+                .unwrap(),
+            RealtimeEventKind::ToolCall { arguments, .. } if arguments == fits
+        ));
     }
 
     #[test]
