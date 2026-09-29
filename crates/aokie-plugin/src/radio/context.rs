@@ -71,6 +71,12 @@ pub(super) struct CallVoiceContext {
     /// parked with the caller context and destroyed at the call boundary.
     #[cfg(feature = "voice")]
     pub(super) pending_assistance: Option<PendingAssistanceCall>,
+    /// This call's transfers to the owner on the OAIY route (`transfer_v1`).
+    /// It lives here, not in the realtime lane: the lane's session stops the
+    /// moment an owner endpoint takes the caller, but the request must stay
+    /// open in the mailbox until the takeover is proved.
+    #[cfg(feature = "voice")]
+    pub(super) transfer: crate::transfer::call::TransferCall,
     #[cfg(feature = "voice")]
     pub(super) queued_appointments: Vec<String>,
     /// The caller was assigned the Desktop Realtime responder. This travels
@@ -127,6 +133,8 @@ impl CallVoiceContext {
             last_turn_audio: Vec::new(),
             #[cfg(feature = "voice")]
             pending_assistance: None,
+            #[cfg(feature = "voice")]
+            transfer: crate::transfer::call::TransferCall::default(),
             #[cfg(feature = "voice")]
             queued_appointments: Vec::new(),
             #[cfg(feature = "voice")]

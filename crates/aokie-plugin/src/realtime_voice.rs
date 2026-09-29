@@ -78,6 +78,13 @@ pub struct SessionConfig {
     /// not a live call. Aokie's fixed lines (a screen message, a hold
     /// announcement, the failure apology) on the OAIY route.
     pub speak_only: bool,
+    /// This call may be transferred to the owner (`transfer_v1`): sent as
+    /// `allowTransfer` on the start, and only when true. The tool is enabled
+    /// for the session only if OAIY answers with the feature in `ready`.
+    pub allow_transfer: bool,
+    /// Sent on the fresh session for the same call that follows a handoff
+    /// (`start.resume`); `None` on every other start.
+    pub resume: Option<crate::transfer::ResumeInfo>,
 }
 
 /// Additive `formlogic.realtime.start` fields: `direction`, `from`,
@@ -107,6 +114,10 @@ fn known(value: &Option<String>) -> Option<&str> {
 pub enum RealtimeEventKind {
     Ready {
         destination_origin: String,
+        /// What this OAIY says it implements for the call, from `ready.features`
+        /// (empty from an OAIY that sends none). `transfer_v1` enables the
+        /// transfer tool.
+        features: Vec<String>,
     },
     SpeechStarted,
     InputTranscript {
@@ -183,6 +194,10 @@ enum ControlCommand {
         output: Value,
         continue_response: bool,
     },
+    /// How a transfer to the owner ended (`transfer_v1`).
+    TransferOutcome {
+        frame: crate::transfer::OutcomeFrame,
+    },
     Stop {
         reason: String,
     },
@@ -222,6 +237,16 @@ struct StartEvent<'a> {
     opening_line: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<&'static str>,
+    /// Omitted when false, so a call that cannot be transferred sends exactly
+    /// the start it always sent.
+    #[serde(skip_serializing_if = "is_false")]
+    allow_transfer: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume: Option<crate::transfer::ResumeInfo>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl<'a> StartEvent<'a> {
@@ -249,6 +274,8 @@ impl<'a> StartEvent<'a> {
             purpose: known(&config.call.purpose),
             opening_line: known(&config.call.opening_line),
             mode: config.speak_only.then_some("speak"),
+            allow_transfer: config.allow_transfer,
+            resume: config.resume,
         }
     }
 }
@@ -289,6 +316,19 @@ struct BeginEvent<'a> {
     instructions: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     greeting: Option<&'a str>,
+}
+
+/// `formlogic.realtime.transfer_outcome`: the outcome fields come from the
+/// transfer contract's own frame type.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferOutcomeEvent<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    call_id: &'a str,
+    generation: u64,
+    #[serde(flatten)]
+    frame: &'a crate::transfer::OutcomeFrame,
 }
 
 #[derive(Serialize)]
@@ -550,6 +590,15 @@ impl RealtimeVoiceSession {
             .map_err(|_| "Desktop realtime control queue is unavailable".to_string())
     }
 
+    /// Tell OAIY how a transfer to the owner ended. Sent only on a session
+    /// that negotiated `transfer_v1`; the socket worker drops it silently if
+    /// the call has not begun.
+    pub fn send_transfer_outcome(&self, frame: crate::transfer::OutcomeFrame) -> Result<(), String> {
+        self.control_tx
+            .send(ControlCommand::TransferOutcome { frame })
+            .map_err(|_| "Desktop realtime control queue is unavailable".to_string())
+    }
+
     /// Arm the already-ready upstream session. The caller must send this only
     /// after the exact call is active, SCO is up, screening has completed,
     /// and Aokie still owns the media fence. Merely opening the WebSocket must
@@ -640,6 +689,7 @@ impl DetachedSession {
                     continue_response,
                 },
                 ControlCommand::Stop { reason } => SentControl::Stop { reason },
+                ControlCommand::TransferOutcome { frame } => SentControl::TransferOutcome { frame },
                 ControlCommand::Begin { .. } => SentControl::Begin,
                 ControlCommand::CancelOutput { item_id, .. } => {
                     SentControl::CancelOutput { item_id }
@@ -674,6 +724,9 @@ pub(crate) enum SentControl {
         ok: bool,
         output: Value,
         continue_response: bool,
+    },
+    TransferOutcome {
+        frame: crate::transfer::OutcomeFrame,
     },
     Stop {
         reason: String,
@@ -780,6 +833,20 @@ async fn run_socket(
                             };
                             sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
                                 .map_err(|e| format!("Desktop realtime tool result failed: {e}"))?;
+                        }
+                        Ok(ControlCommand::TransferOutcome { frame }) => {
+                            // An outcome is only ever about a call that
+                            // began; one that is not is dropped, never fatal.
+                            if begun {
+                                let event = TransferOutcomeEvent {
+                                    kind: "formlogic.realtime.transfer_outcome",
+                                    call_id: &config.call_id,
+                                    generation: config.generation,
+                                    frame: &frame,
+                                };
+                                sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
+                                    .map_err(|e| format!("Desktop realtime transfer outcome failed: {e}"))?;
+                            }
                         }
                         Ok(ControlCommand::Stop { reason }) => {
                             let event = StopEvent {
@@ -1038,6 +1105,7 @@ fn parse_server_text(
             }
             Ok(Some(RealtimeEventKind::Ready {
                 destination_origin: destination,
+                features: crate::transfer::parse_ready_features(value.get("features")),
             }))
         }
         "formlogic.realtime.speech_started" | "speech_started" => {
@@ -1643,7 +1711,26 @@ mod tests {
         assert_eq!(
             ready,
             RealtimeEventKind::Ready {
-                destination_origin: "https://api.openai.com".into()
+                destination_origin: "https://api.openai.com".into(),
+                features: Vec::new(),
+            }
+        );
+        // An OAIY that implements the contract says so in `ready`; members
+        // the plugin does not know are ignored, as before.
+        let with_features = parse_server_text(
+            r#"{"type":"formlogic.realtime.ready","callId":"call_1","generation":7,"destinationOrigin":"https://api.openai.com","features":["transfer_v1","future_thing"],"somethingNew":true}"#,
+            "call_1",
+            7,
+            "https://api.openai.com",
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            with_features,
+            RealtimeEventKind::Ready {
+                destination_origin: "https://api.openai.com".into(),
+                features: vec!["transfer_v1".into(), "future_thing".into()],
             }
         );
         assert!(parse_server_text(
@@ -1679,6 +1766,8 @@ mod tests {
             allow_finish_call: true,
             call,
             speak_only: false,
+            allow_transfer: false,
+            resume: None,
         }
     }
 
@@ -1718,9 +1807,87 @@ mod tests {
             CallFacts::default(),
         )))
         .unwrap();
-        for key in ["direction", "from", "callerName", "purpose", "openingLine", "mode"] {
+        for key in [
+            "direction",
+            "from",
+            "callerName",
+            "purpose",
+            "openingLine",
+            "mode",
+            "allowTransfer",
+            "resume",
+        ] {
             assert!(start.get(key).is_none(), "{key} must be left out");
         }
+    }
+
+    #[test]
+    fn start_offers_transfer_and_names_a_resume_only_when_asked() {
+        let mut config = session_config(CallFacts::default());
+        config.allow_transfer = true;
+        let start = serde_json::to_value(StartEvent::for_session(&config)).unwrap();
+        assert_eq!(start["allowTransfer"], true);
+        assert!(start.get("resume").is_none());
+
+        config.resume = Some(crate::transfer::ResumeInfo::new(
+            75,
+            crate::transfer::Via::Failback,
+        ));
+        config.greeting = crate::transfer::RETURN_GREETING.into();
+        let start = serde_json::to_value(StartEvent::for_session(&config)).unwrap();
+        assert_eq!(
+            start["resume"],
+            serde_json::json!({"afterHandoff": true, "handoffSeconds": 75, "via": "failback"})
+        );
+        assert_eq!(
+            start["greeting"],
+            "Thank you for waiting. Is there anything else I can help with?"
+        );
+        // Everything else of the start is untouched.
+        assert_eq!(start["type"], "formlogic.realtime.start");
+        assert_eq!(start["allowRequestAppointment"], true);
+    }
+
+    #[test]
+    fn a_transfer_outcome_is_a_typed_frame_stamped_with_the_call_and_generation() {
+        let frame = crate::transfer::OutcomeFrame {
+            request_id: "assist_1".into(),
+            outcome: crate::transfer::Outcome::Declined,
+            message: Some("Please ring after five".into()),
+            at_ms: 1_789_000_000_123,
+        };
+        let event = serde_json::to_value(TransferOutcomeEvent {
+            kind: "formlogic.realtime.transfer_outcome",
+            call_id: "call_1",
+            generation: 7,
+            frame: &frame,
+        })
+        .unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "type": "formlogic.realtime.transfer_outcome",
+                "callId": "call_1",
+                "generation": 7,
+                "requestId": "assist_1",
+                "outcome": "declined",
+                "message": "Please ring after five",
+                "atMs": 1_789_000_000_123u64
+            })
+        );
+        let bare = crate::transfer::OutcomeFrame {
+            message: None,
+            outcome: crate::transfer::Outcome::Accepted,
+            ..frame
+        };
+        let event = serde_json::to_value(TransferOutcomeEvent {
+            kind: "formlogic.realtime.transfer_outcome",
+            call_id: "call_1",
+            generation: 7,
+            frame: &bare,
+        })
+        .unwrap();
+        assert!(event.get("message").is_none());
     }
 
     #[test]
@@ -1759,6 +1926,8 @@ mod tests {
             purpose: None,
             opening_line: None,
             mode: None,
+            allow_transfer: false,
+            resume: None,
         })
         .unwrap();
         assert_eq!(start["allowRequestAppointment"], true);

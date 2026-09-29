@@ -28,7 +28,7 @@ pub(crate) const TRANSFER_SETUP_SECONDS: u64 = 45;
 /// deadline. The gateway gets this short interval to return the exact route to
 /// Aokie and publish TransferUnavailable; a dead gateway still converges to an
 /// ordinary expiry after the grace expires.
-const TRANSFER_RESOLUTION_GRACE_SECONDS: u64 = 10;
+pub(crate) const TRANSFER_RESOLUTION_GRACE_SECONDS: u64 = 10;
 const SAFE_TRANSFER_REASON: &str = "Caller requested the owner";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

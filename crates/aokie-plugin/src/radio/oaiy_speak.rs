@@ -126,6 +126,8 @@ pub(super) fn oaiy_say_config(
         allow_finish_call: false,
         call: crate::realtime_voice::CallFacts::default(),
         speak_only: true,
+        allow_transfer: false,
+        resume: None,
     }
 }
 

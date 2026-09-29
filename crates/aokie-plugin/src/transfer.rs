@@ -10,6 +10,15 @@
 
 use sha2::{Digest, Sha256};
 
+mod phrase;
+mod wire;
+
+#[cfg(any(test, feature = "voice"))]
+pub mod call;
+
+pub use phrase::caller_asked;
+pub use wire::*;
+
 /// The realtime tool the OAIY call agent calls.
 pub const TOOL_NAME: &str = "transfer_to_owner";
 

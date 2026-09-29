@@ -1,0 +1,864 @@
+//! The transfer state machine against the real assistance broker and the real
+//! remote-media state, with the host and the owner's endpoint played by the
+//! test: a plan answered over `HostRpc`, an endpoint that accepts, declines or
+//! goes away by calling the broker exactly as the Companion gateway does.
+
+use super::*;
+use crate::event_bridge::VecSink;
+use crate::remote_media::RemoteConsentGate;
+use aokie_protocol::v2::{AssistanceResponseAction, PluginAssistanceAnswerFrame, SCHEMA_VERSION};
+use serde_json::json;
+
+const CALL: &str = "call_a";
+const DEVICE: &str = "device_owner";
+const PHONE: &str = "thumb_phone_0123456789";
+
+fn consenting() -> RemoteConsentGate {
+    RemoteConsentGate {
+        enabled: true,
+        acknowledged: true,
+        acknowledged_at: Some("2026-07-18T00:00:00Z".into()),
+        expires_at: None,
+        assistance_enabled: true,
+        takeover_enabled: true,
+        ..Default::default()
+    }
+}
+
+struct Rig {
+    broker: AssistanceBroker,
+    media: RemoteMediaHandle,
+    host: Arc<HostRpc>,
+    sink: VecSink,
+    machine: TransferCall,
+    now: Instant,
+    active: Option<String>,
+    session: u64,
+    turns: Vec<String>,
+    owner: AokieOwnerFence,
+    host_ring_plan: bool,
+}
+
+impl Rig {
+    fn new() -> Self {
+        Self::with_governor(Arc::new(Governor::default()))
+    }
+
+    fn with_governor(governor: Arc<Governor>) -> Self {
+        let media = RemoteMediaHandle::spawn().unwrap();
+        media.set_remote_consent(consenting());
+        media.observe_physical_call(Some(CALL), true);
+        let owner = media.aokie_owner_fence().expect("Aokie owns the live call");
+        Self {
+            broker: AssistanceBroker::default(),
+            media,
+            host: HostRpc::new(),
+            sink: VecSink::default(),
+            machine: TransferCall::new(governor),
+            now: Instant::now(),
+            active: Some(CALL.to_string()),
+            session: 1,
+            turns: vec!["Can I speak to the owner?".into()],
+            owner,
+            host_ring_plan: true,
+        }
+    }
+
+    fn begin_with(&mut self, tool_call_id: &str, arguments: Value) -> Begin {
+        let mut env = TransferEnv {
+            broker: &self.broker,
+            media: &self.media,
+            host: &self.host,
+            sink: &mut self.sink,
+            now: self.now,
+            active_call_id: self.active.as_deref(),
+            switchboard_revision: 0,
+            host_ring_plan: self.host_ring_plan,
+            session_token: self.session,
+        };
+        self.machine.begin(
+            &mut env,
+            BeginArgs {
+                tool_call_id,
+                arguments: &arguments,
+                call_id: CALL,
+                owner: &self.owner,
+                recent_caller_turns: &self.turns,
+                caller_number: Some("+61491570006"),
+            },
+        )
+    }
+
+    fn begin(&mut self, tool_call_id: &str) -> Begin {
+        self.begin_with(tool_call_id, json!({"reason": "caller_asked"}))
+    }
+
+    fn poll(&mut self) -> Vec<Effect> {
+        let mut env = TransferEnv {
+            broker: &self.broker,
+            media: &self.media,
+            host: &self.host,
+            sink: &mut self.sink,
+            now: self.now,
+            active_call_id: self.active.as_deref(),
+            switchboard_revision: 0,
+            host_ring_plan: self.host_ring_plan,
+            session_token: self.session,
+        };
+        self.machine.poll(&mut env)
+    }
+
+    fn withdraw(&mut self) -> Vec<Effect> {
+        let mut env = TransferEnv {
+            broker: &self.broker,
+            media: &self.media,
+            host: &self.host,
+            sink: &mut self.sink,
+            now: self.now,
+            active_call_id: self.active.as_deref(),
+            switchboard_revision: 0,
+            host_ring_plan: self.host_ring_plan,
+            session_token: self.session,
+        };
+        self.machine.withdraw_unaccepted(&mut env)
+    }
+
+    /// The host requests written so far, as (method, id, params).
+    fn host_requests(&self) -> Vec<(String, u64, Value)> {
+        self.sink
+            .lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value.get("method").is_some())
+            .map(|value| {
+                (
+                    value["method"].as_str().unwrap().to_string(),
+                    value["id"].as_u64().unwrap(),
+                    value["params"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn plan_request(&self) -> (u64, Value) {
+        self.host_requests()
+            .into_iter()
+            .find(|(method, ..)| method == "oaiy.ring.plan")
+            .map(|(_, id, params)| (id, params))
+            .expect("the plugin asked the host for a ring plan")
+    }
+
+    /// The host answers the plan request.
+    fn host_answers(&self, result: Value) {
+        let (id, _) = self.plan_request();
+        assert!(self
+            .host
+            .try_route_response(&json!({"jsonrpc": "2.0", "id": id, "result": result})));
+    }
+
+    fn ring_plan() -> Value {
+        json!({
+            "planId": "plan_0001", "decision": "ring", "reason": "ok", "ringSeconds": 40,
+            "phones": [PHONE], "wake": [PHONE], "desktopToast": false, "desktopCompanions": []
+        })
+    }
+
+    /// Begin, let the host approve a ring, and return the ringing answer.
+    fn ring(&mut self) -> (String, Vec<Effect>) {
+        assert!(matches!(self.begin("tool_1"), Begin::Planning));
+        self.host_answers(Self::ring_plan());
+        let effects = self.poll();
+        let request_id = ringing_request_id(&effects);
+        (request_id, effects)
+    }
+
+    fn fence(&self, request_id: &str) -> AssistanceCallFence {
+        // The fence the request was opened with, read back from the mailbox.
+        self.broker
+            .pending_transfer(CALL, self.media.snapshot().call_epoch)
+            .filter(|pending| pending.request_id == request_id)
+            .expect("the request is open")
+            .fence
+    }
+
+    fn accept(&self, request_id: &str) {
+        let fence = self.fence(request_id);
+        self.broker.accept_transfer(request_id, &fence, DEVICE).unwrap();
+    }
+
+    fn decline(&self, request_id: &str, text: &str) {
+        let fence = self.fence(request_id);
+        self.broker
+            .accept(PluginAssistanceAnswerFrame {
+                kind: "assistance_answer".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                device_id: DEVICE.into(),
+                request_id: request_id.into(),
+                answer_id: "answer_decline".into(),
+                call_id: fence.call_id.clone(),
+                call_epoch: fence.call_epoch,
+                owner_epoch: fence.owner_epoch,
+                switchboard_revision: fence.switchboard_revision,
+                remote_revision: fence.remote_revision,
+                response_action: AssistanceResponseAction::Decline,
+                answer: text.into(),
+            })
+            .unwrap();
+    }
+}
+
+fn ringing_request_id(effects: &[Effect]) -> String {
+    effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ToolAnswer { answer, .. } if answer.ok => {
+                assert_eq!(answer.output["status"], "ringing");
+                Some(answer.output["requestId"].as_str().unwrap().to_string())
+            }
+            _ => None,
+        })
+        .expect("the tool answered ringing")
+}
+
+fn answer_of(begin: Begin) -> ToolAnswer {
+    match begin {
+        Begin::Answered(answer) => answer,
+        Begin::Planning => panic!("expected an immediate answer, the machine is planning"),
+    }
+}
+
+fn outcomes(effects: &[Effect]) -> Vec<(Outcome, Option<String>)> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Outcome(frame) => Some((frame.outcome, frame.message.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn audits(effects: &[Effect]) -> Vec<(String, String)> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Audit(event) => Some((
+                event.name.clone(),
+                event.data["outcome"].as_str().unwrap_or_default().to_string(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn refused_reason(answer: &ToolAnswer) -> String {
+    assert!(!answer.ok, "{answer:?}");
+    answer.output["reason"].as_str().unwrap().to_string()
+}
+
+const REQUESTED: &str = crate::contract::events::CALL_ASSISTANCE_REQUESTED;
+const RESOLVED: &str = crate::contract::events::CALL_ASSISTANCE_RESOLVED;
+
+// --- The happy path and its ends ---------------------------------------------
+
+#[test]
+fn ringing_answers_at_once_with_the_request_and_the_window_and_opens_the_request() {
+    let mut rig = Rig::new();
+    let (request_id, effects) = rig.ring();
+    assert!(request_id.starts_with("assist_"));
+    let answer = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ToolAnswer { tool_call_id, answer } => Some((tool_call_id.clone(), answer.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(answer.0, "tool_1");
+    assert_eq!(answer.1.output["ringSeconds"], 40);
+    // One durable `requested` event, with no text from the call in it.
+    assert_eq!(audits(&effects), vec![(REQUESTED.to_string(), "requested".to_string())]);
+    let audit = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Audit(event) => Some(serde_json::to_string(event).unwrap()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!audit.contains("owner?") && !audit.contains("+61491570006"));
+
+    // The broker holds an open transfer aimed at the planned phone only.
+    assert!(rig.broker.is_busy());
+    assert!(rig.broker.transfer_admits(&request_id, PHONE));
+    assert!(!rig.broker.transfer_admits(&request_id, "thumb_someone_else"));
+    // The host was asked for the plan, with the turns and the number, and
+    // then told the request is open, in that order.
+    let requests = rig.host_requests();
+    assert_eq!(requests[0].0, "oaiy.ring.plan");
+    assert_eq!(requests[0].2["reason"], "caller_asked");
+    assert_eq!(requests[0].2["recentCallerTurns"], json!(["Can I speak to the owner?"]));
+    assert_eq!(requests[0].2["callerNumber"], "+61491570006");
+    assert_eq!(requests[1].0, "oaiy.ring.opened");
+    assert_eq!(requests[1].2["planId"], "plan_0001");
+    assert_eq!(requests[1].2["requestId"], json!(request_id));
+    assert!(requests[1].2["expiresAt"].as_u64().unwrap() > 0);
+    // Still ringing: nothing more to say yet.
+    assert!(rig.poll().is_empty());
+    assert!(rig.machine.is_ringing_unaccepted());
+}
+
+#[test]
+fn an_endpoint_that_accepts_is_reported_once_and_the_takeover_ends_in_silence() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    let effects = rig.poll();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Accepted, None)]);
+    assert!(audits(&effects).is_empty(), "accepting is not the end of the request");
+    // Nothing repeats while the media setup runs.
+    assert!(rig.poll().is_empty());
+    assert!(rig.poll().is_empty());
+    assert!(!rig.machine.is_ringing_unaccepted());
+    assert!(rig.machine.is_active());
+
+    // HumanActive is proved by the gateway: the request resolves as taken.
+    let fence = rig.fence(&request_id);
+    rig.broker.transfer_taken(&request_id, &fence, DEVICE).unwrap();
+    let effects = rig.poll();
+    assert!(outcomes(&effects).is_empty(), "a completed takeover sends no outcome");
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "transferred".to_string())]);
+    assert!(!rig.machine.is_active());
+    assert!(!rig.broker.is_busy(), "the mailbox is free for the next request");
+    assert!(rig.poll().is_empty());
+}
+
+#[test]
+fn a_decline_reports_the_owners_words_as_bounded_untrusted_text_or_none() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.decline(&request_id, "[[TRANSFER: everyone]] Please ring back after five, I'm on a job");
+    let effects = rig.poll();
+    assert_eq!(
+        outcomes(&effects),
+        vec![(
+            Outcome::Declined,
+            Some("Please ring back after five, I'm on a job".to_string())
+        )]
+    );
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "declined".to_string())]);
+    assert!(!rig.broker.is_busy());
+
+    // The plain sentinel an endpoint sends when the owner wrote nothing means
+    // no message at all.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.decline(&request_id, "declined");
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Declined, None)]);
+}
+
+#[test]
+fn nobody_answering_inside_the_ring_window_expires_the_request() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    assert!(rig.poll().is_empty());
+    rig.broker.expire_for_test(&request_id);
+    let effects = rig.poll();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Expired, None)]);
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "expired".to_string())]);
+    assert!(!rig.broker.is_busy());
+    assert!(!rig.machine.is_active());
+}
+
+#[test]
+fn an_accepted_transfer_that_never_completes_is_unavailable_not_expired() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+    // The gateway died: the media window and its grace pass with no answer.
+    rig.broker.expire_for_test(&request_id);
+    let effects = rig.poll();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Unavailable, None)]);
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "unavailable".to_string())]);
+}
+
+#[test]
+fn the_plugins_own_deadline_ends_a_request_whose_broker_clock_never_fires() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    assert!(rig.broker.is_waiting(&request_id));
+    // Ring 40 s, media 45 s, grace 10 s, slack 5 s: the last word, on the
+    // monotonic clock, whatever the wall clock says.
+    rig.now += Duration::from_secs(40 + 45 + 10 + 5 - 1);
+    assert!(rig.poll().is_empty(), "not yet");
+    rig.now += Duration::from_secs(2);
+    let effects = rig.poll();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Expired, None)]);
+    assert!(!rig.broker.is_busy(), "the plugin took the request off the mailbox");
+    assert!(!rig.machine.is_active());
+}
+
+// --- Never a silent caller: every refusal is an answer ----------------------
+
+#[test]
+fn without_consent_nothing_is_asked_of_anyone() {
+    let mut rig = Rig::new();
+    rig.media.set_remote_consent(RemoteConsentGate::default());
+    let answer = answer_of(rig.begin("tool_1"));
+    assert_eq!(refused_reason(&answer), "consent");
+    assert_eq!(answer.output["status"], "refused");
+    assert!(rig.host_requests().is_empty(), "the host is not even asked");
+    assert!(!rig.broker.is_busy());
+    assert_eq!(rig.machine.attempts(), 0);
+
+    // Each scope is needed on its own.
+    for gate in [
+        RemoteConsentGate { assistance_enabled: false, ..consenting() },
+        RemoteConsentGate { takeover_enabled: false, ..consenting() },
+        RemoteConsentGate { acknowledged: false, ..consenting() },
+        RemoteConsentGate { enabled: false, ..consenting() },
+        // Expired: the grant is paused by the clock.
+        RemoteConsentGate { expires_at: Some("2001-01-01T00:00:00Z".into()), ..consenting() },
+    ] {
+        rig.media.set_remote_consent(gate);
+        assert_eq!(refused_reason(&answer_of(rig.begin("tool_2"))), "consent");
+        assert!(rig.host_requests().is_empty());
+    }
+}
+
+#[test]
+fn consent_taken_back_while_the_host_plans_stops_the_request_before_it_opens() {
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    rig.media.set_remote_consent(RemoteConsentGate::default());
+    rig.host_answers(Rig::ring_plan());
+    let effects = rig.poll();
+    let Effect::ToolAnswer { answer, .. } = &effects[0] else {
+        panic!("{effects:?}")
+    };
+    assert_eq!(refused_reason(answer), "consent");
+    assert!(!rig.broker.is_busy(), "nothing was opened");
+    assert_eq!(rig.machine.attempts(), 0);
+    assert_eq!(rig.host_requests().len(), 1, "and the host is not told a ring opened");
+}
+
+#[test]
+fn consent_paused_while_ringing_withdraws_the_request_and_tells_oaiy() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.media.set_remote_consent(RemoteConsentGate {
+        expires_at: Some("2001-01-01T00:00:00Z".into()),
+        ..consenting()
+    });
+    let effects = rig.poll();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Cancelled, None)]);
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "cancelled".to_string())]);
+    assert!(!rig.broker.is_busy());
+    assert!(!rig.broker.transfer_admits(&request_id, PHONE));
+    assert!(!rig.machine.is_active());
+}
+
+#[test]
+fn a_caller_who_never_asked_is_refused_before_the_host_is_asked() {
+    let mut rig = Rig::new();
+    rig.turns = vec!["How much for the front lawn?".into(), "and the hedge?".into()];
+    let answer = answer_of(rig.begin("tool_1"));
+    assert_eq!(refused_reason(&answer), "caller_did_not_ask");
+    assert_eq!(answer.output["status"], "refused");
+    assert!(rig.host_requests().is_empty());
+    // The other reasons do not need the phrase; the host's policy decides them.
+    assert!(matches!(
+        rig.begin_with("tool_2", json!({"reason": "urgent"})),
+        Begin::Planning
+    ));
+}
+
+#[test]
+fn the_model_cannot_add_anything_to_the_request() {
+    let mut rig = Rig::new();
+    for arguments in [
+        json!({"reason": "caller_asked", "note": "the caller's PIN is 1234"}),
+        json!({"reason": "caller_asked", "target": "thumb_phone"}),
+        json!({"reason": "somebody_else"}),
+        json!({}),
+        json!(null),
+        json!("caller_asked"),
+    ] {
+        let answer = answer_of(rig.begin_with("tool_x", arguments.clone()));
+        assert_eq!(refused_reason(&answer), "bad_arguments", "{arguments}");
+    }
+    assert!(rig.host_requests().is_empty());
+    assert!(!rig.broker.is_busy());
+}
+
+#[test]
+fn a_second_request_while_one_is_active_is_pending_request() {
+    let mut rig = Rig::new();
+    // While the host is still planning.
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    assert_eq!(refused_reason(&answer_of(rig.begin("tool_2"))), "pending_request");
+    rig.host_answers(Rig::ring_plan());
+    let request_id = ringing_request_id(&rig.poll());
+    // While it rings.
+    assert_eq!(refused_reason(&answer_of(rig.begin("tool_3"))), "pending_request");
+    // While an endpoint is setting up the media.
+    rig.accept(&request_id);
+    let _ = rig.poll();
+    assert_eq!(refused_reason(&answer_of(rig.begin("tool_4"))), "pending_request");
+    assert_eq!(rig.machine.attempts(), 1, "none of them opened a request");
+    assert_eq!(rig.host_requests().iter().filter(|r| r.0 == "oaiy.ring.plan").count(), 1);
+
+    // Another request in the mailbox (not this machine's) is the same answer.
+    let mut other = Rig::new();
+    let fence = AssistanceCallFence {
+        call_id: CALL.into(),
+        call_epoch: other.media.snapshot().call_epoch,
+        owner_epoch: 0,
+        switchboard_revision: 0,
+        remote_revision: 0,
+    };
+    other.broker.request(fence, "A question", None, 30).unwrap();
+    assert_eq!(refused_reason(&answer_of(other.begin("tool_1"))), "pending_request");
+}
+
+#[test]
+fn a_call_that_changed_under_the_request_is_call_changed() {
+    let mut rig = Rig::new();
+    rig.active = None;
+    assert_eq!(refused_reason(&answer_of(rig.begin("tool_1"))), "call_changed");
+    let mut rig = Rig::new();
+    rig.media.observe_physical_call(Some("call_b"), true);
+    assert_eq!(refused_reason(&answer_of(rig.begin("tool_1"))), "call_changed");
+    // A stale owner fence: something (a claim, another AI action) moved it.
+    let mut rig = Rig::new();
+    rig.media
+        .linearize_aokie_action(&rig.owner)
+        .expect("the first action advances the fence");
+    assert_eq!(refused_reason(&answer_of(rig.begin("tool_1"))), "call_changed");
+    assert!(rig.host_requests().is_empty());
+}
+
+// --- The host's plan ---------------------------------------------------------
+
+#[test]
+fn a_plan_that_says_no_is_the_tool_answer_with_the_plans_reason() {
+    for (decision, reason, status) in [
+        ("refused", "limit_gap", "refused"),
+        ("refused", "caller_did_not_ask", "refused"),
+        ("message_only", "quiet_hours", "unavailable"),
+        ("message_only", "no_endpoint", "unavailable"),
+        ("message_only", "all_do_not_disturb", "unavailable"),
+    ] {
+        let mut rig = Rig::new();
+        assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+        rig.host_answers(json!({"planId": "plan_1", "decision": decision, "reason": reason}));
+        let effects = rig.poll();
+        let Effect::ToolAnswer { tool_call_id, answer } = &effects[0] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(tool_call_id, "tool_1");
+        assert_eq!(answer.output["status"], status, "{decision} {reason}");
+        assert_eq!(refused_reason(answer), reason);
+        assert!(!rig.broker.is_busy(), "a refusal opens nothing");
+        assert_eq!(rig.machine.attempts(), 0, "and does not count as an attempt");
+        assert!(!rig.machine.is_active());
+    }
+}
+
+#[test]
+fn a_plan_that_rings_nobody_is_no_endpoint_and_opens_nothing() {
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    rig.host_answers(json!({
+        "planId": "plan_1", "decision": "ring", "reason": "ok", "ringSeconds": 30,
+        "phones": [], "wake": [], "desktopToast": true, "desktopCompanions": []
+    }));
+    let effects = rig.poll();
+    let Effect::ToolAnswer { answer, .. } = &effects[0] else {
+        panic!("{effects:?}")
+    };
+    assert_eq!(refused_reason(answer), "no_endpoint");
+    assert!(!rig.broker.is_busy());
+}
+
+#[test]
+fn a_host_that_is_slow_broken_or_hostile_is_plan_unavailable_and_fails_closed() {
+    // Slow: nothing comes back inside the wait.
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    rig.now += PLAN_WAIT - Duration::from_millis(1);
+    assert!(rig.poll().is_empty(), "still waiting");
+    rig.now += Duration::from_millis(2);
+    let effects = rig.poll();
+    let Effect::ToolAnswer { answer, .. } = &effects[0] else {
+        panic!("{effects:?}")
+    };
+    assert_eq!(refused_reason(answer), "plan_unavailable");
+    assert!(!rig.broker.is_busy(), "no plan, no ring");
+    assert_eq!(rig.host.pending_count(), 0, "the abandoned request is forgotten");
+    // A late answer is consumed by nobody.
+    let (id, _) = rig.plan_request();
+    assert!(rig.host.try_route_response(&json!({"id": id, "result": Rig::ring_plan()})));
+    assert!(rig.poll().is_empty());
+
+    // An error from the host, or nonsense.
+    for response in [
+        json!({"jsonrpc": "2.0", "error": {"code": -32601, "message": "method not found"}}),
+        json!({"jsonrpc": "2.0", "result": "ring please"}),
+        json!({"jsonrpc": "2.0", "result": {"planId": "p", "decision": "ring", "phones": [7]}}),
+        json!({"jsonrpc": "2.0", "result": {"decision": "ring", "phones": ["thumb"]}}),
+    ] {
+        let mut rig = Rig::new();
+        assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+        let (id, _) = rig.plan_request();
+        let mut response = response;
+        response["id"] = json!(id);
+        assert!(rig.host.try_route_response(&response));
+        let effects = rig.poll();
+        let Effect::ToolAnswer { answer, .. } = &effects[0] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(refused_reason(answer), "plan_unavailable");
+        assert!(!rig.broker.is_busy());
+    }
+
+    // A host that announced nothing is never asked.
+    let mut rig = Rig::new();
+    rig.host_ring_plan = false;
+    assert_eq!(refused_reason(&answer_of(rig.begin("tool_1"))), "plan_unavailable");
+    assert!(rig.host_requests().is_empty());
+
+    // A host whose stdin is gone cannot be asked either.
+    let mut rig = Rig::new();
+    rig.sink.fail = true;
+    assert_eq!(refused_reason(&answer_of(rig.begin("tool_1"))), "plan_unavailable");
+    assert_eq!(rig.host.pending_count(), 0);
+}
+
+#[test]
+fn a_plan_answer_for_a_session_that_is_gone_is_dropped_and_opens_nothing() {
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    // The realtime session was replaced (a handoff and a return) while the
+    // host thought about it: the new session never made this call.
+    rig.session = 2;
+    rig.host_answers(Rig::ring_plan());
+    assert!(rig.poll().is_empty(), "no answer to a session that never asked");
+    assert!(!rig.broker.is_busy());
+    assert!(!rig.machine.is_active());
+    assert_eq!(rig.host.pending_count(), 0);
+}
+
+// --- Cancellation and the endpoint going away ---------------------------------
+
+#[test]
+fn a_caller_who_hangs_up_mid_ring_cancels_the_request_and_frees_the_mailbox() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.active = None;
+    let effects = rig.poll();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Cancelled, None)]);
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "cancelled".to_string())]);
+    assert!(!rig.broker.is_busy());
+    assert!(!rig.broker.transfer_admits(&request_id, PHONE), "the offers stop with it");
+    assert!(rig.poll().is_empty(), "and it is said once");
+
+    // Hanging up during the media setup is the same.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+    rig.active = None;
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Cancelled, None)]);
+    assert!(!rig.broker.is_busy());
+}
+
+#[test]
+fn an_endpoint_that_drops_before_the_media_is_up_puts_the_request_back_to_ringing() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+    // The acceptance transaction could not be delivered: the gateway rolls
+    // the reservation back (`release_transfer_acceptance`) and the request
+    // is open to every target again.
+    let fence = rig.fence(&request_id);
+    rig.broker
+        .release_transfer_acceptance(&request_id, &fence, DEVICE)
+        .unwrap();
+    assert!(rig.poll().is_empty(), "the model was already told; nothing new to say");
+    assert!(rig.machine.is_ringing_unaccepted());
+    // A second endpoint can still win, and is not reported a second time.
+    rig.broker.accept_transfer(&request_id, &fence, "device_second").unwrap();
+    assert!(rig.poll().is_empty(), "accepted was reported once");
+    assert!(!rig.machine.is_ringing_unaccepted());
+}
+
+#[test]
+fn an_endpoint_that_goes_away_mid_bridge_is_unavailable_and_the_ai_has_the_caller_back() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+
+    // The session for the AI was stopped as soon as the human claimed the
+    // caller; then the media failed and the gateway returned the caller.
+    rig.machine.note_handoff(rig.now);
+    let fence = rig.fence(&request_id);
+    let mut returned = fence.clone();
+    returned.owner_epoch += 2;
+    returned.remote_revision += 3;
+    rig.broker
+        .transfer_unavailable(&request_id, &fence, returned, Some(DEVICE))
+        .unwrap();
+    // The fresh session for the same call starts before the machine has
+    // consumed the failure: the mailbox still tells failback from return.
+    rig.now += Duration::from_secs(12);
+    assert_eq!(
+        rig.machine.take_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(12, Via::Failback))
+    );
+    let effects = rig.poll();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Unavailable, None)]);
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "unavailable".to_string())]);
+    assert!(!rig.broker.is_busy());
+}
+
+#[test]
+fn the_ai_resumes_after_a_return_and_after_a_failure_and_only_when_there_was_a_handoff() {
+    // Nothing to resume from before any handoff.
+    let mut rig = Rig::new();
+    assert_eq!(rig.machine.take_resume(rig.now, &rig.broker), None);
+
+    // The owner took the call, spoke, and handed it back.
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    let _ = rig.poll();
+    let fence = rig.fence(&request_id);
+    rig.broker.transfer_taken(&request_id, &fence, DEVICE).unwrap();
+    rig.machine.note_handoff(rig.now);
+    let _ = rig.poll();
+    rig.now += Duration::from_secs(75);
+    assert_eq!(
+        rig.machine.take_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(75, Via::Return))
+    );
+    // The record is consumed: a second session for the call is not "after a handoff".
+    assert_eq!(rig.machine.take_resume(rig.now, &rig.broker), None);
+
+    // The first note wins: a second stop of the same handoff does not restart the clock.
+    let mut rig = Rig::new();
+    rig.machine.note_handoff(rig.now);
+    rig.now += Duration::from_secs(5);
+    rig.machine.note_handoff(rig.now);
+    rig.now += Duration::from_secs(5);
+    assert_eq!(
+        rig.machine.take_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(10, Via::Return))
+    );
+}
+
+#[test]
+fn a_request_nobody_has_won_is_withdrawn_when_someone_takes_the_call_another_way() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    let effects = rig.withdraw();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Cancelled, None)]);
+    assert!(!rig.broker.is_busy());
+    assert!(!rig.broker.transfer_admits(&request_id, PHONE));
+
+    // An accepted one is left alone: its takeover is what is changing the fence.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    let _ = rig.poll();
+    assert!(rig.withdraw().is_empty());
+    assert!(rig.broker.is_busy());
+    let fence = rig.fence(&request_id);
+    rig.broker.transfer_taken(&request_id, &fence, DEVICE).unwrap();
+}
+
+// --- The plugin's own ceilings -------------------------------------------------
+
+#[test]
+fn the_plugins_ceilings_hold_whatever_the_host_allows() {
+    let mut rig = Rig::new();
+    for attempt in 1..=MAX_ATTEMPTS_PER_CALL {
+        let (request_id, _) = rig.ring();
+        rig.decline(&request_id, "declined");
+        assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Declined, None)]);
+        assert_eq!(rig.machine.attempts(), attempt);
+        // Straight after the last one: too soon, or the call's allowance.
+        assert_eq!(
+            refused_reason(&answer_of(rig.begin("too_soon"))),
+            if attempt < MAX_ATTEMPTS_PER_CALL { "limit_gap" } else { "limit_call" }
+        );
+        rig.now += MIN_GAP_BETWEEN_ATTEMPTS;
+        // A fresh tool call id and a fresh plan for the next attempt.
+        rig.sink.lines.clear();
+    }
+    assert_eq!(refused_reason(&answer_of(rig.begin("one_more"))), "limit_call");
+    assert!(rig.host_requests().is_empty(), "no plan is asked for over the ceiling");
+}
+
+#[test]
+fn the_hourly_ceiling_is_shared_across_calls() {
+    let governor = Arc::new(Governor::default());
+    let start = Instant::now();
+    for _ in 0..MAX_ATTEMPTS_PER_HOUR {
+        assert!(governor.allows(start));
+        governor.note_opened(start);
+    }
+    assert!(!governor.allows(start));
+    assert!(!governor.allows(start + Duration::from_secs(3_599)));
+    assert!(governor.allows(start + Duration::from_secs(3_600)), "an hour later the window has moved on");
+
+    let mut rig = Rig::with_governor(Arc::clone(&governor));
+    rig.now = start;
+    // Fill the hour from other calls, then this call is refused.
+    for _ in 0..MAX_ATTEMPTS_PER_HOUR {
+        governor.note_opened(start);
+    }
+    assert_eq!(refused_reason(&answer_of(rig.begin("tool_1"))), "limit_global");
+    assert!(rig.host_requests().is_empty());
+}
+
+// --- Idempotency and what leaves the machine ------------------------------------
+
+#[test]
+fn every_effect_is_free_of_call_text_and_owner_text_except_the_bounded_message() {
+    let mut rig = Rig::new();
+    rig.turns = vec!["My PIN is 4471, can I speak to the owner about Gail's account?".into()];
+    let (request_id, ring_effects) = rig.ring();
+    rig.decline(&request_id, "Call Gail on 0491 570 156");
+    let mut all = ring_effects;
+    all.extend(rig.poll());
+    for effect in &all {
+        let encoded = match effect {
+            Effect::ToolAnswer { answer, .. } => answer.output.to_string(),
+            Effect::Audit(event) => serde_json::to_string(event).unwrap(),
+            Effect::Outcome(frame) if frame.outcome == Outcome::Declined => {
+                // The one place owner text may appear, and only as the message.
+                assert_eq!(frame.message.as_deref(), Some("Call Gail on 0491 570 156"));
+                continue;
+            }
+            Effect::Outcome(frame) => serde_json::to_string(frame).unwrap(),
+        };
+        for secret in ["4471", "Gail", "0491", "570 156", "account"] {
+            assert!(!encoded.contains(secret), "{secret} leaked into {encoded}");
+        }
+    }
+    // What the broker sends the owner's endpoints is the fixed line.
+    let frame = rig.broker.pending_frame("app_a");
+    assert!(frame.is_none(), "declined requests no longer publish");
+}
+
+#[test]
+fn a_transfer_request_carries_the_fixed_text_to_the_owner_never_the_models() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    let frame = rig.broker.pending_frame("app_a").expect("open request publishes");
+    assert_eq!(frame.request_id, request_id);
+    assert!(frame.transfer_offered);
+    assert_eq!(frame.question, "Caller requested the owner");
+    assert!(frame.context.is_none());
+}

@@ -19,19 +19,22 @@ use super::*;
 /// flags — those belong to the LINE, not the caller.
 #[cfg(any(test, feature = "voice"))]
 #[derive(Debug)]
-pub(super) struct AssistanceAuditLifecycle {
+pub(crate) struct AssistanceAuditLifecycle {
     pub(super) request_id: String,
     pub(super) call_id: String,
     pub(super) resolved: bool,
 }
 
 #[cfg(any(test, feature = "voice"))]
-pub(super) enum AssistanceAuditResolution<'a> {
+pub(crate) enum AssistanceAuditResolution<'a> {
     Answered(&'a str),
     Declined(&'a str),
     Transferred(&'a str),
     Unavailable,
     Expired,
+    /// The request was withdrawn before anyone answered it: the caller hung
+    /// up, consent was taken back, or the call changed hands another way.
+    Cancelled,
 }
 
 #[cfg(any(test, feature = "voice"))]
@@ -39,7 +42,7 @@ impl AssistanceAuditLifecycle {
     /// Opening the lifecycle returns its one request event. The constructor
     /// deliberately accepts no question/context/answer text, making sensitive
     /// assistance content unrepresentable in the durable payload.
-    pub(super) fn opened(request_id: &str, call_id: &str) -> (Self, DesktopEvent) {
+    pub(crate) fn opened(request_id: &str, call_id: &str) -> (Self, DesktopEvent) {
         let lifecycle = Self {
             request_id: request_id.to_owned(),
             call_id: call_id.to_owned(),
@@ -55,7 +58,7 @@ impl AssistanceAuditLifecycle {
 
     /// Resolve once. Repeated polling or a duplicate accepted answer cannot
     /// mint another durable resolution for the same request lifecycle.
-    pub(super) fn resolve(&mut self, resolution: AssistanceAuditResolution<'_>) -> Option<DesktopEvent> {
+    pub(crate) fn resolve(&mut self, resolution: AssistanceAuditResolution<'_>) -> Option<DesktopEvent> {
         if self.resolved {
             return None;
         }
@@ -66,6 +69,7 @@ impl AssistanceAuditLifecycle {
             AssistanceAuditResolution::Transferred(device_id) => ("transferred", Some(device_id)),
             AssistanceAuditResolution::Unavailable => ("unavailable", None),
             AssistanceAuditResolution::Expired => ("expired", None),
+            AssistanceAuditResolution::Cancelled => ("cancelled", None),
         };
         Some(self.event(
             crate::contract::events::CALL_ASSISTANCE_RESOLVED,
