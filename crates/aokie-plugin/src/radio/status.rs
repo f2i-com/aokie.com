@@ -78,6 +78,11 @@ pub struct RadioStatus {
     pub realtime_ready: AtomicBool,
     pub realtime_destination: Mutex<Option<String>>,
     pub realtime_error: Mutex<Option<String>>,
+    /// The OAIY route may offer a call the tool `transfer_to_owner`: the host
+    /// announced `ringPlan` at init (it answers `oaiy.ring.plan`, so the owner's
+    /// ring policy exists) and at least one Companion device is approved. Set
+    /// by the connector; read per call, together with the call's consent.
+    pub transfer_ready: AtomicBool,
     /// VOICE-001: the measured TTS→STT loopback self-test outcome. `None` =
     /// still running (auto-answer stays blocked until it lands — never arm on
     /// unproven engines); populated with ok/failed + duration once done.

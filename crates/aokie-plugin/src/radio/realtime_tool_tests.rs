@@ -191,3 +191,158 @@ fn malformed_arguments_are_answered_by_the_tool_and_never_end_the_session() {
     // result rather than by ending the call.
     assert!(!realtime_finish_call_allowed(true, false, 0, 0));
 }
+
+// --- MOB-10: the transfer tool on the lane -------------------------------------
+
+use crate::transfer::call::Effect;
+use crate::transfer::{Outcome, OutcomeFrame, ToolAnswer, TOOL_NAME};
+
+fn features(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+#[test]
+fn the_transfer_tool_exists_only_when_the_start_offered_it_and_oaiy_says_it_implements_it() {
+    // Offered, and OAIY lists it: negotiated.
+    let (mut lane, _detached) = detached_lane(true);
+    lane.allow_transfer_sent = true;
+    lane.negotiate_transfer(&features(&["transfer_v1"]));
+    assert!(lane.transfer_negotiated);
+    // An older OAIY sends no features at all: nothing changes for it.
+    let (mut lane, _detached) = detached_lane(true);
+    lane.allow_transfer_sent = true;
+    lane.negotiate_transfer(&[]);
+    assert!(!lane.transfer_negotiated);
+    lane.negotiate_transfer(&features(&["something_else"]));
+    assert!(!lane.transfer_negotiated);
+    // A feature OAIY lists that the start never offered enables nothing.
+    let (mut lane, _detached) = detached_lane(true);
+    lane.allow_transfer_sent = false;
+    lane.negotiate_transfer(&features(&["transfer_v1"]));
+    assert!(!lane.transfer_negotiated);
+    lane.accept_tool_call(
+        "t1".into(),
+        TOOL_NAME.into(),
+        serde_json::json!({"reason": "caller_asked"}),
+    )
+    .unwrap();
+    assert!(lane.pending_tool_call.is_none());
+    assert_eq!(refused(&mut lane)[0].3, serde_json::json!({"error": "unsupported"}));
+}
+
+#[test]
+fn a_negotiated_transfer_tool_is_an_instant_tool_that_may_run_beside_a_lookup() {
+    let (mut lane, _detached) = detached_lane(true);
+    lane.allow_transfer_sent = true;
+    lane.negotiate_transfer(&features(&["transfer_v1"]));
+    let host = crate::host_rpc::HostRpc::new();
+    let (id, _line, rx) = host.begin("flow.run", serde_json::json!({}));
+    lane.pending_business_lookup = Some(PendingRealtimeBusinessLookup {
+        tool_call_id: "lookup".into(),
+        name: "lookup_business_data".into(),
+        lookup: PendingBusinessLookup {
+            host: host.clone(),
+            id: Some(id),
+            rx,
+            deadline: Instant::now() + Duration::from_secs(5),
+        },
+    });
+    lane.accept_tool_call(
+        "transfer".into(),
+        TOOL_NAME.into(),
+        serde_json::json!({"reason": "caller_asked"}),
+    )
+    .unwrap();
+    assert_eq!(queued_name(&lane), Some(TOOL_NAME));
+    assert!(refused(&mut lane).is_empty(), "it was not refused as busy");
+    // The lookup keeps its slot.
+    assert!(lane.pending_business_lookup.is_some());
+}
+
+#[test]
+fn transfer_effects_reach_oaiy_only_as_typed_results_and_outcomes_on_a_negotiated_session() {
+    let (mut lane, detached) = detached_lane(true);
+    lane.allow_transfer_sent = true;
+    lane.negotiate_transfer(&features(&["transfer_v1"]));
+    let mut sink = crate::event_bridge::VecSink::default();
+    let outcome = OutcomeFrame {
+        request_id: "assist_1".into(),
+        outcome: Outcome::Declined,
+        message: Some("Ring after five".into()),
+        at_ms: 1,
+    };
+    let audit = crate::radio::AssistanceAuditLifecycle::opened("assist_1", "call_1").1;
+    apply_transfer_effects(
+        vec![
+            Effect::ToolAnswer {
+                tool_call_id: "tool_1".into(),
+                answer: ToolAnswer {
+                    ok: true,
+                    output: serde_json::json!({"status": "ringing"}),
+                },
+            },
+            Effect::Outcome(outcome.clone()),
+            Effect::Audit(audit),
+        ],
+        Some(&mut lane),
+        None,
+        &mut sink,
+    );
+    assert_eq!(
+        detached.drain(),
+        vec![
+            crate::realtime_voice::SentControl::ToolResult {
+                tool_call_id: "tool_1".into(),
+                name: TOOL_NAME.into(),
+                ok: true,
+                output: serde_json::json!({"status": "ringing"}),
+                continue_response: true,
+            },
+            crate::realtime_voice::SentControl::TransferOutcome { frame: outcome.clone() },
+        ]
+    );
+    assert_eq!(sink.lines.len(), 1, "the audit event was emitted");
+    assert!(sink.lines[0].contains(crate::contract::events::CALL_ASSISTANCE_REQUESTED));
+
+    // A session that did not negotiate the contract never receives an outcome,
+    // and neither does a call with no session at all; the audit is still written.
+    let (mut old, old_detached) = detached_lane(true);
+    let mut sink = crate::event_bridge::VecSink::default();
+    let audit = crate::radio::AssistanceAuditLifecycle::opened("assist_2", "call_1").1;
+    apply_transfer_effects(
+        vec![Effect::Outcome(outcome.clone()), Effect::Audit(audit.clone())],
+        Some(&mut old),
+        None,
+        &mut sink,
+    );
+    assert!(old_detached.drain().is_empty());
+    assert_eq!(sink.lines.len(), 1);
+    let mut sink = crate::event_bridge::VecSink::default();
+    apply_transfer_effects(vec![Effect::Outcome(outcome), Effect::Audit(audit)], None, None, &mut sink);
+    assert_eq!(sink.lines.len(), 1);
+}
+
+#[test]
+fn the_start_offers_transfer_only_to_an_inbound_oaiy_call_with_consent_a_host_and_a_roster() {
+    let consent = |assistance, takeover| crate::remote_media::RemoteConsentGate {
+        enabled: true,
+        acknowledged: true,
+        assistance_enabled: assistance,
+        takeover_enabled: takeover,
+        ..Default::default()
+    };
+    // The one case that offers it.
+    assert!(realtime_allow_transfer(true, false, true, &consent(true, true)));
+    // Every condition on its own.
+    assert!(!realtime_allow_transfer(false, false, true, &consent(true, true)), "not the OAIY route");
+    assert!(!realtime_allow_transfer(true, true, true, &consent(true, true)), "an outbound call");
+    assert!(!realtime_allow_transfer(true, false, false, &consent(true, true)), "no ring plan or no roster");
+    assert!(!realtime_allow_transfer(true, false, true, &consent(false, true)), "no remote_assistance");
+    assert!(!realtime_allow_transfer(true, false, true, &consent(true, false)), "no remote_takeover");
+    assert!(!realtime_allow_transfer(
+        true,
+        false,
+        true,
+        &crate::remote_media::RemoteConsentGate::default()
+    ));
+}

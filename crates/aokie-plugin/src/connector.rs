@@ -203,6 +203,12 @@ pub struct Plugin {
     /// consent gates the radio finish successfully and broker fresh admission
     /// once renewed consent brings the media endpoint back.
     companion_bootstrap: Option<crate::companion_gateway::CompanionBootstrap>,
+    /// The host announced `ringPlan` at init: it answers `oaiy.ring.plan`, so
+    /// the owner's ring policy exists and the OAIY route may offer a call
+    /// `transfer_to_owner`. Replaced by every `plugin.init`.
+    host_ring_plan: bool,
+    /// Approved Companion devices in the roster the host handed over at init.
+    companion_roster_devices: usize,
 }
 
 impl Plugin {
@@ -240,6 +246,8 @@ impl Plugin {
             host_rpc: crate::host_rpc::HostRpc::new(),
             companion_gateway: None,
             companion_bootstrap: None,
+            host_ring_plan: false,
+            companion_roster_devices: 0,
         })
     }
 
@@ -270,6 +278,8 @@ impl Plugin {
             host_rpc: crate::host_rpc::HostRpc::new(),
             companion_gateway: None,
             companion_bootstrap: None,
+            host_ring_plan: false,
+            companion_roster_devices: 0,
         }
     }
 
@@ -954,11 +964,25 @@ impl Plugin {
                 self.radio_transcription_disabled = std::env::var("AOKIE_STT_DISABLED").as_deref() == Ok("1");
                 self.radio = Some(handle);
                 self.radio_start_error = None;
+                self.apply_transfer_readiness();
             }
             Err(e) => {
                 eprintln!("[aokie-plugin] live radio unavailable: {e}");
                 self.radio_start_error = Some(e.to_string());
             }
+        }
+    }
+
+    /// Tell the radio whether the OAIY route may offer a call the transfer
+    /// tool: the host announced `ringPlan` and at least one Companion device
+    /// is approved. The radio adds the rest per call (the OAIY route, an
+    /// inbound call, current consent for both scopes).
+    fn apply_transfer_readiness(&self) {
+        if let Some(radio) = self.radio.as_ref() {
+            radio.status.transfer_ready.store(
+                self.host_ring_plan && self.companion_roster_devices > 0,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -1508,6 +1532,9 @@ impl Plugin {
         }
         self.companion_bootstrap = None;
         let mut companion_bootstrap = None;
+        // Re-init replaces what the host said about itself and its roster.
+        let mut ring_plan = false;
+        let mut roster_devices = 0usize;
         // {desktopVersion, pluginApiVersion, dataDir, devMode} — all
         // advisory except dataDir (re-roots storage) and devMode.
         if let Some(obj) = params.as_object() {
@@ -1548,7 +1575,10 @@ impl Plugin {
             if let Some(value) = obj.get("privateBootstrap") {
                 if !value.is_null() {
                     match crate::companion_gateway::CompanionBootstrap::parse(value) {
-                        Ok(bootstrap) => companion_bootstrap = Some(bootstrap),
+                        Ok(bootstrap) => {
+                            roster_devices = bootstrap.approved_mobile_roster.keys.len();
+                            companion_bootstrap = Some(bootstrap)
+                        }
                         Err(error) => {
                             return rpc::error_line(Some(id), rpc::INVALID_PARAMS, &error, None)
                         }
@@ -1566,6 +1596,13 @@ impl Plugin {
                 .get("features")
                 .and_then(Value::as_array)
                 .is_some_and(|f| f.iter().any(|v| v.as_str() == Some("eventAck")));
+            // `ringPlan`: the host answers `oaiy.ring.plan` and `oaiy.ring.opened`
+            // (the owner's ring policy). Without it the OAIY route is never
+            // offered the transfer tool.
+            ring_plan = obj
+                .get("features")
+                .and_then(Value::as_array)
+                .is_some_and(|f| f.iter().any(|v| v.as_str() == Some("ringPlan")));
             if ack && !self.ack_mode {
                 self.ack_mode = true;
                 // The replay thread writes real protocol lines to stdout —
@@ -1579,10 +1616,13 @@ impl Plugin {
             }
         }
         self.initialized = true;
+        self.host_ring_plan = ring_plan;
+        self.companion_roster_devices = roster_devices;
         // Arm the live radio at handshake time (real mode) so a call ringing
         // before any command still reaches the flow. Non-blocking: init
         // status surfaces asynchronously via aokie.dongle.ready / hardware.error.
         self.ensure_radio_started();
+        self.apply_transfer_readiness();
         // The Desktop deliberately omits this private, host-proofed material
         // until at least one Companion is approved. Absence is therefore a
         // valid local-radio configuration, not permission to discover or
@@ -6779,6 +6819,78 @@ mod tests {
             .settings
             .get("audioTranscriptEndpoint")
             .is_none());
+    }
+
+    /// MOB-10: the OAIY route is offered the transfer tool only when the host
+    /// announced `ringPlan` and at least one Companion device is approved. Every
+    /// `plugin.init` replaces both facts, and the radio is told.
+    #[test]
+    fn init_features_announce_the_ring_plan_and_the_roster_makes_transfer_ready() {
+        use std::sync::atomic::Ordering;
+        let mut plugin = Plugin::ephemeral(false);
+        let (handle, _rx) = crate::radio::RadioHandle::test_handle();
+        let status = handle.status.clone();
+        plugin.radio = Some(handle);
+        // As the bootstrap fixture above: explicit warn mode keeps the
+        // synthetic radio alive without fabricating a consent grant.
+        plugin
+            .store
+            .config
+            .settings
+            .insert("consentMode".into(), json!("warn"));
+        let mut sink = VecSink::default();
+        let init = |plugin: &mut Plugin, sink: &mut VecSink, params: Value| {
+            let resp = plugin
+                .handle_rpc(request(1, "plugin.init", params), sink)
+                .unwrap();
+            assert!(resp.contains("\"ok\":true"), "{resp}");
+        };
+
+        // An older host: no features, no roster.
+        init(&mut plugin, &mut sink, json!({"pluginApiVersion": 1}));
+        assert!(!plugin.host_ring_plan);
+        assert_eq!(plugin.companion_roster_devices, 0);
+        assert!(!status.transfer_ready.load(Ordering::Relaxed));
+
+        // A host with the ring policy but no approved device: still not ready.
+        init(
+            &mut plugin,
+            &mut sink,
+            json!({"pluginApiVersion": 1, "features": ["eventAck", "ringPlan"]}),
+        );
+        assert!(plugin.host_ring_plan);
+        assert_eq!(plugin.companion_roster_devices, 0);
+        assert!(!status.transfer_ready.load(Ordering::Relaxed));
+
+        // A roster with no ring policy: not ready either.
+        init(
+            &mut plugin,
+            &mut sink,
+            json!({"pluginApiVersion": 1, "privateBootstrap": valid_companion_bootstrap()}),
+        );
+        assert!(!plugin.host_ring_plan);
+        assert_eq!(plugin.companion_roster_devices, 1);
+        assert!(!status.transfer_ready.load(Ordering::Relaxed));
+
+        // Both: ready.
+        init(
+            &mut plugin,
+            &mut sink,
+            json!({"pluginApiVersion": 1, "features": ["ringPlan"], "privateBootstrap": valid_companion_bootstrap()}),
+        );
+        assert!(plugin.host_ring_plan);
+        assert_eq!(plugin.companion_roster_devices, 1);
+        assert!(status.transfer_ready.load(Ordering::Relaxed));
+
+        // A feature that merely resembles it announces nothing, and a re-init
+        // replaces what the last one said.
+        init(
+            &mut plugin,
+            &mut sink,
+            json!({"pluginApiVersion": 1, "features": ["ringplan", "ring_plan", 7], "privateBootstrap": valid_companion_bootstrap()}),
+        );
+        assert!(!plugin.host_ring_plan);
+        assert!(!status.transfer_ready.load(Ordering::Relaxed));
     }
 
     /// Audit INT-003: `plugin.init` feature negotiation flips ack mode, and

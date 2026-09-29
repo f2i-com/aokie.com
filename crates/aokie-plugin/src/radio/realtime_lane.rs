@@ -655,6 +655,34 @@ pub(super) fn should_resume_realtime_after_owner_loss(desktop_realtime_responder
     desktop_realtime_responder
 }
 
+/// A token for one realtime session, never reused within the process.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+fn next_session_token() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Whether the start of a call's realtime session says `allowTransfer`
+/// (`transfer_v1`): only on the OAIY route, only for a call the caller placed
+/// (never an agent's own dial), only when the host announced `ringPlan` and a
+/// Companion device is approved, and only while consent currently grants both
+/// `remote_assistance` and `remote_takeover`. The tool is enabled for the
+/// session only if OAIY then answers with the feature in `ready`; consent is
+/// checked again every time the tool is called.
+#[cfg(feature = "voice")]
+pub(super) fn realtime_allow_transfer(
+    oaiy_route: bool,
+    outbound_call: bool,
+    host_ready: bool,
+    consent: &crate::remote_media::RemoteConsentGate,
+) -> bool {
+    oaiy_route
+        && !outbound_call
+        && host_ready
+        && consent.assistance_enabled
+        && consent.takeover_enabled
+}
+
 #[cfg(all(target_os = "windows", feature = "voice"))]
 pub(super) struct RealtimeCallLane {
     pub(super) session: crate::realtime_voice::RealtimeVoiceSession,
@@ -680,6 +708,15 @@ pub(super) struct RealtimeCallLane {
     /// Calls refused at intake, waiting to be answered as `ok: false` results
     /// (`busy`, `tool_limit`, `unsupported`): (tool call id, name, refusal).
     pub(super) refused_tools: std::collections::VecDeque<(String, String, ToolRefusal)>,
+    /// This session's start said `allowTransfer`.
+    pub(super) allow_transfer_sent: bool,
+    /// `transfer_v1` was negotiated for this session: the start said
+    /// `allowTransfer` and OAIY answered with the feature in `ready`. Only
+    /// then does `transfer_to_owner` exist.
+    pub(super) transfer_negotiated: bool,
+    /// Identifies this session: a tool answer is only ever sent to the
+    /// session that made the call.
+    pub(super) session_token: u64,
     pub(super) completed_appointment_requests: Vec<String>,
     pub(super) caller_activity_revision: u64,
     pub(super) latest_caller_turn: Option<(u32, String)>,
@@ -779,12 +816,27 @@ impl RealtimeCallLane {
             deferred_input: DeferredRealtimeInput::default(),
             tools: ToolLedger::default(),
             refused_tools: std::collections::VecDeque::new(),
+            allow_transfer_sent: false,
+            transfer_negotiated: false,
+            session_token: next_session_token(),
             completed_appointment_requests: Vec::new(),
             caller_activity_revision: 0,
             latest_caller_turn: None,
             authorized_finish_tool: None,
             pending_hangup: None,
         }
+    }
+
+    /// OAIY's `ready` arrived. The transfer tool exists for this session only
+    /// when the start offered it (`allowTransfer`) and this OAIY says in
+    /// `ready.features` that it implements the contract. An OAIY that sends no
+    /// features, or does not list `transfer_v1`, leaves the session exactly as
+    /// it was, and a feature OAIY lists unasked enables nothing.
+    pub(super) fn negotiate_transfer(&mut self, features: &[String]) {
+        self.transfer_negotiated = self.allow_transfer_sent
+            && features
+                .iter()
+                .any(|feature| feature == crate::transfer::FEATURE);
     }
 
     /// Intake of one provider tool call (MOB-01). `Err` is a protocol failure
@@ -804,13 +856,16 @@ impl RealtimeCallLane {
         }
         let slot_busy = self.pending_business_lookup.is_some()
             || self.pending_tool_call.as_ref().is_some_and(|(_, queued, _, _)| {
-                tool_class(queued, false) == Some(ToolClass::Slot)
+                tool_class(queued, self.transfer_negotiated) == Some(ToolClass::Slot)
             });
         let queue_busy = self.pending_tool_call.is_some();
-        match self
-            .tools
-            .admit(&tool_call_id, &name, false, slot_busy, queue_busy)
-        {
+        match self.tools.admit(
+            &tool_call_id,
+            &name,
+            self.transfer_negotiated,
+            slot_busy,
+            queue_busy,
+        ) {
             ToolAdmission::Duplicate => {
                 eprintln!(
                     "[aokie-plugin] realtime tool call repeated an id already seen on this call; ignored"

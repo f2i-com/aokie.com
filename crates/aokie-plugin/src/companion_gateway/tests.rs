@@ -6346,3 +6346,263 @@ fn an_offer_answer_from_a_device_no_longer_in_the_targets_is_refused_before_it_c
         None
     );
 }
+
+// --- MOB-10: `transfer_to_owner` end to end against the relay Companion double --
+//
+// The transfer machine asks for the ring, the gateway publishes the offers, a
+// scripted Companion answers them exactly as a phone does (signed answer,
+// lease request, a media transaction that is dropped and retried), and the
+// machine reports what happened to OAIY.
+
+mod transfer_end_to_end {
+    use super::*;
+    use crate::event_bridge::VecSink;
+    use crate::host_rpc::HostRpc;
+    use crate::transfer::call::{Begin, BeginArgs, Effect, Governor, TransferCall, TransferEnv};
+    use crate::transfer::Outcome;
+
+    struct Owner {
+        host: Arc<HostRpc>,
+        sink: VecSink,
+        machine: TransferCall,
+        now: Instant,
+    }
+
+    impl Owner {
+        fn new() -> Self {
+            Self {
+                host: HostRpc::new(),
+                sink: VecSink::default(),
+                machine: TransferCall::new(Arc::new(Governor::default())),
+                now: Instant::now(),
+            }
+        }
+
+        fn begin(&mut self, harness: &RelayHarness, tool_call_id: &str) -> Begin {
+            let owner = harness.media.aokie_owner_fence().expect("Aokie owns the call");
+            let mut env = TransferEnv {
+                broker: &harness.session.assistance,
+                media: &harness.media,
+                host: &self.host,
+                sink: &mut self.sink,
+                now: self.now,
+                active_call_id: Some("call_a"),
+                switchboard_revision: harness.radio.switchboard_revision(),
+                host_ring_plan: true,
+                session_token: 1,
+            };
+            self.machine.begin(
+                &mut env,
+                BeginArgs {
+                    tool_call_id,
+                    arguments: &json!({"reason": "caller_asked"}),
+                    call_id: "call_a",
+                    owner: &owner,
+                    recent_caller_turns: &["Can I speak to the owner please".to_string()],
+                    caller_number: None,
+                },
+            )
+        }
+
+        fn poll(&mut self, harness: &RelayHarness) -> Vec<Effect> {
+            let mut env = TransferEnv {
+                broker: &harness.session.assistance,
+                media: &harness.media,
+                host: &self.host,
+                sink: &mut self.sink,
+                now: self.now,
+                active_call_id: Some("call_a"),
+                switchboard_revision: harness.radio.switchboard_revision(),
+                host_ring_plan: true,
+                session_token: 1,
+            };
+            self.machine.poll(&mut env)
+        }
+
+        /// The host answers the plan: ring exactly these devices.
+        fn host_plans(&self, targets: &[&str]) {
+            let id = self
+                .sink
+                .lines
+                .iter()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|value| value["method"] == "oaiy.ring.plan")
+                .map(|value| value["id"].as_u64().unwrap())
+                .expect("the plugin asked for a plan");
+            assert!(self.host.try_route_response(&json!({
+                "jsonrpc": "2.0", "id": id, "result": {
+                    "planId": "plan_e2e", "decision": "ring", "reason": "ok", "ringSeconds": 40,
+                    "phones": targets, "wake": [], "desktopToast": false, "desktopCompanions": []
+                }
+            })));
+        }
+    }
+
+    fn outcomes(effects: &[Effect]) -> Vec<Outcome> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Outcome(frame) => Some(frame.outcome),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ringing_request(effects: &[Effect]) -> String {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ToolAnswer { answer, .. } if answer.ok => {
+                    Some(answer.output["requestId"].as_str().unwrap().to_string())
+                }
+                _ => None,
+            })
+            .expect("ringing")
+    }
+
+    #[test]
+    fn the_planned_companion_is_rung_wins_it_survives_a_dropped_setup_and_the_ai_is_told_once() {
+        let mut harness = RelayHarness::with_grants(transfer_grants());
+        let holder_a = holder_of(&harness, "device_a");
+        add_device(&mut harness, "device_b", "thumb_b_0123456789");
+        let mut owner = Owner::new();
+
+        // The tool call: the host plans a ring for device A only.
+        assert!(matches!(owner.begin(&harness, "tool_1"), Begin::Planning));
+        owner.host_plans(&[holder_a.as_str()]);
+        let effects = owner.poll(&harness);
+        let request_id = ringing_request(&effects);
+
+        // The gateway offers the transfer to device A on both surfaces and to
+        // device B on neither; the native offer has the reserved id.
+        let offers = harness.publish_offers();
+        assert_eq!(transfer_offers_for(&offers, "device_a", &request_id).len(), 2);
+        assert!(transfer_offers_for(&offers, "device_b", &request_id).is_empty());
+        let native = native_surface(&transfer_offers_for(&offers, "device_a", &request_id)).clone();
+        assert_eq!(
+            native.offer.offer_id,
+            crate::transfer::reserved_offer_id(&request_id, &holder_a, 0)
+        );
+        assert!(owner.poll(&harness).is_empty(), "nobody has answered yet");
+
+        // The Companion answers the reserved offer: first accept wins, and
+        // OAIY is told once.
+        let accepted = harness.post(&offer_answer(&native, "device_a", "req_e2e_1"));
+        assert!(serde_json::from_str::<PluginOfferAcceptedFrame>(&accepted[0]).is_ok());
+        harness.settle(&accepted, TransportDelivery::Delivered);
+        assert_eq!(outcomes(&owner.poll(&harness)), vec![Outcome::Accepted]);
+        assert!(owner.poll(&harness).is_empty());
+
+        // The media transaction is lost: the gateway retires the offer and
+        // releases the reservation. The request is open again; OAIY was already
+        // told, and is not told a second time.
+        let lease = lease_request(&native, "req_e2e_1", "rtc_e2e_1");
+        let granted = harness.post(&lease);
+        harness.settle(&granted, TransportDelivery::Dropped);
+        assert!(owner.poll(&harness).is_empty());
+        assert!(owner.machine.is_ringing_unaccepted());
+
+        // The retired offer comes back only as the next generation, and the
+        // same Companion wins the request again.
+        let offers = harness.publish_offers();
+        let again = native_surface(&transfer_offers_for(&offers, "device_a", &request_id)).clone();
+        assert_eq!(
+            again.offer.offer_id,
+            crate::transfer::reserved_offer_id(&request_id, &holder_a, 1)
+        );
+        assert_ne!(again.offer.offer_id, native.offer.offer_id);
+        let accepted = harness.post(&offer_answer(&again, "device_a", "req_e2e_2"));
+        assert!(serde_json::from_str::<PluginOfferAcceptedFrame>(&accepted[0]).is_ok());
+        harness.settle(&accepted, TransportDelivery::Delivered);
+        assert!(owner.poll(&harness).is_empty(), "accepted is reported once per request");
+        assert!(!owner.machine.is_ringing_unaccepted());
+
+        // Nothing else can take the request.
+        assert!(harness.session.assistance.is_busy());
+    }
+
+    #[test]
+    fn a_decline_from_the_planned_companion_ends_the_ring_with_the_owners_message() {
+        let mut harness = RelayHarness::with_grants(transfer_grants());
+        let holder_a = holder_of(&harness, "device_a");
+        let mut owner = Owner::new();
+        assert!(matches!(owner.begin(&harness, "tool_1"), Begin::Planning));
+        owner.host_plans(&[holder_a.as_str()]);
+        let request_id = ringing_request(&owner.poll(&harness));
+        let fence = {
+            let remote = harness.media.snapshot();
+            crate::assistance::AssistanceCallFence {
+                call_id: "call_a".into(),
+                call_epoch: remote.call_epoch,
+                owner_epoch: remote.owner_epoch,
+                switchboard_revision: harness.radio.switchboard_revision(),
+                remote_revision: remote.remote_revision,
+            }
+        };
+        let mut decline: MobileAssistanceAnswerFrame =
+            serde_json::from_str(&assistance_decline(&request_id, &fence, "answer_e2e")).unwrap();
+        decline.answer = "Sorry, on a job. Ring after five.".into();
+        let response = harness.post(&serde_json::to_string(&decline).unwrap());
+        assert_eq!(
+            serde_json::from_str::<Value>(&response[0]).unwrap()["kind"],
+            "assistance_answer_accepted"
+        );
+        let effects = owner.poll(&harness);
+        let frames = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Outcome(frame) => Some(frame.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].outcome, Outcome::Declined);
+        assert_eq!(frames[0].message.as_deref(), Some("Sorry, on a job. Ring after five."));
+        assert!(!harness.session.assistance.is_busy());
+        // The offers stop: no request, so no transfer offer for anyone.
+        assert!(harness
+            .publish_offers()
+            .iter()
+            .all(|offer| offer.offer.accepted_transfer_request_id.is_none()));
+    }
+
+    #[test]
+    fn a_companion_cannot_win_a_transfer_after_the_caller_hung_up() {
+        let mut harness = RelayHarness::with_grants(transfer_grants());
+        let holder_a = holder_of(&harness, "device_a");
+        let mut owner = Owner::new();
+        assert!(matches!(owner.begin(&harness, "tool_1"), Begin::Planning));
+        owner.host_plans(&[holder_a.as_str()]);
+        let request_id = ringing_request(&owner.poll(&harness));
+        let offers = harness.publish_offers();
+        let native = native_surface(&transfer_offers_for(&offers, "device_a", &request_id)).clone();
+
+        // The caller hangs up: the machine withdraws the request and tells OAIY.
+        let mut env = TransferEnv {
+            broker: &harness.session.assistance,
+            media: &harness.media,
+            host: &owner.host,
+            sink: &mut owner.sink,
+            now: owner.now,
+            active_call_id: None,
+            switchboard_revision: harness.radio.switchboard_revision(),
+            host_ring_plan: true,
+            session_token: 1,
+        };
+        let effects = owner.machine.poll(&mut env);
+        assert_eq!(outcomes(&effects), vec![Outcome::Cancelled]);
+        assert!(!harness.session.assistance.is_busy());
+
+        // A Companion still holding the offer is refused: there is nothing to win.
+        let late = harness.post(&offer_answer(&native, "device_a", "req_late"));
+        assert_eq!(harness.rejection(&late).code, "transfer_unavailable");
+        assert_eq!(
+            harness
+                .session
+                .assistance
+                .pending_transfer("call_a", 1)
+                .and_then(|pending| pending.accepted_by),
+            None
+        );
+    }
+}

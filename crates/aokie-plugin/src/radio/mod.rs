@@ -127,6 +127,10 @@ use self::realtime_lane::*;
 #[cfg(any(test, feature = "voice"))]
 #[allow(unused_imports)]
 use self::realtime_tools::*;
+// The transfer state machine (`crate::transfer::call`) writes the same two
+// audit events as the local route's typed assistance, through the same type.
+#[cfg(any(test, feature = "voice"))]
+pub(crate) use self::assistance_lane::{AssistanceAuditLifecycle, AssistanceAuditResolution};
 #[allow(unused_imports)]
 use self::reconcile::*;
 #[allow(unused_imports)]
