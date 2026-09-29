@@ -937,7 +937,7 @@ mod tests {
                 start_time: start,
                 duration_minutes: 60,
                 customer_phone: Some("+61491570006".into()),
-                customer_name: Some("Lance".into()),
+                customer_name: Some("Liam".into()),
                 notes: None,
                 source: "manual".into(),
             },

@@ -1084,7 +1084,7 @@ mod tests {
 
     #[test]
     fn parse_book_full_args() {
-        let raw = "<TOOL>book service=\"Lawn mow\" start=2026-05-04T10:00 customer_name=\"Lance Larkin\" customer_phone=\"+61491570006\" notes=\"back gate\"</TOOL>";
+        let raw = "<TOOL>book service=\"Lawn mow\" start=2026-05-04T10:00 customer_name=\"Liam Taylor\" customer_phone=\"+61491570006\" notes=\"back gate\"</TOOL>";
         let calls = parse_tool_calls(raw);
         assert_eq!(calls.len(), 1);
         match calls[0].as_ref().unwrap() {
@@ -1101,7 +1101,7 @@ mod tests {
                     start.format("%Y-%m-%dT%H:%M").to_string(),
                     "2026-05-04T10:00"
                 );
-                assert_eq!(customer_name.as_deref(), Some("Lance Larkin"));
+                assert_eq!(customer_name.as_deref(), Some("Liam Taylor"));
                 assert_eq!(customer_phone.as_deref(), Some("+61491570006"));
                 assert_eq!(notes.as_deref(), Some("back gate"));
                 assert!(address.is_none());
@@ -1126,7 +1126,7 @@ mod tests {
         let calls = parse_tool_calls(
             "<TOOL>add_item product=\"Margherita\" quantity=1</TOOL>\n\
              <TOOL>list_services</TOOL>\n\
-             <TOOL>place_order customer_name=\"Lance\"</TOOL>",
+             <TOOL>place_order customer_name=\"Liam\"</TOOL>",
         );
         assert_eq!(calls.len(), 1, "only list_services is a calendar verb");
         assert!(matches!(calls[0].as_ref().unwrap(), ToolCall::ListServices));
@@ -1188,7 +1188,7 @@ mod tests {
             vec![Ok(ToolCall::Book {
                 service: "Lawn mow".into(),
                 start,
-                customer_name: Some("Lance".into()),
+                customer_name: Some("Liam".into()),
                 customer_phone: Some("+61491570006".into()),
                 notes: None,
                 address: None,
@@ -1229,7 +1229,7 @@ mod tests {
             vec![Ok(ToolCall::Book {
                 service: "Lawn mow".into(),
                 start,
-                customer_name: Some("Lance".into()),
+                customer_name: Some("Liam".into()),
                 customer_phone: Some("+61491570006".into()),
                 notes: Some("back gate unlocked".into()),
                 address: Some("12 Park St, Sydney NSW 2000".into()),
@@ -1263,7 +1263,7 @@ mod tests {
             vec![Ok(ToolCall::Book {
                 service: "Lawn mow".into(),
                 start,
-                customer_name: Some("Lance".into()),
+                customer_name: Some("Liam".into()),
                 customer_phone: Some("+61491570006".into()),
                 notes: None,
                 address: None,
@@ -1286,7 +1286,7 @@ mod tests {
             vec![Ok(ToolCall::Book {
                 service: "Lawn mow".into(),
                 start,
-                customer_name: Some("Lance".into()),
+                customer_name: Some("Liam".into()),
                 customer_phone: Some("+61491570006".into()),
                 notes: None,
                 address: None,
@@ -1329,7 +1329,7 @@ mod tests {
             vec![Ok(ToolCall::Book {
                 service: "Lawn mow".into(),
                 start,
-                customer_name: Some("Lance".into()),
+                customer_name: Some("Liam".into()),
                 customer_phone: Some(bogus.into()),
                 notes: None,
                 address: None,
@@ -1545,10 +1545,10 @@ mod tests {
 
     #[test]
     fn strip_relevance_tags_removes_just_the_tag() {
-        let raw = "<RELEVANT>yes</RELEVANT>\nHi Lance, sure thing.";
+        let raw = "<RELEVANT>yes</RELEVANT>\nHi Liam, sure thing.";
         let cleaned = strip_relevance_tags(raw);
         assert!(!cleaned.contains("<RELEVANT>"));
-        assert!(cleaned.contains("Hi Lance"));
+        assert!(cleaned.contains("Hi Liam"));
     }
 
     #[test]
