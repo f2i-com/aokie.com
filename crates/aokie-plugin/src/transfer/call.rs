@@ -459,14 +459,12 @@ impl TransferCall {
             }
             Decision::Ring => {}
         }
-        // Who may be offered the request. A ring aimed at nobody could only
-        // time out, and would tell the model somebody was being rung.
-        let broker_targets = match plan.target_rule() {
-            Targets::Only(devices) => Some(devices),
-            // The desktop toast is the ring and the Companion it starts is not
-            // in any list yet: any consented device with a live session may
-            // accept, and none of them is woken.
-            Targets::AnyLive => None,
+        // Who may be offered the request: the devices the plan names, and
+        // nobody else. A ring aimed at nobody could only time out, and would
+        // tell the model somebody was being rung; a toast is not a target, so
+        // it cannot open the request to whoever happens to be connected.
+        let target_devices = match plan.target_rule() {
+            Targets::Only(devices) => devices,
             Targets::Nobody => {
                 answered(effects, &planning, refusal(RefusalStatus::Unavailable, "no_endpoint"));
                 return;
@@ -513,7 +511,7 @@ impl TransferCall {
                 "",
                 None,
                 plan.ring_seconds,
-                broker_targets.clone(),
+                Some(target_devices.clone()),
             )
         });
         let request_id = match opened {
@@ -554,12 +552,9 @@ impl TransferCall {
             eprintln!("[aokie-plugin] transfer {request_id}: the host could not be told the ring is open");
         }
         eprintln!(
-            "[aokie-plugin] transfer {request_id} opened: ring {} s, {}, reason {}",
+            "[aokie-plugin] transfer {request_id} opened: ring {} s, {} target device(s), reason {}",
             plan.ring_seconds,
-            match &broker_targets {
-                Some(devices) => format!("{} target device(s)", devices.len()),
-                None => "any live device (desktop toast)".to_string(),
-            },
+            target_devices.len(),
             planning.reason.as_str()
         );
 

@@ -580,11 +580,14 @@ fn a_plan_that_rings_nobody_and_toasts_nobody_is_no_endpoint_and_opens_nothing()
     assert!(!rig.broker.is_busy());
 }
 
-/// Vector V01 of the design: the owner is at the PC, so the plan is `ring`,
-/// 30 s, with the desktop toast and no phone and no online Windows Companion.
-/// The toast is the ring, and the Companion it opens is not in any list yet.
+/// Review finding 5, decided by the owner's advisor: fail closed. Vector V01 of
+/// the design (the owner at the PC: `ring`, 30 s, the desktop toast, no phone,
+/// no Windows Companion named) used to open the request to any live device. A
+/// toast is a notification, not a target: it would let a phone the owner never
+/// meant to ring take the caller. The plugin now answers `no_endpoint` and
+/// opens nothing, and tells the host nothing was opened, so no toast follows.
 #[test]
-fn a_toast_only_plan_opens_the_request_to_any_live_device() {
+fn a_toast_only_plan_is_no_endpoint_and_opens_nothing() {
     let mut rig = Rig::new();
     assert!(matches!(rig.begin("tool_1"), Begin::Planning));
     rig.host_answers(json!({
@@ -592,17 +595,31 @@ fn a_toast_only_plan_opens_the_request_to_any_live_device() {
         "phones": [], "wake": [], "desktopToast": true, "desktopCompanions": []
     }));
     let effects = rig.poll();
-    let request_id = ringing_request_id(&effects);
-    let Effect::ToolAnswer { answer, .. } = &effects[1] else {
+    let Effect::ToolAnswer { answer, .. } = &effects[0] else {
         panic!("{effects:?}")
     };
-    assert_eq!(answer.output["ringSeconds"], 30);
-    // Any consented device with a live session may accept: nothing names the
-    // Companion the toast starts, and nothing is pushed to any device.
-    for device in ["thumb_windows_companion", PHONE, "thumb_anything"] {
-        assert!(rig.broker.transfer_admits(&request_id, device), "{device}");
+    assert_eq!(refused_reason(answer), "no_endpoint");
+    assert_eq!(effects.len(), 1, "no audit event: nothing was requested");
+    assert!(!rig.broker.is_busy(), "nothing was put in the mailbox");
+    assert!(!rig.machine.is_active());
+    assert!(
+        !rig.host_requests().iter().any(|(method, ..)| method == "oaiy.ring.opened"),
+        "the host is not told a ring opened, so no toast is raised for it"
+    );
+    assert_eq!(rig.machine.attempts(), 0, "and it costs no attempt");
+    // The mailbox stays free for a request that names somebody.
+    rig.sink.lines.clear();
+    rig.now += MIN_GAP_BETWEEN_ATTEMPTS;
+    assert!(matches!(rig.begin("tool_2"), Begin::Planning));
+    rig.host_answers(json!({
+        "planId": "plan_v01b", "decision": "ring", "reason": "ok", "ringSeconds": 30,
+        "phones": [], "wake": [], "desktopToast": true, "desktopCompanions": ["thumb_win1"]
+    }));
+    let request_id = ringing_request_id(&rig.poll());
+    assert!(rig.broker.transfer_admits(&request_id, "thumb_win1"));
+    for device in [PHONE, "thumb_anything", "thumb_windows_companion"] {
+        assert!(!rig.broker.transfer_admits(&request_id, device), "{device}");
     }
-    assert!(rig.broker.is_busy());
 }
 
 #[test]
