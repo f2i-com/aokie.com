@@ -143,7 +143,7 @@ impl Rig {
     }
 
     /// The host requests written so far, as (method, id, params).
-    fn host_requests(&self) -> Vec<(String, u64, Value)> {
+    pub(crate) fn host_requests(&self) -> Vec<(String, u64, Value)> {
         self.sink
             .lines
             .iter()
@@ -159,7 +159,7 @@ impl Rig {
             .collect()
     }
 
-    fn plan_request(&self) -> (u64, Value) {
+    pub(crate) fn plan_request(&self) -> (u64, Value) {
         self.host_requests()
             .into_iter()
             .find(|(method, ..)| method == "oaiy.ring.plan")

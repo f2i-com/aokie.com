@@ -185,6 +185,150 @@ pub(super) fn withdraw_open_transfer(
     apply_transfer_effects(effects, lane, &mut ctx.transfer, outbox, sink);
 }
 
+/// `transfer_to_owner` was called on a session that negotiated the contract.
+/// It returns at once: a refusal is its answer now, otherwise the host is asked
+/// for a ring plan and the answer (`ringing`, or a refusal) arrives from the
+/// transfer poll within 1.5 s. How the transfer ends is a later outcome frame.
+/// The caller's own words (the last three turns, the phrase check reads them
+/// and they never leave this machine) and number come from the call's context
+/// and the radio's tracker, never from the tool call.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn begin_transfer_tool(
+    tool_call_id: &str,
+    arguments: &serde_json::Value,
+    ctx: &mut CallVoiceContext,
+    lane: &RealtimeCallLane,
+    broker: &crate::assistance::AssistanceBroker,
+    tracker: &crate::call_session::SessionTracker,
+    remote_media: &crate::remote_media::RemoteMediaHandle,
+    host_rpc: &Arc<crate::host_rpc::HostRpc>,
+    status: &RadioStatus,
+    sink: &mut dyn Sink,
+) -> crate::transfer::call::Begin {
+    let recent_caller_turns: Vec<String> = {
+        let mut turns: Vec<String> = ctx
+            .history
+            .iter()
+            .rev()
+            .filter(|entry| entry.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+            .filter_map(|entry| {
+                entry
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .take(crate::transfer::MAX_RECENT_TURNS)
+            .collect();
+        turns.reverse();
+        turns
+    };
+    let caller_number = tracker.current().and_then(|call| call.caller_id.clone());
+    match lane.owner.clone() {
+        Some(owner) => {
+            let mut env = transfer_env_with(
+                broker,
+                sink,
+                tracker,
+                remote_media,
+                host_rpc,
+                status,
+                lane.session_token,
+            );
+            ctx.transfer.begin(
+                &mut env,
+                crate::transfer::call::BeginArgs {
+                    tool_call_id,
+                    arguments,
+                    call_id: &lane.call_id,
+                    owner: &owner,
+                    recent_caller_turns: &recent_caller_turns,
+                    caller_number: caller_number.as_deref(),
+                },
+            )
+        }
+        None => crate::transfer::call::Begin::Answered(crate::transfer::refusal(
+            crate::transfer::RefusalStatus::Unavailable,
+            "call_changed",
+        )),
+    }
+}
+
+/// The exact Aokie owner fence changed under a live session (a Companion took
+/// the caller, or is returning it): stop the session so no provider audio
+/// competes for caller PCM. On a session that negotiated the contract, OAIY
+/// first hears that a request nobody has won is moot (an accepted one stays
+/// open: its takeover is what is changing the fence), the handoff is noted so
+/// the fresh session can say how long the AI was away, and the stop carries
+/// the reason OAIY tells a handoff from the end of the call by. A session that
+/// did not negotiate the contract keeps the text it always had.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stop_session_for_ownership_change(
+    ctx: &mut CallVoiceContext,
+    lane: &mut RealtimeCallLane,
+    broker: &crate::assistance::AssistanceBroker,
+    tracker: &crate::call_session::SessionTracker,
+    remote_media: &crate::remote_media::RemoteMediaHandle,
+    host_rpc: &Arc<crate::host_rpc::HostRpc>,
+    status: &RadioStatus,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+) {
+    if lane.transfer_negotiated {
+        let effects = {
+            let mut env = transfer_env_with(
+                broker,
+                &mut *sink,
+                tracker,
+                remote_media,
+                host_rpc,
+                status,
+                lane.session_token,
+            );
+            ctx.transfer.withdraw_unaccepted(&mut env)
+        };
+        apply_transfer_effects(effects, Some(&mut *lane), &mut ctx.transfer, outbox, sink);
+        ctx.transfer.note_handoff(Instant::now());
+        lane.session.stop(crate::transfer::STOP_HANDOFF_TAKEOVER);
+    } else {
+        lane.session.stop("Aokie media ownership changed");
+    }
+}
+
+/// How the fresh session for a call the AI has back starts: after a transfer
+/// handoff it says how the AI got the caller back (`start.resume`) and greets
+/// with the return line; every other resume is exactly what it was. Nothing is
+/// consumed: a start that fails is tried again with the same record.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+pub(super) fn resume_start(
+    ctx: &CallVoiceContext,
+    broker: &crate::assistance::AssistanceBroker,
+    now: Instant,
+) -> (Option<crate::transfer::ResumeInfo>, String) {
+    let resume = ctx.transfer.peek_resume(now, broker);
+    let greeting = if resume.is_some() {
+        crate::transfer::RETURN_GREETING.to_string()
+    } else {
+        "Thanks for waiting. How can I continue helping?".to_string()
+    };
+    (resume, greeting)
+}
+
+/// The fresh session exists: it becomes the call's lane, and only now is the
+/// handoff over (`finish_resume`), so a start that failed keeps its record.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+pub(super) fn adopt_resumed_session(
+    ctx: &mut CallVoiceContext,
+    session: crate::realtime_voice::RealtimeVoiceSession,
+    allow_transfer: bool,
+) -> RealtimeCallLane {
+    let mut lane = RealtimeCallLane::new(session);
+    lane.allow_transfer_sent = allow_transfer;
+    ctx.transfer.finish_resume();
+    lane
+}
+
 /// OAIY withdraws a request it asked for (`formlogic.realtime.transfer_cancel`).
 /// Only a session that negotiated the contract has one; on any other the frame
 /// means nothing and gets no reply. The transfer machine decides what it
@@ -348,9 +492,11 @@ pub(super) fn service_realtime_lane(
                         // the AI got the caller back (`start.resume`) and
                         // greets with the return line. Every other resume is
                         // exactly what it was.
-                        let resume = ctx
-                            .transfer
-                            .peek_resume(Instant::now(), crate::assistance::global());
+                        let (resume, resume_greeting) = resume_start(
+                            ctx,
+                            crate::assistance::global(),
+                            Instant::now(),
+                        );
                         let outbound_call = tracker
                             .current()
                             .filter(|call| call.id == resume_id)
@@ -372,11 +518,7 @@ pub(super) fn service_realtime_lane(
                                     persona,
                                     agent_hangup,
                                 ),
-                                greeting: if resume.is_some() {
-                                    crate::transfer::RETURN_GREETING.to_string()
-                                } else {
-                                    "Thanks for waiting. How can I continue helping?".to_string()
-                                },
+                                greeting: resume_greeting,
                                 voice: Some(config.voice.clone()),
                                 model: None,
                                 turn_detection: config.turn_detection,
@@ -391,13 +533,11 @@ pub(super) fn service_realtime_lane(
                             },
                         ) {
                             Ok(session) => {
-                                let mut lane = RealtimeCallLane::new(session);
-                                lane.allow_transfer_sent = allow_transfer;
-                                *realtime_lane = Some(lane);
                                 // The handoff is over only once the fresh
-                                // session exists; a start that failed is tried
-                                // again with the same record.
-                                ctx.transfer.finish_resume();
+                                // session exists; a start that failed keeps
+                                // its record.
+                                *realtime_lane =
+                                    Some(adopt_resumed_session(ctx, session, allow_transfer));
                                 *realtime_resume_call = None;
                                 *status.realtime_error.lock().unwrap() = None;
                             }
@@ -1359,27 +1499,17 @@ pub(super) fn service_realtime_lane(
                     // the caller another way; OAIY hears that before the stop.
                     // An accepted one stays open: its takeover is what is
                     // changing the fence.
-                    if lane.transfer_negotiated {
-                        let effects = {
-                            let mut env = transfer_env(
-                                &mut *sink,
-                                tracker,
-                                remote_media,
-                                host_rpc,
-                                status,
-                                lane.session_token,
-                            );
-                            ctx.transfer.withdraw_unaccepted(&mut env)
-                        };
-                        apply_transfer_effects(effects, Some(&mut *lane), &mut ctx.transfer, outbox, sink);
-                        ctx.transfer.note_handoff(Instant::now());
-                        // OAIY tells a handoff from the end of the call by
-                        // this reason. A session that did not negotiate the
-                        // contract keeps the text it always had.
-                        lane.session.stop(crate::transfer::STOP_HANDOFF_TAKEOVER);
-                    } else {
-                        lane.session.stop("Aokie media ownership changed");
-                    }
+                    stop_session_for_ownership_change(
+                        ctx,
+                        lane,
+                        crate::assistance::global(),
+                        tracker,
+                        remote_media,
+                        host_rpc,
+                        status,
+                        outbox,
+                        sink,
+                    );
                     bt.flush_tx_audio();
                     lane.output_pacer.clear();
                     if let Some(owner_aec) = aec.as_mut() {
@@ -1931,57 +2061,18 @@ pub(super) fn service_realtime_lane(
                         // ring plan and the answer (`ringing`, or a refusal)
                         // arrives from the transfer poll within 1.5 s. How
                         // the transfer ends is a later outcome frame.
-                        let recent_caller_turns: Vec<String> = {
-                            let mut turns: Vec<String> = ctx
-                                .history
-                                .iter()
-                                .rev()
-                                .filter(|entry| {
-                                    entry.get("role").and_then(serde_json::Value::as_str)
-                                        == Some("user")
-                                })
-                                .filter_map(|entry| {
-                                    entry
-                                        .get("content")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(str::to_string)
-                                })
-                                .take(crate::transfer::MAX_RECENT_TURNS)
-                                .collect();
-                            turns.reverse();
-                            turns
-                        };
-                        let caller_number =
-                            tracker.current().and_then(|call| call.caller_id.clone());
-                        let begun = match lane.owner.clone() {
-                            Some(owner) => {
-                                let mut env = transfer_env(
-                                    &mut *sink,
-                                    tracker,
-                                    remote_media,
-                                    host_rpc,
-                                    status,
-                                    lane.session_token,
-                                );
-                                ctx.transfer.begin(
-                                    &mut env,
-                                    crate::transfer::call::BeginArgs {
-                                        tool_call_id: &tool_call_id,
-                                        arguments: &arguments,
-                                        call_id: &lane.call_id,
-                                        owner: &owner,
-                                        recent_caller_turns: &recent_caller_turns,
-                                        caller_number: caller_number.as_deref(),
-                                    },
-                                )
-                            }
-                            None => crate::transfer::call::Begin::Answered(
-                                crate::transfer::refusal(
-                                    crate::transfer::RefusalStatus::Unavailable,
-                                    "call_changed",
-                                ),
-                            ),
-                        };
+                        let begun = begin_transfer_tool(
+                            &tool_call_id,
+                            &arguments,
+                            ctx,
+                            lane,
+                            crate::assistance::global(),
+                            tracker,
+                            remote_media,
+                            host_rpc,
+                            status,
+                            sink,
+                        );
                         if let crate::transfer::call::Begin::Answered(answer) = begun {
                             completion = Some((tool_call_id, name, answer.ok, answer.output, true));
                         }
