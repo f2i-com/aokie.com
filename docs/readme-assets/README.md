@@ -1,7 +1,7 @@
 # README screenshots
 
-Pictures used by the repository's [README](../../README.md). Every name, number and
-record in them is fictional.
+Pictures for the repository's [README](../../README.md), and older ones kept beside
+them. Every name, number and record in them is fictional.
 
 ## The receptionist screen (29 September 2026)
 
@@ -25,7 +25,9 @@ screen.
 `front-desk-demo-desktop.png`, `appointments-demo-desktop.png` and
 `front-desk-demo-mobile.png` show the actual running FormLogic app and its hosted Softn
 Aokie template. The browser received fictional demo records for the screenshots; no
-server records or settings were changed.
+server records or settings were changed. The README shows only
+`front-desk-demo-desktop.png`; the other two are no longer linked and are kept for the
+history.
 
 ## Older illustrations
 

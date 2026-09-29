@@ -36,7 +36,7 @@ for what Aokie is, how to build it and how to install it into OAIY.
 | [drivers/winusb/README.md](../drivers/winusb/README.md) | The production WinUSB driver package and its Microsoft-signed catalog. |
 | [vendor/README.md](../vendor/README.md) | The GLib 0.18 security backport patched into the workspace. |
 
-## Elsewhere
+## Other repositories
 
 - FormLogic's side of the plugin contract, operations and troubleshooting:
   [f2i-com/formlogic.com](https://github.com/f2i-com/formlogic.com), in
