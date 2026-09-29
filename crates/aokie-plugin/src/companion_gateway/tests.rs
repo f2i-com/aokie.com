@@ -6433,6 +6433,118 @@ fn a_device_outside_the_targets_that_holds_a_valid_offer_for_the_current_request
     assert!(serde_json::from_str::<PluginOfferAcceptedFrame>(&accepted[0]).is_ok());
 }
 
+/// On the socket carrier the gateway publishes offers to every device, so the
+/// claim proposal is the one place a plan's targets are enforced there.
+#[test]
+fn a_socket_claim_from_a_device_outside_the_targets_is_refused_and_the_named_devices_claim_is_taken() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    let holder_a = holder_of(&harness, "device_a");
+    // A second approved endpoint key, as the gateway's roster would hold it.
+    let key_b = SigningKey::from_bytes(&[77; 32]);
+    let endpoint_b = EndpointPublicKey::from_ed25519_bytes(&key_b.verifying_key().to_bytes());
+    let holder_b = endpoint_b.thumbprint.clone();
+    std::sync::Arc::make_mut(&mut harness.session.endpoint_authority)
+        .approved_mobile_keys
+        .insert(holder_b.clone(), endpoint_b);
+
+    let remote = harness.media.snapshot();
+    let fence = crate::assistance::AssistanceCallFence {
+        call_id: remote.call_id.clone().unwrap(),
+        call_epoch: remote.call_epoch,
+        owner_epoch: remote.owner_epoch,
+        switchboard_revision: harness.radio.switchboard_revision(),
+        remote_revision: remote.remote_revision,
+    };
+    let request_id = harness
+        .session
+        .assistance
+        .request_transfer_to(fence, "reason", None, 60, Some(vec![holder_a.clone()]))
+        .unwrap();
+
+    let notice = |harness: &RelayHarness, device_id: &str, holder: &str, jti: &str| {
+        let remote = harness.media.snapshot();
+        let mut lease = takeover_claims(&harness.session, LeasePhase::Prepared);
+        lease.device_id = device_id.into();
+        lease.mobile_key_thumbprint = holder.into();
+        lease.call_id = "call_a".into();
+        lease.call_epoch = remote.call_epoch;
+        lease.owner_epoch = remote.owner_epoch;
+        lease.jti = jti.into();
+        lease.lease_id = format!("lease_{device_id}");
+        LeaseNotice {
+            kind: "claim_proposal".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: harness.session.app_id.clone(),
+            request_id: Some(format!("claim_{device_id}")),
+            device_id: device_id.into(),
+            lease_token: "lease-token".into(),
+            lease,
+            accepted_transfer_request_id: Some(request_id.clone()),
+        }
+    };
+
+    // The outsider's claim is refused, and reserves nothing.
+    let outsider = notice(&harness, "device_b", &holder_b, "lease_b_jti");
+    let refused = harness
+        .session
+        .handle_claim_proposal(outsider, &harness.media, &harness.radio, None)
+        .expect_err("a device outside the plan cannot claim the transfer");
+    assert!(refused.message.contains("not offered to this endpoint"), "{}", refused.message);
+    assert_eq!(
+        harness
+            .session
+            .assistance
+            .pending_transfer("call_a", 1)
+            .and_then(|pending| pending.accepted_by),
+        None
+    );
+    assert!(harness.session.prepared.is_none());
+    assert!(harness.session.accepted_transfers.is_empty());
+
+    // The named device's claim is taken, after the outsider's failed one.
+    let named = notice(&harness, "device_a", &holder_a, "lease_a_jti");
+    harness
+        .session
+        .handle_claim_proposal(named, &harness.media, &harness.radio, None)
+        .expect("the named device's claim is accepted");
+    assert_eq!(
+        harness
+            .session
+            .assistance
+            .pending_transfer("call_a", 1)
+            .and_then(|pending| pending.accepted_by),
+        Some("device_a".into())
+    );
+    assert!(harness.session.prepared.is_some());
+    assert_eq!(harness.session.accepted_transfers.len(), 1);
+}
+
+/// Without targets every device with the grants may still claim, as before.
+#[test]
+fn a_socket_claim_for_a_transfer_without_targets_is_taken_from_any_approved_device() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    let (request_id, _) = harness.request_transfer("The caller asked for the owner");
+    let remote = harness.media.snapshot();
+    let mut lease = takeover_claims(&harness.session, LeasePhase::Prepared);
+    lease.call_id = "call_a".into();
+    lease.call_epoch = remote.call_epoch;
+    lease.owner_epoch = remote.owner_epoch;
+    let notice = LeaseNotice {
+        kind: "claim_proposal".into(),
+        schema_version: SCHEMA_VERSION,
+        app_id: harness.session.app_id.clone(),
+        request_id: Some("claim_any".into()),
+        device_id: lease.device_id.clone(),
+        lease_token: "lease-token".into(),
+        lease,
+        accepted_transfer_request_id: Some(request_id),
+    };
+    harness
+        .session
+        .handle_claim_proposal(notice, &harness.media, &harness.radio, None)
+        .expect("a transfer with no targets is open to every approved device");
+}
+
 // --- MOB-10: `transfer_to_owner` end to end against the relay Companion double --
 //
 // The transfer machine asks for the ring, the gateway publishes the offers, a
