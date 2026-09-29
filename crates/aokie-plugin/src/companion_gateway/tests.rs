@@ -6294,6 +6294,61 @@ fn a_device_outside_the_targets_gets_no_transfer_offer_and_cannot_decline() {
     );
 }
 
+/// Finding 5 fails closed on a toast with no device named, so the owner at the
+/// PC is served only by naming the Windows Companion. The plan can name it
+/// before it is running (the toast starts it): the transfer is offered to it,
+/// on both surfaces and with the reserved id, when its verified hello registers
+/// it, and to nobody before that. Any approved endpoint is alike to the
+/// publisher: what matters is the thumbprint its hello proved
+/// (`RelayPeer.holder_key_thumbprint`).
+#[test]
+fn a_companion_the_plan_named_before_it_was_running_is_offered_the_transfer_when_it_connects() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    let remote = harness.media.snapshot();
+    let fence = crate::assistance::AssistanceCallFence {
+        call_id: remote.call_id.clone().unwrap(),
+        call_epoch: remote.call_epoch,
+        owner_epoch: remote.owner_epoch,
+        switchboard_revision: harness.radio.switchboard_revision(),
+        remote_revision: remote.remote_revision,
+    };
+    let windows = "thumb_windows_companion_0123456789";
+    let request_id = harness
+        .session
+        .assistance
+        .request_transfer_to(
+            fence,
+            "The caller asked for the owner",
+            None,
+            60,
+            Some(vec![windows.to_string()]),
+        )
+        .unwrap();
+
+    // The Companion is not running: the connected device is not the one named,
+    // so nothing is offered to anyone.
+    let offers = harness.publish_offers();
+    assert!(offers
+        .iter()
+        .all(|offer| offer.offer.accepted_transfer_request_id.is_none()));
+
+    // The toast starts it; its hello registers it; the next publish offers it
+    // the transfer on both surfaces, and only it.
+    add_device(&mut harness, "device_windows", windows);
+    let offers = harness.publish_offers();
+    let offered = transfer_offers_for(&offers, "device_windows", &request_id);
+    assert_eq!(offered.len(), 2, "one offer per surface");
+    assert_eq!(
+        native_surface(&offered).offer.offer_id,
+        crate::transfer::reserved_offer_id(&request_id, windows, 0),
+        "the reserved id a ring hint from the host would name"
+    );
+    assert!(
+        transfer_offers_for(&offers, &harness.device_id.clone(), &request_id).is_empty(),
+        "the device the plan did not name is still offered nothing"
+    );
+}
+
 /// Review finding 12, pinned so the contract and the code cannot drift. On the
 /// socket carrier the decline the gateway relays carries a device id and no
 /// endpoint key, so the plugin cannot attribute it to the plan: a device outside
