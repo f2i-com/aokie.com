@@ -55,6 +55,8 @@ mod manager_gate;
 mod reply_stream;
 mod watchdogs;
 mod realtime_lane;
+#[cfg(any(test, feature = "voice"))]
+mod realtime_tools;
 mod reply_rounds;
 mod reconcile;
 mod realtime_service;
@@ -122,6 +124,9 @@ use self::manager_gate::*;
 use self::playback::*;
 #[allow(unused_imports)]
 use self::realtime_lane::*;
+#[cfg(any(test, feature = "voice"))]
+#[allow(unused_imports)]
+use self::realtime_tools::*;
 #[allow(unused_imports)]
 use self::reconcile::*;
 #[allow(unused_imports)]
@@ -148,6 +153,9 @@ use self::watchdogs::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "windows", feature = "voice"))]
+mod realtime_tool_tests;
 
 /// §12.3 synthetic audio rig: drives the REAL paced-playback machinery
 /// ([`TtsChunkPlayback`] + the real speexdsp [`crate::aec::EchoCanceller`])

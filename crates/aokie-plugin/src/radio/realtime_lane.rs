@@ -674,7 +674,12 @@ pub(super) struct RealtimeCallLane {
     pub(super) pending_tool_call: Option<(String, String, serde_json::Value, u64)>,
     pub(super) pending_business_lookup: Option<PendingRealtimeBusinessLookup>,
     pub(super) deferred_input: DeferredRealtimeInput,
-    pub(super) completed_tool_calls: Vec<String>,
+    /// Every tool call this call has asked for (MOB-01): duplicate ids, the
+    /// per-call allowance and the busy decision live in the ledger.
+    pub(super) tools: ToolLedger,
+    /// Calls refused at intake, waiting to be answered as `ok: false` results
+    /// (`busy`, `tool_limit`, `unsupported`): (tool call id, name, refusal).
+    pub(super) refused_tools: std::collections::VecDeque<(String, String, ToolRefusal)>,
     pub(super) completed_appointment_requests: Vec<String>,
     pub(super) caller_activity_revision: u64,
     pub(super) latest_caller_turn: Option<(u32, String)>,
@@ -772,13 +777,75 @@ impl RealtimeCallLane {
             pending_tool_call: None,
             pending_business_lookup: None,
             deferred_input: DeferredRealtimeInput::default(),
-            completed_tool_calls: Vec::new(),
+            tools: ToolLedger::default(),
+            refused_tools: std::collections::VecDeque::new(),
             completed_appointment_requests: Vec::new(),
             caller_activity_revision: 0,
             latest_caller_turn: None,
             authorized_finish_tool: None,
             pending_hangup: None,
         }
+    }
+
+    /// Intake of one provider tool call (MOB-01). `Err` is a protocol failure
+    /// that ends the session: a tool call before the call was begun cannot be
+    /// answered, because no result may be sent yet. Every other call is
+    /// either queued to run, or refused with an ordinary `ok: false` result
+    /// the model can read (`busy`, `tool_limit`, `unsupported`), or dropped
+    /// when its id repeats. None of those ends the session.
+    pub(super) fn accept_tool_call(
+        &mut self,
+        tool_call_id: String,
+        name: String,
+        arguments: serde_json::Value,
+    ) -> Result<(), String> {
+        if !self.begun {
+            return Err("Desktop realtime called a tool before the call was begun".into());
+        }
+        let slot_busy = self.pending_business_lookup.is_some()
+            || self.pending_tool_call.as_ref().is_some_and(|(_, queued, _, _)| {
+                tool_class(queued, false) == Some(ToolClass::Slot)
+            });
+        let queue_busy = self.pending_tool_call.is_some();
+        match self
+            .tools
+            .admit(&tool_call_id, &name, false, slot_busy, queue_busy)
+        {
+            ToolAdmission::Duplicate => {
+                eprintln!(
+                    "[aokie-plugin] realtime tool call repeated an id already seen on this call; ignored"
+                );
+            }
+            ToolAdmission::Refuse(refusal) => {
+                eprintln!(
+                    "[aokie-plugin] realtime tool {name} refused without running: {}",
+                    refusal.code()
+                );
+                self.refused_tools.push_back((tool_call_id, name, refusal));
+            }
+            // If the response spoke a short preamble first, let its exact PCM
+            // drain before beginning the tool. Host lookups are then polled
+            // asynchronously.
+            ToolAdmission::Run(_) => {
+                self.pending_tool_call = Some((
+                    tool_call_id,
+                    name,
+                    arguments,
+                    self.caller_activity_revision,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The oldest refused call as a tool completion: `(id, name, ok,
+    /// output, continue_response)`. The model is told what was refused and
+    /// carries on.
+    pub(super) fn next_refused_tool(
+        &mut self,
+    ) -> Option<(String, String, bool, serde_json::Value, bool)> {
+        let (tool_call_id, name, refusal) = self.refused_tools.pop_front()?;
+        Some((tool_call_id, name, false, refusal.output(), true))
     }
 
     pub(super) fn reset_sco_rate(&mut self, rate: u32) {
