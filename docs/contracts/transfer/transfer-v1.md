@@ -89,9 +89,12 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
 3. the call and the AI's hold on it are current (`call_changed`);
 4. consent currently grants `remote_assistance` and `remote_takeover` (`consent`,
    for missing, revoked, expired or paused consent alike);
-5. the plugin's own ceilings: 3 requests a call (`limit_call`), 15 seconds apart
-   (`limit_gap`), 20 an hour (`limit_global`). The host's ring policy is normally
-   stricter (2 a call, a minute apart, 10 an hour by default);
+5. the plugin's own ceilings: 3 requests a call (`limit_call`), the next no
+   sooner than 15 seconds after the last one ended (`limit_gap`), 3 an hour for
+   one caller number across calls (`limit_caller`; only a keyed hash of the
+   number is kept, in memory, and a call with no usable number shares only the
+   global ceiling), 20 an hour in all (`limit_global`). The host's ring policy
+   is normally stricter (2 a call, a minute apart, 10 an hour by default);
 6. for `caller_asked`, the phrase check on the last three caller turns
    (`caller_did_not_ask`), before the host is asked. The turns are normalised
    first (lower-case, apostrophe look-alikes such as U+2019 become `'`, every
