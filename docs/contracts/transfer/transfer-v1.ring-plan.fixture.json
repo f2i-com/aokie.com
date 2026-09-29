@@ -340,7 +340,7 @@
       }
     ],
     "targetRules": {
-      "only": "The plan names devices (phones and desktopCompanions, each once): the request is offered to those devices and no others, and no other device can accept or decline it.",
+      "only": "The plan names devices (phones and desktopCompanions, each once): the request is offered to those devices and no others, and no other device can accept it. On the relay carrier no other device can decline it either; on the socket carrier the plugin cannot attribute a decline to a key, so a device outside the plan can end the request with one (transfer-v1.md).",
       "nobody": "The plan names no device, toast or not: nothing can be rung, and the answer is no_endpoint. A toast is not a target."
     }
   },
