@@ -12,6 +12,7 @@ pub(super) fn run_auto_hold_juggle(
     control_rx: &std::sync::mpsc::Receiver<RadioControl>,
     status: &Arc<RadioStatus>,
     remote_media: &crate::remote_media::RemoteMediaHandle,
+    host_rpc: &Arc<crate::host_rpc::HostRpc>,
     synth: &crate::synth::SynthHandle,
     stt_current_gen: &Arc<AtomicU64>,
     probe_result_rx: &std::sync::mpsc::Receiver<SttResult>,
@@ -37,6 +38,27 @@ pub(super) fn run_auto_hold_juggle(
     pending_ctx_restore: &mut Option<CallVoiceContext>,
     prev_call_held: &mut u64,
 ) {
+    // A context laid aside here belongs to a call that stays alive, and
+    // nothing polls a stowed context: a transfer request it still holds would
+    // keep the one mailbox (and the owner's phone ringing) for a call that no
+    // longer has the line. `stow_ctx!` withdraws it first (OAIY hears
+    // `cancelled` on the session the call gets when it resumes) and then swaps
+    // the context out; a call's context is not laid aside here any other way.
+    macro_rules! stow_ctx {
+        ($replacement:expr) => {
+            stow_call_context(
+                &mut *ctx,
+                $replacement,
+                crate::assistance::global(),
+                &*tracker,
+                remote_media,
+                host_rpc,
+                status,
+                outbox,
+                &mut *sink,
+            )
+        };
+    }
     #[cfg(feature = "voice")]
     if auto_hold
         && !remote_media.radio_reserved()
@@ -210,8 +232,7 @@ pub(super) fn run_auto_hold_juggle(
                                 let sess_a = tracker.park().expect("primary was active");
                                 let a_id = sess_a.id.clone();
                                 let a_number = sess_a.caller_id.clone();
-                                let ctx_a =
-                                    std::mem::replace(ctx, CallVoiceContext::fresh(None));
+                                let ctx_a = stow_ctx!(CallVoiceContext::fresh(None));
                                 synth.reset_call();
                                 stt_buf.clear();
                                 *stt_had_speech = false;
@@ -440,7 +461,7 @@ pub(super) fn run_auto_hold_juggle(
                                         // with their whole conversation intact.
                                         let sess_b =
                                             tracker.park().expect("newcomer was active");
-                                        let ctx_b = std::mem::replace(ctx, ctx_a);
+                                        let ctx_b = stow_ctx!(ctx_a);
                                         match tracker.restore(sess_a) {
                                             Ok(_gen) => {}
                                             Err(back) => {
@@ -689,10 +710,7 @@ pub(super) fn run_auto_hold_juggle(
                                         let b2_id = sess_b2.id.clone();
                                         let b2_from =
                                             sess_b2.caller_id.clone().unwrap_or_default();
-                                        let ctx_b2 = std::mem::replace(
-                                            &mut *ctx,
-                                            CallVoiceContext::fresh(None),
-                                        );
+                                        let ctx_b2 = stow_ctx!(CallVoiceContext::fresh(None));
                                         *parked = Some((sess_b2, ctx_b2));
                                         *status.parked_call.lock().unwrap() =
                                             Some(SwitchboardLeg {
@@ -799,8 +817,7 @@ pub(super) fn run_auto_hold_juggle(
                                 let sess_a = tracker.park().expect("primary was tracked");
                                 let a_id = sess_a.id.clone();
                                 let a_from = sess_a.caller_id.clone().unwrap_or_default();
-                                let ctx_a =
-                                    std::mem::replace(ctx, CallVoiceContext::fresh(None));
+                                let ctx_a = stow_ctx!(CallVoiceContext::fresh(None));
                                 *parked = Some((sess_a, ctx_a));
                                 *status.parked_call.lock().unwrap() = Some(SwitchboardLeg {
                                     call_id: a_id,
