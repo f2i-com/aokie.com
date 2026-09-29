@@ -233,6 +233,43 @@ fn the_reserved_offer_id_fixture_matches_the_derivation_and_the_key_thumbprints(
     }
 }
 
+/// The union of every closed word the plugin sends or reads is in the contract
+/// document, so a word added in code without the document fails here.
+#[test]
+fn the_reason_vocabulary_in_the_contract_names_every_word_the_plugin_uses() {
+    let document = std::fs::read_to_string(folder().join("transfer-v1.md")).unwrap();
+    let in_document = |word: &str| document.contains(&format!("`{word}`"));
+    let mut words: Vec<String> = PLAN_REASONS.iter().map(|word| word.to_string()).collect();
+    words.extend(PLUGIN_REASONS.iter().map(|word| word.to_string()));
+    words.extend(["call_changed", "tool_limit", "unsupported", "not_offered"].map(str::to_string));
+    words.extend(["caller_asked", "urgent", "policy_rule"].map(str::to_string));
+    words.extend(
+        [Outcome::Accepted, Outcome::Declined, Outcome::Unavailable, Outcome::Expired, Outcome::Cancelled]
+            .map(|outcome| outcome.as_str().to_string()),
+    );
+    words.extend(
+        [CancelReason::OwnerDeclined, CancelReason::MessageInstead, CancelReason::GaveUp]
+            .map(|reason| reason.as_str().to_string()),
+    );
+    words.extend([Notice::TooLate, Notice::UnknownRequest].map(|notice| notice.as_str().to_string()));
+    words.extend(["return", "failback", "refused", "unavailable", STOP_HANDOFF_TAKEOVER].map(str::to_string));
+    words.extend(["transferred"].map(str::to_string));
+    for word in &words {
+        assert!(in_document(word), "`{word}` is not in transfer-v1.md");
+    }
+    // The other way: the plugin answers with no word the document does not list.
+    for status in [RefusalStatus::Refused, RefusalStatus::Unavailable] {
+        for reason in PLAN_REASONS.iter().chain(PLUGIN_REASONS.iter()) {
+            let answer = refusal(status, reason);
+            assert_eq!(answer.output["reason"], *reason);
+            assert!(in_document(answer.output["reason"].as_str().unwrap()));
+        }
+        // An unknown word from a host is not passed on.
+        assert_eq!(refusal(status, "the model may say anything")
+            .output["reason"], "plan_unavailable");
+    }
+}
+
 #[test]
 fn the_cancel_fixture_is_what_the_plugin_reads_and_answers() {
     let fixture = fixture("transfer-v1.cancel.fixture.json");
