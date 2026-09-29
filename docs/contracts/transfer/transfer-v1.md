@@ -34,7 +34,8 @@ caller says "can I speak to the owner"
   Aokie       --tool_result {status: "ringing", requestId, ringSeconds}-> OAIY agent
   (the AI keeps the caller company while the owner's devices ring)
   an owner device wins the compare-and-swap
-  Aokie       --transfer_outcome accepted-----------------------------> OAIY agent   (once)
+  Aokie       --transfer_outcome accepted-----------------------------> OAIY agent   (once, at the accept)
+  OAIY agent: one short fixed line ("Connecting you now"), then nothing more
   media setup runs (up to 45 s); the AI is stopped when the human takes the caller
   Aokie       --stop "handoff:takeover"-------------------------------> OAIY
   ... the owner talks to the caller ...
@@ -167,9 +168,21 @@ written down by the gateway when the caller comes back.
 | The plugin's own monotonic deadline behind those | 5 s more |
 | Longest a request can stay open | ring window + 45 s + 10 s + 5 s |
 
-The AI keeps the caller company during the ring. After an acceptance the caller
-hears nothing from the AI until the takeover completes or the setup fails (up to
-55 s); the AI's own words for that gap are OAIY's to choose.
+The AI keeps the caller company during the ring.
+
+**`accepted` is sent when the owner's device wins the request, before any media
+setup**, not when the takeover completes: the plugin reports it at the accept
+(the compare-and-swap in the broker), and the media setup that follows can take
+up to 45 s and can still fail. What OAIY does with it is part of the contract,
+not left to taste: on `accepted` the agent says **one** short fixed line ("Connecting
+you now" or its language's equivalent, no promise of who or when), and then says
+nothing more and does not start a new topic until one of two things happens: the
+session is stopped with `handoff:takeover` (the owner has the caller), or an
+`unavailable` outcome or a fresh `start` with `resume.via = "failback"` arrives
+(the setup failed, up to 55 s later, and the AI has the caller back and offers
+to take a message). Anything the AI says beyond that one line would be spoken over
+the owner's first words. OAIY chooses the wording of the line and its voice, not
+whether to say it and not whether to fall silent.
 
 ## Who may ring, and how the offers are named
 
