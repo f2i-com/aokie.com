@@ -115,6 +115,68 @@ OAIY's agent. A mid-call OAIY failure ends in a hangup and
 apologizedWith?}`. The full rules are in
 [FORMLOGIC_PLUGIN_CONTRACT.md](FORMLOGIC_PLUGIN_CONTRACT.md#calls-on-the-oaiy-route).
 
+## Transferring a call to the owner (`transfer/`, OAIY route)
+
+OAIY's call agent can hand the live call to the owner's own device. The wire
+contract is `transfer_v1`, written down in
+[contracts/transfer/transfer-v1.md](contracts/transfer/transfer-v1.md) with
+fixtures that OAIY's repository shares byte for byte.
+
+What the plugin offers OAIY:
+
+- **A realtime tool**, `transfer_to_owner {reason}` (`caller_asked`, `urgent`,
+  `policy_rule`), offered by `start.allowTransfer` and enabled for a session
+  only if OAIY's `ready.features` lists `transfer_v1`. It is a tool on the
+  loopback call stream, not a connector command, so it is never reachable from a
+  website through the relay.
+- **A result at once**: `ringing`, or a refusal with a closed reason and fixed
+  text (`consent`, `pending_request`, `caller_did_not_ask`, the ring plan's
+  reasons, `plan_unavailable`, the plugin's own ceilings).
+- **A typed outcome later**, `formlogic.realtime.transfer_outcome`: `accepted`,
+  `declined` (with the owner's bounded message), `unavailable`, `expired` or
+  `cancelled`. A completed takeover sends none: the session stops with
+  `handoff:takeover`, and the fresh session for the same call carries
+  `start.resume` (`return` or `failback`).
+
+How it runs. The tool asks the host for a ring plan (`oaiy.ring.plan`, 1.5 s),
+opens a request in the same volatile assistance mailbox that owner transfer on
+Aokie's own route already used, aimed at the planned devices, and tells the host
+(`oaiy.ring.opened`) so it can wake phones and toast the desktop. Nothing about
+the media changed: the Companion gateway publishes signed offers, the first
+accept wins the mailbox's compare-and-swap, and the existing v2 takeover path
+bridges the caller to the accepting endpoint and pauses the AI. The transfer
+machine (`transfer/call.rs`) lives in the call's context and is polled by the
+radio loop each turn, so it outlives the realtime session that the takeover
+stops; the per-call reset asks it to end an open request (reporting `cancelled`
+and closing its audit event) before the context is replaced. The tool's answer
+is queued and sent by the same drained-output gate as every other tool result.
+
+| Ending | Sent to OAIY |
+|---|---|
+| An endpoint takes the caller | nothing; `stop handoff:takeover`, then a fresh session with `resume` |
+| Declined | `declined`, with the owner's message if there is one |
+| Nobody answered in the ring window | `expired` |
+| Accepted, but the media setup failed or never completed | `unavailable` (the AI has the caller back) |
+| Caller hung up, consent withdrawn, someone took the call another way | `cancelled` |
+
+| Timing | Value |
+|---|---|
+| Wait for the host's plan | 1.5 s (no answer means nobody is rung) |
+| Ring window | 20 to 90 s, the plan's, default 40 |
+| Media setup after an accept | 45 s, then 10 s for the gateway to record the result |
+| The plugin's own deadline | 5 s past all of that, on the monotonic clock |
+
+Rules that do not bend: consent must currently grant both `remote_assistance`
+and `remote_takeover` (checked at the door, after the plan, and while ringing);
+one request at a time; at most 3 a call, 15 s apart and 20 an hour, on top of
+the host's own policy; the request text sent to the owner's devices is fixed and
+nothing the model or the caller says is relayed; a device the plan names is the
+only kind offered the transfer (a plan that toasts the desktop and names no
+device, the owner at the PC, opens it to any live device instead, since the
+Companion the toast starts cannot be named yet). A call that is not offered
+the tool (any call before the host announces `ringPlan`, any older OAIY) behaves
+exactly as before, including the text of its stop reason.
+
 ## Durability (`outbox.rs`)
 
 Every essential record event (`call.*`, `sms.*`, `hardware.error`) is written
