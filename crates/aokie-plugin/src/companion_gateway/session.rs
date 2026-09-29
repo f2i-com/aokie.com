@@ -73,6 +73,12 @@ pub(super) struct GatewaySession {
     pub(super) relay_peers: HashMap<String, RelayPeer>,
     pub(super) relay_offers: HashMap<String, MintedOffer>,
     pub(super) relay_offer_winners: HashMap<String, String>,
+    /// Reserved transfer offer ids (`crate::transfer::reserved_offer_id`) carry
+    /// a generation: how many times the offer for this (transfer request,
+    /// holder thumbprint) has been retired. A retired offer is never published
+    /// again under the same id, because the phone spends an offer before it
+    /// answers.
+    pub(super) relay_offer_generations: HashMap<(String, String), u32>,
     /// Transfer offer removed for lease validation but not yet installed as a
     /// delivery-gated provisional claim. Any terminal validation exit drains
     /// this exact entry and releases the AssistanceBroker reservation.
@@ -176,6 +182,7 @@ impl GatewaySession {
             relay_peers: HashMap::new(),
             relay_offers: HashMap::new(),
             relay_offer_winners: HashMap::new(),
+            relay_offer_generations: HashMap::new(),
             relay_redeeming_transfer_offers: HashMap::new(),
             relay_leases: HashMap::new(),
             deferred_prepare: None,

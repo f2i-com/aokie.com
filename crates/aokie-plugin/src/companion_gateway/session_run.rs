@@ -371,6 +371,15 @@ impl GatewaySession {
             .as_ref()
             .filter(|assistance| assistance_matches && assistance.transfer_offered)
             .map(|assistance| assistance.request_id.clone());
+        // Generations of reserved transfer offer ids belong to the request
+        // that is still open; once it is gone nothing can be published under
+        // them again.
+        let open_transfer_request = assistance
+            .as_ref()
+            .filter(|assistance| assistance.transfer_offered)
+            .map(|assistance| assistance.request_id.as_str());
+        self.relay_offer_generations
+            .retain(|(request_id, _), _| Some(request_id.as_str()) == open_transfer_request);
         let accepted_transfer_in_setup = self
             .assistance
             .accepted_transfer(&snapshot.call_id, snapshot.call_epoch)
@@ -404,6 +413,20 @@ impl GatewaySession {
                     .is_some_and(|peer| relay_grants_allow_mode(&peer.grants, mode))
                 {
                     continue;
+                }
+                // A transfer aimed at named devices offers nothing to any
+                // other device, on either surface: it can neither accept the
+                // transfer nor take the caller over behind its back.
+                if mode == LeaseMode::Takeover {
+                    if let Some(request_id) = transfer_request_id.as_deref() {
+                        let admitted = self.relay_peers.get(&device_id).is_some_and(|peer| {
+                            self.assistance
+                                .transfer_admits(request_id, &peer.holder_key_thumbprint)
+                        });
+                        if !admitted {
+                            continue;
+                        }
+                    }
                 }
                 let accepted_transfer_request_id = (mode == LeaseMode::Takeover)
                     .then(|| transfer_request_id.clone())
@@ -561,8 +584,38 @@ impl GatewaySession {
             // sees no offer this turn and the next publish makes room.
             return Ok(None);
         }
+        // The signed transfer offer on the native call surface has a reserved,
+        // derived id: the ring hint the OAIY host posts names the same offer,
+        // so the phone upgrades its placeholder in place instead of ringing
+        // twice. Every other offer keeps a random id.
+        let reserved_offer_id = accepted_transfer_request_id
+            .as_deref()
+            .filter(|_| mode == LeaseMode::Takeover && surface == MobileOfferSurface::VoiceSystemUi)
+            .map(|request_id| {
+                let generation = self
+                    .relay_offer_generations
+                    .get(&(request_id.to_owned(), peer.holder_key_thumbprint.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                crate::transfer::reserved_offer_id(
+                    request_id,
+                    &peer.holder_key_thumbprint,
+                    generation,
+                )
+            });
+        // A reserved id names one offer. What the retain above left under it
+        // is an offer already answered (never overwritten: it is mid-redemption
+        // and its answer, replay and winner record all name this id), or one
+        // that belongs to another device. Publish nothing under it.
+        if reserved_offer_id
+            .as_ref()
+            .is_some_and(|offer_id| self.relay_offers.contains_key(offer_id))
+        {
+            return Ok(None);
+        }
         let claims = PendingMobileOfferClaims {
-            offer_id: format!("offer_{}", uuid::Uuid::new_v4().simple()),
+            offer_id: reserved_offer_id
+                .unwrap_or_else(|| format!("offer_{}", uuid::Uuid::new_v4().simple())),
             opportunity_id: accepted_transfer_request_id
                 .as_deref()
                 .map(transfer_opportunity_id)

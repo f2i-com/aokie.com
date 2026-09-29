@@ -5939,3 +5939,410 @@ fn gateway_error_envelope_accepts_typed_fields_without_app_identity() {
     let notice: ErrorNotice = parse_gateway_frame(&encoded).unwrap();
     assert_eq!(notice.code, "stale_snapshot");
 }
+
+// --- MOB-09: broker targets and reserved transfer offer ids -----------------
+
+fn transfer_grants() -> HashSet<Grant> {
+    let mut grants = full_relay_grants();
+    grants.insert(Grant::AssistanceRespond);
+    grants
+}
+
+fn holder_of(harness: &RelayHarness, device_id: &str) -> String {
+    harness.session.relay_peers[device_id]
+        .holder_key_thumbprint
+        .clone()
+}
+
+/// A second approved device with its own key, as far as the offer publisher
+/// can tell: only its verified thumbprint and grants matter to it.
+fn add_device(harness: &mut RelayHarness, device_id: &str, holder: &str) {
+    harness.session.relay_peers.insert(
+        device_id.into(),
+        RelayPeer {
+            holder_key_thumbprint: holder.into(),
+            session_nonce: format!("mobile_session_{device_id}"),
+            grants: transfer_grants(),
+        },
+    );
+}
+
+fn transfer_offers_for(
+    offers: &[SignedPendingMobileOffer],
+    device_id: &str,
+    request_id: &str,
+) -> Vec<SignedPendingMobileOffer> {
+    offers
+        .iter()
+        .filter(|offer| {
+            offer.offer.target_device_id == device_id
+                && offer.offer.offered_mode == LeaseMode::Takeover
+                && offer.offer.accepted_transfer_request_id.as_deref() == Some(request_id)
+        })
+        .cloned()
+        .collect()
+}
+
+fn native_surface(offers: &[SignedPendingMobileOffer]) -> &SignedPendingMobileOffer {
+    offers
+        .iter()
+        .find(|offer| offer.offer.surface == MobileOfferSurface::VoiceSystemUi)
+        .expect("a native call surface offer is published")
+}
+
+#[test]
+fn the_transfer_offer_on_the_call_surface_has_the_reserved_id_and_the_others_stay_random() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    add_device(&mut harness, "device_b", "thumb_b_0123456789");
+    let (request_id, _) = harness.request_transfer("The caller asked for the owner");
+    let offers = harness.publish_offers();
+
+    for device_id in [harness.device_id.clone(), "device_b".to_string()] {
+        let holder = holder_of(&harness, &device_id);
+        let transfer = transfer_offers_for(&offers, &device_id, &request_id);
+        assert_eq!(transfer.len(), 2, "one offer per surface for {device_id}");
+        let native = native_surface(&transfer);
+        assert_eq!(
+            native.offer.offer_id,
+            crate::transfer::reserved_offer_id(&request_id, &holder, 0),
+            "{device_id}"
+        );
+        assert!(crate::transfer::is_reserved_offer_id(&native.offer.offer_id));
+        let in_app = transfer
+            .iter()
+            .find(|offer| offer.offer.surface == MobileOfferSurface::InApp)
+            .unwrap();
+        assert!(
+            in_app.offer.offer_id.starts_with("offer_"),
+            "the in-app offer keeps a random id"
+        );
+        // Both surfaces are still one opportunity: first accept wins.
+        assert_eq!(in_app.offer.opportunity_id, native.offer.opportunity_id);
+    }
+    // Two devices never share a reserved id.
+    let ids = ["device_a", "device_b"]
+        .map(|device| native_surface(&transfer_offers_for(&offers, device, &request_id)).offer.offer_id.clone());
+    assert_ne!(ids[0], ids[1]);
+    // Nothing that is not a transfer takeover carries a reserved id.
+    for offer in &offers {
+        if offer.offer.accepted_transfer_request_id.is_none() {
+            assert!(!crate::transfer::is_reserved_offer_id(&offer.offer.offer_id));
+        }
+    }
+    // The published offer is well formed, signed and answerable as any other.
+    let native = native_surface(&transfer_offers_for(&offers, "device_a", &request_id)).clone();
+    native.offer.validate(unix_now().unwrap()).expect("a reserved id is a safe id");
+    let accepted = harness.answer(&native, "request_native_answer");
+    assert!(
+        serde_json::from_str::<PluginOfferAcceptedFrame>(&accepted[0]).is_ok(),
+        "{accepted:?}"
+    );
+}
+
+#[test]
+fn a_refresh_keeps_the_reserved_id_and_takes_a_fresh_jti() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    let (request_id, _) = harness.request_transfer("The caller asked for the owner");
+    let first = native_surface(&transfer_offers_for(
+        &harness.publish_offers(),
+        "device_a",
+        &request_id,
+    ))
+    .clone();
+    // Still comfortably alive: republishing reuses it exactly.
+    let again = native_surface(&transfer_offers_for(
+        &harness.publish_offers(),
+        "device_a",
+        &request_id,
+    ))
+    .clone();
+    assert_eq!(again.offer.jti, first.offer.jti);
+    assert_eq!(again.offer_token, first.offer_token);
+
+    // Inside the refresh margin a fresh one is minted: same id, new jti.
+    harness
+        .session
+        .relay_offers
+        .get_mut(&first.offer.offer_id)
+        .unwrap()
+        .claims
+        .expires_at = unix_now().unwrap() + RELAY_OFFER_REFRESH_MARGIN - 1;
+    let refreshed = native_surface(&transfer_offers_for(
+        &harness.publish_offers(),
+        "device_a",
+        &request_id,
+    ))
+    .clone();
+    assert_eq!(refreshed.offer.offer_id, first.offer.offer_id);
+    assert_ne!(refreshed.offer.jti, first.offer.jti);
+    assert_ne!(refreshed.offer_token, first.offer_token);
+    assert!(refreshed.offer.expires_at > first.offer.expires_at.saturating_sub(RELAY_OFFER_TTL));
+    assert_eq!(
+        harness
+            .session
+            .relay_offers
+            .keys()
+            .filter(|id| **id == first.offer.offer_id)
+            .count(),
+        1,
+        "the superseded offer is replaced, not kept beside it"
+    );
+    // The old jti can no longer be answered; the new one can.
+    let stale = harness.answer(&first, "request_stale_jti");
+    assert_eq!(harness.rejection(&stale).code, "offer_unknown");
+    assert!(!harness.answer(&refreshed, "request_fresh_jti").is_empty());
+}
+
+#[test]
+fn a_retired_reserved_offer_comes_back_only_as_the_next_generation() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    let (request_id, _) = harness.request_transfer("The caller asked for the owner");
+    let holder = holder_of(&harness, "device_a");
+    let mut spent = Vec::new();
+
+    for generation in 0..3u32 {
+        let offers = harness.publish_offers();
+        let native = native_surface(&transfer_offers_for(&offers, "device_a", &request_id)).clone();
+        assert_eq!(
+            native.offer.offer_id,
+            crate::transfer::reserved_offer_id(&request_id, &holder, generation),
+            "generation {generation}"
+        );
+        assert!(
+            !spent.contains(&native.offer.offer_id),
+            "a spent id was published again"
+        );
+        spent.push(native.offer.offer_id.clone());
+
+        // The phone answers, asks for the lease, and the grant never reaches
+        // it: the transaction is retired and the offer is spent.
+        let request = format!("request_generation_{generation}");
+        let answer = offer_answer(&native, &harness.device_id, &request);
+        let accepted = harness.post(&answer);
+        assert!(serde_json::from_str::<PluginOfferAcceptedFrame>(&accepted[0]).is_ok());
+        harness.settle(&accepted, TransportDelivery::Delivered);
+        let lease = lease_request(&native, &request, &format!("rtc_generation_{generation}"));
+        let granted = harness.post(&lease);
+        assert_eq!(harness.granted(&granted).status, PluginLeaseStatus::Provisional);
+        harness.settle(&granted, TransportDelivery::Dropped);
+
+        // The cached answer of the spent offer is refused as retired, and the
+        // spent id is gone from the offer book.
+        let replayed = harness.post(&answer);
+        assert_eq!(harness.rejection(&replayed).code, "offer_retired");
+        assert!(!harness.session.relay_offers.contains_key(&native.offer.offer_id));
+        assert_eq!(
+            harness
+                .session
+                .relay_offer_generations
+                .get(&(request_id.clone(), holder.clone()))
+                .copied(),
+            Some(generation + 1)
+        );
+    }
+    assert_eq!(spent.len(), 3);
+    let unique: HashSet<_> = spent.iter().collect();
+    assert_eq!(unique.len(), 3, "three generations, three different ids");
+}
+
+#[test]
+fn an_accepted_reserved_offer_is_never_overwritten() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    let (request_id, _) = harness.request_transfer("The caller asked for the owner");
+    let offers = harness.publish_offers();
+    let native = native_surface(&transfer_offers_for(&offers, "device_a", &request_id)).clone();
+    let accepted = harness.answer(&native, "request_accepted_reserved");
+    harness.settle(&accepted, TransportDelivery::Delivered);
+    assert!(harness.session.relay_offers[&native.offer.offer_id].accepted);
+
+    // The publisher skips an accepted transfer's opportunity; ask the mint
+    // directly, as a future change to that skip rule would.
+    let encoded = harness.session.snapshot_frame(&harness.radio);
+    let snapshot = match encoded {
+        Ok(Some(encoded)) => serde_json::from_str::<PluginSnapshotFrame>(&encoded)
+            .unwrap()
+            .snapshot,
+        _ => {
+            harness.session.last_snapshot_fingerprint = None;
+            harness.session.last_snapshot_sent = None;
+            let encoded = harness
+                .session
+                .snapshot_frame(&harness.radio)
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<PluginSnapshotFrame>(&encoded)
+                .unwrap()
+                .snapshot
+        }
+    };
+    let minted = harness
+        .session
+        .mint_offer(
+            "device_a",
+            LeaseMode::Takeover,
+            MobileOfferSurface::VoiceSystemUi,
+            Some(request_id.clone()),
+            &snapshot,
+            unix_now().unwrap(),
+        )
+        .unwrap();
+    assert!(minted.is_none(), "nothing is published over an accepted reserved offer");
+    let kept = &harness.session.relay_offers[&native.offer.offer_id];
+    assert!(kept.accepted);
+    assert_eq!(kept.claims.jti, native.offer.jti);
+    assert_eq!(kept.token, native.offer_token);
+}
+
+#[test]
+fn a_reserved_id_held_by_another_device_is_never_taken_over() {
+    // Two devices that present the same endpoint key derive the same id. The
+    // first keeps it; the second is offered nothing on that surface rather
+    // than overwriting it.
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    let holder = holder_of(&harness, "device_a");
+    add_device(&mut harness, "device_b", &holder);
+    let (request_id, _) = harness.request_transfer("The caller asked for the owner");
+    let offers = harness.publish_offers();
+    let a = transfer_offers_for(&offers, "device_a", &request_id);
+    let b = transfer_offers_for(&offers, "device_b", &request_id);
+    assert_eq!(
+        native_surface(&a).offer.offer_id,
+        crate::transfer::reserved_offer_id(&request_id, &holder, 0)
+    );
+    assert!(
+        b.iter()
+            .all(|offer| offer.offer.surface == MobileOfferSurface::InApp),
+        "the second device gets no offer under the first device's reserved id"
+    );
+    assert_eq!(
+        harness.session.relay_offers[&native_surface(&a).offer.offer_id]
+            .claims
+            .target_device_id,
+        "device_a"
+    );
+}
+
+#[test]
+fn a_device_outside_the_targets_gets_no_transfer_offer_and_cannot_decline() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    let holder_a = holder_of(&harness, "device_a");
+    add_device(&mut harness, "device_b", "thumb_b_0123456789");
+    let remote = harness.media.snapshot();
+    let fence = crate::assistance::AssistanceCallFence {
+        call_id: remote.call_id.clone().unwrap(),
+        call_epoch: remote.call_epoch,
+        owner_epoch: remote.owner_epoch,
+        switchboard_revision: harness.radio.switchboard_revision(),
+        remote_revision: remote.remote_revision,
+    };
+    let request_id = harness
+        .session
+        .assistance
+        .request_transfer_to(
+            fence.clone(),
+            "The caller asked for the owner",
+            None,
+            60,
+            Some(vec![holder_a.clone()]),
+        )
+        .unwrap();
+
+    let offers = harness.publish_offers();
+    assert_eq!(
+        transfer_offers_for(&offers, "device_a", &request_id).len(),
+        2,
+        "the targeted device is offered the transfer on both surfaces"
+    );
+    assert!(
+        transfer_offers_for(&offers, "device_b", &request_id).is_empty(),
+        "the other device is offered nothing to accept"
+    );
+    assert!(
+        offers
+            .iter()
+            .filter(|offer| offer.offer.target_device_id == "device_b")
+            .all(|offer| offer.offer.offered_mode != LeaseMode::Takeover),
+        "and no generic takeover behind the plan's back either"
+    );
+    // The other device's ordinary, non-transfer offers are unchanged.
+    assert!(offers
+        .iter()
+        .any(|offer| offer.offer.target_device_id == "device_b"
+            && offer.offer.offered_mode == LeaseMode::Monitor));
+
+    // It cannot decline the transfer on the others' behalf either.
+    let party_b = relay_party("thumb_b_0123456789");
+    let refused = harness
+        .session
+        .handle_relay_peer_frame(
+            &assistance_decline(&request_id, &fence, "answer_from_outsider"),
+            Some(&party_b),
+            Some("device_b"),
+            &transfer_grants(),
+            &harness.media,
+            &harness.radio,
+        )
+        .unwrap();
+    assert_eq!(harness.rejection(&refused).code, "not_a_target");
+    assert!(harness.session.assistance.is_busy(), "the ring goes on");
+
+    // The targeted device can.
+    let declined = harness.post(&assistance_decline(&request_id, &fence, "answer_from_target"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&declined[0]).unwrap()["kind"],
+        "assistance_answer_accepted"
+    );
+}
+
+#[test]
+fn a_transfer_without_targets_offers_every_device_as_it_always_did() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    add_device(&mut harness, "device_b", "thumb_b_0123456789");
+    let (request_id, _) = harness.request_transfer("The caller asked for the owner");
+    let offers = harness.publish_offers();
+    for device_id in ["device_a", "device_b"] {
+        assert_eq!(
+            transfer_offers_for(&offers, device_id, &request_id).len(),
+            2,
+            "{device_id}"
+        );
+    }
+}
+
+#[test]
+fn an_offer_answer_from_a_device_no_longer_in_the_targets_is_refused_before_it_can_win() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    let (request_id, _) = harness.request_transfer("The caller asked for the owner");
+    let offer = harness.transfer_offer_for(&request_id, MobileOfferSurface::InApp);
+    // A new request replaces the first, aimed elsewhere; the earlier offer
+    // (still in the book) must not be able to reserve it.
+    harness.session.assistance.discard(&request_id);
+    let remote = harness.media.snapshot();
+    let fence = crate::assistance::AssistanceCallFence {
+        call_id: remote.call_id.unwrap(),
+        call_epoch: remote.call_epoch,
+        owner_epoch: remote.owner_epoch,
+        switchboard_revision: harness.radio.switchboard_revision(),
+        remote_revision: remote.remote_revision,
+    };
+    let other = harness
+        .session
+        .assistance
+        .request_transfer_to(fence, "reason", None, 60, Some(vec!["thumb_elsewhere".into()]))
+        .unwrap();
+    assert_ne!(other, request_id);
+    let refused = harness.answer(&offer, "request_stale_target");
+    let code = harness.rejection(&refused).code;
+    assert!(
+        matches!(code.as_str(), "transfer_unavailable" | "offer_unknown"),
+        "{code}"
+    );
+    assert_eq!(
+        harness
+            .session
+            .assistance
+            .pending_transfer("call_a", 1)
+            .and_then(|pending| pending.accepted_by),
+        None
+    );
+}

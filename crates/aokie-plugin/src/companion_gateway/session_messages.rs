@@ -827,10 +827,13 @@ impl GatewaySession {
                 switchboard_revision: minted.claims.switchboard_revision,
                 remote_revision: minted.claims.remote_revision,
             };
-            if self
+            if !self
                 .assistance
-                .accept_transfer(transfer_request_id, &fence, device_id)
-                .is_err()
+                .transfer_admits(transfer_request_id, &minted.claims.target_holder_key_thumbprint)
+                || self
+                    .assistance
+                    .accept_transfer(transfer_request_id, &fence, device_id)
+                    .is_err()
             {
                 return self.relay_reject(
                     device_id,
