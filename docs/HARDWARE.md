@@ -1,4 +1,4 @@
-# Aokie — Supported Hardware
+# Supported hardware
 
 **The WinUSB dongle is the only supported phone-link transport for calls.**
 Aokie's userspace Bluetooth host stack drives a supported USB dongle directly

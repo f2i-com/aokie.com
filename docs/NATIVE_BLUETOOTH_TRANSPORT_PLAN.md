@@ -1,4 +1,14 @@
-# Native Bluetooth Transport Plan — Using Windows' Built-in Stack Instead of WinUSB
+# Native Bluetooth transport plan: Windows' built-in stack instead of WinUSB
+
+> **Status: done, and its main recommendation superseded (July 2026).** The native
+> backend was built (`crates/aokie-winbt`, chosen by the `transportMode` setting) and
+> tried on real hardware. It carries SMS, contacts, pairing and call control with no
+> driver install, but it cannot carry call audio on Windows 11 25H2. The plan's
+> recommendation to make native mode the default therefore no longer holds:
+> `transportMode` defaults to `dongle`, the settings screen offers only the dongle,
+> and the WinUSB dongle remains the supported transport for calls (see
+> [HARDWARE.md](HARDWARE.md)). The plan below is kept as it was written, as the
+> record of how that decision was reached.
 
 **Status:** IMPLEMENTED + FIELD-EVALUATED (2026-07-20). Native mode is live and
 proven for SMS / contacts / pairing / call control with zero driver install.
@@ -316,7 +326,7 @@ the effort in onboarding polish instead (better driver UX, restore-original-driv
 
 ---
 
-### Appendix A — key code references (today's architecture)
+## Appendix A — key code references (today's architecture)
 
 - Plugin ↔ radio seam: `crates/aokie-dongle/src/bluetooth/mod.rs:140` (`BluetoothManager`),
   `crates/aokie-bluetooth/src/aokie_radio/runtime.rs:466` (`AokieRuntime` channel API).
@@ -334,7 +344,7 @@ the effort in onboarding polish instead (better driver UX, restore-original-driv
 - Reusable protocol modules for native mode: `obex.rs`, `map_mas.rs`, `map_listing.rs`,
   `bmessage.rs`, `pbap.rs`, `vcard.rs` (byte-stream machines, transport-independent).
 
-### Appendix B — verified Windows API citations
+## Appendix B — verified Windows API citations
 
 - No user-mode SCO: <https://learn.microsoft.com/en-us/windows/win32/bluetooth/bluetooth-and-socket>,
   <https://learn.microsoft.com/en-us/windows-hardware/drivers/bluetooth/bluetooth-profile-drivers-overview>

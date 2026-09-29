@@ -3,6 +3,11 @@
 In OAIY, open **AI Receptionist → Settings → Conversation tuning**.
 Reconnect Aokie after changing these settings.
 
+These settings apply to calls that Aokie's own speech answers. On the OAIY
+route, where calls go to OAIY's Front desk, OAIY Voice decides when the caller
+has finished and stops a reply when the caller talks over it. The Settings tab
+then hides Conversation tuning and says so under Answering.
+
 - **Listen while speaking and allow interruptions** (`bargeIn`) keeps the
   echo-cancelled microphone active during replies. Caller audio is retained
   with pre-roll so the first word is available to transcription.

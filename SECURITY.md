@@ -11,8 +11,8 @@ Pre-1.0: only `main` and the latest release receive fixes.
 
 ## Notes for researchers
 
-- The plugin runs as a FormLogic Desktop child process over stdio; it inherits
-  no secrets (allow-listed env only).
+- The plugin runs as a child process of OAIY Desktop or FormLogic Desktop over
+  stdio; it inherits no secrets (allow-listed env only).
 - The event outbox (SQLite) protects transcript/SMS payloads at rest with
   per-user Windows DPAPI; `synchronous=FULL` durability.
 - The voice HTTP service binds 127.0.0.1 only, rejects browser origins,
