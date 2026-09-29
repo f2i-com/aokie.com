@@ -29,13 +29,33 @@ pub(super) fn transfer_env<'a>(
     }
 }
 
+/// Tell OAIY, on a session that negotiated the contract, every outcome that
+/// was waiting for one. Nothing is sent to a session that has not, and nothing
+/// is dropped: the frames stay with the call's transfer machine until a
+/// session can carry them.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+pub(super) fn send_held_outcomes(
+    lane: Option<&mut RealtimeCallLane>,
+    transfer: &mut crate::transfer::call::TransferCall,
+) {
+    let Some(lane) = lane.filter(|lane| lane.transfer_negotiated) else {
+        return;
+    };
+    for frame in transfer.take_held_outcomes() {
+        if let Err(error) = lane.session.send_transfer_outcome(frame) {
+            eprintln!("[aokie-plugin] transfer outcome could not be sent: {error}");
+        }
+    }
+}
+
 /// Carry out what the transfer machine asked for: answer a tool call, tell
-/// OAIY how a transfer ended (only on a session that negotiated the
-/// contract), and write the durable audit events.
+/// OAIY how a transfer ended (on a session that negotiated the contract, or on
+/// the next one that does), and write the durable audit events.
 #[cfg(all(target_os = "windows", feature = "voice"))]
 pub(super) fn apply_transfer_effects(
     effects: Vec<crate::transfer::call::Effect>,
     mut lane: Option<&mut RealtimeCallLane>,
+    transfer: &mut crate::transfer::call::TransferCall,
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
 ) {
@@ -58,11 +78,19 @@ pub(super) fn apply_transfer_effects(
                 }
             }
             Effect::Outcome(frame) => {
-                if let Some(lane) = lane.as_deref_mut().filter(|lane| lane.transfer_negotiated) {
-                    if let Err(error) = lane.session.send_transfer_outcome(frame) {
-                        eprintln!("[aokie-plugin] transfer outcome could not be sent: {error}");
-                    }
+                // Held first, then sent if a negotiated session is open now,
+                // so order is kept whichever way a frame gets out. An outcome
+                // for a session that will never negotiate the contract has no
+                // one to tell; an `accepted` is only news while it is
+                // happening, so it is never kept for a later session.
+                let can_wait = lane.as_deref().is_none_or(|lane| {
+                    lane.transfer_negotiated || lane.may_negotiate_transfer()
+                }) && (frame.outcome != crate::transfer::Outcome::Accepted
+                    || lane.as_deref().is_some_and(|lane| lane.transfer_negotiated));
+                if can_wait {
+                    transfer.hold_outcome(frame);
                 }
+                send_held_outcomes(lane.as_deref_mut(), transfer);
             }
             Effect::Audit(event) => emit(outbox, sink, event),
         }
@@ -120,7 +148,13 @@ pub(super) fn service_realtime_lane(
                 );
                 ctx.transfer.poll(&mut env)
             };
-            apply_transfer_effects(effects, realtime_lane.as_mut(), outbox, sink);
+            apply_transfer_effects(effects, realtime_lane.as_mut(), &mut ctx.transfer, outbox, sink);
+            // An outcome that found no session (the handoff had stopped it, or
+            // the fresh one had not said `ready`) goes out as soon as one
+            // negotiates the contract.
+            if ctx.transfer.has_held_outcomes() {
+                send_held_outcomes(realtime_lane.as_mut(), &mut ctx.transfer);
+            }
         }
         // Companion takeover cancels the old upstream generation and
         // flushes every queued byte. Once the exact same physical caller
@@ -1159,7 +1193,7 @@ pub(super) fn service_realtime_lane(
                             );
                             ctx.transfer.withdraw_unaccepted(&mut env)
                         };
-                        apply_transfer_effects(effects, Some(&mut *lane), outbox, sink);
+                        apply_transfer_effects(effects, Some(&mut *lane), &mut ctx.transfer, outbox, sink);
                         ctx.transfer.note_handoff(Instant::now());
                         // OAIY tells a handoff from the end of the call by
                         // this reason. A session that did not negotiate the

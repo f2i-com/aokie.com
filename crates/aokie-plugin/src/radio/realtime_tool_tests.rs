@@ -272,6 +272,7 @@ fn transfer_effects_reach_oaiy_only_as_typed_results_and_outcomes_on_a_negotiate
         at_ms: 1,
     };
     let audit = crate::radio::AssistanceAuditLifecycle::opened("assist_1", "call_1").1;
+    let mut transfer = machine();
     apply_transfer_effects(
         vec![
             Effect::ToolAnswer {
@@ -285,6 +286,7 @@ fn transfer_effects_reach_oaiy_only_as_typed_results_and_outcomes_on_a_negotiate
             Effect::Audit(audit),
         ],
         Some(&mut lane),
+        &mut transfer,
         None,
         &mut sink,
     );
@@ -310,21 +312,119 @@ fn transfer_effects_reach_oaiy_only_as_typed_results_and_outcomes_on_a_negotiate
     assert!(sink.lines[0].contains(crate::contract::events::CALL_ASSISTANCE_REQUESTED));
 
     // A session that did not negotiate the contract never receives an outcome,
-    // and neither does a call with no session at all; the audit is still written.
+    // and nothing is kept for it; the audit is still written.
     let (mut old, old_detached) = detached_lane(true);
+    old.ready = true;
+    let mut old_transfer = machine();
     let mut sink = crate::event_bridge::VecSink::default();
     let audit = crate::radio::AssistanceAuditLifecycle::opened("assist_2", "call_1").1;
     apply_transfer_effects(
         vec![Effect::Outcome(outcome.clone()), Effect::Audit(audit.clone())],
         Some(&mut old),
+        &mut old_transfer,
         None,
         &mut sink,
     );
     assert!(old_detached.drain().is_empty());
+    assert!(!old_transfer.has_held_outcomes());
     assert_eq!(sink.lines.len(), 1);
+    // Nor is one kept for a session whose start never offered the contract,
+    // ready or not: it can never carry it.
+    let (mut never, never_detached) = detached_lane(true);
+    let mut never_transfer = machine();
+    apply_transfer_effects(
+        vec![Effect::Outcome(outcome)],
+        Some(&mut never),
+        &mut never_transfer,
+        None,
+        &mut sink,
+    );
+    assert!(never_detached.drain().is_empty());
+    assert!(!never_transfer.has_held_outcomes());
+}
+
+fn machine() -> crate::transfer::call::TransferCall {
+    crate::transfer::call::TransferCall::new(std::sync::Arc::new(
+        crate::transfer::call::Governor::default(),
+    ))
+}
+
+fn frame(outcome: Outcome) -> OutcomeFrame {
+    OutcomeFrame {
+        request_id: "assist_1".into(),
+        outcome,
+        message: None,
+        at_ms: 1,
+    }
+}
+
+fn sent_outcomes(detached: &crate::realtime_voice::DetachedSession) -> Vec<Outcome> {
+    detached
+        .drain()
+        .into_iter()
+        .filter_map(|sent| match sent {
+            crate::realtime_voice::SentControl::TransferOutcome { frame } => Some(frame.outcome),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Review finding 3. A setup failure the gateway records after the fresh
+/// session has started, or before it has said `ready`, is not lost: it is
+/// kept and sent once the session negotiates the contract.
+#[test]
+fn an_outcome_with_no_negotiated_session_waits_for_the_next_one_and_is_sent_in_order() {
+    let mut transfer = machine();
     let mut sink = crate::event_bridge::VecSink::default();
-    apply_transfer_effects(vec![Effect::Outcome(outcome), Effect::Audit(audit)], None, None, &mut sink);
-    assert_eq!(sink.lines.len(), 1);
+
+    // No session at all (the handoff stopped it): held. An acceptance is not.
+    apply_transfer_effects(
+        vec![
+            Effect::Outcome(frame(Outcome::Accepted)),
+            Effect::Outcome(frame(Outcome::Unavailable)),
+        ],
+        None,
+        &mut transfer,
+        None,
+        &mut sink,
+    );
+    assert!(transfer.has_held_outcomes());
+
+    // The fresh session has started but not said `ready`: still nothing to send on.
+    let (mut lane, detached) = detached_lane(true);
+    lane.allow_transfer_sent = true;
+    send_held_outcomes(Some(&mut lane), &mut transfer);
+    assert!(sent_outcomes(&detached).is_empty());
+    assert!(transfer.has_held_outcomes());
+    // A second terminal outcome arrives meanwhile and queues behind the first.
+    apply_transfer_effects(
+        vec![Effect::Outcome(frame(Outcome::Cancelled))],
+        Some(&mut lane),
+        &mut transfer,
+        None,
+        &mut sink,
+    );
+    assert!(sent_outcomes(&detached).is_empty(), "the session may still negotiate");
+
+    // OAIY says `ready` with the feature: everything goes, oldest first, once.
+    lane.ready = true;
+    lane.negotiate_transfer(&features(&["transfer_v1"]));
+    send_held_outcomes(Some(&mut lane), &mut transfer);
+    assert_eq!(sent_outcomes(&detached), vec![Outcome::Unavailable, Outcome::Cancelled]);
+    assert!(!transfer.has_held_outcomes());
+    send_held_outcomes(Some(&mut lane), &mut transfer);
+    assert!(sent_outcomes(&detached).is_empty());
+
+    // A session that turns out not to implement the contract is never sent
+    // anything, and what is held for it stays held for nobody.
+    let mut transfer = machine();
+    transfer.hold_outcome(frame(Outcome::Unavailable));
+    let (mut old, old_detached) = detached_lane(true);
+    old.allow_transfer_sent = true;
+    old.ready = true;
+    old.negotiate_transfer(&[]);
+    send_held_outcomes(Some(&mut old), &mut transfer);
+    assert!(sent_outcomes(&old_detached).is_empty());
 }
 
 #[test]

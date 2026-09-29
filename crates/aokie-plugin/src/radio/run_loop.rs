@@ -1240,7 +1240,7 @@ pub(super) fn run_loop(
                     );
                     ctx.transfer.end_call(&mut env)
                 };
-                apply_transfer_effects(effects, realtime_lane.as_mut(), outbox, sink);
+                apply_transfer_effects(effects, realtime_lane.as_mut(), &mut ctx.transfer, outbox, sink);
             }
             if let Some(old) = realtime_lane.take() {
                 if let Some(item_id) = old.output_pacer.active_item() {

@@ -843,6 +843,13 @@ impl RealtimeCallLane {
                 .any(|feature| feature == crate::transfer::FEATURE);
     }
 
+    /// A session that offered `allowTransfer` and has not said `ready` yet may
+    /// still negotiate the contract, so an outcome can wait for it. Once it is
+    /// ready without the feature it never will.
+    pub(super) fn may_negotiate_transfer(&self) -> bool {
+        self.allow_transfer_sent && !self.ready
+    }
+
     /// Intake of one provider tool call (MOB-01). `Err` is a protocol failure
     /// that ends the session: a tool call before the call was begun cannot be
     /// answered, because no result may be sent yet. Every other call is
