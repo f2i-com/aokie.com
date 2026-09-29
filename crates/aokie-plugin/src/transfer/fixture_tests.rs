@@ -38,10 +38,11 @@ fn digest(name: &str) -> String {
         .collect()
 }
 
-const FIXTURES: [&str; 7] = [
+const FIXTURES: [&str; 8] = [
     "transfer-v1.tool-call.fixture.json",
     "transfer-v1.tool-result.fixture.json",
     "transfer-v1.outcome.fixture.json",
+    "transfer-v1.cancel.fixture.json",
     "transfer-v1.start-ready.fixture.json",
     "transfer-v1.ring-plan.fixture.json",
     "transfer-v1.reserved-offer-id.fixture.json",
@@ -230,6 +231,51 @@ fn the_reserved_offer_id_fixture_matches_the_derivation_and_the_key_thumbprints(
     for other in strings(&fixture["notReservedIds"]) {
         assert!(!is_reserved_offer_id(&other), "{other:?}");
     }
+}
+
+#[test]
+fn the_cancel_fixture_is_what_the_plugin_reads_and_answers() {
+    let fixture = fixture("transfer-v1.cancel.fixture.json");
+    // The closed set of reasons is the plugin's.
+    assert_eq!(
+        strings(&fixture["cancel"]["reasons"]),
+        [CancelReason::OwnerDeclined, CancelReason::MessageInstead, CancelReason::GaveUp]
+            .map(|reason| reason.as_str().to_string())
+    );
+    for reason in strings(&fixture["cancel"]["reasons"]) {
+        assert!(fixture["cancel"]["reasonMeaning"][&reason].is_string(), "{reason}");
+    }
+    for case in fixture["cancel"]["cases"].as_array().unwrap() {
+        let (request_id, reason) = parse_cancel(&case["frame"]).unwrap_or_else(|| panic!("{case}"));
+        assert_eq!(request_id, case["frame"]["requestId"].as_str().unwrap());
+        assert_eq!(reason.as_str(), case["frame"]["reason"].as_str().unwrap());
+        assert_eq!(case["frame"]["type"], "formlogic.realtime.transfer_cancel");
+    }
+    assert_eq!(fixture["cancel"]["cases"].as_array().unwrap().len(), 3, "a case per reason");
+    for case in fixture["cancel"]["ignored"]["cases"].as_array().unwrap() {
+        assert_eq!(parse_cancel(&case["frame"]), None, "{case}");
+    }
+    // The notices are the plugin's, each described, each shown once.
+    let notices = [Notice::TooLate, Notice::UnknownRequest].map(|notice| notice.as_str().to_string());
+    assert_eq!(strings(&fixture["notice"]["notices"]), notices);
+    for notice in &notices {
+        assert!(fixture["notice"]["noticeMeaning"][notice].is_string(), "{notice}");
+        assert!(
+            fixture["notice"]["cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|case| case["frame"]["notice"] == notice.as_str()),
+            "{notice} has a case"
+        );
+    }
+    for case in fixture["notice"]["cases"].as_array().unwrap() {
+        let frame = &case["frame"];
+        assert_eq!(frame["type"], "formlogic.realtime.transfer_notice");
+        let parsed: NoticeFrame = serde_json::from_value(frame.clone()).unwrap();
+        assert!(parsed.at_ms > 1_000_000_000_000, "atMs is epoch milliseconds");
+    }
+    assert_eq!(fixture["behaviour"]["cases"].as_array().unwrap().len(), 6);
 }
 
 #[test]

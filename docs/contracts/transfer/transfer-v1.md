@@ -15,6 +15,7 @@ step with the OAIY repository's copy. The digests are in [SHA256SUMS](SHA256SUMS
 | [transfer-v1.tool-call.fixture.json](transfer-v1.tool-call.fixture.json) | The `transfer_to_owner` tool call, its one argument, and the tool-name rule. |
 | [transfer-v1.tool-result.fixture.json](transfer-v1.tool-result.fixture.json) | The tool result: `ringing`, and every refusal with its closed reason set. |
 | [transfer-v1.outcome.fixture.json](transfer-v1.outcome.fixture.json) | The `formlogic.realtime.transfer_outcome` frame, one case per outcome, and the timings. |
+| [transfer-v1.cancel.fixture.json](transfer-v1.cancel.fixture.json) | `formlogic.realtime.transfer_cancel` (OAIY withdraws a request) and the `transfer_notice` reply, with the frames the plugin ignores. |
 | [transfer-v1.start-ready.fixture.json](transfer-v1.start-ready.fixture.json) | `start.allowTransfer`, `ready.features`, `start.resume`, the `handoff:takeover` stop, and the compatibility matrix. |
 | [transfer-v1.ring-plan.fixture.json](transfer-v1.ring-plan.fixture.json) | The two plugin-to-host requests `oaiy.ring.plan` and `oaiy.ring.opened`. |
 | [transfer-v1.reserved-offer-id.fixture.json](transfer-v1.reserved-offer-id.fixture.json) | The reserved transfer offer id and its generations (vector V2). |
@@ -32,7 +33,10 @@ caller says "can I speak to the owner"
   Aokie: opens the request, aimed at the planned devices
   Aokie       --request oaiy.ring.opened (no answer awaited)----------> OAIY host
   Aokie       --tool_result {status: "ringing", requestId, ringSeconds}-> OAIY agent
-  (the AI keeps the caller company while the owner's devices ring)
+  (the AI keeps the caller company while the owner's devices ring;
+   if OAIY's ring dialog is declined or it offers a message instead,
+   OAIY --transfer_cancel {requestId, reason}--> Aokie, which withdraws the request
+   and answers with the cancelled outcome, or with a transfer_notice when too late)
   an owner device wins the compare-and-swap
   Aokie       --transfer_outcome accepted-----------------------------> OAIY agent   (once, at the accept)
   OAIY agent: one short fixed line ("Connecting you now"), then nothing more
@@ -164,6 +168,54 @@ of ours was part of: a person took the caller by hand and gave it back), and
 `failback` for anything else, including a setup that failed but has not yet been
 written down by the gateway when the caller comes back.
 
+## OAIY withdraws a request
+
+The person at OAIY's desk can Decline the ring dialog or choose Take a message
+instead, and OAIY can give up waiting. None of that reaches the owner's phones
+by itself, and a phone that rings afterwards could still accept a call OAIY has
+already offered a message for. So OAIY tells the plugin, with a frame on the
+call's realtime stream (not a connector command, never relayed):
+
+```json
+{ "type": "formlogic.realtime.transfer_cancel", "callId": "call_0123", "generation": 7,
+  "requestId": "assist_0123456789abcdef0123456789abcdef", "reason": "owner_declined" }
+```
+
+`reason` is `owner_declined` (the ring dialog was declined), `message_instead`
+(the caller is being offered a message) or `gave_up`. The frame exists only on a
+session that negotiated `transfer_v1`; on any other it means nothing and gets no
+reply. Like every frame it carries the session's `callId` and `generation`; one
+that does not ends the stream as any frame with a stale call authority does. A
+frame with no usable `requestId` (1 to 128 characters of `A-Z a-z 0-9 - _ . :`)
+or a `reason` outside the closed set is ignored, never fatal.
+
+The plugin handles it exactly as a request withdrawn because someone took the
+caller another way: it asks the broker first, so an acceptance since the last
+turn wins, and then:
+
+| The request | The plugin | OAIY receives |
+|---|---|---|
+| is ringing and nobody has won it | withdraws it: the offers stop, the mailbox is freed, the audit event closes as `cancelled` | one `transfer_outcome cancelled` |
+| has been won by an owner device (accepted, or already bridged) | leaves it alone: the takeover continues | a `transfer_notice` with `notice: "too_late"`; then the stop with `handoff:takeover`, or `unavailable` if the setup fails |
+| ended since OAIY last heard, and the cancel crossed it | changes nothing | the outcome of how it ended (declined, expired, ...), and `unknown_request` |
+| is not this call's (never seen, another call's request, a stale id, already cancelled) | changes nothing; another call's request is never withdrawn | a `transfer_notice` with `notice: "unknown_request"` |
+
+It is replay-safe: the effects of one request happen once, whatever the number
+of cancels. A repeat is an `unknown_request` notice (or `too_late` again while
+the request is still accepted), never a second `cancelled` and never a second
+audit event. The `cancelled` outcome follows the tool result that named the
+request like every outcome (see the order above).
+
+```json
+{ "type": "formlogic.realtime.transfer_notice", "callId": "call_0123", "generation": 7,
+  "requestId": "assist_0123456789abcdef0123456789abcdef", "notice": "too_late",
+  "atMs": 1789000014000 }
+```
+
+`notice` is `too_late` or `unknown_request`; `atMs` is Unix epoch milliseconds.
+A notice answers one frame OAIY sent on this session, is sent at once on that
+session and is never kept for a later one.
+
 ## Timings
 
 | What | Value |
@@ -250,6 +302,11 @@ and a responding device id, and no text from the call or the owner.
   listed `transfer_v1`.
 * Treat `stop` with a reason starting `handoff:` as a handoff, not the end of
   the call.
+* When the ring dialog is declined, the caller is offered a message instead, or
+  OAIY gives up waiting, send `transfer_cancel {requestId, reason}` for the open
+  request and wait for the `cancelled` outcome (or a `too_late` /
+  `unknown_request` notice): until then the owner's phones may still win the
+  call. Send it once; a repeat does nothing.
 * `transfer_to_owner` is a realtime tool over the loopback stream, not a plugin
   connector command, so there is no relayed verb to allow or deny. The relay
   policy's allow-list is not involved; it denies verbs it does not name.
