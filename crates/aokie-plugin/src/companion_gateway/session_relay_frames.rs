@@ -901,6 +901,22 @@ impl GatewaySession {
                 "the assistance request is no longer pending",
             );
         };
+        // A transfer aimed at named devices can be declined only by those
+        // devices: the request card reaches every device, but a device the
+        // plan left out must not be able to end the others' ring.
+        if request.transfer_offered
+            && !self.relay_peers.get(&device_id).is_some_and(|peer| {
+                self.assistance
+                    .transfer_admits(&request.request_id, &peer.holder_key_thumbprint)
+            })
+        {
+            return self.relay_reject(
+                &device_id,
+                &frame.request_id,
+                "not_a_target",
+                "this transfer was not offered to this device",
+            );
+        }
         let remote = media.snapshot();
         if request.request_id != frame.request_id
             || request.call_id != frame.call_id

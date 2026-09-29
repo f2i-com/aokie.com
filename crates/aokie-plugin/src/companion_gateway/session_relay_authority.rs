@@ -116,6 +116,22 @@ impl GatewaySession {
             self.relay_offer_winners.remove(&opportunity_id);
         }
         if let Some(request_id) = offer.claims.accepted_transfer_request_id.as_deref() {
+            // The phone spends an offer before it answers, so this identity
+            // must never be published again. A reserved transfer offer id is
+            // derived, not random: the next offer for this device takes the
+            // next generation instead.
+            if crate::transfer::is_reserved_offer_id(&offer_id) {
+                let key = (
+                    request_id.to_owned(),
+                    offer.claims.target_holder_key_thumbprint.clone(),
+                );
+                let generation = self.relay_offer_generations.entry(key).or_insert(0);
+                *generation = generation.saturating_add(1);
+                if self.relay_offer_generations.len() > 64 {
+                    self.relay_offer_generations
+                        .retain(|(pending_request, _), _| pending_request == request_id);
+                }
+            }
             let fence = crate::assistance::AssistanceCallFence {
                 call_id: offer.claims.call_id.clone(),
                 call_epoch: offer.claims.call_epoch,

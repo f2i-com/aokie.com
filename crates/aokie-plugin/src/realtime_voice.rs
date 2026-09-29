@@ -586,13 +586,13 @@ impl RealtimeVoiceSession {
 
 /// What the plugin has sent toward OAIY, read back by radio-level tests from a
 /// session that has no socket behind it.
-#[cfg(test)]
+#[cfg(all(test, target_os = "windows", feature = "voice"))]
 pub(crate) struct DetachedSession {
     control_rx: Receiver<ControlCommand>,
     event_tx: SyncSender<RealtimeEvent>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "windows", feature = "voice"))]
 impl RealtimeVoiceSession {
     /// A session whose control channel is read by the test instead of a
     /// WebSocket worker. Nothing is spawned and nothing touches the network.
@@ -618,7 +618,7 @@ impl RealtimeVoiceSession {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "windows", feature = "voice"))]
 impl DetachedSession {
     /// Everything the plugin sent since the last call, in order, as
     /// `(kind, detail)` pairs a test can match on.
@@ -661,7 +661,7 @@ impl DetachedSession {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "windows", feature = "voice"))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SentControl {
     Begin,

@@ -13,6 +13,12 @@ use aokie_protocol::v2::{
     SCHEMA_VERSION,
 };
 
+/// The endpoint-key thumbprint of a Companion device: the identity a transfer
+/// is aimed at (`aokie_protocol::v2::EndpointPublicKey::thumbprint`).
+pub type HolderThumbprint = String;
+
+/// Most devices one transfer may name. There are at most six remote peers.
+const MAX_TRANSFER_TARGETS: usize = 16;
 const MAX_TTL_SECONDS: u64 = 300;
 /// A transfer accepted near the end of its ordinary response window gets a
 /// separate, bounded media-establishment window. This is longer than the
@@ -103,6 +109,9 @@ struct PendingAssistance {
     accepted_by: Option<String>,
     accepted_setup_expires_at: Option<u64>,
     resolution: Option<AssistanceResolution>,
+    /// A transfer only: the devices that may be offered it and may answer it
+    /// (`None`: every consented device with a live session, as before).
+    targets: Option<Vec<HolderThumbprint>>,
 }
 
 fn transfer_action_deadline(pending: &PendingAssistance) -> u64 {
@@ -132,26 +141,44 @@ impl AssistanceBroker {
             question,
             context,
             ttl_seconds,
+            None,
         )
     }
 
     pub fn request_transfer(
         &self,
         fence: AssistanceCallFence,
+        reason: &str,
+        context: Option<&str>,
+        ttl_seconds: u64,
+    ) -> Result<String, String> {
+        self.request_transfer_to(fence, reason, context, ttl_seconds, None)
+    }
+
+    /// A transfer aimed at the named devices only (`Some`), or at every
+    /// consented device with a live session (`None`, what
+    /// [`request_transfer`](Self::request_transfer) does). A device outside
+    /// the list is never offered the transfer and cannot answer it.
+    pub fn request_transfer_to(
+        &self,
+        fence: AssistanceCallFence,
         _reason: &str,
         context: Option<&str>,
         ttl_seconds: u64,
+        targets: Option<Vec<HolderThumbprint>>,
     ) -> Result<String, String> {
         // Model output is prompt-untrusted and is broadcast to every eligible
         // owner endpoint. The transcript/context already carries useful call
         // detail behind its own grants, so never relay a model-authored name,
         // number, PIN or identifier as control-plane transfer metadata.
+        let targets = targets.map(normalize_targets).transpose()?;
         self.request_with_intent(
             fence,
             AssistanceIntent::Transfer,
             SAFE_TRANSFER_REASON,
             context,
             ttl_seconds,
+            targets,
         )
     }
 
@@ -162,6 +189,7 @@ impl AssistanceBroker {
         question: &str,
         context: Option<&str>,
         ttl_seconds: u64,
+        targets: Option<Vec<HolderThumbprint>>,
     ) -> Result<String, String> {
         validate_text(question, MAX_ASSISTANCE_QUESTION_BYTES, "question")?;
         if intent == AssistanceIntent::Transfer
@@ -200,8 +228,50 @@ impl AssistanceBroker {
             accepted_by: None,
             accepted_setup_expires_at: None,
             resolution: None,
+            targets,
         });
         Ok(request_id)
+    }
+
+    /// True while a request is open: not yet resolved and not past its
+    /// mailbox deadline. The mailbox holds one request, so this is exactly
+    /// the condition under which a new request is refused as already pending.
+    pub fn is_busy(&self) -> bool {
+        let Ok(now) = unix_now() else {
+            return true;
+        };
+        self.inner.lock().ok().is_none_or(|current| {
+            current.as_ref().is_some_and(|pending| {
+                pending.resolution.is_none() && mailbox_wait_deadline(pending) > now
+            })
+        })
+    }
+
+    /// Whether `holder_thumbprint` may be offered, and may answer, the pending
+    /// transfer `request_id`. False for any other request, for advice, and for
+    /// a device outside the request's targets.
+    pub fn transfer_admits(&self, request_id: &str, holder_thumbprint: &str) -> bool {
+        self.inner.lock().ok().is_some_and(|current| {
+            current.as_ref().is_some_and(|pending| {
+                pending.request_id == request_id
+                    && pending.intent == AssistanceIntent::Transfer
+                    && pending
+                        .targets
+                        .as_ref()
+                        .is_none_or(|targets| targets.iter().any(|target| target == holder_thumbprint))
+            })
+        })
+    }
+
+    /// The resolution this request has reached, without consuming it. The
+    /// radio uses it to tell a return from a failed setup.
+    pub fn peek_resolution(&self, request_id: &str) -> Option<AssistanceResolution> {
+        self.inner.lock().ok().and_then(|current| {
+            current
+                .as_ref()
+                .filter(|pending| pending.request_id == request_id)
+                .and_then(|pending| pending.resolution.clone())
+        })
     }
 
     pub fn pending_frame(&self, app_id: &str) -> Option<PluginAssistanceRequestFrame> {
@@ -650,6 +720,25 @@ impl AssistanceBroker {
         })
     }
 
+    /// Test hook: make this request's windows pass, as waiting out the ring
+    /// (and, once accepted, the media setup and its grace) would.
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&self, request_id: &str) {
+        let now = unix_now().unwrap();
+        if let Ok(mut current) = self.inner.lock() {
+            if let Some(pending) = current
+                .as_mut()
+                .filter(|pending| pending.request_id == request_id)
+            {
+                pending.expires_at = now.saturating_sub(TRANSFER_RESOLUTION_GRACE_SECONDS + 1);
+                if pending.accepted_setup_expires_at.is_some() {
+                    pending.accepted_setup_expires_at =
+                        Some(now.saturating_sub(TRANSFER_RESOLUTION_GRACE_SECONDS + 1));
+                }
+            }
+        }
+    }
+
     /// Remove this exact mailbox at a call boundary or after timeout. A
     /// mismatched request id is deliberately a no-op.
     pub fn discard(&self, request_id: &str) {
@@ -688,6 +777,25 @@ fn resolution_matches_frame(
         }
         _ => false,
     }
+}
+
+/// The targets of a transfer, each a valid identity, without repeats. An empty
+/// list is refused: a transfer that no device may accept can only time out.
+fn normalize_targets(targets: Vec<HolderThumbprint>) -> Result<Vec<HolderThumbprint>, String> {
+    let mut clean: Vec<HolderThumbprint> = Vec::with_capacity(targets.len().min(MAX_TRANSFER_TARGETS));
+    for target in targets {
+        validate_device_id(&target).map_err(|_| "transfer target identity is invalid".to_string())?;
+        if !clean.contains(&target) {
+            clean.push(target);
+        }
+    }
+    if clean.is_empty() {
+        return Err("transfer names no target device".into());
+    }
+    if clean.len() > MAX_TRANSFER_TARGETS {
+        return Err("transfer names too many target devices".into());
+    }
+    Ok(clean)
 }
 
 fn validate_device_id(device_id: &str) -> Result<(), String> {
@@ -1085,5 +1193,118 @@ mod tests {
             broker.take_resolution(&request_id),
             Some(AssistanceResolution::TransferUnavailable { fence: returned })
         );
+    }
+
+    #[test]
+    fn a_transfer_with_targets_admits_only_those_devices() {
+        let broker = AssistanceBroker::default();
+        let request_id = broker
+            .request_transfer_to(
+                fence(),
+                "caller asked for owner",
+                None,
+                30,
+                Some(vec!["thumb_a".into(), "thumb_b".into(), "thumb_a".into()]),
+            )
+            .unwrap();
+        assert!(broker.transfer_admits(&request_id, "thumb_a"));
+        assert!(broker.transfer_admits(&request_id, "thumb_b"));
+        assert!(!broker.transfer_admits(&request_id, "thumb_c"));
+        assert!(!broker.transfer_admits(&request_id, ""));
+        // Another request id is never admitted, whatever the device.
+        assert!(!broker.transfer_admits("assist_other", "thumb_a"));
+        // Without a request there is nothing to admit.
+        broker.discard(&request_id);
+        assert!(!broker.transfer_admits(&request_id, "thumb_a"));
+    }
+
+    #[test]
+    fn a_transfer_without_targets_keeps_todays_behaviour() {
+        let broker = AssistanceBroker::default();
+        let request_id = broker
+            .request_transfer(fence(), "caller asked for owner", None, 30)
+            .unwrap();
+        for device in ["thumb_a", "thumb_b", "anything"] {
+            assert!(broker.transfer_admits(&request_id, device), "{device}");
+        }
+        // Advice is not a transfer: no device is admitted to it as one.
+        let advice = AssistanceBroker::default();
+        let advice_id = advice.request(fence(), "Question", None, 30).unwrap();
+        assert!(!advice.transfer_admits(&advice_id, "thumb_a"));
+    }
+
+    #[test]
+    fn target_lists_are_validated_and_bounded() {
+        let broker = AssistanceBroker::default();
+        for bad in [
+            Some(Vec::new()),
+            Some(vec![String::new()]),
+            Some(vec!["has space".to_string()]),
+            Some(vec!["semi;colon".to_string()]),
+            Some(vec!["x".repeat(201)]),
+            Some((0..17).map(|n| format!("thumb_{n}")).collect()),
+        ] {
+            assert!(
+                broker
+                    .request_transfer_to(fence(), "reason", None, 30, bad.clone())
+                    .is_err(),
+                "{bad:?}"
+            );
+            assert!(!broker.is_busy(), "a refused request opens nothing");
+        }
+        // Sixteen distinct devices are the most allowed.
+        assert!(broker
+            .request_transfer_to(
+                fence(),
+                "reason",
+                None,
+                30,
+                Some((0..16).map(|n| format!("thumb_{n}")).collect()),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn the_mailbox_is_busy_until_its_request_resolves_or_expires() {
+        let broker = AssistanceBroker::default();
+        assert!(!broker.is_busy());
+        let request_id = broker
+            .request_transfer(fence(), "caller asked for owner", None, 30)
+            .unwrap();
+        assert!(broker.is_busy());
+        assert!(broker
+            .request_transfer(fence(), "again", None, 30)
+            .is_err());
+        broker.expire_for_test(&request_id);
+        assert!(!broker.is_busy(), "an expired request no longer blocks the next");
+        assert_eq!(
+            broker.take_resolution(&request_id),
+            Some(AssistanceResolution::Expired)
+        );
+    }
+
+    #[test]
+    fn a_resolution_can_be_read_without_taking_it() {
+        let broker = AssistanceBroker::default();
+        let offered = fence();
+        let request_id = broker
+            .request_transfer(offered.clone(), "caller asked for owner", None, 30)
+            .unwrap();
+        assert_eq!(broker.peek_resolution(&request_id), None);
+        broker
+            .accept_transfer(&request_id, &offered, "device_owner")
+            .unwrap();
+        let mut returned = offered.clone();
+        returned.owner_epoch += 1;
+        returned.remote_revision += 1;
+        broker
+            .transfer_unavailable(&request_id, &offered, returned.clone(), Some("device_owner"))
+            .unwrap();
+        let expected = Some(AssistanceResolution::TransferUnavailable { fence: returned });
+        assert_eq!(broker.peek_resolution(&request_id), expected);
+        assert_eq!(broker.peek_resolution(&request_id), expected);
+        assert_eq!(broker.take_resolution(&request_id), expected);
+        assert_eq!(broker.peek_resolution(&request_id), None);
+        assert_eq!(broker.peek_resolution("assist_other"), None);
     }
 }
