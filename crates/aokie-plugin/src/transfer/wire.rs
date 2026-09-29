@@ -50,16 +50,16 @@ impl Reason {
 /// The reason of a `transfer_to_owner` call. `arguments` must be an object
 /// with exactly one member, `reason`, holding one of the three values; any
 /// other member, any other value, or no object at all is refused.
-pub fn parse_arguments(arguments: &Value) -> Result<Reason, ()> {
-    let object = arguments.as_object().ok_or(())?;
+pub fn parse_arguments(arguments: &Value) -> Option<Reason> {
+    let object = arguments.as_object()?;
     if object.len() != 1 {
-        return Err(());
+        return None;
     }
     match object.get("reason").and_then(Value::as_str) {
-        Some("caller_asked") => Ok(Reason::CallerAsked),
-        Some("urgent") => Ok(Reason::Urgent),
-        Some("policy_rule") => Ok(Reason::PolicyRule),
-        _ => Err(()),
+        Some("caller_asked") => Some(Reason::CallerAsked),
+        Some("urgent") => Some(Reason::Urgent),
+        Some("policy_rule") => Some(Reason::PolicyRule),
+        _ => None,
     }
 }
 
@@ -198,6 +198,21 @@ pub struct RingPlan {
     pub desktop_companions: Vec<String>,
 }
 
+/// Who a `ring` plan lets the request be offered to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Targets {
+    /// Exactly these devices (phones and Windows Companions, once each).
+    Only(Vec<String>),
+    /// The plan names no device but rings the desktop: the toast is the ring,
+    /// and the Windows Companion it opens (or one the owner already has open)
+    /// is what takes the call, and it cannot be named because it may not be
+    /// running yet. Every consented device with a live session may accept;
+    /// nothing is pushed to any of them.
+    AnyLive,
+    /// No device and no toast: there is nothing to ring.
+    Nobody,
+}
+
 impl RingPlan {
     /// The devices that may be rung: phones and Windows Companions, once each.
     pub fn targets(&self) -> Vec<String> {
@@ -208,6 +223,22 @@ impl RingPlan {
             }
         }
         targets
+    }
+
+    /// How the request is aimed. A plan that names devices rings those and no
+    /// others. A plan that names none but toasts the desktop (the design's
+    /// "owner at the PC" case) opens the request to any live device, since the
+    /// toast starts the Companion that will accept. A plan with neither rings
+    /// nobody.
+    pub fn target_rule(&self) -> Targets {
+        let targets = self.targets();
+        if !targets.is_empty() {
+            Targets::Only(targets)
+        } else if self.desktop_toast {
+            Targets::AnyLive
+        } else {
+            Targets::Nobody
+        }
     }
 }
 
@@ -475,7 +506,7 @@ mod tests {
             (json!({"reason": "urgent"}), Reason::Urgent),
             (json!({"reason": "policy_rule"}), Reason::PolicyRule),
         ] {
-            assert_eq!(parse_arguments(&value), Ok(reason));
+            assert_eq!(parse_arguments(&value), Some(reason));
             assert_eq!(value["reason"], reason.as_str());
         }
         for bad in [
@@ -494,7 +525,7 @@ mod tests {
             json!({"reason": "urgent", "target": "thumb"}),
             json!({"note": "x"}),
         ] {
-            assert_eq!(parse_arguments(&bad), Err(()), "{bad}");
+            assert_eq!(parse_arguments(&bad), None, "{bad}");
         }
     }
 

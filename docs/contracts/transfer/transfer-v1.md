@@ -92,9 +92,9 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
 7. the host's ring plan (`oaiy.ring.plan`); the plan's reasons are `disabled`,
    `initiative_off`, `not_urgent`, `caller_did_not_ask`, `limit_call`,
    `limit_gap`, `limit_caller`, `limit_global`, `quiet_hours`,
-   `all_do_not_disturb` and `no_endpoint`. A plan that rings no device is
-   `no_endpoint`. A host that is slow, absent or unusable is `plan_unavailable`:
-   nobody is rung.
+   `all_do_not_disturb` and `no_endpoint`. A `ring` plan with no device and no
+   toast is `no_endpoint`. A host that is slow, absent or unusable is
+   `plan_unavailable`: nobody is rung.
 
 Results:
 
@@ -139,9 +139,27 @@ hears nothing from the AI until the takeover completes or the setup fails (up to
 
 ## Who may ring, and how the offers are named
 
-The plan names devices by endpoint-key thumbprint. A device outside the plan is
-offered no takeover of either surface while the transfer is open, and cannot
-decline it on the others' behalf. The signed offer on the native call surface
+The plan names devices by endpoint-key thumbprint (`phones` and
+`desktopCompanions`). Three cases:
+
+* **Devices named**: the request is offered to those devices and no others. A
+  device outside the plan is offered no takeover of either surface while the
+  transfer is open, cannot win it, and cannot decline it on the others' behalf.
+* **No device named, `desktopToast` true** (the design's vector V01, the owner at
+  the PC): the toast is the ring, and the Windows Companion it opens may not be
+  running yet, so it cannot be named. The request is opened to any consented
+  device with a live session, and nothing is pushed to any of them. A phone the
+  plan left out that happens to be connected can therefore see the offer; the
+  host should list every device it wants excluded as unavailable rather than
+  rely on the plan to hide it.
+* **No device and no toast**: nothing can be rung; the answer is `no_endpoint`.
+
+On the relay carrier the plugin publishes the offers, so it publishes them only
+to the named devices. On the self-hosted socket carrier the gateway publishes
+them, so the plan is enforced where a device tries to win: a device outside the
+plan cannot accept (the plugin refuses the claim). A socket-carrier device
+outside the plan may still be shown the request and may send a decline, which the
+plugin cannot attribute to a key there. The signed offer on the native call surface
 (`voice_system_ui`) has a reserved id, `toffer_` plus 26 characters of base32 of a
 hash of the request id and the device's thumbprint, so a ring hint posted by the
 host names the same offer that later reaches the phone
@@ -169,6 +187,10 @@ and a responding device id, and no text from the call or the owner.
 * Announce `ringPlan` in `plugin.init.features` only if the host answers
   `oaiy.ring.plan` and `oaiy.ring.opened`. Without it the plugin never offers
   transfer.
-* To let a not-yet-running Windows Companion accept after a toast starts it,
-  list its thumbprint in the plan's `desktopCompanions` even while it is offline:
-  the plugin offers only to listed devices.
+* A plan that rings the desktop toast and names no device (vector V01) is a
+  working plan: the plugin opens the request to any live device so that the
+  Companion the toast starts can accept. Name devices only when the host wants
+  the offer kept from every other device.
+* `oaiy.ring.plan` may wait 1.5 s, and the answer to the tool call reaches the
+  model only after the line it spoke before calling has drained (like every tool
+  result), so the model's "I'll see if they are free" is not cut off.

@@ -12,7 +12,13 @@
       "ownerEpoch": 4,
       "reason": "caller_asked",
       "callerNumber": "+61491570006",
-      "recentCallerTurns": ["turn 0", "turn 1", "turn 2", "turn 3", "turn 4"]
+      "recentCallerTurns": [
+        "turn 0",
+        "turn 1",
+        "turn 2",
+        "turn 3",
+        "turn 4"
+      ]
     },
     "params": {
       "callId": "call_0123",
@@ -20,56 +26,274 @@
       "ownerEpoch": 4,
       "reason": "caller_asked",
       "callerNumber": "+61491570006",
-      "recentCallerTurns": ["turn 2", "turn 3", "turn 4"]
+      "recentCallerTurns": [
+        "turn 2",
+        "turn 3",
+        "turn 4"
+      ]
     },
     "paramsRules": "At most the last three caller turns, each cut to 300 characters; callerNumber is left out when unknown. The turns never leave the machine: the host runs the phrase checks on them.",
     "results": [
       {
         "name": "ring the planned phone",
-        "result": { "planId": "plan_0001", "decision": "ring", "reason": "ok", "ringSeconds": 40, "phones": ["thumb_phone_a"], "wake": ["thumb_phone_a"], "desktopToast": false, "desktopCompanions": [] },
-        "parsed": { "decision": "ring", "ringSeconds": 40, "targets": ["thumb_phone_a"] }
+        "result": {
+          "planId": "plan_0001",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 40,
+          "phones": [
+            "thumb_phone_a"
+          ],
+          "wake": [
+            "thumb_phone_a"
+          ],
+          "desktopToast": false,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 40,
+          "targets": [
+            "thumb_phone_a"
+          ],
+          "targetRule": "only"
+        }
       },
       {
         "name": "ring a phone and the Windows Companion (each device once)",
-        "result": { "planId": "plan_0002", "decision": "ring", "reason": "ok", "ringSeconds": 30, "phones": ["thumb_phone_a", "thumb_phone_b"], "wake": [], "desktopToast": true, "desktopCompanions": ["thumb_windows", "thumb_phone_a"], "somethingNew": true },
-        "parsed": { "decision": "ring", "ringSeconds": 30, "targets": ["thumb_phone_a", "thumb_phone_b", "thumb_windows"] }
+        "result": {
+          "planId": "plan_0002",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 30,
+          "phones": [
+            "thumb_phone_a",
+            "thumb_phone_b"
+          ],
+          "wake": [],
+          "desktopToast": true,
+          "desktopCompanions": [
+            "thumb_windows",
+            "thumb_phone_a"
+          ],
+          "somethingNew": true
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 30,
+          "targets": [
+            "thumb_phone_a",
+            "thumb_phone_b",
+            "thumb_windows"
+          ],
+          "targetRule": "only"
+        }
       },
       {
         "name": "the ring window is clamped to 20..90 s (too short)",
-        "result": { "planId": "plan_0003", "decision": "ring", "reason": "ok", "ringSeconds": 5, "phones": ["thumb_phone_a"] },
-        "parsed": { "decision": "ring", "ringSeconds": 20, "targets": ["thumb_phone_a"] }
+        "result": {
+          "planId": "plan_0003",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 5,
+          "phones": [
+            "thumb_phone_a"
+          ]
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 20,
+          "targets": [
+            "thumb_phone_a"
+          ],
+          "targetRule": "only"
+        }
       },
       {
         "name": "the ring window is clamped to 20..90 s (too long)",
-        "result": { "planId": "plan_0004", "decision": "ring", "reason": "ok", "ringSeconds": 500, "phones": ["thumb_phone_a"] },
-        "parsed": { "decision": "ring", "ringSeconds": 90, "targets": ["thumb_phone_a"] }
+        "result": {
+          "planId": "plan_0004",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 500,
+          "phones": [
+            "thumb_phone_a"
+          ]
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 90,
+          "targets": [
+            "thumb_phone_a"
+          ],
+          "targetRule": "only"
+        }
       },
       {
         "name": "the host says the model should not offer a person at all",
-        "result": { "planId": "plan_0005", "decision": "refused", "reason": "limit_gap", "ringSeconds": 0, "phones": [], "wake": [], "desktopToast": false, "desktopCompanions": [] },
-        "parsed": { "decision": "refused", "reason": "limit_gap", "targets": [] }
+        "result": {
+          "planId": "plan_0005",
+          "decision": "refused",
+          "reason": "limit_gap",
+          "ringSeconds": 0,
+          "phones": [],
+          "wake": [],
+          "desktopToast": false,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "refused",
+          "reason": "limit_gap",
+          "targets": []
+        }
       },
       {
         "name": "the host says offer a message instead",
-        "result": { "planId": "plan_0006", "decision": "message_only", "reason": "quiet_hours", "ringSeconds": 0, "phones": [], "wake": [], "desktopToast": false, "desktopCompanions": [] },
-        "parsed": { "decision": "message_only", "reason": "quiet_hours", "targets": [] }
+        "result": {
+          "planId": "plan_0006",
+          "decision": "message_only",
+          "reason": "quiet_hours",
+          "ringSeconds": 0,
+          "phones": [],
+          "wake": [],
+          "desktopToast": false,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "message_only",
+          "reason": "quiet_hours",
+          "targets": []
+        }
       },
       {
-        "name": "a ring aimed at nobody parses, and the plugin answers no_endpoint",
-        "result": { "planId": "plan_0007", "decision": "ring", "reason": "ok", "ringSeconds": 30, "phones": [], "wake": [], "desktopToast": true, "desktopCompanions": [] },
-        "parsed": { "decision": "ring", "ringSeconds": 30, "targets": [] }
+        "name": "the owner is at the PC: the desktop toast is the ring and no device is named (design vector V01)",
+        "result": {
+          "planId": "plan_0007",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 30,
+          "phones": [],
+          "wake": [],
+          "desktopToast": true,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 30,
+          "targets": [],
+          "targetRule": "any_live"
+        },
+        "plugin": "Opens the request to any consented device with a live session, and pushes to none: the Windows Companion the toast starts is not in any list yet."
+      },
+      {
+        "name": "a ring with no device and no toast rings nobody",
+        "result": {
+          "planId": "plan_0008",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 30,
+          "phones": [],
+          "wake": [],
+          "desktopToast": false,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 30,
+          "targets": [],
+          "targetRule": "nobody"
+        },
+        "plugin": "Answers unavailable, reason no_endpoint, and opens nothing."
       }
     ],
     "unusableResults": [
-      { "name": "not an object", "result": "ring please" },
-      { "name": "no planId", "result": { "decision": "ring", "phones": ["thumb_phone_a"] } },
-      { "name": "a planId that is not an identifier", "result": { "planId": "has space", "decision": "ring" } },
-      { "name": "an unknown decision", "result": { "planId": "plan_x", "decision": "maybe" } },
-      { "name": "a device list that is not a list", "result": { "planId": "plan_x", "decision": "ring", "phones": "thumb_phone_a" } },
-      { "name": "a device that is not a string", "result": { "planId": "plan_x", "decision": "ring", "phones": [7] } },
-      { "name": "a device that is not an identifier", "result": { "planId": "plan_x", "decision": "ring", "phones": ["bad thumb"] } },
-      { "name": "more than 16 devices", "result": { "planId": "plan_x", "decision": "ring", "phones": ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11", "t12", "t13", "t14", "t15", "t16"] } }
-    ]
+      {
+        "name": "not an object",
+        "result": "ring please"
+      },
+      {
+        "name": "no planId",
+        "result": {
+          "decision": "ring",
+          "phones": [
+            "thumb_phone_a"
+          ]
+        }
+      },
+      {
+        "name": "a planId that is not an identifier",
+        "result": {
+          "planId": "has space",
+          "decision": "ring"
+        }
+      },
+      {
+        "name": "an unknown decision",
+        "result": {
+          "planId": "plan_x",
+          "decision": "maybe"
+        }
+      },
+      {
+        "name": "a device list that is not a list",
+        "result": {
+          "planId": "plan_x",
+          "decision": "ring",
+          "phones": "thumb_phone_a"
+        }
+      },
+      {
+        "name": "a device that is not a string",
+        "result": {
+          "planId": "plan_x",
+          "decision": "ring",
+          "phones": [
+            7
+          ]
+        }
+      },
+      {
+        "name": "a device that is not an identifier",
+        "result": {
+          "planId": "plan_x",
+          "decision": "ring",
+          "phones": [
+            "bad thumb"
+          ]
+        }
+      },
+      {
+        "name": "more than 16 devices",
+        "result": {
+          "planId": "plan_x",
+          "decision": "ring",
+          "phones": [
+            "t0",
+            "t1",
+            "t2",
+            "t3",
+            "t4",
+            "t5",
+            "t6",
+            "t7",
+            "t8",
+            "t9",
+            "t10",
+            "t11",
+            "t12",
+            "t13",
+            "t14",
+            "t15",
+            "t16"
+          ]
+        }
+      }
+    ],
+    "targetRules": {
+      "only": "The plan names devices (phones and desktopCompanions, each once): the request is offered to those devices and no others, and no other device can accept or decline it.",
+      "any_live": "The plan names no device but desktopToast is true: any consented device with a live session may accept. Nothing is pushed to any of them.",
+      "nobody": "No device and no toast: nothing can be rung."
+    }
   },
   "opened": {
     "method": "oaiy.ring.opened",
@@ -82,6 +306,8 @@
       "expiresAt": 1789000040
     },
     "paramsRules": "expiresAt is Unix seconds: when the ring window ends. The host derives the reserved offer id of every phone in the plan from requestId and the phone's endpoint-key thumbprint (transfer-v1.reserved-offer-id.fixture.json), posts the ring items, and posts cancels when the request resolves.",
-    "result": { "ok": true }
+    "result": {
+      "ok": true
+    }
   }
 }

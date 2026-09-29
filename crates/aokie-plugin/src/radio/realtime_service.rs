@@ -46,16 +46,15 @@ pub(super) fn apply_transfer_effects(
                 tool_call_id,
                 answer,
             } => {
+                // Queued, not sent: the completion goes out from the tool
+                // block once the line the model spoke first has drained.
                 if let Some(lane) = lane.as_deref_mut() {
-                    if let Err(error) = lane.session.complete_tool(
-                        &tool_call_id,
+                    lane.queue_tool_answer(
+                        tool_call_id,
                         crate::transfer::TOOL_NAME,
                         answer.ok,
                         answer.output,
-                        true,
-                    ) {
-                        eprintln!("[aokie-plugin] transfer answer could not be sent: {error}");
-                    }
+                    );
                 }
             }
             Effect::Outcome(frame) => {
@@ -157,7 +156,7 @@ pub(super) fn service_realtime_lane(
                         // exactly what it was.
                         let resume = ctx
                             .transfer
-                            .take_resume(Instant::now(), crate::assistance::global());
+                            .peek_resume(Instant::now(), crate::assistance::global());
                         let outbound_call = tracker
                             .current()
                             .filter(|call| call.id == resume_id)
@@ -201,6 +200,10 @@ pub(super) fn service_realtime_lane(
                                 let mut lane = RealtimeCallLane::new(session);
                                 lane.allow_transfer_sent = allow_transfer;
                                 *realtime_lane = Some(lane);
+                                // The handoff is over only once the fresh
+                                // session exists; a start that failed is tried
+                                // again with the same record.
+                                ctx.transfer.finish_resume();
                                 *realtime_resume_call = None;
                                 *status.realtime_error.lock().unwrap() = None;
                             }
@@ -1375,6 +1378,10 @@ pub(super) fn service_realtime_lane(
                 // else: it costs nothing and the model is waiting for it.
                 if let Some(refused) = lane.next_refused_tool() {
                     completion = Some(refused);
+                // The transfer tool's answer, once the host has planned the
+                // ring, passes the same gate as every other completion.
+                } else if let Some(answer) = lane.next_queued_answer() {
+                    completion = Some(answer);
                 // A host lookup can legitimately take seconds. Poll it;
                 // never block this radio loop, which also owns continuous
                 // SCO capture, hang-up controls, and Realtime PCM ingress.

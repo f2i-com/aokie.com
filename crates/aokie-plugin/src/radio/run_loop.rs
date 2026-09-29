@@ -1222,6 +1222,26 @@ pub(super) fn run_loop(
         // never leak history or half-built utterances into the next call.
         #[cfg(feature = "voice")]
         if voice_call_gen != tracker.generation() {
+            // A transfer to the owner still open when its call ends is
+            // withdrawn and reported before the session stops: OAIY hears
+            // `cancelled`, and the audit trail closes the request it opened.
+            // The context that holds it is about to be replaced, which would
+            // otherwise drop it without a word.
+            #[cfg(target_os = "windows")]
+            if ctx.transfer.is_active() {
+                let effects = {
+                    let mut env = transfer_env(
+                        &mut *sink,
+                        &tracker,
+                        &remote_media,
+                        &host_rpc,
+                        &status,
+                        realtime_lane.as_ref().map_or(0, |lane| lane.session_token),
+                    );
+                    ctx.transfer.end_call(&mut env)
+                };
+                apply_transfer_effects(effects, realtime_lane.as_mut(), outbox, sink);
+            }
             if let Some(old) = realtime_lane.take() {
                 if let Some(item_id) = old.output_pacer.active_item() {
                     let _ = old

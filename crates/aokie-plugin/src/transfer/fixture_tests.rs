@@ -102,13 +102,13 @@ fn the_tool_call_fixture_names_and_arguments_are_judged_by_the_plugin_as_written
     for case in cases {
         let parsed = parse_arguments(&case["arguments"]);
         if case["accepted"] == true {
-            assert_eq!(parsed.map(Reason::as_str), Ok(case["reason"].as_str().unwrap()), "{case}");
+            assert_eq!(parsed.map(Reason::as_str), Some(case["reason"].as_str().unwrap()), "{case}");
         } else {
-            assert_eq!(parsed, Err(()), "{case}");
+            assert_eq!(parsed, None, "{case}");
         }
     }
     // The frame's own argument is one of the accepted ones.
-    assert!(parse_arguments(&fixture["frame"]["arguments"]).is_ok());
+    assert!(parse_arguments(&fixture["frame"]["arguments"]).is_some());
 }
 
 #[test]
@@ -311,7 +311,28 @@ fn the_ring_plan_fixture_is_what_the_plugin_sends_and_reads() {
             assert_eq!(expected["reason"], parsed.reason.as_str(), "{case}");
         }
         assert_eq!(strings(&expected["targets"]), parsed.targets(), "{case}");
+        // How the request is aimed.
+        if decision == "ring" {
+            let rule = match parsed.target_rule() {
+                Targets::Only(_) => "only",
+                Targets::AnyLive => "any_live",
+                Targets::Nobody => "nobody",
+            };
+            assert_eq!(expected["targetRule"], rule, "{case}");
+        } else {
+            assert!(expected.get("targetRule").is_none(), "{case}");
+        }
     }
+    for rule in ["only", "any_live", "nobody"] {
+        assert!(plan["targetRules"][rule].is_string(), "{rule} is described");
+    }
+    let rules_seen: std::collections::BTreeSet<_> = plan["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|case| case["parsed"]["targetRule"].as_str())
+        .collect();
+    assert_eq!(rules_seen.len(), 3, "a case for each way to aim a ring");
     for case in plan["unusableResults"].as_array().unwrap() {
         assert!(parse_plan(&case["result"]).is_err(), "{case}");
     }
