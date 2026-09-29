@@ -6332,11 +6332,7 @@ fn an_offer_answer_from_a_device_no_longer_in_the_targets_is_refused_before_it_c
         .unwrap();
     assert_ne!(other, request_id);
     let refused = harness.answer(&offer, "request_stale_target");
-    let code = harness.rejection(&refused).code;
-    assert!(
-        matches!(code.as_str(), "transfer_unavailable" | "offer_unknown"),
-        "{code}"
-    );
+    assert_eq!(harness.rejection(&refused).code, "transfer_unavailable");
     assert_eq!(
         harness
             .session
@@ -6345,6 +6341,96 @@ fn an_offer_answer_from_a_device_no_longer_in_the_targets_is_refused_before_it_c
             .and_then(|pending| pending.accepted_by),
         None
     );
+}
+
+/// A fresh, current authoritative snapshot of the harness call.
+fn authoritative_snapshot(harness: &mut RelayHarness) -> AuthoritativeCallSnapshot {
+    harness.session.last_snapshot_fingerprint = None;
+    harness.session.last_snapshot_sent = None;
+    let encoded = harness
+        .session
+        .snapshot_frame(&harness.radio)
+        .expect("snapshot builds")
+        .expect("a live call publishes a snapshot");
+    serde_json::from_str::<PluginSnapshotFrame>(&encoded)
+        .expect("snapshot decodes")
+        .snapshot
+}
+
+/// The relay accept path is where a transfer's plan is enforced on the relay
+/// carrier once an offer exists. Nothing else must be what stops this answer:
+/// the outsider holds a validly signed offer for the CURRENT request (as if
+/// one had been published before the request was narrowed, or by a future
+/// change to the publisher), and the offer, its device, its grants and its
+/// signature are all in order.
+#[test]
+fn a_device_outside_the_targets_that_holds_a_valid_offer_for_the_current_request_cannot_accept_it() {
+    let mut harness = RelayHarness::with_grants(transfer_grants());
+    let holder_a = holder_of(&harness, "device_a");
+    add_device(&mut harness, "device_b", "thumb_b_0123456789");
+    let remote = harness.media.snapshot();
+    let fence = crate::assistance::AssistanceCallFence {
+        call_id: remote.call_id.clone().unwrap(),
+        call_epoch: remote.call_epoch,
+        owner_epoch: remote.owner_epoch,
+        switchboard_revision: harness.radio.switchboard_revision(),
+        remote_revision: remote.remote_revision,
+    };
+    let request_id = harness
+        .session
+        .assistance
+        .request_transfer_to(fence, "reason", None, 60, Some(vec![holder_a.clone()]))
+        .unwrap();
+    let snapshot = authoritative_snapshot(&mut harness);
+    let offer_b = harness
+        .session
+        .mint_offer(
+            "device_b",
+            LeaseMode::Takeover,
+            MobileOfferSurface::InApp,
+            Some(request_id.clone()),
+            &snapshot,
+            unix_now().unwrap(),
+        )
+        .unwrap()
+        .expect("the outsider's offer is minted for the current request");
+    assert_eq!(
+        offer_b.offer.accepted_transfer_request_id.as_deref(),
+        Some(request_id.as_str())
+    );
+
+    let party_b = relay_party("thumb_b_0123456789");
+    let refused = harness
+        .session
+        .handle_relay_peer_frame(
+            &offer_answer(&offer_b, "device_b", "request_outsider_accept"),
+            Some(&party_b),
+            Some("device_b"),
+            &transfer_grants(),
+            &harness.media,
+            &harness.radio,
+        )
+        .unwrap();
+    assert_eq!(harness.rejection(&refused).code, "transfer_unavailable");
+    assert!(!harness.session.relay_offers[&offer_b.offer.offer_id].accepted);
+    assert!(!harness
+        .session
+        .relay_offer_winners
+        .contains_key(&offer_b.offer.opportunity_id));
+    assert_eq!(
+        harness
+            .session
+            .assistance
+            .pending_transfer("call_a", 1)
+            .and_then(|pending| pending.accepted_by),
+        None,
+        "the outsider reserved nothing"
+    );
+
+    // The named device still wins it.
+    let offer_a = harness.transfer_offer_for(&request_id, MobileOfferSurface::InApp);
+    let accepted = harness.answer(&offer_a, "request_target_accept");
+    assert!(serde_json::from_str::<PluginOfferAcceptedFrame>(&accepted[0]).is_ok());
 }
 
 // --- MOB-10: `transfer_to_owner` end to end against the relay Companion double --
