@@ -137,6 +137,22 @@ epoch milliseconds. `accepted` is sent once per request, even if the media
 transaction is rolled back and another attempt follows. The frame is sent only on
 a session that negotiated `transfer_v1`.
 
+**Order and delivery.** An outcome about a request is sent only after the tool
+result that names it (`ringing`), and that result itself waits until the line the
+model spoke before calling has drained (like every tool result): the plugin holds
+outcomes behind it, so OAIY always has the `requestId` before it hears about the
+request. An outcome that finds no session able to carry it (the handoff stopped
+the session, or the fresh one has not yet sent `ready`) is kept, three at most,
+and sent oldest first on the next session of the same call that negotiates
+`transfer_v1`. So a `start.resume` with `via: "failback"` may be followed by the
+`unavailable` frame for the request an earlier session knew; a frame whose
+request id OAIY has no open tool call for is the answer to the resume's
+question. An `accepted` is never kept for a later session. `resume.via` is
+`return` only for a takeover the plugin saw complete (or a handoff no transfer
+of ours was part of: a person took the caller by hand and gave it back), and
+`failback` for anything else, including a setup that failed but has not yet been
+written down by the gateway when the caller comes back.
+
 ## Timings
 
 | What | Value |
