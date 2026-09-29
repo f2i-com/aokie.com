@@ -25,22 +25,22 @@ fn consenting() -> RemoteConsentGate {
     }
 }
 
-struct Rig {
-    broker: AssistanceBroker,
-    media: RemoteMediaHandle,
-    host: Arc<HostRpc>,
-    sink: VecSink,
-    machine: TransferCall,
-    now: Instant,
-    active: Option<String>,
-    session: u64,
-    turns: Vec<String>,
-    owner: AokieOwnerFence,
-    host_ring_plan: bool,
+pub(crate) struct Rig {
+    pub(crate) broker: AssistanceBroker,
+    pub(crate) media: RemoteMediaHandle,
+    pub(crate) host: Arc<HostRpc>,
+    pub(crate) sink: VecSink,
+    pub(crate) machine: TransferCall,
+    pub(crate) now: Instant,
+    pub(crate) active: Option<String>,
+    pub(crate) session: u64,
+    pub(crate) turns: Vec<String>,
+    pub(crate) owner: AokieOwnerFence,
+    pub(crate) host_ring_plan: bool,
 }
 
 impl Rig {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_governor(Arc::new(Governor::default()))
     }
 
@@ -93,7 +93,7 @@ impl Rig {
         self.begin_with(tool_call_id, json!({"reason": "caller_asked"}))
     }
 
-    fn poll(&mut self) -> Vec<Effect> {
+    pub(crate) fn poll(&mut self) -> Vec<Effect> {
         let mut env = TransferEnv {
             broker: &self.broker,
             media: &self.media,
@@ -164,7 +164,7 @@ impl Rig {
     }
 
     /// Begin, let the host approve a ring, and return the ringing answer.
-    fn ring(&mut self) -> (String, Vec<Effect>) {
+    pub(crate) fn ring(&mut self) -> (String, Vec<Effect>) {
         assert!(matches!(self.begin("tool_1"), Begin::Planning));
         self.host_answers(Self::ring_plan());
         let effects = self.poll();
@@ -172,7 +172,7 @@ impl Rig {
         (request_id, effects)
     }
 
-    fn fence(&self, request_id: &str) -> AssistanceCallFence {
+    pub(crate) fn fence(&self, request_id: &str) -> AssistanceCallFence {
         // The fence the request was opened with, read back from the mailbox.
         self.broker
             .pending_transfer(CALL, self.media.snapshot().call_epoch)
@@ -181,7 +181,7 @@ impl Rig {
             .fence
     }
 
-    fn accept(&self, request_id: &str) {
+    pub(crate) fn accept(&self, request_id: &str) {
         let fence = self.fence(request_id);
         self.broker.accept_transfer(request_id, &fence, DEVICE).unwrap();
     }
@@ -724,6 +724,101 @@ fn a_caller_who_hangs_up_mid_ring_cancels_the_request_and_frees_the_mailbox() {
     assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
     rig.active = None;
     assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Cancelled, None)]);
+    assert!(!rig.broker.is_busy());
+}
+
+/// Review finding 6. The hold juggle lays a call's context aside while the call
+/// lives on, and nobody polls a stowed context.
+#[test]
+fn a_call_put_on_hold_takes_its_request_with_it_and_says_so() {
+    // Ringing.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    assert!(rig.broker.is_busy());
+    let effects = {
+        let mut env = TransferEnv {
+            broker: &rig.broker,
+            media: &rig.media,
+            host: &rig.host,
+            sink: &mut rig.sink,
+            now: rig.now,
+            active_call_id: rig.active.as_deref(),
+            switchboard_revision: 0,
+            host_ring_plan: true,
+            session_token: 1,
+        };
+        rig.machine.park(&mut env)
+    };
+    assert_eq!(outcomes(&effects), vec![(Outcome::Cancelled, None)]);
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "cancelled".to_string())]);
+    assert!(!rig.broker.is_busy(), "the mailbox is free for the call that has the line");
+    assert!(!rig.broker.transfer_admits(&request_id, PHONE), "and the offers stop");
+    assert!(!rig.machine.is_active());
+    assert!(rig.poll().is_empty(), "it is said once");
+
+    // Nothing open: nothing to say.
+    let effects = {
+        let mut env = TransferEnv {
+            broker: &rig.broker,
+            media: &rig.media,
+            host: &rig.host,
+            sink: &mut rig.sink,
+            now: rig.now,
+            active_call_id: rig.active.as_deref(),
+            switchboard_revision: 0,
+            host_ring_plan: true,
+            session_token: 1,
+        };
+        rig.machine.park(&mut env)
+    };
+    assert!(effects.is_empty());
+
+    // Accepted, media not yet up: the acceptance is withdrawn from under the
+    // device, which the broker then refuses to complete.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+    let fence = rig.fence(&request_id);
+    let effects = {
+        let mut env = TransferEnv {
+            broker: &rig.broker,
+            media: &rig.media,
+            host: &rig.host,
+            sink: &mut rig.sink,
+            now: rig.now,
+            active_call_id: rig.active.as_deref(),
+            switchboard_revision: 0,
+            host_ring_plan: true,
+            session_token: 1,
+        };
+        rig.machine.park(&mut env)
+    };
+    assert_eq!(outcomes(&effects), vec![(Outcome::Cancelled, None)]);
+    assert!(!rig.broker.is_busy());
+    assert!(rig.broker.transfer_taken(&request_id, &fence, DEVICE).is_err());
+}
+
+/// Review finding 6, second half. A machine dropped with a request open (the
+/// context replaced on a path that does not go through `end_call`) still frees
+/// the mailbox: a request nobody can answer must not block every later call.
+#[test]
+fn dropping_a_machine_with_a_ringing_request_frees_the_mailbox() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    assert!(rig.broker.is_busy());
+    let machine = std::mem::replace(&mut rig.machine, TransferCall::new(Arc::new(Governor::default())));
+    drop(machine);
+    assert!(!rig.broker.is_busy(), "the request went with its machine");
+    assert!(!rig.broker.transfer_admits(&request_id, PHONE));
+
+    // The same once a device has won it, before the media is up.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+    let machine = std::mem::replace(&mut rig.machine, TransferCall::new(Arc::new(Governor::default())));
+    drop(machine);
     assert!(!rig.broker.is_busy());
 }
 

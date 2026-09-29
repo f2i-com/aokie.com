@@ -13,8 +13,31 @@ pub(super) fn transfer_env<'a>(
     status: &RadioStatus,
     session_token: u64,
 ) -> crate::transfer::call::TransferEnv<'a> {
+    transfer_env_with(
+        crate::assistance::global(),
+        sink,
+        tracker,
+        remote_media,
+        host_rpc,
+        status,
+        session_token,
+    )
+}
+
+/// [`transfer_env`] against a given mailbox (the process-wide one in the
+/// radio, a private one in tests).
+#[cfg(all(target_os = "windows", feature = "voice"))]
+pub(super) fn transfer_env_with<'a>(
+    broker: &'a crate::assistance::AssistanceBroker,
+    sink: &'a mut dyn Sink,
+    tracker: &'a crate::call_session::SessionTracker,
+    remote_media: &'a crate::remote_media::RemoteMediaHandle,
+    host_rpc: &'a Arc<crate::host_rpc::HostRpc>,
+    status: &RadioStatus,
+    session_token: u64,
+) -> crate::transfer::call::TransferEnv<'a> {
     crate::transfer::call::TransferEnv {
-        broker: crate::assistance::global(),
+        broker,
         media: remote_media,
         host: host_rpc,
         sink,
@@ -95,6 +118,88 @@ pub(super) fn apply_transfer_effects(
             Effect::Audit(event) => emit(outbox, sink, event),
         }
     }
+}
+
+/// Why a call's open transfer request is being withdrawn from outside the
+/// service loop.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TransferWithdrawal {
+    /// The call is over and its context is about to be replaced.
+    CallEnded,
+    /// The call is being put on hold behind another and its context stowed.
+    Parked,
+}
+
+/// Withdraw whatever transfer request the call's context still has open, tell
+/// OAIY (on the call's own negotiated session if there is one, otherwise on the
+/// next one) and close the audit trail. Both places that lay a call's context
+/// aside go through here: the per-call reset and the hold juggle.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn withdraw_open_transfer(
+    why: TransferWithdrawal,
+    ctx: &mut CallVoiceContext,
+    lane: Option<&mut RealtimeCallLane>,
+    broker: &crate::assistance::AssistanceBroker,
+    tracker: &crate::call_session::SessionTracker,
+    remote_media: &crate::remote_media::RemoteMediaHandle,
+    host_rpc: &Arc<crate::host_rpc::HostRpc>,
+    status: &RadioStatus,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+) {
+    if !ctx.transfer.is_active() {
+        return;
+    }
+    let mut lane = lane;
+    let effects = {
+        let mut env = transfer_env_with(
+            broker,
+            &mut *sink,
+            tracker,
+            remote_media,
+            host_rpc,
+            status,
+            lane.as_deref().map_or(0, |lane| lane.session_token),
+        );
+        match why {
+            TransferWithdrawal::CallEnded => ctx.transfer.end_call(&mut env),
+            TransferWithdrawal::Parked => ctx.transfer.park(&mut env),
+        }
+    };
+    apply_transfer_effects(effects, lane.as_deref_mut(), &mut ctx.transfer, outbox, sink);
+}
+
+/// Lay a live call's voice context aside (the hold juggle parking a caller) and
+/// put `replacement` in its place. The transfer request the call still holds is
+/// withdrawn first: nothing polls a stowed context.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stow_call_context(
+    ctx: &mut CallVoiceContext,
+    replacement: CallVoiceContext,
+    broker: &crate::assistance::AssistanceBroker,
+    tracker: &crate::call_session::SessionTracker,
+    remote_media: &crate::remote_media::RemoteMediaHandle,
+    host_rpc: &Arc<crate::host_rpc::HostRpc>,
+    status: &RadioStatus,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+) -> CallVoiceContext {
+    withdraw_open_transfer(
+        TransferWithdrawal::Parked,
+        ctx,
+        None,
+        broker,
+        tracker,
+        remote_media,
+        host_rpc,
+        status,
+        outbox,
+        sink,
+    );
+    std::mem::replace(ctx, replacement)
 }
 
 #[cfg(all(target_os = "windows", feature = "voice"))]

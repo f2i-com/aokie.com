@@ -1186,6 +1186,7 @@ pub(super) fn run_loop(
             &control_rx,
             &status,
             &remote_media,
+            &host_rpc,
             &synth,
             &stt_current_gen,
             &probe_result_rx,
@@ -1228,20 +1229,18 @@ pub(super) fn run_loop(
             // The context that holds it is about to be replaced, which would
             // otherwise drop it without a word.
             #[cfg(target_os = "windows")]
-            if ctx.transfer.is_active() {
-                let effects = {
-                    let mut env = transfer_env(
-                        &mut *sink,
-                        &tracker,
-                        &remote_media,
-                        &host_rpc,
-                        &status,
-                        realtime_lane.as_ref().map_or(0, |lane| lane.session_token),
-                    );
-                    ctx.transfer.end_call(&mut env)
-                };
-                apply_transfer_effects(effects, realtime_lane.as_mut(), &mut ctx.transfer, outbox, sink);
-            }
+            withdraw_open_transfer(
+                TransferWithdrawal::CallEnded,
+                &mut ctx,
+                realtime_lane.as_mut(),
+                crate::assistance::global(),
+                &tracker,
+                &remote_media,
+                &host_rpc,
+                &status,
+                outbox,
+                sink,
+            );
             if let Some(old) = realtime_lane.take() {
                 if let Some(item_id) = old.output_pacer.active_item() {
                     let _ = old

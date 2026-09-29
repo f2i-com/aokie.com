@@ -427,6 +427,132 @@ fn an_outcome_with_no_negotiated_session_waits_for_the_next_one_and_is_sent_in_o
     assert!(sent_outcomes(&old_detached).is_empty());
 }
 
+/// The two places that lay a call's context aside (the per-call reset and the
+/// hold juggle) go through `withdraw_open_transfer`, on a real machine with a
+/// real request in a private mailbox.
+struct Laid {
+    rig: crate::transfer::call::tests::Rig,
+    ctx: CallVoiceContext,
+    tracker: crate::call_session::SessionTracker,
+    status: RadioStatus,
+    sink: crate::event_bridge::VecSink,
+    request_id: String,
+}
+
+fn laid_aside_with_a_ringing_request() -> Laid {
+    let mut rig = crate::transfer::call::tests::Rig::new();
+    let (request_id, _) = rig.ring();
+    let mut ctx = CallVoiceContext::fresh(None);
+    ctx.transfer = std::mem::replace(&mut rig.machine, machine());
+    assert!(ctx.transfer.is_active());
+    assert!(rig.broker.is_busy());
+    Laid {
+        rig,
+        ctx,
+        tracker: crate::call_session::SessionTracker::new(),
+        status: RadioStatus::default(),
+        sink: crate::event_bridge::VecSink::default(),
+        request_id,
+    }
+}
+
+impl Laid {
+    fn withdraw(&mut self, why: TransferWithdrawal, lane: Option<&mut RealtimeCallLane>) {
+        withdraw_open_transfer(
+            why,
+            &mut self.ctx,
+            lane,
+            &self.rig.broker,
+            &self.tracker,
+            &self.rig.media,
+            &self.rig.host,
+            &self.status,
+            None,
+            &mut self.sink,
+        );
+    }
+}
+
+/// Review finding 6: a call parked by the hold juggle (no session: the juggle
+/// disposed of it first) frees the mailbox, closes the audit trail, and keeps
+/// the `cancelled` for the session it gets when it resumes.
+#[test]
+fn a_call_parked_by_the_juggle_frees_the_mailbox_and_owes_its_next_session_a_cancelled() {
+    let mut laid = laid_aside_with_a_ringing_request();
+    // The juggle lays the context aside through `stow_call_context`.
+    let stowed = stow_call_context(
+        &mut laid.ctx,
+        CallVoiceContext::fresh(None),
+        &laid.rig.broker,
+        &laid.tracker,
+        &laid.rig.media,
+        &laid.rig.host,
+        &laid.status,
+        None,
+        &mut laid.sink,
+    );
+    assert!(!stowed.transfer.is_active(), "the stowed context holds no open request");
+    assert!(!laid.ctx.transfer.is_active(), "the newcomer's context is a fresh one");
+    laid.ctx = stowed;
+    assert!(!laid.rig.broker.is_busy(), "the newcomer's requests are not blocked");
+    assert!(!laid.rig.broker.transfer_admits(&laid.request_id, "thumb_phone_0123456789"));
+    assert!(!laid.ctx.transfer.is_active());
+    assert_eq!(laid.sink.lines.len(), 1, "the audit trail closes the request it opened");
+    assert!(laid.sink.lines[0].contains(crate::contract::events::CALL_ASSISTANCE_RESOLVED));
+    assert!(laid.sink.lines[0].contains("cancelled"));
+    assert!(laid.ctx.transfer.has_held_outcomes());
+
+    // The primary is restored and its fresh session negotiates the contract.
+    let (mut lane, detached) = detached_lane(true);
+    lane.allow_transfer_sent = true;
+    lane.ready = true;
+    lane.negotiate_transfer(&features(&["transfer_v1"]));
+    send_held_outcomes(Some(&mut lane), &mut laid.ctx.transfer);
+    assert_eq!(sent_outcomes(&detached), vec![Outcome::Cancelled]);
+    assert!(!laid.ctx.transfer.has_held_outcomes());
+
+    // A call with nothing open is left alone.
+    let mut idle = Laid {
+        ctx: CallVoiceContext::fresh(None),
+        sink: crate::event_bridge::VecSink::default(),
+        ..laid
+    };
+    idle.withdraw(TransferWithdrawal::Parked, None);
+    assert!(idle.sink.lines.is_empty());
+    assert!(!idle.ctx.transfer.has_held_outcomes());
+}
+
+/// The juggle's four parking sites go through `stow_ctx!`; the three that only
+/// keep the continuing newcomer's context safe for the reset do not. A new
+/// place that lays a context aside must choose, and this fails until it does.
+#[test]
+fn the_hold_juggle_lays_a_call_aside_only_through_the_withdrawing_helper() {
+    let source = include_str!("juggle.rs");
+    let invocations = source.matches("stow_ctx!(").count();
+    let raw_swaps = source.matches("std::mem::replace(").count();
+    assert_eq!(invocations, 4, "parking sites that withdraw the transfer first");
+    assert_eq!(
+        raw_swaps, 3,
+        "the newcomer's context is kept for the per-call reset; it is the call that continues"
+    );
+}
+
+/// The per-call reset: OAIY hears `cancelled` on the session that is about to
+/// stop, before it stops.
+#[test]
+fn a_call_that_ends_tells_its_negotiated_session_the_request_was_cancelled() {
+    let mut laid = laid_aside_with_a_ringing_request();
+    let (mut lane, detached) = detached_lane(true);
+    lane.allow_transfer_sent = true;
+    lane.ready = true;
+    lane.negotiate_transfer(&features(&["transfer_v1"]));
+    laid.withdraw(TransferWithdrawal::CallEnded, Some(&mut lane));
+    assert_eq!(sent_outcomes(&detached), vec![Outcome::Cancelled]);
+    assert!(!laid.ctx.transfer.has_held_outcomes(), "it went straight out");
+    assert!(!laid.rig.broker.is_busy());
+    assert_eq!(laid.sink.lines.len(), 1);
+}
+
 #[test]
 fn the_start_offers_transfer_only_to_an_inbound_oaiy_call_with_consent_a_host_and_a_roster() {
     let consent = |assistance, takeover| crate::remote_media::RemoteConsentGate {

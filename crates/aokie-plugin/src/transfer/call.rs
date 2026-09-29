@@ -397,10 +397,24 @@ impl TransferCall {
     /// hears `cancelled` before the session stops and the audit trail closes
     /// its request. A plan still being awaited is simply dropped.
     pub fn end_call(&mut self, env: &mut TransferEnv<'_>) -> Vec<Effect> {
+        self.withdraw_open(env, "the call ended")
+    }
+
+    /// The call is being put on hold behind another caller and its context
+    /// is about to be stowed. Nobody polls a stowed context, so a request left
+    /// open would keep the single mailbox (and the owner's phone ringing) for
+    /// a call that no longer has the line, and could not be reported until the
+    /// call came back. It is withdrawn now, and `cancelled` waits for the
+    /// session the call gets when it resumes.
+    pub fn park(&mut self, env: &mut TransferEnv<'_>) -> Vec<Effect> {
+        self.withdraw_open(env, "the call was put on hold")
+    }
+
+    fn withdraw_open(&mut self, env: &mut TransferEnv<'_>, why: &str) -> Vec<Effect> {
         let mut effects = Vec::new();
         match std::mem::replace(&mut self.stage, Stage::Idle) {
             Stage::Ringing(open) | Stage::Accepted(open) => {
-                self.cancel(open, env, &mut effects, "the call ended");
+                self.cancel(open, env, &mut effects, why);
             }
             Stage::Planning(_) | Stage::Idle => {}
         }
@@ -806,4 +820,4 @@ impl TransferCall {
 
 #[cfg(test)]
 #[path = "call_tests.rs"]
-mod tests;
+pub(crate) mod tests;
