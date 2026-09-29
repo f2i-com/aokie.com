@@ -227,6 +227,9 @@ pub struct TransferCall {
     last_end: Option<End>,
     handoff_started: Option<Instant>,
     held: Vec<OutcomeFrame>,
+    /// The handoff an open request belonged to is over (its fresh session has
+    /// started), so however the request ends is not the next handoff's story.
+    end_is_spent: bool,
 }
 
 impl Default for TransferCall {
@@ -263,6 +266,7 @@ impl TransferCall {
             last_end: None,
             handoff_started: None,
             held: Vec::new(),
+            end_is_spent: false,
         }
     }
 
@@ -657,7 +661,7 @@ impl TransferCall {
         if let Some(event) = open.audit.resolve(AssistanceAuditResolution::Cancelled) {
             effects.push(Effect::Audit(event));
         }
-        self.last_end = Some(End::Other);
+        self.note_end(End::Other);
     }
 
     fn finish(&mut self, mut open: Open, resolution: AssistanceResolution, effects: &mut Vec<Effect>) {
@@ -710,7 +714,7 @@ impl TransferCall {
         if let Some(event) = audit_event {
             effects.push(Effect::Audit(event));
         }
-        self.last_end = Some(end);
+        self.note_end(end);
     }
 
     // --- The handoff and what follows ---------------------------------------
@@ -784,9 +788,24 @@ impl TransferCall {
         std::mem::take(&mut self.held)
     }
 
-    /// The fresh session was started: the handoff is over.
+    /// The fresh session was started: the handoff is over, and how it ended
+    /// belongs to it alone. Left behind, a failed setup would make the next
+    /// handoff of this call (a person taking the caller by hand) read as a
+    /// failback. A request still open now belongs to the handoff that just
+    /// ended too: the gateway may record its failure after the session
+    /// started, and that must not be remembered for the next one either.
     pub fn finish_resume(&mut self) {
         self.handoff_started = None;
+        self.last_end = None;
+        self.end_is_spent = matches!(self.stage, Stage::Ringing(_) | Stage::Accepted(_));
+    }
+
+    fn note_end(&mut self, end: End) {
+        self.last_end = if std::mem::take(&mut self.end_is_spent) {
+            None
+        } else {
+            Some(end)
+        };
     }
 }
 
