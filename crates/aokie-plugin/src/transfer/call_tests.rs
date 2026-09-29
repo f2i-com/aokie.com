@@ -924,6 +924,78 @@ fn an_outcome_with_no_session_to_carry_it_is_held_in_order_and_not_kept_past_the
     );
 }
 
+/// Review finding 4. How a handoff ended belongs to that handoff. A later one
+/// (the owner taking the caller by hand from the Companion) is a return, not
+/// the failback the last request left behind.
+#[test]
+fn a_failed_setup_is_not_remembered_by_a_later_manual_handoff() {
+    let failed_setup = |rig: &mut Rig| -> String {
+        let (request_id, _) = rig.ring();
+        rig.accept(&request_id);
+        let _ = rig.poll();
+        rig.machine.note_handoff(rig.now);
+        let fence = rig.fence(&request_id);
+        let mut returned = fence.clone();
+        returned.owner_epoch += 2;
+        returned.remote_revision += 3;
+        rig.broker
+            .transfer_unavailable(&request_id, &fence, returned, Some(DEVICE))
+            .unwrap();
+        request_id
+    };
+
+    // The failure was recorded and consumed before the fresh session started.
+    let mut rig = Rig::new();
+    failed_setup(&mut rig);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Unavailable, None)]);
+    rig.now += Duration::from_secs(4);
+    assert_eq!(
+        rig.machine.take_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(4, Via::Failback))
+    );
+    // Later, a person takes the caller by hand and gives it back.
+    rig.machine.note_handoff(rig.now);
+    rig.now += Duration::from_secs(30);
+    assert_eq!(
+        rig.machine.take_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(30, Via::Return)),
+        "the earlier failure is not this handoff's"
+    );
+
+    // The failure was recorded only after the fresh session started (the
+    // gateway writes it a moment after the media returns): same answer.
+    let mut rig = Rig::new();
+    failed_setup(&mut rig);
+    rig.now += Duration::from_secs(4);
+    assert_eq!(
+        rig.machine.take_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(4, Via::Failback))
+    );
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Unavailable, None)]);
+    rig.machine.note_handoff(rig.now);
+    rig.now += Duration::from_secs(30);
+    assert_eq!(
+        rig.machine.take_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(30, Via::Return))
+    );
+
+    // A completed takeover is no different: it is remembered until the
+    // session that follows has started, and not after.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    let _ = rig.poll();
+    let fence = rig.fence(&request_id);
+    rig.broker.transfer_taken(&request_id, &fence, DEVICE).unwrap();
+    rig.machine.note_handoff(rig.now);
+    let _ = rig.poll();
+    assert_eq!(
+        rig.machine.take_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(0, Via::Return))
+    );
+    assert_eq!(rig.machine.peek_resume(rig.now, &rig.broker), None);
+}
+
 #[test]
 fn the_ai_resumes_after_a_return_and_after_a_failure_and_only_when_there_was_a_handoff() {
     // Nothing to resume from before any handoff.
