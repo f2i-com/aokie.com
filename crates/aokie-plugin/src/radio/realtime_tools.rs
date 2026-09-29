@@ -266,6 +266,21 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_fixture_shows_the_refusals_the_plugin_gives() {
+        let fixture = crate::transfer::fixture_tests::fixture("transfer-v1.tool-result.fixture.json");
+        let cases = fixture["toolRefusals"]["cases"].as_array().unwrap();
+        let ours = [ToolRefusal::Busy, ToolRefusal::ToolLimit, ToolRefusal::Unsupported];
+        assert_eq!(cases.len(), ours.len());
+        for refusal in ours {
+            assert!(
+                cases.iter().any(|case| case["output"] == refusal.output()),
+                "{refusal:?} is not in the fixture"
+            );
+        }
+        assert_eq!(MAX_TOOL_CALLS_PER_CALL, 24, "the fixture says the 25th call is refused");
+    }
+
+    #[test]
     fn refusal_output_never_carries_call_text() {
         for refusal in [ToolRefusal::Unsupported, ToolRefusal::Busy, ToolRefusal::ToolLimit] {
             let output = refusal.output();

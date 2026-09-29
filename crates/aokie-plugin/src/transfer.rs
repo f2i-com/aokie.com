@@ -19,6 +19,9 @@ pub mod call;
 pub use phrase::caller_asked;
 pub use wire::*;
 
+#[cfg(test)]
+pub(crate) mod fixture_tests;
+
 /// The realtime tool the OAIY call agent calls.
 pub const TOOL_NAME: &str = "transfer_to_owner";
 

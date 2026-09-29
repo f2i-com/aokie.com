@@ -369,14 +369,14 @@ impl Outcome {
 
 /// One `formlogic.realtime.transfer_outcome`, less the `type`, `callId` and
 /// `generation` the session stamps on every frame it sends.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutcomeFrame {
     pub request_id: String,
     pub outcome: Outcome,
     /// The owner's own words for the caller. Untrusted text: bounded and
     /// stripped of control markers, and only ever on `declined`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// Unix epoch milliseconds at which the plugin decided the outcome.
     pub at_ms: u64,
