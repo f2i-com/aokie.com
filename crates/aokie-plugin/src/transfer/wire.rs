@@ -203,13 +203,12 @@ pub struct RingPlan {
 pub enum Targets {
     /// Exactly these devices (phones and Windows Companions, once each).
     Only(Vec<String>),
-    /// The plan names no device but rings the desktop: the toast is the ring,
-    /// and the Windows Companion it opens (or one the owner already has open)
-    /// is what takes the call, and it cannot be named because it may not be
-    /// running yet. Every consented device with a live session may accept;
-    /// nothing is pushed to any of them.
-    AnyLive,
-    /// No device and no toast: there is nothing to ring.
+    /// The plan names no device: there is nobody to offer the call to, whatever
+    /// else it rings. The desktop toast is a notification, not a target: a
+    /// request offered to "any live device" would let a phone the owner never
+    /// meant to ring take the caller, so a plan that wants the owner at the PC
+    /// names the Windows Companion (by thumbprint, whether or not it is running
+    /// yet: the toast starts it).
     Nobody,
 }
 
@@ -226,18 +225,13 @@ impl RingPlan {
     }
 
     /// How the request is aimed. A plan that names devices rings those and no
-    /// others. A plan that names none but toasts the desktop (the design's
-    /// "owner at the PC" case) opens the request to any live device, since the
-    /// toast starts the Companion that will accept. A plan with neither rings
-    /// nobody.
+    /// others; a plan that names none rings nobody, toast or not.
     pub fn target_rule(&self) -> Targets {
         let targets = self.targets();
-        if !targets.is_empty() {
-            Targets::Only(targets)
-        } else if self.desktop_toast {
-            Targets::AnyLive
-        } else {
+        if targets.is_empty() {
             Targets::Nobody
+        } else {
+            Targets::Only(targets)
         }
     }
 }

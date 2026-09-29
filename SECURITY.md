@@ -24,7 +24,9 @@ Pre-1.0: only `main` and the latest release receive fixes.
   the plugin on its own (3 requests a call, 15 seconds apart, 20 an hour), relays
   nothing the model or the caller said to the owner's devices (the request text
   is fixed), and offers the request only to the devices the host's ring plan
-  names. A host that does not answer the plan means nobody is rung.
+  names; a plan that names none rings nobody, whatever else it asks for (a
+  desktop toast is not a target). A host that does not answer the plan means
+  nobody is rung.
 - Driver installation uses an elevated helper whose SHA-256 is pinned into
   the plugin at build time; a byte of drift refuses to elevate. The
   self-signed driver-trust path is a development affordance — production

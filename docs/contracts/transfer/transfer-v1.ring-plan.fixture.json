@@ -166,7 +166,7 @@
         }
       },
       {
-        "name": "the owner is at the PC: the desktop toast is the ring and no device is named (design vector V01)",
+        "name": "a desktop toast with no device named is not a target (design vector V01, fail closed)",
         "result": {
           "planId": "plan_0007",
           "decision": "ring",
@@ -181,9 +181,33 @@
           "decision": "ring",
           "ringSeconds": 30,
           "targets": [],
-          "targetRule": "any_live"
+          "targetRule": "nobody"
         },
-        "plugin": "Opens the request to any consented device with a live session, and pushes to none: the Windows Companion the toast starts is not in any list yet."
+        "plugin": "Answers unavailable, reason no_endpoint, opens nothing and does not send oaiy.ring.opened, so no toast follows: a toast is a notification, not a target. A plan for the owner at the PC names the Windows Companion in desktopCompanions (see the next case)."
+      },
+      {
+        "name": "the owner is at the PC: the toast, and the Windows Companion it starts named by its thumbprint",
+        "result": {
+          "planId": "plan_0007b",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 30,
+          "phones": [],
+          "wake": [],
+          "desktopToast": true,
+          "desktopCompanions": [
+            "thumb_win_companion_0123456789"
+          ]
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 30,
+          "targets": [
+            "thumb_win_companion_0123456789"
+          ],
+          "targetRule": "only"
+        },
+        "plugin": "Offers the request to that Windows Companion and to no other device, whether or not the Companion is running yet: it is offered the request when it connects inside the ring window."
       },
       {
         "name": "a ring with no device and no toast rings nobody",
@@ -291,8 +315,7 @@
     ],
     "targetRules": {
       "only": "The plan names devices (phones and desktopCompanions, each once): the request is offered to those devices and no others, and no other device can accept or decline it.",
-      "any_live": "The plan names no device but desktopToast is true: any consented device with a live session may accept. Nothing is pushed to any of them.",
-      "nobody": "No device and no toast: nothing can be rung."
+      "nobody": "The plan names no device, toast or not: nothing can be rung, and the answer is no_endpoint. A toast is not a target."
     }
   },
   "opened": {

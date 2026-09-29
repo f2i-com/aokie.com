@@ -315,7 +315,6 @@ fn the_ring_plan_fixture_is_what_the_plugin_sends_and_reads() {
         if decision == "ring" {
             let rule = match parsed.target_rule() {
                 Targets::Only(_) => "only",
-                Targets::AnyLive => "any_live",
                 Targets::Nobody => "nobody",
             };
             assert_eq!(expected["targetRule"], rule, "{case}");
@@ -323,16 +322,20 @@ fn the_ring_plan_fixture_is_what_the_plugin_sends_and_reads() {
             assert!(expected.get("targetRule").is_none(), "{case}");
         }
     }
-    for rule in ["only", "any_live", "nobody"] {
+    for rule in ["only", "nobody"] {
         assert!(plan["targetRules"][rule].is_string(), "{rule} is described");
     }
+    assert!(
+        plan["targetRules"].get("any_live").is_none(),
+        "a toast is not a target: there is no rule that opens the request to any device"
+    );
     let rules_seen: std::collections::BTreeSet<_> = plan["results"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|case| case["parsed"]["targetRule"].as_str())
         .collect();
-    assert_eq!(rules_seen.len(), 3, "a case for each way to aim a ring");
+    assert_eq!(rules_seen.len(), 2, "a case for each way to aim a ring");
     for case in plan["unusableResults"].as_array().unwrap() {
         assert!(parse_plan(&case["result"]).is_err(), "{case}");
     }

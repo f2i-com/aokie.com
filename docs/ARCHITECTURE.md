@@ -172,8 +172,9 @@ one request at a time; at most 3 a call, 15 s apart and 20 an hour, on top of
 the host's own policy; the request text sent to the owner's devices is fixed and
 nothing the model or the caller says is relayed; a device the plan names is the
 only kind offered the transfer (a plan that toasts the desktop and names no
-device, the owner at the PC, opens it to any live device instead, since the
-Companion the toast starts cannot be named yet). A call that is not offered
+device is `no_endpoint`: a toast is a notification, not a target, so for the
+owner at the PC the plan names the Windows Companion by thumbprint, running or
+not). A call that is not offered
 the tool (any call before the host announces `ringPlan`, any older OAIY) behaves
 exactly as before, including the text of its stop reason.
 
