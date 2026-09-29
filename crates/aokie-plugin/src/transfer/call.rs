@@ -154,8 +154,9 @@ pub enum Effect {
         tool_call_id: String,
         answer: ToolAnswer,
     },
-    /// Tell OAIY how the request ended. Only if a session that negotiated
-    /// `transfer_v1` is open for this call; otherwise it is dropped.
+    /// Tell OAIY how the request ended. Goes on a session that negotiated
+    /// `transfer_v1`; while none is open a terminal outcome is held for the
+    /// next one (`hold_outcome`), and an `accepted` is dropped.
     Outcome(OutcomeFrame),
     /// A durable `aokie.call.assistance.*` event.
     Audit(DesktopEvent),
@@ -225,6 +226,7 @@ pub struct TransferCall {
     governor: Arc<Governor>,
     last_end: Option<End>,
     handoff_started: Option<Instant>,
+    held: Vec<OutcomeFrame>,
 }
 
 impl Default for TransferCall {
@@ -260,6 +262,7 @@ impl TransferCall {
             governor,
             last_end: None,
             handoff_started: None,
+            held: Vec::new(),
         }
     }
 
@@ -731,24 +734,54 @@ impl TransferCall {
 
     /// [`take_resume`](Self::take_resume) without consuming the record, for a
     /// session start that may fail and be tried again.
+    ///
+    /// `return` is claimed only for a takeover that was seen to complete
+    /// (`TransferTaken`, or no transfer of ours in the story at all: a person
+    /// took the caller by hand and gave it back). A request that is still
+    /// accepted-and-unresolved when the caller comes back is a setup that
+    /// failed and has not been written down yet: the gateway returns the media
+    /// first and records `TransferUnavailable` a moment later, so the radio can
+    /// get here in between. Saying `return` then would tell OAIY the owner
+    /// spoke to the caller.
     pub fn peek_resume(&self, now: Instant, broker: &AssistanceBroker) -> Option<ResumeInfo> {
         let started = self.handoff_started?;
-        let unresolved_failure = match &self.stage {
-            Stage::Ringing(open) | Stage::Accepted(open) => matches!(
-                broker.peek_resolution(&open.request_id),
-                Some(AssistanceResolution::TransferUnavailable { .. })
-            ),
-            _ => false,
-        };
-        let via = if unresolved_failure || self.last_end == Some(End::Unavailable) {
-            Via::Failback
-        } else {
-            Via::Return
+        let via = match &self.stage {
+            Stage::Ringing(open) | Stage::Accepted(open) => {
+                match broker.peek_resolution(&open.request_id) {
+                    Some(AssistanceResolution::TransferTaken { .. }) => Via::Return,
+                    _ => Via::Failback,
+                }
+            }
+            _ if self.last_end == Some(End::Unavailable) => Via::Failback,
+            _ => Via::Return,
         };
         Some(ResumeInfo::new(
             now.saturating_duration_since(started).as_secs(),
             via,
         ))
+    }
+
+    // --- Outcomes with nobody to tell ---------------------------------------
+
+    /// Keep a terminal outcome that found no session able to carry it: the
+    /// session for the AI is gone (the handoff stopped it) or has not said
+    /// `ready` yet. It goes to the next session of this call that negotiates
+    /// `transfer_v1`; the call's end drops it. Bounded, oldest out.
+    pub fn hold_outcome(&mut self, frame: OutcomeFrame) {
+        if self.held.len() >= MAX_ATTEMPTS_PER_CALL as usize {
+            self.held.remove(0);
+        }
+        self.held.push(frame);
+    }
+
+    /// Whether an outcome is waiting for a session.
+    pub fn has_held_outcomes(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// The held outcomes, oldest first, for a session that can carry them.
+    pub fn take_held_outcomes(&mut self) -> Vec<OutcomeFrame> {
+        std::mem::take(&mut self.held)
     }
 
     /// The fresh session was started: the handoff is over.

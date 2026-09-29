@@ -797,6 +797,133 @@ fn an_endpoint_that_goes_away_mid_bridge_is_unavailable_and_the_ai_has_the_calle
     assert!(!rig.broker.is_busy());
 }
 
+/// Review finding 3. The gateway returns the media to Aokie first and writes
+/// `TransferUnavailable` a moment later, so the radio can start the fresh
+/// session in between. That session must not be told the owner handed the
+/// caller back.
+#[test]
+fn a_caller_back_before_the_gateway_records_the_failed_setup_is_a_failback_not_a_return() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+    rig.machine.note_handoff(rig.now);
+
+    // Nothing is recorded yet: the accepted request is neither taken nor failed.
+    rig.now += Duration::from_secs(9);
+    assert_eq!(
+        rig.machine.peek_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(9, Via::Failback)),
+        "a takeover nobody saw complete is not a return"
+    );
+
+    // The gateway then records the failure; the machine reports it once, and
+    // a start that has to be retried still says failback.
+    let fence = rig.fence(&request_id);
+    let mut returned = fence.clone();
+    returned.owner_epoch += 2;
+    returned.remote_revision += 3;
+    rig.broker
+        .transfer_unavailable(&request_id, &fence, returned, Some(DEVICE))
+        .unwrap();
+    let effects = rig.poll();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Unavailable, None)]);
+    assert_eq!(
+        rig.machine.take_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(9, Via::Failback))
+    );
+}
+
+/// The same failure with the order swapped, and the completed takeover, which
+/// is the only thing that makes a return.
+#[test]
+fn the_resume_says_return_only_for_a_takeover_that_was_seen_to_complete() {
+    // Failure recorded and consumed before the fresh session asks.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    let _ = rig.poll();
+    rig.machine.note_handoff(rig.now);
+    let fence = rig.fence(&request_id);
+    let mut returned = fence.clone();
+    returned.owner_epoch += 2;
+    returned.remote_revision += 3;
+    rig.broker
+        .transfer_unavailable(&request_id, &fence, returned, Some(DEVICE))
+        .unwrap();
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Unavailable, None)]);
+    assert_eq!(
+        rig.machine.peek_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(0, Via::Failback))
+    );
+
+    // Completion recorded but not yet consumed: a return.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    let _ = rig.poll();
+    rig.machine.note_handoff(rig.now);
+    let fence = rig.fence(&request_id);
+    rig.broker.transfer_taken(&request_id, &fence, DEVICE).unwrap();
+    assert_eq!(
+        rig.machine.peek_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(0, Via::Return))
+    );
+    // Consumed: still a return.
+    let _ = rig.poll();
+    assert_eq!(
+        rig.machine.peek_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(0, Via::Return))
+    );
+
+    // Ringing and unanswered when the caller is back: nothing completed.
+    let mut rig = Rig::new();
+    let (_request_id, _) = rig.ring();
+    rig.machine.note_handoff(rig.now);
+    assert_eq!(
+        rig.machine.peek_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(0, Via::Failback))
+    );
+}
+
+/// Review finding 3, second half: the failure that arrives after the fresh
+/// session has started is still owed to OAIY. The machine holds it for the next
+/// session that negotiates the contract and drops it with the call.
+#[test]
+fn an_outcome_with_no_session_to_carry_it_is_held_in_order_and_not_kept_past_the_bound() {
+    let frame = |outcome: Outcome| OutcomeFrame {
+        request_id: "assist_1".into(),
+        outcome,
+        message: None,
+        at_ms: 1,
+    };
+    let mut machine = TransferCall::new(Arc::new(Governor::default()));
+    assert!(!machine.has_held_outcomes());
+    machine.hold_outcome(frame(Outcome::Unavailable));
+    machine.hold_outcome(frame(Outcome::Cancelled));
+    assert!(machine.has_held_outcomes());
+    let taken = machine.take_held_outcomes();
+    assert_eq!(
+        taken.iter().map(|frame| frame.outcome).collect::<Vec<_>>(),
+        vec![Outcome::Unavailable, Outcome::Cancelled],
+        "oldest first"
+    );
+    assert!(!machine.has_held_outcomes(), "and taken once");
+
+    // A call opens at most a handful of requests; the holder never grows past
+    // that, and it is the oldest that goes.
+    assert_eq!(MAX_ATTEMPTS_PER_CALL, 3);
+    machine.hold_outcome(frame(Outcome::Unavailable));
+    machine.hold_outcome(frame(Outcome::Cancelled));
+    machine.hold_outcome(frame(Outcome::Expired));
+    machine.hold_outcome(frame(Outcome::Declined));
+    let held = machine.take_held_outcomes();
+    assert_eq!(
+        held.iter().map(|frame| frame.outcome).collect::<Vec<_>>(),
+        vec![Outcome::Cancelled, Outcome::Expired, Outcome::Declined]
+    );
+}
+
 #[test]
 fn the_ai_resumes_after_a_return_and_after_a_failure_and_only_when_there_was_a_handoff() {
     // Nothing to resume from before any handoff.
