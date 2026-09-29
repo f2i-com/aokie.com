@@ -3,142 +3,218 @@
 <p align="center"><strong>Your phone. A local AI receptionist. An editable front desk.</strong></p>
 
 <p align="center">
-  <a href="https://formlogic.com/aokie">Setup guide</a> ·
-  <a href="https://formlogic.com/packs/aokie-receptionist">Receptionist app</a> ·
+  <a href="#install-it-into-oaiy">Install</a> ·
   <a href="docs/HARDWARE.md">Supported hardware</a> ·
-  <a href="#build-from-source">Build from source</a>
+  <a href="#build-from-source">Build from source</a> ·
+  <a href="docs/README.md">Documentation</a> ·
+  <a href="https://formlogic.com/aokie">Setup guide</a>
 </p>
 
-Aokie connects a supported Bluetooth USB adapter and your existing mobile phone to a Windows PC. It handles incoming and outgoing conversations through **OAIY**, then sends calls, messages, transcripts and appointment requests into **FormLogic**. The front desk is a **Softn app**: use it as supplied, download its source, or integrate its forms into another app.
+Aokie Phone Bridge turns the mobile your business already uses into an AI front desk.
+A USB Bluetooth dongle on a Windows PC pairs with the phone; Aokie answers and places
+its calls, sends and reads its texts, and reads its contacts. It runs as a plugin
+inside **OAIY Desktop** (or FormLogic Desktop), where OAIY's voice and Front desk agent
+talk to callers, and it sends every call, text and transcript on to **FormLogic**. The
+phone keeps its number: there is nothing to port and no SIP.
 
 <p align="center">
-  <img src="docs/readme-assets/front-desk-demo-desktop.png" alt="Actual Aokie front desk in FormLogic, showing fictional calls, a missed call, navigation and the Download editable app button" width="100%" />
-  <br /><sub>Actual hosted Aokie interface, September 2026. Names and records are fictional browser-only demo data.</sub>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/readme-assets/receptionist-overview-dark.png" />
+    <img src="docs/readme-assets/receptionist-overview-light.png" alt="The Aokie receptionist screen's Overview: ready for calls, calls going to OAIY's Front desk, a live call with a second caller waiting, the paired phone and all events delivered" width="100%" />
+  </picture>
+  <br /><sub>The receptionist screen, with a live call going to OAIY's Front desk and a second caller waiting. Stub host and fictional data.</sub>
 </p>
 
-**Hardware beta · Windows 10/11 x64 · Bring your own AI · Auto-answer is opt-in**
+**Hardware beta · Windows 10/11 x64 · Pre-1.0 · Auto-answer and outbound calls are opt-in**
 
-## One connected front desk
+## What it does
 
-| Part | What it does |
+- **Answers and places calls.** Answer, reject and end calls from the screen, or let
+  the receptionist pick up by itself. Outbound calls speak a set opening line and wait
+  for the other person to talk first, behind an off-by-default switch, quiet hours
+  and a daily limit.
+- **Hands the conversation to OAIY.** On the OAIY route the call's audio streams to
+  OAIY's voice gateway: OAIY Voice hears and speaks, and OAIY's Front desk agent
+  answers from your business notes. Aokie's own lines (a screened caller's message,
+  hold announcements) are said in the same voice.
+- **Keeps the conversation natural.** Callers can interrupt, and the receptionist
+  yields; echo cancellation and speech pre-roll keep quiet words. Transcripts keep
+  only the part of a reply the caller actually heard, and mark interruptions and
+  corrections.
+- **Texts and contacts.** Receives and sends SMS over MAP and reads the phone book over
+  PBAP. A text marked sent means the phone accepted it, not that the carrier delivered
+  it; a send that is refused is reported back as failed, never left queued.
+- **Takes appointment requests.** Collects the caller's name, service, date and time,
+  and queues a checked request for the connected app. A request is not a confirmed
+  booking.
+- **Call waiting and hold.** With the settings on, a second caller shows as waiting, the
+  switchboard swaps between callers, and an automatic hold queue can juggle them.
+  Carrier and handset support matter.
+- **Screens callers.** Blocked numbers, callers outside an accept pattern and, if you
+  choose, withheld numbers hear a short message and are refused; they never reach the
+  agent.
+- **Asks first.** The radio stays off until consent is recorded, and each use
+  (Bluetooth, contacts, texts, transcription, recording, remote captions) is chosen
+  explicitly.
+- **Loses nothing.** Every call and text event is written to a local SQLite outbox
+  before it is sent, with transcripts and texts encrypted at rest (Windows DPAPI), and
+  re-delivered until the host acknowledges it.
+- **Lets a person take over.** Aokie Companion, a phone or desktop app, can listen to a
+  live call or take it over and hand it back.
+
+### Who talks to the caller
+
+| Route | Who hears, decides and speaks |
 |---|---|
-| **Aokie phone bridge** | Owns Bluetooth call audio, SMS, the voice conversation and a durable event outbox. |
-| **OAIY Desktop** | Runs the plugin, supervises local services, connects AI providers and executes connected flows. |
-| **FormLogic** | Hosts the app, applies permissions, stores records and runs backend logic around each conversation. |
-| **Softn app** | Provides the editable front desk UI and logic, connected to FormLogic through the host session. |
+| **OAIY** (the setup wizard's last step turns it on) | OAIY Voice hears and speaks; OAIY's Front desk agent answers, with the model loaded in OAIY's Engines. |
+| **Aokie's own speech** (the `voice` build) | Parakeet speech recognition and Pocket TTS or sherpa voices inside the plugin, with any OpenAI-compatible language model (tested with Qwen3.5-9B GGUF, Q4, on a local server). |
+| **Flows only** | No AI receptionist: your flows, or you through the screen, speak to the caller. |
 
-Your phone keeps its number. There is no number port or SIP migration. Calls still arrive on the mobile; Aokie supplies the conversation and FormLogic supplies the business workflow.
+Model and hardware requirements depend on what you choose. Remote providers receive only
+the text or audio the enabled operation needs.
 
-## Conversations that keep moving
+## Supported hardware
 
-- **Incoming and outbound calls.** Answer, reject or end a call from the console. An Aokie-initiated outbound call waits for the recipient to speak before introducing itself.
-- **Interruptions and overlap.** With barge-in enabled, Aokie keeps capturing caller speech while it talks and can yield to a correction. Echo cancellation and speech pre-roll help preserve quiet words.
-- **Useful transcripts.** Caller and assistant turns are stored with overlap, correction and interrupted-reply labels. The live console keeps a bounded view; the connected app holds the durable records.
-- **Appointment requests.** Collect the caller's name, service, date, time and agreement, then queue a validated request for the connected flow. A request is not a confirmed booking.
-- **SMS and follow-ups.** Receive messages, prepare AI reply drafts for approval and send approved texts. Configured flows can create missed-call callback tasks and outbound attempts.
-- **Visible call waiting.** The console shows waiting and held callers, plus whether a caller switch is still being confirmed by the phone. Carrier and handset support matter.
+- **A PC:** Windows 10 or 11, x64.
+- **A USB Bluetooth dongle** bound to the WinUSB driver. Aokie drives it with its own
+  Bluetooth stack, and this is the only path that carries call audio: Windows 11 25H2
+  no longer lets applications reach Bluetooth call audio. The dongle is dedicated to
+  Aokie while it is bound; **Restore driver** gives it back to Windows.
+- **The business mobile:** Android or iPhone with Bluetooth hands-free calling (HFP),
+  and message access (MAP) and phone book access (PBAP) for texts and contacts. Tested
+  most with a Pixel 9a; there is no certified phone list yet.
 
-The normal conversation uses the plugin's voice loop. FormLogic flows handle business work such as recording an appointment, summarising a call or preparing a follow-up; they do not need to generate a second reply over the live AI.
+| Chipset | VID:PID | Tier |
+|---|---|---|
+| Broadcom BCM20702 | `0a5c:21e8`, `0a5c:21ec` | Certified: answer, hear, speak and SMS run end to end |
+| Realtek RTL8761 | `0bda:8771` | Beta: enumerates and pairs; call audio may vary by firmware |
+| Realtek RTL8821CE | `0bda:c822` | Beta |
+| CSR CSR8510 A10 | `0a12:0001` | Beta |
 
-## The app belongs in your workflow
+Read [docs/HARDWARE.md](docs/HARDWARE.md) before changing a driver. It covers the tiers,
+the managed-beta path for dongles not in the catalog, Linux, the native Windows
+Bluetooth backend (texts, contacts and call control without a driver, but no call
+audio), and known phone issues.
 
-The front desk brings **Calls, Appointments, Messages, Transcripts, Follow-ups and Device logs** together. Search the current page, browse older records, open details and jump into the full tool for a record type. The same interface adapts to mobile screens.
+## How it fits together
 
-<p align="center">
-  <img src="docs/readme-assets/appointments-demo-desktop.png" alt="Aokie appointment requests with fictional names, services and requested dates awaiting confirmation" width="100%" />
-  <br /><sub>Actual appointment view with fictional demo requests. Requested and confirmed appointments remain distinct.</sub>
-</p>
+```text
+  Business mobile
+        │  Bluetooth: calls (HFP/SCO), texts (MAP), contacts (PBAP)
+        ▼
+  USB Bluetooth dongle (WinUSB)
+        │
+        ▼
+  Aokie Phone Bridge     aokie-plugin.exe: the radio, the call loop, the event outbox
+        │                and the receptionist screen (this repository)
+        │  JSON-RPC 2.0 over stdio: commands in, events out
+        ▼
+  OAIY Desktop           hosts the plugin, its screen and its setup wizard;
+        │                OAIY Voice and the Front desk agent answer calls
+        │  events, flow runs
+        ▼
+  FormLogic              the Aokie Receptionist app: calls, texts, transcripts,
+                         appointments, follow-ups
+```
 
-| Start with Aokie | Add Aokie to an existing app |
+| Part | What it owns |
 |---|---|
-| Install the **Aokie Receptionist** starter in FormLogic. | Use App Studio's app composition to share the Aokie forms into the destination app. |
-| Connect OAIY and configure the receptionist settings and flows. | Keep the existing app's home and navigation, and add the front desk where it fits. |
-| Use **Download editable app** to get the Softn project. | Shared forms keep their records and permissions. Review automation bindings separately. |
+| **Aokie Phone Bridge** (this repo) | The Bluetooth link, call audio, texts and contacts, the call loop, the durable event outbox, and the receptionist screen. |
+| **OAIY Desktop** | Runs the plugin and shows its screen and setup wizard. Its voice gateway, OAIY Voice and Front desk agent answer calls, and it runs flows. FormLogic Desktop can host the plugin instead, over the same protocol. |
+| **FormLogic** | The business side: records, permissions, flows and the front desk app. |
 
-The editable project contains `.ui` and `.logic` source plus the FormLogic connection declaration. Authentication stays in the host session; the export does not embed that session's credentials. The template lives in the [Softn Aokie workspace](https://github.com/f2i-com/softn.com/tree/main/examples/aokie-workspace), while the connected starter and business flows live in [FormLogic](https://github.com/f2i-com/formlogic.com).
+The plugin speaks JSON-RPC 2.0 over newline-delimited stdio. Its manifest is at
+`schemaVersion` 4: it provides the `phone` and `calendar` modules and declares its setup
+wizard. Its commands, events, settings schema and default persona are frozen in
+[docs/contracts](docs/contracts/), with test-locked copies in the FormLogic repository.
+See [Architecture](docs/ARCHITECTURE.md) and the
+[plugin contract](docs/FORMLOGIC_PLUGIN_CONTRACT.md).
+
+### The front desk in FormLogic
+
+The **Aokie Receptionist** starter in FormLogic brings Calls, Appointments, Messages,
+Transcripts, Follow-ups and Device logs together, and works at phone width too. It is a
+Softn app: use it as supplied, add its forms to an existing app with App Studio, or use
+**Download editable app** for its `.ui` and `.logic` source. The template lives in the
+[Softn Aokie workspace](https://github.com/f2i-com/softn.com/tree/main/examples/aokie-workspace),
+and the starter and its flows in [FormLogic](https://github.com/f2i-com/formlogic.com).
 
 <p align="center">
-  <img src="docs/readme-assets/front-desk-demo-mobile.png" alt="Actual mobile Aokie front desk with appointment navigation, request status and fictional demo records" width="320" />
-  <br /><sub>The same hosted app at phone width, using the same fictional demo records.</sub>
+  <img src="docs/readme-assets/front-desk-demo-desktop.png" alt="The Aokie front desk in FormLogic, showing fictional calls, a missed call and the Download editable app button" width="100%" />
+  <br /><sub>The hosted FormLogic front desk, September 2026, with fictional demo records.</sub>
 </p>
 
-## See what is connected in OAIY
+## Install it into OAIY
+
+1. **Get a plugin bundle:** a release zip, `aokie-plugin-windows-<version>.zip`, or one you
+   [build](#build-from-source).
+2. **Install it.** In OAIY Desktop, open **Connections → Plugins → Install a plugin** and
+   choose the bundle's folder, `.zip` or `.tar.gz` (the Setup page offers the same as
+   **Install a plugin from a folder**). Installing a plugin installs code the computer
+   runs, so install only a bundle you trust. Installing a newer bundle over it updates it
+   in place; never edit files inside an installed bundle, because its signature covers
+   every file ([SECURITY.md](SECURITY.md)).
+3. **Follow the setup wizard.** It opens by itself after the install. Each step checks
+   itself once it is true, and the steps inside the plugin show a single tab of the
+   receptionist screen:
+
+   | Step | What happens |
+   |---|---|
+   | What it may do | OAIY lists the plugin's permissions to accept. |
+   | Consent | Choose what the receptionist may access and where call data may go. Done once consent is recorded and enforced. |
+   | Hearing and speaking | OAIY checks for the OAIY Voice service and a language model in Engines. |
+   | Bluetooth dongle | Install the dongle's WinUSB driver. Shown only while the transport is the dongle; done once the radio is up. |
+   | Pair your phone | On the phone, pair with **Aokie AI Assistant** and confirm that the codes match. Done once the phone is connected. |
+   | How calls are handled | Optional: pick up by itself, let callers interrupt, let the agent end calls. |
+   | Your business | Its name, opening hours and services, as callers hear them. |
+   | Answer calls and texts with OAIY | Sends calls and texts to OAIY's Front desk. |
+
+4. **Test the whole path.** Make a test call, read the transcript, and make a fictional
+   appointment request; test texts only with a number you control. Then turn on the
+   automation you want (auto-answer, outbound calls, call waiting) one at a time.
 
 <p align="center">
-  <img src="docs/readme-assets/receptionist-overview-light.png" alt="The Aokie receptionist screen's Overview: ready for calls, calls going to OAIY's Front desk, a live call with a second caller waiting, and all events delivered" width="100%" />
-  <br /><sub>The receptionist screen with a stub host and fictional data, September 2026.</sub>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/readme-assets/receptionist-setup-pairing-dark.png" />
+    <img src="docs/readme-assets/receptionist-setup-pairing-light.png" alt="The Pair your phone step in setup mode: the receptionist screen without its tab bar, asking to confirm pairing code 482913" width="720" />
+  </picture>
+  <br /><sub>The Pair your phone step: the receptionist screen in setup mode, as OAIY's wizard shows it. Stub host and fictional data.</sub>
 </p>
 
-The Overview reports plugin health, phone connection, AI readiness, delivery backlog and live call state. Phone setup guides pairing, Settings selects the voice and AI endpoints, and Consent controls the allowed data use. Failed health checks show the problem instead of leaving the screen on “Starting”. Provider selections use the connected OAIY gateway address, including a custom local port.
-
-Messages marked **sent** mean the phone accepted the send operation; that status is not a carrier delivery receipt. Drafts remain marked **Needs approval** until the configured approval step is completed.
-
-## Bring your own AI
-
-The voice pipeline can run locally or use endpoints you explicitly configure:
-
-| Stage | Current local test configuration |
-|---|---|
-| Language model | Qwen3.5-9B GGUF, Q4, through a local OpenAI-compatible server |
-| Speech recognition | NVIDIA Parakeet through a local ONNX speech service |
-| Speech synthesis | Pocket TTS through a local speech service |
-| Runtime and routing | OAIY Desktop, with local services or configured provider profiles |
-
-These are tested choices, not required model purchases. Hardware requirements depend on the selected models and inference runtimes. A GPU can accelerate supported engines; selecting a local endpoint alone does not guarantee GPU execution. Remote providers receive the text or audio required by the enabled operation.
-
-## Set it up
-
-1. **Prepare Windows and a supported external USB Bluetooth adapter.** Check the [hardware guide](docs/HARDWARE.md) before changing a driver. The supported voice path uses the WinUSB dongle transport.
-2. **Run [OAIY Desktop](https://github.com/f2i-com/oaiy.com)** and install the Aokie plugin package. For a source build, see the instructions below.
-3. **Configure the AI and speech services.** Start the selected local services or connect a provider, then select the corresponding endpoints in Aokie Settings.
-4. **Pair the business mobile.** Open Phone setup, start pairing and confirm matching codes. Check that both the Bluetooth link and voice pipeline become ready.
-5. **Install the Aokie Receptionist starter in FormLogic.** Connect OAIY to the intended FormLogic app and review the app's receptionist settings and flow bindings.
-6. **Test the whole path.** Make a test call, check the transcript, submit a fictional appointment request and verify its record in the app. Test messaging only with a number you control.
-7. **Enable the behaviour you want.** Auto-answer, outbound calling, messaging and interruption settings are explicit choices. Start with manual calls, then enable automation after reviewing its flow and result.
-
-Keep OAIY running on the computer attached to the phone. FormLogic supplies the hosted app and records; the local computer supplies the phone connection and any local AI services.
-
-## What has been checked
-
-The current local integration has exercised incoming and outbound calls with a Pixel 9a and a Broadcom USB adapter, including recipient-first greetings, interruptions, transcript delivery, sending a test SMS and receiving its reply. Local LLM-driven booking tests also exercised validated appointment requests reaching the connected app. The screenshots above show the current implementation, not a proposed mockup.
-
-Remaining limits are explicit:
-
-- Hardware and mobile-network behaviour varies. End-to-end carrier call waiting/hold and automatic missed-call callbacks still need additional live validation; code tests alone do not prove those paths on every phone.
-- Appointment requests require staff or an intentionally configured backend to confirm them. A model-generated readback is not confirmation.
-- OAIY's current provider gateway does not expose the realtime WebSocket voice route; the working local path uses separate LLM, STT and TTS services.
-- Aokie is pre-1.0. Release packaging, code signing and supported hardware should be checked before a wider rollout. See [hardware compatibility](docs/HARDWARE.md) and [security boundaries](SECURITY.md).
-
-Essential events use a write-before-emit SQLite outbox. Call IDs and generation stamps fence delayed work to its original conversation, while idempotency protects the connected records from duplicate delivery. See [Architecture](docs/ARCHITECTURE.md) for the detailed runtime and recovery rules.
-
----
+Keep OAIY running on the computer the dongle is plugged into. For the FormLogic side,
+install the Aokie Receptionist starter and connect OAIY to that app; the
+[setup guide](https://formlogic.com/aokie) walks through it.
 
 ## Build from source
 
-Aokie's radio runtime uses WinUSB on Windows and libusb on Linux. The managed
-beta can probe an uncatalogued, external USB Bluetooth HCI controller after an
-explicit operator opt-in; "any dongle" is a compatibility goal rather than a
-guarantee because controller firmware, endpoint layouts and SCO support vary.
+You need Windows 10/11 x64 with:
 
-### Test gates
+- Rust 1.88 or later (MSVC toolchain) and the Visual Studio 2022 C++ build tools.
+- LLVM, for `bindgen`: `.cargo/config.toml` points `LIBCLANG_PATH` at
+  `C:\Program Files\LLVM\bin`.
+- For the `voice` feature: CMake for the sherpa-onnx build (or `SHERPA_LIB_PATH` pointing
+  at an existing build; see [dependency maintenance](docs/dependency-maintenance.md)), and
+  at run time ONNX Runtime and the speech models.
+- Node.js 20 for the Companion app and the screen checks.
 
-```bash
-cargo test --workspace
-cargo check -p aokie-plugin --features voice
-cargo test -p aokie-plugin --features voice -- --test-threads=2
-node scripts/check-receptionist-ui.mjs
-node scripts/check-receptionist-setup.mjs
-cargo test -p aokie-protocol -p aokie-mobile
-(cd apps/aokie-mobile && npm ci && npm test && npm run build)
-cargo clippy --workspace --all-targets
-cargo audit
+The plugin is left out of the workspace's `default-members`, so a bare `cargo build`
+builds only five library crates. Name the package:
+
+```powershell
+cargo build -p aokie-plugin                                     # the light plugin
+cargo build -p aokie-plugin --features voice                    # with Aokie's own speech
+cargo build -p aokie-plugin --features voice,managed-beta-driver
+cargo build -p aokie-voice-server                               # loopback speech service
 ```
 
-Run checks manually against both the default plugin surface and the `voice` feature. Automatic CI is temporarily paused; the CI and self-host smoke workflows remain available through GitHub Actions **Run workflow**. Review deny-level Clippy findings and RustSec advisories before releasing.
+`voice,managed-beta-driver` is the combination the managed pilots ship. Debug builds need
+no pinned hashes; release builds do, as below. If a voice build fails because Windows no
+longer has `wmic`, run `scripts/repair-sherpa-cmake.ps1` and build again.
 
 ### Release build
 
-Build the elevated driver helper first, pin its final SHA-256 into the plugin, then build the voice-enabled plugin:
+Build the elevated driver helper first, pin its final SHA-256 into the plugin, then build
+the voice-enabled plugin:
 
 ```powershell
 $env:AOKIE_EXPECTED_HELPER_SHA256 = 'helper-build-placeholder'
@@ -147,14 +223,18 @@ $env:AOKIE_EXPECTED_HELPER_SHA256 = (Get-FileHash target/release/aokie-driver-he
 cargo build -p aokie-plugin --features voice --release
 ```
 
-The placeholder is used only while compiling the helper itself; the helper never dispatches an elevation request. A production helper also requires `AOKIE_EXPECTED_DRIVER_INF_SHA256` and `AOKIE_EXPECTED_DRIVER_CAT_SHA256` for the exact Microsoft-signed driver pair. Sign the helper before calculating its final hash, then build the plugin with that post-sign hash. The release voice bundle also needs ONNX Runtime, the Parakeet assets and the pocket-tts assets in the expected model directories.
+The placeholder is used only while compiling the helper itself; the helper never
+dispatches an elevation request. A production helper also requires
+`AOKIE_EXPECTED_DRIVER_INF_SHA256` and `AOKIE_EXPECTED_DRIVER_CAT_SHA256` for the exact
+Microsoft-signed driver pair in `drivers/winusb`. Sign the helper before calculating its
+final hash, then build the plugin with that post-sign hash.
 
 ### Managed-beta driver build
 
-For administrator-managed pilots without a Microsoft-signed catalog, build the
-distinct managed-beta flavour. It keeps the helper hash pin and privileged
-target checks, but permits the helper's trusted per-device INF renderer and a
-locally generated catalog certificate:
+For administrator-managed pilots without a Microsoft-signed catalog, build the distinct
+managed-beta flavour. It keeps the helper hash pin and the privileged target checks, but
+permits the helper's trusted per-device INF renderer and a locally generated catalog
+certificate:
 
 ```powershell
 $env:AOKIE_EXPECTED_HELPER_SHA256 = 'helper-build-placeholder'
@@ -163,57 +243,130 @@ $env:AOKIE_EXPECTED_HELPER_SHA256 = (Get-FileHash target/release/aokie-driver-he
 cargo build -p aokie-plugin --features voice,managed-beta-driver --release
 ```
 
-The installed app must also receive `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`; the
-compile-time feature alone never authorises trust-store changes. To try an
-uncatalogued external dongle, additionally set:
+The installed app must also receive `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`; the compile-time
+feature alone never authorises trust-store changes. To try an external dongle that is not
+in the catalog, also set:
 
 ```powershell
 $env:AOKIE_INSTALL_UNKNOWN_DONGLE = 'YES_I_REBIND_AT_MY_OWN_RISK'
 ```
 
-Unknown-device mode still refuses absent devices, hubs, composite/internal
-radios and non-Bluetooth device classes. Use **Restore driver** before returning
-the dongle to the operating system's normal Bluetooth stack.
+Unknown-device mode still refuses absent devices, hubs, composite or internal radios and
+non-Bluetooth device classes. Use **Restore driver** before returning the dongle to
+Windows' own Bluetooth stack.
 
-## Workspace map
+### The release bundle
 
-| Crate | Responsibility |
+The `plugin-release` job in [.github/workflows/ci.yml](.github/workflows/ci.yml) builds,
+signs and packages the bundle: `aokie-plugin.exe`, `aokie-driver-helper.exe` and
+`aokie-voice-server.exe`, `manifest.json`, `definitions/`, `ui/`, the driver package, ONNX
+Runtime and sherpa-onnx DLLs, `models-manifest.json` and `MODEL_LICENSES.md`, then
+`SHA256SUMS.txt`, `release-manifest.json` and a `package-manifest.json` signed by
+`package-signer`. `scripts/verify-bundle-assets.ps1 -Bundle <dir> -Voice` checks that
+every file the manifest names is present.
+
+## Test
+
+```powershell
+cargo test --workspace
+cargo check -p aokie-plugin --features voice,managed-beta-driver
+cargo test -p aokie-plugin --features voice -- --test-threads=2
+node scripts/check-receptionist-ui.mjs
+node scripts/check-receptionist-setup.mjs
+cargo test -p aokie-protocol -p aokie-mobile
+cd apps/aokie-mobile; npm ci; npm test; npm run build; cd ../..
+cargo clippy --workspace --all-targets
+cargo audit
+```
+
+The two `node` checks run the receptionist screen, in normal mode and as a setup-wizard
+step, against a stub host: no device, network or plugin is touched.
+`scripts/check-release.ps1` runs the whole release bar in order: the feature-combination
+compile matrix, the tests, clippy, the cross-repository contract check (it needs a
+FormLogic checkout beside this one, or `FORMLOGIC_REPO`) and the self-host render test.
+Add `-Companion`, `-Audit`, `-Fmt`, `-Msrv` or `-AndroidTarget` for the opt-in gates.
+
+Automatic CI is paused: the CI and self-host smoke workflows run from GitHub Actions
+**Run workflow**. Review deny-level Clippy findings and RustSec advisories before
+releasing.
+
+## Status and limits
+
+Incoming and outbound calls have been exercised with a Pixel 9a and a Broadcom dongle,
+including greetings that wait for the other person, interruptions, transcript delivery,
+and a test text and its reply. Local booking tests sent checked appointment requests to
+the connected app.
+
+- Hardware and mobile networks vary. Carrier call waiting and hold, and automatic
+  missed-call callbacks, still need more live testing; code tests alone do not prove
+  them on every phone.
+- Appointment requests need staff, or a deliberately configured backend, to confirm them.
+  A model reading a booking back is not a confirmation.
+- On Android 17, the Google Messages beta can leave texts sent through Aokie stuck on
+  "Sending…"; see [HARDWARE.md](docs/HARDWARE.md#android-17-texts-stuck-on-sending-google-messages-beta).
+- Aokie is pre-1.0. Check release packaging, code signing and supported hardware before a
+  wider rollout.
+
+## Repository layout
+
+| Path | What it is |
 |---|---|
-| `aokie-plugin` | OAIY Desktop plugin process, JSON-RPC connector, call state, voice agent and durable outbox |
-| `aokie-protocol` | Canonical Companion snapshot/command models, revision fences and cross-language fixtures |
-| `aokie-realtime` | Self-hostable authenticated Companion WSS gateway, bounded replay and Desktop/mobile routing |
-| `aokie-bluetooth` | WinUSB HCI/ACL/SCO runtime, HFP, audio codecs, MAP/PBAP protocol support and recovery |
-| `aokie-dongle` | Dongle discovery, guarded driver installation, restoration and event mapping |
-| `aokie-ai` | Local ONNX speech-to-text and text-to-speech runtimes |
-| `aokie-voice-server` | Loopback OpenAI-compatible STT/TTS service |
-| `aokie-core` | Tauri-free shared policy, catalog, contracts, security and native logic |
-| `aokie-audio`, `aokie-db` | Shared audio and storage infrastructure |
-| `aokie-receptionist` | Reserved shared receptionist crate surface; the active business UI and workflows live in FormLogic |
-| `apps/aokie-mobile` | Aokie Companion Tauri v2 shell, realtime client, safety state, demo and native integration seams |
-
-The plugin speaks JSON-RPC 2.0 over newline-delimited stdio. Its events, commands, errors, settings schema and default persona are frozen in `docs/contracts/*.json`, with test-locked copies in the FormLogic repository.
+| `crates/aokie-plugin` | The plugin process: JSON-RPC over stdio, the connector commands, the call loop, the outbox, `manifest.json` and the receptionist screen (`ui/receptionist`). |
+| `crates/aokie-bluetooth` | Aokie's own Bluetooth stack: WinUSB and libusb transport, HCI, L2CAP, RFCOMM and SDP, HFP and SCO voice, MAP and PBAP, and a pure-Rust mSBC codec. |
+| `crates/aokie-dongle` | Dongle discovery, the guarded WinUSB driver install and restore with its elevated helper, and the radio's event bridge. |
+| `crates/aokie-winbt` | The native Windows Bluetooth backend (WinRT Calls, WASAPI, RFCOMM); built only when asked for. |
+| `crates/aokie-core` | The Tauri-free foundation the other crates share: policy, the dongle catalog, contracts and security. |
+| `crates/aokie-ai` | Language, speech-recognition and speech providers: the OpenAI-compatible client and the in-process ONNX, Candle and sherpa engines. |
+| `crates/aokie-audio` | Echo cancellation, voice activity detection, recording and audio buffers. |
+| `crates/aokie-db` | The SQLite schema for calls, transcripts, contacts and texts, with search and retention. |
+| `crates/aokie-voice-server` | A loopback-only, OpenAI-compatible speech service for Aokie's own models. |
+| `crates/aokie-receptionist` | Appointment calendar and orders logic, prompt building and spoken-date parsing. |
+| `crates/aokie-protocol` | Companion snapshot and command models, revision fences and shared fixtures. |
+| `crates/aokie-realtime` | The self-hostable Companion signalling gateway. |
+| `crates/aokie-media` | The native WebRTC media bridge shared by the desktop and Companion. |
+| `crates/package-signer` | Ed25519 signing and verification of release bundles. |
+| `crates/transcribe-rs` | A vendored fork of transcribe-rs: ONNX speech-recognition engines. |
+| `apps/aokie-mobile` | Aokie Companion (Tauri 2, React and TypeScript). |
+| `deploy/companion-self-host` | Docker Compose for the Companion gateway, Traefik and a TURN relay. |
+| `drivers/winusb` | The production WinUSB driver package. |
+| `scripts` | The screen checks, the release bar, the contract check and bundle tools. |
+| `docs` | The guides, contracts and README pictures. |
+| `vendor/glib` | GLib 0.18.5 with a security fix, patched into the workspace. |
 
 ## Documentation
 
+The [documentation index](docs/README.md) lists every guide. The main ones:
+
 | Guide | What it covers |
 |---|---|
-| [Architecture](docs/ARCHITECTURE.md) | Process shape, call state, voice pipeline, durability and invariants |
-| [Supported hardware](docs/HARDWARE.md) | Dongle catalog, compatibility tiers, phone notes and Windows timing |
-| [FormLogic plugin contract](docs/FORMLOGIC_PLUGIN_CONTRACT.md) | Cross-repository commands, events, manifests and obligations |
-| [Aokie Companion](apps/aokie-mobile/README.md) | Mobile shell, current capabilities, security boundaries and local builds |
-| [Security policy](SECURITY.md) | Supported versions, security boundaries and private reporting |
-| [FormLogic Aokie operations](https://github.com/f2i-com/formlogic.com/blob/main/docs/AOKIE_OPERATIONS.md) | Stack supervision, deployment, diagnostics, retention and event recovery |
-| [FormLogic troubleshooting](https://github.com/f2i-com/formlogic.com/blob/main/docs/AOKIE_TROUBLESHOOTING.md) | Concrete call, audio, flow and hardware failures |
+| [Architecture](docs/ARCHITECTURE.md) | The process and its host, call state, the voice pipeline, the OAIY route and durability. |
+| [Plugin contract](docs/FORMLOGIC_PLUGIN_CONTRACT.md) | The manifest, setup wizard, commands, events and the host's obligations. |
+| [Supported hardware](docs/HARDWARE.md) | Dongles and tiers, phones, Windows and Linux notes. |
+| [Conversation timing](docs/CONVERSATION_TIMING.md) | Interruptions, pauses, acknowledgements and spoken dates. |
+| [Aokie Companion](apps/aokie-mobile/README.md) | The mobile and desktop app, its capabilities and security boundaries. |
+| [Security policy](SECURITY.md) | Supported versions, security boundaries, bundle signing and private reporting. |
+| [FormLogic Aokie operations](https://github.com/f2i-com/formlogic.com/blob/main/docs/AOKIE_OPERATIONS.md) | Stack supervision, deployment, diagnostics, retention and event recovery. |
+| [FormLogic troubleshooting](https://github.com/f2i-com/formlogic.com/blob/main/docs/AOKIE_TROUBLESHOOTING.md) | Concrete call, audio, flow and hardware failures. |
 
-## Security reporting
+## Security
 
-Please report suspected vulnerabilities privately to **the@lance.name** with `SECURITY` in the subject. Do not open a public issue for a security report.
+Please report suspected vulnerabilities privately to **the@lance.name** with `SECURITY`
+in the subject. Do not open a public issue for a security report.
 
-## License
+## Licence
 
-Aokie is **proprietary software** (`LicenseRef-Proprietary`) and is not open source. The workspace is pre-1.0 and is not published to crates.io. Contact FormLogic for licensing terms.
+- Aokie is **proprietary software** (`LicenseRef-Proprietary`) and is not open source.
+  The workspace is pre-1.0 and is not published to crates.io. Contact FormLogic for
+  licensing terms.
+- The speech models are downloaded at pinned revisions under their own licences: the
+  NVIDIA Open Model License for Parakeet, and CC BY 4.0 (model) with Apache 2.0 (export
+  code) for Pocket TTS. See [MODEL_LICENSES.md](docs/MODEL_LICENSES.md).
+- Vendored code keeps its licence: `crates/transcribe-rs` is MIT (a fork of
+  andrewleech/transcribe-rs), and `vendor/glib` is MIT (see
+  [vendor/README.md](vendor/README.md)).
 
-FormLogic is maintained separately in [f2i-com/formlogic.com](https://github.com/f2i-com/formlogic.com).
+FormLogic is maintained separately in
+[f2i-com/formlogic.com](https://github.com/f2i-com/formlogic.com).
 
 ---
 
