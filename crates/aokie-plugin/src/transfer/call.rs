@@ -220,6 +220,12 @@ enum Stage {
     Accepted(Open),
 }
 
+/// An outcome waiting to be sent, and the session it was made for.
+struct Held {
+    frame: OutcomeFrame,
+    session_token: u64,
+}
+
 /// The transfers of one call. Lives in the call's context, so a new call
 /// starts with a fresh one and a parked call keeps its own.
 pub struct TransferCall {
@@ -229,7 +235,7 @@ pub struct TransferCall {
     governor: Arc<Governor>,
     last_end: Option<End>,
     handoff_started: Option<Instant>,
-    held: Vec<OutcomeFrame>,
+    held: Vec<Held>,
     /// The handoff an open request belonged to is over (its fresh session has
     /// started), so however the request ends is not the next handoff's story.
     end_is_spent: bool,
@@ -798,25 +804,36 @@ impl TransferCall {
 
     // --- Outcomes with nobody to tell ---------------------------------------
 
-    /// Keep a terminal outcome that found no session able to carry it: the
-    /// session for the AI is gone (the handoff stopped it) or has not said
-    /// `ready` yet. It goes to the next session of this call that negotiates
-    /// `transfer_v1`; the call's end drops it. Bounded, oldest out.
-    pub fn hold_outcome(&mut self, frame: OutcomeFrame) {
+    /// Keep an outcome that cannot go out yet: either no session can carry it
+    /// (the handoff stopped the session for the AI, or the fresh one has not
+    /// said `ready`), or the session it was made for has not yet been given
+    /// the answer to the tool call that named the request (an outcome never
+    /// overtakes that answer). It goes to the session that can carry it once it
+    /// negotiates `transfer_v1`; the call's end drops it. `session_token`
+    /// identifies the session it was made for (0 for none). Bounded, oldest
+    /// out.
+    pub fn hold_outcome(&mut self, frame: OutcomeFrame, session_token: u64) {
         if self.held.len() >= MAX_ATTEMPTS_PER_CALL as usize {
             self.held.remove(0);
         }
-        self.held.push(frame);
+        self.held.push(Held { frame, session_token });
     }
 
-    /// Whether an outcome is waiting for a session.
+    /// Whether an outcome is waiting.
     pub fn has_held_outcomes(&self) -> bool {
         !self.held.is_empty()
     }
 
-    /// The held outcomes, oldest first, for a session that can carry them.
-    pub fn take_held_outcomes(&mut self) -> Vec<OutcomeFrame> {
+    /// The held outcomes, oldest first, for the session `session_token`, which
+    /// can carry them now. An `accepted` is news only to the session it was
+    /// made for: a later session (after a handoff) would be told a takeover is
+    /// starting that has already ended, so it is dropped instead.
+    pub fn take_held_outcomes(&mut self, session_token: u64) -> Vec<OutcomeFrame> {
         std::mem::take(&mut self.held)
+            .into_iter()
+            .filter(|held| held.frame.outcome != Outcome::Accepted || held.session_token == session_token)
+            .map(|held| held.frame)
+            .collect()
     }
 
     /// The fresh session was started: the handoff is over, and how it ended

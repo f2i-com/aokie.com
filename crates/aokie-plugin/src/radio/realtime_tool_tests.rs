@@ -336,13 +336,14 @@ fn transfer_effects_reach_oaiy_only_as_typed_results_and_outcomes_on_a_negotiate
         None,
         &mut sink,
     );
-    // The outcome goes out at once. The answer to the tool call does not: it is
-    // queued for the completion block, which sends it only once the line the
-    // model spoke before calling has drained, like every other completion.
-    assert_eq!(
-        detached.drain(),
-        vec![crate::realtime_voice::SentControl::TransferOutcome { frame: outcome.clone() }]
-    );
+    // The answer to the tool call is queued for the completion block, which
+    // sends it only once the line the model spoke before calling has drained,
+    // like every other completion. The outcome about the request that answer
+    // names must not overtake it (review finding 9): it waits.
+    assert!(detached.drain().is_empty(), "the outcome does not go out ahead of the answer");
+    assert!(transfer.has_held_outcomes());
+    send_held_outcomes(Some(&mut lane), &mut transfer);
+    assert!(detached.drain().is_empty(), "still behind the queued answer");
     assert_eq!(
         lane.next_queued_answer(),
         Some((
@@ -354,6 +355,13 @@ fn transfer_effects_reach_oaiy_only_as_typed_results_and_outcomes_on_a_negotiate
         ))
     );
     assert_eq!(lane.next_queued_answer(), None);
+    // The completion block has sent the answer; now the outcome follows.
+    send_held_outcomes(Some(&mut lane), &mut transfer);
+    assert_eq!(
+        detached.drain(),
+        vec![crate::realtime_voice::SentControl::TransferOutcome { frame: outcome.clone() }]
+    );
+    assert!(!transfer.has_held_outcomes());
     assert_eq!(sink.lines.len(), 1, "the audit event was emitted");
     assert!(sink.lines[0].contains(crate::contract::events::CALL_ASSISTANCE_REQUESTED));
 
@@ -415,6 +423,80 @@ fn sent_outcomes(detached: &crate::realtime_voice::DetachedSession) -> Vec<Outco
         .collect()
 }
 
+/// Review finding 9. The answer to the tool call names the request; OAIY must
+/// have it before it hears anything about that request, however the turns fall.
+#[test]
+fn outcomes_follow_the_answer_that_names_their_request_and_an_accepted_is_not_replayed() {
+    let mut sink = crate::event_bridge::VecSink::default();
+    let negotiated = || {
+        let (mut lane, detached) = detached_lane(true);
+        lane.allow_transfer_sent = true;
+        lane.ready = true;
+        lane.negotiate_transfer(&features(&["transfer_v1"]));
+        (lane, detached)
+    };
+
+    // Turn 1: the ringing answer is queued (the model is still speaking).
+    let (mut lane, detached) = negotiated();
+    let mut transfer = machine();
+    apply_transfer_effects(
+        vec![Effect::ToolAnswer {
+            tool_call_id: "tool_1".into(),
+            answer: ToolAnswer { ok: true, output: serde_json::json!({"status": "ringing"}) },
+        }],
+        Some(&mut lane),
+        &mut transfer,
+        None,
+        &mut sink,
+    );
+    // Turn 2: an endpoint accepts and the media fails, both before the answer
+    // has gone out. Nothing may be sent ahead of it.
+    apply_transfer_effects(
+        vec![Effect::Outcome(frame(Outcome::Accepted))],
+        Some(&mut lane),
+        &mut transfer,
+        None,
+        &mut sink,
+    );
+    apply_transfer_effects(
+        vec![Effect::Outcome(frame(Outcome::Unavailable))],
+        Some(&mut lane),
+        &mut transfer,
+        None,
+        &mut sink,
+    );
+    assert!(sent_outcomes(&detached).is_empty());
+    // Turn 3: the completion block sends the answer; the outcomes follow, in order.
+    assert!(lane.next_queued_answer().is_some());
+    send_held_outcomes(Some(&mut lane), &mut transfer);
+    assert_eq!(sent_outcomes(&detached), vec![Outcome::Accepted, Outcome::Unavailable]);
+
+    // An acceptance held behind an answer is not replayed to a later session:
+    // the takeover it announced has ended by then.
+    let (mut first, first_detached) = negotiated();
+    let mut transfer = machine();
+    first.queue_tool_answer("tool_1".into(), TOOL_NAME, true, serde_json::json!({}));
+    apply_transfer_effects(
+        vec![Effect::Outcome(frame(Outcome::Accepted))],
+        Some(&mut first),
+        &mut transfer,
+        None,
+        &mut sink,
+    );
+    assert!(sent_outcomes(&first_detached).is_empty());
+    drop(first);
+    let (mut second, second_detached) = negotiated();
+    apply_transfer_effects(
+        vec![Effect::Outcome(frame(Outcome::Unavailable))],
+        Some(&mut second),
+        &mut transfer,
+        None,
+        &mut sink,
+    );
+    send_held_outcomes(Some(&mut second), &mut transfer);
+    assert_eq!(sent_outcomes(&second_detached), vec![Outcome::Unavailable]);
+}
+
 /// Review finding 3. A setup failure the gateway records after the fresh
 /// session has started, or before it has said `ready`, is not lost: it is
 /// kept and sent once the session negotiates the contract.
@@ -464,7 +546,7 @@ fn an_outcome_with_no_negotiated_session_waits_for_the_next_one_and_is_sent_in_o
     // A session that turns out not to implement the contract is never sent
     // anything, and what is held for it stays held for nobody.
     let mut transfer = machine();
-    transfer.hold_outcome(frame(Outcome::Unavailable));
+    transfer.hold_outcome(frame(Outcome::Unavailable), 0);
     let (mut old, old_detached) = detached_lane(true);
     old.allow_transfer_sent = true;
     old.ready = true;

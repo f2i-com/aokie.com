@@ -1087,10 +1087,10 @@ fn an_outcome_with_no_session_to_carry_it_is_held_in_order_and_not_kept_past_the
     };
     let mut machine = TransferCall::new(Arc::new(Governor::default()));
     assert!(!machine.has_held_outcomes());
-    machine.hold_outcome(frame(Outcome::Unavailable));
-    machine.hold_outcome(frame(Outcome::Cancelled));
+    machine.hold_outcome(frame(Outcome::Unavailable), 7);
+    machine.hold_outcome(frame(Outcome::Cancelled), 7);
     assert!(machine.has_held_outcomes());
-    let taken = machine.take_held_outcomes();
+    let taken = machine.take_held_outcomes(7);
     assert_eq!(
         taken.iter().map(|frame| frame.outcome).collect::<Vec<_>>(),
         vec![Outcome::Unavailable, Outcome::Cancelled],
@@ -1101,14 +1101,31 @@ fn an_outcome_with_no_session_to_carry_it_is_held_in_order_and_not_kept_past_the
     // A call opens at most a handful of requests; the holder never grows past
     // that, and it is the oldest that goes.
     assert_eq!(MAX_ATTEMPTS_PER_CALL, 3);
-    machine.hold_outcome(frame(Outcome::Unavailable));
-    machine.hold_outcome(frame(Outcome::Cancelled));
-    machine.hold_outcome(frame(Outcome::Expired));
-    machine.hold_outcome(frame(Outcome::Declined));
-    let held = machine.take_held_outcomes();
+    machine.hold_outcome(frame(Outcome::Unavailable), 7);
+    machine.hold_outcome(frame(Outcome::Cancelled), 7);
+    machine.hold_outcome(frame(Outcome::Expired), 7);
+    machine.hold_outcome(frame(Outcome::Declined), 7);
+    let held = machine.take_held_outcomes(7);
     assert_eq!(
         held.iter().map(|frame| frame.outcome).collect::<Vec<_>>(),
         vec![Outcome::Cancelled, Outcome::Expired, Outcome::Declined]
+    );
+
+    // An `accepted` is news only to the session it was made for: a later
+    // session would be told a takeover is starting that has already ended.
+    machine.hold_outcome(frame(Outcome::Accepted), 7);
+    machine.hold_outcome(frame(Outcome::Unavailable), 7);
+    let later = machine.take_held_outcomes(8);
+    assert_eq!(
+        later.iter().map(|frame| frame.outcome).collect::<Vec<_>>(),
+        vec![Outcome::Unavailable]
+    );
+    machine.hold_outcome(frame(Outcome::Accepted), 7);
+    machine.hold_outcome(frame(Outcome::Declined), 7);
+    let same = machine.take_held_outcomes(7);
+    assert_eq!(
+        same.iter().map(|frame| frame.outcome).collect::<Vec<_>>(),
+        vec![Outcome::Accepted, Outcome::Declined]
     );
 }
 

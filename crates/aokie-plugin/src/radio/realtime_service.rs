@@ -53,18 +53,22 @@ pub(super) fn transfer_env_with<'a>(
 }
 
 /// Tell OAIY, on a session that negotiated the contract, every outcome that
-/// was waiting for one. Nothing is sent to a session that has not, and nothing
-/// is dropped: the frames stay with the call's transfer machine until a
-/// session can carry them.
+/// was waiting. Nothing is sent to a session that has not negotiated, and
+/// nothing is sent while an answer to a tool call is still waiting for its
+/// turn (`ringing` names the request the outcome is about, and OAIY must have it
+/// first: the answer waits for the line the model spoke to drain, the outcome
+/// must not overtake it). Nothing is dropped: the frames stay with the call's
+/// transfer machine until a session can carry them.
 #[cfg(all(target_os = "windows", feature = "voice"))]
 pub(super) fn send_held_outcomes(
     lane: Option<&mut RealtimeCallLane>,
     transfer: &mut crate::transfer::call::TransferCall,
 ) {
-    let Some(lane) = lane.filter(|lane| lane.transfer_negotiated) else {
+    let Some(lane) = lane.filter(|lane| lane.transfer_negotiated && lane.queued_answers.is_empty())
+    else {
         return;
     };
-    for frame in transfer.take_held_outcomes() {
+    for frame in transfer.take_held_outcomes(lane.session_token) {
         if let Err(error) = lane.session.send_transfer_outcome(frame) {
             eprintln!("[aokie-plugin] transfer outcome could not be sent: {error}");
         }
@@ -101,17 +105,18 @@ pub(super) fn apply_transfer_effects(
                 }
             }
             Effect::Outcome(frame) => {
-                // Held first, then sent if a negotiated session is open now,
-                // so order is kept whichever way a frame gets out. An outcome
-                // for a session that will never negotiate the contract has no
-                // one to tell; an `accepted` is only news while it is
-                // happening, so it is never kept for a later session.
+                // Held first, then sent if a negotiated session is open and
+                // its tool answers have gone out, so order is kept whichever
+                // way a frame gets out. An outcome for a session that will
+                // never negotiate the contract has no one to tell; an
+                // `accepted` is only news to the session it was made for.
                 let can_wait = lane.as_deref().is_none_or(|lane| {
                     lane.transfer_negotiated || lane.may_negotiate_transfer()
                 }) && (frame.outcome != crate::transfer::Outcome::Accepted
                     || lane.as_deref().is_some_and(|lane| lane.transfer_negotiated));
                 if can_wait {
-                    transfer.hold_outcome(frame);
+                    let session_token = lane.as_deref().map_or(0, |lane| lane.session_token);
+                    transfer.hold_outcome(frame, session_token);
                 }
                 send_held_outcomes(lane.as_deref_mut(), transfer);
             }
@@ -1951,6 +1956,13 @@ pub(super) fn service_realtime_lane(
                     }
                 }
             }
+        }
+
+        // The answer to the transfer tool has just gone out (if it could):
+        // anything about that request that was waiting behind it follows in
+        // the same turn, in order.
+        if realtime_failure.is_none() && ctx.transfer.has_held_outcomes() {
+            send_held_outcomes(realtime_lane.as_mut(), &mut ctx.transfer);
         }
 
         // A finish_call is only a request. Desktop generates a separate,
