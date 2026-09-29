@@ -63,6 +63,11 @@ spans, spoken stop commands and urgent call controls. The acknowledgement
 policy tests cover pauses, cooldown, stale transcripts and unfinished details.
 Also run `node crates/aokie-plugin/tests/settings_ui_harness.cjs` and the
 cross-repository contract check documented in `scripts/check-contracts.mjs`.
+As of 29 September 2026 the settings harness stops before its first check: its
+stub tab registry has no `oaiy` helper, which the Settings tab now reads, so
+it needs updating before it can be relied on again.
+`node scripts/check-receptionist-ui.mjs` still checks the Settings tab's save
+logic in the meantime.
 
 For a live check, interrupt a reply with “Wait, I meant Friday afternoon,”
 then finish the sentence. Check the transcript and whether Aokie yields.
