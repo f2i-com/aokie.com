@@ -1099,6 +1099,32 @@ fn a_call_put_on_hold_takes_its_request_with_it_and_says_so() {
     assert!(!rig.machine.is_active());
     assert!(rig.poll().is_empty(), "it is said once");
 
+    // An acceptance the machine has not seen yet is reported first, then the
+    // request is withdrawn (the broker is asked before anything is trusted).
+    let mut unseen = Rig::new();
+    let (unseen_id, _) = unseen.ring();
+    unseen.accept(&unseen_id);
+    let effects = {
+        let mut env = TransferEnv {
+            broker: &unseen.broker,
+            media: &unseen.media,
+            host: &unseen.host,
+            sink: &mut unseen.sink,
+            now: unseen.now,
+            active_call_id: unseen.active.as_deref(),
+            switchboard_revision: 0,
+            host_ring_plan: true,
+            session_token: 1,
+        };
+        unseen.machine.park(&mut env)
+    };
+    assert_eq!(
+        outcomes(&effects),
+        vec![(Outcome::Accepted, None), (Outcome::Cancelled, None)],
+        "reported as it happened, then withdrawn because the call was put on hold"
+    );
+    assert!(!unseen.broker.is_busy());
+
     // Nothing open: nothing to say.
     let effects = {
         let mut env = TransferEnv {
