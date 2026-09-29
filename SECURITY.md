@@ -21,7 +21,7 @@ Pre-1.0: only `main` and the latest release receive fixes.
   is a realtime tool on the loopback call stream, not a plugin command, so it
   cannot be queued from a website through the command relay. It needs current
   `remote_assistance` and `remote_takeover` consent at every step, is limited by
-  the plugin on its own (3 requests a call, 15 seconds apart, 20 an hour), relays
+  the plugin on its own (3 requests a call, 15 seconds after the last ended, 3 an hour per caller number, 20 an hour), relays
   nothing the model or the caller said to the owner's devices (the request text
   is fixed), and offers the request only to the devices the host's ring plan
   names; a plan that names none rings nobody, whatever else it asks for (a

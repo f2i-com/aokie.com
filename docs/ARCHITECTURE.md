@@ -168,7 +168,7 @@ is queued and sent by the same drained-output gate as every other tool result.
 
 Rules that do not bend: consent must currently grant both `remote_assistance`
 and `remote_takeover` (checked at the door, after the plan, and while ringing);
-one request at a time; at most 3 a call, 15 s apart and 20 an hour, on top of
+one request at a time; at most 3 a call, 15 s between one ending and the next, 3 an hour per caller number and 20 an hour, on top of
 the host's own policy; the request text sent to the owner's devices is fixed and
 nothing the model or the caller says is relayed; a device the plan names is the
 only kind offered the transfer (a plan that toasts the desktop and names no

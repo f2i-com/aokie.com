@@ -37,6 +37,8 @@ pub(crate) struct Rig {
     pub(crate) turns: Vec<String>,
     pub(crate) owner: AokieOwnerFence,
     pub(crate) host_ring_plan: bool,
+    /// The number the caller rang from (a fictional ACMA number).
+    pub(crate) caller_number: Option<String>,
 }
 
 impl Rig {
@@ -61,6 +63,7 @@ impl Rig {
             turns: vec!["Can I speak to the owner?".into()],
             owner,
             host_ring_plan: true,
+            caller_number: Some("+61491570006".into()),
         }
     }
 
@@ -84,7 +87,7 @@ impl Rig {
                 call_id: CALL,
                 owner: &self.owner,
                 recent_caller_turns: &self.turns,
-                caller_number: Some("+61491570006"),
+                caller_number: self.caller_number.as_deref(),
             },
         )
     }
@@ -1394,7 +1397,7 @@ fn the_hourly_ceiling_is_shared_across_calls() {
     let start = Instant::now();
     for _ in 0..MAX_ATTEMPTS_PER_HOUR {
         assert!(governor.allows(start));
-        governor.note_opened(start);
+        governor.note_opened(start, None);
     }
     assert!(!governor.allows(start));
     assert!(!governor.allows(start + Duration::from_secs(3_599)));
@@ -1404,10 +1407,108 @@ fn the_hourly_ceiling_is_shared_across_calls() {
     rig.now = start;
     // Fill the hour from other calls, then this call is refused.
     for _ in 0..MAX_ATTEMPTS_PER_HOUR {
-        governor.note_opened(start);
+        governor.note_opened(start, None);
     }
     assert_eq!(refused_reason(&answer_of(rig.begin("tool_1"))), "limit_global");
     assert!(rig.host_requests().is_empty());
+}
+
+/// Review finding 10. The gap runs from the end of the last request. Measured
+/// from its opening it could only hold back a request that ended inside it,
+/// because a ring lasts at least twenty seconds.
+#[test]
+fn the_gap_before_the_next_request_runs_from_the_end_of_the_last() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    // Nobody answers for the whole ring.
+    rig.now += Duration::from_secs(40);
+    rig.broker.expire_for_test(&request_id);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Expired, None)]);
+    // Just after it ended, the owner is not rung again.
+    rig.now += Duration::from_secs(1);
+    assert_eq!(refused_reason(&answer_of(rig.begin("soon"))), "limit_gap");
+    rig.now += MIN_GAP_BETWEEN_ATTEMPTS - Duration::from_secs(2);
+    assert_eq!(refused_reason(&answer_of(rig.begin("still_soon"))), "limit_gap");
+    // The full gap after the end.
+    rig.now += Duration::from_secs(1);
+    rig.sink.lines.clear();
+    assert!(matches!(rig.begin("later"), Begin::Planning));
+
+    // A request that is withdrawn counts as ended too.
+    let mut rig = Rig::new();
+    let (_request_id, _) = rig.ring();
+    rig.now += Duration::from_secs(30);
+    rig.active = None;
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Cancelled, None)]);
+    rig.active = Some(CALL.to_string());
+    assert_eq!(refused_reason(&answer_of(rig.begin("soon"))), "limit_gap");
+}
+
+/// Review finding 10. One caller number may cost the owner three requests an
+/// hour across calls; the global ceiling stays.
+#[test]
+fn one_caller_number_has_an_hourly_ceiling_across_calls() {
+    let governor = Arc::new(Governor::default());
+    let start = Instant::now();
+    let call = |number: Option<&str>, at: Instant| {
+        let mut rig = Rig::with_governor(Arc::clone(&governor));
+        rig.now = at;
+        rig.caller_number = number.map(str::to_string);
+        rig
+    };
+    // Three calls from the same number each open one request.
+    assert_eq!(MAX_ATTEMPTS_PER_CALLER_PER_HOUR, 3, "the contract says three an hour");
+    for n in 0..MAX_ATTEMPTS_PER_CALLER_PER_HOUR {
+        let mut rig = call(Some("0491 570 006"), start + Duration::from_secs(n as u64));
+        let (request_id, _) = rig.ring();
+        rig.decline(&request_id, "no");
+        assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Declined, Some("no".to_string()))]);
+    }
+    // The fourth call from that number, however the network writes it, is refused
+    // before the host is asked.
+    for written in ["0491 570 006", "+61491570006", "+61 491 570 006", "(0491) 570-006", "0491570006"] {
+        let mut rig = call(Some(written), start + Duration::from_secs(30));
+        assert_eq!(refused_reason(&answer_of(rig.begin("again"))), "limit_caller", "{written}");
+        assert!(rig.host_requests().is_empty(), "{written}");
+    }
+    // Another caller is not touched, and neither is a call with no usable number.
+    for number in [Some("0491 570 156"), Some("0491 570 157"), None, Some("anonymous"), Some("")] {
+        let mut rig = call(number, start + Duration::from_secs(30));
+        assert!(matches!(rig.begin("fine"), Begin::Planning), "{number:?}");
+    }
+    // An hour later the window has moved on.
+    let mut rig = call(Some("0491 570 006"), start + Duration::from_secs(3_600 + 2));
+    assert!(matches!(rig.begin("next_hour"), Begin::Planning));
+}
+
+#[test]
+fn the_caller_table_holds_only_keyed_hashes_and_is_bounded() {
+    let governor = Governor::default();
+    let start = Instant::now();
+    // The key is a hash of the digits, and differs between processes' governors.
+    let key = governor.caller_key("0491 570 006").expect("a usable number");
+    assert_eq!(governor.caller_key("+61491570006"), Some(key));
+    assert_ne!(Governor::default().caller_key("0491 570 006"), Some(key), "keyed per process");
+    assert_eq!(governor.caller_key("anonymous"), None);
+    assert_eq!(governor.caller_key(""), None);
+    assert_eq!(governor.caller_key("12345"), None, "too short to be a number");
+    // Many callers do not grow the table past its bound.
+    for n in 0..(MAX_CALLERS_TRACKED * 2) {
+        let key = governor.caller_key(&format!("049157{n:04}"));
+        governor.note_opened(start + Duration::from_millis(n as u64), key);
+    }
+    assert!(governor.callers_tracked() <= MAX_CALLERS_TRACKED);
+    // The oldest is the one forgotten, and a busy caller is not lost to newcomers.
+    let key = governor.caller_key("0491 570 006");
+    for _ in 0..MAX_ATTEMPTS_PER_CALLER_PER_HOUR {
+        governor.note_opened(start + Duration::from_secs(10), key);
+    }
+    for n in 0..(MAX_CALLERS_TRACKED / 2) {
+        let other = governor.caller_key(&format!("049199{n:04}"));
+        governor.note_opened(start + Duration::from_secs(11), other);
+    }
+    assert!(!governor.allows_caller(key, start + Duration::from_secs(12)));
+    assert!(governor.callers_tracked() <= MAX_CALLERS_TRACKED);
 }
 
 // --- Idempotency and what leaves the machine ------------------------------------

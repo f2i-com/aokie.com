@@ -26,7 +26,9 @@
 //! cancels the request); nothing here can raise consent, and the plugin's
 //! media gates recheck it again at every claim.
 
-use std::collections::VecDeque;
+use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, VecDeque};
+use std::hash::BuildHasher;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -57,8 +59,19 @@ pub const PLAN_WAIT: Duration = Duration::from_millis(1_500);
 /// own so that a host with no limits, or a model that will not stop asking,
 /// still cannot make the owner's phone ring without end.
 pub const MAX_ATTEMPTS_PER_CALL: u32 = 3;
+/// How long after a request ends (declined, expired, failed, withdrawn) the
+/// next may open. Measured from the end, not from the opening: a ring lasts at
+/// least 20 seconds, so a gap from the opening would only ever hold back a
+/// request that ended within it, and a decline is exactly that.
 pub const MIN_GAP_BETWEEN_ATTEMPTS: Duration = Duration::from_secs(15);
 pub const MAX_ATTEMPTS_PER_HOUR: usize = 20;
+/// Requests one caller number may cost the owner in an hour, across calls: a
+/// caller who rings back again and again must not be able to ring the owner
+/// without end even if each call stays inside the per-call allowance. Calls with
+/// no usable number share only the hourly ceiling above.
+pub const MAX_ATTEMPTS_PER_CALLER_PER_HOUR: usize = 3;
+/// Caller numbers remembered (as keyed hashes) at once.
+const MAX_CALLERS_TRACKED: usize = 256;
 
 /// Slack after the broker's own last deadline before the plugin ends the
 /// request itself.
@@ -66,10 +79,18 @@ const HARD_DEADLINE_SLACK: Duration = Duration::from_secs(5);
 
 // --- The hourly ceiling ----------------------------------------------------
 
-/// Requests opened in the last hour, across calls.
+/// Requests opened in the last hour, across calls, and per caller number.
+///
+/// A caller number is never stored. It is reduced to its digits (an Australian
+/// `+61` prefix folded to the leading `0`, so the two ways a network writes the
+/// same mobile agree) and keyed with a hash whose key is random for this
+/// process: the table holds hashes and times, lives in memory only, and is
+/// bounded.
 #[derive(Default)]
 pub struct Governor {
     opened: Mutex<VecDeque<Instant>>,
+    callers: Mutex<HashMap<u64, VecDeque<Instant>>>,
+    key: RandomState,
 }
 
 impl Governor {
@@ -95,11 +116,66 @@ impl Governor {
         opened.len() < MAX_ATTEMPTS_PER_HOUR
     }
 
-    fn note_opened(&self, now: Instant) {
+    /// The table key for a caller number, or `None` when there is no usable
+    /// number (withheld, "anonymous", empty).
+    pub(crate) fn caller_key(&self, number: &str) -> Option<u64> {
+        let mut digits: String = number.chars().filter(char::is_ascii_digit).collect();
+        if digits.len() == 11 && digits.starts_with("61") {
+            digits.replace_range(..2, "0");
+        }
+        (digits.len() >= 6).then(|| self.key.hash_one(digits))
+    }
+
+    fn allows_caller(&self, key: Option<u64>, now: Instant) -> bool {
+        let Some(key) = key else {
+            return true;
+        };
+        let Ok(mut callers) = self.callers.lock() else {
+            return false;
+        };
+        let Some(opened) = callers.get_mut(&key) else {
+            return true;
+        };
+        Self::prune(opened, now);
+        opened.len() < MAX_ATTEMPTS_PER_CALLER_PER_HOUR
+    }
+
+    fn note_opened(&self, now: Instant, key: Option<u64>) {
         if let Ok(mut opened) = self.opened.lock() {
             Self::prune(&mut opened, now);
             opened.push_back(now);
         }
+        let Some(key) = key else {
+            return;
+        };
+        if let Ok(mut callers) = self.callers.lock() {
+            if callers.len() >= MAX_CALLERS_TRACKED && !callers.contains_key(&key) {
+                callers.retain(|_, opened| {
+                    Self::prune(opened, now);
+                    !opened.is_empty()
+                });
+                // Still full of live callers: forget the one seen longest ago.
+                if callers.len() >= MAX_CALLERS_TRACKED {
+                    let oldest = callers
+                        .iter()
+                        .filter_map(|(key, opened)| opened.back().map(|at| (*key, *at)))
+                        .min_by_key(|(_, at)| *at)
+                        .map(|(key, _)| key);
+                    if let Some(oldest) = oldest {
+                        callers.remove(&oldest);
+                    }
+                }
+            }
+            let opened = callers.entry(key).or_default();
+            Self::prune(opened, now);
+            opened.push_back(now);
+        }
+    }
+
+    /// How many caller numbers are remembered.
+    #[cfg(test)]
+    pub(crate) fn callers_tracked(&self) -> usize {
+        self.callers.lock().map(|callers| callers.len()).unwrap_or(0)
     }
 }
 
@@ -179,6 +255,8 @@ struct Planning {
     /// The phrase check on the caller's recent turns, taken when the tool was
     /// called (only the verdict is kept, never the turns).
     caller_asked: bool,
+    /// The keyed hash of the caller's number (never the number).
+    caller_key: Option<u64>,
     owner: AokieOwnerFence,
     session_token: u64,
     host: Arc<HostRpc>,
@@ -231,7 +309,9 @@ struct Held {
 pub struct TransferCall {
     stage: Stage,
     attempts: u32,
-    last_opened: Option<Instant>,
+    /// When the last request ended; the gap before the next is measured from
+    /// here.
+    last_ended: Option<Instant>,
     governor: Arc<Governor>,
     last_end: Option<End>,
     handoff_started: Option<Instant>,
@@ -270,7 +350,7 @@ impl TransferCall {
         Self {
             stage: Stage::Idle,
             attempts: 0,
-            last_opened: None,
+            last_ended: None,
             governor,
             last_end: None,
             handoff_started: None,
@@ -330,10 +410,20 @@ impl TransferCall {
             return refused(RefusalStatus::Refused, "limit_call");
         }
         if self
-            .last_opened
+            .last_ended
             .is_some_and(|at| env.now.saturating_duration_since(at) < MIN_GAP_BETWEEN_ATTEMPTS)
         {
             return refused(RefusalStatus::Refused, "limit_gap");
+        }
+        // A caller who rings back again and again costs the owner one request
+        // each time however tidy each call is. Only a keyed hash of the number
+        // is kept, and a call with no usable number shares the global ceiling
+        // alone.
+        let caller_key = args
+            .caller_number
+            .and_then(|number| self.governor.caller_key(number));
+        if !self.governor.allows_caller(caller_key, env.now) {
+            return refused(RefusalStatus::Refused, "limit_caller");
         }
         if !self.governor.allows(env.now) {
             return refused(RefusalStatus::Refused, "limit_global");
@@ -364,6 +454,7 @@ impl TransferCall {
             call_id: args.call_id.to_string(),
             reason,
             caller_asked: caller_did_ask,
+            caller_key,
             owner: args.owner.clone(),
             session_token: env.session_token,
             host: Arc::clone(env.host),
@@ -569,8 +660,7 @@ impl TransferCall {
         };
 
         self.attempts += 1;
-        self.last_opened = Some(env.now);
-        self.governor.note_opened(env.now);
+        self.governor.note_opened(env.now, planning.caller_key);
         let (audit, requested) = AssistanceAuditLifecycle::opened(&request_id, &fence.call_id);
         effects.push(Effect::Audit(requested));
 
@@ -643,7 +733,7 @@ impl TransferCall {
                 .take_resolution(&open.request_id)
                 .unwrap_or(AssistanceResolution::Expired);
             env.broker.discard(&open.request_id);
-            self.finish(open, resolution, effects);
+            self.finish(open, resolution, env.now, effects);
             return;
         }
         // The plugin's own last word, on the monotonic clock, in case the
@@ -654,7 +744,7 @@ impl TransferCall {
                 open.request_id
             );
             env.broker.discard(&open.request_id);
-            self.finish(open, AssistanceResolution::Expired, effects);
+            self.finish(open, AssistanceResolution::Expired, env.now, effects);
             return;
         }
         let won = env
@@ -698,10 +788,16 @@ impl TransferCall {
         if let Some(event) = open.audit.resolve(AssistanceAuditResolution::Cancelled) {
             effects.push(Effect::Audit(event));
         }
-        self.note_end(End::Other);
+        self.note_end(End::Other, env.now);
     }
 
-    fn finish(&mut self, mut open: Open, resolution: AssistanceResolution, effects: &mut Vec<Effect>) {
+    fn finish(
+        &mut self,
+        mut open: Open,
+        resolution: AssistanceResolution,
+        now: Instant,
+        effects: &mut Vec<Effect>,
+    ) {
         let request_id = open.request_id.clone();
         let (outcome, message, audit_event, end) = match resolution {
             AssistanceResolution::TransferTaken { device_id } => {
@@ -751,7 +847,7 @@ impl TransferCall {
         if let Some(event) = audit_event {
             effects.push(Effect::Audit(event));
         }
-        self.note_end(end);
+        self.note_end(end, now);
     }
 
     // --- The handoff and what follows ---------------------------------------
@@ -848,7 +944,8 @@ impl TransferCall {
         self.end_is_spent = matches!(self.stage, Stage::Ringing(_) | Stage::Accepted(_));
     }
 
-    fn note_end(&mut self, end: End) {
+    fn note_end(&mut self, end: End, now: Instant) {
+        self.last_ended = Some(now);
         self.last_end = if std::mem::take(&mut self.end_is_spent) {
             None
         } else {
