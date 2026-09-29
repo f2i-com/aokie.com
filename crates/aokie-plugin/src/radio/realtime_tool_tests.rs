@@ -637,6 +637,275 @@ fn negotiated_lane() -> (RealtimeCallLane, crate::realtime_voice::DetachedSessio
     (lane, detached)
 }
 
+// --- The glue the service loop runs, driven on a session with no socket -----------
+//
+// `RealtimeVoiceSession::spawn` connects to the one loopback route the desktop
+// listens on (ws://127.0.0.1:17872 is the only endpoint `validate_endpoint`
+// accepts), so no test may start a real session: the resume path is driven up
+// to the spawn and from the spawn's result on, with a detached session standing
+// in for the socket.
+
+fn detached_lane_for(call_id: &str) -> (RealtimeCallLane, crate::realtime_voice::DetachedSession) {
+    let (session, detached) = crate::realtime_voice::RealtimeVoiceSession::detached(call_id, 7);
+    let mut lane = RealtimeCallLane::new(session);
+    lane.begun = true;
+    lane.allow_transfer_sent = true;
+    lane.ready = true;
+    lane.negotiate_transfer(&features(&["transfer_v1"]));
+    (lane, detached)
+}
+
+impl Laid {
+    /// `transfer_to_owner` arrives on `lane` with these `arguments`.
+    fn call_the_tool(&mut self, lane: &RealtimeCallLane, arguments: serde_json::Value) -> crate::transfer::call::Begin {
+        begin_transfer_tool(
+            "tool_1",
+            &arguments,
+            &mut self.ctx,
+            lane,
+            &self.rig.broker,
+            &self.tracker,
+            &self.rig.media,
+            &self.rig.host,
+            &self.status,
+            &mut self.sink,
+        )
+    }
+}
+
+/// The params of the first host request of this method written to `sink`.
+fn host_request_params(sink: &crate::event_bridge::VecSink, method: &str) -> Option<serde_json::Value> {
+    sink.lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["method"] == method)
+        .map(|value| value["params"].clone())
+}
+
+fn a_call_with_no_open_request() -> Laid {
+    let rig = crate::transfer::call::tests::Rig::new();
+    let mut tracker = crate::call_session::SessionTracker::new();
+    tracker.ring("call_a".into(), aokie_core::events::now_iso8601());
+    tracker.caller_id("0491 570 006".into());
+    tracker.answered();
+    // The host announced ringPlan and a Companion device is approved.
+    let status = RadioStatus::default();
+    status
+        .transfer_ready
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Laid {
+        rig,
+        ctx: CallVoiceContext::fresh(None),
+        tracker,
+        status,
+        sink: crate::event_bridge::VecSink::default(),
+        request_id: String::new(),
+    }
+}
+
+/// The tool call: the caller's own turns and number come from the call's
+/// context and the radio's tracker, so the phrase floor and the per-caller
+/// ceiling read what the caller actually said and rang from.
+#[test]
+fn the_transfer_tool_reads_the_callers_turns_and_number_from_the_radios_own_state() {
+    use crate::transfer::call::Begin;
+    let user = |text: &str| serde_json::json!({"role": "user", "content": text});
+    let bot = |text: &str| serde_json::json!({"role": "assistant", "content": text});
+    let call_asked = serde_json::json!({"reason": "caller_asked"});
+
+    // The caller asked for a person: the host is asked for a plan, and the
+    // caller's number goes with the request.
+    let mut laid = a_call_with_no_open_request();
+    let (mut lane, _detached) = detached_lane_for("call_a");
+    lane.owner = laid.rig.media.aokie_owner_fence();
+    laid.ctx.history = vec![user("Hi"), bot("How can I help?"), user("Can I speak to the owner please?")];
+    assert!(matches!(laid.call_the_tool(&lane, call_asked.clone()), Begin::Planning));
+    let params = host_request_params(&laid.sink, "oaiy.ring.plan").expect("the host was asked for a ring plan");
+    assert_eq!(params["callerNumber"], "0491 570 006");
+    assert_eq!(params["recentCallerTurns"], serde_json::json!(["Hi", "Can I speak to the owner please?"]));
+
+    // Nothing the caller said asks for anyone, and the AI's own words do not
+    // count: refused before the host is asked.
+    let mut laid = a_call_with_no_open_request();
+    laid.ctx.history = vec![user("How much for the lawn?"), bot("Can I put you through to the owner?")];
+    let Begin::Answered(answer) = laid.call_the_tool(&lane, call_asked.clone()) else {
+        panic!("expected a refusal")
+    };
+    assert_eq!(answer.output["reason"], "caller_did_not_ask");
+    assert!(host_request_params(&laid.sink, "oaiy.ring.plan").is_none(), "the host is not asked");
+
+    // Only the last three caller turns are looked at.
+    let mut laid = a_call_with_no_open_request();
+    laid.ctx.history = vec![
+        user("Can I speak to the owner?"),
+        user("no"),
+        user("sorry"),
+        user("the gate is blue"),
+    ];
+    let Begin::Answered(answer) = laid.call_the_tool(&lane, call_asked) else {
+        panic!("expected a refusal")
+    };
+    assert_eq!(answer.output["reason"], "caller_did_not_ask");
+
+    // A lane whose exact owner fence is gone cannot start one: the call moved.
+    let mut laid = a_call_with_no_open_request();
+    lane.owner = None;
+    let Begin::Answered(answer) =
+        laid.call_the_tool(&lane, serde_json::json!({"reason": "caller_asked"}))
+    else {
+        panic!("expected a refusal")
+    };
+    assert_eq!(answer.output["reason"], "call_changed");
+    assert_eq!(answer.output["status"], "unavailable");
+}
+
+/// The exact owner fence changed under a live session: the stop OAIY hears,
+/// what it hears before it, and what the fresh session is told afterwards.
+#[test]
+fn a_takeover_stops_the_session_as_a_handoff_and_the_fresh_session_says_how_the_ai_got_the_caller_back() {
+    use crate::realtime_voice::SentControl;
+    use crate::transfer::Via;
+
+    // A request that rings when the caller is taken another way: OAIY hears
+    // it is moot, then the stop that says handoff, not the end of the call.
+    let mut laid = laid_aside_with_a_ringing_request();
+    let (mut lane, detached) = negotiated_lane();
+    stop_session_for_ownership_change(
+        &mut laid.ctx,
+        &mut lane,
+        &laid.rig.broker,
+        &laid.tracker,
+        &laid.rig.media,
+        &laid.rig.host,
+        &laid.status,
+        None,
+        &mut laid.sink,
+    );
+    let sent = detached.drain();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(
+        matches!(&sent[0], SentControl::TransferOutcome { frame } if frame.outcome == Outcome::Cancelled),
+        "cancelled first: {sent:?}"
+    );
+    assert_eq!(
+        sent[1],
+        SentControl::Stop { reason: crate::transfer::STOP_HANDOFF_TAKEOVER.into() },
+        "then the handoff stop"
+    );
+    assert!(!laid.rig.broker.is_busy());
+
+    // The fresh session says how the AI got the caller back. The record of the
+    // handoff was made by that stop, so a start now carries `resume`.
+    let now = Instant::now() + Duration::from_secs(20);
+    let (resume, greeting) = resume_start(&laid.ctx, &laid.rig.broker, now);
+    assert_eq!(resume.map(|resume| resume.via), Some(Via::Return));
+    assert!(resume.is_some_and(|resume| resume.after_handoff && resume.handoff_seconds >= 20));
+    assert_eq!(greeting, crate::transfer::RETURN_GREETING);
+    // Nothing was consumed: a start that fails is asked again.
+    assert_eq!(resume_start(&laid.ctx, &laid.rig.broker, now).0.map(|resume| resume.via), Some(Via::Return));
+    assert!(laid.ctx.transfer.peek_resume(now, &laid.rig.broker).is_some());
+
+    // The session that could not start leaves the record; the one that starts consumes it.
+    let (session, _detached) = crate::realtime_voice::RealtimeVoiceSession::detached("call_a", 8);
+    let fresh = adopt_resumed_session(&mut laid.ctx, session, true);
+    assert!(fresh.allow_transfer_sent);
+    assert!(!fresh.transfer_negotiated, "the fresh session negotiates on its own ready");
+    assert!(laid.ctx.transfer.peek_resume(now, &laid.rig.broker).is_none(), "the handoff is over");
+    let (resume, greeting) = resume_start(&laid.ctx, &laid.rig.broker, now);
+    assert_eq!(resume, None);
+    assert_ne!(greeting, crate::transfer::RETURN_GREETING, "an ordinary resume greets as it always did");
+
+    // A session that did not negotiate the contract keeps the words it always had
+    // and leaves no record: its fresh session says nothing about a handoff.
+    let mut laid = a_call_with_no_open_request();
+    let (mut old, old_detached) = detached_lane_for("call_a");
+    old.transfer_negotiated = false;
+    stop_session_for_ownership_change(
+        &mut laid.ctx,
+        &mut old,
+        &laid.rig.broker,
+        &laid.tracker,
+        &laid.rig.media,
+        &laid.rig.host,
+        &laid.status,
+        None,
+        &mut laid.sink,
+    );
+    assert_eq!(
+        old_detached.drain(),
+        vec![SentControl::Stop { reason: "Aokie media ownership changed".into() }]
+    );
+    assert_eq!(laid.ctx.transfer.peek_resume(now, &laid.rig.broker), None);
+
+    // A failed setup: the caller is back before the gateway has written the
+    // failure down, so the fresh session says failback, and the failure is
+    // still owed to OAIY once it negotiates (finding 3, end to end).
+    let mut laid = laid_aside_with_a_ringing_request();
+    let request_id = laid.request_id.clone();
+    laid.rig.accept(&request_id);
+    let (mut lane, _detached) = negotiated_lane();
+    stop_session_for_ownership_change(
+        &mut laid.ctx,
+        &mut lane,
+        &laid.rig.broker,
+        &laid.tracker,
+        &laid.rig.media,
+        &laid.rig.host,
+        &laid.status,
+        None,
+        &mut laid.sink,
+    );
+    assert!(laid.ctx.transfer.is_active(), "an accepted request stays open through its takeover");
+    let (resume, greeting) = resume_start(&laid.ctx, &laid.rig.broker, Instant::now());
+    assert_eq!(resume.map(|resume| resume.via), Some(Via::Failback));
+    assert_eq!(greeting, crate::transfer::RETURN_GREETING);
+}
+
+/// The loop itself needs a phone, a dongle and a socket to the desktop, so what
+/// it calls is tested above and that it calls it is checked here: each helper is
+/// defined once and used once in the loop (the send after the tool block, which
+/// only shortens the wait, twice), and nothing in the loop does by hand what a
+/// helper does. Changing the wiring means changing this on purpose.
+#[test]
+fn the_service_loop_runs_the_transfer_helpers_it_is_tested_through() {
+    let service = include_str!("realtime_service.rs");
+    let run_loop = include_str!("run_loop.rs");
+    let count = |text: &str, needle: &str| text.matches(needle).count();
+
+    // Defined once, called once.
+    for helper in [
+        "stop_session_for_ownership_change(",
+        "resume_start(",
+        "adopt_resumed_session(",
+        "begin_transfer_tool(",
+        "handle_transfer_cancel(",
+    ] {
+        assert_eq!(count(service, helper), 2, "{helper} is defined once and called once");
+    }
+    // The handoff stop, the resume record and the poll are written in one place.
+    assert_eq!(count(service, "STOP_HANDOFF_TAKEOVER"), 1, "only the stop helper says handoff");
+    assert_eq!(count(service, "note_handoff("), 1);
+    assert_eq!(count(service, "ctx.transfer.finish_resume"), 1, "only the adoption consumes the record");
+    assert_eq!(count(service, "ctx.transfer.poll(&mut env)"), 1, "one poll a turn, at the top of the block");
+    // Held outcomes are flushed at the top of the block and behind the tool block.
+    assert_eq!(count(service, "send_held_outcomes(realtime_lane.as_mut(), &mut ctx.transfer)"), 2);
+    assert_eq!(
+        count(
+            service,
+            "if realtime_failure.is_none() && ctx.transfer.has_held_outcomes() {\n            send_held_outcomes(realtime_lane.as_mut(), &mut ctx.transfer);"
+        ) + count(
+            service,
+            "if ctx.transfer.has_held_outcomes() {\n                send_held_outcomes(realtime_lane.as_mut(), &mut ctx.transfer);"
+        ),
+        2,
+        "both flushes are unconditional but for the failure and the held frames"
+    );
+    // The per-call reset withdraws through the shared helper, and does not do it by hand.
+    assert_eq!(count(run_loop, "TransferWithdrawal::CallEnded"), 1);
+    assert_eq!(count(run_loop, "end_call("), 0);
+    assert_eq!(count(run_loop, "ctx.transfer."), 0);
+}
+
 /// The realtime side of OAIY withdrawing a request: what reaches OAIY, on which
 /// session, in which form.
 #[test]
