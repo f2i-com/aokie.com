@@ -38,8 +38,8 @@ use serde_json::Value;
 
 use super::{
     caller_asked, opened_params, parse_arguments, parse_plan, plan_params, refusal, ringing,
-    sanitize_owner_message, Decision, Outcome, OutcomeFrame, Reason, RefusalStatus, ResumeInfo,
-    Targets, ToolAnswer, Via,
+    sanitize_owner_message, CancelReason, Decision, Notice, NoticeFrame, Outcome, OutcomeFrame,
+    Reason, RefusalStatus, ResumeInfo, Targets, ToolAnswer, Via,
 };
 use crate::assistance::{
     AssistanceBroker, AssistanceCallFence, AssistanceResolution, TRANSFER_RESOLUTION_GRACE_SECONDS,
@@ -234,6 +234,9 @@ pub enum Effect {
     /// `transfer_v1`; while none is open a terminal outcome is held for the
     /// next one (`hold_outcome`), and an `accepted` is dropped.
     Outcome(OutcomeFrame),
+    /// Tell OAIY that a `transfer_cancel` it sent changed nothing (and why).
+    /// Sent at once on the session that asked; never held for a later one.
+    Notice(NoticeFrame),
     /// A durable `aokie.call.assistance.*` event.
     Audit(DesktopEvent),
 }
@@ -489,6 +492,62 @@ impl TransferCall {
         if let Stage::Ringing(_) = self.stage {
             if let Stage::Ringing(open) = std::mem::replace(&mut self.stage, Stage::Idle) {
                 self.cancel(open, env, &mut effects, "the caller changed hands another way");
+            }
+        }
+        effects
+    }
+
+    /// OAIY withdraws a request (`formlogic.realtime.transfer_cancel`): its
+    /// ring dialog was declined, the caller was offered a message instead, or it
+    /// gave up waiting. Handled exactly as a request withdrawn because someone
+    /// took the caller another way: an acceptance since the last turn is seen
+    /// first and wins, a request nobody has won is withdrawn (its offers stop,
+    /// `cancelled` is reported once, the audit closes), and one that an owner
+    /// device has won is left alone, because its takeover is already under way:
+    /// OAIY is told `too_late`. An id this call has no open request for (never
+    /// seen, another call's, already ended, already cancelled) changes nothing
+    /// and is answered `unknown_request`, so a replayed cancel does nothing
+    /// twice.
+    pub fn cancel_requested(
+        &mut self,
+        env: &mut TransferEnv<'_>,
+        request_id: &str,
+        reason: CancelReason,
+    ) -> Vec<Effect> {
+        let notice = |kind: Notice| {
+            Effect::Notice(NoticeFrame {
+                request_id: request_id.to_string(),
+                notice: kind,
+                at_ms: unix_ms(),
+            })
+        };
+        if self.request_id() != Some(request_id) {
+            return vec![notice(Notice::UnknownRequest)];
+        }
+        // Ask the broker before trusting what was last seen: an endpoint may
+        // have won, or the request may have ended, since the last turn.
+        let mut effects = self.poll(env);
+        match std::mem::replace(&mut self.stage, Stage::Idle) {
+            Stage::Ringing(open) if open.request_id == request_id => {
+                eprintln!(
+                    "[aokie-plugin] transfer {request_id}: OAIY withdrew it ({})",
+                    reason.as_str()
+                );
+                self.cancel(open, env, &mut effects, "OAIY withdrew it");
+            }
+            Stage::Accepted(open) if open.request_id == request_id => {
+                eprintln!(
+                    "[aokie-plugin] transfer {request_id}: OAIY's withdrawal ({}) came after an owner device accepted",
+                    reason.as_str()
+                );
+                self.stage = Stage::Accepted(open);
+                effects.push(notice(Notice::TooLate));
+            }
+            other => {
+                // The poll ended it (resolved, expired, the call moved on) and
+                // reported how; the cancel is moot.
+                self.stage = other;
+                effects.push(notice(Notice::UnknownRequest));
             }
         }
         effects

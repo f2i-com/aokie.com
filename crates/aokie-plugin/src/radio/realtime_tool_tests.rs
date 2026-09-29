@@ -574,10 +574,14 @@ fn laid_aside_with_a_ringing_request() -> Laid {
     ctx.transfer = std::mem::replace(&mut rig.machine, machine());
     assert!(ctx.transfer.is_active());
     assert!(rig.broker.is_busy());
+    // The radio holds the call as active, as it does while the request rings.
+    let mut tracker = crate::call_session::SessionTracker::new();
+    tracker.ring("call_a".into(), aokie_core::events::now_iso8601());
+    tracker.answered();
     Laid {
         rig,
         ctx,
-        tracker: crate::call_session::SessionTracker::new(),
+        tracker,
         status: RadioStatus::default(),
         sink: crate::event_bridge::VecSink::default(),
         request_id,
@@ -599,6 +603,149 @@ impl Laid {
             &mut self.sink,
         );
     }
+}
+
+impl Laid {
+    /// OAIY sends `transfer_cancel` on `lane`.
+    fn cancel(
+        &mut self,
+        lane: &mut RealtimeCallLane,
+        request_id: &str,
+        reason: crate::transfer::CancelReason,
+    ) {
+        handle_transfer_cancel(
+            request_id,
+            reason,
+            &mut self.ctx,
+            lane,
+            &self.rig.broker,
+            &self.tracker,
+            &self.rig.media,
+            &self.rig.host,
+            &self.status,
+            None,
+            &mut self.sink,
+        );
+    }
+}
+
+fn negotiated_lane() -> (RealtimeCallLane, crate::realtime_voice::DetachedSession) {
+    let (mut lane, detached) = detached_lane(true);
+    lane.allow_transfer_sent = true;
+    lane.ready = true;
+    lane.negotiate_transfer(&features(&["transfer_v1"]));
+    (lane, detached)
+}
+
+/// The realtime side of OAIY withdrawing a request: what reaches OAIY, on which
+/// session, in which form.
+#[test]
+fn a_cancel_from_oaiy_is_answered_on_its_own_session_by_the_outcome_or_a_typed_notice() {
+    use crate::realtime_voice::SentControl;
+    use crate::transfer::{CancelReason, Notice, NoticeFrame};
+    let notice_of = |sent: &SentControl| match sent {
+        SentControl::TransferNotice { frame: NoticeFrame { request_id, notice, .. } } => {
+            Some((request_id.clone(), *notice))
+        }
+        _ => None,
+    };
+
+    // A request that rings: withdrawn, reported once as the outcome.
+    let mut laid = laid_aside_with_a_ringing_request();
+    let (mut lane, detached) = negotiated_lane();
+    let request_id = laid.request_id.clone();
+    laid.cancel(&mut lane, &request_id, CancelReason::OwnerDeclined);
+    assert_eq!(sent_outcomes(&detached), vec![Outcome::Cancelled]);
+    assert!(!laid.rig.broker.is_busy(), "the mailbox is free");
+    assert!(!laid.rig.broker.transfer_admits(&request_id, "thumb_phone_0123456789"));
+    assert_eq!(laid.sink.lines.len(), 1, "the audit closes the request");
+    assert!(laid.sink.lines[0].contains("cancelled"));
+
+    // The same cancel again: a typed notice, and nothing done twice.
+    laid.cancel(&mut lane, &request_id, CancelReason::OwnerDeclined);
+    let sent = detached.drain();
+    assert_eq!(
+        sent.iter().filter_map(notice_of).collect::<Vec<_>>(),
+        vec![(request_id.clone(), Notice::UnknownRequest)]
+    );
+    assert_eq!(sent.len(), 1);
+    assert_eq!(laid.sink.lines.len(), 1, "no second audit event");
+
+    // A request an owner device has won: too late, and nothing changes.
+    let mut laid = laid_aside_with_a_ringing_request();
+    let (mut lane, detached) = negotiated_lane();
+    let request_id = laid.request_id.clone();
+    laid.rig.accept(&request_id);
+    laid.cancel(&mut lane, &request_id, CancelReason::MessageInstead);
+    let sent = detached.drain();
+    assert_eq!(
+        sent.iter().filter_map(notice_of).collect::<Vec<_>>(),
+        vec![(request_id.clone(), Notice::TooLate)]
+    );
+    assert!(laid.rig.broker.is_busy(), "the takeover is not affected");
+    assert!(laid.ctx.transfer.is_active());
+
+    // A session that did not negotiate the contract: the frame means nothing,
+    // nothing is sent, and the request is left exactly as it was.
+    let mut laid = laid_aside_with_a_ringing_request();
+    let (mut old, old_detached) = detached_lane(true);
+    old.ready = true;
+    let request_id = laid.request_id.clone();
+    laid.cancel(&mut old, &request_id, CancelReason::GaveUp);
+    assert!(old_detached.drain().is_empty());
+    assert!(laid.rig.broker.is_busy());
+    assert!(laid.ctx.transfer.is_active());
+    assert!(laid.sink.lines.is_empty());
+
+    // The cancelled outcome of a withdrawal still waits behind the answer that
+    // names the request (finding 9); the notice, a reply, does not.
+    let mut laid = laid_aside_with_a_ringing_request();
+    let (mut lane, detached) = negotiated_lane();
+    let request_id = laid.request_id.clone();
+    lane.queue_tool_answer("tool_1".into(), TOOL_NAME, true, serde_json::json!({}));
+    laid.cancel(&mut lane, &request_id, CancelReason::GaveUp);
+    assert!(sent_outcomes(&detached).is_empty(), "behind the queued answer");
+    assert!(laid.ctx.transfer.has_held_outcomes());
+    laid.cancel(&mut lane, &request_id, CancelReason::GaveUp);
+    assert_eq!(
+        detached.drain().iter().filter_map(notice_of).collect::<Vec<_>>(),
+        vec![(request_id.clone(), Notice::UnknownRequest)],
+        "the notice goes at once"
+    );
+    assert!(lane.next_queued_answer().is_some());
+    send_held_outcomes(Some(&mut lane), &mut laid.ctx.transfer);
+    assert_eq!(sent_outcomes(&detached), vec![Outcome::Cancelled]);
+
+    // A notice is never kept for a later session: with no session, it is dropped.
+    let mut sink = crate::event_bridge::VecSink::default();
+    let mut transfer = machine();
+    apply_transfer_effects(
+        vec![crate::transfer::call::Effect::Notice(NoticeFrame {
+            request_id: "assist_1".into(),
+            notice: Notice::UnknownRequest,
+            at_ms: 1,
+        })],
+        None,
+        &mut transfer,
+        None,
+        &mut sink,
+    );
+    assert!(!transfer.has_held_outcomes());
+    // Nor is one sent on a session that never negotiated the contract.
+    let (mut old, old_detached) = detached_lane(true);
+    old.ready = true;
+    apply_transfer_effects(
+        vec![crate::transfer::call::Effect::Notice(NoticeFrame {
+            request_id: "assist_1".into(),
+            notice: Notice::TooLate,
+            at_ms: 1,
+        })],
+        Some(&mut old),
+        &mut transfer,
+        None,
+        &mut sink,
+    );
+    assert!(old_detached.drain().is_empty());
 }
 
 /// Review finding 6: a call parked by the hold juggle (no session: the juggle

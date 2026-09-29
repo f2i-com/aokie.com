@@ -126,6 +126,22 @@ impl Rig {
         self.machine.withdraw_unaccepted(&mut env)
     }
 
+    /// OAIY sends `transfer_cancel` for this request id.
+    pub(crate) fn cancel(&mut self, request_id: &str, reason: CancelReason) -> Vec<Effect> {
+        let mut env = TransferEnv {
+            broker: &self.broker,
+            media: &self.media,
+            host: &self.host,
+            sink: &mut self.sink,
+            now: self.now,
+            active_call_id: self.active.as_deref(),
+            switchboard_revision: 0,
+            host_ring_plan: self.host_ring_plan,
+            session_token: self.session,
+        };
+        self.machine.cancel_requested(&mut env, request_id, reason)
+    }
+
     /// The host requests written so far, as (method, id, params).
     fn host_requests(&self) -> Vec<(String, u64, Value)> {
         self.sink
@@ -236,6 +252,16 @@ fn outcomes(effects: &[Effect]) -> Vec<(Outcome, Option<String>)> {
         .iter()
         .filter_map(|effect| match effect {
             Effect::Outcome(frame) => Some((frame.outcome, frame.message.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn notices(effects: &[Effect]) -> Vec<(String, Notice)> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Notice(frame) => Some((frame.request_id.clone(), frame.notice)),
             _ => None,
         })
         .collect()
@@ -863,6 +889,184 @@ fn a_caller_who_hangs_up_mid_ring_cancels_the_request_and_frees_the_mailbox() {
     assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
     rig.active = None;
     assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Cancelled, None)]);
+    assert!(!rig.broker.is_busy());
+}
+
+// --- OAIY withdraws a request (`transfer_cancel`) --------------------------------
+
+/// A cancel while the request rings is handled exactly like a request withdrawn
+/// because someone took the caller another way.
+#[test]
+fn a_cancel_while_the_request_rings_withdraws_it_and_is_reported_once() {
+    for reason in [CancelReason::OwnerDeclined, CancelReason::MessageInstead, CancelReason::GaveUp] {
+        let mut rig = Rig::new();
+        let (request_id, _) = rig.ring();
+        assert!(rig.broker.transfer_admits(&request_id, PHONE));
+
+        let effects = rig.cancel(&request_id, reason);
+        assert_eq!(outcomes(&effects), vec![(Outcome::Cancelled, None)], "{reason:?}");
+        assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "cancelled".to_string())]);
+        assert!(notices(&effects).is_empty(), "a cancel that worked is answered by the outcome");
+        assert!(!rig.broker.is_busy(), "the mailbox is free");
+        assert!(!rig.broker.transfer_admits(&request_id, PHONE), "and the offers stop");
+        assert!(!rig.machine.is_active());
+        assert_eq!(rig.machine.attempts(), 1, "it still counts as an attempt");
+
+        // A phone that answers after the withdrawal wins nothing.
+        let fence = AssistanceCallFence {
+            call_id: CALL.into(),
+            call_epoch: rig.media.snapshot().call_epoch,
+            owner_epoch: rig.media.snapshot().owner_epoch,
+            switchboard_revision: 0,
+            remote_revision: rig.media.snapshot().remote_revision,
+        };
+        assert!(rig.broker.accept_transfer(&request_id, &fence, DEVICE).is_err());
+        assert!(rig.poll().is_empty(), "nothing is said a second time");
+    }
+}
+
+#[test]
+fn a_repeated_cancel_does_nothing_twice() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    let first = rig.cancel(&request_id, CancelReason::OwnerDeclined);
+    assert_eq!(outcomes(&first), vec![(Outcome::Cancelled, None)]);
+    for _ in 0..3 {
+        let repeat = rig.cancel(&request_id, CancelReason::OwnerDeclined);
+        assert_eq!(notices(&repeat), vec![(request_id.clone(), Notice::UnknownRequest)]);
+        assert!(outcomes(&repeat).is_empty(), "no second cancelled");
+        assert!(audits(&repeat).is_empty(), "no second audit event");
+        assert_eq!(repeat.len(), 1);
+    }
+    // A later request is not touched by a replay of the old id.
+    rig.now += MIN_GAP_BETWEEN_ATTEMPTS;
+    rig.sink.lines.clear();
+    let (second_id, _) = rig.ring();
+    assert_ne!(second_id, request_id);
+    let replay = rig.cancel(&request_id, CancelReason::GaveUp);
+    assert_eq!(notices(&replay), vec![(request_id.clone(), Notice::UnknownRequest)]);
+    assert!(rig.broker.transfer_admits(&second_id, PHONE), "the new request is still ringing");
+    assert!(rig.machine.is_ringing_unaccepted());
+}
+
+/// A request an owner device has won is past withdrawing: its takeover is under
+/// way. OAIY is told so, and nothing changes.
+#[test]
+fn a_cancel_after_an_owner_device_accepted_is_too_late_and_changes_nothing() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+
+    for reason in [CancelReason::OwnerDeclined, CancelReason::MessageInstead, CancelReason::GaveUp] {
+        let effects = rig.cancel(&request_id, reason);
+        assert_eq!(notices(&effects), vec![(request_id.clone(), Notice::TooLate)]);
+        assert!(outcomes(&effects).is_empty(), "no cancelled: the takeover continues");
+        assert!(audits(&effects).is_empty());
+        assert!(rig.broker.is_busy(), "the request stays open for its takeover");
+        assert!(rig.machine.is_active());
+    }
+    // The takeover completes as if nothing had been said.
+    let fence = rig.fence(&request_id);
+    rig.broker.transfer_taken(&request_id, &fence, DEVICE).unwrap();
+    let effects = rig.poll();
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "transferred".to_string())]);
+    assert!(outcomes(&effects).is_empty());
+}
+
+/// An acceptance the machine has not seen yet still wins: the cancel polls
+/// the broker first, as `withdraw_unaccepted` does.
+#[test]
+fn an_acceptance_since_the_last_turn_beats_a_cancel() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    // The machine has not polled since the accept.
+    let effects = rig.cancel(&request_id, CancelReason::MessageInstead);
+    assert_eq!(outcomes(&effects), vec![(Outcome::Accepted, None)], "the acceptance is reported first");
+    assert_eq!(notices(&effects), vec![(request_id.clone(), Notice::TooLate)]);
+    assert!(rig.broker.is_busy());
+}
+
+#[test]
+fn a_cancel_for_a_request_this_call_does_not_have_changes_nothing() {
+    // Nothing open at all.
+    let mut rig = Rig::new();
+    let effects = rig.cancel("assist_00000000000000000000000000000000", CancelReason::GaveUp);
+    assert_eq!(
+        notices(&effects),
+        vec![("assist_00000000000000000000000000000000".to_string(), Notice::UnknownRequest)]
+    );
+    assert_eq!(effects.len(), 1);
+
+    // Another id while one rings: the ringing request is untouched.
+    let (request_id, _) = rig.ring();
+    let effects = rig.cancel("assist_not_this_one", CancelReason::OwnerDeclined);
+    assert_eq!(notices(&effects), vec![("assist_not_this_one".to_string(), Notice::UnknownRequest)]);
+    assert!(rig.machine.is_ringing_unaccepted());
+    assert!(rig.broker.transfer_admits(&request_id, PHONE));
+
+    // While the host is still planning there is no request id yet.
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    let effects = rig.cancel("assist_0123", CancelReason::GaveUp);
+    assert_eq!(notices(&effects), vec![("assist_0123".to_string(), Notice::UnknownRequest)]);
+    assert!(rig.machine.is_active(), "the plan is still being awaited");
+}
+
+/// A request of another call is never withdrawn by this call's cancel, even
+/// though the mailbox is shared.
+#[test]
+fn a_cancel_naming_another_calls_request_leaves_it_alone() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    // Another call's machine (nothing open) is handed the id of this call's request.
+    let mut other = TransferCall::new(Arc::new(Governor::default()));
+    let effects = {
+        let mut env = TransferEnv {
+            broker: &rig.broker,
+            media: &rig.media,
+            host: &rig.host,
+            sink: &mut rig.sink,
+            now: rig.now,
+            active_call_id: Some("call_other"),
+            switchboard_revision: 0,
+            host_ring_plan: true,
+            session_token: 2,
+        };
+        other.cancel_requested(&mut env, &request_id, CancelReason::OwnerDeclined)
+    };
+    assert_eq!(notices(&effects), vec![(request_id.clone(), Notice::UnknownRequest)]);
+    assert!(outcomes(&effects).is_empty());
+    assert!(rig.broker.is_busy(), "call A's request is still open");
+    assert!(rig.broker.transfer_admits(&request_id, PHONE));
+    assert!(rig.machine.is_ringing_unaccepted());
+}
+
+/// A cancel that crosses the request's own end changes nothing: how it ended is
+/// what OAIY hears.
+#[test]
+fn a_cancel_that_crosses_the_end_of_the_request_changes_nothing() {
+    // Declined a moment before, not yet polled.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.decline(&request_id, "Ring after five");
+    let effects = rig.cancel(&request_id, CancelReason::GaveUp);
+    assert_eq!(
+        outcomes(&effects),
+        vec![(Outcome::Declined, Some("Ring after five".to_string()))],
+        "the decline is what OAIY hears"
+    );
+    assert_eq!(notices(&effects), vec![(request_id.clone(), Notice::UnknownRequest)]);
+    assert!(!rig.machine.is_active());
+
+    // The caller hung up first: the poll reports cancelled for the call ending.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.active = None;
+    let effects = rig.cancel(&request_id, CancelReason::MessageInstead);
+    assert_eq!(outcomes(&effects), vec![(Outcome::Cancelled, None)], "reported once, by the call ending");
+    assert_eq!(notices(&effects), vec![(request_id.clone(), Notice::UnknownRequest)]);
     assert!(!rig.broker.is_busy());
 }
 
@@ -1628,6 +1832,7 @@ fn every_effect_is_free_of_call_text_and_owner_text_except_the_bounded_message()
                 continue;
             }
             Effect::Outcome(frame) => serde_json::to_string(frame).unwrap(),
+            Effect::Notice(frame) => serde_json::to_string(frame).unwrap(),
         };
         for secret in ["4471", "Gail", "0491", "570 156", "account"] {
             assert!(!encoded.contains(secret), "{secret} leaked into {encoded}");

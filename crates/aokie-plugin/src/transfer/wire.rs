@@ -440,6 +440,87 @@ pub fn sanitize_owner_message(answer: &str) -> Option<String> {
     Some(bounded)
 }
 
+// --- OAIY withdraws a request ------------------------------------------
+
+/// Why OAIY withdraws a request it asked for, from
+/// `formlogic.realtime.transfer_cancel`. A closed set: the plugin records it in
+/// its log and nowhere else, and nothing OAIY writes beyond it is accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelReason {
+    /// The person at the desk pressed Decline in OAIY's ring dialog.
+    OwnerDeclined,
+    /// OAIY offered the caller a message instead (Take a message instead).
+    MessageInstead,
+    /// OAIY gave up waiting.
+    GaveUp,
+}
+
+impl CancelReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerDeclined => "owner_declined",
+            Self::MessageInstead => "message_instead",
+            Self::GaveUp => "gave_up",
+        }
+    }
+}
+
+/// The request and reason of a `formlogic.realtime.transfer_cancel`, or `None`
+/// for a frame the plugin will not act on: no usable request id, or a reason
+/// outside the closed set. Such a frame is ignored, never fatal: there is
+/// nothing typed to answer it with.
+pub fn parse_cancel(value: &Value) -> Option<(String, CancelReason)> {
+    let request_id = value
+        .get("requestId")
+        .and_then(Value::as_str)
+        .filter(|id| safe_token(id))?
+        .to_string();
+    let reason = match value.get("reason").and_then(Value::as_str)? {
+        "owner_declined" => CancelReason::OwnerDeclined,
+        "message_instead" => CancelReason::MessageInstead,
+        "gave_up" => CancelReason::GaveUp,
+        _ => return None,
+    };
+    Some((request_id, reason))
+}
+
+/// What the plugin tells OAIY about a `transfer_cancel` that did not withdraw
+/// anything. A cancel that did is answered by the `cancelled` outcome itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Notice {
+    /// An owner device has already won the request: the takeover is under way
+    /// and is not affected. OAIY should expect the stop with `handoff:takeover`
+    /// or an `unavailable` outcome.
+    TooLate,
+    /// This call has no open request with that id: it never existed here, it
+    /// belongs to another call, or it has already ended (including by an
+    /// earlier cancel of the same id). Nothing was changed.
+    UnknownRequest,
+}
+
+impl Notice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TooLate => "too_late",
+            Self::UnknownRequest => "unknown_request",
+        }
+    }
+}
+
+/// One `formlogic.realtime.transfer_notice`, less the `type`, `callId` and
+/// `generation` the session stamps on every frame it sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoticeFrame {
+    /// The id OAIY named, echoed only when it was a well-formed id.
+    pub request_id: String,
+    pub notice: Notice,
+    /// Unix epoch milliseconds at which the plugin decided.
+    pub at_ms: u64,
+}
+
 // --- The session that follows a handoff ----------------------------------
 
 /// How the call came back to the AI after a handoff.

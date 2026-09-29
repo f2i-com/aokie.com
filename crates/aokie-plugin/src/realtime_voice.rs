@@ -148,6 +148,13 @@ pub enum RealtimeEventKind {
         response_id: String,
         item_id: String,
     },
+    /// OAIY withdraws a transfer request it asked for
+    /// (`formlogic.realtime.transfer_cancel`). Only meaningful on a session
+    /// that negotiated `transfer_v1`.
+    TransferCancel {
+        request_id: String,
+        reason: crate::transfer::CancelReason,
+    },
     Error {
         code: Option<String>,
         message: String,
@@ -197,6 +204,10 @@ enum ControlCommand {
     /// How a transfer to the owner ended (`transfer_v1`).
     TransferOutcome {
         frame: crate::transfer::OutcomeFrame,
+    },
+    /// A `transfer_cancel` from OAIY changed nothing (`transfer_v1`).
+    TransferNotice {
+        frame: crate::transfer::NoticeFrame,
     },
     Stop {
         reason: String,
@@ -329,6 +340,19 @@ struct TransferOutcomeEvent<'a> {
     generation: u64,
     #[serde(flatten)]
     frame: &'a crate::transfer::OutcomeFrame,
+}
+
+/// `formlogic.realtime.transfer_notice`: the notice fields come from the
+/// transfer contract's own frame type.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferNoticeEvent<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    call_id: &'a str,
+    generation: u64,
+    #[serde(flatten)]
+    frame: &'a crate::transfer::NoticeFrame,
 }
 
 #[derive(Serialize)]
@@ -599,6 +623,14 @@ impl RealtimeVoiceSession {
             .map_err(|_| "Desktop realtime control queue is unavailable".to_string())
     }
 
+    /// Tell OAIY that its `transfer_cancel` changed nothing. Sent only on a
+    /// session that negotiated `transfer_v1`.
+    pub fn send_transfer_notice(&self, frame: crate::transfer::NoticeFrame) -> Result<(), String> {
+        self.control_tx
+            .send(ControlCommand::TransferNotice { frame })
+            .map_err(|_| "Desktop realtime control queue is unavailable".to_string())
+    }
+
     /// Arm the already-ready upstream session. The caller must send this only
     /// after the exact call is active, SCO is up, screening has completed,
     /// and Aokie still owns the media fence. Merely opening the WebSocket must
@@ -690,6 +722,7 @@ impl DetachedSession {
                 },
                 ControlCommand::Stop { reason } => SentControl::Stop { reason },
                 ControlCommand::TransferOutcome { frame } => SentControl::TransferOutcome { frame },
+                ControlCommand::TransferNotice { frame } => SentControl::TransferNotice { frame },
                 ControlCommand::Begin { .. } => SentControl::Begin,
                 ControlCommand::CancelOutput { item_id, .. } => {
                     SentControl::CancelOutput { item_id }
@@ -727,6 +760,9 @@ pub(crate) enum SentControl {
     },
     TransferOutcome {
         frame: crate::transfer::OutcomeFrame,
+    },
+    TransferNotice {
+        frame: crate::transfer::NoticeFrame,
     },
     Stop {
         reason: String,
@@ -846,6 +882,20 @@ async fn run_socket(
                                 };
                                 sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
                                     .map_err(|e| format!("Desktop realtime transfer outcome failed: {e}"))?;
+                            }
+                        }
+                        Ok(ControlCommand::TransferNotice { frame }) => {
+                            // A reply to OAIY's cancel, which OAIY can only
+                            // have sent on a call that began.
+                            if begun {
+                                let event = TransferNoticeEvent {
+                                    kind: "formlogic.realtime.transfer_notice",
+                                    call_id: &config.call_id,
+                                    generation: config.generation,
+                                    frame: &frame,
+                                };
+                                sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
+                                    .map_err(|e| format!("Desktop realtime transfer notice failed: {e}"))?;
                             }
                         }
                         Ok(ControlCommand::Stop { reason }) => {
@@ -1227,6 +1277,24 @@ fn parse_server_text(
                 fatal,
                 abandoned_item_id,
             }))
+        }
+        "formlogic.realtime.transfer_cancel" => {
+            // OAIY withdraws a request it asked for. Well formed or not it is
+            // never fatal: a frame the plugin cannot make sense of changes
+            // nothing (there is nothing typed to answer it with), and whether
+            // the request exists is the transfer machine's business.
+            match crate::transfer::parse_cancel(&value) {
+                Some((request_id, reason)) => Ok(Some(RealtimeEventKind::TransferCancel {
+                    request_id,
+                    reason,
+                })),
+                None => {
+                    eprintln!(
+                        "[aokie-plugin] ignoring a transfer_cancel with no usable requestId or reason"
+                    );
+                    Ok(None)
+                }
+            }
         }
         other => Err(format!("unsupported Desktop realtime event: {other}")),
     }
@@ -1980,6 +2048,61 @@ mod tests {
                     | Outcome::Expired
                     | Outcome::Cancelled
             ));
+        }
+
+        // OAIY withdraws a request: what it sends parses, what the plugin
+        // ignores is ignored (never fatal), and the notices the plugin sends
+        // are what the fixture shows.
+        let cancel = fixture("transfer-v1.cancel.fixture.json");
+        let mut state = OutputParseState::default();
+        for case in cancel["cancel"]["cases"].as_array().unwrap() {
+            let parsed = parse_server_text(
+                &case["frame"].to_string(),
+                "call_0123",
+                7,
+                "https://oaiy.localhost",
+                &mut state,
+            )
+            .unwrap()
+            .unwrap();
+            let RealtimeEventKind::TransferCancel { request_id, reason } = parsed else {
+                panic!("{case}: {parsed:?}")
+            };
+            assert_eq!(request_id, case["frame"]["requestId"].as_str().unwrap());
+            assert_eq!(reason.as_str(), case["frame"]["reason"].as_str().unwrap());
+        }
+        for case in cancel["cancel"]["ignored"]["cases"].as_array().unwrap() {
+            let parsed = parse_server_text(
+                &case["frame"].to_string(),
+                "call_0123",
+                7,
+                "https://oaiy.localhost",
+                &mut state,
+            );
+            assert_eq!(parsed, Ok(None), "{case}");
+        }
+        // A cancel is judged like any frame: the session's own call and
+        // generation, or the stream ends.
+        for (call_id, generation) in [("call_other", 7), ("call_0123", 8)] {
+            let mut frame = cancel["cancel"]["cases"][0]["frame"].clone();
+            frame["callId"] = call_id.into();
+            frame["generation"] = generation.into();
+            assert!(
+                parse_server_text(&frame.to_string(), "call_0123", 7, "https://oaiy.localhost", &mut state).is_err(),
+                "{frame}"
+            );
+        }
+        for case in cancel["notice"]["cases"].as_array().unwrap() {
+            let frame = &case["frame"];
+            let notice: crate::transfer::NoticeFrame = serde_json::from_value(frame.clone()).unwrap();
+            let sent = serde_json::to_value(TransferNoticeEvent {
+                kind: "formlogic.realtime.transfer_notice",
+                call_id: frame["callId"].as_str().unwrap(),
+                generation: frame["generation"].as_u64().unwrap(),
+                frame: &notice,
+            })
+            .unwrap();
+            assert_eq!(&sent, frame, "{case}");
         }
     }
 

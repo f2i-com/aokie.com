@@ -120,6 +120,16 @@ pub(super) fn apply_transfer_effects(
                 }
                 send_held_outcomes(lane.as_deref_mut(), transfer);
             }
+            Effect::Notice(frame) => {
+                // A reply to a frame this session's OAIY sent: sent at once,
+                // and only on a session that negotiated the contract. It is
+                // never kept for a later one.
+                if let Some(lane) = lane.as_deref_mut().filter(|lane| lane.transfer_negotiated) {
+                    if let Err(error) = lane.session.send_transfer_notice(frame) {
+                        eprintln!("[aokie-plugin] transfer notice could not be sent: {error}");
+                    }
+                }
+            }
             Effect::Audit(event) => emit(outbox, sink, event),
         }
     }
@@ -173,6 +183,47 @@ pub(super) fn withdraw_open_transfer(
         }
     };
     apply_transfer_effects(effects, lane, &mut ctx.transfer, outbox, sink);
+}
+
+/// OAIY withdraws a request it asked for (`formlogic.realtime.transfer_cancel`).
+/// Only a session that negotiated the contract has one; on any other the frame
+/// means nothing and gets no reply. The transfer machine decides what it
+/// changes; the result reaches OAIY as the `cancelled` outcome, or as a typed
+/// notice when nothing was withdrawn.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn handle_transfer_cancel(
+    request_id: &str,
+    reason: crate::transfer::CancelReason,
+    ctx: &mut CallVoiceContext,
+    lane: &mut RealtimeCallLane,
+    broker: &crate::assistance::AssistanceBroker,
+    tracker: &crate::call_session::SessionTracker,
+    remote_media: &crate::remote_media::RemoteMediaHandle,
+    host_rpc: &Arc<crate::host_rpc::HostRpc>,
+    status: &RadioStatus,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+) {
+    if !lane.transfer_negotiated {
+        eprintln!(
+            "[aokie-plugin] transfer_cancel ignored: this session did not negotiate transfer_v1"
+        );
+        return;
+    }
+    let effects = {
+        let mut env = transfer_env_with(
+            broker,
+            &mut *sink,
+            tracker,
+            remote_media,
+            host_rpc,
+            status,
+            lane.session_token,
+        );
+        ctx.transfer.cancel_requested(&mut env, request_id, reason)
+    };
+    apply_transfer_effects(effects, Some(lane), &mut ctx.transfer, outbox, sink);
 }
 
 /// Lay a live call's voice context aside (the hold juggle parking a caller) and
@@ -1173,6 +1224,24 @@ pub(super) fn service_realtime_lane(
                             ));
                             break;
                         }
+                    }
+                    crate::realtime_voice::RealtimeEventKind::TransferCancel {
+                        request_id,
+                        reason,
+                    } => {
+                        handle_transfer_cancel(
+                            &request_id,
+                            reason,
+                            ctx,
+                            lane,
+                            crate::assistance::global(),
+                            tracker,
+                            remote_media,
+                            host_rpc,
+                            status,
+                            outbox,
+                            sink,
+                        );
                     }
                     crate::realtime_voice::RealtimeEventKind::HangupRequested {
                         tool_call_id,

@@ -137,6 +137,14 @@ What the plugin offers OAIY:
   `cancelled`. A completed takeover sends none: the session stops with
   `handoff:takeover`, and the fresh session for the same call carries
   `start.resume` (`return` or `failback`).
+- **A withdrawal from OAIY**, `formlogic.realtime.transfer_cancel {requestId,
+  reason}` (`owner_declined`, `message_instead`, `gave_up`), handled like a
+  request withdrawn because someone took the caller another way: a request
+  nobody has won is withdrawn and reported once as `cancelled`; one an owner
+  device has won is left alone and answered with a `transfer_notice`
+  (`too_late`); an id the call has no open request for is answered
+  `unknown_request`. Replay-safe, and only on a session that negotiated
+  `transfer_v1`.
 
 How it runs. The tool asks the host for a ring plan (`oaiy.ring.plan`, 1.5 s),
 opens a request in the same volatile assistance mailbox that owner transfer on
