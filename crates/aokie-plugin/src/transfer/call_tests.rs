@@ -460,6 +460,66 @@ fn consent_paused_while_ringing_withdraws_the_request_and_tells_oaiy() {
     assert!(!rig.machine.is_active());
 }
 
+/// Review finding 13. Consent taken back after an endpoint has won is not the
+/// machine's to act on: the media path owns consent from then on. Revoking it
+/// there ends the takeover and returns the caller to the AI (the gateway then
+/// records the request's end), so the machine leaves the request alone and
+/// reports what the broker resolves. Cancelling it here would discard the
+/// mailbox from under a takeover that is still being torn down, and tell OAIY
+/// `cancelled` for a caller who was in fact bridged.
+#[test]
+fn consent_taken_back_after_an_accept_is_the_media_paths_to_act_on_not_the_machines() {
+    let withdrawn = || RemoteConsentGate {
+        expires_at: Some("2001-01-01T00:00:00Z".into()),
+        ..consenting()
+    };
+
+    // Accepted, media setup running.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+    rig.media.set_remote_consent(withdrawn());
+    assert!(rig.poll().is_empty(), "no cancelled: the takeover is not the machine's");
+    assert!(rig.machine.is_active());
+    assert!(rig.broker.is_busy(), "the mailbox is held until the media path has resolved it");
+    // The media path returns the caller and the gateway records the failure:
+    // the AI resumes, and OAIY is told the setup did not complete.
+    rig.machine.note_handoff(rig.now);
+    let fence = rig.fence(&request_id);
+    let mut returned = fence.clone();
+    returned.owner_epoch += 2;
+    returned.remote_revision += 3;
+    rig.broker
+        .transfer_unavailable(&request_id, &fence, returned, Some(DEVICE))
+        .unwrap();
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Unavailable, None)]);
+    assert_eq!(
+        rig.machine.take_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(0, Via::Failback))
+    );
+    assert!(!rig.broker.is_busy());
+
+    // Bridged: the takeover completed and the owner is talking to the caller.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    let _ = rig.poll();
+    let fence = rig.fence(&request_id);
+    rig.broker.transfer_taken(&request_id, &fence, DEVICE).unwrap();
+    rig.machine.note_handoff(rig.now);
+    rig.media.set_remote_consent(withdrawn());
+    let effects = rig.poll();
+    assert!(outcomes(&effects).is_empty(), "no frame: the session was stopped for the handoff");
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "transferred".to_string())]);
+    // The media path ends the bridge; the AI resumes, and the caller was with the owner.
+    assert_eq!(
+        rig.machine.take_resume(rig.now, &rig.broker),
+        Some(ResumeInfo::new(0, Via::Return))
+    );
+    assert!(!rig.broker.is_busy());
+}
+
 #[test]
 fn a_caller_who_never_asked_is_refused_before_the_host_is_asked() {
     let mut rig = Rig::new();

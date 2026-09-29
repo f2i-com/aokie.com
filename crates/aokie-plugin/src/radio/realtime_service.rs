@@ -157,7 +157,6 @@ pub(super) fn withdraw_open_transfer(
     if !ctx.transfer.is_active() {
         return;
     }
-    let mut lane = lane;
     let effects = {
         let mut env = transfer_env_with(
             broker,
@@ -173,7 +172,7 @@ pub(super) fn withdraw_open_transfer(
             TransferWithdrawal::Parked => ctx.transfer.park(&mut env),
         }
     };
-    apply_transfer_effects(effects, lane.as_deref_mut(), &mut ctx.transfer, outbox, sink);
+    apply_transfer_effects(effects, lane, &mut ctx.transfer, outbox, sink);
 }
 
 /// Lay a live call's voice context aside (the hold juggle parking a caller) and
@@ -250,7 +249,7 @@ pub(super) fn service_realtime_lane(
             let effects = {
                 let mut env = transfer_env(
                     &mut *sink,
-                    &tracker,
+                    tracker,
                     remote_media,
                     host_rpc,
                     status,
@@ -1295,7 +1294,7 @@ pub(super) fn service_realtime_lane(
                         let effects = {
                             let mut env = transfer_env(
                                 &mut *sink,
-                                &tracker,
+                                tracker,
                                 remote_media,
                                 host_rpc,
                                 status,
@@ -1889,7 +1888,7 @@ pub(super) fn service_realtime_lane(
                             Some(owner) => {
                                 let mut env = transfer_env(
                                     &mut *sink,
-                                    &tracker,
+                                    tracker,
                                     remote_media,
                                     host_rpc,
                                     status,

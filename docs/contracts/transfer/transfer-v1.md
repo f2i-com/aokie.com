@@ -51,8 +51,15 @@ Every request ends in exactly one of these, in bounded time:
 | An owner device declined | `transfer_outcome declined`, optionally with `message` | tell the caller kindly, relay the message faithfully, offer to take a message |
 | Nobody answered inside the ring window | `transfer_outcome expired` | offer to take a message |
 | Media setup failed after an acceptance | `transfer_outcome unavailable` (or a fresh `start` with `resume.via = "failback"` when the session had already stopped) | offer to take a message |
-| The caller hung up, consent was withdrawn, or the request was withdrawn | `transfer_outcome cancelled` | nothing if the call is over |
+| The caller hung up, consent was withdrawn while it still rang, or the request was withdrawn (someone took the caller another way, the call was put on hold behind another) | `transfer_outcome cancelled` | nothing if the call is over |
 | Refused at the door | the tool result itself: `ok: false`, `status`, `reason` | per status: `refused` means do not offer a person; `unavailable` means offer a message |
+
+**Consent taken back after an owner device accepted** is not a `cancelled`: from
+the accept on, the media path owns consent. Revoking it there ends the takeover
+and returns the caller to the AI. If the setup had not completed the request
+ends `unavailable` (or a `failback` start); if the owner was already talking to
+the caller the session simply resumes with a fresh `start` and `resume.via =
+"return"`. Consent taken back while the request still rings is `cancelled`.
 
 ## Negotiation
 
