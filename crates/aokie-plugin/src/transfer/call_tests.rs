@@ -126,6 +126,38 @@ impl Rig {
         self.machine.withdraw_unaccepted(&mut env)
     }
 
+    /// The call is about to be put on hold: whether it may be parked, and what was said.
+    pub(crate) fn park(&mut self) -> (Vec<Effect>, bool) {
+        let mut env = TransferEnv {
+            broker: &self.broker,
+            media: &self.media,
+            host: &self.host,
+            sink: &mut self.sink,
+            now: self.now,
+            active_call_id: self.active.as_deref(),
+            switchboard_revision: 0,
+            host_ring_plan: self.host_ring_plan,
+            session_token: self.session,
+        };
+        self.machine.park(&mut env)
+    }
+
+    /// The call has already left the line.
+    pub(crate) fn park_forced(&mut self) -> Vec<Effect> {
+        let mut env = TransferEnv {
+            broker: &self.broker,
+            media: &self.media,
+            host: &self.host,
+            sink: &mut self.sink,
+            now: self.now,
+            active_call_id: self.active.as_deref(),
+            switchboard_revision: 0,
+            host_ring_plan: self.host_ring_plan,
+            session_token: self.session,
+        };
+        self.machine.park_forced(&mut env)
+    }
+
     /// OAIY sends `transfer_cancel` for this request id.
     pub(crate) fn cancel(&mut self, request_id: &str, reason: CancelReason) -> Vec<Effect> {
         let mut env = TransferEnv {
@@ -1154,28 +1186,18 @@ fn a_cancel_that_crosses_the_end_of_the_request_changes_nothing() {
     assert!(!rig.broker.is_busy());
 }
 
-/// Review finding 6. The hold juggle lays a call's context aside while the call
-/// lives on, and nobody polls a stowed context.
+/// Review finding 6, and the second review's F2. The hold juggle lays a call's
+/// context aside while the call lives on, and nobody polls a stowed context. A
+/// request nobody has won is withdrawn with it; one an owner device has won is a
+/// takeover being connected, and the call is NOT parked.
 #[test]
-fn a_call_put_on_hold_takes_its_request_with_it_and_says_so() {
+fn a_call_put_on_hold_takes_an_unwon_request_with_it_and_never_an_accepted_one() {
     // Ringing.
     let mut rig = Rig::new();
     let (request_id, _) = rig.ring();
     assert!(rig.broker.is_busy());
-    let effects = {
-        let mut env = TransferEnv {
-            broker: &rig.broker,
-            media: &rig.media,
-            host: &rig.host,
-            sink: &mut rig.sink,
-            now: rig.now,
-            active_call_id: rig.active.as_deref(),
-            switchboard_revision: 0,
-            host_ring_plan: true,
-            session_token: 1,
-        };
-        rig.machine.park(&mut env)
-    };
+    let (effects, may_park) = rig.park();
+    assert!(may_park);
     assert_eq!(outcomes(&effects), vec![(Outcome::Cancelled, None)]);
     assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "cancelled".to_string())]);
     assert!(!rig.broker.is_busy(), "the mailbox is free for the call that has the line");
@@ -1183,73 +1205,74 @@ fn a_call_put_on_hold_takes_its_request_with_it_and_says_so() {
     assert!(!rig.machine.is_active());
     assert!(rig.poll().is_empty(), "it is said once");
 
-    // An acceptance the machine has not seen yet is reported first, then the
-    // request is withdrawn (the broker is asked before anything is trusted).
-    let mut unseen = Rig::new();
-    let (unseen_id, _) = unseen.ring();
-    unseen.accept(&unseen_id);
-    let effects = {
-        let mut env = TransferEnv {
-            broker: &unseen.broker,
-            media: &unseen.media,
-            host: &unseen.host,
-            sink: &mut unseen.sink,
-            now: unseen.now,
-            active_call_id: unseen.active.as_deref(),
-            switchboard_revision: 0,
-            host_ring_plan: true,
-            session_token: 1,
-        };
-        unseen.machine.park(&mut env)
-    };
-    assert_eq!(
-        outcomes(&effects),
-        vec![(Outcome::Accepted, None), (Outcome::Cancelled, None)],
-        "reported as it happened, then withdrawn because the call was put on hold"
-    );
-    assert!(!unseen.broker.is_busy());
-
-    // Nothing open: nothing to say.
-    let effects = {
-        let mut env = TransferEnv {
-            broker: &rig.broker,
-            media: &rig.media,
-            host: &rig.host,
-            sink: &mut rig.sink,
-            now: rig.now,
-            active_call_id: rig.active.as_deref(),
-            switchboard_revision: 0,
-            host_ring_plan: true,
-            session_token: 1,
-        };
-        rig.machine.park(&mut env)
-    };
+    // Nothing open: nothing to say, and the call may be parked.
+    let (effects, may_park) = rig.park();
     assert!(effects.is_empty());
+    assert!(may_park);
 
-    // Accepted, media not yet up: the acceptance is withdrawn from under the
-    // device, which the broker then refuses to complete.
+    // Accepted, media setup running: the phone has accepted. The call is not
+    // parked, the request carries on untouched, and the acceptance is reported
+    // once however many times the gate is asked.
     let mut rig = Rig::new();
     let (request_id, _) = rig.ring();
     rig.accept(&request_id);
     assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
     let fence = rig.fence(&request_id);
-    let effects = {
-        let mut env = TransferEnv {
-            broker: &rig.broker,
-            media: &rig.media,
-            host: &rig.host,
-            sink: &mut rig.sink,
-            now: rig.now,
-            active_call_id: rig.active.as_deref(),
-            switchboard_revision: 0,
-            host_ring_plan: true,
-            session_token: 1,
-        };
-        rig.machine.park(&mut env)
-    };
+    for _ in 0..3 {
+        let (effects, may_park) = rig.park();
+        assert!(!may_park, "a takeover is being connected");
+        assert!(effects.is_empty(), "nothing is said, nothing is withdrawn");
+        assert!(rig.broker.is_busy());
+        assert!(rig.broker.transfer_activation_is_current(&request_id, &fence, DEVICE));
+        assert!(rig.machine.is_active());
+    }
+    // The takeover completes as if nothing had been asked.
+    rig.broker.transfer_taken(&request_id, &fence, DEVICE).unwrap();
+    let effects = rig.poll();
+    assert_eq!(audits(&effects), vec![(RESOLVED.to_string(), "transferred".to_string())]);
+
+    // An acceptance the machine has not seen yet is reported (once), and the
+    // call is not parked either.
+    let mut unseen = Rig::new();
+    let (unseen_id, _) = unseen.ring();
+    unseen.accept(&unseen_id);
+    let (effects, may_park) = unseen.park();
+    assert!(!may_park);
+    assert_eq!(outcomes(&effects), vec![(Outcome::Accepted, None)], "reported as it happened");
+    assert!(unseen.park().0.is_empty(), "and only once");
+    assert!(unseen.broker.is_busy());
+
+    // A phone that accepts at the very instant of the withdrawal wins too.
+    let mut race = Rig::new();
+    let (race_id, _) = race.ring();
+    assert!(race.poll().is_empty());
+    let race_fence = race.fence(&race_id);
+    let id = race_id.clone();
+    let fence_in_the_race = race_fence.clone();
+    race.machine.before_withdrawal = Some(Box::new(move |broker| {
+        broker.accept_transfer(&id, &fence_in_the_race, DEVICE).unwrap();
+    }));
+    let (effects, may_park) = race.park();
+    assert!(!may_park);
+    assert_eq!(outcomes(&effects), vec![(Outcome::Accepted, None)]);
+    assert!(race.broker.transfer_activation_is_current(&race_id, &race_fence, DEVICE));
+}
+
+/// The backstop, once the call has already left the line: everything open goes,
+/// an accepted request included (fail closed), so no request is left in a
+/// context nobody polls.
+#[test]
+fn a_call_that_has_already_left_the_line_takes_even_an_accepted_request_with_it() {
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Accepted, None)]);
+    let fence = rig.fence(&request_id);
+    let effects = rig.park_forced();
     assert_eq!(outcomes(&effects), vec![(Outcome::Cancelled, None)]);
     assert!(!rig.broker.is_busy());
     assert!(rig.broker.transfer_taken(&request_id, &fence, DEVICE).is_err());
+    assert!(!rig.machine.is_active());
 }
 
 /// Review finding 6, second half. A machine dropped with a request open (the

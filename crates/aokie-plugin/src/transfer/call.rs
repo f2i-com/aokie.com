@@ -606,15 +606,37 @@ impl TransferCall {
     /// would keep the single mailbox (and the owner's phone ringing) for a call
     /// that no longer has the line, and could not be reported until the call
     /// came back. A request nobody has won is withdrawn now (atomically) and
-    /// `cancelled` waits for the session the call gets when it resumes. The
-    /// broker is asked first, as for every withdrawal.
-    pub fn park(&mut self, env: &mut TransferEnv<'_>) -> Vec<Effect> {
+    /// `cancelled` waits for the session the call gets when it resumes.
+    ///
+    /// A request an owner device HAS won is never withdrawn by this: its
+    /// takeover is being connected (the phone has accepted; its media setup can
+    /// take up to 45 s), and putting the caller on hold behind another call
+    /// would fail it after the phone accepted, with OAIY having heard
+    /// `accepted` and then `cancelled`. The broker is asked first, so an
+    /// acceptance the machine had not seen is reported, and the answer is
+    /// whether the call may be parked: `false` means the second caller is left
+    /// to the network's call waiting, and the request carries on untouched.
+    pub fn park(&mut self, env: &mut TransferEnv<'_>) -> (Vec<Effect>, bool) {
         let mut effects = self.poll(env);
         if let Stage::Ringing(_) = self.stage {
             if let Stage::Ringing(open) = std::mem::replace(&mut self.stage, Stage::Idle) {
                 self.withdraw_unwon(open, env, &mut effects, "the call was put on hold");
             }
         }
+        if let Stage::Planning(_) = self.stage {
+            // The session that asked is about to be disposed: nobody would get the answer.
+            self.stage = Stage::Idle;
+        }
+        let may_park = !matches!(self.stage, Stage::Accepted(_));
+        (effects, may_park)
+    }
+
+    /// [`park`](Self::park) when the call has already left the line (the swap
+    /// happened) and an accepted request cannot be left behind either: it is
+    /// withdrawn whatever its state, failing closed. Reached only if an
+    /// acceptance raced the gate that should have stopped the swap.
+    pub fn park_forced(&mut self, env: &mut TransferEnv<'_>) -> Vec<Effect> {
+        let mut effects = self.poll(env);
         effects.extend(self.withdraw_open(env, "the call was put on hold"));
         effects
     }

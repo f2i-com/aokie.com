@@ -142,14 +142,27 @@ pub(super) fn apply_transfer_effects(
 pub(super) enum TransferWithdrawal {
     /// The call is over and its context is about to be replaced.
     CallEnded,
-    /// The call is being put on hold behind another and its context stowed.
+    /// The call is about to be put on hold behind another and its context
+    /// stowed. A request an owner device has already accepted is NOT withdrawn:
+    /// the answer is that the call may not be parked.
     Parked,
+    /// The call has already left the line and its context is being stowed: an
+    /// accepted request cannot be left behind either, so everything open is
+    /// withdrawn (fail closed). Only reached if an acceptance raced the gate.
+    ParkedForced,
 }
 
 /// Withdraw whatever transfer request the call's context still has open, tell
 /// OAIY (on the call's own negotiated session if there is one, otherwise on the
-/// next one) and close the audit trail. Both places that lay a call's context
-/// aside go through here: the per-call reset and the hold juggle.
+/// next one) and close the audit trail. Every place that lays a call's context
+/// aside goes through here: the per-call reset, the hold juggle and the
+/// switchboard's swaps.
+///
+/// Returns whether the call MAY be parked. It is `false` only for
+/// [`TransferWithdrawal::Parked`] when an owner device has already accepted
+/// the request: that takeover is being connected and is left untouched (its
+/// acceptance is reported once), and the caller of this must not put the call
+/// on hold.
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn withdraw_open_transfer(
@@ -163,10 +176,11 @@ pub(super) fn withdraw_open_transfer(
     status: &RadioStatus,
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
-) {
+) -> bool {
     if !ctx.transfer.is_active() {
-        return;
+        return true;
     }
+    let mut may_park = true;
     let effects = {
         let mut env = transfer_env_with(
             broker,
@@ -179,10 +193,16 @@ pub(super) fn withdraw_open_transfer(
         );
         match why {
             TransferWithdrawal::CallEnded => ctx.transfer.end_call(&mut env),
-            TransferWithdrawal::Parked => ctx.transfer.park(&mut env),
+            TransferWithdrawal::Parked => {
+                let (effects, may) = ctx.transfer.park(&mut env);
+                may_park = may;
+                effects
+            }
+            TransferWithdrawal::ParkedForced => ctx.transfer.park_forced(&mut env),
         }
     };
     apply_transfer_effects(effects, lane, &mut ctx.transfer, outbox, sink);
+    may_park
 }
 
 /// `transfer_to_owner` was called on a session that negotiated the contract.
@@ -386,7 +406,11 @@ pub(super) fn stow_call_context(
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
 ) -> CallVoiceContext {
-    withdraw_open_transfer(
+    // The gate that may refuse to park an accepted transfer runs BEFORE the
+    // swap, where the caller can still abandon it. Here the call has left the
+    // line: whatever is still open is withdrawn, an acceptance that raced the
+    // gate included (fail closed).
+    let may_park = withdraw_open_transfer(
         TransferWithdrawal::Parked,
         ctx,
         None,
@@ -396,8 +420,22 @@ pub(super) fn stow_call_context(
         host_rpc,
         status,
         outbox,
-        sink,
+        &mut *sink,
     );
+    if !may_park {
+        withdraw_open_transfer(
+            TransferWithdrawal::ParkedForced,
+            ctx,
+            None,
+            broker,
+            tracker,
+            remote_media,
+            host_rpc,
+            status,
+            outbox,
+            sink,
+        );
+    }
     std::mem::replace(ctx, replacement)
 }
 
