@@ -88,9 +88,14 @@ if ($Audit) {
 }
 
 # ── Cross-repo contract digest (audit FL-34) — cheap, always on; fails loudly
-# when the formlogic checkout is missing (set FORMLOGIC_REPO) ──
-Invoke-Gate 'contracts: cross-repo digest (FL-34)' $repo {
-    node scripts/check-contracts.mjs
+# when the formlogic checkout is missing (set FORMLOGIC_REPO). The transfer_v1
+# contract is also compared with OAIY's copy of it: the folder
+# OAIY_TRANSFER_CONTRACTS names, else a sibling ../oaiy checkout. With neither, the
+# gate says SKIPPED in so many words (it does not fail: the OAIY checkout is not
+# needed to release this repository), so a green release check never silently
+# means the comparison ran. ──
+Invoke-Gate 'contracts: cross-repo digest (FL-34, transfer_v1 against OAIY when present)' $repo {
+    node scripts/check-contracts.mjs --find-oaiy
 }
 
 # ── Self-host template rendering (audit AK-14) — cheap, always on ──

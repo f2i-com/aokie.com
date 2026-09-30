@@ -25,6 +25,9 @@
  *      so: the OAIY checkout is not required to build or test this repository.
  *
  * Usage:  node scripts/check-contracts.mjs
+ *         node scripts/check-contracts.mjs --find-oaiy             (the release check: also look for a sibling
+ *                                                                    ../oaiy checkout, and say SKIPPED when
+ *                                                                    there is none)
  *         node scripts/check-contracts.mjs --write-transfer-sums   (rewrite SHA256SUMS)
  *         node --test scripts/check-contracts.test.mjs             (the transfer rules' own tests)
  * Env:    FORMLOGIC_REPO — path to the formlogic checkout
@@ -37,7 +40,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { checkTransfer, SUMS, writeSums } from './lib/transfer-contract.mjs';
+import { checkTransfer, findOaiyCopy, SUMS, writeSums } from './lib/transfer-contract.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -50,15 +53,25 @@ if (process.argv.includes('--write-transfer-sums')) {
   process.exit(0);
 }
 
-const transfer = checkTransfer({ transferDir, oaiyDir: process.env.OAIY_TRANSFER_CONTRACTS });
+// With --find-oaiy (the release check) the OAIY copy is looked for when the variable is not set:
+// a sibling `oaiy` checkout. Without it, only the variable names a copy (the OAIY checkout is not
+// needed to build or test this repository).
+const finding = process.argv.includes('--find-oaiy');
+const oaiy = finding
+  ? findOaiyCopy({ repoRoot })
+  : { dir: process.env.OAIY_TRANSFER_CONTRACTS, source: 'OAIY_TRANSFER_CONTRACTS', tried: [] };
+const transfer = checkTransfer({ transferDir, oaiyDir: oaiy.dir });
 if (transfer.problems.length > 0) {
   console.error(`check-contracts: FAIL — ${transfer.problems.length} transfer_v1 problem(s):`);
   for (const p of transfer.problems) console.error(`  ${p}`);
+} else if (transfer.compared === null && finding) {
+  console.log(`check-contracts: OK — transfer_v1: ${transfer.files} files match ${SUMS}`);
+  console.log(`check-contracts: SKIPPED — the OAIY copy of transfer_v1 was NOT compared: OAIY_TRANSFER_CONTRACTS is not set and there is no OAIY checkout at ${oaiy.tried.join(', ')}. Set OAIY_TRANSFER_CONTRACTS to OAIY's docs/contracts/transfer folder to run the cross-repository comparison.`);
 } else if (transfer.compared === null) {
   console.log(`check-contracts: OK — transfer_v1: ${transfer.files} files match ${SUMS}`);
   console.log('check-contracts: NOTE — the OAIY copy of transfer_v1 was not compared; set OAIY_TRANSFER_CONTRACTS to its docs/contracts/transfer folder.');
 } else {
-  console.log(`check-contracts: OK — transfer_v1: ${transfer.files} files match ${SUMS}, ${transfer.compared} files (fixtures and the document) byte-identical with the OAIY copy`);
+  console.log(`check-contracts: OK — transfer_v1: ${transfer.files} files match ${SUMS}, ${transfer.compared} files (fixtures and the document) byte-identical with the OAIY copy (${oaiy.source}: ${oaiy.dir})`);
 }
 
 // --- the shared FormLogic contracts -----------------------------------------
