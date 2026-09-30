@@ -37,6 +37,7 @@ pub(super) const MAX_REFUSALS_AFTER_LIMIT: usize = 10;
 /// waits for its result, so a well-behaved bridge never has more than one; a
 /// bridge that keeps sending while they pile up is broken, and the session
 /// ends rather than holding an unbounded queue.
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
 pub(super) const MAX_QUEUED_REFUSALS: usize = 8;
 
 /// Tool-call ids remembered for duplicate detection. A little more than the

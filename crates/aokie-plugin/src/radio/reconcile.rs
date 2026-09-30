@@ -40,6 +40,7 @@ pub(super) fn reconcile_switchboard(
     // the helpers in radio/realtime_service.rs: a transfer request it still
     // holds is withdrawn with a context that is stowed or retired, and nothing
     // polls a stowed one.
+    #[cfg_attr(not(feature = "voice"), allow(unused_macros))]
     macro_rules! stow_ctx {
         ($replacement:expr) => {
             stow_call_context(
@@ -55,6 +56,7 @@ pub(super) fn reconcile_switchboard(
             )
         };
     }
+    #[cfg_attr(not(feature = "voice"), allow(unused_macros))]
     macro_rules! retire_ctx {
         ($replacement:expr) => {
             retire_call_context(
