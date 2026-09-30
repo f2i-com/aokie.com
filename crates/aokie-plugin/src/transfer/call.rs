@@ -67,9 +67,13 @@ pub const MIN_GAP_BETWEEN_ATTEMPTS: Duration = Duration::from_secs(15);
 pub const MAX_ATTEMPTS_PER_HOUR: usize = 20;
 /// Requests one caller number may cost the owner in an hour, across calls: a
 /// caller who rings back again and again must not be able to ring the owner
-/// without end even if each call stays inside the per-call allowance. Calls with
-/// no usable number share only the hourly ceiling above.
+/// without end even if each call stays inside the per-call allowance.
 pub const MAX_ATTEMPTS_PER_CALLER_PER_HOUR: usize = 3;
+/// Calls with no usable number (withheld, "anonymous", empty, too short) cannot
+/// be told apart, so they share ONE small bucket: a caller who withholds the
+/// number can neither ring the owner without end nor drain the hourly ceiling
+/// above for everyone else.
+pub const MAX_ATTEMPTS_PER_WITHHELD_PER_HOUR: usize = 2;
 /// Caller numbers remembered (as keyed hashes) at once.
 const MAX_CALLERS_TRACKED: usize = 256;
 
@@ -90,6 +94,8 @@ const HARD_DEADLINE_SLACK: Duration = Duration::from_secs(5);
 pub struct Governor {
     opened: Mutex<VecDeque<Instant>>,
     callers: Mutex<HashMap<u64, VecDeque<Instant>>>,
+    /// The one bucket every call with no usable number shares.
+    withheld: Mutex<VecDeque<Instant>>,
     key: RandomState,
 }
 
@@ -128,7 +134,12 @@ impl Governor {
 
     fn allows_caller(&self, key: Option<u64>, now: Instant) -> bool {
         let Some(key) = key else {
-            return true;
+            // No usable number: the shared bucket.
+            let Ok(mut withheld) = self.withheld.lock() else {
+                return false;
+            };
+            Self::prune(&mut withheld, now);
+            return withheld.len() < MAX_ATTEMPTS_PER_WITHHELD_PER_HOUR;
         };
         let Ok(mut callers) = self.callers.lock() else {
             return false;
@@ -146,6 +157,10 @@ impl Governor {
             opened.push_back(now);
         }
         let Some(key) = key else {
+            if let Ok(mut withheld) = self.withheld.lock() {
+                Self::prune(&mut withheld, now);
+                withheld.push_back(now);
+            }
             return;
         };
         if let Ok(mut callers) = self.callers.lock() {
@@ -426,8 +441,7 @@ impl TransferCall {
         }
         // A caller who rings back again and again costs the owner one request
         // each time however tidy each call is. Only a keyed hash of the number
-        // is kept, and a call with no usable number shares the global ceiling
-        // alone.
+        // is kept, and calls with no usable number share one small bucket.
         let caller_key = args
             .caller_number
             .and_then(|number| self.governor.caller_key(number));

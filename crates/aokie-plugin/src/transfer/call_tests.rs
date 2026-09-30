@@ -1953,6 +1953,52 @@ fn one_caller_number_has_an_hourly_ceiling_across_calls() {
     assert!(matches!(rig.begin("next_hour"), Begin::Planning));
 }
 
+/// Second review F9. Calls with a withheld or unusable number used to share only
+/// the hourly ceiling, so they could drain it: twenty opened, then a named
+/// caller was refused `limit_global`. They now share one small bucket.
+#[test]
+fn callers_with_a_withheld_number_share_one_small_bucket_and_cannot_drain_the_global_ceiling() {
+    assert_eq!(MAX_ATTEMPTS_PER_WITHHELD_PER_HOUR, 2);
+    let governor = Arc::new(Governor::default());
+    let start = Instant::now();
+    let call = |number: Option<&str>, at: Instant| {
+        let mut rig = Rig::with_governor(Arc::clone(&governor));
+        rig.now = at;
+        rig.caller_number = number.map(str::to_string);
+        rig
+    };
+    // The reviewer's probe: many withheld callers, in every way a number can be unusable.
+    let withheld = [None, Some("anonymous"), Some(""), Some("12345"), Some("Private"), Some("unknown"), Some("+")];
+    let mut opened = 0;
+    let mut refused = 0;
+    for attempt in 0..(MAX_ATTEMPTS_PER_HOUR + 10) {
+        let number = withheld[attempt % withheld.len()];
+        let mut rig = call(number, start + Duration::from_secs(attempt as u64));
+        match rig.begin("tool_1") {
+            Begin::Planning => {
+                rig.host_answers(Rig::ring_plan());
+                let request_id = ringing_request_id(&rig.poll());
+                rig.decline(&request_id, "no");
+                let _ = rig.poll();
+                opened += 1;
+            }
+            Begin::Answered(answer) => {
+                assert_eq!(refused_reason(&answer), "limit_caller", "{number:?}");
+                assert!(rig.host_requests().is_empty(), "the host is not asked: {number:?}");
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!(opened, MAX_ATTEMPTS_PER_WITHHELD_PER_HOUR, "the whole crowd of withheld numbers gets two");
+    assert_eq!(refused, MAX_ATTEMPTS_PER_HOUR + 10 - MAX_ATTEMPTS_PER_WITHHELD_PER_HOUR);
+    // The global ceiling was not touched beyond those two: a named caller is fine.
+    let mut named = call(Some("0491 570 006"), start + Duration::from_secs(60));
+    assert!(matches!(named.begin("named"), Begin::Planning), "not limit_global");
+    // An hour later the bucket has moved on.
+    let mut later = call(None, start + Duration::from_secs(3_600 + 30));
+    assert!(matches!(later.begin("later"), Begin::Planning));
+}
+
 #[test]
 fn the_caller_table_holds_only_keyed_hashes_and_is_bounded() {
     let governor = Governor::default();

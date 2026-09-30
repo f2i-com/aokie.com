@@ -123,8 +123,10 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
 5. the plugin's own ceilings: 3 requests a call (`limit_call`), the next no
    sooner than 15 seconds after the last one ended (`limit_gap`), 3 an hour for
    one caller number across calls (`limit_caller`; only a keyed hash of the
-   number is kept, in memory, and a call with no usable number shares only the
-   global ceiling), 20 an hour in all (`limit_global`). The host's ring policy
+   number is kept, in memory, and every call with no usable number (withheld,
+   `anonymous`, empty) shares ONE bucket of 2 an hour, also `limit_caller`, so a
+   caller who withholds the number cannot drain the global ceiling), 20 an hour in
+   all (`limit_global`). The host's ring policy
    is normally stricter (2 a call, a minute apart, 10 an hour by default);
 6. for `caller_asked`, the phrase check on the last three caller turns
    (`caller_did_not_ask`), before the host is asked. The turns are normalised
