@@ -278,22 +278,18 @@ pub(super) fn begin_transfer_tool(
     status: &RadioStatus,
     sink: &mut dyn Sink,
 ) -> crate::transfer::call::Begin {
+    // What the caller said, oldest first. Turns that only acknowledge the AI
+    // ("mm-hmm", "yeah, okay") are not turns to the host, whose own record
+    // skips them, so they neither count nor push a real turn out of the last
+    // three (`caller_turns`).
     let recent_caller_turns: Vec<String> = {
-        let mut turns: Vec<String> = ctx
+        let said: Vec<&str> = ctx
             .history
             .iter()
-            .rev()
             .filter(|entry| entry.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-            .filter_map(|entry| {
-                entry
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-            .take(crate::transfer::MAX_RECENT_TURNS)
+            .filter_map(|entry| entry.get("content").and_then(serde_json::Value::as_str))
             .collect();
-        turns.reverse();
-        turns
+        crate::transfer::caller_turns(&said)
     };
     let caller_number = tracker.current().and_then(|call| call.caller_id.clone());
     match lane.owner.clone() {

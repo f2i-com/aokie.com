@@ -337,50 +337,157 @@ fn the_cancel_fixture_is_what_the_plugin_reads_and_answers() {
     assert_eq!(fixture["behaviour"]["cases"].as_array().unwrap().len(), 6);
 }
 
+/// The check the file describes (its `algorithm`), run from the file's own
+/// data alone: no pattern, list or number of the plugin's is used, only its
+/// normaliser (which has its own test).
+fn caller_asked_from_the_file(fixture: &Value, said: &[String]) -> bool {
+    let person = fixture["person"].as_str().unwrap();
+    let head = fixture["head"].as_str().unwrap();
+    let compile = |source: &Value, flags: &str| {
+        let pattern = source.as_str().unwrap().replace("<person>", person).replace("<head>", head);
+        regex::Regex::new(&format!("{flags}{pattern}")).unwrap()
+    };
+    let list = |key: &str| -> Vec<regex::Regex> {
+        fixture[key].as_array().unwrap().iter().map(|source| compile(source, "")).collect()
+    };
+    let (rules, blocks, turn_blocks) = (list("rules"), list("blocks"), list("turnBlocks"));
+    let role_marker = compile(&fixture["roleMarker"], "(?i)");
+    let fillers = strings(&fixture["fillers"]);
+    let ends: Vec<char> = strings(&fixture["sentenceEnds"])
+        .iter()
+        .map(|end| end.chars().next().unwrap())
+        .collect();
+    let recent = fixture["recentTurns"].as_u64().unwrap() as usize;
+    let chars = fixture["turnChars"].as_u64().unwrap() as usize;
+    let plain = |text: &str| -> String {
+        phrase::normalize(text)
+            .split(' ')
+            .filter(|word| !word.is_empty() && !fillers.iter().any(|filler| filler == word))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    said[said.len().saturating_sub(recent)..].iter().any(|turn| {
+        let skip = turn.chars().count().saturating_sub(chars);
+        let turn: String = turn.chars().skip(skip).collect();
+        if role_marker.is_match(&turn) {
+            return false;
+        }
+        let whole = plain(&turn);
+        if whole.is_empty() || turn_blocks.iter().any(|block| block.is_match(&whole)) {
+            return false;
+        }
+        turn.split(|character: char| ends.contains(&character))
+            .map(&plain)
+            .filter(|sentence| !sentence.is_empty())
+            .any(|sentence| {
+                !blocks.iter().any(|block| block.is_match(&sentence))
+                    && rules.iter().any(|rule| rule.is_match(&sentence))
+            })
+    })
+}
+
+/// The file's `backchannel` rule, from the file's own words.
+fn is_backchannel_from_the_file(fixture: &Value, text: &str) -> bool {
+    let backchannel = &fixture["backchannel"];
+    let (words, pairs) = (strings(&backchannel["words"]), strings(&backchannel["pairs"]));
+    let at_most = backchannel["atMost"].as_u64().unwrap() as usize;
+    let pieces: Vec<String> = text
+        .to_lowercase()
+        .split(|c: char| c.is_whitespace() || ['-', '\u{2010}', '\u{2011}', '\u{2013}'].contains(&c))
+        .map(|piece| piece.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+        .filter(|piece| !piece.is_empty())
+        .collect();
+    let (mut at, mut said) = (0, 0);
+    while at < pieces.len() {
+        if pieces.get(at + 1).is_some_and(|next| pairs.contains(&format!("{} {next}", pieces[at]))) {
+            at += 2;
+        } else if words.contains(&pieces[at]) {
+            at += 1;
+        } else {
+            return false;
+        }
+        said += 1;
+    }
+    (1..=at_most).contains(&said)
+}
+
 #[test]
-fn the_caller_asked_fixture_passes_and_its_rules_are_the_plugins_rules() {
+fn the_caller_asked_fixture_passes_and_its_patterns_are_the_plugins_patterns() {
     let fixture = fixture("transfer-v1.caller-asked.fixture.json");
-    assert_eq!(fixture["recentTurns"], 3);
     let turns = |case: &Value| strings(&case["turns"]);
-    assert_eq!(fixture["positive"].as_array().unwrap().len(), 10);
-    assert_eq!(fixture["negative"].as_array().unwrap().len(), 10);
-    for case in fixture["positive"].as_array().unwrap() {
+    let cases = |key: &str| fixture[key].as_array().unwrap().clone();
+    let (positive, negative, window) = (cases("positive"), cases("negative"), cases("window"));
+    assert_eq!((positive.len(), negative.len(), window.len()), (51, 66, 4));
+    for case in &positive {
         assert!(caller_asked(&turns(case)), "{case}");
     }
-    for case in fixture["negative"].as_array().unwrap() {
+    for case in &negative {
         assert!(!caller_asked(&turns(case)), "{case}");
     }
-    for case in fixture["window"].as_array().unwrap() {
+    for case in &window {
         assert_eq!(caller_asked(&turns(case)), case["asked"] == true, "{case}");
     }
-    for case in fixture["knownGaps"]["cases"].as_array().unwrap() {
-        assert_eq!(caller_asked(&turns(case)), case["asked"] == true, "{case}");
+    // Nothing is a known gap any more: every case there would be a negative one.
+    let gaps = fixture["knownGaps"]["cases"].as_array().unwrap();
+    assert!(gaps.is_empty(), "a known gap is a case the check gets wrong; list it or fix it");
+
+    // The backchannel: the words, the pairs and the limit are the plugin's, its
+    // text rule decides every listed turn as the file says, the turns that
+    // remain are the ones the plugin keeps, and the check then decides as listed.
+    let backchannel = &fixture["backchannel"];
+    assert_eq!(backchannel["atMost"], phrase::ACK_AT_MOST);
+    assert_eq!(strings(&backchannel["words"]), phrase::ACK_WORDS);
+    assert_eq!(strings(&backchannel["pairs"]), phrase::ACK_PAIRS);
+    let (acknowledgements, not_acknowledgements) = (
+        strings(&backchannel["acknowledgements"]),
+        strings(&backchannel["notAcknowledgements"]),
+    );
+    assert_eq!((acknowledgements.len(), not_acknowledgements.len()), (29, 18));
+    for said in &acknowledgements {
+        assert!(phrase::is_backchannel(said), "{said:?}");
+        assert!(is_backchannel_from_the_file(&fixture, said), "{said:?}");
+    }
+    for said in &not_acknowledgements {
+        assert!(!phrase::is_backchannel(said), "{said:?}");
+        assert!(!is_backchannel_from_the_file(&fixture, said), "{said:?}");
+    }
+    let backchannel_cases = backchannel["cases"].as_array().unwrap();
+    assert_eq!(backchannel_cases.len(), 7);
+    for case in backchannel_cases {
+        let kept = caller_turns(&turns(case));
+        assert_eq!(kept, strings(&case["window"]), "{case}");
+        assert_eq!(caller_asked(&kept), case["asked"] == true, "{case}");
     }
 
-    // The rules the file spells out, compiled here, decide every case the
-    // way the plugin's own compiled rules do.
-    let person = fixture["person"].as_str().unwrap();
-    let compile = |source: &Value| {
-        regex::Regex::new(&source.as_str().unwrap().replace("<person>", person)).unwrap()
-    };
-    let rules: Vec<_> = fixture["rules"].as_array().unwrap().iter().map(compile).collect();
-    let blocks: Vec<_> = fixture["blocks"].as_array().unwrap().iter().map(compile).collect();
-    assert_eq!((rules.len(), blocks.len()), (7, 6));
-    let with_fixture_rules = |turns: &[String]| {
-        turns[turns.len().saturating_sub(3)..].iter().any(|turn| {
-            let turn = phrase::normalize(turn);
-            !blocks.iter().any(|block| block.is_match(&turn))
-                && rules.iter().any(|rule| rule.is_match(&turn))
-        })
-    };
-    let every_case = ["positive", "negative"]
-        .iter()
-        .flat_map(|key| fixture[key].as_array().unwrap().iter())
-        .chain(fixture["window"].as_array().unwrap().iter())
-        .chain(fixture["knownGaps"]["cases"].as_array().unwrap().iter());
+    // Every number, list and pattern of the file is the plugin's, and the
+    // file's own algorithm, run from its own data, decides every case the way
+    // the plugin does: neither can move without the other.
+    assert_eq!(fixture["recentTurns"], phrase::RECENT_TURNS);
+    assert_eq!(fixture["turnChars"], phrase::TURN_CHARS);
+    assert_eq!(fixture["person"], phrase::PERSON);
+    assert_eq!(fixture["head"], phrase::HEAD);
+    assert_eq!(strings(&fixture["rules"]), phrase::RULES);
+    assert_eq!(strings(&fixture["blocks"]), phrase::BLOCKS);
+    assert_eq!(strings(&fixture["turnBlocks"]), phrase::TURN_BLOCKS);
+    assert_eq!(fixture["roleMarker"], phrase::ROLE_MARKER);
+    assert_eq!(strings(&fixture["fillers"]), phrase::FILLERS);
+    let ends: Vec<char> =
+        strings(&fixture["sentenceEnds"]).iter().map(|end| end.chars().next().unwrap()).collect();
+    assert_eq!(ends, phrase::SENTENCE_ENDS);
+    let listed: std::collections::BTreeSet<char> = regex::Regex::new(r"U\+([0-9A-F]{4})")
+        .unwrap()
+        .captures_iter(fixture["normalise"].as_str().unwrap())
+        .map(|found| char::from_u32(u32::from_str_radix(&found[1], 16).unwrap()).unwrap())
+        .collect();
+    assert_eq!(listed, phrase::APOSTROPHES.iter().copied().collect(), "the file's apostrophes");
+    let every_case = positive.iter().chain(&negative).chain(&window);
     for case in every_case {
         let turns = turns(case);
-        assert_eq!(with_fixture_rules(&turns), caller_asked(&turns), "{case}");
+        assert_eq!(caller_asked_from_the_file(&fixture, &turns), caller_asked(&turns), "{case}");
+    }
+    for case in backchannel_cases {
+        let window = strings(&case["window"]);
+        assert_eq!(caller_asked_from_the_file(&fixture, &window), case["asked"] == true, "{case}");
     }
 }
 

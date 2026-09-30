@@ -18,11 +18,6 @@ pub const RING_SECONDS_DEFAULT: u64 = 40;
 /// The owner's caller-facing text is at most this long.
 pub const MAX_MESSAGE_CHARS: usize = 320;
 
-/// The most caller turns that go to the host with a plan request, and the
-/// longest each may be.
-pub const MAX_RECENT_TURNS: usize = 3;
-pub const MAX_TURN_CHARS: usize = 300;
-
 const MAX_ID_CHARS: usize = 128;
 const MAX_TARGET_LIST: usize = 16;
 
@@ -332,7 +327,9 @@ pub fn parse_plan(result: &Value) -> Result<RingPlan, String> {
 }
 
 /// The params of `oaiy.ring.plan`. The caller's turns go to the host on this
-/// machine only, to run the phrase check; each is cut to 300 characters.
+/// machine only, to run the phrase check: the last three that are not only
+/// acknowledgements of the AI, each cut to its last 300 characters (a turn is
+/// read from its end), which is what the plugin's own phrase check read.
 pub fn plan_params(
     call_id: &str,
     call_epoch: u64,
@@ -341,13 +338,7 @@ pub fn plan_params(
     caller_number: Option<&str>,
     recent_caller_turns: &[String],
 ) -> Value {
-    let turns: Vec<String> = recent_caller_turns
-        .iter()
-        .rev()
-        .take(MAX_RECENT_TURNS)
-        .rev()
-        .map(|turn| turn.chars().take(MAX_TURN_CHARS).collect())
-        .collect();
+    let turns = super::phrase::caller_turns(recent_caller_turns);
     let mut params = json!({
         "callId": call_id,
         "callEpoch": call_epoch,
@@ -775,6 +766,20 @@ mod tests {
         let long = plan_params("call_1", 1, 1, Reason::Urgent, None, &["x".repeat(900)]);
         assert_eq!(long["recentCallerTurns"][0].as_str().unwrap().chars().count(), 300);
         assert!(long.get("callerNumber").is_none());
+        // A turn is read from its end: the words that finish a long turn are
+        // the ones the host gets (second review F4).
+        let ask_at_the_end = format!("{} can I speak to the owner", "blah ".repeat(80));
+        let kept = plan_params("call_1", 1, 1, Reason::CallerAsked, None, &[ask_at_the_end.clone()]);
+        let sent = kept["recentCallerTurns"][0].as_str().unwrap();
+        assert_eq!(sent.chars().count(), 300);
+        assert!(ask_at_the_end.ends_with(sent) && sent.ends_with("can I speak to the owner"));
+        // Turns that only acknowledge the AI are not turns: they neither go to
+        // the host nor push a real turn out of the last three.
+        let said: Vec<String> = ["Can I speak to the owner?", "yeah", "okay", "mm-hmm"]
+            .map(String::from)
+            .to_vec();
+        let params = plan_params("call_1", 1, 1, Reason::CallerAsked, None, &said);
+        assert_eq!(params["recentCallerTurns"], json!(["Can I speak to the owner?"]));
         let blank = plan_params("call_1", 1, 1, Reason::Urgent, Some("  "), &[]);
         assert!(blank.get("callerNumber").is_none());
     }

@@ -19,7 +19,7 @@ step with the OAIY repository's copy. The digests are in [SHA256SUMS](SHA256SUMS
 | [transfer-v1.start-ready.fixture.json](transfer-v1.start-ready.fixture.json) | `start.allowTransfer`, `ready.features`, `start.resume`, the `handoff:takeover` stop, and the compatibility matrix. |
 | [transfer-v1.ring-plan.fixture.json](transfer-v1.ring-plan.fixture.json) | The two plugin-to-host requests `oaiy.ring.plan` and `oaiy.ring.opened`. |
 | [transfer-v1.reserved-offer-id.fixture.json](transfer-v1.reserved-offer-id.fixture.json) | The reserved transfer offer id and its generations (vector V2). |
-| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, the rules, 10 positive and 10 negative cases. |
+| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, every rule and block, 51 positive and 66 negative cases, the windows, and the turns that only acknowledge the AI. |
 
 ## How a transfer runs
 
@@ -136,11 +136,29 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    all (`limit_global`). The host's ring policy
    is normally stricter (2 a call, a minute apart, 10 an hour by default);
 6. for `caller_asked`, the phrase check on the last three caller turns
-   (`caller_did_not_ask`), before the host is asked. The turns are normalised
-   first (lower-case, apostrophe look-alikes such as U+2019 become `'`, every
-   run of other characters and of spaces becomes one space), so "speak, to the
-   owner" matches and "I don't want to speak" typed with a curly apostrophe is
-   blocked like its straight twin;
+   (`caller_did_not_ask`), before the host is asked. The turns are the
+   caller's, without the ones that only acknowledge the AI ("mm-hmm", "yeah,
+   okay": one to three acknowledgements and nothing else, so a caller's "yeah"
+   after the ask does not push it out of the last three), each read from its
+   last 300 characters, a sentence at a time, after normalising (lower-case,
+   apostrophe look-alikes such as U+2019 become `'`, every run of other
+   characters and of spaces becomes one space, thinking noises dropped), so
+   "speak, to the owner" matches and "I don't want to speak" (or "I dont want
+   to speak", or the same with a curly apostrophe) is a refusal. The rules,
+   the blocks that stop a sentence counting (a refusal, the future or the past,
+   a question about what the receptionist is, what someone else said, a caller
+   telling the receptionist what to say) and the cases are the caller-asked
+   fixture, the one source both ends are tested against; the plugin's check is
+   never stricter than the host's, names aside (what the host counts, the
+   plugin lets through), because it runs first. It has no names in it: a caller who asks
+   for the owner by first name is recognised only by a host that knows the
+   owner's name (OAIY takes it from a business named for its owner), the plugin
+   does not, so it answers `caller_did_not_ask` and the caller is offered a
+   message. The plugin decides what is an acknowledgement by the words alone;
+   the host also leaves out a turn said before the greeting, one that resumed
+   a reply that was cut off and a quick "of course" or "go on" said over the
+   AI, using audio timing the plugin cannot see. The same turns, cut the same
+   way, are the `recentCallerTurns` of the plan request;
 7. the host's ring plan (`oaiy.ring.plan`). For `urgent` and `policy_rule` the
    plugin cannot see an emergency or a business rule, so its phrase check is
    skipped only when the plan carries `"reasonAllowed": true` (the host vouches
@@ -413,8 +431,12 @@ and a responding device id, and no text from the call or the owner.
 * Announce `ringPlan` in `plugin.init.features` only if the host answers
   `oaiy.ring.plan` and `oaiy.ring.opened`. Without it the plugin never offers
   transfer.
-* Run the caller-asked phrase check with the fixture's normaliser (apostrophe
-  look-alikes folded, spaces collapsed), and put `"reasonAllowed": true` in the
+* Run the caller-asked phrase check as the caller-asked fixture describes it
+  (its normaliser, rules, blocks, sentences, turn blocks and 300-character
+  reading; the fixture is the plugin's floor as well, so a request the host
+  counts is never refused first), leave the caller's acknowledgement-only turns
+  out of the record it is run on and of the `recentCallerTurns` of a plan
+  request (the plugin does), and put `"reasonAllowed": true` in the
   plan only when the host itself has confirmed the `urgent` or `policy_rule`
   reason for this call; without it those reasons also need the caller to have
   asked.
