@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 /// Shortest and longest ring the plugin will open, whatever the plan says.
 pub const RING_SECONDS_MIN: u64 = 20;
 pub const RING_SECONDS_MAX: u64 = 90;
+/// The ring a plan gets when it says nothing about one (the design's default; a
+/// number it does say is clamped to the two limits above).
+pub const RING_SECONDS_DEFAULT: u64 = 40;
 
 /// The owner's caller-facing text is at most this long.
 pub const MAX_MESSAGE_CHARS: usize = 320;
@@ -310,7 +313,7 @@ pub fn parse_plan(result: &Value) -> Result<RingPlan, String> {
     let ring_seconds = object
         .get("ringSeconds")
         .and_then(Value::as_u64)
-        .unwrap_or(0)
+        .unwrap_or(RING_SECONDS_DEFAULT)
         .clamp(RING_SECONDS_MIN, RING_SECONDS_MAX);
     Ok(RingPlan {
         plan_id,
@@ -694,6 +697,16 @@ mod tests {
         for (asked, got) in [(0, 20), (5, 20), (30, 30), (500, 90), (u64::MAX, 90)] {
             let plan = parse_plan(&json!({"planId": "p", "decision": "ring", "ringSeconds": asked})).unwrap();
             assert_eq!(plan.ring_seconds, got, "{asked}");
+        }
+        // Second review F7: a plan that says nothing about the ring gets the
+        // documented default of 40 s (it used to get the 20 s minimum); a
+        // number it does say, even 0, is clamped, and a member that is not a
+        // number says nothing.
+        assert_eq!(RING_SECONDS_DEFAULT, 40);
+        for said_nothing in [json!({}), json!({"ringSeconds": null}), json!({"ringSeconds": "45"}), json!({"ringSeconds": -5}), json!({"ringSeconds": 30.5})] {
+            let mut plan = json!({"planId": "p", "decision": "ring"});
+            plan.as_object_mut().unwrap().extend(said_nothing.as_object().unwrap().clone());
+            assert_eq!(parse_plan(&plan).unwrap().ring_seconds, 40, "{plan}");
         }
         for bad in [
             Value::Null,

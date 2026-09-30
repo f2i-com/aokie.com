@@ -249,7 +249,7 @@ session and is never kept for a later one.
 | What | Value |
 |---|---|
 | Wait for the host's ring plan | 1.5 s |
-| Ring window (the plan's `ringSeconds`, clamped by the plugin) | 20 to 90 s, default 40 |
+| Ring window (the plan's `ringSeconds`, clamped by the plugin) | 20 to 90 s; 40 s when the plan says nothing about it (an absent or non-numeric `ringSeconds`; a number, even 0, is clamped) |
 | Media setup after an acceptance | 45 s |
 | Grace for the gateway to record the result | 10 s |
 | The plugin's own monotonic deadline behind those | 5 s more |
@@ -306,8 +306,11 @@ The plan names devices by endpoint-key thumbprint (`phones` and
 
 On the **relay carrier** the plugin publishes the offers, so it publishes them
 only to the named devices (a device outside the plan is offered no takeover of
-either surface while the transfer is open) and refuses an accept or a decline
-from any other device (`not_a_target`).
+either surface while the transfer is open). A device outside the plan that
+answers anyway is refused: an accept with `transfer_unavailable` (the same typed
+refusal as for a request that was declined, has expired or was won by another
+endpoint: the device learns nothing about the plan) and a decline with
+`not_a_target`.
 
 On the self-hosted **socket carrier** the gateway publishes the offers to every
 approved device, so the plan is enforced only where a device tries to win: a
@@ -319,7 +322,17 @@ request can end it with a decline, and OAIY is told `declined` (with that
 device's message, bounded and untrusted). That costs the owner availability (the
 ring ends early and the caller is offered a message) and nothing else: it can
 never accept, take the caller, or reach the media. A host that must not be
-exposed to it should use the relay carrier.
+exposed to it should use the relay carrier. Also on that carrier, an accept or a
+claim from a device outside the plan is not a typed refusal: the plugin ends the
+whole gateway connection (a reconnect), because on the socket every frame comes
+from trusted gateway infrastructure and one that breaks the plan means the
+session is broken.
+
+On both carriers the **request card** (the plugin's `assistance_request`, whose
+text for a transfer is the fixed "Caller requested the owner") is published with
+the call snapshot to every approved device that may read state; only the offers
+and the declines are filtered by the plan. A device outside the plan can
+therefore see that a transfer request is open, and is offered nothing to accept.
 
 The signed offer on the native call surface
 (`voice_system_ui`) has a reserved id, `toffer_` plus 26 characters of base32 of a
