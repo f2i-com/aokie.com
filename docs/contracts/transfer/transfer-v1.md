@@ -185,7 +185,15 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    acknowledgement-only turn can never be what asks, so dropping more of them
    only lets the last three reach further back); the one way it can be
    stricter is a turn the host drops for its timing that the plugin keeps,
-   which uses one of the plugin's three places. The floor is also looser than
+   which uses one of the plugin's three places. An ask counts for **one
+   request**. The turns this check reads are the turns not yet spent: a turn is
+   spent when a request that passed the check has been given to the host to
+   plan (whatever the host then says of it) and when the AI has the caller back
+   (the fresh session after a takeover or a hold); a request refused before the
+   host is asked, for a busy mailbox or a ceiling, spends nothing. What the
+   caller says after that is what the next request rests on, so "Thanks, that
+   is all sorted now" after a ring or a takeover is judged on its own and not on
+   the ask before it. The floor is also looser than
    the host for what only the host reads (an ask taken back, being told to say
    it, a different target such as billing, someone else in the room), which the
    host refuses after the floor has let it through; and the one difference of
@@ -360,9 +368,12 @@ The plan names devices by endpoint-key thumbprint (`phones` and
   design's vector V01 (the owner at the PC) therefore needs the Windows
   Companion **named**: the host puts the thumbprint of every paired Windows
   Companion it wants offered the call in `desktopCompanions`, including one that
-  is not running yet (the toast starts it, and it is offered the request when it
-  connects inside the ring window). A plan that sets `desktopToast` and leaves
-  `desktopCompanions` empty gets `no_endpoint` and no toast.
+  is not running. Nothing launches a Companion today (the desktop toast shows a
+  notification and raises the host's window, and that is all): a Companion the
+  plan names is assumed reachable for the whole ring window, and is offered the
+  request if it connects (its hello registers it) inside that window. A plan
+  that sets `desktopToast` and leaves `desktopCompanions` empty gets
+  `no_endpoint` and no toast.
 
 On the **relay carrier** the plugin publishes the offers, so it publishes them
 only to the named devices (a device outside the plan is offered no takeover of
@@ -396,9 +407,13 @@ therefore see that a transfer request is open, and is offered nothing to accept.
 
 The signed offer on the native call surface
 (`voice_system_ui`) has a reserved id, `toffer_` plus 26 characters of base32 of a
-hash of the request id and the device's thumbprint, so a ring hint posted by the
-host names the same offer that later reaches the phone
-([fixture](transfer-v1.reserved-offer-id.fixture.json)). A retired offer is never
+hash of the request id and the device's thumbprint, so that a ring hint, if a
+host posts one, names the same offer that later reaches the phone
+([fixture](transfer-v1.reserved-offer-id.fixture.json)). **No host posts a ring
+hint yet**, and none wakes a sleeping phone: the id is defined and
+vector-tested, the plugin publishes the offer under it, and a phone learns of
+the request from that offer alone. A phone in the roster is assumed reachable
+for the whole ring window. A retired offer is never
 published again under the same id: the id carries a generation that the plugin
 increments on every retirement.
 
@@ -480,7 +495,10 @@ and a responding device id, and no text from the call or the owner.
   counts is never refused first, names aside), run it on the host's own record
   of what the caller said, which leaves out an acknowledgement said over the AI
   (the plugin, which cannot see that timing, drops every acknowledgement-only
-  turn from the `recentCallerTurns` of a plan request), and put
+  turn from the `recentCallerTurns` of a plan request), count an ask for one
+  request only (a turn is spent by the request that was planned and by the AI
+  getting the caller back, as step 6 says: the host's own record too must not
+  let an ask from before authorise the next request), and put
   `"reasonAllowed": true` in the
   plan only when the host itself has confirmed the `urgent` or `policy_rule`
   reason for this call; without it those reasons also need the caller to have
@@ -501,13 +519,17 @@ and a responding device id, and no text from the call or the owner.
     names it: it has to be enrolled as an approved endpoint like a phone.
   * List the paired Windows Companion **whether or not it is online**. The
     design's reference `plan()` puts a Windows Companion in `desktopCompanions`
-    only while it is online (`d.online`); the toast exists to start a Companion
-    that is not running yet, so that plan emits an empty list at exactly the
-    moment it matters and the plugin now answers `no_endpoint`. Drop the online
-    filter for Windows Companions (keep `callAuthority`, `canTake` and the
-    availability rules). A Companion the plan named before it was running is
-    offered the request, on both surfaces and with the reserved id, when its
-    hello registers it inside the ring window.
+    only while it is online (`d.online`), so that plan emits an empty list
+    whenever the Companion is not connected at that moment and the plugin
+    answers `no_endpoint`, though it might connect inside the ring window. Drop
+    the online filter for Windows Companions (keep `callAuthority`, `canTake`
+    and the availability rules). A Companion the plan named before it was
+    running is offered the request, on both surfaces and with the reserved id,
+    when its hello registers it inside the ring window. Do not read more into
+    that than it says: nothing in the host launches a Companion (the toast is a
+    notification and raises the window) or wakes a sleeping phone (the plan's
+    `wake` list is not acted on: no ring hint or wake push is posted), so what
+    is offered is what is connected, or connects, inside the window.
 * `oaiy.ring.plan` may wait 1.5 s, and the answer to the tool call reaches the
   model only after the line it spoke before calling has drained (like every tool
   result), so the model's "I'll see if they are free" is not cut off.

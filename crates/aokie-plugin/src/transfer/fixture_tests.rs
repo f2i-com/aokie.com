@@ -292,6 +292,46 @@ fn the_documents_state_the_ring_default_and_the_relay_refusals_the_code_gives() 
     assert!(document.contains("**request card**"));
 }
 
+/// Review R9: the contract says what is true today about delivery. Nothing
+/// launches a Windows Companion, and no host posts a ring hint or wakes a
+/// phone; the reserved offer id is defined and vector-tested and that is all.
+/// Words that promised more must not come back, in the document, the fixtures
+/// or the notes beside them.
+#[test]
+fn the_contract_does_not_promise_a_launch_a_wake_or_a_ring_hint_that_no_host_gives() {
+    let read = |name: &str| std::fs::read_to_string(folder().join(name)).unwrap().replace("\r\n", "\n");
+    let document = read("transfer-v1.md");
+    let ring_plan = read("transfer-v1.ring-plan.fixture.json");
+    let reserved = read("transfer-v1.reserved-offer-id.fixture.json");
+    let architecture = std::fs::read_to_string(folder().join("../../ARCHITECTURE.md")).unwrap().replace("\r\n", "\n");
+    for (name, text) in [
+        ("transfer-v1.md", &document),
+        ("the ring-plan fixture", &ring_plan),
+        ("the reserved-offer-id fixture", &reserved),
+        ("ARCHITECTURE.md", &architecture),
+    ] {
+        for promised in [
+            "the toast starts it",
+            "the toast exists to start a Companion",
+            "Windows Companion it starts",
+            "ring hint posted by the\nhost names",
+            "ring hint the OAIY host posts",
+            "so it can wake phones",
+            "so it can start delivery",
+            "The ring hint carries generation 0",
+        ] {
+            assert!(!text.contains(promised), "{name} promises: {promised}");
+        }
+    }
+    // What is true instead, said where a reader would look.
+    assert!(document.contains("Nothing launches a Companion today"));
+    assert!(document.contains("**No host posts a ring\nhint yet**"));
+    assert!(document.contains("A phone in the roster is assumed reachable\nfor the whole ring window"));
+    assert!(ring_plan.contains("No host does yet"));
+    assert!(reserved.contains("No host posts a ring hint yet"));
+    assert!(architecture.contains("no host wakes a phone or posts a ring hint yet"));
+}
+
 #[test]
 fn the_cancel_fixture_is_what_the_plugin_reads_and_answers() {
     let fixture = fixture("transfer-v1.cancel.fixture.json");

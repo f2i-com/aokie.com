@@ -215,7 +215,8 @@ pub enum Targets {
     /// request offered to "any live device" would let a phone the owner never
     /// meant to ring take the caller, so a plan that wants the owner at the PC
     /// names the Windows Companion (by thumbprint, whether or not it is running
-    /// yet: the toast starts it).
+    /// yet; nothing launches it, so it is offered the request if it connects
+    /// inside the ring window).
     Nobody,
 }
 
