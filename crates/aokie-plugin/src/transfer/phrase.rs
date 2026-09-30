@@ -77,7 +77,7 @@ pub(crate) const RULES: [&str; 19] = [
 ];
 
 /// What stops a sentence counting, each read against one sentence.
-pub(crate) const BLOCKS: [&str; 17] = [
+pub(crate) const BLOCKS: [&str; 23] = [
     r"\b(?:my|our|his|her|their) (?:owner|manager|boss)\b",
     r"\bowner of\b",
     r"\b(?:speak|talk|chat)(?:ing)? (?:to|with) (?:you|u)\b",
@@ -86,13 +86,19 @@ pub(crate) const BLOCKS: [&str; 17] = [
     r"\b(?:do not|don't|dont|does not|doesn't|did not|didn't|cannot|can not|can't|cant|will not|won't|wont|would not|wouldn't|should not|shouldn't|never|no way|not going to|not gonna|refuse to|rather not|no need to|no wish to|not able to|unable to|no longer|not asking|not wanting|not looking|not trying|not needing|not requesting|not after|not here) (?:\w+ ){0,3}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b",
     r"\b(?:without|instead of|rather than|as opposed to|in place of) (?:\w+ ){0,2}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b",
     r"\b(?:how (?:do|can|could|would|should|might) (?:i|we)|what (?:number|way|time|day|hours?)|when (?:can|could|do|does|is|will)|where (?:do|can|could)) (?:\w+ ){0,6}(?:speak|talk|chat|reach|contact|get hold of|get through|transfer|put)\w*\b",
-    r"\b(?:i m|i am|we re|we are) (?:\w+ ){0,1}(?:speaking|talking|chatting) (?:to|with)\b",
+    r"\bhow to (?:\w+ ){0,2}(?:speak|talk|chat|reach|contact|get hold of|get through|transfer|put|connect)\w*\b",
+    r"\b(?:speaking|talking|chatting) (?:to|with) (?:\w+ ){0,2}else\b",
+    r"\b(?:i m|i'm|i am|we re|we're|we are) (?:\w+ ){0,1}(?:speaking|talking|chatting) (?:to|with)\b",
     r"\bi(?:'ll| will| shall|'m going to| am going to|'m gonna| am gonna) (?:\w+ ){0,2}(?:speak|talk|chat|call|ring)\b",
     r"\b(?:speak|talk|chat)(?:ing)? (?:to|with) (?:\w+ ){0,3}myself\b",
     r"\b(?:was|were|been|had been) (?:\w+ )?(?:speak|talk|chat)(?:ing)?\b",
+    r"\b(?:was|were|been|had been|has been|have been) (?:\w+ ){0,2}(?:transferred (?:to|over to|through to)|(?:put|patched) (?:through|thru|thro))\b",
+    r"\b(?:he|she|they) (?:\w+ )?(?:put|patched|handed|connected|transferred) (?:the |your )?(?:owner|manager|boss|proprietor)\b",
     r"\b(?:am i|are we) (?:speaking|talking|chatting) (?:to|with)\b",
     r"\b(?:are|is|am) (?:you|this|that|it|i) (?:\w+ ){0,2}(?:real|actual|live|human|person|robot|machine|bot|ai|recording|computer)\b",
-    r"\b(?:said|says|told|tells) (?:\w+ ){0,3}(?:speak|talk|transfer|put|patch|connect|get)\b",
+    r"\b(?:said|says|told|tells) (?:\w+ ){0,3}(?:speak|talk|transfer(?:red)?|put|patch(?:ed)?|connect(?:ed)?|get)\b",
+    r"\b(?:owner|manager|boss|he|she|they|someone|somebody|everyone|people|staff|it) (?:\w+ )?(?:said|says|told|tells|allowed|allows|permitted|approved|okayed)\b (?:\w+ ){0,14}(?:speak|talk|transfer(?:red)?|put|patch(?:ed)?|connect(?:ed)?|get)\b",
+    r"\b(?:do|would|shall|should|can|could) (?:you|they) (?:want|like|need|prefer) (?:me|us) to (?:be )?(?:speak|talk|chat|transfer|put)\w*\b",
     r"\bthe caller\b",
     r"\b(?:wants|want|asked|asks|tells|told) you to\b",
 ];
@@ -416,6 +422,82 @@ mod tests {
             "I am talking to my wife, is there anyone I can speak to",
         ] {
             assert!(!caller_asked(&[said]), "{said}");
+        }
+    }
+
+    /// Fourth round: the normaliser keeps the apostrophe inside a word, so "I'm"
+    /// and "we're" are one word each, and the block for a caller who is talking
+    /// to somebody now has to name them as well as "I am" and "we are".
+    #[test]
+    fn a_caller_talking_to_somebody_now_is_not_asking_whichever_way_they_say_it() {
+        for said in [
+            "I'm talking to the owner, right?",
+            "we're talking to the owner, right?",
+            "I am talking to the owner",
+            "we are talking to the owner",
+            "I\u{2019}m speaking with the manager",
+            "I m talking to a person",
+            "talking to someone else, hold on",
+            "I'm speaking to someone else right now",
+        ] {
+            assert!(!caller_asked(&[said]), "{said}");
+        }
+        // Someone else is a person to ask for; the caller who is *talking* to someone else is busy.
+        for said in [
+            "Can I speak to someone else",
+            "can I talk to somebody else about this",
+            "I want to speak to someone else",
+            "Could I please talk to someone else",
+        ] {
+            assert!(caller_asked(&[said]), "{said}");
+        }
+    }
+
+    /// Fourth round: what was done to the caller, what someone else did, a
+    /// question about how, and a question put to the receptionist are not asks;
+    /// an ask that follows them still is.
+    #[test]
+    fn what_was_done_or_said_or_asked_is_not_an_ask_but_the_ask_after_it_is() {
+        for said in [
+            "I was transferred to the owner yesterday",
+            "I had been put through to the manager before",
+            "he put the owner on",
+            "she just patched the manager through",
+            "they said I could be transferred to the manager",
+            "you said I could be transferred to the owner",
+            "I was told I could be connected to the manager",
+            "the owner told me last week that on a day like this I could be transferred to a person",
+            "do you want me to be transferred to the owner",
+            "would you like me to be transferred to the manager",
+            "can you tell me how to be transferred to the owner",
+            "how to get through to the owner",
+        ] {
+            assert!(!caller_asked(&[said]), "{said}");
+        }
+        for said in [
+            "I was transferred three times, can I speak to the manager",
+            "They put me on hold for an hour, can I speak to the owner",
+            "I've been put on hold, put me through to the owner",
+            "I want to be transferred to the owner",
+            "I don't know how to say this but can I speak to the owner",
+        ] {
+            assert!(caller_asked(&[said]), "{said}");
+        }
+    }
+
+    /// Fourth round: holes with contractions and spellings that the host has too, so
+    /// no case can be shared until both ends close them. Kept so nobody mistakes
+    /// the floor for more than it is; closing one means changing this on purpose.
+    #[test]
+    fn contraction_gaps_the_host_shares() {
+        for said in [
+            "we'll speak to the manager tomorrow",
+            "they've put the owner on",
+            "he'd put the owner on",
+            "I wouldnt speak to the manager",
+            "I couldn't speak to the owner earlier",
+        ] {
+            assert!(caller_asked(&[said]), "{said}");
         }
     }
 
