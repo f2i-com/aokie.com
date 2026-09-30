@@ -25,6 +25,24 @@ export const DOCUMENT = 'transfer-v1.md';
 const normalized = (buffer) => Buffer.from(buffer.toString('binary').replaceAll('\r\n', '\n'), 'binary');
 export const sha256 = (buffer) => createHash('sha256').update(normalized(buffer)).digest('hex');
 
+/** Where the folder lives in an OAIY checkout. */
+export const OAIY_FOLDER = path.join('docs', 'contracts', 'transfer');
+
+/**
+ * Where OAIY's copy of the folder is, for a run that should compare with it when it can (the
+ * release check): the folder OAIY_TRANSFER_CONTRACTS names, else a sibling `oaiy` checkout of
+ * this repository. `dir` is null when there is neither, and `tried` says where it looked, so
+ * a skipped comparison can say so and why.
+ */
+export function findOaiyCopy({ env = process.env, repoRoot, exists = existsSync }) {
+  if (env.OAIY_TRANSFER_CONTRACTS) {
+    return { dir: env.OAIY_TRANSFER_CONTRACTS, source: 'OAIY_TRANSFER_CONTRACTS', tried: [] };
+  }
+  const sibling = path.join(repoRoot, '..', 'oaiy', OAIY_FOLDER);
+  if (exists(sibling)) return { dir: sibling, source: 'the sibling checkout ../oaiy', tried: [sibling] };
+  return { dir: null, source: null, tried: [sibling] };
+}
+
 /** The fixtures: JSON files, byte-identical in both repositories and listed in SHA256SUMS. */
 export function transferFiles(transferDir) {
   return readdirSync(transferDir).filter((name) => name.endsWith('.json')).sort();
