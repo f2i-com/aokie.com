@@ -9,18 +9,26 @@
 //! `docs/contracts/transfer/transfer-v1.caller-asked.fixture.json` is the one
 //! source of the rules, the blocks and the cases; both repositories test
 //! against that file, and the tests here compare every pattern in this file
-//! with it, so neither side can drift alone. The plugin's floor must never be
-//! stricter than the host's own check (a request the host would count must not
-//! be refused here first), so the algorithm is the host's.
+//! with it, so neither side can drift alone. The plugin's floor is meant never
+//! to be stricter than the host's own check (a request the host would count
+//! must not be refused here first), so the algorithm is the host's, with two
+//! differences that are stated, not hidden.
 //!
 //! A turn is read from its **end** (its last [`TURN_CHARS`] characters), a
 //! sentence at a time. Of the caller's last three turns, one sentence must
 //! match a rule and no block may match that sentence, and no block that reads
 //! the whole turn (someone told to repeat, pretend or ignore) may match the
 //! turn. Turns that only acknowledge the AI ("mm-hmm", "yeah, okay") are not
-//! turns: [`caller_turns`] drops them before the last three are taken.
+//! turns to the plugin: [`caller_turns`] drops them before the last three are
+//! taken. The host drops an acknowledgement from its own record only when it
+//! was said over the AI (and a turn said before the greeting, one that resumed
+//! a cut-off reply, and a quick "of course" or "go on" said over the AI), which
+//! is audio timing the plugin cannot see; the plugin decides by the words alone.
+//! That only lets the window reach further back (an acknowledgement can never be
+//! what asks), and the one way it can be stricter is a turn the host drops for
+//! its timing and the plugin keeps.
 //!
-//! What the check does not do, on purpose: it has no names in it. A caller who
+//! The first difference: the check has no names in it. A caller who
 //! asks for the owner by first name is recognised only by a host that knows the
 //! owner's name (OAIY takes it from a business named for its owner), and the
 //! plugin has no such name. It is a floor under the host's own policy

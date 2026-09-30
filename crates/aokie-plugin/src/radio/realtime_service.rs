@@ -266,8 +266,9 @@ pub(super) fn begin_transfer_tool(
     sink: &mut dyn Sink,
 ) -> crate::transfer::call::Begin {
     // What the caller said, oldest first. Turns that only acknowledge the AI
-    // ("mm-hmm", "yeah, okay") are not turns to the host, whose own record
-    // skips them, so they neither count nor push a real turn out of the last
+    // ("mm-hmm", "yeah, okay") are not turns to the plugin (the host's own
+    // record skips the ones said over the AI, and the plugin cannot see that
+    // timing), so they neither count nor push a real turn out of the last
     // three (`caller_turns`).
     let recent_caller_turns: Vec<String> = {
         let said: Vec<&str> = ctx
