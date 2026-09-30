@@ -67,8 +67,9 @@ fn every_file_is_this_contracts_and_the_digests_are_current() {
     expected.sort();
     assert_eq!(on_disk, expected, "a file was added or removed without the tests noticing");
 
-    // SHA256SUMS lists every fixture (the shared, byte-identical set; the
-    // prose contract is each repository's own), and every digest is current.
+    // SHA256SUMS lists every fixture, and every digest is current. The
+    // document transfer-v1.md is not listed: scripts/check-contracts.mjs
+    // compares it, like the fixtures, with the OAIY copy.
     let sums = std::fs::read_to_string(folder().join("SHA256SUMS")).unwrap();
     let mut listed = std::collections::BTreeMap::new();
     for line in sums.lines().filter(|line| !line.trim().is_empty()) {
