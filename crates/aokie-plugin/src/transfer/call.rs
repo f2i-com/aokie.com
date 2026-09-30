@@ -792,6 +792,11 @@ impl TransferCall {
             answered(effects, &planning, refusal(RefusalStatus::Refused, "consent"));
             return;
         }
+        // This check and the call-id half of the owner check below are
+        // redundant with the owner check's epoch half (a call epoch is handed
+        // out once, in increasing order, and the snapshot and the fence come
+        // from the same state), so no input tells them apart and no test can
+        // pin either alone; they stay as defence in depth.
         if remote.call_id.as_deref() != Some(planning.call_id.as_str()) || remote.call_epoch == 0 {
             answered(effects, &planning, refusal(RefusalStatus::Unavailable, "call_changed"));
             return;

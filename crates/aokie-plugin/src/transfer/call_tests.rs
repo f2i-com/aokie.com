@@ -1750,19 +1750,33 @@ fn another_ai_action_while_the_host_plans_does_not_cost_the_request() {
     assert!(!rig.broker.is_busy());
 }
 
-// --- The world moves while the host plans: each guard, on its own ------------
+// --- The world moves while the host plans: what each test pins ---------------
 //
-// Three checks stand between the host's `ring` and an open request, and a state
-// that trips one must not also trip another, or the test cannot tell which held.
-// The media state below is untouched in the first two, and the radio's own view
-// of the call is untouched in the third.
+// Between the host's `ring` and an open request the machine checks the session,
+// the radio's active call, the media state's call, the owner fence and the
+// mailbox. A state that trips one must not also trip another, or a test cannot
+// tell which held. What is pinned, one test each (the mutant that removes the
+// check dies in that test alone):
 //
-// The check of the media's call id and epoch, and the call-id half of the owner
-// check, see the same fact twice: every call has its own epoch (a new one for a
-// call the media state has forgotten), so an epoch that equals the plan's is the
-// plan's call. Taking either out alone changes nothing a test can see (the two
-// mutants are equivalent); the epoch half of the owner check is what holds the
-// pair, and the third test below is the one that fails without it.
+//   * the session that asked is still the session: a_session_replaced...
+//   * the radio's own active call is still the call: a_call_hung_up...
+//   * the owner fence still has the plan's call epoch (and Aokie still owns the
+//     caller): the_same_call_seen_again_with_a_new_epoch...
+//   * the mailbox is still free: another_request_taking_the_mailbox...
+//
+// Two checks are NOT pinned by any test, because no input tells them from the
+// owner-epoch check, and each is redundant with it rather than untested: the
+// media state's call id and epoch (`remote.call_id != Some(plan's call) ||
+// remote.call_epoch == 0`), and the call-id half of the owner fence. A call
+// epoch is handed out once, in increasing order, to each call the media state
+// sees (`next_call_epoch`; a call it forgot comes back under a NEW epoch), and
+// the snapshot and the fence are read from the same state, so an owner fence
+// with the epoch the plan was made under is the plan's call, with a call id
+// that matches and an epoch that is not zero. Taking either check out alone
+// therefore changes no behaviour (the two review mutants that removed them
+// survive because they are equivalent); they stay in `poll_planning` as
+// defence in depth. The claim that each guard is held by a test of its own is
+// true of the four above, and only of them.
 
 /// The answer a plan that did not open a request ends in: nothing was asked of
 /// the mailbox and the host is not told a ring opened.
@@ -1850,6 +1864,16 @@ fn an_ask_is_spent_when_the_request_opens_and_not_before() {
     rig.turns = vec!["How much for the front lawn?".into(), "and the hedge?".into()];
     assert_eq!(refused_reason(&answer_of(rig.begin("tool_1"))), "caller_did_not_ask");
     assert_eq!(rig.machine.caller_turns_spent(), 0);
+
+    // What is spent never comes back: a request begun on fewer turns than are
+    // spent already (a hand-back spent the rest while it planned) leaves the
+    // count where it was, and a later, smaller count is no un-spending.
+    let mut machine = TransferCall::new(Arc::new(Governor::default()));
+    machine.spend_caller_turns(5);
+    machine.spend_caller_turns(2);
+    assert_eq!(machine.caller_turns_spent(), 5);
+    machine.spend_caller_turns(7);
+    assert_eq!(machine.caller_turns_spent(), 7);
 }
 
 #[test]
