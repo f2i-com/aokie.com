@@ -277,14 +277,15 @@ pub(super) fn begin_transfer_tool(
     sink: &mut dyn Sink,
 ) -> crate::transfer::call::Begin {
     // What the caller said, oldest first, and not yet spent: an ask counts for
-    // ONE request. It is spent when the request it opens has been planned (the
-    // host was asked), and by a hand-back to the AI (`adopt_resumed_session`),
-    // so "Thanks, that is all sorted now" after a ring or a takeover is judged
-    // on its own, not on the ask before it. Turns that only acknowledge the AI
-    // ("mm-hmm", "yeah, okay") are not turns to the plugin (the host's own
-    // record skips the ones said over the AI, and the plugin cannot see that
-    // timing), so they neither count nor push a real turn out of the last
-    // three (`caller_turns`).
+    // ONE request. It is spent when the request it opens is open (the machine
+    // does that: the host authorised the ring), and by a hand-back to the AI
+    // (`adopt_resumed_session`), so "Thanks, that is all sorted now" after a
+    // ring or a takeover is judged on its own, not on the ask before it, while
+    // a host that did not answer leaves the ask to be tried again. Turns that
+    // only acknowledge the AI ("mm-hmm", "yeah, okay") are not turns to the
+    // plugin (the host's own record skips the ones said over the AI, and the
+    // plugin cannot see that timing), so they neither count nor push a real
+    // turn out of the last three (`caller_turns`).
     let (heard, recent_caller_turns): (usize, Vec<String>) = {
         let said = caller_turns_said(&ctx.history);
         let spent = ctx.transfer.caller_turns_spent().min(said.len());
@@ -302,7 +303,7 @@ pub(super) fn begin_transfer_tool(
                 status,
                 lane.session_token,
             );
-            let begun = ctx.transfer.begin(
+            ctx.transfer.begin(
                 &mut env,
                 crate::transfer::call::BeginArgs {
                     tool_call_id,
@@ -310,13 +311,10 @@ pub(super) fn begin_transfer_tool(
                     call_id: &lane.call_id,
                     owner: &owner,
                     recent_caller_turns: &recent_caller_turns,
+                    caller_turns_heard: heard,
                     caller_number: caller_number.as_deref(),
                 },
-            );
-            if matches!(begun, crate::transfer::call::Begin::Planning) {
-                ctx.transfer.spend_caller_turns(heard);
-            }
-            begun
+            )
         }
         None => crate::transfer::call::Begin::Answered(crate::transfer::refusal(
             crate::transfer::RefusalStatus::Unavailable,

@@ -223,8 +223,11 @@ pub struct BeginArgs<'a> {
     pub call_id: &'a str,
     /// The realtime lane's exact Aokie owner fence.
     pub owner: &'a AokieOwnerFence,
-    /// The caller's newest turns, oldest first.
+    /// The caller's newest turns not yet spent, oldest first.
     pub recent_caller_turns: &'a [String],
+    /// How many turns the caller has said in this call so far, spent or not:
+    /// the request this begins spends that many if it opens.
+    pub caller_turns_heard: usize,
     pub caller_number: Option<&'a str>,
 }
 
@@ -273,6 +276,9 @@ struct Planning {
     /// The phrase check on the caller's recent turns, taken when the tool was
     /// called (only the verdict is kept, never the turns).
     caller_asked: bool,
+    /// How many of the caller's turns had been said when the tool was called:
+    /// what the request spends when it opens.
+    heard: usize,
     /// The keyed hash of the caller's number (never the number).
     caller_key: Option<u64>,
     owner: AokieOwnerFence,
@@ -339,10 +345,12 @@ pub struct TransferCall {
     end_is_spent: bool,
     /// How many of the caller's turns (counted from the start of the call, in
     /// the order they were said) are spent: the phrase floor reads only what
-    /// was said after them. A caller's ask is spent by the first request it
-    /// opens (the host is asked to plan it) and by a hand-back to the AI (a
-    /// fresh session after a takeover or a hold), so it counts for one request
-    /// and never for one that comes after the AI lost the line and got it back.
+    /// was said after them. A caller's ask is spent by the request it opens
+    /// (the host authorised the ring and the request is open: not by a plan
+    /// that was refused, was not answered or could not be read, which leave
+    /// the ask to be tried again) and by a hand-back to the AI (a fresh session
+    /// after a takeover or a hold), so it counts for one request and never for
+    /// one that comes after the AI lost the line and got it back.
     caller_turns_spent: usize,
     /// Test seam: runs against the broker between the machine's last look and
     /// the withdrawal, the instant a phone could accept.
@@ -507,6 +515,7 @@ impl TransferCall {
             call_id: args.call_id.to_string(),
             reason,
             caller_asked: caller_did_ask,
+            heard: args.caller_turns_heard,
             caller_key,
             owner: args.owner.clone(),
             session_token: env.session_token,
@@ -834,6 +843,9 @@ impl TransferCall {
 
         self.attempts += 1;
         self.governor.note_opened(env.now, planning.caller_key);
+        // The request is open: what the caller said up to the tool call is
+        // spent, so the same ask cannot open a second one.
+        self.spend_caller_turns(planning.heard);
         let (audit, requested) = AssistanceAuditLifecycle::opened(&request_id, &fence.call_id);
         effects.push(Effect::Audit(requested));
 

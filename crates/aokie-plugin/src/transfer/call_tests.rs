@@ -87,6 +87,7 @@ impl Rig {
                 call_id: CALL,
                 owner: &self.owner,
                 recent_caller_turns: &self.turns,
+                caller_turns_heard: self.turns.len(),
                 caller_number: self.caller_number.as_deref(),
             },
         )
@@ -1770,6 +1771,85 @@ fn assert_nothing_was_opened(rig: &Rig) {
     assert_eq!(rig.machine.attempts(), 0);
     assert_eq!(rig.host_requests().len(), 1, "and the host is not told a ring opened");
     assert!(!rig.machine.is_active());
+}
+
+/// One way a plan can end short of an open request: what the world does to the rig.
+type PlanEnd = Box<dyn Fn(&mut Rig)>;
+
+/// Review R4, and the caller's ask "counting for one request": the turns the
+/// tool was called on are spent when the request OPENS, and by nothing that
+/// stops short of it. A host that does not answer, a plan that cannot be read,
+/// a refusal and a call that moved on leave the ask as it was, so the model's
+/// retry is judged on it and not refused as `caller_did_not_ask`.
+#[test]
+fn an_ask_is_spent_when_the_request_opens_and_not_before() {
+    let mut rig = Rig::new();
+    assert_eq!(rig.machine.caller_turns_spent(), 0);
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    assert_eq!(rig.machine.caller_turns_spent(), 0, "the host is still planning");
+    rig.host_answers(Rig::ring_plan());
+    let _ = ringing_request_id(&rig.poll());
+    assert_eq!(rig.machine.caller_turns_spent(), 1, "the request is open: the turn it was made on is spent");
+
+    // What is said after the tool was called is not spent by it: two turns
+    // were heard when the call was made, a third came while the host planned.
+    let mut rig = Rig::new();
+    rig.turns = vec!["Hello".into(), "Can I speak to the owner?".into()];
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    rig.turns.push("Hello? Are you there?".into());
+    rig.host_answers(Rig::ring_plan());
+    let _ = ringing_request_id(&rig.poll());
+    assert_eq!(rig.machine.caller_turns_spent(), 2);
+
+    // Nothing that stops short of an open request spends anything.
+    let ends: Vec<(&str, PlanEnd)> = vec![
+        ("the host never answers", Box::new(|rig: &mut Rig| rig.now += PLAN_WAIT + Duration::from_millis(1))),
+        ("an error from the host", Box::new(|rig: &mut Rig| {
+            let (id, _) = rig.plan_request();
+            let error = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not found"}});
+            assert!(rig.host.try_route_response(&error));
+        })),
+        ("a plan that cannot be read", Box::new(|rig: &mut Rig| rig.host_answers(json!("ring please")))),
+        ("a plan that refuses", Box::new(|rig: &mut Rig| {
+            rig.host_answers(json!({"planId": "plan_1", "decision": "refused", "reason": "quiet_hours"}));
+        })),
+        ("a plan for message only", Box::new(|rig: &mut Rig| {
+            rig.host_answers(json!({"planId": "plan_1", "decision": "message_only", "reason": "no_endpoint"}));
+        })),
+        ("a plan that rings nobody", Box::new(|rig: &mut Rig| {
+            rig.host_answers(json!({
+                "planId": "plan_1", "decision": "ring", "reason": "ok", "ringSeconds": 30,
+                "phones": [], "wake": [], "desktopToast": false, "desktopCompanions": []
+            }));
+        })),
+        ("consent taken back", Box::new(|rig: &mut Rig| {
+            rig.media.set_remote_consent(RemoteConsentGate::default());
+            rig.host_answers(Rig::ring_plan());
+        })),
+        ("the call hung up", Box::new(|rig: &mut Rig| {
+            rig.active = None;
+            rig.host_answers(Rig::ring_plan());
+        })),
+        ("the session replaced", Box::new(|rig: &mut Rig| {
+            rig.session += 1;
+            rig.host_answers(Rig::ring_plan());
+        })),
+    ];
+    for (name, end) in ends {
+        let mut rig = Rig::new();
+        assert!(matches!(rig.begin("tool_1"), Begin::Planning), "{name}");
+        end(&mut rig);
+        let _ = rig.poll();
+        assert!(!rig.machine.is_active(), "{name}: the plan is over");
+        assert_eq!(rig.machine.attempts(), 0, "{name}: no request was opened");
+        assert_eq!(rig.machine.caller_turns_spent(), 0, "{name}: the ask is not spent");
+    }
+
+    // A request the plugin refuses before it asks the host spends nothing either.
+    let mut rig = Rig::new();
+    rig.turns = vec!["How much for the front lawn?".into(), "and the hedge?".into()];
+    assert_eq!(refused_reason(&answer_of(rig.begin("tool_1"))), "caller_did_not_ask");
+    assert_eq!(rig.machine.caller_turns_spent(), 0);
 }
 
 #[test]
