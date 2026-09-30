@@ -318,7 +318,7 @@ pub(super) fn service_controls(
                         emit_control_failed(
                             outbox,
                             sink,
-                            &tracker,
+                            tracker,
                             "call.activate",
                             op.as_deref(),
                             "a transfer to the owner is being connected for the active call: it cannot be put on hold now",

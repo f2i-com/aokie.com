@@ -537,7 +537,7 @@ fn a_takeover_stops_the_session_as_a_handoff_and_the_loop_starts_a_fresh_one_tha
     l.pass();
     assert_eq!(l.sessions(), 2, "a fresh session for the returned caller");
     let start = l.start(1);
-    let resume: ResumeInfo = start.resume.clone().expect("the fresh start carries start.resume");
+    let resume: ResumeInfo = start.resume.expect("the fresh start carries start.resume");
     assert_eq!(resume.via, Via::Return);
     assert!(resume.after_handoff);
     assert_eq!(start.greeting, crate::transfer::RETURN_GREETING);

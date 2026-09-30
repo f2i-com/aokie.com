@@ -769,7 +769,14 @@ mod tests {
         // A turn is read from its end: the words that finish a long turn are
         // the ones the host gets (second review F4).
         let ask_at_the_end = format!("{} can I speak to the owner", "blah ".repeat(80));
-        let kept = plan_params("call_1", 1, 1, Reason::CallerAsked, None, &[ask_at_the_end.clone()]);
+        let kept = plan_params(
+            "call_1",
+            1,
+            1,
+            Reason::CallerAsked,
+            None,
+            std::slice::from_ref(&ask_at_the_end),
+        );
         let sent = kept["recentCallerTurns"][0].as_str().unwrap();
         assert_eq!(sent.chars().count(), 300);
         assert!(ask_at_the_end.ends_with(sent) && sent.ends_with("can I speak to the owner"));
