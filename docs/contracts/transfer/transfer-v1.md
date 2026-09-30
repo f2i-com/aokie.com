@@ -19,7 +19,7 @@ step with the OAIY repository's copy. The digests are in [SHA256SUMS](SHA256SUMS
 | [transfer-v1.start-ready.fixture.json](transfer-v1.start-ready.fixture.json) | `start.allowTransfer`, `ready.features`, `start.resume`, the `handoff:takeover` stop, and the compatibility matrix. |
 | [transfer-v1.ring-plan.fixture.json](transfer-v1.ring-plan.fixture.json) | The two plugin-to-host requests `oaiy.ring.plan` and `oaiy.ring.opened`. |
 | [transfer-v1.reserved-offer-id.fixture.json](transfer-v1.reserved-offer-id.fixture.json) | The reserved transfer offer id and its generations (vector V2). |
-| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, every rule and block, 78 positive and 92 negative cases, the windows, and the turns that only acknowledge the AI. |
+| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, every rule and block, 91 positive and 108 negative cases, the windows, the refusals a pause splits, and the turns that only acknowledge the AI. |
 
 ## How a transfer runs
 
@@ -155,7 +155,20 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    what someone else said, a caller who is talking to somebody now ("I'm
    talking to someone else", though "can I speak to someone else" is an ask),
    a caller telling the receptionist what to say) and the cases are the caller-asked
-   fixture, the one source both ends are tested against; the plugin's check is
+   fixture, the one source both ends are tested against. A refusal a pause
+   splits is still a refusal: a sentence that ends in a refusal the caller has
+   begun and not finished ("I don't want to", "no need to", "please do not", "I
+   can't...") is carried to the sentence after it, in the same turn or the next,
+   and that sentence is read joined to it, and only joined, so "I don't want
+   to" then "speak to the owner" is not an ask. Nothing else is carried and no
+   ask is ever looked for across a join otherwise ("No thanks." then "Can I
+   speak to the owner?" is an ask, as is "Hi" then the same). How a sentence
+   ends decides it: a question or exclamation mark or a line end finishes it;
+   a full stop finishes what could be a whole answer ("I can't.") but not what
+   needs a verb ("I don't want to."); no ending, or an ellipsis, finishes
+   neither. The fixture's `unfinished` object and `algorithm` say exactly how;
+   the read window is that of the last three turns, so the two sentences are
+   read as one only within it. The plugin's check is
    meant never to be stricter than the host's (what the host counts, the
    plugin lets through), because it runs first, with two differences that are
    stated here. It has no names in it: a caller who asks
@@ -461,7 +474,8 @@ and a responding device id, and no text from the call or the owner.
   `oaiy.ring.plan` and `oaiy.ring.opened`. Without it the plugin never offers
   transfer.
 * Run the caller-asked phrase check as the caller-asked fixture describes it
-  (its normaliser, rules, blocks, sentences, turn blocks and 300-character
+  (its normaliser, rules, blocks, sentences, the unfinished refusal carried to
+  the sentence after it, turn blocks and 300-character
   reading; the fixture is the plugin's floor as well, so a request the host
   counts is never refused first, names aside), run it on the host's own record
   of what the caller said, which leaves out an acknowledgement said over the AI
