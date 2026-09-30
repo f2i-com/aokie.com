@@ -742,7 +742,35 @@ fn the_transfer_tool_reads_the_callers_turns_and_number_from_the_radios_own_stat
         user("sorry"),
         user("the gate is blue"),
     ];
-    let Begin::Answered(answer) = laid.call_the_tool(&lane, call_asked) else {
+    let Begin::Answered(answer) = laid.call_the_tool(&lane, call_asked.clone()) else {
+        panic!("expected a refusal")
+    };
+    assert_eq!(answer.output["reason"], "caller_did_not_ask");
+
+    // Second review F4: the caller's "yeah", "okay" and "mm-hmm" after the ask
+    // are not turns (the host's own record skips them too), so they neither
+    // push the ask out of the last three nor go to the host.
+    let mut laid = a_call_with_no_open_request();
+    laid.ctx.history = vec![
+        user("Can I speak to the owner?"),
+        bot("Of course, one moment."),
+        user("yeah"),
+        user("okay"),
+        user("mm-hmm"),
+    ];
+    assert!(matches!(laid.call_the_tool(&lane, call_asked.clone()), Begin::Planning));
+    let params = host_request_params(&laid.sink, "oaiy.ring.plan").expect("the host was asked");
+    assert_eq!(params["recentCallerTurns"], serde_json::json!(["Can I speak to the owner?"]));
+    // A "yes please" is a turn and does push it out.
+    let mut laid = a_call_with_no_open_request();
+    laid.ctx.history = vec![
+        user("Can I speak to the owner?"),
+        user("Yes please"),
+        user("Sorry?"),
+        user("Stop"),
+        user("Yeah"),
+    ];
+    let Begin::Answered(answer) = laid.call_the_tool(&lane, call_asked.clone()) else {
         panic!("expected a refusal")
     };
     assert_eq!(answer.output["reason"], "caller_did_not_ask");

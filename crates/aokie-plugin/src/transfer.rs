@@ -16,7 +16,7 @@ mod wire;
 #[cfg(any(test, feature = "voice"))]
 pub mod call;
 
-pub use phrase::caller_asked;
+pub use phrase::{caller_asked, caller_turns};
 pub use wire::*;
 
 #[cfg(test)]
