@@ -11,8 +11,11 @@
 //! against that file, and the tests here compare every pattern in this file
 //! with it, so neither side can drift alone. The plugin's floor is meant never
 //! to be stricter than the host's own check (a request the host would count
-//! must not be refused here first), so the algorithm is the host's, with two
-//! differences that are stated, not hidden.
+//! must not be refused here first), so the algorithm is the host's, with the
+//! differences that are stated, not hidden: no names, acknowledgements decided
+//! by words, no host-only extras (an ask taken back, a different target, being
+//! told to say it), and the invisible joiners the host also removes (typed
+//! text only; the soft hyphen is removed here too).
 //!
 //! A turn is read from its **end** (its last [`TURN_CHARS`] characters), a
 //! sentence at a time. Of the caller's last three turns, one sentence must
@@ -51,12 +54,18 @@ pub(crate) const PERSON: &str = "(?:the |your |a |an |that )?(?:owner|manager|bo
 pub(crate) const HEAD: &str = "(?:the |your )?(?:owner|manager|boss|proprietor)";
 
 /// What counts as asking. `<person>` and `<head>` stand for the two patterns above.
-pub(crate) const RULES: [&str; 13] = [
+pub(crate) const RULES: [&str; 19] = [
     r"\b(?:speak|talk|chat)(?:ing)? (?:to|with) <person>\b",
     r"\b(?:put|patch) (?:me|us) (?:through|thru|thro)\b",
     r"\bbe (?:put|patched) (?:through|thru|thro)\b",
     r"\b(?:put|patch) (?:this|my|our|the) call (?:through|thru|thro)\b",
     r"\btransfer (?:me|us|this call|my call|our call)\b",
+    r"\btransfer (?:the|this|my|our) call (?:to|over to|through to) <person>\b",
+    r"\b(?:be )?transferred (?:to|over to|through to) <person>\b",
+    r"\bput <head> on(?: the (?:phone|line))?(?: please| now)?$",
+    r"\bhand (?:me|us|this call|my call) (?:over )?(?:to|over to) <person>\b",
+    r"\b(?:is|are) (?:anyone|anybody|someone|somebody) (?:available|free|around) to (?:speak|talk|chat) (?:to|with) (?:me|us)\b",
+    r"\b(?:is|are) there (?:anyone|anybody|someone|somebody|a person|a human) (?:i|we) can (?:speak|talk|chat) (?:to|with)\b",
     r"\bconnect (?:me|us|this call|my call|our call) (?:to|with|through to) <person>\b",
     r"\b(?:get|find|fetch|grab) (?:me )?<person>\b",
     r"\b(?:is|are) <head> (?:there|available|in|around|free|about)\b",
@@ -64,17 +73,20 @@ pub(crate) const RULES: [&str; 13] = [
     r"\b(?:give|get|find|fetch|need|want|wanna|like|d like) (?:me )?(?:a |an )?(?:real|actual) (?:person|human)\b",
     r"\b(?:want|need|wanna|like|d like) (?:me )?(?:a |an )human\b",
     r"\b(?:i )?(?:want|need|would like|d like|wanna|have to|got to|gotta) (?:to )?(?:speak|talk) (?:to|with)\b",
-    r"^(?:(?:can|could|may) i (?:please )?(?:have|get) |i (?:need|want) |give me |get me |just |yes |yeah |hi |hello |please )*<head>(?: please| pls| thanks| thank you)?$",
+    r"^(?:(?:can|could|may) i (?:please )?(?:have|get) |i(?: need| want| wanna| would like|'d like| d like) |give me |get me |just |yes |yeah |hi |hello |please )*<head>(?: please| pls| thanks| thank you)?$",
 ];
 
 /// What stops a sentence counting, each read against one sentence.
-pub(crate) const BLOCKS: [&str; 14] = [
+pub(crate) const BLOCKS: [&str; 17] = [
     r"\b(?:my|our|his|her|their) (?:owner|manager|boss)\b",
     r"\bowner of\b",
     r"\b(?:speak|talk|chat)(?:ing)? (?:to|with) (?:you|u)\b",
     r"\btalk to you later\b",
     r"\bspeak to you (?:later|soon)\b",
-    r"\b(?:do not|don't|dont|does not|doesn't|did not|didn't|cannot|can not|can't|cant|will not|won't|wont|would not|wouldn't|should not|shouldn't|never|no way|not going to|not gonna|refuse to|rather not|no need to|no wish to|not able to|unable to|no longer) (?:\w+ ){0,3}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b",
+    r"\b(?:do not|don't|dont|does not|doesn't|did not|didn't|cannot|can not|can't|cant|will not|won't|wont|would not|wouldn't|should not|shouldn't|never|no way|not going to|not gonna|refuse to|rather not|no need to|no wish to|not able to|unable to|no longer|not asking|not wanting|not looking|not trying|not needing|not requesting|not after|not here) (?:\w+ ){0,3}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b",
+    r"\b(?:without|instead of|rather than|as opposed to|in place of) (?:\w+ ){0,2}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b",
+    r"\b(?:how (?:do|can|could|would|should|might) (?:i|we)|what (?:number|way|time|day|hours?)|when (?:can|could|do|does|is|will)|where (?:do|can|could)) (?:\w+ ){0,6}(?:speak|talk|chat|reach|contact|get hold of|get through|transfer|put)\w*\b",
+    r"\b(?:i m|i am|we re|we are) (?:\w+ ){0,1}(?:speaking|talking|chatting) (?:to|with)\b",
     r"\bi(?:'ll| will| shall|'m going to| am going to|'m gonna| am gonna) (?:\w+ ){0,2}(?:speak|talk|chat|call|ring)\b",
     r"\b(?:speak|talk|chat)(?:ing)? (?:to|with) (?:\w+ ){0,3}myself\b",
     r"\b(?:was|were|been|had been) (?:\w+ )?(?:speak|talk|chat)(?:ing)?\b",
@@ -146,7 +158,12 @@ pub(crate) const APOSTROPHES: [char; 8] = [
     '\u{2018}', '\u{2019}', '\u{02BC}', '\u{201B}', '\u{2032}', '\u{FF07}', '`', '\u{00B4}',
 ];
 
-/// Lower-case; the apostrophe look-alikes become `'`; every run of characters
+/// The soft hyphen: nobody sees it, a typed text may hide a word in it, and
+/// the host reads a word with one inside as the word. It is removed outright.
+pub(crate) const SOFT_HYPHEN: char = '\u{00AD}';
+
+/// Lower-case; the soft hyphen U+00AD is removed (not made a space); the
+/// apostrophe look-alikes become `'`; every run of characters
 /// outside `[a-z0-9' ]` becomes one space; every run of spaces becomes one
 /// space; trim. The last two steps together mean punctuation between words
 /// never leaves the double space that would defeat a single-space pattern
@@ -156,6 +173,9 @@ pub(crate) fn normalize(turn: &str) -> String {
     let mut out = String::with_capacity(turn.len());
     let mut after_space = true;
     for character in turn.to_lowercase().chars() {
+        if character == SOFT_HYPHEN {
+            continue;
+        }
         let character = if APOSTROPHES.contains(&character) {
             '\''
         } else {
@@ -336,6 +356,81 @@ mod tests {
         ] {
             assert!(caller_asked(&[said]), "{said}");
         }
+    }
+
+    /// Third round: thirteen more forms the host counts that the floor still
+    /// refused, from the host's own rules (be transferred, transfer the call to,
+    /// I would like the role, put the role on, hand over, is anyone available,
+    /// is there someone I can talk to).
+    #[test]
+    fn the_thirteen_more_forms_the_host_counts_are_not_refused_either() {
+        for said in [
+            "I'd like to be transferred to the owner",
+            "can I be transferred to the manager",
+            "I would like to be transferred to a person",
+            "transfer the call to the owner",
+            "I'd like the owner please",
+            "I would like the manager please",
+            "put the owner on",
+            "put the manager on the phone please",
+            "hand me over to the owner",
+            "hand this call over to the owner",
+            "is anyone available to speak with me",
+            "is there someone I can talk to",
+            "is there anyone I can speak to",
+            "I wanna the owner",
+            "I d like the manager",
+            "put the boss on the line now",
+        ] {
+            assert!(caller_asked(&[said]), "{said}");
+        }
+        // The new forms stop where they should.
+        for said in [
+            "put the owner on hold",
+            "put the owner on the roster",
+            "transfer the call to billing",
+            "hand me over to billing",
+            "can I be transferred to billing",
+            "Nobody transferred me to the manager",
+            "I handed the call over to the owner",
+            "is anyone free on Tuesday to speak with me",
+        ] {
+            assert!(!caller_asked(&[said]), "{said}");
+        }
+    }
+
+    /// Third round: what the host's blocks stop that the new forms would
+    /// otherwise let through (a question about how, a refusal that is not
+    /// worded as one, doing it without or instead, a caller busy with someone).
+    #[test]
+    fn the_new_forms_do_not_let_a_question_or_a_refusal_through() {
+        for said in [
+            "how do I get transferred to the owner",
+            "how can I be transferred to the manager",
+            "what number do I ring to talk to the owner",
+            "when can I speak to the manager",
+            "I'm not asking to be transferred to the owner",
+            "I am not asking to talk to the owner",
+            "without being transferred to the owner",
+            "instead of being transferred to the owner I'd like a message taken",
+            "I am talking to my wife, is there anyone I can speak to",
+        ] {
+            assert!(!caller_asked(&[said]), "{said}");
+        }
+    }
+
+    /// Third round: nobody sees a soft hyphen, so a word with one in it is the word.
+    #[test]
+    fn a_soft_hyphen_inside_a_word_is_not_seen() {
+        assert_eq!(normalize("man\u{ad}ager"), "manager");
+        assert_eq!(normalize("the\u{ad} owner"), "the owner");
+        assert_eq!(normalize("\u{ad}"), "");
+        assert!(caller_asked(&["Could I talk to the man\u{ad}ager please"]));
+        assert!(caller_asked(&["can I speak to the ow\u{ad}ner"]));
+        assert!(caller_asked(&["put the ow\u{ad}ner on"]));
+        // A soft hyphen is not a space: it does not part two words either.
+        assert_eq!(normalize("speak\u{ad}to the owner"), "speakto the owner");
+        assert!(!caller_asked(&["speak\u{ad}to the owner"]));
     }
 
     /// Second review F4, the residual: the old block needed the apostrophe.

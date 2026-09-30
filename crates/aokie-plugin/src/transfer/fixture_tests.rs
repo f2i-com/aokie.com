@@ -359,8 +359,13 @@ fn caller_asked_from_the_file(fixture: &Value, said: &[String]) -> bool {
         .collect();
     let recent = fixture["recentTurns"].as_u64().unwrap() as usize;
     let chars = fixture["turnChars"].as_u64().unwrap() as usize;
+    let removed: Vec<char> = strings(&fixture["removedCharacters"])
+        .iter()
+        .flat_map(|removed| removed.chars())
+        .collect();
     let plain = |text: &str| -> String {
-        phrase::normalize(text)
+        let text: String = text.chars().filter(|character| !removed.contains(character)).collect();
+        phrase::normalize(&text)
             .split(' ')
             .filter(|word| !word.is_empty() && !fillers.iter().any(|filler| filler == word))
             .collect::<Vec<_>>()
@@ -417,7 +422,7 @@ fn the_caller_asked_fixture_passes_and_its_patterns_are_the_plugins_patterns() {
     let turns = |case: &Value| strings(&case["turns"]);
     let cases = |key: &str| fixture[key].as_array().unwrap().clone();
     let (positive, negative, window) = (cases("positive"), cases("negative"), cases("window"));
-    assert_eq!((positive.len(), negative.len(), window.len()), (51, 66, 4));
+    assert_eq!((positive.len(), negative.len(), window.len()), (65, 76, 4));
     for case in &positive {
         assert!(caller_asked(&turns(case)), "{case}");
     }
@@ -470,6 +475,11 @@ fn the_caller_asked_fixture_passes_and_its_patterns_are_the_plugins_patterns() {
     assert_eq!(strings(&fixture["blocks"]), phrase::BLOCKS);
     assert_eq!(strings(&fixture["turnBlocks"]), phrase::TURN_BLOCKS);
     assert_eq!(fixture["roleMarker"], phrase::ROLE_MARKER);
+    assert_eq!(
+        strings(&fixture["removedCharacters"]),
+        vec![phrase::SOFT_HYPHEN.to_string()],
+        "the characters the normaliser removes outright"
+    );
     assert_eq!(strings(&fixture["fillers"]), phrase::FILLERS);
     let ends: Vec<char> =
         strings(&fixture["sentenceEnds"]).iter().map(|end| end.chars().next().unwrap()).collect();
