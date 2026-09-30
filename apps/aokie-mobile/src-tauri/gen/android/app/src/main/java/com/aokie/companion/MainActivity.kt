@@ -15,6 +15,9 @@ class MainActivity : TauriActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
+    // Must precede super.onCreate, which starts the Rust runtime: the native start-up here needs a
+    // Java frame with the app's class loader (see AokieNativeInit).
+    AokieNativeInit.initialize(this)
     super.onCreate(savedInstanceState)
     AokieCallNotifications.createChannels(this)
     AokieAudioRoutes.initialize(this)

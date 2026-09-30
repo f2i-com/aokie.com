@@ -8,6 +8,7 @@ mod https_probe;
 mod managed_auth;
 mod media;
 mod mobile_api;
+mod native_init;
 mod peer_trust;
 mod push_registration;
 mod realtime;

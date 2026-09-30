@@ -1700,41 +1700,16 @@ async fn initialize_platform_audio(_app: &AppHandle) -> Result<bool, String> {
     Ok(true)
 }
 
+/// libwebrtc is initialised by `AokieNativeInit.initialize` (see `native_init.rs`) inside a
+/// Java-to-native call. Doing it here, from a command handler on the Looper, has no Java frame and so
+/// no app class loader: libwebrtc's class lookups fail and the process aborts.
 #[cfg(target_os = "android")]
-async fn initialize_platform_audio(app: &AppHandle) -> Result<bool, String> {
-    use tokio::sync::oneshot;
-
-    let window = app
-        .get_webview_window("main")
-        .ok_or("main Android webview is unavailable")?;
-    let (send, receive) = oneshot::channel();
-    window
-        .with_webview(move |webview| {
-            webview.jni_handle().exec(move |env, activity, _webview| {
-                let result = (|| -> Result<bool, String> {
-                    let vm = env.get_java_vm().map_err(|error| error.to_string())?;
-                    let context = env
-                        .call_method(
-                            activity,
-                            "getApplicationContext",
-                            "()Landroid/content/Context;",
-                            &[],
-                        )
-                        .map_err(|error| error.to_string())?
-                        .l()
-                        .map_err(|error| error.to_string())?;
-                    Ok(libwebrtc::android::initialize_android_context(
-                        &vm, &context,
-                    ))
-                })();
-                let _ = send.send(result);
-            });
-        })
-        .map_err(|error| error.to_string())?;
-    tokio::time::timeout(Duration::from_secs(5), receive)
-        .await
-        .map_err(|_| "Android WebRTC initialization timed out".to_string())?
-        .map_err(|_| "Android WebRTC initialization was cancelled".to_string())?
+async fn initialize_platform_audio(_app: &AppHandle) -> Result<bool, String> {
+    if crate::native_init::webrtc_ready() {
+        Ok(true)
+    } else {
+        Err("Android WebRTC was not initialised at start-up".into())
+    }
 }
 
 #[cfg(not(target_os = "android"))]

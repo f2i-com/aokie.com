@@ -68,6 +68,31 @@ rust {
     rootDirRel = "../../../"
 }
 
+// R8 cannot see JNI use, so the classes that native code looks up by name are kept by rules in
+// proguard-rules.pro. This check runs right after every R8 pass and fails the build if R8's own mapping
+// shows one of them removed or renamed, which is what a missing or mistyped rule looks like.
+val jniKeptClasses = listOf(
+    "livekit.org.webrtc.ContextUtils",
+    "livekit.org.jni_zero.JniZero",
+)
+val r8MappingDir = layout.buildDirectory.dir("outputs/mapping")
+tasks.configureEach {
+    if (name.startsWith("minify") && name.endsWith("WithR8")) {
+        doLast {
+            val mappings = r8MappingDir.get().asFile.walkTopDown().filter { it.name == "mapping.txt" }.toList()
+            if (mappings.isEmpty()) throw GradleException("R8 wrote no mapping.txt under ${r8MappingDir.get().asFile}")
+            for (mapping in mappings) {
+                val text = mapping.readText()
+                for (name in jniKeptClasses) {
+                    val kept = Regex("^" + Regex.escape(name) + " -> " + Regex.escape(name) + ":\\r?$", RegexOption.MULTILINE)
+                    if (!kept.containsMatchIn(text)) {
+                        throw GradleException("R8 removed or renamed $name (${mapping.path}); native code finds it by name, see proguard-rules.pro")
+                    }
+                }
+            }
+        }
+    }
+}
 dependencies {
     // webrtc-sys writes the matching prefixed Java runtime beside each Cargo
     // Android target. The Rust Gradle task copies that architecture-neutral
