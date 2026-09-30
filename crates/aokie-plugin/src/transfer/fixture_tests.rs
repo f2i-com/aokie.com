@@ -413,6 +413,7 @@ fn caller_asked_from_the_file(fixture: &Value, said: &[String]) -> bool {
     };
     let unfinished = &fixture["unfinished"];
     let (always, bare) = (compile(&unfinished["always"], ""), compile(&unfinished["bare"], ""));
+    let joins = compile(&unfinished["joins"], "");
     let hard: Vec<char> = strings(&unfinished["hard"]).iter().map(|end| end.chars().next().unwrap()).collect();
     let trailing: Vec<char> =
         strings(&unfinished["trailing"]).iter().map(|end| end.chars().next().unwrap()).collect();
@@ -477,8 +478,8 @@ fn caller_asked_from_the_file(fixture: &Value, said: &[String]) -> bool {
         }
         for (sentence, ending) in sentences(&turn) {
             let read = match carried.take() {
-                Some(before) => format!("{before} {sentence}"),
-                None => sentence,
+                Some(before) if joins.is_match(&sentence) => format!("{before} {sentence}"),
+                _ => sentence,
             };
             if !blocks.iter().any(|block| block.is_match(&read))
                 && rules.iter().any(|rule| rule.is_match(&read))
@@ -524,7 +525,7 @@ fn the_caller_asked_fixture_passes_and_its_patterns_are_the_plugins_patterns() {
     let turns = |case: &Value| strings(&case["turns"]);
     let cases = |key: &str| fixture[key].as_array().unwrap().clone();
     let (positive, negative, window) = (cases("positive"), cases("negative"), cases("window"));
-    assert_eq!((positive.len(), negative.len(), window.len()), (91, 108, 4));
+    assert_eq!((positive.len(), negative.len(), window.len()), (103, 115, 4));
     for case in &positive {
         assert!(caller_asked(&turns(case)), "{case}");
     }
@@ -580,6 +581,7 @@ fn the_caller_asked_fixture_passes_and_its_patterns_are_the_plugins_patterns() {
     let unfinished = &fixture["unfinished"];
     assert_eq!(unfinished["always"], phrase::UNFINISHED_ALWAYS);
     assert_eq!(unfinished["bare"], phrase::UNFINISHED_BARE);
+    assert_eq!(unfinished["joins"], phrase::UNFINISHED_JOINS);
     let single = |key: &str| -> Vec<char> {
         strings(&unfinished[key]).iter().map(|end| end.chars().next().unwrap()).collect()
     };

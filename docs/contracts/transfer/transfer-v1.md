@@ -19,7 +19,7 @@ step with the OAIY repository's copy. The digests are in [SHA256SUMS](SHA256SUMS
 | [transfer-v1.start-ready.fixture.json](transfer-v1.start-ready.fixture.json) | `start.allowTransfer`, `ready.features`, `start.resume`, the `handoff:takeover` stop, and the compatibility matrix. |
 | [transfer-v1.ring-plan.fixture.json](transfer-v1.ring-plan.fixture.json) | The two plugin-to-host requests `oaiy.ring.plan` and `oaiy.ring.opened`. |
 | [transfer-v1.reserved-offer-id.fixture.json](transfer-v1.reserved-offer-id.fixture.json) | The reserved transfer offer id and its generations (vector V2). |
-| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, every rule and block, 91 positive and 108 negative cases, the windows, the refusals a pause splits, and the turns that only acknowledge the AI. |
+| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, every rule and block, 103 positive and 115 negative cases, the windows, the refusals a pause splits, and the turns that only acknowledge the AI. |
 
 ## How a transfer runs
 
@@ -159,8 +159,14 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    splits is still a refusal: a sentence that ends in a refusal the caller has
    begun and not finished ("I don't want to", "no need to", "please do not", "I
    can't...") is carried to the sentence after it, in the same turn or the next,
-   and that sentence is read joined to it, and only joined, so "I don't want
-   to" then "speak to the owner" is not an ask. Nothing else is carried and no
+   and that sentence, when it begins with the verb the refusal is about
+   (speak, talk, chat, transfer, put, patch or connect, with a "to" or a "be"
+   before it if the refusal runs on with one), is read joined to it, and only
+   joined, so "I don't want to" then "speak to the owner" is not an ask. A
+   sentence that begins any other way is a sentence of its own and is read
+   alone, as it always was: an answer left without its full stop ("I can't",
+   "No need to.") does not swallow the ask that follows it ("Can I speak to the
+   owner?", "I want to speak to the owner"). Nothing else is carried and no
    ask is ever looked for across a join otherwise ("No thanks." then "Can I
    speak to the owner?" is an ask, as is "Hi" then the same). How a sentence
    ends decides it: a question or exclamation mark or a line end finishes it;
@@ -490,7 +496,7 @@ and a responding device id, and no text from the call or the owner.
   transfer.
 * Run the caller-asked phrase check as the caller-asked fixture describes it
   (its normaliser, rules, blocks, sentences, the unfinished refusal carried to
-  the sentence after it, turn blocks and 300-character
+  the sentence after it when that begins with the verb it is about, turn blocks and 300-character
   reading; the fixture is the plugin's floor as well, so a request the host
   counts is never refused first, names aside), run it on the host's own record
   of what the caller said, which leaves out an acknowledgement said over the AI
