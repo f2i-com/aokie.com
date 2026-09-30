@@ -149,16 +149,25 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    a question about what the receptionist is, what someone else said, a caller
    telling the receptionist what to say) and the cases are the caller-asked
    fixture, the one source both ends are tested against; the plugin's check is
-   never stricter than the host's, names aside (what the host counts, the
-   plugin lets through), because it runs first. It has no names in it: a caller who asks
+   meant never to be stricter than the host's (what the host counts, the
+   plugin lets through), because it runs first, with two differences that are
+   stated here. It has no names in it: a caller who asks
    for the owner by first name is recognised only by a host that knows the
    owner's name (OAIY takes it from a business named for its owner), the plugin
    does not, so it answers `caller_did_not_ask` and the caller is offered a
-   message. The plugin decides what is an acknowledgement by the words alone;
-   the host also leaves out a turn said before the greeting, one that resumed
-   a reply that was cut off and a quick "of course" or "go on" said over the
-   AI, using audio timing the plugin cannot see. The same turns, cut the same
-   way, are the `recentCallerTurns` of the plan request;
+   message. And it decides what is an acknowledgement by the words alone, where
+   the host leaves an acknowledgement out of its record only when it was said
+   over the AI while the AI was talking (and leaves out a turn said before the
+   greeting, one that resumed a reply that was cut off, and a quick "of course"
+   or "go on" said over the AI): an acknowledgement in a pause after the AI
+   had finished is a turn to the host and not to the plugin. The audio timing
+   is not the plugin's to see. That runs the allowed way (an
+   acknowledgement-only turn can never be what asks, so dropping more of them
+   only lets the last three reach further back); the one way it can be
+   stricter is a turn the host drops for its timing that the plugin keeps,
+   which uses one of the plugin's three places. The same turns, cut the same
+   way, are the `recentCallerTurns` of the plan request, which the host reads
+   only for a call it has no record of;
 7. the host's ring plan (`oaiy.ring.plan`). For `urgent` and `policy_rule` the
    plugin cannot see an emergency or a business rule, so its phrase check is
    skipped only when the plan carries `"reasonAllowed": true` (the host vouches
@@ -434,9 +443,11 @@ and a responding device id, and no text from the call or the owner.
 * Run the caller-asked phrase check as the caller-asked fixture describes it
   (its normaliser, rules, blocks, sentences, turn blocks and 300-character
   reading; the fixture is the plugin's floor as well, so a request the host
-  counts is never refused first), leave the caller's acknowledgement-only turns
-  out of the record it is run on and of the `recentCallerTurns` of a plan
-  request (the plugin does), and put `"reasonAllowed": true` in the
+  counts is never refused first, names aside), run it on the host's own record
+  of what the caller said, which leaves out an acknowledgement said over the AI
+  (the plugin, which cannot see that timing, drops every acknowledgement-only
+  turn from the `recentCallerTurns` of a plan request), and put
+  `"reasonAllowed": true` in the
   plan only when the host itself has confirmed the `urgent` or `policy_rule`
   reason for this call; without it those reasons also need the caller to have
   asked.

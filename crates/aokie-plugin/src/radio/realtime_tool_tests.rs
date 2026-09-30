@@ -748,7 +748,7 @@ fn the_transfer_tool_reads_the_callers_turns_and_number_from_the_radios_own_stat
     assert_eq!(answer.output["reason"], "caller_did_not_ask");
 
     // Second review F4: the caller's "yeah", "okay" and "mm-hmm" after the ask
-    // are not turns (the host's own record skips them too), so they neither
+    // are not turns (the plugin cannot tell which the host's record skips), so they neither
     // push the ask out of the last three nor go to the host.
     let mut laid = a_call_with_no_open_request();
     laid.ctx.history = vec![
