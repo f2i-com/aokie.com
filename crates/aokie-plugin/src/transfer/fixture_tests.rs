@@ -332,6 +332,44 @@ fn the_contract_does_not_promise_a_launch_a_wake_or_a_ring_hint_that_no_host_giv
     assert!(architecture.contains("no host wakes a phone or posts a ring hint yet"));
 }
 
+/// Review R4: what the contract says an ask is spent by is what the machine
+/// does (`an_ask_is_spent_when_the_request_opens_and_not_before`): the request
+/// that OPENS, not the one the host was asked about, so a host that did not
+/// answer leaves the ask to be tried again. The words are read with their line
+/// breaks folded, so a re-wrap does not fail this and a change of meaning does.
+#[test]
+fn the_contract_says_an_ask_is_spent_when_its_request_opens() {
+    let flat = |name: &str| {
+        std::fs::read_to_string(folder().join(name))
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let document = flat("transfer-v1.md");
+    let ring_plan = flat("transfer-v1.ring-plan.fixture.json");
+    for (name, text) in [("transfer-v1.md", &document), ("the ring-plan fixture", &ring_plan)] {
+        for stale in [
+            "given to the host to plan",
+            "gave the host to plan",
+            "asked to plan (whatever",
+            "the request that was planned",
+        ] {
+            assert!(!text.contains(stale), "{name} still says an ask is spent by the plan: {stale}");
+        }
+    }
+    assert!(document.contains(
+        "the turns said up to the tool call are spent when the request they asked for **opens**"
+    ));
+    assert!(document.contains(
+        "A request that stops short of opening spends nothing: one refused before the host is asked"
+    ));
+    assert!(document.contains("a host that does not answer or whose plan cannot be read"));
+    assert!(document.contains("a turn is spent by the request that opened and by the AI"));
+    assert!(ring_plan.contains("the last request the plugin opened"));
+    assert!(ring_plan.contains("so the same ask can be planned again"));
+}
+
 #[test]
 fn the_cancel_fixture_is_what_the_plugin_reads_and_answers() {
     let fixture = fixture("transfer-v1.cancel.fixture.json");

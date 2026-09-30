@@ -192,14 +192,18 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    only lets the last three reach further back); the one way it can be
    stricter is a turn the host drops for its timing that the plugin keeps,
    which uses one of the plugin's three places. An ask counts for **one
-   request**. The turns this check reads are the turns not yet spent: a turn is
-   spent when a request that passed the check has been given to the host to
-   plan (whatever the host then says of it) and when the AI has the caller back
-   (the fresh session after a takeover or a hold); a request refused before the
-   host is asked, for a busy mailbox or a ceiling, spends nothing. What the
-   caller says after that is what the next request rests on, so "Thanks, that
-   is all sorted now" after a ring or a takeover is judged on its own and not on
-   the ask before it. The floor is also looser than
+   request**. The turns this check reads are the turns not yet spent: the turns
+   said up to the tool call are spent when the request they asked for **opens**
+   (the host's plan authorised the ring and the request is open) and when the AI
+   has the caller back (the fresh session after a takeover or a hold). A request
+   that stops short of opening spends nothing: one refused before the host is
+   asked (a busy mailbox, a ceiling), a plan that refuses or offers a message
+   only, a host that does not answer or whose plan cannot be read, a call that
+   ends or changes while the host plans; the ask stands, and the model's retry
+   is judged on it. What the caller says after the tool call (while the host
+   plans, or later) is not spent by it: it is what the next request rests on,
+   so "Thanks, that is all sorted now" after a ring or a takeover is judged on
+   its own and not on the ask before it. The floor is also looser than
    the host for what only the host reads (an ask taken back, being told to say
    it, a different target such as billing, someone else in the room), which the
    host refuses after the floor has let it through; and the one difference of
@@ -502,7 +506,7 @@ and a responding device id, and no text from the call or the owner.
   of what the caller said, which leaves out an acknowledgement said over the AI
   (the plugin, which cannot see that timing, drops every acknowledgement-only
   turn from the `recentCallerTurns` of a plan request), count an ask for one
-  request only (a turn is spent by the request that was planned and by the AI
+  request only (a turn is spent by the request that opened and by the AI
   getting the caller back, as step 6 says: the host's own record too must not
   let an ask from before authorise the next request), and put
   `"reasonAllowed": true` in the
