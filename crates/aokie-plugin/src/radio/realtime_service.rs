@@ -246,6 +246,7 @@ pub(super) fn finish_call_answer(
 
 /// What the caller said in this call, oldest first: the `user` entries of its
 /// history (the realtime lane pushes only the caller's finished transcripts there).
+#[cfg(all(target_os = "windows", feature = "voice"))]
 fn caller_turns_said(history: &[serde_json::Value]) -> Vec<&str> {
     history
         .iter()
@@ -546,7 +547,7 @@ pub(super) fn retire_call_context(
 
 /// [`retire_call_context`] for a build without the realtime lane.
 #[cfg(all(target_os = "windows", not(feature = "voice")))]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(super) fn retire_call_context(
     ctx: &mut CallVoiceContext,
     replacement: CallVoiceContext,
@@ -568,6 +569,7 @@ pub(super) fn retire_call_context(
 /// Nothing is stowed here, so nothing is withdrawn: this is the only place other
 /// than the stow and retire helpers that swaps a call's context, and the pin
 /// test lists it.
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
 pub(super) fn carry_call_context(
     ctx: &mut CallVoiceContext,
     replacement: CallVoiceContext,
