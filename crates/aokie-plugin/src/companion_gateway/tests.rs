@@ -6296,9 +6296,9 @@ fn a_device_outside_the_targets_gets_no_transfer_offer_and_cannot_decline() {
 
 /// Finding 5 fails closed on a toast with no device named, so the owner at the
 /// PC is served only by naming the Windows Companion. The plan can name it
-/// before it is running (the toast starts it): the transfer is offered to it,
+/// before it is running (nothing launches it): the transfer is offered to it,
 /// on both surfaces and with the reserved id, when its verified hello registers
-/// it, and to nobody before that. Any approved endpoint is alike to the
+/// it inside the ring window, and to nobody before that. Any approved endpoint is alike to the
 /// publisher: what matters is the thumbprint its hello proved
 /// (`RelayPeer.holder_key_thumbprint`).
 #[test]
@@ -6332,8 +6332,9 @@ fn a_companion_the_plan_named_before_it_was_running_is_offered_the_transfer_when
         .iter()
         .all(|offer| offer.offer.accepted_transfer_request_id.is_none()));
 
-    // The toast starts it; its hello registers it; the next publish offers it
-    // the transfer on both surfaces, and only it.
+    // It comes up (not by anything the plugin or the host does); its hello
+    // registers it; the next publish offers it the transfer on both surfaces,
+    // and only it.
     add_device(&mut harness, "device_windows", windows);
     let offers = harness.publish_offers();
     let offered = transfer_offers_for(&offers, "device_windows", &request_id);
@@ -6341,7 +6342,7 @@ fn a_companion_the_plan_named_before_it_was_running_is_offered_the_transfer_when
     assert_eq!(
         native_surface(&offered).offer.offer_id,
         crate::transfer::reserved_offer_id(&request_id, windows, 0),
-        "the reserved id a ring hint from the host would name"
+        "the reserved id a ring hint from a host would name"
     );
     assert!(
         transfer_offers_for(&offers, &harness.device_id.clone(), &request_id).is_empty(),

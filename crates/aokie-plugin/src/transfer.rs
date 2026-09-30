@@ -42,10 +42,12 @@ const OFFER_ID_DIGEST_CHARS: usize = 26;
 
 /// The id of the signed transfer offer the plugin publishes to one device.
 ///
-/// It is derived, not random, so the ring hint that the OAIY host posts (which
-/// knows the request id and the phone's endpoint key) names the same offer as
-/// the signed offer that reaches the phone through the authoritative snapshot,
-/// and the phone upgrades the placeholder in place instead of ringing twice:
+/// It is derived, not random, so that a ring hint from a host (which knows the
+/// request id and the phone's endpoint key) would name the same offer as the
+/// signed offer that reaches the phone through the authoritative snapshot, and
+/// the phone would upgrade the placeholder in place instead of ringing twice.
+/// No host posts a ring hint yet: the id is defined and vector-tested, and the
+/// plugin publishes the offer under it:
 ///
 /// ```text
 /// "toffer_" + lower-case base32(SHA-256("oaiy/transfer-offer/v1" 0x00 requestId 0x00 holderThumbprint))[0..26]

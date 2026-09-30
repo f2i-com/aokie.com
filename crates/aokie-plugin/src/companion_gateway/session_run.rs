@@ -585,9 +585,9 @@ impl GatewaySession {
             return Ok(None);
         }
         // The signed transfer offer on the native call surface has a reserved,
-        // derived id: the ring hint the OAIY host posts names the same offer,
-        // so the phone upgrades its placeholder in place instead of ringing
-        // twice. Every other offer keeps a random id.
+        // derived id: a ring hint from a host (none posts one yet) would name
+        // the same offer, so the phone would upgrade its placeholder in place
+        // instead of ringing twice. Every other offer keeps a random id.
         let reserved_offer_id = accepted_transfer_request_id
             .as_deref()
             .filter(|_| mode == LeaseMode::Takeover && surface == MobileOfferSurface::VoiceSystemUi)

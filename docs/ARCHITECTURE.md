@@ -149,7 +149,7 @@ What the plugin offers OAIY:
 How it runs. The tool asks the host for a ring plan (`oaiy.ring.plan`, 1.5 s),
 opens a request in the same volatile assistance mailbox that owner transfer on
 Aokie's own route already used, aimed at the planned devices, and tells the host
-(`oaiy.ring.opened`) so it can wake phones and toast the desktop. Nothing about
+(`oaiy.ring.opened`) so that it can act on it (today OAIY shows a desktop toast and raises its window; no host wakes a phone or posts a ring hint yet, and nothing launches a Companion). Nothing about
 the media changed: the Companion gateway publishes signed offers, the first
 accept wins the mailbox's compare-and-swap, and the existing v2 takeover path
 bridges the caller to the accepting endpoint and pauses the AI. The transfer
