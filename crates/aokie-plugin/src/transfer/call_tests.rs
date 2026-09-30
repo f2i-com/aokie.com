@@ -237,7 +237,7 @@ impl Rig {
         self.broker.accept_transfer(request_id, &fence, DEVICE).unwrap();
     }
 
-    fn decline(&self, request_id: &str, text: &str) {
+    pub(crate) fn decline(&self, request_id: &str, text: &str) {
         let fence = self.fence(request_id);
         self.broker
             .accept(PluginAssistanceAnswerFrame {

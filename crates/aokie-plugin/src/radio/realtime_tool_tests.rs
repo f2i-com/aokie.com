@@ -1228,6 +1228,77 @@ fn a_primary_parked_while_its_session_is_up_hears_cancelled_before_the_stop() {
     assert!(!laid.ctx.transfer.is_active());
 }
 
+/// Second review F10. The model may call `finish_call` while a request to the
+/// owner is open (the caller asked for a person, the model says goodbye): that
+/// hangup would drop the caller the owner's phone is answering for. It is
+/// refused with a typed error for as long as the transfer is in flight, and only
+/// then.
+#[test]
+fn finish_call_is_refused_while_a_transfer_is_in_flight_and_only_then() {
+    let ask = |transfer: &crate::transfer::call::TransferCall| finish_call_answer(true, true, 5, 5, transfer);
+    let assert_refused = |transfer: &crate::transfer::call::TransferCall, stage: &str| {
+        let (accepted, output) = ask(transfer);
+        assert!(!accepted, "{stage}");
+        assert_eq!(output["accepted"], false, "{stage}");
+        assert_eq!(output["error"], "transfer_in_progress", "{stage}");
+        assert!(output["instruction"].as_str().unwrap().contains("keep the caller company"), "{stage}");
+        assert_eq!(output.as_object().unwrap().len(), 3, "{stage}: accepted, a typed error and a fixed instruction, nothing else");
+    };
+
+    // Nothing open: as ever.
+    let idle = machine();
+    let (accepted, output) = ask(&idle);
+    assert!(accepted);
+    assert_eq!(output["accepted"], true);
+
+    // Planning: the host is being asked.
+    let mut planning = a_call_with_no_open_request();
+    let (mut lane, _detached) = detached_lane_for("call_a");
+    lane.owner = planning.rig.media.aokie_owner_fence();
+    planning.ctx.history = vec![serde_json::json!({"role": "user", "content": "Can I speak to the owner?"})];
+    assert!(matches!(
+        planning.call_the_tool(&lane, serde_json::json!({"reason": "caller_asked"})),
+        crate::transfer::call::Begin::Planning
+    ));
+    assert_refused(&planning.ctx.transfer, "planning");
+
+    // Ringing, then accepted with the takeover not completed.
+    let mut laid = laid_aside_with_a_ringing_request();
+    assert_refused(&laid.ctx.transfer, "ringing");
+    let request_id = laid.request_id.clone();
+    laid.rig.accept(&request_id);
+    assert!(!laid.withdraw(TransferWithdrawal::Parked, None), "the gate polls: accepted, left untouched");
+    assert_refused(&laid.ctx.transfer, "accepted");
+
+    // The takeover completes: the transfer has ended.
+    let fence = laid.rig.fence(&request_id);
+    laid.rig.broker.transfer_taken(&request_id, &fence, "device_owner").unwrap();
+    assert!(laid.withdraw(TransferWithdrawal::Parked, None));
+    assert!(ask(&laid.ctx.transfer).0, "taken");
+
+    // Declined, and withdrawn.
+    let mut declined = laid_aside_with_a_ringing_request();
+    let declined_id = declined.request_id.clone();
+    declined.rig.decline(&declined_id, "no");
+    assert!(declined.withdraw(TransferWithdrawal::Parked, None));
+    assert!(ask(&declined.ctx.transfer).0, "declined");
+    let mut withdrawn = laid_aside_with_a_ringing_request();
+    assert!(withdrawn.withdraw(TransferWithdrawal::Parked, None));
+    assert!(ask(&withdrawn.ctx.transfer).0, "withdrawn");
+
+    // What made it refused before stays refused for its old reason.
+    let (accepted, output) = finish_call_answer(false, true, 5, 5, &idle);
+    assert!(!accepted);
+    assert_eq!(output["error"], "Call finishing is disabled or the request was invalid.");
+    assert!(!finish_call_answer(true, false, 5, 5, &idle).0, "arguments were not empty");
+    assert!(!finish_call_answer(true, true, 5, 6, &idle).0, "the caller spoke again since");
+    // And a refused request for another reason does not become a transfer error.
+    assert_eq!(
+        finish_call_answer(false, true, 5, 5, &laid_aside_with_a_ringing_request().ctx.transfer).1["error"],
+        "Call finishing is disabled or the request was invalid."
+    );
+}
+
 /// Second review F2. The gate the juggle and the switchboard run before a call
 /// is parked: a request nobody has won is withdrawn and the call may be parked;
 /// one an owner device has accepted is a takeover being connected, is left

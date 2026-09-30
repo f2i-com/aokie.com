@@ -205,6 +205,58 @@ pub(super) fn withdraw_open_transfer(
     may_park
 }
 
+/// The answer to a `finish_call` tool call: `(accepted, output)`.
+///
+/// A call is not finished while a request to the owner is being planned, is
+/// ringing, or has been accepted and its takeover has not completed: the
+/// caller is being connected (or is waiting for it), and a goodbye that hangs
+/// up would drop the very caller the owner's phone is answering for. The
+/// refusal is a typed error and a fixed instruction, and it stands only until
+/// the transfer ends (declined, expired, cancelled, failed or taken: a taken
+/// call has stopped the session, so the tool cannot be called at all).
+#[cfg(feature = "voice")]
+pub(super) fn finish_call_answer(
+    agent_hangup: bool,
+    valid_arguments: bool,
+    activity_revision: u64,
+    lane_activity_revision: u64,
+    transfer: &crate::transfer::call::TransferCall,
+) -> (bool, serde_json::Value) {
+    let allowed = realtime_finish_call_allowed(
+        agent_hangup,
+        valid_arguments,
+        activity_revision,
+        lane_activity_revision,
+    );
+    if allowed && transfer.is_active() {
+        return (
+            false,
+            serde_json::json!({
+                "accepted": false,
+                "error": "transfer_in_progress",
+                "instruction": "A request to reach the owner is open. Do not end the call; keep the caller company until you are told how it ends."
+            }),
+        );
+    }
+    if allowed {
+        (
+            true,
+            serde_json::json!({
+                "accepted": true,
+                "instruction": "Say one brief goodbye now. Do not ask a question."
+            }),
+        )
+    } else {
+        (
+            false,
+            serde_json::json!({
+                "accepted": false,
+                "error": "Call finishing is disabled or the request was invalid."
+            }),
+        )
+    }
+}
+
 /// `transfer_to_owner` was called on a session that negotiated the contract.
 /// It returns at once: a refusal is its answer now, otherwise the host is asked
 /// for a ring plan and the answer (`ringing`, or a refusal) arrives from the
@@ -2148,33 +2200,18 @@ pub(super) fn service_realtime_lane(
                     } else if name == "finish_call" {
                         let valid_arguments =
                             arguments.as_object().is_some_and(serde_json::Map::is_empty);
-                        let accepted = realtime_finish_call_allowed(
+                        let (accepted, output) = finish_call_answer(
                             agent_hangup,
                             valid_arguments,
                             activity_revision,
                             lane.caller_activity_revision,
+                            &ctx.transfer,
                         );
                         if accepted {
                             lane.authorized_finish_tool =
                                 Some((tool_call_id.clone(), lane.caller_activity_revision));
                         }
-                        completion = Some((
-                            tool_call_id,
-                            name,
-                            accepted,
-                            if accepted {
-                                serde_json::json!({
-                                    "accepted": true,
-                                    "instruction": "Say one brief goodbye now. Do not ask a question."
-                                })
-                            } else {
-                                serde_json::json!({
-                                    "accepted": false,
-                                    "error": "Call finishing is disabled or the request was invalid."
-                                })
-                            },
-                            true,
-                        ));
+                        completion = Some((tool_call_id, name, accepted, output, true));
                     } else if name == crate::transfer::TOOL_NAME && lane.transfer_negotiated {
                         // `transfer_to_owner` returns at once. A refusal is
                         // its answer now; otherwise the host is asked for a

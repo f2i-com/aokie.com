@@ -105,6 +105,13 @@ moved, and it depends on whether an owner device has accepted:
   eight waiting); OAIY sends one at a time and waits for each result. A
   name that is not an identifier, a missing tool call id, or a tool call before
   the call began is a protocol violation and ends the stream.
+* **finish_call.** While a request to the owner is being planned, is ringing, or
+  has been accepted and its takeover has not completed, a `finish_call` tool call
+  is answered `{"accepted": false, "error": "transfer_in_progress",
+  "instruction": ...}` (a fixed instruction: keep the caller company until told how
+  it ends): a goodbye that hangs up would drop the caller the owner's phone is
+  answering for. It is answered as before once the transfer has ended (declined,
+  expired, cancelled, failed).
 
 ## The tool
 
@@ -357,6 +364,7 @@ sets is ever echoed to the model or to OAIY.
 | `tool_result` `reason`, given by the plugin | `consent`, `pending_request`, `busy`, `bad_arguments`, `plan_unavailable`, `call_changed`; and, from its own checks, `caller_did_not_ask` (the phrase floor, also for `policy_rule`), `not_urgent` (an unconfirmed `urgent`), `limit_call`, `limit_gap`, `limit_caller`, `limit_global` (the plugin's ceilings), `no_endpoint` (a plan that names no device) |
 | `tool_result` `status` | `refused` (do not offer a person), `unavailable` (offer a message) |
 | tool intake errors, `output: {"error": ...}` with no `status` | `busy`, `tool_limit`, `unsupported` |
+| `finish_call` result `error`, given by the plugin | `transfer_in_progress` (a request to the owner is open and its takeover has not completed) |
 | OAIY's own words, defined by OAIY and never sent or received by the plugin | `not_offered`, `tool_limit` and `no_answer`: reasons in the tool result OAIY composes itself for `transfer_to_owner` (`status: "unavailable"`, offer a message) when nothing reaches the plugin or the plugin does not answer. `not_offered`: transfer is not on for this call (the owner has it off, the call was not given `allowTransfer`, or it is a call the desktop placed). `tool_limit`: OAIY's own tool budget for the call is spent. `no_answer`: the plugin did not answer the request within 25 s, so OAIY answers the model for it (it is not the `expired` outcome, which is a ring nobody answered, sent by the plugin). None of them is the plugin's tool-intake errors above, which are `{"error": ...}` with no `status` and answer a call that reached the plugin |
 | a plan's `reason` the plugin does not know | becomes `plan_unavailable`: nothing the host says is echoed |
 | `transfer_to_owner` `reason` argument | `caller_asked`, `urgent`, `policy_rule` |
