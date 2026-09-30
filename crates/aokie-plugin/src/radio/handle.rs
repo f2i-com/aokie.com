@@ -294,6 +294,10 @@ pub(super) fn return_companion_end_caller_to_aokie(
     }
 }
 
+/// How long a stop waits for the radio to confirm it (its terminal transcript
+/// barrier flushed) before it is unconfirmed.
+pub const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl RadioHandle {
     /// Test-only: a handle wired to a bare channel (no radio thread) so
     /// connector tests can exercise the radio-backed command paths —
@@ -349,14 +353,24 @@ impl RadioHandle {
     /// round-trip, but still prevents a wedged driver from hanging the plugin
     /// RPC thread forever.
     pub fn shutdown_and_wait(&self) -> Result<(), String> {
+        self.shutdown_within(SHUTDOWN_WAIT)
+    }
+
+    /// [`Self::shutdown_and_wait`] with the wait given: the answer to whether
+    /// the radio confirmed it stopped, so a caller that must know (the consent
+    /// pause tells OAIY whether a call may still be on the radio) can ask with
+    /// a wait a test can shorten.
+    pub fn shutdown_within(&self, wait: std::time::Duration) -> Result<(), String> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.send(RadioControl::Shutdown {
             completion: Some(tx),
         })?;
-        rx.recv_timeout(std::time::Duration::from_secs(15))
-            .map_err(|_| {
-                "the radio did not complete graceful shutdown within 15 seconds".to_string()
-            })
+        rx.recv_timeout(wait).map_err(|_| {
+            format!(
+                "the radio did not complete graceful shutdown within {} seconds",
+                wait.as_secs_f64()
+            )
+        })
     }
 
     pub fn is_initialized(&self) -> bool {
