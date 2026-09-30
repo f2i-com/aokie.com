@@ -59,6 +59,23 @@ pub(super) fn run_auto_hold_juggle(
             )
         };
     }
+    // The newcomer's leg is gone and its context is replaced by the primary's:
+    // whatever the old one held is withdrawn (it ended) and it is dropped.
+    macro_rules! retire_ctx {
+        ($replacement:expr) => {
+            retire_call_context(
+                &mut *ctx,
+                $replacement,
+                crate::assistance::global(),
+                &*tracker,
+                remote_media,
+                host_rpc,
+                status,
+                outbox,
+                &mut *sink,
+            )
+        };
+    }
     #[cfg(feature = "voice")]
     if auto_hold
         && !remote_media.radio_reserved()
@@ -566,7 +583,7 @@ pub(super) fn run_auto_hold_juggle(
                                                 sink,
                                             );
                                         }
-                                        *ctx = ctx_a;
+                                        drop(retire_ctx!(ctx_a));
                                         match tracker.restore(sess_a) {
                                             Ok(_gen) => {}
                                             Err(back) => {
@@ -614,7 +631,7 @@ pub(super) fn run_auto_hold_juggle(
                                         // this call ends.
                                         *parked = Some((sess_a, ctx_a));
                                         *promote_greet_for = Some(b_id.clone());
-                                        *pending_ctx_restore = Some(std::mem::replace(
+                                        *pending_ctx_restore = Some(carry_call_context(
                                             &mut *ctx,
                                             CallVoiceContext::fresh(None),
                                         ));
@@ -639,7 +656,7 @@ pub(super) fn run_auto_hold_juggle(
                                         drop(ctx_a);
                                         *status.parked_call.lock().unwrap() = None;
                                         *promote_greet_for = Some(b_id.clone());
-                                        *pending_ctx_restore = Some(std::mem::replace(
+                                        *pending_ctx_restore = Some(carry_call_context(
                                             &mut *ctx,
                                             CallVoiceContext::fresh(None),
                                         ));
@@ -825,7 +842,7 @@ pub(super) fn run_auto_hold_juggle(
                                         // stays parked for auto-retrieve.
                                         *parked = Some((sess_a, ctx_a));
                                         *promote_greet_for = Some(b_id.clone());
-                                        *pending_ctx_restore = Some(std::mem::replace(
+                                        *pending_ctx_restore = Some(carry_call_context(
                                             &mut *ctx,
                                             CallVoiceContext::fresh(None),
                                         ));

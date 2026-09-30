@@ -1120,6 +1120,7 @@ pub(super) fn run_loop(
             &control_rx,
             &status,
             &remote_media,
+            &host_rpc,
             &mut tracker,
             &mut pending_companion_end_caller,
             &mut ctx,
@@ -1152,6 +1153,7 @@ pub(super) fn run_loop(
             &control_rx,
             &status,
             &remote_media,
+            &host_rpc,
             &mut tracker,
             &mut pending_companion_end_caller,
             &mut ctx,
@@ -1319,7 +1321,7 @@ pub(super) fn run_loop(
             let incoming_ctx = pending_ctx_restore
                 .take()
                 .unwrap_or_else(|| CallVoiceContext::fresh(None));
-            let prev_ctx = std::mem::replace(&mut ctx, incoming_ctx);
+            let prev_ctx = carry_call_context(&mut ctx, incoming_ctx);
             ctx.rt_lane = fresh_lane;
             // §9.3: the call-scoped agent overlay dies WITH its call — the
             // next caller can never inherit the previous caller's persona.
@@ -2003,6 +2005,7 @@ pub(super) fn run_loop(
             &control_rx,
             &status,
             &remote_media,
+            &host_rpc,
             &mut greeting,
             &mut tracker,
             &mut pending_companion_end_caller,
@@ -2042,6 +2045,7 @@ pub(super) fn run_loop(
             &control_rx,
             &status,
             &remote_media,
+            &host_rpc,
             &mut greeting,
             &mut tracker,
             &mut pending_companion_end_caller,

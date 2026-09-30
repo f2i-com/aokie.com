@@ -14,6 +14,7 @@ pub(super) fn service_controls(
     control_rx: &std::sync::mpsc::Receiver<RadioControl>,
     status: &Arc<RadioStatus>,
     remote_media: &crate::remote_media::RemoteMediaHandle,
+    host_rpc: &Arc<crate::host_rpc::HostRpc>,
     greeting: &mut Option<String>,
     tracker: &mut crate::call_session::SessionTracker,
     pending_companion_end_caller: &mut Option<PendingCompanionEndCaller>,
@@ -46,6 +47,51 @@ pub(super) fn service_controls(
     #[cfg(feature = "voice")] oaiy_route: bool,
 ) -> bool {
     use std::sync::mpsc::TryRecvError;
+    // A live call's context is only ever laid aside through these two: a
+    // transfer request it still holds is withdrawn with it (nothing polls a
+    // stowed context), and a call whose transfer an owner device has accepted
+    // is not parked at all.
+    macro_rules! stow_ctx {
+        ($replacement:expr) => {
+            stow_call_context(
+                &mut *ctx,
+                $replacement,
+                crate::assistance::global(),
+                &*tracker,
+                remote_media,
+                host_rpc,
+                status,
+                outbox,
+                &mut *sink,
+            )
+        };
+    }
+    // Whether the live call may be put on hold: a request nobody has won is
+    // withdrawn now; one an owner device has accepted is being connected and
+    // the call is not parked.
+    macro_rules! transfer_permits_parking {
+        () => {{
+            #[cfg(feature = "voice")]
+            {
+                withdraw_open_transfer(
+                    TransferWithdrawal::Parked,
+                    &mut *ctx,
+                    realtime_lane.as_mut(),
+                    crate::assistance::global(),
+                    &*tracker,
+                    remote_media,
+                    host_rpc,
+                    status,
+                    outbox,
+                    &mut *sink,
+                )
+            }
+            #[cfg(not(feature = "voice"))]
+            {
+                true
+            }
+        }};
+    }
     status
         .loop_phase
         .store(loop_phase::CONTROLS, Ordering::Relaxed);
@@ -268,6 +314,15 @@ pub(super) fn service_controls(
                             op.as_deref(),
                             "a Companion media claim or physical call transition crossed this switch",
                         );
+                    } else if !transfer_permits_parking!() {
+                        emit_control_failed(
+                            outbox,
+                            sink,
+                            &tracker,
+                            "call.activate",
+                            op.as_deref(),
+                            "a transfer to the owner is being connected for the active call: it cannot be put on hold now",
+                        );
                     } else if let Err(e) = remote_media
                         .with_aokie_switch_owner(
                             waiting_switch
@@ -316,7 +371,7 @@ pub(super) fn service_controls(
                         );
                     } else {
                         let sess_a = tracker.park().expect("checked active above");
-                        let ctx_a = std::mem::replace(&mut *ctx, CallVoiceContext::fresh(None));
+                        let ctx_a = stow_ctx!(CallVoiceContext::fresh(None));
                         eprintln!(
                             "[aokie-plugin] SWITCHBOARD: parked {} — accepting waiting caller {} (AT+CHLD=2 sent)",
                             sess_a.id, w.call_id
@@ -386,7 +441,9 @@ pub(super) fn service_controls(
                     } else if let Some((sess_a, ctx_a)) = parked.take() {
                         let foreground_active =
                             tracker.current().is_some_and(|session| session.is_active());
-                        let swap_result = if foreground_active {
+                        let swap_result = if foreground_active && !transfer_permits_parking!() {
+                            Err("a transfer to the owner is being connected for the active call: it cannot be put on hold now".to_string())
+                        } else if foreground_active {
                             remote_media
                                 .aokie_switch_fence()
                                 .filter(|fence| {
@@ -465,8 +522,7 @@ pub(super) fn service_controls(
                         } else {
                             if tracker.current().is_some() {
                                 let sess_b = tracker.park().expect("checked current");
-                                let ctx_b =
-                                    std::mem::replace(&mut *ctx, CallVoiceContext::fresh(None));
+                                let ctx_b = stow_ctx!(CallVoiceContext::fresh(None));
                                 eprintln!(
                                     "[aokie-plugin] SWITCHBOARD: swap — {} parked, resuming {}",
                                     sess_b.id, sess_a.id

@@ -861,6 +861,12 @@ fn a_takeover_stops_the_session_as_a_handoff_and_the_fresh_session_says_how_the_
     assert_eq!(greeting, crate::transfer::RETURN_GREETING);
 }
 
+/// A source file as the scan tests read it, with line endings folded: a
+/// checkout with core.autocrlf (CRLF) and one without must count the same.
+fn scanned(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 /// The loop itself needs a phone, a dongle and a socket to the desktop, so what
 /// it calls is tested above and that it calls it is checked here: each helper is
 /// defined once and used once in the loop (the send after the tool block, which
@@ -868,8 +874,9 @@ fn a_takeover_stops_the_session_as_a_handoff_and_the_fresh_session_says_how_the_
 /// helper does. Changing the wiring means changing this on purpose.
 #[test]
 fn the_service_loop_runs_the_transfer_helpers_it_is_tested_through() {
-    let service = include_str!("realtime_service.rs");
-    let run_loop = include_str!("run_loop.rs");
+    let service = scanned(include_str!("realtime_service.rs"));
+    let run_loop = scanned(include_str!("run_loop.rs"));
+    let (service, run_loop) = (service.as_str(), run_loop.as_str());
     let count = |text: &str, needle: &str| text.matches(needle).count();
 
     // Defined once, called once.
@@ -1071,14 +1078,17 @@ fn a_call_parked_by_the_juggle_frees_the_mailbox_and_owes_its_next_session_a_can
 /// place that lays a context aside must choose, and this fails until it does.
 #[test]
 fn the_hold_juggle_lays_a_call_aside_only_through_the_withdrawing_helper() {
-    let source = include_str!("juggle.rs");
+    let source = scanned(include_str!("juggle.rs"));
+    let source = source.as_str();
     let invocations = source.matches("stow_ctx!(").count();
-    let raw_swaps = source.matches("std::mem::replace(").count();
     assert_eq!(invocations, 4, "parking sites that withdraw the transfer first");
     assert_eq!(
-        raw_swaps, 3,
-        "the newcomer's context is kept for the per-call reset; it is the call that continues"
+        source.matches("std::mem::replace(").count(),
+        0,
+        "the newcomer's context that is kept for the per-call reset goes through carry_call_context"
     );
+    assert_eq!(source.matches("carry_call_context(").count(), 3);
+    assert_eq!(source.matches("retire_ctx!(").count(), 1, "the vanished newcomer's context is retired");
     // The transfer gate runs first: the open request is withdrawn while the
     // session is still up, before it is stopped and before the hold
     // announcements begin, and an accepted one abandons the juggle.
@@ -1093,6 +1103,110 @@ fn the_hold_juggle_lays_a_call_aside_only_through_the_withdrawing_helper() {
     let announced_at = source.find("HOLD_PRIMARY_ASK_LINE").unwrap();
     assert!(withdrawn_at < stopped_at, "the request is withdrawn before the session is stopped");
     assert!(withdrawn_at < announced_at, "and before the first hold announcement");
+}
+
+/// Second review F1. A call's voice context is laid aside in more places than
+/// the juggle (the switchboard's manual swaps, the reconciliation's cascade), and
+/// a Ringing request in a stowed context sits there unpolled: the mailbox busy,
+/// the owner's phones ringing, OAIY told nothing. So NO code in the radio swaps a
+/// call's context by hand: it goes through `stow_call_context` (parked: the
+/// request is withdrawn, or the park refused for an accepted one),
+/// `retire_call_context` (the call ended) or `carry_call_context` (the call
+/// continues), all three defined in realtime_service.rs, which is the only file
+/// that may say `mem::replace` on a context.
+#[test]
+fn no_place_in_the_radio_swaps_a_call_context_by_hand() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("radio");
+    let swap = regex::Regex::new(r"mem::(replace|swap|take)\(\s*(&mut\s*)?\*?\s*ctx\b").unwrap();
+    let assign = regex::Regex::new(r"\*ctx\s*=[^=]").unwrap();
+    let mut files = 0;
+    let mut helper_swaps = 0;
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if !name.ends_with(".rs") || name.ends_with("tests.rs") {
+            continue;
+        }
+        files += 1;
+        let text = scanned(&std::fs::read_to_string(&path).unwrap());
+        let swaps = swap.find_iter(&text).count();
+        if name == "realtime_service.rs" {
+            helper_swaps = swaps;
+        } else if swaps > 0 || assign.is_match(&text) {
+            offenders.push(name);
+        }
+    }
+    assert!(files >= 20, "the scan found the radio's sources ({files})");
+    assert!(offenders.is_empty(), "a call context is swapped by hand in {offenders:?}");
+    assert_eq!(
+        helper_swaps, 5,
+        "the swaps live in the stow, retire and carry helpers (two builds of the first two)"
+    );
+
+    // Each site is wired as decided: the switchboard's two parks are gated (an
+    // accepted transfer is not parked) and stowed, the cascade stows two newcomers,
+    // retires the ended foreground's context and carries the newcomer that keeps
+    // the line; the juggle's parks are stowed and its newcomers carried.
+    let read = |name: &str| scanned(&std::fs::read_to_string(dir.join(name)).unwrap());
+    let (controls, reconcile) = (read("controls.rs"), read("reconcile.rs"));
+    assert_eq!(controls.matches("stow_ctx!(").count(), 2);
+    assert_eq!(controls.matches("transfer_permits_parking!()").count(), 2, "two gates");
+    assert!(controls.contains("foreground_active && !transfer_permits_parking!()"));
+    assert!(controls.contains("} else if !transfer_permits_parking!() {"));
+    assert_eq!(reconcile.matches("stow_ctx!(").count(), 2);
+    assert_eq!(reconcile.matches("retire_ctx!(").count(), 1);
+    assert_eq!(reconcile.matches("carry_call_context(").count(), 2);
+}
+
+/// The helpers the scan above forces every site through, by behaviour: a stowed
+/// or retired context leaves no request behind (OAIY told, the audit closed, the
+/// mailbox free); a carried one is the same call continuing and is untouched.
+#[test]
+fn the_retired_context_is_withdrawn_and_the_carried_one_is_left_alone() {
+    let mut laid = laid_aside_with_a_ringing_request();
+    let request_id = laid.request_id.clone();
+    let carried = carry_call_context(&mut laid.ctx, CallVoiceContext::fresh(None));
+    assert!(carried.transfer.is_active(), "the call continues: its request is untouched");
+    assert!(laid.rig.broker.is_busy());
+    assert!(!laid.ctx.transfer.is_active());
+    laid.ctx = carried;
+
+    let retired = retire_call_context(
+        &mut laid.ctx,
+        CallVoiceContext::fresh(None),
+        &laid.rig.broker,
+        &laid.tracker,
+        &laid.rig.media,
+        &laid.rig.host,
+        &laid.status,
+        None,
+        &mut laid.sink,
+    );
+    assert!(!retired.transfer.is_active(), "the ended call's request is withdrawn");
+    assert!(retired.transfer.has_held_outcomes(), "and OAIY is owed the cancelled");
+    assert!(!laid.rig.broker.is_busy());
+    assert!(!laid.rig.broker.transfer_admits(&request_id, "thumb_phone_0123456789"));
+    assert_eq!(laid.sink.lines.len(), 1, "the audit trail closes the request");
+    assert!(laid.sink.lines[0].contains("cancelled"));
+}
+
+/// The scan reads sources however the checkout ended their lines.
+#[test]
+fn the_source_scans_count_the_same_with_crlf_line_endings() {
+    let lf = "if x {\n    stow_ctx!(a);\n}\n";
+    let crlf = lf.replace('\n', "\r\n");
+    assert_ne!(lf, crlf);
+    assert_eq!(scanned(&crlf), lf);
+    assert_eq!(scanned(&crlf).matches("if x {\n    stow_ctx!(").count(), 1);
+    // The sources under test are scanned folded whichever they are.
+    for source in [
+        include_str!("realtime_service.rs"),
+        include_str!("run_loop.rs"),
+        include_str!("juggle.rs"),
+    ] {
+        assert!(!scanned(source).contains('\r'));
+    }
 }
 
 /// The juggle's step 0: the primary's session is still up when its open request
