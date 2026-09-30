@@ -44,3 +44,7 @@
 -keep class livekit.org.jni_zero.** { *; }
 # The generated glue class the jar's JniZero refers to is not shipped; nothing calls the method that uses it.
 -dontwarn livekit.org.jni_zero.JniZeroJni
+
+# rustls-platform-verifier's Java component is reached only through JNI from the Rust verifier, so R8 sees
+# no use and would remove or rename it, and every HTTPS request would fail in the minified build.
+-keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }

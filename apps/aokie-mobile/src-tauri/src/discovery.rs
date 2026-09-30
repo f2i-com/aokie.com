@@ -821,6 +821,7 @@ pub(crate) async fn fetch_discovery(url: &str) -> Result<DiscoveryDocument, Stri
         return Err("discovery URL must target the Aokie discovery document".into());
     }
 
+    crate::native_init::ensure_https_ready()?;
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
         .timeout(Duration::from_secs(8))
