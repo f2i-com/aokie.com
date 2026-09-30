@@ -89,7 +89,7 @@
         "turn 4"
       ]
     },
-    "paramsRules": "At most the last three caller turns that are not only acknowledgements of the AI (\"mm-hmm\", \"yeah, okay\": see backchannel in the caller-asked fixture), each cut to its last 300 characters (a turn is read from its end), and only what was said after the last request the plugin gave the host to plan and after the last time the AI got the caller back (an ask counts for one request); callerNumber is left out when unknown. The turns never leave the machine: the host runs the phrase checks on them.",
+    "paramsRules": "At most the last three caller turns that are not only acknowledgements of the AI (\"mm-hmm\", \"yeah, okay\": see backchannel in the caller-asked fixture), each cut to its last 300 characters (a turn is read from its end), and only what was said after the last request the plugin opened (the host authorised the ring and the request is open; a plan that was refused, unanswered or unusable spends nothing, so the same ask can be planned again) and after the last time the AI got the caller back (an ask counts for one request); callerNumber is left out when unknown. The turns never leave the machine: the host runs the phrase checks on them.",
     "results": [
       {
         "name": "ring the planned phone",
