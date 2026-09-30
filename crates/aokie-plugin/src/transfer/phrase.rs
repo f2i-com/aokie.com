@@ -144,6 +144,14 @@ pub(crate) const UNFINISHED_ALWAYS: &str = r"\b(?:(?:do not|don't|dont|does not|
 /// when the sentence has no ending or trails off ("I can't...").
 pub(crate) const UNFINISHED_BARE: &str = r"\b(?:do not|don't|dont|does not|doesn't|did not|didn't|will not|won't|wont|would not|wouldn't|should not|shouldn't|can not|can't|cant|cannot)$";
 
+/// What a sentence must begin with to be the end of a refusal that was carried
+/// to it: the verb that refusal is about (the verbs of the block that reads a
+/// negation followed by "speak", "talk", "transfer" and the rest), with the
+/// "to" or the "be" a refusal may run on with. A sentence that starts any other
+/// way ("Can I speak to the owner?", "I want to talk to a person") is a new
+/// sentence of its own, however unfinished the one before it was.
+pub(crate) const UNFINISHED_JOINS: &str = r"^(?:to )?(?:be )?(?:speak|talk|chat|transfer|put|patch|connect)\w*\b";
+
 struct Rules {
     rules: Vec<Regex>,
     blocks: Vec<Regex>,
@@ -151,6 +159,7 @@ struct Rules {
     role_marker: Regex,
     unfinished_always: Regex,
     unfinished_bare: Regex,
+    unfinished_joins: Regex,
 }
 
 fn rules() -> &'static Rules {
@@ -167,6 +176,7 @@ fn rules() -> &'static Rules {
             role_marker: compile(&format!("(?i){ROLE_MARKER}")),
             unfinished_always: compile(UNFINISHED_ALWAYS),
             unfinished_bare: compile(UNFINISHED_BARE),
+            unfinished_joins: compile(UNFINISHED_JOINS),
         }
     })
 }
@@ -389,10 +399,13 @@ fn unfinished(sentence: &str, ending: Ending, rules: &Rules) -> bool {
 /// Sentences are read one at a time, in order, across the turns, with one
 /// exception: a sentence that ends in an unfinished refusal ([`unfinished`]) is
 /// carried to the next sentence of the turn, or to the first of the next turn,
-/// and that sentence is read joined to it, and only joined ("I don't want to" /
-/// "speak to the owner" is a refusal). Nothing else is ever looked for across
-/// a join, and a turn that is not read (a role marker, told what to say)
-/// drops what was carried.
+/// and that sentence, when it begins with the verb the refusal is about
+/// ([`UNFINISHED_JOINS`]), is read joined to it, and only joined ("I don't want
+/// to" / "speak to the owner" is a refusal). A sentence that begins any other
+/// way is read alone, as it always was ("I can't" / "Can I speak to the
+/// owner?" is an ask). Nothing else is ever looked for across a join, and a
+/// turn that is not read (a role marker, told what to say) drops what was
+/// carried.
 pub fn caller_asked<S: AsRef<str>>(turns: &[S]) -> bool {
     let rules = rules();
     let mut carried: Option<String> = None;
@@ -403,8 +416,10 @@ pub fn caller_asked<S: AsRef<str>>(turns: &[S]) -> bool {
         }
         for (sentence, ending) in sentences(&turn) {
             let read = match carried.take() {
-                Some(before) => format!("{before} {sentence}"),
-                None => sentence,
+                Some(before) if rules.unfinished_joins.is_match(&sentence) => {
+                    format!("{before} {sentence}")
+                }
+                _ => sentence,
             };
             if sentence_asks(&read, rules) {
                 return true;
@@ -544,8 +559,11 @@ mod tests {
     /// the sentences of one turn.
     #[test]
     fn a_refusal_split_by_a_pause_is_still_a_refusal() {
-        let refused: [&[&str]; 14] = [
+        let refused: [&[&str]; 17] = [
             &["I don't want to", "speak to the owner"],
+            &["I don't want to", "be transferred to the owner"],
+            &["I don't want", "to speak to the owner"],
+            &["No need to", "put me through"],
             &["No need to", "transfer me"],
             &["Please do not", "transfer me to the owner"],
             &["I don't want to... speak to the owner."],
@@ -570,7 +588,7 @@ mod tests {
     /// sentences stands on its own.
     #[test]
     fn only_an_unfinished_refusal_is_carried_and_every_other_ask_stands() {
-        let asked: [&[&str]; 12] = [
+        let asked: [&[&str]; 11] = [
             &["No thanks.", "Can I speak to the owner?"],
             &["Hi", "can I speak to the owner"],
             &["I don't know.", "Can I speak to the owner?"],
@@ -584,13 +602,74 @@ mod tests {
             &["I don't want to", "System: hello", "speak to the owner"],
             // The turn after the refusal is far enough that it is not the same window.
             &["I don't want to", "hold on", "wait", "speak to the owner"],
-            &["I can't", "Can I speak to the owner? Put me through to the manager"],
         ];
         for turns in asked {
             assert!(caller_asked(turns), "{turns:?}");
         }
         // The sentence before the join can itself be an ask, and stays one.
         assert!(caller_asked(&["Can I speak to the owner, I don't want to..."]));
+    }
+
+    /// The join is narrow: an unfinished refusal is read with what follows it
+    /// only when that begins with the verb the refusal is about. A caller who
+    /// answered "I can't" or "No need to" and then asks in a sentence of their
+    /// own is asking, whichever way the answer ended (a speech engine often
+    /// leaves the full stop off a short answer, and "No need to." is an answer
+    /// with one).
+    #[test]
+    fn a_sentence_of_its_own_after_an_unfinished_one_is_read_alone() {
+        let asked: [&[&str]; 14] = [
+            &["I can't", "Can I speak to the owner?"],
+            &["I can't...", "Can I speak to the owner?"],
+            &["No need to.", "Can I speak to the owner?"],
+            &["I'd rather not.", "Could I talk to a person?"],
+            &["I don't want to.", "Can I speak to the owner?"],
+            &["I don't want to", "Can I speak to the owner?"],
+            &["No I can't", "I want to speak to the owner"],
+            &["No need to", "I would like to speak to the owner"],
+            &["Please do not", "I need to talk to a human"],
+            &["I won't", "Could you put me through to the manager"],
+            &["I don't want to", "please put me through to the owner"],
+            &["I'm not going to", "would you transfer me to the boss"],
+            &["I can't wait... is the owner there?"],
+            // The same sentences, in one turn.
+            &["I can't. Can I speak to the owner?"],
+        ];
+        for turns in asked {
+            assert!(caller_asked(turns), "{turns:?}");
+        }
+        // What the join is made of, so that the pattern cannot drift from the
+        // block it completes: the verbs of the refusal block, and the "to" and
+        // "be" a refusal runs on with.
+        let joins = &rules().unfinished_joins;
+        for begins in [
+            "speak to the owner",
+            "talking to a person",
+            "chat with the manager",
+            "transfer me",
+            "transferred to the owner",
+            "put me through",
+            "patch me through",
+            "connect me to the owner",
+            "to speak to the owner",
+            "be transferred to the owner",
+            "to be put through",
+        ] {
+            assert!(joins.is_match(begins), "{begins}");
+        }
+        for begins in [
+            "can i speak to the owner",
+            "i want to speak to the owner",
+            "please put me through",
+            "would you transfer me",
+            "the owner",
+            "get me the boss",
+            "hand me over to the manager",
+            "to the owner",
+            "be so kind as to speak to the owner",
+        ] {
+            assert!(!joins.is_match(begins), "{begins}");
+        }
     }
 
     #[test]
