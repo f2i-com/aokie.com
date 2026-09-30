@@ -337,6 +337,13 @@ pub struct TransferCall {
     /// The handoff an open request belonged to is over (its fresh session has
     /// started), so however the request ends is not the next handoff's story.
     end_is_spent: bool,
+    /// How many of the caller's turns (counted from the start of the call, in
+    /// the order they were said) are spent: the phrase floor reads only what
+    /// was said after them. A caller's ask is spent by the first request it
+    /// opens (the host is asked to plan it) and by a hand-back to the AI (a
+    /// fresh session after a takeover or a hold), so it counts for one request
+    /// and never for one that comes after the AI lost the line and got it back.
+    caller_turns_spent: usize,
     /// Test seam: runs against the broker between the machine's last look and
     /// the withdrawal, the instant a phone could accept.
     #[cfg(test)]
@@ -382,9 +389,28 @@ impl TransferCall {
             handoff_started: None,
             held: Vec::new(),
             end_is_spent: false,
+            caller_turns_spent: 0,
             #[cfg(test)]
             before_withdrawal: None,
         }
+    }
+
+    /// How many of the caller's turns are spent (see the field): the phrase
+    /// floor and the plan request read the turns after this many.
+    pub fn caller_turns_spent(&self) -> usize {
+        self.caller_turns_spent
+    }
+
+    /// The caller's first `heard` turns are spent. Never fewer than were.
+    pub fn spend_caller_turns(&mut self, heard: usize) {
+        self.caller_turns_spent = self.caller_turns_spent.max(heard);
+    }
+
+    /// Test seam: the gap since the last request has passed, so the next one is
+    /// judged on what the caller said and not on the clock.
+    #[cfg(test)]
+    pub(crate) fn forget_the_last_end(&mut self) {
+        self.last_ended = None;
     }
 
     /// Whether a transfer is planned, ringing or accepted right now.

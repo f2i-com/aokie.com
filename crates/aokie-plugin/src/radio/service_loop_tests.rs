@@ -174,7 +174,16 @@ impl Loop {
             midcall: None,
             terminal: None,
             deferred: None,
-            ctx: CallVoiceContext::fresh(None),
+            ctx: {
+                // A private governor: the process-wide one counts every ring of
+                // every test that shares this caller's number, and would refuse
+                // the fourth in the hour.
+                let mut ctx = CallVoiceContext::fresh(None);
+                ctx.transfer = crate::transfer::call::TransferCall::new(Arc::new(
+                    crate::transfer::call::Governor::default(),
+                ));
+                ctx
+            },
             agent_hangup: false,
             started: RefCell::new(Vec::new()),
         }
@@ -604,4 +613,137 @@ fn held_outcomes_go_out_before_a_stop_and_right_behind_the_answer_they_waited_fo
     let outcome_at = sent.iter().position(|control| matches!(control, SentControl::TransferOutcome { .. }));
     assert!(answer_at.is_some() && outcome_at.is_some() && answer_at < outcome_at, "answer, then outcome: {sent:?}");
     assert!(!l.ctx.transfer.has_held_outcomes());
+}
+
+// --- An ask counts for one request (review R4) ------------------------------------
+//
+// "Consumed" means this: a caller turn is spent when the host has been asked to
+// plan a request that the phrase floor let through (the first request the ask
+// opens), and when the AI gets the caller back (a fresh session after a takeover
+// or a hold). The floor, and the `recentCallerTurns` the host is sent, read only
+// the turns said after the last spent one. These run the loop, so the history,
+// the machine, the session and the host are the real ones.
+
+/// The number of `oaiy.ring.plan` requests written to the host so far.
+fn plans_asked(l: &Loop) -> usize {
+    l.sink
+        .lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| value["method"] == "oaiy.ring.plan")
+        .count()
+}
+
+/// The model calls `transfer_to_owner` again; what it is answered with (or `None`
+/// while the host is being asked).
+fn calls_the_tool_again(l: &mut Loop, id: &str) -> Option<(bool, Value)> {
+    l.ctx.transfer.forget_the_last_end(); // the 15 s gap is not what is under test
+    l.tool(id, TOOL_NAME, json!({"reason": "caller_asked"}));
+    l.pass();
+    tool_result(&l.sent(), id)
+}
+
+#[test]
+fn an_ask_opens_one_request_and_a_later_turn_that_asks_nothing_opens_none() {
+    // A ring, the caller says no and takes a message instead, and the model
+    // calls the tool again on the strength of the old ask.
+    let mut l = Loop::begun_with_transfer();
+    let request_id = l.ring();
+    assert_eq!(plans_asked(&l), 1);
+    l.oaiy(RealtimeEventKind::TransferCancel {
+        request_id,
+        reason: CancelReason::MessageInstead,
+    });
+    l.pass();
+    assert_eq!(outcomes(&l.sent()), vec![Outcome::Cancelled]);
+    l.caller_says("No, just take a message please.");
+    let (ok, output) = calls_the_tool_again(&mut l, "tool_2").expect("refused at once, not asked of the host");
+    assert!(!ok);
+    assert_eq!(output["reason"], "caller_did_not_ask", "{output}");
+    assert_eq!(plans_asked(&l), 1, "the host was not asked again");
+    assert!(!l.rig.broker.is_busy());
+
+    // A new ask is a new request.
+    l.caller_says("Actually, can I speak to the owner?");
+    assert!(calls_the_tool_again(&mut l, "tool_3").is_none(), "the host is being asked");
+    assert_eq!(plans_asked(&l), 2);
+}
+
+#[test]
+fn an_ask_is_spent_by_a_request_that_reached_the_host_and_by_none_that_did_not() {
+    // Another request holds the mailbox, so the tool is refused before the host
+    // is asked: the ask stands, and the retry once the mailbox is free is judged on it.
+    let mut l = Loop::begun_with_transfer();
+    let snapshot = l.rig.media.snapshot();
+    let fence = crate::assistance::AssistanceCallFence {
+        call_id: CALL.into(),
+        call_epoch: snapshot.call_epoch,
+        owner_epoch: snapshot.owner_epoch,
+        switchboard_revision: 0,
+        remote_revision: snapshot.remote_revision,
+    };
+    let other = l.rig.broker.request(fence, "Is Tuesday free?", None, 60).expect("the mailbox was free");
+    l.caller_says("Can I speak to the owner?");
+    let (ok, output) = calls_the_tool_again(&mut l, "tool_1").expect("refused at once");
+    assert!(!ok);
+    assert_eq!(output["reason"], "pending_request", "{output}");
+    assert_eq!(plans_asked(&l), 0);
+    l.rig.broker.discard(&other);
+    assert!(calls_the_tool_again(&mut l, "tool_2").is_none(), "the same ask, and the host is asked");
+    assert_eq!(plans_asked(&l), 1);
+}
+
+#[test]
+fn an_ask_from_before_a_takeover_does_not_open_a_request_after_the_caller_is_handed_back() {
+    // Call, ask, ring, takeover, and the caller is back with the AI.
+    let mut l = Loop::begun_with_transfer();
+    l.ring();
+    l.rig.media.observe_physical_call(Some("call_b"), true);
+    l.pass();
+    assert_eq!(outcomes(&l.sent()), vec![Outcome::Cancelled]);
+    l.rig.media.observe_physical_call(Some(CALL), true);
+    l.pass();
+    assert_eq!(l.sessions(), 2, "a fresh session for the returned caller");
+    l.ready(&["transfer_v1"]);
+    l.pass();
+    assert!(l.lane.as_ref().unwrap().transfer_negotiated && l.lane.as_ref().unwrap().begun);
+    l.sent();
+    let plans = plans_asked(&l);
+
+    // Something that is not an ask, and the model reaches for the tool.
+    l.caller_says("Thanks, that is all sorted now.");
+    let (ok, output) = calls_the_tool_again(&mut l, "tool_2").expect("refused at once");
+    assert!(!ok);
+    assert_eq!(output["reason"], "caller_did_not_ask", "{output}");
+    assert_eq!(plans_asked(&l), plans, "nothing was asked of the host");
+
+    // An ask to the fresh session is a request.
+    l.caller_says("Can I speak to the owner please?");
+    assert!(calls_the_tool_again(&mut l, "tool_3").is_none(), "the host is being asked");
+    assert_eq!(plans_asked(&l), plans + 1);
+}
+
+#[test]
+fn an_ask_the_ai_never_acted_on_is_spent_when_it_gets_the_caller_back() {
+    // The caller asked, the model did not call the tool, and the AI's session is
+    // replaced (the call went on hold and came back: a fresh session resumes it).
+    let mut l = Loop::new();
+    l.caller_says("Can I speak to the owner?");
+    l.resume = Some(CALL.into());
+    l.pass();
+    assert_eq!(l.sessions(), 1);
+    l.ready(&["transfer_v1"]);
+    l.pass();
+    assert!(l.lane.as_ref().unwrap().transfer_negotiated && l.lane.as_ref().unwrap().begun);
+    l.sent();
+
+    l.caller_says("Thanks, that is all sorted now.");
+    let (ok, output) = calls_the_tool_again(&mut l, "tool_1").expect("refused at once");
+    assert!(!ok);
+    assert_eq!(output["reason"], "caller_did_not_ask", "{output}");
+    assert_eq!(plans_asked(&l), 0);
+
+    l.caller_says("Can I speak to the owner please?");
+    assert!(calls_the_tool_again(&mut l, "tool_2").is_none(), "the host is being asked");
+    assert_eq!(plans_asked(&l), 1);
 }
