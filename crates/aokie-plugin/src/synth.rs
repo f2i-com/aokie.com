@@ -87,6 +87,20 @@ pub struct SynthHandle {
 }
 
 impl SynthHandle {
+    /// A handle with no worker behind it: every job is dropped and nothing is
+    /// ever synthesized. For tests that drive the radio loop, which asks the
+    /// engine to warm up when a call begins.
+    #[cfg(test)]
+    pub(crate) fn inert() -> Self {
+        let (job_tx, _job_rx) = mpsc::channel::<SynthJob>();
+        let (_out_tx, out_rx) = mpsc::sync_channel::<SynthOut>(1);
+        Self {
+            job_tx,
+            out_rx,
+            epoch: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     /// Spawn the worker. The HTTP TTS endpoint is seeded from
     /// `AOKIE_TTS_ENDPOINT` exactly as the old in-loop runtime was.
     pub fn spawn() -> Self {

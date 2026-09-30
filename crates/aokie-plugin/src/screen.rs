@@ -53,6 +53,21 @@ pub(crate) fn digit_suffix(raw: &str) -> String {
 }
 
 impl ScreenPolicy {
+    /// A policy that screens nobody and knows no manager, with nothing read
+    /// from the environment: for tests that drive the radio loop.
+    #[cfg(test)]
+    pub(crate) fn permissive() -> Self {
+        Self {
+            blocked: Vec::new(),
+            accept: None,
+            reject_private: false,
+            message: String::new(),
+            blocked_message: String::new(),
+            auto_block_abuse: false,
+            manager: Vec::new(),
+        }
+    }
+
     pub fn from_env() -> Self {
         let blocked = std::env::var("AOKIE_BLOCKED_NUMBERS")
             .unwrap_or_default()

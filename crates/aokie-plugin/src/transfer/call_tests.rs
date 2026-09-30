@@ -200,14 +200,14 @@ impl Rig {
     }
 
     /// The host answers the plan request.
-    fn host_answers(&self, result: Value) {
+    pub(crate) fn host_answers(&self, result: Value) {
         let (id, _) = self.plan_request();
         assert!(self
             .host
             .try_route_response(&json!({"jsonrpc": "2.0", "id": id, "result": result})));
     }
 
-    fn ring_plan() -> Value {
+    pub(crate) fn ring_plan() -> Value {
         json!({
             "planId": "plan_0001", "decision": "ring", "reason": "ok", "ringSeconds": 40,
             "phones": [PHONE], "wake": [PHONE], "desktopToast": false, "desktopCompanions": []

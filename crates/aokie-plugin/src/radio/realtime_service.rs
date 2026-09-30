@@ -3,29 +3,16 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// What the transfer machine reads and acts on for this radio turn.
+/// How the loop starts a realtime session for a call: `RealtimeVoiceSession::spawn`
+/// in the radio (a WebSocket to the OAIY route), a recording stand-in with no
+/// socket in the tests that drive the loop.
 #[cfg(all(target_os = "windows", feature = "voice"))]
-pub(super) fn transfer_env<'a>(
-    sink: &'a mut dyn Sink,
-    tracker: &'a crate::call_session::SessionTracker,
-    remote_media: &'a crate::remote_media::RemoteMediaHandle,
-    host_rpc: &'a Arc<crate::host_rpc::HostRpc>,
-    status: &RadioStatus,
-    session_token: u64,
-) -> crate::transfer::call::TransferEnv<'a> {
-    transfer_env_with(
-        crate::assistance::global(),
-        sink,
-        tracker,
-        remote_media,
-        host_rpc,
-        status,
-        session_token,
-    )
-}
+pub(super) type SpawnSession<'a> = &'a dyn Fn(
+    crate::realtime_voice::SessionConfig,
+) -> Result<crate::realtime_voice::RealtimeVoiceSession, String>;
 
-/// [`transfer_env`] against a given mailbox (the process-wide one in the
-/// radio, a private one in tests).
+/// What the transfer machine reads and acts on for this radio turn, against a
+/// given mailbox (the process-wide one in the radio, a private one in tests).
 #[cfg(all(target_os = "windows", feature = "voice"))]
 pub(super) fn transfer_env_with<'a>(
     broker: &'a crate::assistance::AssistanceBroker,
@@ -601,6 +588,8 @@ pub(super) fn service_realtime_lane(
     realtime_terminal_call: &mut Option<(String, std::time::Instant, u8)>,
     realtime_deferred_policy_failure: &mut Option<(String, String)>,
     ctx: &mut CallVoiceContext,
+    broker: &crate::assistance::AssistanceBroker,
+    spawn_session: SpawnSession<'_>,
 ) {
     #[cfg(feature = "voice")]
     if realtime_selected {
@@ -610,7 +599,8 @@ pub(super) fn service_realtime_lane(
         // session for the returned caller asks how the handoff ended.
         {
             let effects = {
-                let mut env = transfer_env(
+                let mut env = transfer_env_with(
+                    broker,
                     &mut *sink,
                     tracker,
                     remote_media,
@@ -660,11 +650,8 @@ pub(super) fn service_realtime_lane(
                         // the AI got the caller back (`start.resume`) and
                         // greets with the return line. Every other resume is
                         // exactly what it was.
-                        let (resume, resume_greeting) = resume_start(
-                            ctx,
-                            crate::assistance::global(),
-                            Instant::now(),
-                        );
+                        let (resume, resume_greeting) =
+                            resume_start(ctx, broker, Instant::now());
                         let outbound_call = tracker
                             .current()
                             .filter(|call| call.id == resume_id)
@@ -675,7 +662,7 @@ pub(super) fn service_realtime_lane(
                             status.transfer_ready.load(Ordering::Relaxed),
                             &remote_media.snapshot().consent,
                         );
-                        match crate::realtime_voice::RealtimeVoiceSession::spawn(
+                        match spawn_session(
                             crate::realtime_voice::SessionConfig {
                                 endpoint: config.endpoint.clone(),
                                 call_id: resume_id.clone(),
@@ -822,7 +809,7 @@ pub(super) fn service_realtime_lane(
                                 status.transfer_ready.load(Ordering::Relaxed),
                                 &remote_media.snapshot().consent,
                             );
-                            let session = crate::realtime_voice::RealtimeVoiceSession::spawn(
+                            let session = spawn_session(
                                 crate::realtime_voice::SessionConfig {
                                     endpoint: config.endpoint.clone(),
                                     call_id: call.id.clone(),
@@ -1542,7 +1529,7 @@ pub(super) fn service_realtime_lane(
                             reason,
                             ctx,
                             lane,
-                            crate::assistance::global(),
+                            broker,
                             tracker,
                             remote_media,
                             host_rpc,
@@ -1670,7 +1657,7 @@ pub(super) fn service_realtime_lane(
                     stop_session_for_ownership_change(
                         ctx,
                         lane,
-                        crate::assistance::global(),
+                        broker,
                         tracker,
                         remote_media,
                         host_rpc,
@@ -2219,7 +2206,7 @@ pub(super) fn service_realtime_lane(
                             &arguments,
                             ctx,
                             lane,
-                            crate::assistance::global(),
+                            broker,
                             tracker,
                             remote_media,
                             host_rpc,
