@@ -59,6 +59,20 @@ pub enum AssistanceIntent {
     Transfer,
 }
 
+/// What [`AssistanceBroker::withdraw_if_unaccepted`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Withdrawal {
+    /// Nobody had won it: it was removed.
+    Withdrawn,
+    /// An owner endpoint has won it (its takeover is under way): untouched.
+    Won,
+    /// It has already resolved (declined, unavailable, ...): untouched, for the
+    /// radio to consume and report as it ended.
+    Resolved,
+    /// The mailbox holds no such request (never opened, consumed, or another's).
+    Gone,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistanceResolution {
     Answered(AssistanceAnswer),
@@ -741,6 +755,31 @@ impl AssistanceBroker {
 
     /// Remove this exact mailbox at a call boundary or after timeout. A
     /// mismatched request id is deliberately a no-op.
+    /// Withdraw this request only if no endpoint has won it and it has not
+    /// resolved, in ONE lock: the check and the removal cannot be split by a
+    /// phone that accepts between them. Reading the mailbox and then calling
+    /// [`discard`](Self::discard) is two acquisitions, and an acceptance that
+    /// lands between them would be discarded from under a phone that was
+    /// already acknowledged (on the relay it then gets `transfer_unavailable`,
+    /// on the socket carrier a whole-connection reconnect).
+    pub fn withdraw_if_unaccepted(&self, request_id: &str) -> Withdrawal {
+        let Ok(mut current) = self.inner.lock() else {
+            return Withdrawal::Gone;
+        };
+        let Some(pending) = current.as_ref().filter(|pending| pending.request_id == request_id)
+        else {
+            return Withdrawal::Gone;
+        };
+        if pending.accepted_by.is_some() {
+            return Withdrawal::Won;
+        }
+        if pending.resolution.is_some() {
+            return Withdrawal::Resolved;
+        }
+        *current = None;
+        Withdrawal::Withdrawn
+    }
+
     pub fn discard(&self, request_id: &str) {
         if let Ok(mut current) = self.inner.lock() {
             if current
