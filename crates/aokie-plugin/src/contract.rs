@@ -422,12 +422,37 @@ mod tests {
             sources.len() - 2
         );
         for (file, src) in sources {
+            // Line endings folded, like every source scan: a checkout with
+            // core.autocrlf and one without must count the same.
+            let src = src.replace("\r\n", "\n");
             let raw = src.matches("\"aokie.").count();
             assert_eq!(
                 raw, 0,
                 "{file} contains {raw} raw \"aokie.*\" string literal(s) — use crate::contract::events::* instead"
             );
         }
+    }
+
+    /// Second review F8. The tests that scan Rust sources read them as a checkout
+    /// left them, and a checkout with core.autocrlf=true (this machine) has CRLF
+    /// where the sources say LF. Every scan folds line endings, and the repository
+    /// also says Rust sources are checked out with LF, so a fresh checkout is LF
+    /// whatever the machine's setting.
+    #[test]
+    fn rust_sources_are_checked_out_with_lf_and_the_scans_fold_line_endings() {
+        let attributes = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.gitattributes"),
+        )
+        .expect("the repository's .gitattributes");
+        let attributes = attributes.replace("\r\n", "\n");
+        assert!(
+            attributes.lines().any(|line| line.trim() == "*.rs text eol=lf"),
+            "Rust sources must be forced to LF in .gitattributes"
+        );
+        assert!(
+            attributes.lines().any(|line| line.trim() == "*.sh text eol=lf"),
+            "the shell scripts rule that was already there stays"
+        );
     }
 
     #[test]
