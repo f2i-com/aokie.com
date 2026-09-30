@@ -142,15 +142,19 @@ fn instruction_for(reason: &str) -> &'static str {
 
 /// `ok: false`, with a status, a reason from the closed sets above and a fixed
 /// instruction. An unknown reason (a host that says something new) becomes
-/// `plan_unavailable`: nothing the host sends is echoed to the model.
+/// `plan_unavailable`, and with it the status that reason has (`unavailable`:
+/// offer a message), whatever status the host's plan carried: nothing the host
+/// sends is echoed to the model, and a reason it invented must not bring its
+/// own status either (a `refused` would tell the model not to offer a person at
+/// all, on the word of a host the plugin could not understand).
 pub fn refusal(status: RefusalStatus, reason: &str) -> ToolAnswer {
-    let reason = if PLAN_REASONS.contains(&reason)
+    let (reason, status) = if PLAN_REASONS.contains(&reason)
         || PLUGIN_REASONS.contains(&reason)
         || reason == "call_changed"
     {
-        reason
+        (reason, status)
     } else {
-        "plan_unavailable"
+        ("plan_unavailable", RefusalStatus::Unavailable)
     };
     ToolAnswer {
         ok: false,
