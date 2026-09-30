@@ -244,6 +244,16 @@ pub(super) fn finish_call_answer(
     }
 }
 
+/// What the caller said in this call, oldest first: the `user` entries of its
+/// history (the realtime lane pushes only the caller's finished transcripts there).
+fn caller_turns_said(history: &[serde_json::Value]) -> Vec<&str> {
+    history
+        .iter()
+        .filter(|entry| entry.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .filter_map(|entry| entry.get("content").and_then(serde_json::Value::as_str))
+        .collect()
+}
+
 /// `transfer_to_owner` was called on a session that negotiated the contract.
 /// It returns at once: a refusal is its answer now, otherwise the host is asked
 /// for a ring plan and the answer (`ringing`, or a refusal) arrives from the
@@ -265,19 +275,19 @@ pub(super) fn begin_transfer_tool(
     status: &RadioStatus,
     sink: &mut dyn Sink,
 ) -> crate::transfer::call::Begin {
-    // What the caller said, oldest first. Turns that only acknowledge the AI
+    // What the caller said, oldest first, and not yet spent: an ask counts for
+    // ONE request. It is spent when the request it opens has been planned (the
+    // host was asked), and by a hand-back to the AI (`adopt_resumed_session`),
+    // so "Thanks, that is all sorted now" after a ring or a takeover is judged
+    // on its own, not on the ask before it. Turns that only acknowledge the AI
     // ("mm-hmm", "yeah, okay") are not turns to the plugin (the host's own
     // record skips the ones said over the AI, and the plugin cannot see that
     // timing), so they neither count nor push a real turn out of the last
     // three (`caller_turns`).
-    let recent_caller_turns: Vec<String> = {
-        let said: Vec<&str> = ctx
-            .history
-            .iter()
-            .filter(|entry| entry.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-            .filter_map(|entry| entry.get("content").and_then(serde_json::Value::as_str))
-            .collect();
-        crate::transfer::caller_turns(&said)
+    let (heard, recent_caller_turns): (usize, Vec<String>) = {
+        let said = caller_turns_said(&ctx.history);
+        let spent = ctx.transfer.caller_turns_spent().min(said.len());
+        (said.len(), crate::transfer::caller_turns(&said[spent..]))
     };
     let caller_number = tracker.current().and_then(|call| call.caller_id.clone());
     match lane.owner.clone() {
@@ -291,7 +301,7 @@ pub(super) fn begin_transfer_tool(
                 status,
                 lane.session_token,
             );
-            ctx.transfer.begin(
+            let begun = ctx.transfer.begin(
                 &mut env,
                 crate::transfer::call::BeginArgs {
                     tool_call_id,
@@ -301,7 +311,11 @@ pub(super) fn begin_transfer_tool(
                     recent_caller_turns: &recent_caller_turns,
                     caller_number: caller_number.as_deref(),
                 },
-            )
+            );
+            if matches!(begun, crate::transfer::call::Begin::Planning) {
+                ctx.transfer.spend_caller_turns(heard);
+            }
+            begun
         }
         None => crate::transfer::call::Begin::Answered(crate::transfer::refusal(
             crate::transfer::RefusalStatus::Unavailable,
@@ -382,6 +396,10 @@ pub(super) fn adopt_resumed_session(
     let mut lane = RealtimeCallLane::new(session);
     lane.allow_transfer_sent = allow_transfer;
     ctx.transfer.finish_resume();
+    // The AI has the caller back (after a takeover, or after a hold): whatever
+    // the caller asked before that is spent. What they say to the fresh session
+    // is what a new request can rest on.
+    ctx.transfer.spend_caller_turns(caller_turns_said(&ctx.history).len());
     lane
 }
 
