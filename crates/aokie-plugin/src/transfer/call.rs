@@ -340,8 +340,12 @@ pub struct TransferCall {
     /// Test seam: runs against the broker between the machine's last look and
     /// the withdrawal, the instant a phone could accept.
     #[cfg(test)]
-    pub(crate) before_withdrawal: Option<Box<dyn FnOnce(&AssistanceBroker)>>,
+    pub(crate) before_withdrawal: Option<BeforeWithdrawal>,
 }
+
+/// What runs at the [`TransferCall::before_withdrawal`] seam.
+#[cfg(test)]
+pub(crate) type BeforeWithdrawal = Box<dyn FnOnce(&AssistanceBroker)>;
 
 impl Default for TransferCall {
     fn default() -> Self {
