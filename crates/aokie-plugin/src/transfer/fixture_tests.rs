@@ -422,7 +422,7 @@ fn the_caller_asked_fixture_passes_and_its_patterns_are_the_plugins_patterns() {
     let turns = |case: &Value| strings(&case["turns"]);
     let cases = |key: &str| fixture[key].as_array().unwrap().clone();
     let (positive, negative, window) = (cases("positive"), cases("negative"), cases("window"));
-    assert_eq!((positive.len(), negative.len(), window.len()), (65, 76, 4));
+    assert_eq!((positive.len(), negative.len(), window.len()), (78, 92, 4));
     for case in &positive {
         assert!(caller_asked(&turns(case)), "{case}");
     }
