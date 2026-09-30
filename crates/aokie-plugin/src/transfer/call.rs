@@ -42,8 +42,8 @@ use super::{
     Reason, RefusalStatus, ResumeInfo, Targets, ToolAnswer, Via,
 };
 use crate::assistance::{
-    AssistanceBroker, AssistanceCallFence, AssistanceResolution, TRANSFER_RESOLUTION_GRACE_SECONDS,
-    TRANSFER_SETUP_SECONDS,
+    AssistanceBroker, AssistanceCallFence, AssistanceResolution, Withdrawal,
+    TRANSFER_RESOLUTION_GRACE_SECONDS, TRANSFER_SETUP_SECONDS,
 };
 use crate::event_bridge::Sink;
 use crate::host_rpc::{HostResult, HostRpc};
@@ -322,6 +322,10 @@ pub struct TransferCall {
     /// The handoff an open request belonged to is over (its fresh session has
     /// started), so however the request ends is not the next handoff's story.
     end_is_spent: bool,
+    /// Test seam: runs against the broker between the machine's last look and
+    /// the withdrawal, the instant a phone could accept.
+    #[cfg(test)]
+    pub(crate) before_withdrawal: Option<Box<dyn FnOnce(&AssistanceBroker)>>,
 }
 
 impl Default for TransferCall {
@@ -359,6 +363,8 @@ impl TransferCall {
             handoff_started: None,
             held: Vec::new(),
             end_is_spent: false,
+            #[cfg(test)]
+            before_withdrawal: None,
         }
     }
 
@@ -480,6 +486,36 @@ impl TransferCall {
         effects
     }
 
+    /// Withdraw a request nobody has won, ATOMICALLY: one broker operation
+    /// decides. If an owner device won it (or it resolved) between the last look
+    /// and now, the request is left exactly as it is and the poll reports what
+    /// happened (`accepted`, or how it ended), so a phone that was already
+    /// acknowledged is never discarded from under its takeover. Returns whether
+    /// it was withdrawn.
+    fn withdraw_unwon(
+        &mut self,
+        open: Open,
+        env: &mut TransferEnv<'_>,
+        effects: &mut Vec<Effect>,
+        why: &str,
+    ) -> bool {
+        #[cfg(test)]
+        if let Some(interleave) = self.before_withdrawal.take() {
+            interleave(env.broker);
+        }
+        match env.broker.withdraw_if_unaccepted(&open.request_id) {
+            Withdrawal::Withdrawn | Withdrawal::Gone => {
+                self.cancel(open, env, effects, why);
+                true
+            }
+            Withdrawal::Won | Withdrawal::Resolved => {
+                self.stage = Stage::Ringing(open);
+                effects.extend(self.poll(env));
+                false
+            }
+        }
+    }
+
     /// The session is about to stop because the owner fence changed. A request
     /// nobody has won is withdrawn (its ring is moot: someone took the call
     /// another way); an accepted one stays, since its takeover is exactly what
@@ -491,7 +527,7 @@ impl TransferCall {
         let mut effects = self.poll(env);
         if let Stage::Ringing(_) = self.stage {
             if let Stage::Ringing(open) = std::mem::replace(&mut self.stage, Stage::Idle) {
-                self.cancel(open, env, &mut effects, "the caller changed hands another way");
+                self.withdraw_unwon(open, env, &mut effects, "the caller changed hands another way");
             }
         }
         effects
@@ -507,7 +543,9 @@ impl TransferCall {
     /// OAIY is told `too_late`. An id this call has no open request for (never
     /// seen, another call's, already ended, already cancelled) changes nothing
     /// and is answered `unknown_request`, so a replayed cancel does nothing
-    /// twice.
+    /// twice. The withdrawal is one broker operation, so a phone that accepts
+    /// at the same instant either wins (`too_late`) or finds it withdrawn:
+    /// never both.
     pub fn cancel_requested(
         &mut self,
         env: &mut TransferEnv<'_>,
@@ -533,22 +571,24 @@ impl TransferCall {
                     "[aokie-plugin] transfer {request_id}: OAIY withdrew it ({})",
                     reason.as_str()
                 );
-                self.cancel(open, env, &mut effects, "OAIY withdrew it");
+                if self.withdraw_unwon(open, env, &mut effects, "OAIY withdrew it") {
+                    // Answered by the `cancelled` outcome itself.
+                    return effects;
+                }
             }
+            other => self.stage = other,
+        }
+        // Not withdrawn: an owner device won it (before the cancel, or at the
+        // very moment of it), or it ended and the poll reported how.
+        match &self.stage {
             Stage::Accepted(open) if open.request_id == request_id => {
                 eprintln!(
                     "[aokie-plugin] transfer {request_id}: OAIY's withdrawal ({}) came after an owner device accepted",
                     reason.as_str()
                 );
-                self.stage = Stage::Accepted(open);
                 effects.push(notice(Notice::TooLate));
             }
-            other => {
-                // The poll ended it (resolved, expired, the call moved on) and
-                // reported how; the cancel is moot.
-                self.stage = other;
-                effects.push(notice(Notice::UnknownRequest));
-            }
+            _ => effects.push(notice(Notice::UnknownRequest)),
         }
         effects
     }
@@ -561,17 +601,20 @@ impl TransferCall {
         self.withdraw_open(env, "the call ended")
     }
 
-    /// The call is being put on hold behind another caller and its context
-    /// is about to be stowed. Nobody polls a stowed context, so a request left
-    /// open would keep the single mailbox (and the owner's phone ringing) for
-    /// a call that no longer has the line, and could not be reported until the
-    /// call came back. It is withdrawn now, and `cancelled` waits for the
-    /// session the call gets when it resumes. The broker is asked first, as
-    /// for every withdrawal: an acceptance the machine has not seen yet is
-    /// reported before the request is withdrawn from under it, and one that
-    /// ended in the meantime is reported as it ended.
+    /// The call is about to be put on hold behind another caller and its
+    /// context stowed. Nobody polls a stowed context, so a request left open
+    /// would keep the single mailbox (and the owner's phone ringing) for a call
+    /// that no longer has the line, and could not be reported until the call
+    /// came back. A request nobody has won is withdrawn now (atomically) and
+    /// `cancelled` waits for the session the call gets when it resumes. The
+    /// broker is asked first, as for every withdrawal.
     pub fn park(&mut self, env: &mut TransferEnv<'_>) -> Vec<Effect> {
         let mut effects = self.poll(env);
+        if let Stage::Ringing(_) = self.stage {
+            if let Stage::Ringing(open) = std::mem::replace(&mut self.stage, Stage::Idle) {
+                self.withdraw_unwon(open, env, &mut effects, "the call was put on hold");
+            }
+        }
         effects.extend(self.withdraw_open(env, "the call was put on hold"));
         effects
     }

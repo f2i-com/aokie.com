@@ -988,6 +988,90 @@ fn an_acceptance_since_the_last_turn_beats_a_cancel() {
     assert!(rig.broker.is_busy());
 }
 
+/// Second review F5. The cancel read the mailbox and then discarded it: two lock
+/// acquisitions, and a phone that accepted between them was discarded from
+/// under a takeover it had been acknowledged for. The withdrawal is now one
+/// broker operation, and the instant a phone could accept is played here
+/// deterministically through the machine's test seam.
+#[test]
+fn a_phone_that_accepts_at_the_instant_of_a_withdrawal_wins_and_is_not_discarded() {
+    fn interleave_an_accept(rig: &mut Rig, request_id: &str) {
+        let fence = rig.fence(request_id);
+        let id = request_id.to_string();
+        rig.machine.before_withdrawal = Some(Box::new(move |broker| {
+            broker.accept_transfer(&id, &fence, DEVICE).unwrap();
+        }));
+    }
+
+    // OAIY's cancel.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    assert!(rig.poll().is_empty(), "ringing, and the machine has seen nothing since");
+    interleave_an_accept(&mut rig, &request_id);
+    let fence = rig.fence(&request_id);
+    let effects = rig.cancel(&request_id, CancelReason::OwnerDeclined);
+    assert_eq!(outcomes(&effects), vec![(Outcome::Accepted, None)], "the acceptance is what OAIY hears");
+    assert_eq!(notices(&effects), vec![(request_id.clone(), Notice::TooLate)]);
+    assert!(audits(&effects).is_empty(), "the audit stays open for the takeover");
+    assert!(rig.broker.is_busy(), "the request was not discarded");
+    assert!(
+        rig.broker.transfer_activation_is_current(&request_id, &fence, DEVICE),
+        "the phone that was acknowledged can still complete its takeover"
+    );
+    assert!(rig.machine.is_active() && !rig.machine.is_ringing_unaccepted());
+    rig.broker.transfer_taken(&request_id, &fence, DEVICE).unwrap();
+
+    // The owner fence changed under the session (someone took the caller another way).
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    assert!(rig.poll().is_empty());
+    interleave_an_accept(&mut rig, &request_id);
+    let fence = rig.fence(&request_id);
+    let effects = rig.withdraw();
+    assert_eq!(outcomes(&effects), vec![(Outcome::Accepted, None)]);
+    assert!(rig.broker.transfer_activation_is_current(&request_id, &fence, DEVICE));
+    assert!(rig.machine.is_active());
+
+    // And when nobody accepts, the same path withdraws (control).
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    assert!(rig.poll().is_empty());
+    rig.machine.before_withdrawal = Some(Box::new(|_| {}));
+    let effects = rig.cancel(&request_id, CancelReason::GaveUp);
+    assert_eq!(outcomes(&effects), vec![(Outcome::Cancelled, None)]);
+    assert!(!rig.broker.is_busy());
+}
+
+/// The broker operation itself, for every state the mailbox can be in.
+#[test]
+fn the_broker_withdraws_a_request_only_if_nobody_has_won_or_resolved_it() {
+    // Ringing: withdrawn, and gone afterwards.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    assert_eq!(rig.broker.withdraw_if_unaccepted("assist_other"), Withdrawal::Gone);
+    assert!(rig.broker.is_busy(), "another id leaves the request alone");
+    assert_eq!(rig.broker.withdraw_if_unaccepted(&request_id), Withdrawal::Withdrawn);
+    assert!(!rig.broker.is_busy());
+    assert_eq!(rig.broker.withdraw_if_unaccepted(&request_id), Withdrawal::Gone, "twice does nothing");
+
+    // Won: untouched.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.accept(&request_id);
+    assert_eq!(rig.broker.withdraw_if_unaccepted(&request_id), Withdrawal::Won);
+    assert!(rig.broker.is_busy());
+    let fence = rig.fence(&request_id);
+    assert!(rig.broker.transfer_activation_is_current(&request_id, &fence, DEVICE));
+
+    // Resolved (a decline): untouched, for the machine to consume and report.
+    let mut rig = Rig::new();
+    let (request_id, _) = rig.ring();
+    rig.decline(&request_id, "no");
+    assert_eq!(rig.broker.withdraw_if_unaccepted(&request_id), Withdrawal::Resolved);
+    assert!(rig.broker.peek_resolution(&request_id).is_some(), "still there to be consumed");
+    assert_eq!(outcomes(&rig.poll()), vec![(Outcome::Declined, Some("no".to_string()))]);
+}
+
 #[test]
 fn a_cancel_for_a_request_this_call_does_not_have_changes_nothing() {
     // Nothing open at all.
