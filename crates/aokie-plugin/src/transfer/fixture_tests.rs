@@ -370,6 +370,48 @@ fn the_contract_says_an_ask_is_spent_when_its_request_opens() {
     assert!(ring_plan.contains("so the same ask can be planned again"));
 }
 
+/// Final re-verification G1-3: where the floor is stricter than the host is
+/// said where a reader looks, with the case's example turns, and the words that
+/// said it never was (or that the forms no shared block names are let through
+/// "by both") are gone. The differences are asserted by
+/// `an_acknowledgement_between_a_refusal_and_its_words_is_not_there_for_the_floor`
+/// and by the fixture; this keeps the prose from going back.
+#[test]
+fn the_contract_says_where_the_floor_is_stricter_than_the_host() {
+    let flat = |name: &str| {
+        std::fs::read_to_string(folder().join(name))
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let document = flat("transfer-v1.md");
+    let fixture_text = flat("transfer-v1.caller-asked.fixture.json");
+    for (name, text) in [("transfer-v1.md", &document), ("the caller-asked fixture", &fixture_text)] {
+        for stale in [
+            "meant never to be stricter than the host",
+            "are let through by both",
+            "the one way it can be stricter",
+            "The one way the plugin can be stricter",
+            "is never refused first, names aside",
+        ] {
+            assert!(!text.contains(stale), "{name} still says: {stale}");
+        }
+    }
+    // The three classes, and the case that was missing, with its turns.
+    assert!(document.contains("it is stricter than a host reading its own record in the cases stated here"));
+    assert!(document.contains("a caller who asks for the owner by first name is recognised only by a host that knows the owner's name"));
+    assert!(document.contains("It does not remove the invisible joiners and marks (hex 200C to 200F, 2060, FEFF) that the host removes"));
+    assert!(document.contains(
+        "a refusal begun in one turn, an acknowledgement, and the words that would finish it. The turns \"I don't want to\", \"mm-hmm\", \"speak to the owner\""
+    ));
+    assert!(document.contains("a host that kept the acknowledgement (said in a pause) has it between them"));
+    assert!(document.contains("are let through by the floor and refused by the host, whose own blocks are wider"));
+    assert!(document.contains("refused first only in the cases step 6 states"));
+    assert!(fixture_text.contains("the turns \\\"I don't want to\\\", \\\"mm-hmm\\\", \\\"speak to the owner\\\" reach the plugin's check as the first and the last"));
+    assert!(fixture_text.contains("a first name (the plugin knows no names, the host knows the owner's)"));
+}
+
 #[test]
 fn the_cancel_fixture_is_what_the_plugin_reads_and_answers() {
     let fixture = fixture("transfer-v1.cancel.fixture.json");
@@ -563,7 +605,7 @@ fn the_caller_asked_fixture_passes_and_its_patterns_are_the_plugins_patterns() {
     let turns = |case: &Value| strings(&case["turns"]);
     let cases = |key: &str| fixture[key].as_array().unwrap().clone();
     let (positive, negative, window) = (cases("positive"), cases("negative"), cases("window"));
-    assert_eq!((positive.len(), negative.len(), window.len()), (103, 115, 4));
+    assert_eq!((positive.len(), negative.len(), window.len()), (105, 115, 4));
     for case in &positive {
         assert!(caller_asked(&turns(case)), "{case}");
     }
