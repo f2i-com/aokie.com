@@ -66,12 +66,23 @@ ends `unavailable` (or a `failback` start); if the owner was already talking to
 the caller the session simply resumes with a fresh `start` and `resume.via =
 "return"`. Consent taken back while the request still rings is `cancelled`.
 
-**A call put on hold behind another caller** (Aokie's hold juggle) withdraws its
-open request first, while its session is still up (the broker is asked, so an
-acceptance wins; OAIY hears `cancelled` before the stop). The session then stops
-with free text, not a `handoff:` reason, because the caller is not going to a
-person: OAIY reads it like any session that ends, and the fresh session for the
-same call after the swap starts without `resume`.
+**A second caller arriving while the first has a request open** (Aokie's hold
+juggle, and the switchboard's manual swaps) is handled before anything is said or
+moved, and it depends on whether an owner device has accepted:
+
+* **Nobody has accepted**: the request is withdrawn first, while its session is
+  still up (one broker operation, so a phone that accepts at that instant either
+  wins or finds it withdrawn, never both). OAIY hears `cancelled` before the stop,
+  the mailbox is free for the new caller, and the first caller is put on hold.
+  The session then stops with free text, not a `handoff:` reason, because the
+  caller is not going to a person: OAIY reads it like any session that ends, and
+  the fresh session for the same call after the swap starts without `resume`.
+* **An owner device has accepted** (the takeover is being connected, up to 45 s):
+  the first caller is **not** put on hold. Parking them would fail the takeover
+  after the phone accepted, and OAIY would hear `accepted` and then `cancelled`.
+  The hold is abandoned, the second caller stays with the network's call
+  waiting, and the request carries on: OAIY hears its `accepted` once and then
+  the stop with `handoff:takeover`, or `unavailable`.
 
 ## Negotiation
 

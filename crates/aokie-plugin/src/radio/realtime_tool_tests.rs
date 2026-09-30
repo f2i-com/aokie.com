@@ -589,7 +589,7 @@ fn laid_aside_with_a_ringing_request() -> Laid {
 }
 
 impl Laid {
-    fn withdraw(&mut self, why: TransferWithdrawal, lane: Option<&mut RealtimeCallLane>) {
+    fn withdraw(&mut self, why: TransferWithdrawal, lane: Option<&mut RealtimeCallLane>) -> bool {
         withdraw_open_transfer(
             why,
             &mut self.ctx,
@@ -601,7 +601,7 @@ impl Laid {
             &self.status,
             None,
             &mut self.sink,
-        );
+        )
     }
 }
 
@@ -1079,12 +1079,20 @@ fn the_hold_juggle_lays_a_call_aside_only_through_the_withdrawing_helper() {
         raw_swaps, 3,
         "the newcomer's context is kept for the per-call reset; it is the call that continues"
     );
-    // Step 0 withdraws the open request while the session is still up, before
-    // it is stopped and before the hold announcements begin.
+    // The transfer gate runs first: the open request is withdrawn while the
+    // session is still up, before it is stopped and before the hold
+    // announcements begin, and an accepted one abandons the juggle.
     assert_eq!(source.matches("withdraw_open_transfer(").count(), 1);
+    assert_eq!(
+        source.matches("} else if !withdraw_open_transfer(").count(),
+        1,
+        "a transfer being connected abandons the juggle"
+    );
     let withdrawn_at = source.find("withdraw_open_transfer(").unwrap();
     let stopped_at = source.find("lane.session.stop(\"hold juggle").unwrap();
+    let announced_at = source.find("HOLD_PRIMARY_ASK_LINE").unwrap();
     assert!(withdrawn_at < stopped_at, "the request is withdrawn before the session is stopped");
+    assert!(withdrawn_at < announced_at, "and before the first hold announcement");
 }
 
 /// The juggle's step 0: the primary's session is still up when its open request
@@ -1104,6 +1112,62 @@ fn a_primary_parked_while_its_session_is_up_hears_cancelled_before_the_stop() {
     assert!(matches!(&sent[1], crate::realtime_voice::SentControl::Stop { .. }), "{sent:?}");
     assert!(!laid.rig.broker.is_busy(), "no phone can accept while the announcements play");
     assert!(!laid.ctx.transfer.is_active());
+}
+
+/// Second review F2. The gate the juggle and the switchboard run before a call
+/// is parked: a request nobody has won is withdrawn and the call may be parked;
+/// one an owner device has accepted is a takeover being connected, is left
+/// untouched (its acceptance reported once) and the call may NOT be parked.
+#[test]
+fn a_call_whose_transfer_a_phone_has_accepted_is_not_parked() {
+    let mut laid = laid_aside_with_a_ringing_request();
+    let (mut lane, detached) = negotiated_lane();
+    let request_id = laid.request_id.clone();
+    // The phone accepts; the machine has not yet looked.
+    laid.rig.accept(&request_id);
+    let fence = laid.rig.fence(&request_id);
+    for _ in 0..3 {
+        assert!(
+            !laid.withdraw(TransferWithdrawal::Parked, Some(&mut lane)),
+            "the gate says no"
+        );
+    }
+    assert_eq!(sent_outcomes(&detached), vec![Outcome::Accepted], "accepted, once, and nothing cancelled");
+    assert!(laid.rig.broker.is_busy(), "the request was left alone");
+    assert!(laid.rig.broker.transfer_activation_is_current(&request_id, &fence, "device_owner"));
+    assert!(laid.ctx.transfer.is_active());
+    assert!(laid.sink.lines.is_empty(), "no audit event closes a request that is still being connected");
+
+    // The phone's takeover completes; the transfer ends as a takeover.
+    laid.rig.broker.transfer_taken(&request_id, &fence, "device_owner").unwrap();
+    assert!(laid.withdraw(TransferWithdrawal::Parked, Some(&mut lane)), "nothing open now");
+    assert!(!laid.ctx.transfer.is_active());
+
+    // A request nobody has won: withdrawn, and the call may be parked.
+    let mut laid = laid_aside_with_a_ringing_request();
+    let (mut lane, detached) = negotiated_lane();
+    assert!(laid.withdraw(TransferWithdrawal::Parked, Some(&mut lane)));
+    assert_eq!(sent_outcomes(&detached), vec![Outcome::Cancelled]);
+    assert!(!laid.rig.broker.is_busy());
+
+    // The backstop once the swap has happened: nothing may be left in the stowed
+    // context, an accepted request included.
+    let mut laid = laid_aside_with_a_ringing_request();
+    let request_id = laid.request_id.clone();
+    laid.rig.accept(&request_id);
+    let stowed = stow_call_context(
+        &mut laid.ctx,
+        CallVoiceContext::fresh(None),
+        &laid.rig.broker,
+        &laid.tracker,
+        &laid.rig.media,
+        &laid.rig.host,
+        &laid.status,
+        None,
+        &mut laid.sink,
+    );
+    assert!(!stowed.transfer.is_active(), "no request is left in a context nobody polls");
+    assert!(!laid.rig.broker.is_busy());
 }
 
 /// The per-call reset: OAIY hears `cancelled` on the session that is about to

@@ -129,6 +129,32 @@ pub(super) fn run_auto_hold_juggle(
                         "[aokie-plugin] AUTO-HOLD: no audio path (sr=0) — leaving {} in observe state",
                         w.call_id
                     );
+                } else if !withdraw_open_transfer(
+                    // The transfer gate, before anything is said or moved. A
+                    // request nobody has won is withdrawn NOW (while its session
+                    // is still up to hear `cancelled`, and before the seconds of
+                    // hold announcements in which an owner's phone could still
+                    // accept a call that is about to leave the line). A request
+                    // an owner device has ALREADY accepted is a takeover being
+                    // connected: it is left untouched and the juggle is
+                    // abandoned, because parking the caller would fail it after
+                    // the phone accepted. `stow_ctx!` below stays as a backstop.
+                    TransferWithdrawal::Parked,
+                    &mut *ctx,
+                    realtime_lane.as_mut(),
+                    crate::assistance::global(),
+                    &*tracker,
+                    remote_media,
+                    host_rpc,
+                    status,
+                    outbox,
+                    &mut *sink,
+                ) {
+                    eprintln!(
+                        "[aokie-plugin] AUTO-HOLD: a transfer to the owner is being connected for {} — they are not put on hold; {} stays with the network's call waiting",
+                        tracker.call_id().unwrap_or("the primary"),
+                        w.call_id
+                    );
                 } else {
                     eprintln!(
                         "[aokie-plugin] AUTO-HOLD: second caller {} knocking — telling the primary to hold",
@@ -144,27 +170,7 @@ pub(super) fn run_auto_hold_juggle(
                         .as_ref()
                         .is_some_and(|lane| lane.begun)
                     {
-                        if let Some(mut lane) = realtime_lane.take() {
-                            // A transfer request this call still has open is
-                            // withdrawn NOW, before the session stops and
-                            // before the hold announcements: while they play
-                            // (seconds) an owner's phone could still accept a
-                            // call that is about to leave the line. The broker
-                            // is asked first (an acceptance wins), and OAIY
-                            // hears `cancelled` on the session that knows the
-                            // request. `stow_ctx!` below stays as a backstop.
-                            withdraw_open_transfer(
-                                TransferWithdrawal::Parked,
-                                &mut *ctx,
-                                Some(&mut lane),
-                                crate::assistance::global(),
-                                &*tracker,
-                                remote_media,
-                                host_rpc,
-                                status,
-                                outbox,
-                                &mut *sink,
-                            );
+                        if let Some(lane) = realtime_lane.take() {
                             if let Some(item_id) = lane.output_pacer.active_item() {
                                 let _ = lane.session.cancel_output(
                                     item_id,
