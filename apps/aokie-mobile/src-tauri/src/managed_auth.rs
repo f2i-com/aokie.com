@@ -1516,6 +1516,7 @@ fn admission_grants(scopes: &[String]) -> Vec<Grant> {
 }
 
 fn native_client() -> Result<reqwest::Client, String> {
+    crate::native_init::ensure_https_ready()?;
     reqwest::Client::builder()
         .redirect(Policy::none())
         .timeout(HTTP_TIMEOUT)

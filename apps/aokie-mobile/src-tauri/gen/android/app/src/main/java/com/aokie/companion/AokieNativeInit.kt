@@ -37,6 +37,7 @@ object AokieNativeInit {
       Log.e(TAG, "the native library could not be loaded", error)
       return
     }
+    Log.i(TAG, "platform verifier: ${step("platform verifier") { nativeInitPlatformVerifier(application) }}")
     Log.i(TAG, "webrtc context: ${step("webrtc context") { nativeInitWebRtc(application) }}")
   }
 
@@ -48,7 +49,15 @@ object AokieNativeInit {
       false
     }
 
-  /** Implemented in Rust (`media.rs`). The name and signature are a JNI contract, pinned by a test. */
+  /**
+   * Implemented in Rust (`native_init.rs`). Gives `rustls-platform-verifier`, the certificate
+   * verifier behind every HTTPS client in the Rust core, the application Context it needs before
+   * its first handshake. Without it every HTTPS request fails.
+   */
+  @JvmStatic
+  external fun nativeInitPlatformVerifier(context: Context): Boolean
+
+  /** Implemented in Rust (`native_init.rs`). Initialises libwebrtc's Java side. */
   @JvmStatic
   external fun nativeInitWebRtc(context: Context): Boolean
 }
