@@ -2580,13 +2580,7 @@ impl Plugin {
                         return Ok(json!({
                             "call": null,
                             "companionMedia": null,
-                            "radio": {
-                                "running": false,
-                                "status": "paused",
-                                "paused": true,
-                                "blockedBy": "consent",
-                                "reason": reason,
-                            },
+                            "radio": consent_paused_radio(reason),
                         }));
                     }
                 }
@@ -2602,6 +2596,23 @@ impl Plugin {
                 expect_fields(payload, &[])?;
                 if let Some(radio) = self.radio.as_ref() {
                     return Ok(radio.switchboard_view());
+                }
+                // A radio kept absent by consent holds no call, as for
+                // `call.current`: the same empty view, and why, so a reader
+                // (OAIY's update check asks this command first) can tell a
+                // safe pause from a fault. Every call mutation keeps the gate.
+                if !self.dev_mode {
+                    if let Some(reason) = self.consent_blocked.as_deref() {
+                        return Ok(json!({
+                            "foreground": null,
+                            "waiting": null,
+                            "parked": null,
+                            "revision": 0,
+                            "switchInProgress": false,
+                            "callHeldState": 0,
+                            "radio": consent_paused_radio(reason),
+                        }));
+                    }
                 }
                 self.require_radio_or_dev("call.switchboard")?;
                 // Dev/mock: one simulated call, never a waiting/parked leg.
@@ -4151,6 +4162,18 @@ impl Plugin {
             .counts()
             .map_err(|e| CmdError::failed(format!("outbox unavailable: {e}")))
     }
+}
+
+/// Why a status read that would have needed the radio answers empty instead of
+/// failing: consent has paused it (`call.current` and `call.switchboard`).
+fn consent_paused_radio(reason: &str) -> Value {
+    json!({
+        "running": false,
+        "status": "paused",
+        "paused": true,
+        "blockedBy": "consent",
+        "reason": reason,
+    })
 }
 
 /// Canonical `call.current` call object (audit C-02): `callId`/`from`/
@@ -6150,7 +6173,43 @@ mod tests {
             })
         );
 
-        // Only the two status reads above gain a consent-pause path. A command
+        // Review item D: the switchboard read is the one OAIY's update check
+        // asks first, and it answers like `call.current` does: empty, and why.
+        let switchboard = plugin
+            .dispatch_command("call.switchboard", &Value::Null, &mut sink)
+            .unwrap();
+        assert_eq!(
+            switchboard,
+            json!({
+                "foreground": null,
+                "waiting": null,
+                "parked": null,
+                "revision": 0,
+                "switchInProgress": false,
+                "callHeldState": 0,
+                "radio": {
+                    "running": false,
+                    "status": "paused",
+                    "paused": true,
+                    "blockedBy": "consent",
+                    "reason": reason,
+                },
+            })
+        );
+        // It still names no field it does not take.
+        assert!(plugin
+            .dispatch_command("call.switchboard", &json!({"callId": "x"}), &mut sink)
+            .is_err());
+        // A dev-mode plugin has the simulated call, not a pause: its own view, no radio block.
+        let mut dev = Plugin::ephemeral(true);
+        dev.consent_blocked = Some(reason.to_string());
+        let mock = dev
+            .dispatch_command("call.switchboard", &Value::Null, &mut sink)
+            .unwrap();
+        assert!(mock.get("radio").is_none(), "{mock}");
+        assert_eq!(mock["revision"], 0);
+
+        // Only the three status reads above gain a consent-pause path. A command
         // that could touch the real call remains behind the strict radio gate
         // and cannot emit a fabricated success/event.
         let err = plugin
@@ -6172,6 +6231,12 @@ mod tests {
         assert!(err
             .message
             .contains("no dongle / driver not bound / startup failed"));
+        assert!(!err.message.contains("consent required"));
+        // ...and neither is the switchboard's: with no consent pause a missing radio is an error.
+        let err = plugin
+            .dispatch_command("call.switchboard", &Value::Null, &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("radio is not running"));
         assert!(!err.message.contains("consent required"));
         let err = plugin
             .dispatch_command("dongle.diagnostics", &Value::Null, &mut sink)
