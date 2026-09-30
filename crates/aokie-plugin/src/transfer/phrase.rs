@@ -9,13 +9,17 @@
 //! `docs/contracts/transfer/transfer-v1.caller-asked.fixture.json` is the one
 //! source of the rules, the blocks and the cases; both repositories test
 //! against that file, and the tests here compare every pattern in this file
-//! with it, so neither side can drift alone. The plugin's floor is meant never
-//! to be stricter than the host's own check (a request the host would count
-//! must not be refused here first), so the algorithm is the host's, with the
-//! differences that are stated, not hidden: no names, acknowledgements decided
-//! by words, no host-only extras (an ask taken back, a different target, being
-//! told to say it), and the invisible joiners the host also removes (typed
-//! text only; the soft hyphen is removed here too).
+//! with it, so neither side can drift alone. The plugin's floor is meant to be
+//! no stricter than the host's own check (a request the host would count must
+//! not be refused here first), so the algorithm is the host's, with the
+//! differences that are stated, not hidden: no host-only extras (an ask taken
+//! back, a different target, being told to say it), which only loosen it, and
+//! three that make it stricter than a host reading its own record: no names,
+//! the invisible joiners the host also removes (typed text only; the soft
+//! hyphen is removed here too), and acknowledgements decided by words, which
+//! leaves a refusal, an acknowledgement and the words that finish it (a host
+//! that kept the acknowledgement reads them apart, and counts the words) read
+//! joined here and refused.
 //!
 //! A turn is read from its **end** (its last [`TURN_CHARS`] characters), a
 //! sentence at a time. Of the caller's last three turns, one sentence must
@@ -670,6 +674,60 @@ mod tests {
         ] {
             assert!(!joins.is_match(begins), "{begins}");
         }
+    }
+
+    /// Final re-verification P2: a question mark or an exclamation mark finishes
+    /// a bare negative too. "I can't?" and "I don't!" are answers, not a lead-in,
+    /// so what follows them is read alone ("I can't." was already so).
+    #[test]
+    fn a_question_or_an_exclamation_finishes_a_bare_negative_as_it_finishes_any_refusal() {
+        for turns in [
+            &["I can't?", "Put me through to the owner"][..],
+            &["I don't!", "Speak to the owner"],
+            &["I won't?", "talk to the manager"],
+            &["Please don't!", "transfer me to the owner"],
+            &["I can't? Put me through to the owner"],
+            &["I don't! Speak to the owner"],
+            // The always-list is finished the same way.
+            &["No need to?", "transfer me"],
+            &["I don't want to!", "Speak to the owner"],
+        ] {
+            assert!(caller_asked(turns), "{turns:?}");
+        }
+        // Without the mark the same words are the lead-in of a refusal.
+        for turns in [
+            &["I can't", "put me through to the owner"][..],
+            &["I don't", "speak to the owner"],
+            &["Please don't", "transfer me to the owner"],
+        ] {
+            assert!(!caller_asked(turns), "{turns:?}");
+        }
+    }
+
+    /// Final re-verification G1-3: the one place the floor is stricter than a host
+    /// that keeps an acknowledgement (one said in a pause after the AI had
+    /// finished). The floor drops it, so the refusal is directly before the words
+    /// that finish it and they are read joined; the host's record has the
+    /// acknowledgement between them, a sentence of its own that ends what was
+    /// carried. transfer-v1.md states it, with these turns.
+    #[test]
+    fn an_acknowledgement_between_a_refusal_and_its_words_is_not_there_for_the_floor() {
+        for said in [
+            &["I don't want to", "mm-hmm", "speak to the owner"][..],
+            &["I don't want to", "Yeah, sure.", "speak to the owner"],
+            &["I don't want to\u{2026}", "um", "put me through to the owner"],
+            &["He doesn't want to.", "I see", "talk to a person"],
+            &["I don't want to", "yeah, yeah, yeah", "speak to the owner"],
+        ] {
+            // What the floor reads: the acknowledgement is not a turn.
+            assert!(!caller_asked(&caller_turns(said)), "the floor refuses {said:?}");
+            // What a host that kept it reads: the acknowledgement ends the carry.
+            assert!(caller_asked(said), "a record that kept the acknowledgement counts {said:?}");
+        }
+        // Four acknowledgements are not an acknowledgement (they are a turn, so the
+        // floor keeps it too): the refusal is not joined to the words, and they count.
+        let said = ["I don't want to", "yeah, yeah, yeah, yeah", "speak to the owner"];
+        assert!(caller_asked(&caller_turns(&said)));
     }
 
     #[test]
