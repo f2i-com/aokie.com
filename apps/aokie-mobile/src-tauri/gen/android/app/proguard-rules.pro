@@ -36,3 +36,11 @@
     public int invalidateAokiePushToken();
     public int reconcileAokieOffer(java.lang.String, long, java.lang.String, java.lang.String);
 }
+
+# libwebrtc's Java runtime is reached only from native code, by class name (JNI FindClass and
+# GetMethodID), so R8 sees no use and removes it: the minified build then dies the first time WebRTC
+# starts. The jar carries no consumer rules of its own. Class names are the repackaged ones.
+-keep class livekit.org.webrtc.** { *; }
+-keep class livekit.org.jni_zero.** { *; }
+# The generated glue class the jar's JniZero refers to is not shipped; nothing calls the method that uses it.
+-dontwarn livekit.org.jni_zero.JniZeroJni
