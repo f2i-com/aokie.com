@@ -17,6 +17,10 @@ custom-protocol = ["tauri/custom-protocol"]
 # `api.formlogic.local` API host over HTTP and a numeric loopback gateway WS;
 # normal release builds remain HTTPS/WSS-only.
 managed-beta-local = []
+# Test hook, never for a shipped build: at start-up the app makes real HTTPS requests
+# (a public site and negative controls) and writes each result to logcat under the tag
+# `AokieProbe`. It exists to show on a device or emulator whether the TLS stack works.
+https-probe = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

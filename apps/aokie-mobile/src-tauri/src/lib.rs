@@ -3,6 +3,8 @@ mod companion_relay;
 mod desktop_pairing;
 mod discovery;
 mod endpoint_identity;
+#[cfg(feature = "https-probe")]
+mod https_probe;
 mod managed_auth;
 mod media;
 mod mobile_api;
@@ -143,7 +145,7 @@ async fn request_notification_permission(app: AppHandle) -> Result<bool, String>
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(RealtimeState::default())
         .manage(NativeMediaState::default())
@@ -193,7 +195,16 @@ pub fn run() {
             media_renew_lease,
             media_revoke,
             media_close,
-        ])
+        ]);
+
+    // Test hook (see https_probe.rs): real HTTPS requests at start-up, results in logcat.
+    #[cfg(feature = "https-probe")]
+    let builder = builder.setup(|_app| {
+        https_probe::spawn();
+        Ok(())
+    });
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running Aokie Companion");
 }
