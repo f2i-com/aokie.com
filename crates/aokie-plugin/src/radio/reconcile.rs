@@ -14,6 +14,7 @@ pub(super) fn reconcile_switchboard(
     control_rx: &std::sync::mpsc::Receiver<RadioControl>,
     status: &Arc<RadioStatus>,
     remote_media: &crate::remote_media::RemoteMediaHandle,
+    host_rpc: &Arc<crate::host_rpc::HostRpc>,
     tracker: &mut crate::call_session::SessionTracker,
     pending_companion_end_caller: &mut Option<PendingCompanionEndCaller>,
     ctx: &mut CallVoiceContext,
@@ -35,6 +36,40 @@ pub(super) fn reconcile_switchboard(
     #[cfg(feature = "voice")] protected_max_ms: u32,
     #[cfg(feature = "voice")] line_voice: LineVoice<'_>,
 ) {
+    // A call's context is only ever laid aside, retired or carried through
+    // the helpers in radio/realtime_service.rs: a transfer request it still
+    // holds is withdrawn with a context that is stowed or retired, and nothing
+    // polls a stowed one.
+    macro_rules! stow_ctx {
+        ($replacement:expr) => {
+            stow_call_context(
+                &mut *ctx,
+                $replacement,
+                crate::assistance::global(),
+                &*tracker,
+                remote_media,
+                host_rpc,
+                status,
+                outbox,
+                &mut *sink,
+            )
+        };
+    }
+    macro_rules! retire_ctx {
+        ($replacement:expr) => {
+            retire_call_context(
+                &mut *ctx,
+                $replacement,
+                crate::assistance::global(),
+                &*tracker,
+                remote_media,
+                host_rpc,
+                status,
+                outbox,
+                &mut *sink,
+            )
+        };
+    }
     // ── Phase 4 switchboard reconciliation (only while a caller is
     // parked — normal calls never enter this block). The phone's
     // indicator stream cannot say WHICH leg an edge belongs to once two
@@ -185,7 +220,7 @@ pub(super) fn reconcile_switchboard(
                             // mid-call juggle above.
                             let c_id = w.call_id.clone();
                             let c_from = w.from.clone();
-                            *ctx = CallVoiceContext::fresh(None);
+                            drop(retire_ctx!(CallVoiceContext::fresh(None)));
                             synth.reset_call();
                             stt_buf.clear();
                             *stt_had_speech = false;
@@ -369,10 +404,7 @@ pub(super) fn reconcile_switchboard(
                                     // Newcomer parked; the longest-waiting
                                     // caller finally gets the line.
                                     let sess_c = tracker.park().expect("newcomer was active");
-                                    let ctx_c = std::mem::replace(
-                                        &mut *ctx,
-                                        CallVoiceContext::fresh(None),
-                                    );
+                                    let ctx_c = stow_ctx!(CallVoiceContext::fresh(None));
                                     let (sess_b, ctx_b) = parked
                                         .take()
                                         .expect("cascade runs with a parked caller");
@@ -449,10 +481,8 @@ pub(super) fn reconcile_switchboard(
                                         }
                                     }
                                     *promote_greet_for = Some(c_id.clone());
-                                    *pending_ctx_restore = Some(std::mem::replace(
-                                        &mut *ctx,
-                                        CallVoiceContext::fresh(None),
-                                    ));
+                                    *pending_ctx_restore =
+                                        Some(carry_call_context(&mut *ctx, CallVoiceContext::fresh(None)));
                                     status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
                                 }
                                 SwapBackVerdict::SwappedNewcomerGone => {
@@ -581,10 +611,7 @@ pub(super) fn reconcile_switchboard(
                                         let c2_id = sess_c.id.clone();
                                         let c2_from =
                                             sess_c.caller_id.clone().unwrap_or_default();
-                                        let ctx_c = std::mem::replace(
-                                            &mut *ctx,
-                                            CallVoiceContext::fresh(None),
-                                        );
+                                        let ctx_c = stow_ctx!(CallVoiceContext::fresh(None));
                                         *parked = Some((sess_c, ctx_c));
                                         *status.parked_call.lock().unwrap() =
                                             Some(SwitchboardLeg {
@@ -660,10 +687,8 @@ pub(super) fn reconcile_switchboard(
                                     // newcomer keeps the line, the parked
                                     // caller waits for auto-retrieve.
                                     *promote_greet_for = Some(c_id.clone());
-                                    *pending_ctx_restore = Some(std::mem::replace(
-                                        &mut *ctx,
-                                        CallVoiceContext::fresh(None),
-                                    ));
+                                    *pending_ctx_restore =
+                                        Some(carry_call_context(&mut *ctx, CallVoiceContext::fresh(None)));
                                     eprintln!("[aokie-plugin] SWITCHBOARD: unresolved cascade verdict — newcomer keeps the line");
                                 }
                             }

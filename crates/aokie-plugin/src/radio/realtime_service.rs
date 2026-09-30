@@ -439,6 +439,88 @@ pub(super) fn stow_call_context(
     std::mem::replace(ctx, replacement)
 }
 
+/// [`stow_call_context`] for a build without the realtime lane: no call has a
+/// transfer to withdraw, so the context is just swapped.
+#[cfg(all(target_os = "windows", not(feature = "voice")))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stow_call_context(
+    ctx: &mut CallVoiceContext,
+    replacement: CallVoiceContext,
+    _broker: &crate::assistance::AssistanceBroker,
+    _tracker: &crate::call_session::SessionTracker,
+    _remote_media: &crate::remote_media::RemoteMediaHandle,
+    _host_rpc: &Arc<crate::host_rpc::HostRpc>,
+    _status: &RadioStatus,
+    _outbox: OutboxRef<'_>,
+    _sink: &mut dyn Sink,
+) -> CallVoiceContext {
+    std::mem::replace(ctx, replacement)
+}
+
+/// A call's leg is gone (it ended, or was closed honestly) and its context is
+/// replaced: whatever transfer request it still held is withdrawn first (OAIY
+/// hears `cancelled` on its session, the audit trail closes the request), and
+/// the old context is returned to be dropped. Dropping it any other way would
+/// free the mailbox (the open request discards itself) but tell nobody.
+#[cfg(all(target_os = "windows", feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn retire_call_context(
+    ctx: &mut CallVoiceContext,
+    replacement: CallVoiceContext,
+    broker: &crate::assistance::AssistanceBroker,
+    tracker: &crate::call_session::SessionTracker,
+    remote_media: &crate::remote_media::RemoteMediaHandle,
+    host_rpc: &Arc<crate::host_rpc::HostRpc>,
+    status: &RadioStatus,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+) -> CallVoiceContext {
+    withdraw_open_transfer(
+        TransferWithdrawal::CallEnded,
+        ctx,
+        None,
+        broker,
+        tracker,
+        remote_media,
+        host_rpc,
+        status,
+        outbox,
+        sink,
+    );
+    std::mem::replace(ctx, replacement)
+}
+
+/// [`retire_call_context`] for a build without the realtime lane.
+#[cfg(all(target_os = "windows", not(feature = "voice")))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn retire_call_context(
+    ctx: &mut CallVoiceContext,
+    replacement: CallVoiceContext,
+    _broker: &crate::assistance::AssistanceBroker,
+    _tracker: &crate::call_session::SessionTracker,
+    _remote_media: &crate::remote_media::RemoteMediaHandle,
+    _host_rpc: &Arc<crate::host_rpc::HostRpc>,
+    _status: &RadioStatus,
+    _outbox: OutboxRef<'_>,
+    _sink: &mut dyn Sink,
+) -> CallVoiceContext {
+    std::mem::replace(ctx, replacement)
+}
+
+/// Swap the live call's context for another WITHOUT parking or ending anything:
+/// the call it belongs to continues and its context comes back after the
+/// per-call reset (the newcomer that keeps the line), or the reset installs the
+/// context of the call it resumes after having already withdrawn the old one.
+/// Nothing is stowed here, so nothing is withdrawn: this is the only place other
+/// than the stow and retire helpers that swaps a call's context, and the pin
+/// test lists it.
+pub(super) fn carry_call_context(
+    ctx: &mut CallVoiceContext,
+    replacement: CallVoiceContext,
+) -> CallVoiceContext {
+    std::mem::replace(ctx, replacement)
+}
+
 #[cfg(all(target_os = "windows", feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn service_realtime_lane(
