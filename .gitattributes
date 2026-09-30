@@ -1,3 +1,7 @@
 # Shell scripts run inside Linux containers/CI — a CRLF checkout breaks them
 # ("\r: command not found"). Force LF regardless of core.autocrlf.
 *.sh text eol=lf
+# Rust sources: LF in every checkout. Several tests scan them for wiring, and a CRLF
+# checkout (core.autocrlf=true) must not change what they see. The scans also fold
+# line endings, so a working copy checked out before this rule still passes.
+*.rs text eol=lf
