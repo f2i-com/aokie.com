@@ -209,6 +209,14 @@ pub struct Plugin {
     host_ring_plan: bool,
     /// Approved Companion devices in the roster the host handed over at init.
     companion_roster_devices: usize,
+    /// How long a radio stopped for consent is waited for before its stop is
+    /// unconfirmed ([`crate::radio::SHUTDOWN_WAIT`]; a test shortens it).
+    radio_shutdown_wait: std::time::Duration,
+    /// A radio that was told to stop for consent and did not confirm it, with
+    /// why. Its thread may still be running, and a call may still be on it, so
+    /// while it is (`initialized` stays set until the thread exits) the plugin
+    /// cannot say that no call is live: see [`Plugin::unconfirmed_radio`].
+    radio_left_running: Option<(crate::radio::RadioHandle, String)>,
 }
 
 impl Plugin {
@@ -248,6 +256,8 @@ impl Plugin {
             companion_bootstrap: None,
             host_ring_plan: false,
             companion_roster_devices: 0,
+            radio_shutdown_wait: crate::radio::SHUTDOWN_WAIT,
+            radio_left_running: None,
         })
     }
 
@@ -280,6 +290,8 @@ impl Plugin {
             companion_bootstrap: None,
             host_ring_plan: false,
             companion_roster_devices: 0,
+            radio_shutdown_wait: crate::radio::SHUTDOWN_WAIT,
+            radio_left_running: None,
         }
     }
 
@@ -1045,15 +1057,49 @@ impl Plugin {
             gateway.stop();
         }
         let stopped = if let Some(radio) = self.radio.take() {
-            if let Err(error) = radio.shutdown_and_wait() {
-                eprintln!("[aokie-plugin] consent shutdown did not confirm cleanly: {error}");
-            }
+            self.retire_radio(radio, "consent shutdown");
             true
         } else {
             false
         };
         self.consent_blocked = Some(reason);
         stopped
+    }
+
+    /// Stop a radio taken out of service for consent and wait for it to say it
+    /// has. A radio that does not say so within the wait may still be running,
+    /// and a call may still be on it: it is remembered, so the reads that say
+    /// whether a call is live do not answer "none" for it.
+    fn retire_radio(&mut self, radio: crate::radio::RadioHandle, what: &str) {
+        if let Err(error) = radio.shutdown_within(self.radio_shutdown_wait) {
+            eprintln!("[aokie-plugin] {what} did not confirm cleanly: {error}");
+            self.radio_left_running = Some((radio, error));
+        }
+    }
+
+    /// Why this plugin cannot say that no call is live, when a radio it stopped
+    /// for consent never confirmed it stopped and has not exited since (its
+    /// thread clears `initialized` as it ends; a radio that was never
+    /// initialised holds no call, as `plugin.shutdown` already reasons).
+    fn unconfirmed_radio(&self) -> Option<&str> {
+        self.radio_left_running
+            .as_ref()
+            .filter(|(radio, _)| radio.is_initialized())
+            .map(|(_, why)| why.as_str())
+    }
+
+    /// The typed answer of a read that asks whether a call is live while the
+    /// radio's stop is unconfirmed: it cannot tell, and says so, as an error.
+    /// OAIY's update check reads that as "cannot tell" and holds the update
+    /// back (it names stopping this plugin as the way out); an empty answer
+    /// would read as "no call" and let it restart the desktop, or install,
+    /// over a call that may still be on the radio.
+    fn unconfirmed_radio_error(&self, command: &str) -> Option<CmdError> {
+        self.unconfirmed_radio().map(|why| {
+            CmdError::failed(format!(
+                "{command}: cannot say whether a call is live: the radio was stopped for consent and has not confirmed it stopped ({why}), so a call may still be on it"
+            ))
+        })
     }
 
     /// Human re-consent can take far longer than the admission bearer/ICE
@@ -1422,11 +1468,7 @@ impl Plugin {
             gateway.stop();
         }
         let radio_stopped = if let Some(radio) = self.radio.take() {
-            if let Err(error) = radio.shutdown_and_wait() {
-                eprintln!(
-                    "[aokie-plugin] consent-revoke shutdown did not confirm cleanly: {error}"
-                );
-            }
+            self.retire_radio(radio, "consent-revoke shutdown");
             true
         } else {
             false
@@ -2577,6 +2619,10 @@ impl Plugin {
                 // gate below, and every call mutation retains that same gate.
                 if !self.dev_mode {
                     if let Some(reason) = self.consent_blocked.as_deref() {
+                        // Empty only when the radio is known to have stopped.
+                        if let Some(unconfirmed) = self.unconfirmed_radio_error("call.current") {
+                            return Err(unconfirmed);
+                        }
                         return Ok(json!({
                             "call": null,
                             "companionMedia": null,
@@ -2600,9 +2646,16 @@ impl Plugin {
                 // A radio kept absent by consent holds no call, as for
                 // `call.current`: the same empty view, and why, so a reader
                 // (OAIY's update check asks this command first) can tell a
-                // safe pause from a fault. Every call mutation keeps the gate.
+                // safe pause from a fault. Only when the radio is known to
+                // have stopped: one that was told to stop and never confirmed
+                // may still hold a call, and the answer is then that this
+                // cannot be said (an error OAIY holds an update back on),
+                // never "none". Every call mutation keeps the gate.
                 if !self.dev_mode {
                     if let Some(reason) = self.consent_blocked.as_deref() {
+                        if let Some(unconfirmed) = self.unconfirmed_radio_error("call.switchboard") {
+                            return Err(unconfirmed);
+                        }
                         return Ok(json!({
                             "foreground": null,
                             "waiting": null,
@@ -6242,6 +6295,157 @@ mod tests {
             .dispatch_command("dongle.diagnostics", &Value::Null, &mut sink)
             .unwrap_err();
         assert!(err.message.contains("not yet wired to hardware"));
+    }
+
+    /// How OAIY's update check reads one of the two "is a call live" answers over
+    /// the wire, as `update/phone.rs` (`count_calls`, strict: `foreground` must be
+    /// there, null or a call; `waiting` and `parked` are counted when present;
+    /// every other key is ignored) and `setup::unwrap_reply` (an error, or
+    /// `ok: false`, is no answer) do. `Ok(0)` is idle and lets it restart or
+    /// install; `Err` is "cannot tell" and holds it back; `Ok(n)` is `n` calls.
+    fn oaiy_reads_the_wire(line: &str, command: &str) -> Result<usize, String> {
+        let reply: Value = serde_json::from_str(line).unwrap();
+        if let Some(error) = reply.get("error") {
+            return Err(error["message"].as_str().unwrap_or("an error").to_string());
+        }
+        let body = &reply["result"];
+        assert_eq!(body["ok"], json!(true), "{line}");
+        let data = &body["data"];
+        let slot = |key: &str, required: bool| match data.get(key) {
+            Some(Value::Null) => Ok(0),
+            Some(Value::Object(_)) => Ok(1),
+            Some(_) => Err(format!("{key} is neither empty nor a call")),
+            None if required => Err(format!("no {key}")),
+            None => Ok(0),
+        };
+        match command {
+            "call.switchboard" => Ok(slot("foreground", true)? + slot("waiting", false)? + slot("parked", false)?),
+            "call.current" => slot("call", true),
+            other => panic!("{other}"),
+        }
+    }
+
+    /// Review G3-1: a consent pause answers "no call" only when the radio is known
+    /// to have stopped. A radio that was told to stop and never confirmed it (15 s
+    /// in life) may still be running with a call on it, and an empty answer would
+    /// let OAIY's update check restart the desktop, or install, over that call.
+    /// The answer is then an error that says so (which OAIY reads as "cannot
+    /// tell", and holds the update back), until the radio's thread is seen to
+    /// have ended. The radio here is a bare channel the test answers for, or does
+    /// not; its `initialized` flag is what the real thread clears as it ends.
+    #[test]
+    fn a_consent_pause_says_no_call_only_when_the_radio_is_known_to_have_stopped() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let reason = "signed grant does not cover OpenAI ChatGPT via Codex";
+        let asked = |plugin: &mut Plugin, command: &str| {
+            let mut sink = VecSink::default();
+            let line = plugin
+                .handle_rpc(
+                    request(
+                        7,
+                        "connector.request",
+                        json!({"connectorId": CONNECTOR_ID, "command": command}),
+                    ),
+                    &mut sink,
+                )
+                .expect("a request is answered");
+            (oaiy_reads_the_wire(&line, command), line)
+        };
+        let is_quiet = |plugin: &mut Plugin| {
+            for command in ["call.switchboard", "call.current"] {
+                let (read, line) = asked(plugin, command);
+                assert_eq!(read, Ok(0), "{command}: {line}");
+                assert!(line.contains("\"paused\":true"), "{command} says why: {line}");
+            }
+        };
+        let cannot_say = |plugin: &mut Plugin| {
+            for command in ["call.switchboard", "call.current"] {
+                let (read, line) = asked(plugin, command);
+                let why = read.expect_err(&format!("{command} must not read as no call: {line}"));
+                assert!(why.contains(command), "{why}");
+                assert!(why.contains("cannot say whether a call is live"), "{why}");
+                assert!(why.contains("did not complete graceful shutdown"), "{why}");
+                assert!(why.contains("a call may still be on it"), "{why}");
+                assert!(!line.contains("\"paused\":true"), "it is not the pause view: {line}");
+            }
+        };
+        let stopped_for_consent = |plugin: &mut Plugin, radio: crate::radio::RadioHandle| {
+            plugin.radio = Some(radio);
+            assert!(plugin.block_radio_for_consent(reason.to_string()));
+        };
+
+        // The radio confirms it stopped: nothing is on it, and the pause says so.
+        let mut plugin = Plugin::ephemeral(false);
+        let (radio, control_rx) = crate::radio::RadioHandle::test_handle();
+        radio.status.initialized.store(true, Relaxed);
+        let confirming = std::thread::spawn(move || {
+            if let Ok(crate::radio::RadioControl::Shutdown { completion: Some(done) }) = control_rx.recv() {
+                let _ = done.send(());
+            }
+        });
+        stopped_for_consent(&mut plugin, radio);
+        confirming.join().unwrap();
+        is_quiet(&mut plugin);
+
+        // The radio never confirms: the plugin cannot say, and says so, for as
+        // long as the radio's thread has not ended.
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.radio_shutdown_wait = std::time::Duration::from_millis(30);
+        let (radio, _control_rx) = crate::radio::RadioHandle::test_handle();
+        radio.status.initialized.store(true, Relaxed);
+        let thread = radio.status.clone();
+        stopped_for_consent(&mut plugin, radio);
+        cannot_say(&mut plugin);
+        cannot_say(&mut plugin);
+        // Anything that could touch the call keeps the strict gate either way.
+        let mut sink = VecSink::default();
+        assert!(plugin.dispatch_command("call.answer", &Value::Null, &mut sink).is_err());
+        // The thread ends at last (it clears `initialized` as it goes): quiet again.
+        thread.initialized.store(false, Relaxed);
+        is_quiet(&mut plugin);
+
+        // A radio that was never initialised holds no call, answered or not.
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.radio_shutdown_wait = std::time::Duration::from_millis(30);
+        let (radio, _control_rx) = crate::radio::RadioHandle::test_handle();
+        stopped_for_consent(&mut plugin, radio);
+        is_quiet(&mut plugin);
+
+        // A radio whose thread is already gone (nobody receives) confirms nothing
+        // and holds no call either.
+        let mut plugin = Plugin::ephemeral(false);
+        let (radio, control_rx) = crate::radio::RadioHandle::test_handle();
+        radio.status.initialized.store(false, Relaxed);
+        drop(control_rx);
+        stopped_for_consent(&mut plugin, radio);
+        is_quiet(&mut plugin);
+
+        // Revoking consent stops the radio the same way, and is judged the same.
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.radio_shutdown_wait = std::time::Duration::from_millis(30);
+        let (radio, _control_rx) = crate::radio::RadioHandle::test_handle();
+        radio.status.initialized.store(true, Relaxed);
+        plugin.radio = Some(radio);
+        let mut sink = VecSink::default();
+        let revoked = plugin
+            .dispatch_command("consent.revoke", &Value::Null, &mut sink)
+            .unwrap();
+        assert_eq!(revoked["radioStopped"], json!(true));
+        cannot_say(&mut plugin);
+        let mut plugin = Plugin::ephemeral(false);
+        let (radio, control_rx) = crate::radio::RadioHandle::test_handle();
+        radio.status.initialized.store(true, Relaxed);
+        let confirming = std::thread::spawn(move || {
+            if let Ok(crate::radio::RadioControl::Shutdown { completion: Some(done) }) = control_rx.recv() {
+                let _ = done.send(());
+            }
+        });
+        plugin.radio = Some(radio);
+        plugin
+            .dispatch_command("consent.revoke", &Value::Null, &mut sink)
+            .unwrap();
+        confirming.join().unwrap();
+        is_quiet(&mut plugin);
     }
 
     #[test]
