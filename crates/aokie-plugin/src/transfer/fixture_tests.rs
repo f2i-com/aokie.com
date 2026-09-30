@@ -241,7 +241,9 @@ fn the_reason_vocabulary_in_the_contract_names_every_word_the_plugin_uses() {
     let in_document = |word: &str| document.contains(&format!("`{word}`"));
     let mut words: Vec<String> = PLAN_REASONS.iter().map(|word| word.to_string()).collect();
     words.extend(PLUGIN_REASONS.iter().map(|word| word.to_string()));
-    words.extend(["call_changed", "tool_limit", "unsupported", "not_offered"].map(str::to_string));
+    words.extend(
+        ["call_changed", "tool_limit", "unsupported", "not_offered", "no_answer"].map(str::to_string),
+    );
     words.extend(["caller_asked", "urgent", "policy_rule"].map(str::to_string));
     words.extend(
         [Outcome::Accepted, Outcome::Declined, Outcome::Unavailable, Outcome::Expired, Outcome::Cancelled]
