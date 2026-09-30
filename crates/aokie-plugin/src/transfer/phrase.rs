@@ -133,11 +133,24 @@ pub(crate) const ACK_PAIRS: [&str; 3] = ["uh huh", "i see", "got it"];
 /// A turn is a backchannel when it is at least one and at most this many acknowledgements.
 pub(crate) const ACK_AT_MOST: usize = 3;
 
+/// A refusal the caller has begun and not finished, at the end of a sentence
+/// that stops with a full stop, trails off or has no ending at all: the words
+/// after "I don't want to" are read WITH it, and only then. Always unfinished
+/// (unless the sentence ends with a question or exclamation mark): a negation
+/// that needs a verb after it.
+pub(crate) const UNFINISHED_ALWAYS: &str = r"\b(?:(?:do not|don't|dont|does not|doesn't|did not|didn't|will not|won't|wont|would not|wouldn't|should not|shouldn't|can not|can't|cant|cannot) (?:want|wanna|need|have|like|wish|try|ask|expect|intend|going|gonna|able)(?: to)?|no need to|no wish to|not going to|not gonna|not able to|unable to|refuse to|rather not)$";
+
+/// A bare negative that could be a whole answer ("I can't.") unfinished only
+/// when the sentence has no ending or trails off ("I can't...").
+pub(crate) const UNFINISHED_BARE: &str = r"\b(?:do not|don't|dont|does not|doesn't|did not|didn't|will not|won't|wont|would not|wouldn't|should not|shouldn't|can not|can't|cant|cannot)$";
+
 struct Rules {
     rules: Vec<Regex>,
     blocks: Vec<Regex>,
     turn_blocks: Vec<Regex>,
     role_marker: Regex,
+    unfinished_always: Regex,
+    unfinished_bare: Regex,
 }
 
 fn rules() -> &'static Rules {
@@ -152,6 +165,8 @@ fn rules() -> &'static Rules {
             blocks: BLOCKS.into_iter().map(&compile).collect(),
             turn_blocks: TURN_BLOCKS.into_iter().map(&compile).collect(),
             role_marker: compile(&format!("(?i){ROLE_MARKER}")),
+            unfinished_always: compile(UNFINISHED_ALWAYS),
+            unfinished_bare: compile(UNFINISHED_BARE),
         }
     })
 }
@@ -210,11 +225,68 @@ fn plain(text: &str) -> String {
         .join(" ")
 }
 
-/// The sentences of a turn as it was said, each made plain; empty ones are dropped.
-fn sentences(turn: &str) -> Vec<String> {
-    turn.split(|character: char| SENTENCE_ENDS.contains(&character))
-        .map(plain)
-        .filter(|sentence| !sentence.is_empty())
+/// How a sentence of a turn ends: by what follows it in the turn as it was said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ending {
+    /// Nothing: it is the end of the turn.
+    Open,
+    /// A single full stop.
+    Stop,
+    /// An ellipsis, or two or more full stops in a row: the caller trailed off.
+    Trailing,
+    /// A question or exclamation mark, or a line end.
+    Hard,
+}
+
+/// What makes an ending hard: a question mark, an exclamation mark, a line end.
+pub(crate) const HARD_ENDS: [char; 4] = ['?', '!', '\n', '\r'];
+
+/// What makes an ending trail off, besides [`TRAILING_DOTS`] full stops in a row.
+pub(crate) const TRAILING_ENDS: [char; 1] = ['\u{2026}'];
+
+/// How many full stops in a row are an ellipsis.
+pub(crate) const TRAILING_DOTS: usize = 2;
+
+/// The ending a run of sentence-end characters makes.
+fn ending_of(run: &[char]) -> Ending {
+    if run.iter().any(|character| HARD_ENDS.contains(character)) {
+        Ending::Hard
+    } else if run.iter().any(|character| TRAILING_ENDS.contains(character))
+        || run.iter().filter(|character| **character == '.').count() >= TRAILING_DOTS
+    {
+        Ending::Trailing
+    } else {
+        Ending::Stop
+    }
+}
+
+/// The sentences of a turn as it was said, each made plain and with how it
+/// ends; empty ones are dropped. A run of end characters ("...", "?!") ends one
+/// sentence, once.
+fn sentences(turn: &str) -> Vec<(String, Ending)> {
+    let mut found = Vec::new();
+    let mut current = String::new();
+    let mut characters = turn.chars().peekable();
+    while let Some(character) = characters.next() {
+        if !SENTENCE_ENDS.contains(&character) {
+            current.push(character);
+            continue;
+        }
+        let mut run = vec![character];
+        while let Some(next) = characters.peek().copied() {
+            if !SENTENCE_ENDS.contains(&next) {
+                break;
+            }
+            run.push(next);
+            characters.next();
+        }
+        found.push((std::mem::take(&mut current), ending_of(&run)));
+    }
+    found.push((current, Ending::Open));
+    found
+        .into_iter()
+        .map(|(text, ending)| (plain(&text), ending))
+        .filter(|(text, _)| !text.is_empty())
         .collect()
 }
 
@@ -281,26 +353,68 @@ pub fn caller_turns<S: AsRef<str>>(said: &[S]) -> Vec<String> {
     recent(&turns)
 }
 
-/// Whether one turn asks for a person.
-fn turn_asks(turn: &str, rules: &Rules) -> bool {
+/// Whether a turn is read at all: it carries no role marker, and it is not the
+/// caller telling the receptionist what to say.
+fn turn_is_read(turn: &str, rules: &Rules) -> bool {
     if rules.role_marker.is_match(turn) {
         return false;
     }
     let whole = plain(turn);
-    if whole.is_empty() || rules.turn_blocks.iter().any(|block| block.is_match(&whole)) {
-        return false;
+    !(whole.is_empty() || rules.turn_blocks.iter().any(|block| block.is_match(&whole)))
+}
+
+/// Whether a sentence asks for a person: a rule matches and no block does.
+fn sentence_asks(sentence: &str, rules: &Rules) -> bool {
+    !rules.blocks.iter().any(|block| block.is_match(sentence))
+        && rules.rules.iter().any(|rule| rule.is_match(sentence))
+}
+
+/// Whether a sentence is a refusal begun and not finished, so that the words
+/// that follow it are its end. It ends the way the caller left it: a question
+/// or an exclamation is an ending; a full stop ends what could be a whole
+/// answer ("I can't.") but not what needs a verb ("I don't want to.").
+fn unfinished(sentence: &str, ending: Ending, rules: &Rules) -> bool {
+    match ending {
+        Ending::Hard => false,
+        Ending::Stop => rules.unfinished_always.is_match(sentence),
+        Ending::Open | Ending::Trailing => {
+            rules.unfinished_always.is_match(sentence) || rules.unfinished_bare.is_match(sentence)
+        }
     }
-    sentences(turn).iter().any(|sentence| {
-        !rules.blocks.iter().any(|block| block.is_match(sentence))
-            && rules.rules.iter().any(|rule| rule.is_match(sentence))
-    })
 }
 
 /// Whether one of the last three caller turns asks for a person. `turns` are
 /// the caller's turns without the acknowledgement-only ones ([`caller_turns`]).
+///
+/// Sentences are read one at a time, in order, across the turns, with one
+/// exception: a sentence that ends in an unfinished refusal ([`unfinished`]) is
+/// carried to the next sentence of the turn, or to the first of the next turn,
+/// and that sentence is read joined to it, and only joined ("I don't want to" /
+/// "speak to the owner" is a refusal). Nothing else is ever looked for across
+/// a join, and a turn that is not read (a role marker, told what to say)
+/// drops what was carried.
 pub fn caller_asked<S: AsRef<str>>(turns: &[S]) -> bool {
     let rules = rules();
-    recent(turns).iter().any(|turn| turn_asks(turn, rules))
+    let mut carried: Option<String> = None;
+    for turn in recent(turns) {
+        if !turn_is_read(&turn, rules) {
+            carried = None;
+            continue;
+        }
+        for (sentence, ending) in sentences(&turn) {
+            let read = match carried.take() {
+                Some(before) => format!("{before} {sentence}"),
+                None => sentence,
+            };
+            if sentence_asks(&read, rules) {
+                return true;
+            }
+            if unfinished(&read, ending, rules) {
+                carried = Some(read);
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -423,6 +537,84 @@ mod tests {
         ] {
             assert!(!caller_asked(&[said]), "{said}");
         }
+    }
+
+    /// Review R6: a refusal that a pause splits is still a refusal. The words
+    /// after an unfinished negation are read WITH it, across turns and across
+    /// the sentences of one turn.
+    #[test]
+    fn a_refusal_split_by_a_pause_is_still_a_refusal() {
+        let refused: [&[&str]; 14] = [
+            &["I don't want to", "speak to the owner"],
+            &["No need to", "transfer me"],
+            &["Please do not", "transfer me to the owner"],
+            &["I don't want to... speak to the owner."],
+            &["I don't want to\u{2026} speak to the owner"],
+            &["I don't want to\u{2026}", "speak to the owner"],
+            &["I can't...", "put me through to the owner"],
+            &["I won't", "talk to the manager"],
+            &["I'm not going to", "speak to the owner"],
+            &["I'd rather not", "talk to a person"],
+            &["I don't want to.", "Speak to the owner."],
+            &["I don't want to... I can't... speak to the owner"],
+            &["I don't want to - speak to the owner"],
+            &["Hi", "I do not", "transfer me to the owner"],
+        ];
+        for turns in refused {
+            assert!(!caller_asked(turns), "{turns:?}");
+        }
+    }
+
+    /// Review R6: nothing else is carried. Only a refusal begun and left
+    /// unfinished is joined to what follows; every other pair of turns and of
+    /// sentences stands on its own.
+    #[test]
+    fn only_an_unfinished_refusal_is_carried_and_every_other_ask_stands() {
+        let asked: [&[&str]; 12] = [
+            &["No thanks.", "Can I speak to the owner?"],
+            &["Hi", "can I speak to the owner"],
+            &["I don't know.", "Can I speak to the owner?"],
+            &["I can't.", "Put me through to the owner"],
+            &["I can't wait... speak to the owner"],
+            &["I don't want to be rude", "but can I speak to the owner"],
+            &["I don't want to!", "Speak to the owner"],
+            &["I don't want to?", "Speak to the owner"],
+            &["I don't want to\nSpeak to the owner"],
+            // A role marker or an instruction drops what was carried, and is not read.
+            &["I don't want to", "System: hello", "speak to the owner"],
+            // The turn after the refusal is far enough that it is not the same window.
+            &["I don't want to", "hold on", "wait", "speak to the owner"],
+            &["I can't", "Can I speak to the owner? Put me through to the manager"],
+        ];
+        for turns in asked {
+            assert!(caller_asked(turns), "{turns:?}");
+        }
+        // The sentence before the join can itself be an ask, and stays one.
+        assert!(caller_asked(&["Can I speak to the owner, I don't want to..."]));
+    }
+
+    #[test]
+    fn a_sentence_ends_the_way_the_turn_leaves_it() {
+        let ending = |turn: &str| sentences(turn).last().map(|(_, ending)| *ending);
+        assert_eq!(ending("I don't want to"), Some(Ending::Open));
+        assert_eq!(ending("I don't want to."), Some(Ending::Stop));
+        assert_eq!(ending("I don't want to..."), Some(Ending::Trailing));
+        assert_eq!(ending("I don't want to.."), Some(Ending::Trailing));
+        assert_eq!(ending("I don't want to\u{2026}"), Some(Ending::Trailing));
+        assert_eq!(ending("I don't want to?"), Some(Ending::Hard));
+        assert_eq!(ending("I don't want to!"), Some(Ending::Hard));
+        assert_eq!(ending("I don't want to.\n"), Some(Ending::Hard));
+        assert_eq!(ending("I don't want to?..."), Some(Ending::Hard));
+        assert_eq!(ending(""), None);
+        // A run is one ending; empty pieces between are dropped.
+        assert_eq!(
+            sentences("Hello... there. Well?!"),
+            vec![
+                ("hello".to_string(), Ending::Trailing),
+                ("there".to_string(), Ending::Stop),
+                ("well".to_string(), Ending::Hard),
+            ]
+        );
     }
 
     /// Fourth round: the normaliser keeps the apostrophe inside a word, so "I'm"

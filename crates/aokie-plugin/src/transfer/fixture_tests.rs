@@ -371,24 +371,86 @@ fn caller_asked_from_the_file(fixture: &Value, said: &[String]) -> bool {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    said[said.len().saturating_sub(recent)..].iter().any(|turn| {
+    let unfinished = &fixture["unfinished"];
+    let (always, bare) = (compile(&unfinished["always"], ""), compile(&unfinished["bare"], ""));
+    let hard: Vec<char> = strings(&unfinished["hard"]).iter().map(|end| end.chars().next().unwrap()).collect();
+    let trailing: Vec<char> =
+        strings(&unfinished["trailing"]).iter().map(|end| end.chars().next().unwrap()).collect();
+    let trailing_dots = unfinished["trailingDots"].as_u64().unwrap() as usize;
+    // How a run of end characters ends the sentence before it.
+    let ending_of = |run: &[char]| -> &'static str {
+        if run.iter().any(|character| hard.contains(character)) {
+            "hard"
+        } else if run.iter().any(|character| trailing.contains(character))
+            || run.iter().filter(|character| **character == '.').count() >= trailing_dots
+        {
+            "trailing"
+        } else {
+            "stop"
+        }
+    };
+    // The sentences of a turn as it was said, each made plain, with how it ends.
+    let sentences = |turn: &str| -> Vec<(String, &'static str)> {
+        let mut found = Vec::new();
+        let mut current = String::new();
+        let characters: Vec<char> = turn.chars().collect();
+        let mut at = 0;
+        while at < characters.len() {
+            if !ends.contains(&characters[at]) {
+                current.push(characters[at]);
+                at += 1;
+                continue;
+            }
+            let mut run = vec![characters[at]];
+            while at + 1 < characters.len() && ends.contains(&characters[at + 1]) {
+                at += 1;
+                run.push(characters[at]);
+            }
+            at += 1;
+            found.push((std::mem::take(&mut current), ending_of(&run)));
+        }
+        found.push((current, "open"));
+        found
+            .into_iter()
+            .map(|(text, ending)| (plain(&text), ending))
+            .filter(|(text, _)| !text.is_empty())
+            .collect()
+    };
+    let is_unfinished = |sentence: &str, ending: &str| -> bool {
+        match ending {
+            "hard" => false,
+            "stop" => always.is_match(sentence),
+            _ => always.is_match(sentence) || bare.is_match(sentence),
+        }
+    };
+    let mut carried: Option<String> = None;
+    for turn in &said[said.len().saturating_sub(recent)..] {
         let skip = turn.chars().count().saturating_sub(chars);
         let turn: String = turn.chars().skip(skip).collect();
-        if role_marker.is_match(&turn) {
-            return false;
-        }
         let whole = plain(&turn);
-        if whole.is_empty() || turn_blocks.iter().any(|block| block.is_match(&whole)) {
-            return false;
+        if role_marker.is_match(&turn)
+            || whole.is_empty()
+            || turn_blocks.iter().any(|block| block.is_match(&whole))
+        {
+            carried = None;
+            continue;
         }
-        turn.split(|character: char| ends.contains(&character))
-            .map(&plain)
-            .filter(|sentence| !sentence.is_empty())
-            .any(|sentence| {
-                !blocks.iter().any(|block| block.is_match(&sentence))
-                    && rules.iter().any(|rule| rule.is_match(&sentence))
-            })
-    })
+        for (sentence, ending) in sentences(&turn) {
+            let read = match carried.take() {
+                Some(before) => format!("{before} {sentence}"),
+                None => sentence,
+            };
+            if !blocks.iter().any(|block| block.is_match(&read))
+                && rules.iter().any(|rule| rule.is_match(&read))
+            {
+                return true;
+            }
+            if is_unfinished(&read, ending) {
+                carried = Some(read);
+            }
+        }
+    }
+    false
 }
 
 /// The file's `backchannel` rule, from the file's own words.
@@ -422,7 +484,7 @@ fn the_caller_asked_fixture_passes_and_its_patterns_are_the_plugins_patterns() {
     let turns = |case: &Value| strings(&case["turns"]);
     let cases = |key: &str| fixture[key].as_array().unwrap().clone();
     let (positive, negative, window) = (cases("positive"), cases("negative"), cases("window"));
-    assert_eq!((positive.len(), negative.len(), window.len()), (78, 92, 4));
+    assert_eq!((positive.len(), negative.len(), window.len()), (91, 108, 4));
     for case in &positive {
         assert!(caller_asked(&turns(case)), "{case}");
     }
@@ -475,6 +537,15 @@ fn the_caller_asked_fixture_passes_and_its_patterns_are_the_plugins_patterns() {
     assert_eq!(strings(&fixture["blocks"]), phrase::BLOCKS);
     assert_eq!(strings(&fixture["turnBlocks"]), phrase::TURN_BLOCKS);
     assert_eq!(fixture["roleMarker"], phrase::ROLE_MARKER);
+    let unfinished = &fixture["unfinished"];
+    assert_eq!(unfinished["always"], phrase::UNFINISHED_ALWAYS);
+    assert_eq!(unfinished["bare"], phrase::UNFINISHED_BARE);
+    let single = |key: &str| -> Vec<char> {
+        strings(&unfinished[key]).iter().map(|end| end.chars().next().unwrap()).collect()
+    };
+    assert_eq!(single("hard"), phrase::HARD_ENDS);
+    assert_eq!(single("trailing"), phrase::TRAILING_ENDS);
+    assert_eq!(unfinished["trailingDots"], phrase::TRAILING_DOTS);
     assert_eq!(
         strings(&fixture["removedCharacters"]),
         vec![phrase::SOFT_HYPHEN.to_string()],
