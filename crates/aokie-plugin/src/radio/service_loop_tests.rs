@@ -286,12 +286,13 @@ impl Loop {
         self.ctx.history.push(json!({"role": "user", "content": text}));
     }
 
-    /// The host answers the plan request the plugin wrote to the sink.
+    /// The host answers the newest plan request the plugin wrote to the sink.
     fn host_answers(&self, result: Value) {
         let id = self
             .sink
             .lines
             .iter()
+            .rev()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .find(|value| value["method"] == "oaiy.ring.plan")
             .map(|value| value["id"].as_u64().unwrap())
@@ -617,12 +618,13 @@ fn held_outcomes_go_out_before_a_stop_and_right_behind_the_answer_they_waited_fo
 
 // --- An ask counts for one request (review R4) ------------------------------------
 //
-// "Consumed" means this: a caller turn is spent when the host has been asked to
-// plan a request that the phrase floor let through (the first request the ask
-// opens), and when the AI gets the caller back (a fresh session after a takeover
-// or a hold). The floor, and the `recentCallerTurns` the host is sent, read only
-// the turns said after the last spent one. These run the loop, so the history,
-// the machine, the session and the host are the real ones.
+// "Consumed" means this: a caller turn is spent when the request it asked for
+// opens (the host authorised the ring and the request is open: not by a plan
+// that was refused, was not answered or could not be read), and when the AI gets
+// the caller back (a fresh session after a takeover or a hold). The floor, and
+// the `recentCallerTurns` the host is sent, read only the turns said after the
+// last spent one. These run the loop, so the history, the machine, the session
+// and the host are the real ones.
 
 /// The number of `oaiy.ring.plan` requests written to the host so far.
 fn plans_asked(l: &Loop) -> usize {
@@ -663,14 +665,75 @@ fn an_ask_opens_one_request_and_a_later_turn_that_asks_nothing_opens_none() {
     assert_eq!(plans_asked(&l), 1, "the host was not asked again");
     assert!(!l.rig.broker.is_busy());
 
-    // A new ask is a new request.
+    // A new ask is a new request, and it counts once too: what the first
+    // request spent is not what the second spends (the second spends everything
+    // said up to its own tool call).
     l.caller_says("Actually, can I speak to the owner?");
     assert!(calls_the_tool_again(&mut l, "tool_3").is_none(), "the host is being asked");
     assert_eq!(plans_asked(&l), 2);
+    l.host_answers(Rig::ring_plan());
+    l.pass();
+    let (ok, output) = tool_result(&l.sent(), "tool_3").expect("the model is answered");
+    assert!(ok && output["status"] == "ringing", "{output}");
+    let second = output["requestId"].as_str().expect("the answer names the request").to_string();
+    l.oaiy(RealtimeEventKind::TransferCancel {
+        request_id: second,
+        reason: CancelReason::MessageInstead,
+    });
+    l.pass();
+    assert_eq!(outcomes(&l.sent()), vec![Outcome::Cancelled]);
+    let (ok, output) = calls_the_tool_again(&mut l, "tool_4").expect("refused at once, not asked of the host");
+    assert!(!ok);
+    assert_eq!(output["reason"], "caller_did_not_ask", "{output}");
+    assert_eq!(plans_asked(&l), 2, "the second ask is spent by the second request");
 }
 
 #[test]
-fn an_ask_is_spent_by_a_request_that_reached_the_host_and_by_none_that_did_not() {
+fn a_host_that_could_not_plan_leaves_the_ask_to_be_tried_again_and_a_ring_spends_it() {
+    let mut l = Loop::begun_with_transfer();
+    l.caller_says("Can I speak to the owner?");
+
+    // The host's answer cannot be read: the model is told the transfer is
+    // unavailable, and its retry, on the same ask, reaches the host again.
+    assert!(calls_the_tool_again(&mut l, "tool_1").is_none(), "the host is being asked");
+    assert_eq!(plans_asked(&l), 1);
+    l.host_answers(json!("ring please"));
+    l.pass();
+    let (ok, output) = tool_result(&l.sent(), "tool_1").expect("the model is answered");
+    assert!(!ok);
+    assert_eq!(output["reason"], "plan_unavailable", "{output}");
+    assert!(calls_the_tool_again(&mut l, "tool_2").is_none(), "the same ask reaches the host again");
+    assert_eq!(plans_asked(&l), 2);
+
+    // A plan that says no leaves it too.
+    l.host_answers(json!({"planId": "plan_1", "decision": "refused", "reason": "quiet_hours"}));
+    l.pass();
+    let (ok, output) = tool_result(&l.sent(), "tool_2").expect("the model is answered");
+    assert!(!ok);
+    assert_eq!(output["reason"], "quiet_hours", "{output}");
+    assert!(calls_the_tool_again(&mut l, "tool_3").is_none(), "and again");
+    assert_eq!(plans_asked(&l), 3);
+
+    // The ring that opens spends it: withdrawn, the same ask is not a request.
+    l.host_answers(Rig::ring_plan());
+    l.pass();
+    let (ok, output) = tool_result(&l.sent(), "tool_3").expect("the model is answered");
+    assert!(ok && output["status"] == "ringing", "{output}");
+    let request_id = output["requestId"].as_str().expect("the answer names the request").to_string();
+    l.oaiy(RealtimeEventKind::TransferCancel {
+        request_id,
+        reason: CancelReason::MessageInstead,
+    });
+    l.pass();
+    assert_eq!(outcomes(&l.sent()), vec![Outcome::Cancelled]);
+    let (ok, output) = calls_the_tool_again(&mut l, "tool_4").expect("refused at once, not asked of the host");
+    assert!(!ok);
+    assert_eq!(output["reason"], "caller_did_not_ask", "{output}");
+    assert_eq!(plans_asked(&l), 3);
+}
+
+#[test]
+fn an_ask_that_was_refused_before_the_host_was_asked_is_not_spent() {
     // Another request holds the mailbox, so the tool is refused before the host
     // is asked: the ask stands, and the retry once the mailbox is free is judged on it.
     let mut l = Loop::begun_with_transfer();

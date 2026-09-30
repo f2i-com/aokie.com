@@ -6719,6 +6719,7 @@ mod transfer_end_to_end {
                     call_id: "call_a",
                     owner: &owner,
                     recent_caller_turns: &["Can I speak to the owner please".to_string()],
+                    caller_turns_heard: 1,
                     caller_number: None,
                 },
             )
