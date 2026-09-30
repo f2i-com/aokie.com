@@ -895,11 +895,13 @@ fn scanned(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
-/// The loop itself needs a phone, a dongle and a socket to the desktop, so what
-/// it calls is tested above and that it calls it is checked here: each helper is
-/// defined once and used once in the loop (the send after the tool block, which
-/// only shortens the wait, twice), and nothing in the loop does by hand what a
-/// helper does. Changing the wiring means changing this on purpose.
+/// The realtime block of the loop is driven for real in `service_loop_tests`
+/// (a fake phone link, a detached session, a private mailbox), which is what
+/// shows it does what it should; this is the shape guard beside it, and covers
+/// what those tests cannot reach, the per-call reset in `run_loop`: each helper
+/// is defined once and used once in the loop (the send after the tool block,
+/// which only shortens the wait, twice), and nothing in the loop does by hand
+/// what a helper does. Changing the wiring means changing this on purpose.
 #[test]
 fn the_service_loop_runs_the_transfer_helpers_it_is_tested_through() {
     let service = scanned(include_str!("realtime_service.rs"));

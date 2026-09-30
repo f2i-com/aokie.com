@@ -161,6 +161,9 @@ mod tests;
 #[cfg(all(test, target_os = "windows", feature = "voice"))]
 mod realtime_tool_tests;
 
+#[cfg(all(test, target_os = "windows", feature = "voice"))]
+mod service_loop_tests;
+
 /// §12.3 synthetic audio rig: drives the REAL paced-playback machinery
 /// ([`TtsChunkPlayback`] + the real speexdsp [`crate::aec::EchoCanceller`])
 /// with scripted audio on a virtual clock — a known "bot voice" waveform

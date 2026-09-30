@@ -1648,6 +1648,8 @@ pub(super) fn run_loop(
             &mut realtime_terminal_call,
             &mut realtime_deferred_policy_failure,
             &mut ctx,
+            crate::assistance::global(),
+            &crate::realtime_voice::RealtimeVoiceSession::spawn,
         );
 
         #[cfg(all(target_os = "windows", feature = "voice"))]
