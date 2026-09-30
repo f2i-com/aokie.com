@@ -1749,6 +1749,101 @@ fn another_ai_action_while_the_host_plans_does_not_cost_the_request() {
     assert!(!rig.broker.is_busy());
 }
 
+// --- The world moves while the host plans: each guard, on its own ------------
+//
+// Three checks stand between the host's `ring` and an open request, and a state
+// that trips one must not also trip another, or the test cannot tell which held.
+// The media state below is untouched in the first two, and the radio's own view
+// of the call is untouched in the third.
+//
+// The check of the media's call id and epoch, and the call-id half of the owner
+// check, see the same fact twice: every call has its own epoch (a new one for a
+// call the media state has forgotten), so an epoch that equals the plan's is the
+// plan's call. Taking either out alone changes nothing a test can see (the two
+// mutants are equivalent); the epoch half of the owner check is what holds the
+// pair, and the third test below is the one that fails without it.
+
+/// The answer a plan that did not open a request ends in: nothing was asked of
+/// the mailbox and the host is not told a ring opened.
+fn assert_nothing_was_opened(rig: &Rig) {
+    assert!(!rig.broker.is_busy(), "nothing was opened");
+    assert_eq!(rig.machine.attempts(), 0);
+    assert_eq!(rig.host_requests().len(), 1, "and the host is not told a ring opened");
+    assert!(!rig.machine.is_active());
+}
+
+#[test]
+fn a_call_hung_up_while_the_host_plans_drops_the_plan_and_opens_nothing() {
+    // The radio's tracker says the call is over; the media state has not
+    // caught up. Only the plan's own look at the radio can stop this one.
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    rig.active = None;
+    rig.host_answers(Rig::ring_plan());
+    assert!(rig.poll().is_empty(), "nobody is waiting for an answer");
+    assert_nothing_was_opened(&rig);
+}
+
+#[test]
+fn a_session_replaced_while_the_host_plans_drops_the_plan_and_opens_nothing() {
+    // The session that asked is gone and a fresh one has the call: an answer
+    // for the old tool call must not open a request for the new session.
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    rig.session += 1;
+    rig.host_answers(Rig::ring_plan());
+    assert!(rig.poll().is_empty(), "the answer was for a session that is gone");
+    assert_nothing_was_opened(&rig);
+}
+
+#[test]
+fn the_same_call_seen_again_with_a_new_epoch_while_the_host_plans_is_call_changed() {
+    // The call the plan was made for is gone and the same id came back as a new
+    // call (the media state forgets a call after sixteen newer ones): the call id
+    // still matches and the epoch is not zero, so only the epoch the plan was
+    // made under can tell it is not the call that asked.
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    let epoch = rig.media.snapshot().call_epoch;
+    for n in 0..17 {
+        rig.media.observe_physical_call(Some(&format!("call_other_{n}")), true);
+    }
+    rig.media.observe_physical_call(Some(CALL), true);
+    let seen = rig.media.snapshot();
+    assert_eq!(seen.call_id.as_deref(), Some(CALL));
+    assert_ne!(seen.call_epoch, epoch, "the same id, a different call");
+    rig.host_answers(Rig::ring_plan());
+    let effects = rig.poll();
+    let Effect::ToolAnswer { answer, .. } = &effects[0] else {
+        panic!("{effects:?}")
+    };
+    assert_eq!(refused_reason(answer), "call_changed");
+    assert_nothing_was_opened(&rig);
+}
+
+#[test]
+fn another_request_taking_the_mailbox_while_the_host_plans_is_pending_request_and_is_left_alone() {
+    let mut rig = Rig::new();
+    assert!(matches!(rig.begin("tool_1"), Begin::Planning));
+    let fence = AssistanceCallFence {
+        call_id: CALL.into(),
+        call_epoch: rig.media.snapshot().call_epoch,
+        owner_epoch: rig.media.snapshot().owner_epoch,
+        switchboard_revision: 0,
+        remote_revision: rig.media.snapshot().remote_revision,
+    };
+    rig.broker.request(fence, "Is Tuesday free?", None, 30).expect("the mailbox was free");
+    rig.host_answers(Rig::ring_plan());
+    let effects = rig.poll();
+    let Effect::ToolAnswer { answer, .. } = &effects[0] else {
+        panic!("{effects:?}")
+    };
+    assert_eq!(refused_reason(answer), "pending_request");
+    assert_eq!(rig.machine.attempts(), 0);
+    assert!(rig.broker.is_busy(), "the other request is still the mailbox's");
+    assert!(!rig.machine.is_active());
+}
+
 #[test]
 fn a_call_that_ends_takes_its_open_request_with_it_and_says_so() {
     // The radio's per-call reset asks the machine to end the call's requests
