@@ -170,7 +170,7 @@ is queued and sent by the same drained-output gate as every other tool result.
 | Timing | Value |
 |---|---|
 | Wait for the host's plan | 1.5 s (no answer means nobody is rung) |
-| Ring window | 20 to 90 s, the plan's, default 40 |
+| Ring window | 20 to 90 s, the plan's (40 when it says nothing) |
 | Media setup after an accept | 45 s, then 10 s for the gateway to record the result |
 | The plugin's own deadline | 5 s past all of that, on the monotonic clock |
 

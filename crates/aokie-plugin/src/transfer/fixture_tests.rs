@@ -273,6 +273,25 @@ fn the_reason_vocabulary_in_the_contract_names_every_word_the_plugin_uses() {
     }
 }
 
+/// Second review F7: the document and the architecture note state the ring
+/// default the parser applies, and the relay refusals the gateway gives.
+#[test]
+fn the_documents_state_the_ring_default_and_the_relay_refusals_the_code_gives() {
+    let document = std::fs::read_to_string(folder().join("transfer-v1.md")).unwrap().replace("\r\n", "\n");
+    assert_eq!(RING_SECONDS_DEFAULT, 40);
+    assert_eq!((RING_SECONDS_MIN, RING_SECONDS_MAX), (20, 90));
+    assert!(document.contains("20 to 90 s; 40 s when the plan says nothing about it"));
+    let architecture = std::fs::read_to_string(folder().join("../../ARCHITECTURE.md")).unwrap().replace("\r\n", "\n");
+    assert!(architecture.contains("20 to 90 s, the plan's (40 when it says nothing)"));
+    // The relay answers an accept from outside the plan `transfer_unavailable`,
+    // and only the decline `not_a_target` (companion_gateway tests pin both).
+    assert!(document.contains("an accept with `transfer_unavailable`"));
+    assert!(document.contains("a decline with\n`not_a_target`"));
+    assert!(!document.contains("refuses an accept or a decline\nfrom any other device (`not_a_target`)"));
+    assert!(document.contains("whole gateway connection (a reconnect)"));
+    assert!(document.contains("**request card**"));
+}
+
 #[test]
 fn the_cancel_fixture_is_what_the_plugin_reads_and_answers() {
     let fixture = fixture("transfer-v1.cancel.fixture.json");
