@@ -58,7 +58,9 @@ Invoke-Gate 'check: ONNX CUDA API and Candle engines' $repo {
 }
 
 # ── Tests ──
-Invoke-Gate 'test: workspace (default features)' $repo { cargo test --workspace }
+Invoke-Gate 'test: workspace (default features, transcribe-rs OpenAI engine on a loopback mock)' $repo {
+    cargo test --workspace --features transcribe-rs/openai
+}
 # --test-threads=2: the synthetic-audio/QuickJS timing tests are a documented
 # flake class under full parallel load.
 Invoke-Gate 'test: plugin (voice)' $repo {
@@ -66,7 +68,9 @@ Invoke-Gate 'test: plugin (voice)' $repo {
 }
 
 # ── Lints ──
-Invoke-Gate 'clippy: workspace (deny-level lints)' $repo { cargo clippy --workspace --all-targets }
+Invoke-Gate 'clippy: workspace (deny-level lints)' $repo {
+    cargo clippy --workspace --all-targets --features transcribe-rs/openai
+}
 Invoke-Gate 'clippy: plugin (voice)' $repo {
     cargo clippy -p aokie-plugin --all-targets --features voice
 }
