@@ -83,8 +83,11 @@ pub fn logcat(message: &str) {
 
         #[link(name = "log")]
         extern "C" {
-            fn __android_log_write(priority: c_int, tag: *const c_char, text: *const c_char)
-                -> c_int;
+            fn __android_log_write(
+                priority: c_int,
+                tag: *const c_char,
+                text: *const c_char,
+            ) -> c_int;
         }
         const ANDROID_LOG_INFO: c_int = 4;
         let tag = CString::new(TAG).expect("tag has no NUL");
@@ -208,7 +211,10 @@ mod tests {
             "error sending request",
             Some(Box::new(Layer(
                 "client error (Connect)",
-                Some(Box::new(Layer("invalid peer certificate: UnknownIssuer", None))),
+                Some(Box::new(Layer(
+                    "invalid peer certificate: UnknownIssuer",
+                    None,
+                ))),
             ))),
         );
         assert_eq!(
@@ -219,20 +225,35 @@ mod tests {
 
     #[test]
     fn only_a_completed_request_or_a_returned_error_counts_as_a_verdict() {
-        assert_eq!(verdict(Expect::Accept, "request_ok status=200 ms=90"), "as_expected");
-        assert_eq!(verdict(Expect::Reject, "request_ok status=200 ms=90"), "UNEXPECTED_SUCCESS");
+        assert_eq!(
+            verdict(Expect::Accept, "request_ok status=200 ms=90"),
+            "as_expected"
+        );
+        assert_eq!(
+            verdict(Expect::Reject, "request_ok status=200 ms=90"),
+            "UNEXPECTED_SUCCESS"
+        );
         assert_eq!(
             verdict(Expect::Reject, "request_failed ms=40 error=\"a <- client error (Connect) <- invalid peer certificate: Expired\""),
             "as_expected"
         );
         assert_eq!(
-            verdict(Expect::Reject, "request_failed ms=15004 error=\"a <- operation timed out\""),
+            verdict(
+                Expect::Reject,
+                "request_failed ms=15004 error=\"a <- operation timed out\""
+            ),
             "INCONCLUSIVE"
         );
-        assert_eq!(verdict(Expect::Accept, "request_failed ms=40 error=\"x\""), "UNEXPECTED_FAILURE");
+        assert_eq!(
+            verdict(Expect::Accept, "request_failed ms=40 error=\"x\""),
+            "UNEXPECTED_FAILURE"
+        );
         // The unfixed verifier panics inside the request task: neither a success nor a refusal.
         for expect in [Expect::Accept, Expect::Reject] {
-            assert_eq!(verdict(expect, "task_failed error=\"task 8 panicked\""), "BROKEN");
+            assert_eq!(
+                verdict(expect, "task_failed error=\"task 8 panicked\""),
+                "BROKEN"
+            );
             assert_eq!(verdict(expect, "client_build_failed error=\"x\""), "BROKEN");
         }
     }
