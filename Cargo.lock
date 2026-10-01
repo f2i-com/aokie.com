@@ -112,7 +112,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rubato",
  "rustfft",
- "safetensors 0.4.5",
+ "safetensors 0.8.0",
  "serde",
  "serde_json",
  "sherpa-rs",
