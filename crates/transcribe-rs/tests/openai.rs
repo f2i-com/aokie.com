@@ -5,7 +5,11 @@ use transcribe_rs::{
     RemoteTranscriptionEngine,
 };
 
+// This test calls the real OpenAI API with OPENAI_API_KEY from the environment, so it is skipped
+// unless asked for: `cargo test -p transcribe-rs --features openai -- --ignored`. The request shape
+// is checked against a loopback server, with no network, in `tests/openai_mock.rs`.
 #[tokio::test]
+#[ignore = "calls the real OpenAI API and needs OPENAI_API_KEY"]
 async fn test_dots_transcription() {
     let engine = openai::default_engine();
 
