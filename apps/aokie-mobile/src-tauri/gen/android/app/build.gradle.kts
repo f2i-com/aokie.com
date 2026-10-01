@@ -1,4 +1,3 @@
-import groovy.json.JsonSlurper
 import java.util.Properties
 
 plugins {
@@ -70,44 +69,24 @@ rust {
 }
 
 // rustls-platform-verifier: reqwest's `rustls` feature verifies server certificates through the Android
-// trust store, using a small Java component that the `rustls-platform-verifier-android` crate ships as a
-// local Maven repository. Cargo.lock pins the crate, so the component's version follows the Rust side.
-// `cargo build` normally has unpacked the crate in the Cargo registry before Gradle asks; when it has
-// not, `cargo metadata` fetches it and says where it is. Nothing is downloaded from anywhere else.
-fun findRustlsPlatformVerifier(): Pair<File, String> {
+// trust store, using a small Java component, org.rustls:rustls-platform-verifier. Since the
+// `rustls-platform-verifier-android` crate moved to 0.2.0 the crate no longer carries that component: it
+// is published as a Maven archive on GitHub (the repository below, which is what the crate's own Gradle
+// instructions give), so an Android build now downloads it from there. Cargo.lock pins the crate, so the
+// component's version follows the Rust side; the repository is limited to the org.rustls group so that
+// nothing else is looked up there.
+val rustlsPlatformVerifierVersion: String = run {
     val crate = "rustls-platform-verifier-android"
-    val workspaceRoot = File(rootDir, "../../../../..").canonicalFile
-    val lockedVersion = File(workspaceRoot, "Cargo.lock").takeIf { it.isFile }?.readText()?.let {
-        Regex("name = \"$crate\"\\s+version = \"([^\"]+)\"").find(it)?.groupValues?.get(1)
-    }
-    val cargoHome = System.getenv("CARGO_HOME")?.let(::File) ?: File(System.getProperty("user.home"), ".cargo")
-    if (lockedVersion != null) {
-        File(cargoHome, "registry/src").listFiles()
-            ?.map { File(it, "$crate-$lockedVersion/maven") }
-            ?.firstOrNull { it.isDirectory }
-            ?.let { return it to lockedVersion }
-    }
-    val metadata = providers.exec {
-        workingDir = rootDir
-        commandLine(
-            "cargo", "metadata", "--format-version", "1", "--locked",
-            "--filter-platform", "x86_64-linux-android",
-            "--manifest-path", File(rootDir, "../../Cargo.toml").canonicalPath,
-        )
-    }.standardOutput.asText.get()
-    @Suppress("UNCHECKED_CAST")
-    val packages = (JsonSlurper().parseText(metadata) as Map<String, Any?>)["packages"] as List<Map<String, Any?>>
-    val found = packages.first { it["name"] == crate }
-    return File(File(found["manifest_path"] as String).parentFile, "maven") to (found["version"] as String)
+    val lockFile = File(rootDir, "../../../../../Cargo.lock").canonicalFile
+    if (!lockFile.isFile) throw GradleException("Cargo.lock not found at $lockFile")
+    Regex("name = \"$crate\"\\s+version = \"([^\"]+)\"").find(lockFile.readText())?.groupValues?.get(1)
+        ?: throw GradleException("$crate not found in $lockFile")
 }
-
-val rustlsPlatformVerifier = findRustlsPlatformVerifier()
 
 repositories {
     maven {
-        url = uri(rustlsPlatformVerifier.first)
-        metadataSources.artifact()
-        content { includeGroup("rustls") }
+        url = uri("https://github.com/rustls/rustls-platform-verifier/raw/maven-archive/android-release-support/maven/")
+        content { includeGroup("org.rustls") }
     }
 }
 
@@ -142,8 +121,8 @@ dependencies {
     // Android target. The Rust Gradle task copies that architecture-neutral
     // jar here before dex/package tasks execute.
     implementation(files("libs/libwebrtc.jar"))
-    // The certificate verifier's Java component (see findRustlsPlatformVerifier above).
-    implementation("rustls:rustls-platform-verifier:${rustlsPlatformVerifier.second}")
+    // The certificate verifier's Java component (see rustlsPlatformVerifierVersion above).
+    implementation("org.rustls:rustls-platform-verifier:$rustlsPlatformVerifierVersion")
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")

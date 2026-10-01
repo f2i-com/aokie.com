@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug builds only. rustls-platform-verifier-android 0.2.0 ships its own network_security_config with
+  `<base-config cleartextTrafficPermitted="false" />`, which Android applies to the whole app and which
+  overrides android:usesCleartextTraffic. That is what a release build wants (cleartext only to the
+  certificate-revocation hosts the library lists), but a debug build loads the Vite dev server over
+  http, so `tauri android dev` would stop working. A resource of the same name in this source set wins over
+  the library's, and keeps what debug builds did before: cleartext allowed (debug sets
+  usesCleartextTraffic to true). Release builds use the library's file unchanged.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

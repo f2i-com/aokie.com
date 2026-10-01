@@ -13,14 +13,19 @@
 //!
 //! `reqwest`'s `rustls` feature verifies server certificates with `rustls-platform-verifier`. On
 //! Android that verifier asks the system trust store through JNI, using a small Java component
-//! (`org.rustls.platformverifier.CertificateVerifier`, shipped inside the
-//! `rustls-platform-verifier-android` crate) and the application Context. Until it has been given
-//! that Context it panics on the first TLS handshake ("Expect rustls-platform-verifier to be
-//! initialized"), so every HTTPS call the app makes fails on a device. Three pieces make it work,
-//! and all three are needed:
+//! (`org.rustls.platformverifier.CertificateVerifier`, published as the Maven artifact
+//! `org.rustls:rustls-platform-verifier` whose version is that of the `rustls-platform-verifier-android`
+//! crate) and the application Context. Until it has been given that Context it panics on the first TLS
+//! handshake ("Expect rustls-platform-verifier to be initialized"), so every HTTPS call the app makes
+//! fails on a device. Three pieces make it work, and all three are needed:
 //!
-//! 1. Gradle: the crate's bundled Maven repository and the `rustls:rustls-platform-verifier`
-//!    dependency (`gen/android/app/build.gradle.kts`).
+//! 1. Gradle: the GitHub-hosted Maven archive that `rustls-platform-verifier-android` 0.2.0 points to
+//!    (the crate itself no longer carries the component, so an Android build downloads it from there)
+//!    and the `org.rustls:rustls-platform-verifier` dependency, at the version Cargo.lock names
+//!    (`gen/android/app/build.gradle.kts`). The component's manifest brings a network security config
+//!    that forbids cleartext app-wide except to certificate-revocation hosts; debug builds replace it
+//!    with one that allows cleartext, for the dev server
+//!    (`gen/android/app/src/debug/res/xml/network_security_config.xml`).
 //! 2. R8: the rule `-keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }`
 //!    (`gen/android/app/proguard-rules.pro`), because R8 cannot see the JNI use and would remove or
 //!    rename the component in a minified build.
@@ -125,6 +130,8 @@ mod tests {
         include_str!("../gen/android/app/src/main/java/com/aokie/companion/MainActivity.kt");
     const PROGUARD: &str = include_str!("../gen/android/app/proguard-rules.pro");
     const GRADLE: &str = include_str!("../gen/android/app/build.gradle.kts");
+    const DEBUG_NETWORK_SECURITY_CONFIG: &str =
+        include_str!("../gen/android/app/src/debug/res/xml/network_security_config.xml");
     const MEDIA: &str = include_str!("media.rs");
     const SOURCE: &str = include_str!("native_init.rs");
 
@@ -206,12 +213,34 @@ mod tests {
 
     #[test]
     fn gradle_pulls_in_the_verifier_component_and_checks_it_survives_r8() {
-        assert!(GRADLE.contains("implementation(\"rustls:rustls-platform-verifier:"));
-        assert!(GRADLE.contains("includeGroup(\"rustls\")"));
+        assert!(GRADLE.contains("implementation(\"org.rustls:rustls-platform-verifier:"));
+        assert!(
+            GRADLE.contains("includeGroup(\"org.rustls\")"),
+            "the Maven archive must only serve the verifier's own group"
+        );
+        assert!(
+            GRADLE.contains(
+                "https://github.com/rustls/rustls-platform-verifier/raw/maven-archive/android-release-support/maven/"
+            ),
+            "the repository the crate's Gradle instructions name"
+        );
+        assert!(
+            GRADLE.contains("\"rustls-platform-verifier-android\""),
+            "the component's version must come from the locked crate"
+        );
         assert!(
             GRADLE.contains("\"org.rustls.platformverifier.CertificateVerifier\""),
             "the post-R8 check must list the verifier component"
         );
+    }
+
+    #[test]
+    fn debug_builds_keep_cleartext_for_the_dev_server_despite_the_verifier_components_config() {
+        // The component's manifest sets `android:networkSecurityConfig` with cleartext off for the whole
+        // app, overriding `usesCleartextTraffic`. A debug build loads the dev server over http.
+        assert!(DEBUG_NETWORK_SECURITY_CONFIG
+            .contains("<base-config cleartextTrafficPermitted=\"true\" />"));
+        assert!(GRADLE.contains("manifestPlaceholders[\"usesCleartextTraffic\"] = \"true\""));
     }
 
     #[test]
