@@ -119,9 +119,8 @@ pub fn ensure_https_ready() -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const KOTLIN: &str = include_str!(
-        "../gen/android/app/src/main/java/com/aokie/companion/AokieNativeInit.kt"
-    );
+    const KOTLIN: &str =
+        include_str!("../gen/android/app/src/main/java/com/aokie/companion/AokieNativeInit.kt");
     const MAIN_ACTIVITY: &str =
         include_str!("../gen/android/app/src/main/java/com/aokie/companion/MainActivity.kt");
     const PROGUARD: &str = include_str!("../gen/android/app/proguard-rules.pro");
