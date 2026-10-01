@@ -195,7 +195,7 @@ You need Windows 10/11 x64 with:
 - For the `voice` feature: CMake for the sherpa-onnx build (or `SHERPA_LIB_PATH` pointing
   at an existing build; see [dependency maintenance](docs/dependency-maintenance.md)), and
   at run time ONNX Runtime and the speech models.
-- Node.js 20 for the Companion app and the screen checks.
+- Node.js 22 for the Companion app and the screen checks.
 
 The plugin is left out of the workspace's `default-members`, so a bare `cargo build`
 builds only five library crates. Name the package:
