@@ -44,7 +44,10 @@
 
 use async_openai::{
     config::OpenAIConfig,
-    types::{AudioInput, CreateTranscriptionRequestArgs, InputSource},
+    types::{
+        audio::{AudioInput, AudioResponseFormat, CreateTranscriptionRequestArgs},
+        InputSource,
+    },
 };
 use async_trait::async_trait;
 use derive_builder::Builder;
@@ -78,9 +81,9 @@ pub fn default_engine() -> OpenAIEngine<OpenAIConfig> {
     }
 }
 
-pub use async_openai::types::TimestampGranularity as OpenAITimestampGranularity;
+pub use async_openai::types::audio::TimestampGranularity as OpenAITimestampGranularity;
 
-/// https://docs.rs/async-openai/latest/src/async_openai/types/audio.rs.html#72-99
+/// https://docs.rs/async-openai/0.42.0/async_openai/types/audio/struct.CreateTranscriptionRequest.html
 #[derive(Builder, Debug)]
 #[builder(setter(into), default)]
 pub struct OpenAIRequestParams {
@@ -181,7 +184,7 @@ where
         // for different models.
         match params.model {
             OpenAIModel::Gpt4oMiniTranscribe | OpenAIModel::Gpt4oTranscribe => {
-                request.response_format(async_openai::types::AudioResponseFormat::Json);
+                request.response_format(AudioResponseFormat::Json);
 
                 let request = request
                     .build()
@@ -190,7 +193,8 @@ where
                 let response = self
                     .client
                     .audio()
-                    .transcribe(request)
+                    .transcription()
+                    .create(request)
                     .await
                     .map_err(|e| TranscribeError::Inference(e.to_string()))?;
 
@@ -200,7 +204,7 @@ where
                 });
             }
             OpenAIModel::Whisper1 => {
-                request.response_format(async_openai::types::AudioResponseFormat::VerboseJson);
+                request.response_format(AudioResponseFormat::VerboseJson);
 
                 if let Some(timestamp_granularity) = &params.timestamp_granularity {
                     // OpenAI APi allows multiple levels of granularities in the
@@ -215,12 +219,13 @@ where
                 let response = self
                     .client
                     .audio()
-                    .transcribe_verbose_json(request)
+                    .transcription()
+                    .create_verbose_json(request)
                     .await
                     .map_err(|e| TranscribeError::Inference(e.to_string()))?;
 
                 let segments = match params.timestamp_granularity {
-                    Some(async_openai::types::TimestampGranularity::Word) => Some(
+                    Some(OpenAITimestampGranularity::Word) => Some(
                         response
                             .words
                             .unwrap()
@@ -232,7 +237,7 @@ where
                             })
                             .collect(),
                     ),
-                    Some(async_openai::types::TimestampGranularity::Segment) => Some(
+                    Some(OpenAITimestampGranularity::Segment) => Some(
                         response
                             .segments
                             .unwrap()
