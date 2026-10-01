@@ -271,6 +271,10 @@ impl RelayChannel {
         device_id: &str,
         prime_tail: bool,
     ) -> Result<(Self, EndpointChallengeFrame), RelayConnectError> {
+        crate::native_init::ensure_https_ready().map_err(|message| RelayConnectError {
+            message,
+            admission_rejected: false,
+        })?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
