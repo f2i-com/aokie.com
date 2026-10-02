@@ -157,6 +157,36 @@ offer expiry/cancellation, first-winner reconciliation, audio focus, and media
 on physical hardware. An emulator is not a meaningful Bluetooth/cellular
 audio-route test.
 
+### Back button
+
+Back never finishes the activity (`MainActivity`, `AokieBackPolicy.kt`): while the page has history it goes back in
+the page, otherwise the task moves to the background, as Home does. The page itself has no history or Back handling,
+so on every screen Back sends the app to the background; an open dialog is still open when the app returns (its own
+close button closes it), and a soft keyboard is closed by the first Back as usual.
+
+Finishing the activity used to be the answer, and it aborted the process: the destroy ends Tauri's runtime with
+`process::exit`, libc runs the static destructors of every library while the process's render thread is still
+tearing the WebView down, and Android's own `libhwui` hits a destroyed mutex (`FORTIFY: pthread_mutex_lock called on
+a destroyed mutex`, `WebViewFunctorManager::destroyFunctor`). On the emulator that was logged after nearly every
+Back at the first screen; Android recorded a native crash (SIGABRT or SIGSEGV in the RenderThread, a DropBox
+`data_app_native_crash` entry) whenever the abort beat the exit: 3 of 12 Backs in a debug build with the guest CPU
+loaded, none in 44 release-build Backs, where the exit won every time.
+
+Any other way the activity is destroyed (the system removing the task, a swipe from the recents screen) still ends
+the runtime. `src-tauri/src/process_exit.rs` therefore ends the process with `_exit` instead of `exit` when Tauri
+reports `RunEvent::Exit`: no destructors run, so there is nothing for the render thread to trip over.
+
+Separately, `vendor/wry-0.57.0-patched` removes a start-up abort in wry's Android main-thread pump (see
+`vendor/README.md`). To check it after touching that crate, temporarily make `MainActivity.onCreate` sleep 12
+seconds after `super.onCreate` in a debug build (never commit that): the app must still start and nothing may log
+`panicked at`.
+
+To check the Back policy on an emulator (never on a phone that is attached over adb: pin every command with
+`-s emulator-5554`): start the app, wait for the first screen, `adb -s emulator-5554 shell input keyevent
+KEYCODE_BACK`, then expect the process to be alive (`pidof com.aokie.companion`), the launcher on top, and no
+`FORTIFY`, `panicked at` or `Fatal signal` in `adb -s emulator-5554 logcat -d`. To check `process_exit.rs`, remove
+the task (`am stack remove <id> ` for the root task that `am stack list` shows for the app, then Home if the
+recents screen is open) and expect no `FORTIFY` either.
 ## Tests
 
 ```powershell
