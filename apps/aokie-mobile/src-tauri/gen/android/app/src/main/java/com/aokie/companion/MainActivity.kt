@@ -1,6 +1,7 @@
 package com.aokie.companion
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -9,6 +10,8 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.WindowManager
+import android.webkit.WebView
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.core.content.ContextCompat
 
@@ -20,18 +23,61 @@ class MainActivity : TauriActivity() {
   private var notificationRequestedAtMs = 0L
   private var notificationRationaleBefore = false
 
+  /** The page, once Tauri has created the WebView (see [onWebViewCreate]). */
+  private var page: WebView? = null
+
+  /** This activity as the Back policy sees it (see [handleBack]). */
+  private val backHost = object : BackHost {
+    override fun pageCanGoBack(): Boolean = page?.canGoBack() == true
+
+    override fun goBackInPage() {
+      page?.goBack()
+    }
+
+    override fun moveTaskToBackground() {
+      moveTaskToBack(true)
+    }
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     // Must precede super.onCreate, which starts the Rust runtime: the native start-up here needs a
     // Java frame with the app's class loader (see AokieNativeInit).
     AokieNativeInit.initialize(this)
     super.onCreate(savedInstanceState)
+    // Back before Tauri's own Back callback exists (it is added once the runtime has loaded its app plugin, which
+    // then calls onBackPressed below when the page cannot go back): without this, Android's default would finish
+    // the activity. See AokieBackPolicy.
+    onBackPressedDispatcher.addCallback(
+      this,
+      object : OnBackPressedCallback(true) {
+        override fun handleOnBackPressed() = handleBack(backHost)
+      },
+    )
     AokieCallNotifications.createChannels(this)
     AokieAudioRoutes.initialize(this)
     AokieOfferStore.current(this, clearExpired = true)
     AokiePushRegistration.ensure(this)
     handleWakeIntent(intent)
   }
+
+  override fun onWebViewCreate(webView: WebView) {
+    page = webView
+  }
+
+  override fun onDestroy() {
+    page = null
+    super.onDestroy()
+  }
+
+  /**
+   * Tauri's Back callback ends here when the page cannot go back (it would otherwise call the platform default,
+   * which finishes the activity). Back moves the task to the background instead; see AokieBackPolicy for why
+   * finishing the activity is never the answer. Not calling super is the point: the default is the finish.
+   */
+  @SuppressLint("MissingSuperCall")
+  @Suppress("OVERRIDE_DEPRECATION")
+  override fun onBackPressed() = handleBack(backHost)
 
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)

@@ -10,6 +10,7 @@ mod media;
 mod mobile_api;
 mod native_init;
 mod peer_trust;
+mod process_exit;
 mod push_registration;
 mod realtime;
 mod realtime_v2;
@@ -216,9 +217,19 @@ pub fn run() {
         Ok(())
     });
 
-    builder
-        .run(tauri::generate_context!())
+    // `Builder::run` is `build` followed by `App::run` with no callback; the callback is only there to end the
+    // Android process without libc's static destructors (see process_exit.rs).
+    let app = builder
+        .build(tauri::generate_context!())
         .expect("error while running Aokie Companion");
+    app.run(|_app, event| {
+        #[cfg(target_os = "android")]
+        if matches!(event, tauri::RunEvent::Exit) {
+            process_exit::exit_now();
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = event;
+    });
 }
 
 // Keep the exported command response types referenced in this module so the

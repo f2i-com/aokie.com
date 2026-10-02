@@ -60,3 +60,6 @@ uuid = { version = "1.0", features = ["v4"] }
 # GTK 3 compatibility backport of RUSTSEC-2024-0429 (see vendor/README.md).
 [patch.crates-io]
 glib = { path = "vendor/glib" }
+# wry 0.57.0 with its Android main-thread message pump made panic-free: a late answer there aborts the app
+# process (see vendor/README.md).
+wry = { path = "vendor/wry-0.57.0-patched" }
