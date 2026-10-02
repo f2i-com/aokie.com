@@ -29,6 +29,11 @@ const PAIRING_TTL_SECONDS: u64 = 10 * 60;
 const RESPONSE_TTL_SECONDS: u64 = 2 * 60;
 const CLOCK_SKEW_SECONDS: u64 = 5;
 const PAIRING_RESPONSE_DOMAIN: &str = "aokie/v2/mobile-pairing-response";
+const OFFER_KIND: &str = "aokie_mobile_pairing";
+/// The one offer format this build reads.
+const OFFER_SCHEMA_VERSION: u64 = 2;
+const NEWER_OFFER_MESSAGE: &str =
+    "This pairing offer is from a newer version of OAIY: update this app";
 
 #[derive(Clone, Default)]
 pub struct DesktopPairingState {
@@ -308,10 +313,23 @@ fn parse_offer_at(offer_json: &str, now: u64) -> Result<PairingPayload, String> 
     if trimmed.is_empty() || trimmed.len() > MAX_OFFER_BYTES {
         return Err("Desktop pairing offer must be 1-16384 UTF-8 bytes".into());
     }
+    // A newer offer format keeps the `kind` and raises the version, and carries members this build does not
+    // know. The strict decode below would call that "malformed", which sends the user hunting for a typo: say
+    // what is true. Only a well-formed object that names this kind and a higher integer version is read this way.
+    if let Ok(Value::Object(members)) = serde_json::from_str::<Value>(trimmed) {
+        let newer = members.get("kind").and_then(Value::as_str) == Some(OFFER_KIND)
+            && members
+                .get("schemaVersion")
+                .and_then(Value::as_u64)
+                .is_some_and(|version| version > OFFER_SCHEMA_VERSION);
+        if newer {
+            return Err(NEWER_OFFER_MESSAGE.into());
+        }
+    }
     let payload: PairingPayload = serde_json::from_str(trimmed).map_err(|_| {
         "Desktop pairing offer is malformed or contains unsupported fields".to_string()
     })?;
-    if payload.kind != "aokie_mobile_pairing" || payload.schema_version != 2 {
+    if payload.kind != OFFER_KIND || u64::from(payload.schema_version) != OFFER_SCHEMA_VERSION {
         return Err("unsupported Desktop pairing offer".into());
     }
     for (value, label) in [
@@ -728,6 +746,72 @@ mod tests {
         let mut expired: Value = serde_json::from_str(&offer_json(now)).unwrap();
         expired["expiresAt"] = Value::from(now);
         assert!(parse_offer_at(&expired.to_string(), now).is_err());
+    }
+
+    #[test]
+    fn a_newer_offer_format_is_named_as_newer_not_as_malformed() {
+        let now = 1_700_000_000;
+        // The shape of an OAIY pairing v3 offer: the same kind, a higher version, and members this build lacks.
+        let mut newer: Value = serde_json::from_str(&offer_json(now)).unwrap();
+        newer["schemaVersion"] = Value::from(3);
+        newer["desktopName"] = Value::String("Front desk PC".into());
+        newer["relay"] =
+            serde_json::json!({"url": "https://relay.example.com", "fingerprint": "f"});
+        assert_eq!(
+            parse_offer_at(&newer.to_string(), now).unwrap_err(),
+            "This pairing offer is from a newer version of OAIY: update this app"
+        );
+        // The version alone is enough to say so, and a far higher one too.
+        let mut only_version: Value = serde_json::from_str(&offer_json(now)).unwrap();
+        only_version["schemaVersion"] = Value::from(40);
+        assert_eq!(
+            parse_offer_at(&only_version.to_string(), now).unwrap_err(),
+            NEWER_OFFER_MESSAGE
+        );
+    }
+
+    #[test]
+    fn really_malformed_offers_are_still_reported_as_malformed() {
+        let now = 1_700_000_000;
+        let malformed = "Desktop pairing offer is malformed or contains unsupported fields";
+        // Not JSON at all, and JSON that is not an object.
+        assert_eq!(
+            parse_offer_at("this is not an offer", now).unwrap_err(),
+            malformed
+        );
+        assert_eq!(parse_offer_at("[1, 2, 3]", now).unwrap_err(), malformed);
+        // The current version with an unknown member stays strict.
+        let mut unknown: Value = serde_json::from_str(&offer_json(now)).unwrap();
+        unknown["relay"] = serde_json::json!({"url": "https://relay.example.com"});
+        assert_eq!(
+            parse_offer_at(&unknown.to_string(), now).unwrap_err(),
+            malformed
+        );
+        // A higher version of some other kind is not this app's to call newer.
+        let mut other_kind: Value = serde_json::from_str(&offer_json(now)).unwrap();
+        other_kind["kind"] = Value::String("something_else".into());
+        other_kind["schemaVersion"] = Value::from(3);
+        other_kind["extra"] = Value::Bool(true);
+        assert_eq!(
+            parse_offer_at(&other_kind.to_string(), now).unwrap_err(),
+            malformed
+        );
+        // A version that is not an integer is malformed, not newer.
+        let mut text_version: Value = serde_json::from_str(&offer_json(now)).unwrap();
+        text_version["schemaVersion"] = Value::String("3".into());
+        assert_eq!(
+            parse_offer_at(&text_version.to_string(), now).unwrap_err(),
+            malformed
+        );
+        // An older or other version of the right shape is unsupported, as before.
+        let mut older: Value = serde_json::from_str(&offer_json(now)).unwrap();
+        older["schemaVersion"] = Value::from(1);
+        assert_eq!(
+            parse_offer_at(&older.to_string(), now).unwrap_err(),
+            "unsupported Desktop pairing offer"
+        );
+        // The offer this build reads still parses.
+        assert!(parse_offer_at(&offer_json(now), now).is_ok());
     }
 
     #[test]
