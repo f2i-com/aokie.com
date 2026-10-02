@@ -1482,6 +1482,10 @@ export class TauriCompanionBridge implements CompanionBridge {
     return invoke<boolean>("request_notification_permission");
   }
 
+  async openNotificationSettings(): Promise<boolean> {
+    return invoke<boolean>("open_notification_settings");
+  }
+
   async getCompanionBootstrap(): Promise<CompanionBootstrap> {
     return parseCompanionBootstrap(await invoke("companion_bootstrap"));
   }

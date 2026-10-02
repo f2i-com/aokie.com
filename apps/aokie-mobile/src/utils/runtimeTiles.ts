@@ -25,3 +25,40 @@ export function nativeCallsTile(
   }
   return { ready: false, status: "Not installed" };
 }
+
+export interface NotificationPrompt {
+  kind: "request" | "open_settings";
+  sentence: string;
+  actionLabel: string;
+}
+
+/**
+ * What the setup screen says and does about denied notifications. While Android will still show its dialog the
+ * button asks for the permission. Once Android has stopped showing it (the question was declined twice) a request
+ * would do nothing, so the button opens the app's notification settings and the sentence says why.
+ */
+export function notificationPrompt(
+  runtime: Pick<RuntimeCapabilities, "platform" | "notificationPermission" | "notificationPermissionBlocked">,
+): NotificationPrompt | null {
+  if (
+    runtime.platform !== "android" ||
+    runtime.notificationPermission === "granted" ||
+    runtime.notificationPermission === "not_required"
+  ) {
+    return null;
+  }
+  if (runtime.notificationPermissionBlocked) {
+    return {
+      kind: "open_settings",
+      sentence:
+        "Android will not ask for notifications again because the question was declined twice. Open this app's notification settings and turn notifications on: genuine voice offers need them to ring. Microphone access remains a separate, later prompt used only after an active talk lease.",
+      actionLabel: "Open notification settings",
+    };
+  }
+  return {
+    kind: "request",
+    sentence:
+      "Android notifications are currently denied. Genuine voice offers cannot start Core-Telecom or a foreground call surface until you allow them. Microphone access remains a separate, later prompt used only after an active talk lease.",
+    actionLabel: "Allow call notifications",
+  };
+}

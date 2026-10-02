@@ -98,6 +98,7 @@ export class DemoCompanionBridge implements CompanionBridge {
       demo: true,
       localPilot: false,
       notificationPermission: "not_applicable",
+      notificationPermissionBlocked: false,
       microphonePermission: "not_applicable",
       fcmConfigured: false,
       fcmTokenPresent: false,
@@ -145,6 +146,7 @@ export class DemoCompanionBridge implements CompanionBridge {
   async restoreManaged(): Promise<RealtimeConfig | null> { return null; }
   async forgetManaged(): Promise<void> {}
   async requestNotificationPermission(): Promise<boolean> { return false; }
+  async openNotificationSettings(): Promise<boolean> { return false; }
   async getCompanionBootstrap(): Promise<CompanionBootstrap> { throw new Error("Demo mode has no managed Companion account data."); }
   async getCompanionHistory(_limit?: number, _before?: number): Promise<CompanionHistory> { throw new Error("Demo mode has no managed Companion account data."); }
   async getCompanionRouting(): Promise<CompanionRouting> { throw new Error("Demo mode has no managed Companion account data."); }

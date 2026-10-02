@@ -49,6 +49,7 @@ const runtime: RuntimeCapabilities = {
   demo: false,
   localPilot: true,
   notificationPermission: "granted",
+  notificationPermissionBlocked: false,
   microphonePermission: "prompt",
   fcmConfigured: false,
   fcmTokenPresent: false,
