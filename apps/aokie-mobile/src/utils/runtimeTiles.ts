@@ -34,8 +34,8 @@ export interface NotificationPrompt {
 
 /**
  * What the setup screen says and does about denied notifications. While Android will still show its dialog the
- * button asks for the permission. Once Android has stopped showing it (the question was declined twice) a request
- * would do nothing, so the button opens the app's notification settings and the sentence says why.
+ * button asks for the permission. Once Android has stopped showing it (the user declined twice, or Settings fixed the
+ * choice) a request would do nothing, so the button opens the app's notification settings and the sentence says why.
  */
 export function notificationPrompt(
   runtime: Pick<RuntimeCapabilities, "platform" | "notificationPermission" | "notificationPermissionBlocked">,
@@ -51,7 +51,7 @@ export function notificationPrompt(
     return {
       kind: "open_settings",
       sentence:
-        "Android will not ask for notifications again because the question was declined twice. Open this app's notification settings and turn notifications on: genuine voice offers need them to ring. Microphone access remains a separate, later prompt used only after an active talk lease.",
+        "Android will not ask for notifications again for this app, so the question cannot be shown from here. Open this app's notification settings and turn notifications on: genuine voice offers need them to ring. Microphone access remains a separate, later prompt used only after an active talk lease.",
       actionLabel: "Open notification settings",
     };
   }
