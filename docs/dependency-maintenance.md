@@ -42,6 +42,21 @@ The GLib 0.18 GTK compatibility backport and its Linux release-mode regression
 test are documented in [vendor/README.md](../vendor/README.md). Do not replace
 it with an additional newer GLib dependency: the old GTK dependency would remain.
 
+`wry` 0.57.0 is patched the same way (`vendor/wry-0.57.0-patched`, a path entry under `[patch.crates-io]` in the
+root `Cargo.toml`; `Cargo.lock` therefore has no registry `source`/`checksum` for it). On Android a late answer on
+the main-thread message pump aborted the whole app: `GetWebViewVersion` is asked for while the runtime is created,
+waits 10 seconds, and a slow start-up (a main thread still in `Activity.onCreate`, as on a small emulator right
+after an install) first made wry panic on the dropped receiver and then made Tauri refuse to create the webview.
+After a `tauri` or `wry` bump, check whether the new wry still needs the patch (the `unwrap` on `tx.send` in
+`src/android/main_pipe.rs`, the 10 s wait in `platform_webview_version`), drop it if not, and otherwise re-apply the
+edits marked `PATCH (aokie)` to the new source and update the checksum in `vendor/README.md`. Re-run the
+12-second main-thread stall check described in `apps/aokie-mobile/README.md`.
+
+Do not make `Activity.finish()` the Android Back behaviour again (see "Back button" in
+`apps/aokie-mobile/README.md`): the destroy path ends in `process::exit`, which races Android's `libhwui` render
+thread and aborts the process. `src-tauri/src/process_exit.rs` exists for the same reason; a newer tao or Tauri that
+no longer calls `process::exit` on the Android destroy path would make it unnecessary.
+
 On recent Windows installations, Sherpa 0.6.8's source build can fail because
 its CMake OS-description probe invokes the removed `wmic` executable. Its
 supported `SHERPA_LIB_PATH` setting can use an existing matching Sherpa build:
