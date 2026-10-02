@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.WindowManager
 import androidx.activity.enableEdgeToEdge
@@ -14,6 +15,10 @@ import androidx.core.content.ContextCompat
 class MainActivity : TauriActivity() {
   private val microphonePermissionResults = mutableMapOf<Int, Int>()
   private val notificationPermissionResults = mutableMapOf<Int, Int>()
+
+  /** What Android offered when the notification request went out, to read its answer by (see [answerIsFinal]). */
+  private var notificationRequestedAtMs = 0L
+  private var notificationRationaleBefore = false
 
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
@@ -93,6 +98,8 @@ class MainActivity : TauriActivity() {
     }
     if (notificationPermissionResults[requestId] == 0) return 0
     notificationPermissionResults[requestId] = 0
+    notificationRationaleBefore = shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)
+    notificationRequestedAtMs = SystemClock.elapsedRealtime()
     requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), requestId)
     return 0
   }
@@ -219,12 +226,17 @@ class MainActivity : TauriActivity() {
     if (permissions.any { it == Manifest.permission.POST_NOTIFICATIONS }) {
       val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
       notificationPermissionResults[requestCode] = if (granted) 1 else -1
-      // A denial that Android will not follow up with a rationale is final: remember it, so the setup screen can
-      // send the user to the notification settings instead of a button that cannot show the dialog again.
+      // Remember when Android will not show the question again, so the setup screen can send the user to the
+      // notification settings instead of a button that cannot show the dialog. A dialog the user merely closed
+      // does not count: see answerIsFinal.
       AokieNotificationPrompt.recordAnswer(
         this,
-        granted,
-        shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS),
+        answerIsFinal(
+          granted = granted,
+          canAskAgainBefore = notificationRationaleBefore,
+          canAskAgainAfter = shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS),
+          answeredAfterMs = SystemClock.elapsedRealtime() - notificationRequestedAtMs,
+        ),
       )
     }
   }
