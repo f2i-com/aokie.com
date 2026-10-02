@@ -64,6 +64,7 @@ import {
   createCompanionCallState,
 } from "./state/callReducer";
 import { displayError } from "./utils/displayError";
+import { refreshWhenForegrounded } from "./utils/foregroundRefresh";
 
 type AppMode = "setup" | "demo" | "live";
 type SendCommand = <Type extends CommandType>(
@@ -1096,6 +1097,10 @@ function App() {
     setRuntime(capabilities);
     return capabilities;
   }, [bridge]);
+
+  // Permissions and battery settings change while the app is in the background (the user comes back from
+  // Android's Settings): read them again each time the app returns to the foreground.
+  useEffect(() => refreshWhenForegrounded(document, refreshRuntime), [refreshRuntime]);
 
   useEffect(() => {
     if (restoreAttempted.current || !runtime.tauri || !runtime.secureStorage || mode !== "setup") return;
