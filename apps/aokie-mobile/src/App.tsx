@@ -65,6 +65,7 @@ import {
 } from "./state/callReducer";
 import { displayError } from "./utils/displayError";
 import { refreshWhenForegrounded } from "./utils/foregroundRefresh";
+import { nativeCallsTile } from "./utils/runtimeTiles";
 
 type AppMode = "setup" | "demo" | "live";
 type SendCommand = <Type extends CommandType>(
@@ -1426,6 +1427,7 @@ function SetupScreen({ bridge, runtime, error, connecting, onDemo, onConnect, on
   const [appId, setAppId] = useState(DEFAULT_APP_ID);
   const [deviceId, setDeviceId] = useState(import.meta.env.DEV ? "device_local" : "device_local_development");
   const isMobilePlatform = runtime.platform === "android" || runtime.platform === "ios";
+  const nativeCalls = nativeCallsTile(runtime);
   const discoveryTransport = setupTransportState(discoveryUrl, "https:");
   const realtimeUrl = discovery?.realtimeUrl ?? discovery?.gatewayUrl ?? "";
   const realtimeTransport = setupTransportState(realtimeUrl, "wss:");
@@ -1601,7 +1603,7 @@ function SetupScreen({ bridge, runtime, error, connecting, onDemo, onConnect, on
         <div className="runtime-grid" aria-label="Runtime readiness">
           <RuntimeChip icon={Wifi} label="Realtime" ready={runtime.realtime} />
           <RuntimeChip icon={LockKeyhole} label="Secure store" ready={runtime.secureStorage} />
-          <RuntimeChip icon={Smartphone} label="Native calls" ready={runtime.nativeCallUi} />
+          <RuntimeChip icon={Smartphone} label="Native calls" ready={nativeCalls.ready} status={nativeCalls.status} />
           <RuntimeChip icon={Radio} label="Media bridge" ready={runtime.mediaBridge} />
         </div>
 
@@ -1775,8 +1777,8 @@ function SetupReadinessRow({ label, detail, ready = false, warning = false }: { 
   return <div className={`setup-readiness-row ${ready ? "is-ready" : warning ? "is-warning" : "is-pending"}`}>{ready ? <CheckCircle2 size={17} /> : warning ? <AlertTriangle size={17} /> : <RefreshCw size={17} />}<span><strong>{label}</strong><small>{detail}</small></span></div>;
 }
 
-function RuntimeChip({ icon: Icon, label, ready }: { icon: typeof Wifi; label: string; ready: boolean }) {
-  return <span className={ready ? "is-ready" : "is-pending"}><Icon size={15} />{label}<small>{ready ? "Ready" : "Not installed"}</small></span>;
+function RuntimeChip({ icon: Icon, label, ready, status }: { icon: typeof Wifi; label: string; ready: boolean; status?: string }) {
+  return <span className={ready ? "is-ready" : "is-pending"}><Icon size={15} />{label}<small>{status ?? (ready ? "Ready" : "Not installed")}</small></span>;
 }
 
 interface V2LiveRuntimeProps {
