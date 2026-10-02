@@ -3,8 +3,10 @@ package com.aokie.companion
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.WindowManager
 import androidx.activity.enableEdgeToEdge
 import androidx.core.content.ContextCompat
@@ -107,6 +109,20 @@ class MainActivity : TauriActivity() {
     return notificationPermissionResults[requestId] ?: -1
   }
 
+  /**
+   * Opens this app's notification settings, where the user can allow notifications once Android no longer
+   * shows the permission dialog. 1 = opened, -1 = this device has no such screen.
+   */
+  fun openAokieNotificationSettings(): Int = runCatching {
+    val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+    } else {
+      Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null))
+    }
+    startActivity(intent)
+    1
+  }.getOrElse { -1 }
+
   /** Narrow JNI surface. Values never enter WebView storage or callbacks. */
   fun putAokieSecureValue(key: String, value: String): Int =
     if (AokieSecureStore.put(this, key, value)) 1 else -1
@@ -201,8 +217,15 @@ class MainActivity : TauriActivity() {
         if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) 1 else -1
     }
     if (permissions.any { it == Manifest.permission.POST_NOTIFICATIONS }) {
-      notificationPermissionResults[requestCode] =
-        if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) 1 else -1
+      val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+      notificationPermissionResults[requestCode] = if (granted) 1 else -1
+      // A denial that Android will not follow up with a rationale is final: remember it, so the setup screen can
+      // send the user to the notification settings instead of a button that cannot show the dialog again.
+      AokieNotificationPrompt.recordAnswer(
+        this,
+        granted,
+        shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS),
+      )
     }
   }
 

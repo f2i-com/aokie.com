@@ -65,7 +65,7 @@ import {
 } from "./state/callReducer";
 import { displayError } from "./utils/displayError";
 import { refreshWhenForegrounded } from "./utils/foregroundRefresh";
-import { nativeCallsTile } from "./utils/runtimeTiles";
+import { nativeCallsTile, notificationPrompt } from "./utils/runtimeTiles";
 
 type AppMode = "setup" | "demo" | "live";
 type SendCommand = <Type extends CommandType>(
@@ -90,6 +90,7 @@ const DEFAULT_RUNTIME: RuntimeCapabilities = {
   demo: false,
   localPilot: false,
   notificationPermission: "not_applicable",
+  notificationPermissionBlocked: false,
   microphonePermission: "unknown",
   fcmConfigured: false,
   fcmTokenPresent: false,
@@ -1428,6 +1429,7 @@ function SetupScreen({ bridge, runtime, error, connecting, onDemo, onConnect, on
   const [deviceId, setDeviceId] = useState(import.meta.env.DEV ? "device_local" : "device_local_development");
   const isMobilePlatform = runtime.platform === "android" || runtime.platform === "ios";
   const nativeCalls = nativeCallsTile(runtime);
+  const notifications = notificationPrompt(runtime);
   const discoveryTransport = setupTransportState(discoveryUrl, "https:");
   const realtimeUrl = discovery?.realtimeUrl ?? discovery?.gatewayUrl ?? "";
   const realtimeTransport = setupTransportState(realtimeUrl, "wss:");
@@ -1619,17 +1621,23 @@ function SetupScreen({ bridge, runtime, error, connecting, onDemo, onConnect, on
           </section>
         )}
 
-        {runtime.platform === "android" && runtime.notificationPermission !== "granted" && runtime.notificationPermission !== "not_required" && (
+        {notifications && (
           <div className="developer-fields">
-            <p>Android notifications are currently denied. Genuine voice offers cannot start Core-Telecom or a foreground call surface until you allow them. Microphone access remains a separate, later prompt used only after an active talk lease.</p>
+            <p>{notifications.sentence}</p>
             <button className="secondary-button" disabled={requestingNotifications} onClick={() => {
               setRequestingNotifications(true);
-              void bridge.requestNotificationPermission()
-                .then(() => onRefreshRuntime())
-                .catch((caught) => setDiscoveryMessage(displayError(caught, "Notification permission could not be requested")))
+              // Once Android will not show its dialog again, the settings screen is the only way to allow notifications;
+              // the page refreshes its readiness when the user comes back from it.
+              const action = notifications.kind === "open_settings"
+                ? bridge.openNotificationSettings().then((opened) => {
+                    if (!opened) setDiscoveryMessage("This device has no notification settings screen to open. Allow notifications for Aokie Companion in Android's app settings.");
+                  })
+                : bridge.requestNotificationPermission().then(() => onRefreshRuntime());
+              void action
+                .catch((caught) => setDiscoveryMessage(displayError(caught, notifications.kind === "open_settings" ? "Notification settings could not be opened" : "Notification permission could not be requested")))
                 .finally(() => setRequestingNotifications(false));
             }}>
-              {requestingNotifications ? "Waiting for Android…" : "Allow call notifications"}
+              {requestingNotifications ? "Waiting for Android…" : notifications.actionLabel}
             </button>
           </div>
         )}

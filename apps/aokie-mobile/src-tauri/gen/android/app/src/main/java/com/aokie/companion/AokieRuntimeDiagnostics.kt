@@ -42,6 +42,10 @@ internal object AokieRuntimeDiagnostics {
     return JSONObject()
       .put("secureStorage", AokieSecureStore.isAvailable(context))
       .put("notificationPermission", notificationPermission)
+      .put(
+        "notificationPermissionBlocked",
+        AokieNotificationPrompt.blocked(context, Build.VERSION.SDK_INT, notificationPermission == "granted"),
+      )
       .put("microphonePermission", microphonePermission)
       .put("notificationsEnabled", notificationsEnabled)
       .put("nativeCallUi", nativeCallUi)

@@ -11,6 +11,9 @@ use tauri::AppHandle;
 pub(crate) struct AndroidRuntimeDiagnostics {
     pub(crate) secure_storage: bool,
     pub(crate) notification_permission: String,
+    /// Android will not show the notification dialog again: only the app's notification settings can allow them.
+    #[serde(default)]
+    pub(crate) notification_permission_blocked: bool,
     pub(crate) microphone_permission: String,
     pub(crate) notifications_enabled: bool,
     pub(crate) native_call_ui: bool,
@@ -483,6 +486,17 @@ pub(crate) async fn request_notification_permission(_app: &AppHandle) -> Result<
     Ok(false)
 }
 
+/// Opens the app's notification settings (Android). False when this device has no such screen.
+#[cfg(target_os = "android")]
+pub(crate) async fn open_notification_settings(app: &AppHandle) -> Result<bool, String> {
+    Ok(call_int_no_args(app, "openAokieNotificationSettings").await? > 0)
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) async fn open_notification_settings(_app: &AppHandle) -> Result<bool, String> {
+    Ok(false)
+}
+
 #[cfg(target_os = "android")]
 pub(crate) async fn reconcile_offer(
     app: &AppHandle,
@@ -842,6 +856,7 @@ mod tests {
         let encoded = r#"{
           "secureStorage":true,
           "notificationPermission":"granted",
+          "notificationPermissionBlocked":false,
           "microphonePermission":"denied",
           "notificationsEnabled":true,
           "nativeCallUi":true,
@@ -858,6 +873,40 @@ mod tests {
         assert!(value.secure_storage);
         assert!(!value.fcm_token_present);
         assert!(!encoded.contains("refresh_token"));
+    }
+
+    #[test]
+    fn diagnostics_from_an_older_native_layer_still_decode() {
+        // `notificationPermissionBlocked` is new; a build whose Kotlin does not send it reads as "not blocked".
+        let encoded = r#"{
+          "secureStorage":true,"notificationPermission":"denied","microphonePermission":"denied",
+          "notificationsEnabled":false,"nativeCallUi":false,"fcmConfigured":false,"fcmTokenPresent":false,
+          "pushRegistration":"configuration_required","pendingCallOffer":false,
+          "batteryOptimizationsRestricted":false,"forceStopState":"not_detectable",
+          "callInfrastructure":"notification_permission_required","lastNativeDiagnostic":null
+        }"#;
+        let value: AndroidRuntimeDiagnostics = serde_json::from_str(encoded).unwrap();
+        assert!(!value.notification_permission_blocked);
+        let blocked = encoded.replace(
+            "\"notificationPermission\":\"denied\",",
+            "\"notificationPermission\":\"denied\",\"notificationPermissionBlocked\":true,",
+        );
+        assert!(
+            serde_json::from_str::<AndroidRuntimeDiagnostics>(&blocked)
+                .unwrap()
+                .notification_permission_blocked
+        );
+    }
+
+    #[test]
+    fn the_notification_settings_bridge_is_declared_and_kept_from_r8() {
+        // Rust finds `openAokieNotificationSettings` by name through JNI, so R8 must neither remove nor rename it.
+        const MAIN_ACTIVITY: &str =
+            include_str!("../gen/android/app/src/main/java/com/aokie/companion/MainActivity.kt");
+        const PROGUARD: &str = include_str!("../gen/android/app/proguard-rules.pro");
+        assert!(MAIN_ACTIVITY.contains("fun openAokieNotificationSettings(): Int"));
+        assert!(PROGUARD.contains("public int openAokieNotificationSettings();"));
+        assert!(include_str!("android_runtime.rs").contains("\"openAokieNotificationSettings\""));
     }
 
     #[test]

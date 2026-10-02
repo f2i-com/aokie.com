@@ -28,6 +28,7 @@
     public int pollAokieMicrophonePermission(int);
     public int requestAokieNotificationPermission(int);
     public int pollAokieNotificationPermission(int);
+    public int openAokieNotificationSettings();
     public int putAokieSecureValue(java.lang.String, java.lang.String);
     public java.lang.String getAokieSecureValue(java.lang.String);
     public int deleteAokieSecureValue(java.lang.String);

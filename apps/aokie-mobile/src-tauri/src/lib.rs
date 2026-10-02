@@ -59,6 +59,7 @@ struct RuntimeCapabilities {
     demo: bool,
     local_pilot: bool,
     notification_permission: String,
+    notification_permission_blocked: bool,
     microphone_permission: String,
     fcm_configured: bool,
     fcm_token_present: bool,
@@ -109,6 +110,9 @@ async fn runtime_capabilities(
             || "not_applicable".into(),
             |value| value.notification_permission.clone(),
         ),
+        notification_permission_blocked: android
+            .as_ref()
+            .is_some_and(|value| value.notification_permission_blocked),
         microphone_permission: android.as_ref().map_or_else(
             || "unknown".into(),
             |value| value.microphone_permission.clone(),
@@ -144,6 +148,12 @@ async fn request_notification_permission(app: AppHandle) -> Result<bool, String>
     android_runtime::request_notification_permission(&app).await
 }
 
+/// Opens the app's notification settings, for when Android will not show the permission dialog again.
+#[tauri::command]
+async fn open_notification_settings(app: AppHandle) -> Result<bool, String> {
+    android_runtime::open_notification_settings(&app).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -168,6 +178,7 @@ pub fn run() {
             companion_availability,
             companion_set_availability,
             request_notification_permission,
+            open_notification_settings,
             native_review_desktop_pairing_offer,
             native_confirm_desktop_pairing,
             native_confirm_desktop_peer_trust,

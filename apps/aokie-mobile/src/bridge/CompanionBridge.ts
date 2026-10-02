@@ -641,6 +641,8 @@ export interface RuntimeCapabilities {
   demo: boolean;
   localPilot: boolean;
   notificationPermission: string;
+  /** Android will not show the notification dialog again; only the app's notification settings can allow them. */
+  notificationPermissionBlocked: boolean;
   microphonePermission: string;
   fcmConfigured: boolean;
   fcmTokenPresent: boolean;
@@ -686,6 +688,8 @@ export interface CompanionBridge {
   restoreManaged(): Promise<RealtimeConfig | null>;
   forgetManaged(): Promise<void>;
   requestNotificationPermission(): Promise<boolean>;
+  /** Opens the app's notification settings. False when the device has no such screen. */
+  openNotificationSettings(): Promise<boolean>;
   getCompanionBootstrap(): Promise<CompanionBootstrap>;
   getCompanionHistory(limit?: number, before?: number): Promise<CompanionHistory>;
   getCompanionRouting(): Promise<CompanionRouting>;
