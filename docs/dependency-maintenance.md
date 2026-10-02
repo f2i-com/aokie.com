@@ -12,6 +12,10 @@ Keep these dependency groups aligned:
   tensors and model APIs must use the same release.
 - Keep both `libwebrtc` pins aligned: `aokie-media` and the Companion Android
   target. Build Windows with the static CRT settings in `.cargo/config.toml`.
+  The Android Gradle build copies libwebrtc's Java runtime (`libwebrtc.jar`) into
+  `gen/android/app/libs` from the prebuilt libwebrtc that `webrtc-sys-build` downloads
+  (`gen/android/buildSrc/.../BuildTask.kt` looks for it in the Cargo target directory). After a
+  `webrtc-sys` bump, check that the Android build still finds it.
 - Keep the `tauri` crate and the `@tauri-apps/api` and `@tauri-apps/cli` packages in
   `apps/aokie-mobile/package.json` on the same major and minor release: `tauri dev` and
   `tauri build` refuse to run when they differ. Upgrade them in one change, together with
