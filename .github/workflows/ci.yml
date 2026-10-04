@@ -9,14 +9,20 @@ name: CI
 # triggers only when the project is ready to re-enable CI.
 on:
   workflow_dispatch:
+    inputs:
+      bundle:
+        description: 'The release bundle to build: production (needs the Microsoft-signed driver catalog and the Authenticode certificate) or managed-beta (a pre-release without either). A tag whose name contains managed-beta always builds managed-beta.'
+        type: choice
+        options: [production, managed-beta]
+        default: production
   # push:
   #   branches: [main]
   #   tags: ['v*']
   # pull_request:
   #   branches: [main]
 
-# TRUST-001: least privilege by default — read-only token everywhere; the one
-# job that publishes release assets asks for contents:write itself.
+# TRUST-001: least privilege by default — read-only token everywhere; the two
+# jobs that publish release assets (production and managed-beta) ask for contents:write themselves.
 permissions:
   contents: read
 
@@ -158,10 +164,11 @@ jobs:
     # audit, the Companion frontend, or the shipping-feature gates fail or are
     # still running.
     needs: [plugin, plugin-voice, clippy, supply-chain, managed-beta, companion]
-    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    # A managed-beta tag or dispatch builds the managed-beta bundle below instead, never this one.
+    if: (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') && !contains(github.ref_name, 'managed-beta') && inputs.bundle != 'managed-beta'
     permissions:
-      # gh release create/upload on tag builds — the ONLY write surface in
-      # this workflow, isolated to this job (TRUST-001 item 5).
+      # gh release create/upload on tag builds — one of the two write surfaces in
+      # this workflow (with the managed-beta job), each isolated to its job (TRUST-001 item 5).
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -434,4 +441,168 @@ jobs:
           $zip = "aokie-plugin-windows-${{ github.ref_name }}.zip"
           Compress-Archive -Path bundle/* -DestinationPath $zip
           gh release create '${{ github.ref_name }}' --verify-tag --title 'Aokie ${{ github.ref_name }}' --notes 'Signed Aokie plugin bundle (plugin + driver helper + voice server + manifests + checksums). Verify with SHA256SUMS.txt and the package-manifest.json publisher signature.' $zip bundle/SHA256SUMS.txt bundle/release-manifest.json bundle/package-manifest.json
+          if ($LASTEXITCODE -ne 0) { throw "release publish failed" }
+
+  # The managed-beta bundle (README, "Managed-beta driver build"): for administrator-managed pilots while the
+  # Microsoft-signed driver catalog and the Authenticode certificate do not exist. The helper and the plugin are the
+  # managed-beta-driver flavour: the helper renders the selected dongle's INF and signs a catalog with a certificate it
+  # makes on that PC, and only when the operator sets AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 (the production flavour cannot be
+  # switched into that). So no driver package ships and no catalog is checked, and the executables are not
+  # Authenticode-signed. The package manifest IS signed (fl-aokie-2026a), so OAIY verifies the bundle as Aokie's. Tags
+  # whose name contains managed-beta publish it as a GitHub PRE-release labelled managed beta; the production job above
+  # never runs for them, and this one never runs for a production tag.
+  plugin-release-managed-beta:
+    name: aokie-plugin managed-beta bundle
+    runs-on: windows-latest
+    needs: [plugin, plugin-voice, clippy, supply-chain, managed-beta, companion]
+    if: contains(github.ref_name, 'managed-beta') || inputs.bundle == 'managed-beta'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      # The production job's order, less the signing of executables: the helper first, its hash pinned into the plugin
+      # (the release gate of aokie-dongle), then the plugin and the voice server.
+      - name: Build the managed-beta helper, pin its hash, build the plugin and the voice server
+        shell: pwsh
+        run: |
+          $env:AOKIE_EXPECTED_HELPER_SHA256 = 'helper-build-placeholder'
+          cargo build -p aokie-dongle --bin aokie-driver-helper --features managed-beta-driver --release
+          if ($LASTEXITCODE -ne 0) { throw "helper build failed" }
+          $sha = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
+          "helper sha256 = $sha"
+          $env:AOKIE_EXPECTED_HELPER_SHA256 = $sha
+          cargo build -p aokie-plugin --features voice,managed-beta-driver --release
+          if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
+          cargo build -p aokie-voice-server --release
+          if ($LASTEXITCODE -ne 0) { throw "voice server build failed" }
+          Set-Content -Encoding ascii pinned-helper-sha.txt $sha
+
+      - name: Assemble + verify bundle (fail closed)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bundle | Out-Null
+          Copy-Item target/release/aokie-plugin.exe bundle/
+          Copy-Item target/release/aokie-driver-helper.exe bundle/
+          Copy-Item target/release/aokie-voice-server.exe bundle/
+          Copy-Item crates/aokie-plugin/manifest.json bundle/
+          Copy-Item crates/aokie-plugin/definitions bundle/definitions -Recurse
+          Copy-Item crates/aokie-plugin/ui bundle/ui -Recurse
+          Copy-Item docs/models-manifest.json bundle/
+          Copy-Item docs/MODEL_LICENSES.md bundle/
+          $dll = Get-ChildItem target/release -Filter 'onnxruntime*.dll' -ErrorAction SilentlyContinue
+          if (-not $dll) { throw "AOK-REL-002: voice release requires onnxruntime*.dll beside the plugin exe — none found" }
+          $dll | Copy-Item -Destination bundle/
+          Copy-Item target/release/sherpa-onnx-c-api.dll bundle/
+          Copy-Item target/release/sherpa-onnx-cxx-api.dll bundle/
+          ./scripts/verify-bundle-assets.ps1 -Bundle bundle -Voice
+
+          $pinned = (Get-Content pinned-helper-sha.txt -Raw).Trim()
+          $packaged = (Get-FileHash bundle/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
+          if ($pinned -ne $packaged) { throw "helper hash drift: pinned $pinned but packaging $packaged" }
+
+          $manifest = [ordered]@{
+            builtAt = (Get-Date).ToUniversalTime().ToString('o')
+            ref = $env:GITHUB_SHA
+            contractVersion = (Get-Content docs/contracts/aokie-connector-contract.v1.json -Raw | ConvertFrom-Json).contractVersion
+            flavour = 'managed-beta'
+            # Authenticode: the managed beta's executables are not signed with a certificate.
+            signed = $false
+            helperSha256 = $packaged
+            files = @(Get-ChildItem bundle -File -Recurse | ForEach-Object {
+              $name = [IO.Path]::GetRelativePath((Resolve-Path bundle).Path, $_.FullName).Replace('\', '/')
+              [ordered]@{ name = $name; sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() }
+            })
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding ascii bundle/release-manifest.json
+
+      - name: Checksums
+        shell: pwsh
+        working-directory: bundle
+        run: |
+          Get-ChildItem -File -Recurse | Where-Object { $_.Name -ne 'SHA256SUMS.txt' -and $_.Name -ne 'package-manifest.json' } |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), [IO.Path]::GetRelativePath((Get-Location).Path, $_.Path).Replace('\', '/') } |
+            Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
+      # The last bundle mutation, as in the production job: OAIY refuses a bundle whose manifest does not verify against
+      # the pinned fl-aokie-2026a key. A managed-beta TAG without the key fails; a dispatch smoke build warns.
+      - name: Sign package manifest (package-signer)
+        shell: pwsh
+        env:
+          AOKIE_PACKAGE_SIGNING_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY }}
+        run: |
+          if (-not $env:AOKIE_PACKAGE_SIGNING_KEY) {
+            if ('${{ github.ref_type }}' -eq 'tag') {
+              throw "TRUST-001: a managed-beta tag requires the AOKIE_PACKAGE_SIGNING_KEY secret — refusing a bundle OAIY could not verify"
+            }
+            Write-Warning "AOKIE_PACKAGE_SIGNING_KEY not set — smoke bundle ships WITHOUT a package manifest"
+            exit 0
+          }
+          $version = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { "dev-$env:GITHUB_SHA" }
+          cargo run -p package-signer --release -- sign --dir bundle --name aokie-plugin --version $version --key-id fl-aokie-2026a --key-env AOKIE_PACKAGE_SIGNING_KEY
+          if ($LASTEXITCODE -ne 0) { throw "package signing failed" }
+
+      - name: Verify the extracted final artifact
+        shell: pwsh
+        env:
+          AOKIE_PACKAGE_SIGNING_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY }}
+        run: |
+          Compress-Archive -Path bundle/* -DestinationPath verify-roundtrip.zip -Force
+          Expand-Archive -Path verify-roundtrip.zip -DestinationPath verify-extracted -Force
+          ./scripts/verify-bundle-assets.ps1 -Bundle verify-extracted
+          if (-not $env:AOKIE_PACKAGE_SIGNING_KEY) {
+            Write-Warning "asset references verified; unsigned smoke bundle skips signature verification"
+            exit 0
+          }
+          $pub = (cargo run -p package-signer --release --quiet -- pubkey --key-env AOKIE_PACKAGE_SIGNING_KEY | Select-Object -Last 1).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $pub) { throw "could not derive the signing public key" }
+          # The key OAIY pins (platform/desktop/src-tauri/resources/trusted-publishers.json in the OAIY repository).
+          if ($pub -ne 'n832sELL2yC6UksKhiz4C4UY7P9//mf8JfeFJRcuk5s=') { throw "the signing key is not fl-aokie-2026a, which OAIY pins" }
+          cargo run -p package-signer --release -- verify --dir bundle --pubkey $pub
+          if ($LASTEXITCODE -ne 0) { throw "final bundle tree failed verification" }
+          cargo run -p package-signer --release -- verify --dir verify-extracted --pubkey $pub
+          if ($LASTEXITCODE -ne 0) { throw "EXTRACTED artifact failed verification — the shipped zip does not match the signed tree" }
+          Remove-Item verify-roundtrip.zip -Force
+          Remove-Item verify-extracted -Recurse -Force
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aokie-plugin-windows-managed-beta
+          path: bundle/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish the pre-release (managed-beta tags only)
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $zip = "aokie-plugin-windows-$tag.zip"
+          Compress-Archive -Path bundle/* -DestinationPath $zip
+          $notes = @(
+            "**Managed beta, for administrator-managed pilots.** This is not the production package: its executables are not Authenticode-signed (Windows names no publisher, also on the driver helper's elevation prompt), and the Microsoft-signed driver catalog does not exist yet.",
+            "",
+            "The bundle is signed with Aokie's package key (fl-aokie-2026a): OAIY verifies it as Aokie's and refuses it if any file in it changes.",
+            "",
+            "**Install:** in OAIY Desktop, Connections, Plugins, Install a plugin, and choose $zip. The setup wizard opens after the install.",
+            "",
+            "**Call audio** goes through a USB Bluetooth dongle bound to WinUSB. To let this build bind it, set AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 for the account that runs OAIY (for example setx AOKIE_ALLOW_SELF_SIGNED_DRIVER 1, then restart OAIY); OAIY 0.1.2 or later passes it to Aokie. The driver helper then signs the dongle's driver catalog with a certificate it makes on that PC and trusts machine-wide (LocalMachine Root and TrustedPublisher). Restore driver gives the dongle back to Windows.",
+            "",
+            "Without that setting, texts, contacts and call control work through Windows' own Bluetooth, with no call audio.",
+            "",
+            "**Verify:** SHA256SUMS.txt, and package-signer verify --dir <extracted bundle> --pubkey n832sELL2yC6UksKhiz4C4UY7P9//mf8JfeFJRcuk5s="
+          )
+          Set-Content -Encoding utf8 managed-beta-notes.md $notes
+          gh release create $tag --verify-tag --prerelease --title "Aokie $tag (managed beta)" --notes-file managed-beta-notes.md $zip bundle/SHA256SUMS.txt bundle/release-manifest.json bundle/package-manifest.json
           if ($LASTEXITCODE -ne 0) { throw "release publish failed" }
