@@ -273,6 +273,38 @@ async fn receive(socket: &mut Socket) -> Value {
     .expect("gateway response timeout")
 }
 
+/// Waits until the gateway has handled every frame sent on `socket` so far. It reads a socket's frames in order and
+/// answers a ping only after handling the frames before it, so the pong to this ping is that point.
+async fn handled(socket: &mut Socket) {
+    socket
+        .send(Message::Ping(b"handled".to_vec().into()))
+        .await
+        .expect("ping");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match socket
+                .next()
+                .await
+                .expect("open WebSocket")
+                .expect("v2 frame")
+            {
+                Message::Pong(payload) if &payload[..] == b"handled" => return,
+                Message::Text(text) => {
+                    let value: Value = serde_json::from_str(&text).expect("valid v2 JSON");
+                    assert_ne!(value["kind"], "error", "the gateway refused a frame: {value}");
+                }
+                Message::Ping(payload) => {
+                    socket.send(Message::Pong(payload)).await.expect("pong");
+                }
+                Message::Pong(_) => {}
+                other => panic!("unexpected gateway frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("gateway pong timeout");
+}
+
 async fn receive_kind(socket: &mut Socket, expected: &str) -> Value {
     loop {
         let value = receive(socket).await;
@@ -376,6 +408,10 @@ async fn register_endpoints(gateway: &TestGateway) -> (Socket, Socket, Value) {
         }),
     )
     .await;
+    // A mobile is refused until the plugin has published its state ("Aokie plugin has not published authoritative
+    // state"), and the gateway applies the snapshot on the plugin socket's own task: registering the mobile at once
+    // raced that task, which a busy CI runner lost.
+    handled(&mut plugin).await;
 
     let mut mobile = connect(gateway, DEVICE_ID, &gateway.mobile_token).await;
     let mobile_challenge = receive_challenge(&mut mobile).await;
