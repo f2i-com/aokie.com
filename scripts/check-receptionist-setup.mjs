@@ -561,4 +561,123 @@ const radioDown = { radio: { initialized: false, connected: false, localAddress:
   assert.equal(page.tabs.setup.active(), false);
 }
 
+// ---- the managed beta: the driver signed on this computer is accepted on the screen ----
+
+/** Pick a dongle in the dongle tab's list (its radio's change event), as a person does. */
+async function pickDongle(page, d) {
+  const target = { type: 'radio', getAttribute: (name) => (name === 'data-pick' ? d.vid + ':' + d.pid : null) };
+  for (const fn of page.el('tab-dongle').listeners.change || []) fn({ target });
+  await settle();
+}
+
+const unboundDongle = { ...boundDongle, driverBound: false };
+const installs = (page) => page.log.filter((l) => l[0] === 'command' && l[1] === 'dongle.installDriver').map((l) => l[2]);
+
+{
+  // A managed-beta release: the step explains what is signed here and asks; Install waits for the box.
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioDown,
+      'dongle.list': { connected: [unboundDongle], driverSigning: { flavour: 'managed-beta', acceptanceRequired: true, preauthorised: false } },
+      'dongle.installDriver': { installed: true },
+    },
+  });
+  await pickDongle(page, unboundDongle);
+  await page.click('dongle', 'dg-continue');
+  const html = () => page.el('tab-dongle').innerHTML;
+  assert.match(html(), /This is the managed beta of Aokie/);
+  assert.match(html(), /Root<\/em> and <em>Trusted Publishers/);
+  assert.match(html(), /Restore driver<\/strong> gives the dongle back/);
+  assert.match(html(), /data-act="dg-accept-signing"(?! checked)/);
+  assert.match(html(), /data-act="dg-install" disabled/, 'Install waits for the person to accept');
+  await page.click('dongle', 'dg-install');
+  assert.deepEqual(installs(page), [], 'no install before the box is ticked');
+  await page.click('dongle', 'dg-accept-signing');
+  assert.match(html(), /data-act="dg-accept-signing" checked/);
+  assert.doesNotMatch(html(), /data-act="dg-install" disabled/);
+  await page.click('dongle', 'dg-install');
+  assert.deepEqual(installs(page), [{ vid: unboundDongle.vid, pid: unboundDongle.pid, acceptLocalSigning: true }]);
+}
+
+{
+  // The acceptance is for one install: going back clears it, and the next install asks again.
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioDown,
+      'dongle.list': { connected: [unboundDongle], driverSigning: { flavour: 'managed-beta', acceptanceRequired: true, preauthorised: false } },
+    },
+  });
+  await pickDongle(page, unboundDongle);
+  await page.click('dongle', 'dg-continue');
+  await page.click('dongle', 'dg-accept-signing');
+  await page.click('dongle', 'dg-back');
+  await page.click('dongle', 'dg-continue');
+  assert.match(page.el('tab-dongle').innerHTML, /data-act="dg-accept-signing"(?! checked)/);
+  assert.match(page.el('tab-dongle').innerHTML, /data-act="dg-install" disabled/);
+}
+
+{
+  // A production build (and an older plugin that says nothing): no box, and nothing extra is sent.
+  for (const driverSigning of [{ flavour: 'production', acceptanceRequired: false, preauthorised: false }, undefined]) {
+    const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+    const listed = { connected: [unboundDongle] };
+    if (driverSigning) listed.driverSigning = driverSigning;
+    const page = await openScreen({
+      setup,
+      payloads: { 'settings.get': { settings: {} }, 'dongle.diagnostics': radioDown, 'dongle.list': listed, 'dongle.installDriver': { installed: true } },
+    });
+    await pickDongle(page, unboundDongle);
+    await page.click('dongle', 'dg-continue');
+    assert.doesNotMatch(page.el('tab-dongle').innerHTML, /dg-accept-signing|managed beta/i);
+    await page.click('dongle', 'dg-install');
+    assert.deepEqual(installs(page), [{ vid: unboundDongle.vid, pid: unboundDongle.pid }]);
+  }
+}
+
+{
+  // A managed beta the administrator pre-authorised (AOKIE_ALLOW_SELF_SIGNED_DRIVER=1): said, not asked.
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioDown,
+      'dongle.list': { connected: [unboundDongle], driverSigning: { flavour: 'managed-beta', acceptanceRequired: false, preauthorised: true } },
+      'dongle.installDriver': { installed: true },
+    },
+  });
+  await pickDongle(page, unboundDongle);
+  await page.click('dongle', 'dg-continue');
+  assert.match(page.el('tab-dongle').innerHTML, /administrator has allowed drivers signed on this computer/);
+  assert.doesNotMatch(page.el('tab-dongle').innerHTML, /dg-accept-signing/);
+  await page.click('dongle', 'dg-install');
+  assert.deepEqual(installs(page), [{ vid: unboundDongle.vid, pid: unboundDongle.pid }]);
+}
+
+{
+  // A debug build of the managed beta signs on a developer's own machine unasked: no box, and
+  // no claim that an administrator allowed it.
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioDown,
+      'dongle.list': { connected: [unboundDongle], driverSigning: { flavour: 'managed-beta', acceptanceRequired: false, preauthorised: false } },
+      'dongle.installDriver': { installed: true },
+    },
+  });
+  await pickDongle(page, unboundDongle);
+  await page.click('dongle', 'dg-continue');
+  assert.doesNotMatch(page.el('tab-dongle').innerHTML, /administrator has allowed|dg-accept-signing/);
+  await page.click('dongle', 'dg-install');
+  assert.deepEqual(installs(page), [{ vid: unboundDongle.vid, pid: unboundDongle.pid }]);
+}
+
 console.log('Receptionist setup-mode checks passed (isolated host; no live commands).');

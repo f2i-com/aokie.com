@@ -245,9 +245,18 @@ $env:AOKIE_EXPECTED_HELPER_SHA256 = (Get-FileHash target/release/aokie-driver-he
 cargo build -p aokie-plugin --features voice,managed-beta-driver --release
 ```
 
-The installed app must also receive `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`; the compile-time
-feature alone never authorises trust-store changes. To try an external dongle that is not
-in the catalog, also set:
+The compile-time feature alone never authorises trust-store changes: the operator also
+opts in, for each install. Before the dongle setup screen installs the driver, a
+managed-beta build says what it is about to do (the helper makes a signing certificate on
+this computer, signs this dongle's catalog with it, deletes its private key, and Windows
+trusts the certificate machine-wide, in LocalMachine Root and TrustedPublisher), and its
+Install button waits until the operator ticks that they accept it. That acceptance goes
+with that one `dongle.installDriver` request as `acceptLocalSigning: true` and is never
+stored, so the next install asks again; Windows' User Account Control prompt is still the
+last gate. An administrator can pre-authorise a machine instead with
+`AOKIE_ALLOW_SELF_SIGNED_DRIVER=1` for the account that runs OAIY (OAIY passes it to Aokie
+from 0.1.2); the screen then says so and does not ask. A production build ignores both. To
+try an external dongle that is not in the catalog, also set:
 
 ```powershell
 $env:AOKIE_INSTALL_UNKNOWN_DONGLE = 'YES_I_REBIND_AT_MY_OWN_RISK'
@@ -273,8 +282,9 @@ with `bundle: managed-beta`, or on a tag whose name contains `managed-beta` (for
 `v0.0.1-managed-beta`), which it publishes as a GitHub pre-release labelled managed beta.
 It ships no driver package, its executables are not Authenticode-signed, and its
 `package-manifest.json` is signed with the same `fl-aokie-2026a` key, so OAIY verifies it as
-Aokie's. Its driver path needs `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`, which OAIY passes to
-Aokie from 0.1.2.
+Aokie's. Its dongle setup screen asks the operator to accept the driver it signs on that
+PC before it installs it, so nothing needs setting first; `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`
+still pre-authorises a machine.
 
 ## Test
 

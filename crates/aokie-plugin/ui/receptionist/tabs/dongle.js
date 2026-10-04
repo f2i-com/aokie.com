@@ -45,6 +45,10 @@
   var busy = false;
   var error = null;
   var restoreArm = null; // "vid:pid" with the inline restore confirm open
+  // The managed beta: the person ticked that Windows may trust a driver signed on this
+  // computer. For ONE install only: cleared after every attempt and whenever the device or
+  // the step changes, and sent as dongle.installDriver's acceptLocalSigning (never stored).
+  var acceptSigning = false;
   var verifyTimer = null;
   var verifyAttempts = 0;
   // The device a verify poll is checking. Kept OUTSIDE the live list because
@@ -96,6 +100,17 @@
 
   function connectedDevices() {
     return (list && list.connected) || [];
+  }
+
+  /** dongle.list's driverSigning: whether this build signs the driver on this computer. */
+  function signing() {
+    return (list && list.driverSigning) || null;
+  }
+
+  /** The managed beta, not pre-authorised: the person must accept before installing. */
+  function signingNeedsAcceptance() {
+    var sg = signing();
+    return !!(sg && sg.acceptanceRequired === true);
   }
 
   function selectedDevice() {
@@ -178,7 +193,18 @@
     busy = true;
     error = null;
     render();
-    HOST.command('dongle.installDriver', { vid: sel.vid, pid: sel.pid })
+    var request = { vid: sel.vid, pid: sel.pid };
+    if (signingNeedsAcceptance()) {
+      if (!acceptSigning) {
+        busy = false;
+        render();
+        return;
+      }
+      request.acceptLocalSigning = true;
+    }
+    // One acceptance, one install: the next one asks again.
+    acceptSigning = false;
+    HOST.command('dongle.installDriver', request)
       .then(
         function () {
           busy = false;
@@ -542,11 +568,42 @@
       '<p class="rcp-step-meta">Windows will show a <strong>User Account Control</strong> prompt — choose <strong>Yes</strong>. ' +
       'Only this exact device is rebound (the installer pins its hardware identity), and you can restore the standard ' +
       'Windows driver at any time.</p>' +
+      signingHtml() +
       '<div class="rcp-actions">' +
       '<button type="button" class="rcp-button" data-act="dg-back"' + (busy ? ' disabled' : '') + '>Back</button>' +
-      '<button type="button" class="rcp-button is-primary" data-act="dg-install"' + (busy ? ' disabled' : '') + '>' +
+      '<button type="button" class="rcp-button is-primary" data-act="dg-install"' +
+      (busy || (signingNeedsAcceptance() && !acceptSigning) ? ' disabled' : '') + '>' +
       (busy ? 'Installing — watch for the Windows prompt…' : 'Install WinUSB driver') +
       '</button>' +
+      '</div>'
+    );
+  }
+
+  /** The managed beta's driver is signed on this computer: say what that means, and ask. */
+  function signingHtml() {
+    var sg = signing();
+    if (!sg || sg.flavour !== 'managed-beta') return '';
+    if (!sg.acceptanceRequired) {
+      // Not asked: an administrator pre-authorised the machine, or this is a debug build of
+      // the managed beta, which signs on a developer's own machine without asking.
+      if (!sg.preauthorised) return '';
+      return (
+        '<p class="rcp-notice rcp-notice--warn" role="note"><strong>Managed beta:</strong> this computer’s administrator ' +
+        'has allowed drivers signed on this computer, so Windows will trust the certificate Aokie makes here for the dongle’s driver.</p>'
+      );
+    }
+    return (
+      '<div class="rcp-callout is-warn" role="group" aria-label="A driver signed on this computer">' +
+      ICONS.alert +
+      '<span><strong>This is the managed beta of Aokie.</strong> Its dongle driver is not signed by Microsoft yet, so Aokie ' +
+      'signs it on this computer: its installer makes a signing certificate here, signs this dongle’s driver with it, deletes ' +
+      'the certificate’s private key, and Windows then trusts that certificate on this whole computer (in Local Machine ' +
+      '<em>Root</em> and <em>Trusted Publishers</em>). It cannot sign anything else, since its private key is gone, and it ' +
+      'stays trusted after the install. <strong>Restore driver</strong> gives the dongle back to the standard Windows driver.' +
+      '<label class="rcp-check" style="display: block; margin-top: 8px;">' +
+      '<input type="checkbox" data-act="dg-accept-signing"' + (acceptSigning ? ' checked' : '') + (busy ? ' disabled' : '') + ' /> ' +
+      'I understand, and want Windows to trust a driver signed on this computer for this dongle.' +
+      '</label></span>' +
       '</div>'
     );
   }
@@ -657,6 +714,7 @@
       if (pick != null && t.type === 'radio') {
         selectedKey = pick;
         restoreArm = null;
+        acceptSigning = false;
         render();
       }
     });
@@ -671,6 +729,12 @@
         render();
       } else if (act === 'dg-back') {
         step = 'select';
+        acceptSigning = false;
+        render();
+      } else if (act === 'dg-accept-signing') {
+        // A click flips the box (the browser has already flipped its own mark); the
+        // rendered box follows this state.
+        acceptSigning = !acceptSigning;
         render();
       } else if (act === 'dg-install') install();
       else if (act === 'dg-restore-arm') {
@@ -696,6 +760,7 @@
         step = 'select';
         error = null;
         verifyTarget = null;
+        acceptSigning = false;
         refresh();
       }
     });
