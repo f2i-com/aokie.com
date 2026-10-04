@@ -332,6 +332,22 @@ jobs:
           Set-Content -Encoding ascii pinned-helper-sha.txt $sha
           Set-Content -Encoding ascii signing-state.txt $(if ($signingEnabled) { 'signed' } else { 'unsigned' })
 
+      # sherpa-rs-sys's build script copies its DLLs beside the binaries, but only when it runs: with its build restored
+      # from the cache it does not, and the cache keeps its output folder but not those copies (a release built on a warm
+      # cache had no sherpa-onnx-c-api.dll). Take any that are missing from that folder.
+      - name: sherpa-onnx's DLLs beside the binaries
+        shell: pwsh
+        run: |
+          foreach ($name in 'onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'sherpa-onnx-c-api.dll', 'sherpa-onnx-cxx-api.dll') {
+            if (Test-Path -LiteralPath "target/release/$name") { continue }
+            $source = Get-ChildItem -Path target/release/build -Filter $name -Recurse -File |
+              Where-Object { $_.FullName -like '*\sherpa-rs-sys-*\out\lib\*' } |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $source) { throw "$name is neither beside the binaries nor in a sherpa-rs-sys build" }
+            Copy-Item -LiteralPath $source.FullName "target/release/$name"
+            "took $name from $($source.FullName)"
+          }
+
       # The ort engines (Pocket-TTS, Parakeet) load ONNX Runtime 1.25.0 by that exact name from beside the exe
       # (crates/aokie-plugin/src/voice.rs, ensure_ort_dylib); sherpa's own onnxruntime.dll is 1.17.1 and cannot run
       # them, and scripts/verify-bundle-assets.ps1 requires both. Microsoft's release, pinned by the digest it publishes.
@@ -544,6 +560,22 @@ jobs:
           cargo build -p aokie-voice-server --release
           if ($LASTEXITCODE -ne 0) { throw "voice server build failed" }
           Set-Content -Encoding ascii pinned-helper-sha.txt $sha
+
+      # sherpa-rs-sys's build script copies its DLLs beside the binaries, but only when it runs: with its build restored
+      # from the cache it does not, and the cache keeps its output folder but not those copies (a release built on a warm
+      # cache had no sherpa-onnx-c-api.dll). Take any that are missing from that folder.
+      - name: sherpa-onnx's DLLs beside the binaries
+        shell: pwsh
+        run: |
+          foreach ($name in 'onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'sherpa-onnx-c-api.dll', 'sherpa-onnx-cxx-api.dll') {
+            if (Test-Path -LiteralPath "target/release/$name") { continue }
+            $source = Get-ChildItem -Path target/release/build -Filter $name -Recurse -File |
+              Where-Object { $_.FullName -like '*\sherpa-rs-sys-*\out\lib\*' } |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $source) { throw "$name is neither beside the binaries nor in a sherpa-rs-sys build" }
+            Copy-Item -LiteralPath $source.FullName "target/release/$name"
+            "took $name from $($source.FullName)"
+          }
 
       # The ort engines (Pocket-TTS, Parakeet) load ONNX Runtime 1.25.0 by that exact name from beside the exe
       # (crates/aokie-plugin/src/voice.rs, ensure_ort_dylib); sherpa's own onnxruntime.dll is 1.17.1 and cannot run
