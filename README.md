@@ -265,6 +265,15 @@ Runtime and sherpa-onnx DLLs, `models-manifest.json` and `MODEL_LICENSES.md`, th
 `package-signer`. `scripts/verify-bundle-assets.ps1 -Bundle <dir> -Voice` checks that
 every file the manifest names is present.
 
+Until the Microsoft-signed catalog and the Authenticode certificate exist, the
+`plugin-release-managed-beta` job builds the managed-beta flavour instead: run the workflow
+with `bundle: managed-beta`, or on a tag whose name contains `managed-beta` (for example
+`v0.0.1-managed-beta`), which it publishes as a GitHub pre-release labelled managed beta.
+It ships no driver package, its executables are not Authenticode-signed, and its
+`package-manifest.json` is signed with the same `fl-aokie-2026a` key, so OAIY verifies it as
+Aokie's. Its driver path needs `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`, which OAIY passes to
+Aokie from 0.1.2.
+
 ## Test
 
 ```powershell
