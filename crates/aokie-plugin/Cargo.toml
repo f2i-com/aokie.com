@@ -15,7 +15,8 @@ default = []
 # build the voice plugin with `--features voice`.
 voice = ["dep:aokie-ai", "dep:aokie-audio", "dep:reqwest", "dep:aec-rs"]
 # Controlled WinUSB self-signing path for administrator-managed beta installs.
-# The runtime still requires AOKIE_ALLOW_SELF_SIGNED_DRIVER=1.
+# The runtime still requires the operator's opt-in: acceptance of the install on
+# the dongle setup screen, or AOKIE_ALLOW_SELF_SIGNED_DRIVER=1.
 managed-beta-driver = ["aokie-dongle/managed-beta-driver"]
 
 [dependencies]

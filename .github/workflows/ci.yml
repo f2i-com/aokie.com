@@ -515,9 +515,10 @@ jobs:
   # The managed-beta bundle (README, "Managed-beta driver build"): for administrator-managed pilots while the
   # Microsoft-signed driver catalog and the Authenticode certificate do not exist. The helper and the plugin are the
   # managed-beta-driver flavour: the helper renders the selected dongle's INF and signs a catalog with a certificate it
-  # makes on that PC, and only when the operator sets AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 (the production flavour cannot be
-  # switched into that). So no driver package ships and no catalog is checked, and the executables are not
-  # Authenticode-signed. The package manifest IS signed (fl-aokie-2026a), so OAIY verifies the bundle as Aokie's. Tags
+  # makes on that PC, and only when the operator accepts that for the install on the dongle setup screen, or
+  # pre-authorises the machine with AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 (the production flavour cannot be switched into
+  # that). So no driver package ships and no catalog is checked, and the executables are not Authenticode-signed. The
+  # package manifest IS signed (fl-aokie-2026a), so OAIY verifies the bundle as Aokie's. Tags
   # whose name contains managed-beta publish it as a GitHub PRE-release labelled managed beta; the production job above
   # never runs for them, and this one never runs for a production tag.
   plugin-release-managed-beta:
@@ -703,9 +704,9 @@ jobs:
             "",
             "**Install:** in OAIY Desktop, Connections, Plugins, Install a plugin, and choose $zip. The setup wizard opens after the install.",
             "",
-            "**Call audio** goes through a USB Bluetooth dongle bound to WinUSB. To let this build bind it, set AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 for the account that runs OAIY (for example setx AOKIE_ALLOW_SELF_SIGNED_DRIVER 1, then restart OAIY); OAIY 0.1.2 or later passes it to Aokie. The driver helper then signs the dongle's driver catalog with a certificate it makes on that PC and trusts machine-wide (LocalMachine Root and TrustedPublisher). Restore driver gives the dongle back to Windows.",
+            "**Call audio** goes through a USB Bluetooth dongle bound to WinUSB. Nothing needs setting first: when Aokie's dongle setup installs the dongle's driver, it explains that this build signs the driver on that PC (the driver helper makes a certificate there, signs the dongle's driver catalog with it, deletes its private key, and Windows trusts the certificate machine-wide, in LocalMachine Root and TrustedPublisher) and asks you to tick that you accept it before Install works; then choose Yes on the Windows prompt. It asks again for every install. Restore driver gives the dongle back to Windows. An administrator can pre-authorise a machine instead with AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 for the account that runs OAIY (OAIY 0.1.2 or later passes it to Aokie); the setup then does not ask.",
             "",
-            "Without that setting, texts, contacts and call control work through Windows' own Bluetooth, with no call audio.",
+            "Without that driver, texts, contacts and call control work through Windows' own Bluetooth, with no call audio.",
             "",
             "**Verify:** SHA256SUMS.txt, and package-signer verify --dir <extracted bundle> --pubkey n832sELL2yC6UksKhiz4C4UY7P9//mf8JfeFJRcuk5s="
           )

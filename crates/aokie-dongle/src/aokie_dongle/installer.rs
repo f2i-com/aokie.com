@@ -102,7 +102,8 @@ struct DriverJob<'a> {
     /// catalog-signing cert trusted machine-wide) is authorised for this
     /// install. Debug builds default on. Release builds require BOTH the
     /// `managed-beta-driver` compile-time feature and the operator's explicit
-    /// `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1` runtime opt-in.
+    /// runtime opt-in: `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`, or their acceptance
+    /// of this install on the dongle setup screen ([`LocalSigning`]).
     allow_dev_self_sign: bool,
 }
 
@@ -110,13 +111,79 @@ fn self_sign_policy(debug_build: bool, managed_beta_build: bool, operator_opt_in
     debug_build || (managed_beta_build && operator_opt_in)
 }
 
+/// The operator's word on THIS install of a driver signed on this computer.
+///
+/// A managed-beta build has no Microsoft-signed catalog, so binding a dongle means the
+/// elevated helper makes a catalog-signing certificate here, signs the dongle's catalog
+/// with it once, destroys the private key, and adds the certificate to LocalMachine\Root
+/// and TrustedPublisher so Windows accepts the driver. That is a machine-wide trust
+/// grant, so it is never the default: the person says yes on the dongle setup screen,
+/// which explains it and sends `AcceptedForThisInstall` only after they confirm, or an
+/// administrator pre-authorises the machine with `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`.
+///
+/// The acceptance is per install and never stored. A stored "yes" would let any later
+/// caller of `dongle.installDriver` (a flow, a relayed command) sign and trust a new
+/// certificate without asking again; a per-install one has to come with the request the
+/// person just confirmed. The plugin cannot tell its own screen from another caller, so
+/// the acceptance is not proof of a human: the UAC prompt the helper raises, on this
+/// machine and for an administrator, stays the last gate, as it is for every install.
+/// A production build ignores both forms: only the compile-time `managed-beta-driver`
+/// feature makes the helper able to self-sign at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalSigning {
+    NotAccepted,
+    AcceptedForThisInstall,
+}
+
+/// `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`: an administrator pre-authorised local signing on this machine.
+fn preauthorised() -> bool {
+    std::env::var("AOKIE_ALLOW_SELF_SIGNED_DRIVER").as_deref() == Ok("1")
+}
+
+/// The operator opted in: pre-authorised for the machine, or accepted for this install.
+fn operator_opt_in(preauthorised: bool, local: LocalSigning) -> bool {
+    preauthorised || local == LocalSigning::AcceptedForThisInstall
+}
+
+/// What this build does with a dongle that has no Microsoft-signed catalog, for the setup
+/// screen: `managed-beta` signs it here once the operator accepts (`acceptance_required`
+/// unless pre-authorised); `production` never does; `development` (a debug build) always
+/// may, as a developer's own machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalSigningStatus {
+    pub flavour: &'static str,
+    pub preauthorised: bool,
+    pub acceptance_required: bool,
+}
+
+pub fn local_signing_status() -> LocalSigningStatus {
+    signing_status(cfg!(debug_assertions), cfg!(feature = "managed-beta-driver"), preauthorised())
+}
+
+fn signing_status(debug_build: bool, managed_beta_build: bool, preauthorised: bool) -> LocalSigningStatus {
+    let flavour = if managed_beta_build {
+        "managed-beta"
+    } else if debug_build {
+        "development"
+    } else {
+        "production"
+    };
+    LocalSigningStatus {
+        flavour,
+        preauthorised: managed_beta_build && preauthorised,
+        acceptance_required: managed_beta_build && !debug_build && !preauthorised,
+    }
+}
+
 /// DRIVER-001: is local catalog self-signing allowed for this dispatch?
 /// Debug builds: yes (a dev box installing its own WinUSB rebind).
 /// Release builds: only when compiled as the explicit managed-beta flavour
-/// AND the operator sets `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`. A standard
-/// production binary cannot be switched into self-signing mode at runtime.
-fn dev_self_sign_allowed() -> bool {
-    let operator_opt_in = std::env::var("AOKIE_ALLOW_SELF_SIGNED_DRIVER").as_deref() == Ok("1");
+/// AND the operator opted in ([`LocalSigning`]): accepted for this install,
+/// or `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`. A standard production binary cannot
+/// be switched into self-signing mode at runtime.
+fn dev_self_sign_allowed(local: LocalSigning) -> bool {
+    let preauthorised = preauthorised();
+    let operator_opt_in = operator_opt_in(preauthorised, local);
     let allowed = self_sign_policy(
         cfg!(debug_assertions),
         cfg!(feature = "managed-beta-driver"),
@@ -125,8 +192,13 @@ fn dev_self_sign_allowed() -> bool {
     if allowed && !cfg!(debug_assertions) {
         aokie_core::redact::audit(
             "managed_beta_driver_self_sign",
-            "managed-beta-driver build + AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 — a \
-             locally-generated signing certificate will be trusted machine-wide for this install",
+            if preauthorised {
+                "managed-beta-driver build + AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 — a \
+                 locally-generated signing certificate will be trusted machine-wide for this install"
+            } else {
+                "managed-beta-driver build + the operator accepted this install on the dongle setup \
+                 screen — a locally-generated signing certificate will be trusted machine-wide for this install"
+            },
         );
         eprintln!(
             "[installer] ⚠️ MANAGED BETA DRIVER — release build will self-sign the driver \
@@ -135,8 +207,8 @@ fn dev_self_sign_allowed() -> bool {
     } else if operator_opt_in && !allowed {
         aokie_core::redact::audit(
             "driver_self_sign_refused",
-            "AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 was ignored because this release was not \
-             compiled with the managed-beta-driver feature",
+            "the operator's opt-in to a locally signed driver was ignored because this release \
+             was not compiled with the managed-beta-driver feature",
         );
     }
     allowed
@@ -173,7 +245,12 @@ pub fn remove_aokie_certs(work_dir: &Path) -> Result<(), String> {
     run_helper_remove_certs(work_dir, &helper_path)
 }
 
-pub fn install_winusb(vid: u16, pid: u16, work_dir: &Path) -> Result<InstallOutcome, String> {
+pub fn install_winusb(
+    vid: u16,
+    pid: u16,
+    work_dir: &Path,
+    local_signing: LocalSigning,
+) -> Result<InstallOutcome, String> {
     // Single-instance lock for the whole install dispatch. If a second
     // caller (another app window, a misbehaving frontend that double-
     // clicks Install, a user racing two installs from the tray menu)
@@ -218,6 +295,7 @@ pub fn install_winusb(vid: u16, pid: u16, work_dir: &Path) -> Result<InstallOutc
         work_dir,
         &inf_path,
         &helper_path,
+        local_signing,
     )
 }
 
@@ -313,6 +391,7 @@ fn run_helper_install(
     work_dir: &Path,
     inf_path: &Path,
     helper_path: &Path,
+    local_signing: LocalSigning,
 ) -> Result<InstallOutcome, String> {
     let job_path = work_dir.join("aokie_driver_job.json");
     let hardware_id = super::winusb::hardware_id(vid, pid);
@@ -329,7 +408,7 @@ fn run_helper_install(
         // Prefer a shipped catalog whenever one is present. The managed-beta
         // trust-store path is considered only for a genuinely catalog-less,
         // dynamically rendered package.
-        allow_dev_self_sign: cat_sha256.is_empty() && dev_self_sign_allowed(),
+        allow_dev_self_sign: cat_sha256.is_empty() && dev_self_sign_allowed(local_signing),
     };
     let job_json = serde_json::to_string_pretty(&job)
         .map_err(|e| format!("could not serialize driver helper job: {}", e))?;
@@ -665,6 +744,39 @@ mod tests {
         assert!(!self_sign_policy(false, false, true));
         assert!(!self_sign_policy(false, true, false));
         assert!(self_sign_policy(false, true, true));
+    }
+
+    #[test]
+    fn the_operator_opts_in_by_accepting_this_install_or_by_pre_authorising_the_machine() {
+        use LocalSigning::*;
+        assert!(!operator_opt_in(false, NotAccepted), "neither: no opt-in");
+        assert!(operator_opt_in(false, AcceptedForThisInstall), "accepted on the setup screen");
+        assert!(operator_opt_in(true, NotAccepted), "AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 still pre-authorises");
+        // Through the policy, in a release build: the managed beta signs with either opt-in, never
+        // without one, and a production build ignores the screen's acceptance as it ignores the variable.
+        let release = |managed_beta: bool, pre: bool, local: LocalSigning| {
+            self_sign_policy(false, managed_beta, operator_opt_in(pre, local))
+        };
+        assert!(release(true, false, AcceptedForThisInstall));
+        assert!(release(true, true, NotAccepted));
+        assert!(!release(true, false, NotAccepted));
+        assert!(!release(false, false, AcceptedForThisInstall));
+        assert!(!release(false, true, AcceptedForThisInstall));
+    }
+
+    #[test]
+    fn the_setup_screen_is_told_whether_this_build_asks_before_signing_here() {
+        let beta = signing_status(false, true, false);
+        assert_eq!((beta.flavour, beta.acceptance_required, beta.preauthorised), ("managed-beta", true, false));
+        let pre = signing_status(false, true, true);
+        assert_eq!((pre.flavour, pre.acceptance_required, pre.preauthorised), ("managed-beta", false, true));
+        let production = signing_status(false, false, true);
+        assert_eq!(
+            (production.flavour, production.acceptance_required, production.preauthorised),
+            ("production", false, false)
+        );
+        let dev = signing_status(true, false, false);
+        assert_eq!((dev.flavour, dev.acceptance_required), ("development", false));
     }
 
     #[test]

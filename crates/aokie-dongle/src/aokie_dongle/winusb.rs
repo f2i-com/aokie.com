@@ -227,9 +227,10 @@ pub fn install_package(
         return Err(
             "driver package has no signed catalog (.cat) and developer self-signing is \
              disabled: production installs require a properly signed driver package. \
-             (Dev builds allow self-signing automatically; on a release build set \
-             AOKIE_ALLOW_SELF_SIGNED_DRIVER=1 only if you explicitly accept installing \
-             a locally-generated signing certificate into this machine's trust stores.)"
+             (Dev builds allow self-signing automatically. A managed-beta release build \
+             does it only once you accept installing a locally-generated signing \
+             certificate into this machine's trust stores, on Aokie's dongle setup screen \
+             or with AOKIE_ALLOW_SELF_SIGNED_DRIVER=1; a production build never does.)"
                 .to_string(),
         );
     }

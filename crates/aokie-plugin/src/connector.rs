@@ -2169,6 +2169,7 @@ impl Plugin {
                 Ok(json!({
                     "dongles": dongles,
                     "connected": connected,
+                    "driverSigning": driver_signing(),
                     "liveEnumeration": live_err.is_none(),
                     "note": live_err.unwrap_or_else(|| "connected[] are live USB devices; driverBound=true means the WinUSB driver is attached and the dongle is ready to pair.".to_string()),
                 }))
@@ -4069,6 +4070,11 @@ impl Plugin {
     #[cfg(target_os = "windows")]
     fn install_driver(&self, payload: &Value) -> Result<Value, CmdError> {
         let obj = payload.as_object().cloned().unwrap_or_default();
+        let local_signing = if accepts_local_signing(&obj)? {
+            aokie_dongle::installer::LocalSigning::AcceptedForThisInstall
+        } else {
+            aokie_dongle::installer::LocalSigning::NotAccepted
+        };
         let (vid, pid) = if obj.contains_key("vid") || obj.contains_key("pid") {
             (require_u16(&obj, "vid")?, require_u16(&obj, "pid")?)
         } else if let Some(pref) = &self.store.config.preferred_dongle {
@@ -4079,7 +4085,7 @@ impl Plugin {
             ));
         };
         let work_dir = self.data_dir.join("winusb-install");
-        match aokie_dongle::installer::install_winusb(vid, pid, &work_dir) {
+        match aokie_dongle::installer::install_winusb(vid, pid, &work_dir, local_signing) {
             Ok(_) => Ok(json!({
                 "installed": true,
                 "vid": vid,
@@ -5475,6 +5481,41 @@ fn require_u16(obj: &Map<String, Value>, key: &str) -> Result<u16, CmdError> {
         .ok_or_else(|| CmdError::failed(format!("field {key} must be an integer in 0..=65535")))
 }
 
+/// `dongle.installDriver`'s `acceptLocalSigning`: the person accepted, on the dongle setup
+/// screen and for this install, a driver signed on this computer (the managed beta; see
+/// `aokie_dongle::installer::LocalSigning`). Absent or false: not accepted. Anything but a
+/// boolean is refused, so a malformed request never reads as a yes. Never stored.
+// Only Windows installs a driver; elsewhere only the tests read it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn accepts_local_signing(obj: &Map<String, Value>) -> Result<bool, CmdError> {
+    match obj.get("acceptLocalSigning") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(accepted)) => Ok(*accepted),
+        Some(_) => Err(CmdError::failed("field acceptLocalSigning must be a boolean")),
+    }
+}
+
+/// What this build does with a dongle that has no Microsoft-signed catalog, for the dongle
+/// setup screen (`dongle.list`'s `driverSigning`): `managed-beta` asks the person before it
+/// signs the driver here (`acceptanceRequired`, unless an administrator pre-authorised the
+/// machine), `production` never signs here, `development` is a debug build.
+fn driver_signing() -> Value {
+    #[cfg(target_os = "windows")]
+    {
+        let status = aokie_dongle::installer::local_signing_status();
+        json!({
+            "flavour": status.flavour,
+            "acceptanceRequired": status.acceptance_required,
+            "preauthorised": status.preauthorised,
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // No WinUSB install off Windows: nothing to sign or to ask about.
+        json!({ "flavour": "unsupported", "acceptanceRequired": false, "preauthorised": false })
+    }
+}
+
 fn apply_endpoint_env_from_settings(
     settings: &Map<String, Value>,
     setting_key: &str,
@@ -6092,6 +6133,45 @@ mod tests {
         assert!(data["connected"].is_array());
         assert!(data["liveEnumeration"].is_boolean());
         assert!(data["note"].is_string());
+    }
+
+    #[test]
+    fn dongle_list_says_whether_this_build_asks_before_signing_a_driver_here() {
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+        let data = plugin
+            .dispatch_command("dongle.list", &Value::Null, &mut sink)
+            .unwrap();
+        let signing = &data["driverSigning"];
+        let flavour = signing["flavour"].as_str().unwrap();
+        if !cfg!(target_os = "windows") {
+            assert_eq!(flavour, "unsupported");
+        } else if cfg!(feature = "managed-beta-driver") {
+            assert_eq!(flavour, "managed-beta");
+        } else if cfg!(debug_assertions) {
+            assert_eq!(flavour, "development");
+        } else {
+            assert_eq!(flavour, "production");
+        }
+        // Only a managed-beta RELEASE build asks; a production build has nothing to accept.
+        if flavour != "managed-beta" {
+            assert_eq!(signing["acceptanceRequired"], json!(false));
+        }
+        assert!(signing["preauthorised"].is_boolean());
+    }
+
+    #[test]
+    fn install_driver_reads_the_per_install_acceptance_strictly() {
+        let obj = |v: Value| v.as_object().cloned().unwrap();
+        assert!(!accepts_local_signing(&obj(json!({"vid": 1, "pid": 2}))).unwrap(), "absent: not accepted");
+        assert!(!accepts_local_signing(&obj(json!({"acceptLocalSigning": null}))).unwrap());
+        assert!(!accepts_local_signing(&obj(json!({"acceptLocalSigning": false}))).unwrap());
+        assert!(accepts_local_signing(&obj(json!({"acceptLocalSigning": true}))).unwrap());
+        // A malformed acceptance is refused, never read as a yes.
+        for bad in [json!("true"), json!(1), json!({}), json!([true])] {
+            let err = accepts_local_signing(&obj(json!({"acceptLocalSigning": bad.clone()}))).unwrap_err();
+            assert!(err.message.contains("acceptLocalSigning"), "{bad}: {}", err.message);
+        }
     }
 
     #[test]
