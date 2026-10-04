@@ -39,6 +39,14 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
+      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
+      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
+      - name: sherpa-onnx without wmic
+        shell: pwsh
+        run: |
+          cargo fetch
+          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
+
       # The WHOLE shipping workspace (audit AOK-CI-001): core, bluetooth, db,
       # audio, ai, dongle, voice-server, receptionist AND the plugin — the
       # radio/recovery logic lives in crates the old plugin-only run never
@@ -60,6 +68,14 @@ jobs:
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
+      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
+      - name: sherpa-onnx without wmic
+        shell: pwsh
+        run: |
+          cargo fetch
+          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
 
       # The voice build compiles a distinct cfg surface (agent, AEC, TTS/STT
       # runtimes) that the default build never touches. Audit AK-15: the
@@ -85,6 +101,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
+      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
+      - name: sherpa-onnx without wmic
+        shell: pwsh
+        run: |
+          cargo fetch
+          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
       - name: Check plugin (voice,managed-beta-driver)
         run: cargo check -p aokie-plugin --features voice,managed-beta-driver
       - name: Check driver helper (managed-beta-driver)
@@ -126,6 +150,14 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
+      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
+      - name: sherpa-onnx without wmic
+        shell: pwsh
+        run: |
+          cargo fetch
+          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
       - name: Clippy
         run: cargo clippy --workspace --all-targets --features transcribe-rs/openai
 
@@ -178,6 +210,14 @@ jobs:
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
+      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
+      - name: sherpa-onnx without wmic
+        shell: pwsh
+        run: |
+          cargo fetch
+          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
 
       # Audit AOK-REL-001: the ONLY correct order is
       #   build helper → SIGN helper → VERIFY signature → hash the SIGNED
@@ -466,6 +506,14 @@ jobs:
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
+      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
+      - name: sherpa-onnx without wmic
+        shell: pwsh
+        run: |
+          cargo fetch
+          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
 
       # The production job's order, less the signing of executables: the helper first, its hash pinned into the plugin
       # (the release gate of aokie-dongle), then the plugin and the voice server.

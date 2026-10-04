@@ -1,13 +1,20 @@
 # Repair the optional OS-caption probe after a voice build fails without wmic.
+# -CargoRegistry repairs it BEFORE a build instead (CI, whose Windows runners have no wmic either): the crate's own copy
+# in Cargo's registry, which every build copies into its output folder. Run `cargo fetch` first so the copy exists.
 [CmdletBinding()]
-param([string]$TargetDirectory)
+param([string]$TargetDirectory, [switch]$CargoRegistry)
 $ErrorActionPreference = 'Stop'
-# Resolved here, not as the parameter default: Windows PowerShell 5.1 leaves
-# $PSScriptRoot empty inside param() when the script is run with -File.
-if (-not $TargetDirectory) { $TargetDirectory = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '../target' }
-$targetRoot = (Resolve-Path -LiteralPath $TargetDirectory).Path
-$files = Get-ChildItem -LiteralPath $targetRoot -Filter show-info.cmake -Recurse -File |
-    Where-Object { $_.FullName -like '*sherpa-rs-sys-*\out\sherpa-onnx\cmake\show-info.cmake' }
+if ($CargoRegistry) {
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
+    $files = @(Get-ChildItem -Path (Join-Path $cargoHome 'registry/src/*/sherpa-rs-sys-*/sherpa-onnx/cmake/show-info.cmake') -File -ErrorAction SilentlyContinue)
+} else {
+    # Resolved here, not as the parameter default: Windows PowerShell 5.1 leaves
+    # $PSScriptRoot empty inside param() when the script is run with -File.
+    if (-not $TargetDirectory) { $TargetDirectory = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '../target' }
+    $targetRoot = (Resolve-Path -LiteralPath $TargetDirectory).Path
+    $files = Get-ChildItem -LiteralPath $targetRoot -Filter show-info.cmake -Recurse -File |
+        Where-Object { $_.FullName -like '*sherpa-rs-sys-*\out\sherpa-onnx\cmake\show-info.cmake' }
+}
 $replacement = @'
 if(SHERPA_ONNX_OS_TWO_LINES)
   string(REPLACE "\n" ";" SHERPA_ONNX_OS_LIST "${SHERPA_ONNX_OS_TWO_LINES}")
@@ -32,6 +39,8 @@ foreach ($file in $files) {
         Write-Host "Repaired optional Windows information probe: $($file.FullName)"
         $patched = $true
     }
+    # The registry copy has no build of its own to regenerate.
+    if ($CargoRegistry) { continue }
     # Cargo retries may jump straight to --build after a failed configure.
     # Regenerate the existing cache so that retry has an install target. An
     # already-patched tree is reconfigured too when its build has no project
@@ -51,4 +60,7 @@ foreach ($file in $files) {
     if ($cmakeExit -ne 0) { throw "CMake reconfiguration failed: $buildDirectory" }
     Write-Host "Reconfigured: $buildDirectory"
 }
-if (-not $files) { throw 'No generated sherpa CMake file found. Run the voice build first.' }
+if (-not $files) {
+    if ($CargoRegistry) { throw "No sherpa-rs-sys source in Cargo's registry. Run cargo fetch first." }
+    throw 'No generated sherpa CMake file found. Run the voice build first.'
+}

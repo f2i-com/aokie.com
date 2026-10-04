@@ -209,7 +209,9 @@ cargo build -p aokie-voice-server                               # loopback speec
 
 `voice,managed-beta-driver` is the combination the managed pilots ship. Debug builds need
 no pinned hashes; release builds do, as below. If a voice build fails because Windows no
-longer has `wmic`, run `scripts/repair-sherpa-cmake.ps1` and build again.
+longer has `wmic`, run `scripts/repair-sherpa-cmake.ps1` and build again. Run with
+`-CargoRegistry` after `cargo fetch`, it repairs the crate's source before any build, which
+is what CI does (GitHub's Windows runners have no `wmic` either).
 
 ### Release build
 
