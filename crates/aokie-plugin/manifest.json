@@ -2,7 +2,7 @@
   "schemaVersion": 4,
   "id": "aokie",
   "name": "Aokie Phone Bridge",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "publisher": "Aokie",
   "description": "Bluetooth dongle / phone bridge (WinUSB, HFP/SCO, MAP SMS, PBAP contacts) packaged as a FormLogic Desktop plugin. Emits aokie.* call/SMS/dongle events and serves the aokie connector command surface.",
   "pluginApiVersion": 1,

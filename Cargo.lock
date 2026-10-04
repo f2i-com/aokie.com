@@ -94,7 +94,7 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "aokie-ai"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aokie-core",
  "async-trait",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-audio"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aec-rs",
  "aokie-core",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-bluetooth"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aokie-core",
  "chrono",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-db"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aokie-core",
  "rusqlite",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-dongle"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aokie-bluetooth",
  "aokie-core",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-media"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "futures-util",
  "libwebrtc",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-plugin"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aec-rs",
  "aokie-ai",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-protocol"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-realtime"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aokie-protocol",
  "axum",
@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-receptionist"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aokie-ai",
  "aokie-core",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-voice-server"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aokie-ai",
  "aokie-core",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "aokie-winbt"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aokie-bluetooth",
  "aokie-core",
