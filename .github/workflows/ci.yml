@@ -332,6 +332,19 @@ jobs:
           Set-Content -Encoding ascii pinned-helper-sha.txt $sha
           Set-Content -Encoding ascii signing-state.txt $(if ($signingEnabled) { 'signed' } else { 'unsigned' })
 
+      # The ort engines (Pocket-TTS, Parakeet) load ONNX Runtime 1.25.0 by that exact name from beside the exe
+      # (crates/aokie-plugin/src/voice.rs, ensure_ort_dylib); sherpa's own onnxruntime.dll is 1.17.1 and cannot run
+      # them, and scripts/verify-bundle-assets.ps1 requires both. Microsoft's release, pinned by the digest it publishes.
+      - name: ONNX Runtime 1.25.0 for the ort engines
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'onnxruntime-win-x64-1.25.0.zip'
+          Invoke-WebRequest -Uri 'https://github.com/microsoft/onnxruntime/releases/download/v1.25.0/onnxruntime-win-x64-1.25.0.zip' -OutFile $zip
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne 'da753f762bf2400e7191ec594086b186a7051d5af8dc886f6e2020c2403df738') { throw "onnxruntime-win-x64-1.25.0.zip is not the published release ($sha)" }
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'ort') -Force
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'ort/onnxruntime-win-x64-1.25.0/lib/onnxruntime.dll') target/release/onnxruntime_1.25.0.dll
+
       # Audit AOK-REL-002: a voice release without its runtime is a phone
       # that can't hear or speak — missing assets FAIL the release, and the
       # pin/signature invariants are re-checked on the exact bytes packaged.
@@ -531,6 +544,19 @@ jobs:
           cargo build -p aokie-voice-server --release
           if ($LASTEXITCODE -ne 0) { throw "voice server build failed" }
           Set-Content -Encoding ascii pinned-helper-sha.txt $sha
+
+      # The ort engines (Pocket-TTS, Parakeet) load ONNX Runtime 1.25.0 by that exact name from beside the exe
+      # (crates/aokie-plugin/src/voice.rs, ensure_ort_dylib); sherpa's own onnxruntime.dll is 1.17.1 and cannot run
+      # them, and scripts/verify-bundle-assets.ps1 requires both. Microsoft's release, pinned by the digest it publishes.
+      - name: ONNX Runtime 1.25.0 for the ort engines
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'onnxruntime-win-x64-1.25.0.zip'
+          Invoke-WebRequest -Uri 'https://github.com/microsoft/onnxruntime/releases/download/v1.25.0/onnxruntime-win-x64-1.25.0.zip' -OutFile $zip
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne 'da753f762bf2400e7191ec594086b186a7051d5af8dc886f6e2020c2403df738') { throw "onnxruntime-win-x64-1.25.0.zip is not the published release ($sha)" }
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'ort') -Force
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'ort/onnxruntime-win-x64-1.25.0/lib/onnxruntime.dll') target/release/onnxruntime_1.25.0.dll
 
       - name: Assemble + verify bundle (fail closed)
         shell: pwsh
