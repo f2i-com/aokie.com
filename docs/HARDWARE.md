@@ -48,26 +48,51 @@ and iOS builds; there is no certified-phone matrix yet — establishing one is
 the hardware half of audit task **AOK-E2E-001** (a record/replay radio
 abstraction plus a small supported-device lab).
 
-### Android 17: texts stuck on "Sending…" (Google Messages beta)
+### Android 17: texts held by the Google Messages beta
 
 `aokie.sms.sent` means the phone accepted the MAP PushMessage into its outbox
 (OBEX `0xA0`), not that the text went out. The phone reports the real result
 only over MNS, which outbound sessions never get. Since 28 Sept 2026 the radio
 logs a **sent check** 20 s after each send: the phone's outbox and sent folder
-listings (`[AokieRadio] sent check: Outbox holds …`). A text still in the
-outbox has not gone out; the phone files queued and failed texts there too.
+listings (`[AokieRadio] sent check: Outbox holds …`).
 
-On the Pixel 9a test phone (Android 17, CP3A.260905.009) every pushed text
-stayed "Still sending" in Google Messages. Android 17 asks the default
-messaging app to "upgrade" texts sent by other apps before sending them
-(`SMSDispatcher: sendText: requesting message upgrade via DMA.` in
-`adb logcat -b radio`). The Google Messages **open beta**
-(`messages.android_20260921_01_RC00.phone.openbeta`) accepted the handover
-(`onMessageUpgradeRequested`) and never sent its copy. Rolling Messages back
-fixed it: `adb shell pm uninstall-system-updates com.google.android.apps.messaging`.
-The factory build declines the upgrade and the phone sends the text itself.
-Leaving the Messages beta in the Play Store keeps it fixed. It was not a
-Bluetooth, SIM or carrier fault; texts typed on the phone always went out.
+What the phone does with a pushed text, read from its logs and its own code on
+the Pixel 9a test phone (Android 17, CP3A.260905.009) on 9 Oct 2026:
+
+- Its Bluetooth message service stores the text and asks the phone service to
+  send the stored one (`SmsController: sendStoredText caller=com.google.android.bluetooth`
+  in `adb logcat -b radio`).
+- Android 17 hands every text from an app that is not the default SMS app to
+  the default app first, when that app offers a service for
+  `android.service.messaging.AlternativeMessageTransportService`
+  (`SMSDispatcher: sendText: requesting message upgrade via DMA.`). Only the
+  sender's package is looked at. **A sender cannot opt out**: nothing in a MAP
+  push changes it, the phone turns a text-only MMS push back into an SMS, and
+  the switch for it is fixed on in Android 17.
+- Google Messages offers that service (its "RCS upgrade"), and what happens
+  next is the build's:
+  - The factory build (`messages.android_20260331_00_RC04`) refuses the
+    hand-over (`sendText: message upgrade request failed.`) and the phone sends
+    the text itself within a second.
+  - The open beta (`20260921_01_RC00`, and `20261002_00_RC00` still) accepts
+    it. With RCS chats off it makes an SMS copy of its own and queues it. The
+    stored original stays in the conversation as a second message on "Still
+    sending", and the queue stalls on it: the copy went out only when the next
+    message was sent (15 s late once, not at all in 4½ minutes another time).
+    A text typed in Messages in the same conversation then showed "Not sent"
+    although the network had taken it.
+
+The fix is on the phone: `adb shell pm uninstall-system-updates
+com.google.android.apps.messaging` puts the factory build back (Messages' own
+data starts over; the texts are read again from the phone's store), and
+leaving the Messages beta in the Play Store keeps it there (still enrolled,
+Play put the beta back on 8 Oct). Checked again on 9 Oct 2026: the two texts
+pushed after the rollback were refused the hand-over and sent at once. It was
+not a Bluetooth, SIM or carrier fault, and turning RCS chats off in the beta
+does not help.
+
+On the beta the sent check cannot tell a sent text from a held one: the
+stored original stays in the outbox either way.
 
 ## Windows
 

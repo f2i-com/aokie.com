@@ -1237,6 +1237,16 @@ impl Plugin {
             )
             .into());
         }
+        // Nor a short code or a service number: only a person's number is
+        // texted. A flow or an agent that answers every incoming text would
+        // otherwise write back to a bank's code or a carrier's notice. (A
+        // sender id of letters is refused above: it is not a number at all.)
+        if to.chars().filter(char::is_ascii_digit).count() < SMS_PERSON_MIN_DIGITS {
+            return Err(CmdError::failed(
+                "sms.send refused: the recipient is a short code or a service number (fewer than 7 digits), and only a person's phone number is texted",
+            )
+            .into());
+        }
         // AOK-CONSENT-001: sending SMS (MAP) needs the `sms` scope.
         self.check_consent("sms.send", crate::consent::Scope::Sms)?;
         if let Some(radio) = self.radio.as_ref() {
@@ -5463,6 +5473,11 @@ impl From<CmdError> for SmsSendError {
     }
 }
 
+/// The fewest digits a number a person texts from has. Short codes and
+/// carriers' service numbers have three to six; the shortest national
+/// numbers, written without their country, have seven.
+const SMS_PERSON_MIN_DIGITS: usize = 7;
+
 /// An SMS messageId is a correlation id and part of an idempotency key, so it
 /// must be 1..=128 safe identifier characters (the event envelope caps
 /// `correlationId` at 128).
@@ -9020,6 +9035,48 @@ mod tests {
             .dispatch_command(
                 "sms.send",
                 &json!({"to": "0499 999 999", "body": "Hello", "messageId": "msg-open-1"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(
+            err.message.contains("radio is not running"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn sms_send_to_a_short_code_is_refused_and_acknowledges_the_message_id() {
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+        for (to, id) in [
+            ("55555", "msg-short-1"),
+            ("19 12 34", "msg-short-2"),
+            ("+61101", "msg-short-3"),
+        ] {
+            sink.lines.clear();
+            let err = plugin
+                .dispatch_command(
+                    "sms.send",
+                    &json!({"to": to, "body": "Thanks for your message", "messageId": id}),
+                    &mut sink,
+                )
+                .unwrap_err();
+            assert_eq!(err.code, "command_failed");
+            assert!(err.message.contains("short code"), "{}", err.message);
+            let ev = sms_refusal_event(&sink, id);
+            assert_eq!(ev["data"]["reason"], json!(err.message));
+        }
+        // Seven digits is someone's number somewhere: it gets as far as it did before (no radio here).
+        sink.lines.clear();
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "555 0123", "body": "Hello", "messageId": "msg-seven-1"}),
                 &mut sink,
             )
             .unwrap_err();
