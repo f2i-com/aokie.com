@@ -595,6 +595,9 @@ pub(super) fn run_loop(
     // ringing call (bounds the hold; reset per call).
     #[cfg(feature = "voice")]
     let mut answer_hold_started: Option<Instant> = None;
+    // A call the screening refused while it rang, until the phone ends it
+    // (`screen::RingRefusal`).
+    let mut ring_refusal: Option<crate::screen::RingRefusal> = None;
     // Guide phase 2/5 — LIVE HYPOTHESIS LANE: while the caller speaks (bot
     // idle), the in-progress utterance is re-transcribed every ~600 ms on the
     // probe channel, giving streaming partial text; a STABLE partial starts a
@@ -1680,10 +1683,64 @@ pub(super) fn run_loop(
         // the REMOTE side hasn't picked up — an ATA into our own dialing
         // attempt is nonsense.
         // A screened caller refused while the phone still rings: decided
-        // below, acted on once the session is let go.
-        let mut refuse_at_ring: Option<&'static str> = None;
+        // below (the reason, and which try this is), acted on once the session
+        // is let go.
+        let mut refuse_at_ring: Option<(&'static str, u8)> = None;
         if auto_answer {
             if let Some(s) = tracker.current_mut() {
+                // A screened caller whose number is known while the phone still
+                // rings, with nothing to be said to them, is refused there: not
+                // picked up at all. Decided before anything about the voice
+                // pipeline, the realtime route's preparing or the
+                // personalization window: none of them is needed to refuse a
+                // call. With a message to say, or with no number yet, the call
+                // is answered and screened at the greeting, as before.
+                if !s.is_active() && !s.outbound {
+                    let refusing = ring_refusal.as_ref().is_some_and(|r| r.call_id == s.id);
+                    if !refusing {
+                        #[cfg(feature = "voice")]
+                        let ring_screened =
+                            screen_policy.ring_verdict(s.outbound, s.caller_id.as_deref());
+                        #[cfg(not(feature = "voice"))]
+                        let ring_screened: Option<&'static str> = None;
+                        if let (false, Some(reason)) = (s.auto_answered, ring_screened) {
+                            // Not answered while the phone has its time to act.
+                            s.auto_answered = true;
+                            ring_refusal = Some(crate::screen::RingRefusal {
+                                call_id: s.id.clone(),
+                                reason,
+                                sent: Instant::now(),
+                                tries: 1,
+                                gave_up: false,
+                            });
+                            refuse_at_ring = Some((reason, 1));
+                            idle = false;
+                        }
+                    } else if let Some(r) = ring_refusal.as_mut().filter(|r| !r.gave_up) {
+                        // The call is still here: a reject is only a request.
+                        match crate::screen::ring_refusal_step(r.tries, r.sent.elapsed()) {
+                            crate::screen::RingStep::Wait => {}
+                            crate::screen::RingStep::RejectAgain => {
+                                r.tries += 1;
+                                r.sent = Instant::now();
+                                refuse_at_ring = Some((r.reason, r.tries));
+                                idle = false;
+                            }
+                            crate::screen::RingStep::AnswerInstead => {
+                                // The phone did not act. The call is answered
+                                // after all and refused at the greeting, as
+                                // every screened call was before: a screened
+                                // caller is never left ringing through.
+                                r.gave_up = true;
+                                s.auto_answered = false;
+                                eprintln!(
+                                    "[aokie-plugin] call screened while ringing ({}) — the phone still rings after {} rejects; answering it to refuse it at the greeting",
+                                    r.reason, r.tries
+                                );
+                            }
+                        }
+                    }
+                }
                 if !s.auto_answered && !s.is_active() && !s.outbound {
                     // AOK-VOICE-001: never answer into silence. A KNOWN voice
                     // failure (asset preflight or a live engine/synthesis
@@ -1808,23 +1865,7 @@ pub(super) fn run_loop(
                         };
                         #[cfg(not(feature = "voice"))]
                         let (hold, overlay_ready) = (false, false);
-                        // A screened caller with nothing to be said to them
-                        // is refused while the phone still rings: not picked up
-                        // at all, and without waiting out the personalization
-                        // window. With a message to say, or with no number yet,
-                        // the call is answered and screened at the greeting, as
-                        // before.
-                        #[cfg(feature = "voice")]
-                        let ring_screened =
-                            screen_policy.ring_verdict(s.outbound, s.caller_id.as_deref());
-                        #[cfg(not(feature = "voice"))]
-                        let ring_screened: Option<&'static str> = None;
-                        if let Some(reason) = ring_screened {
-                            // Not answered, and not looked at again for this call.
-                            s.auto_answered = true;
-                            refuse_at_ring = Some(reason);
-                            idle = false;
-                        } else if hold {
+                        if hold {
                             idle = false;
                         } else {
                             match bt.answer_call() {
@@ -1859,17 +1900,17 @@ pub(super) fn run_loop(
             }
         }
 
-        if let Some(reason) = refuse_at_ring {
+        if let Some((reason, attempt)) = refuse_at_ring {
             // Recorded before the phone acts, so the call's end reads
-            // "rejected", never "missed": a screened caller is not rung or
-            // texted back as a missed call.
-            tracker.note_intent(crate::call_session::TerminationIntent::OperatorReject);
+            // "rejected" (by the screening), never "missed": a screened caller
+            // is not rung or texted back as a missed call.
+            tracker.note_intent(crate::call_session::TerminationIntent::Screened);
             match bt.reject_call() {
                 Ok(()) => eprintln!(
-                    "[aokie-plugin] call screened while ringing ({reason}) — rejected, not answered"
+                    "[aokie-plugin] call screened while ringing ({reason}) — reject {attempt} sent, not answered"
                 ),
                 Err(e) => eprintln!(
-                    "[aokie-plugin] call screened while ringing ({reason}) — the reject failed ({e}); it is left ringing, not answered"
+                    "[aokie-plugin] call screened while ringing ({reason}) — reject {attempt} could not be sent ({e})"
                 ),
             }
         }

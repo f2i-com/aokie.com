@@ -8,7 +8,10 @@
 //! Where the caller's number is known while the phone still rings and there
 //! is no message to say to them, the call is refused there instead and never
 //! picked up (`ring_verdict`): answering a blocked number to hang up on it
-//! tells whoever dials it that the line is live.
+//! tells whoever dials it that the line is live. A reject is only a request to
+//! the phone, so it is watched (`RingRefusal`): sent again when the call still
+//! rings, and after that the call is answered and refused at the greeting, as
+//! every screened call was before. A screened caller never rings through.
 
 /// Parsed screening policy. Built once at radio start from the settings-fed
 /// environment (`blockedNumbers` / `acceptPattern` / `rejectPrivate` /
@@ -44,6 +47,51 @@ impl ScreenPolicy {
         } else {
             self.message.trim()
         }
+    }
+}
+
+/// How long the phone has to end a ringing call it was told to reject, before
+/// it is told again, and then before the call is answered instead.
+pub(crate) const RING_REJECT_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// The rejects a ringing call is sent in all.
+pub(crate) const RING_REJECT_TRIES: u8 = 2;
+
+/// A call being refused while it rings: the phone was told to reject it, and
+/// the call is still there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RingRefusal {
+    pub call_id: String,
+    /// The verdict's reason ("blocked" / "filtered").
+    pub reason: &'static str,
+    /// When the phone was last told.
+    pub sent: std::time::Instant,
+    /// How many times it was told.
+    pub tries: u8,
+    /// The phone did not act: the call goes on to be answered and refused at
+    /// the greeting, and is not looked at here again.
+    pub gave_up: bool,
+}
+
+/// What to do about a call the phone was told to reject and still shows ringing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RingStep {
+    /// The phone still has time to act.
+    Wait,
+    /// Tell it again.
+    RejectAgain,
+    /// It did not act: answer the call, and refuse it at the greeting.
+    AnswerInstead,
+}
+
+/// The next step for a ringing call that was sent `tries` rejects, the last of
+/// them `since_last` ago.
+pub(crate) fn ring_refusal_step(tries: u8, since_last: std::time::Duration) -> RingStep {
+    if since_last < RING_REJECT_WAIT {
+        RingStep::Wait
+    } else if tries < RING_REJECT_TRIES {
+        RingStep::RejectAgain
+    } else {
+        RingStep::AnswerInstead
     }
 }
 
@@ -327,6 +375,26 @@ mod tests {
         assert_eq!(p.ring_verdict(false, Some("0299998888")), Some("filtered"));
         p.message = "Please call back showing your number.".into();
         assert_eq!(p.ring_verdict(false, Some("0299998888")), None);
+    }
+
+    /// A reject is a request: the phone has a moment to act on it, is told once
+    /// more, and after that the call is answered to be refused at the greeting.
+    #[test]
+    fn a_reject_the_phone_does_not_act_on_is_sent_again_and_then_the_call_is_answered_instead() {
+        use std::time::Duration;
+        let just_under = RING_REJECT_WAIT - Duration::from_millis(1);
+        assert_eq!(ring_refusal_step(1, Duration::ZERO), RingStep::Wait);
+        assert_eq!(ring_refusal_step(1, just_under), RingStep::Wait);
+        assert_eq!(ring_refusal_step(1, RING_REJECT_WAIT), RingStep::RejectAgain);
+        assert_eq!(ring_refusal_step(RING_REJECT_TRIES, just_under), RingStep::Wait);
+        assert_eq!(ring_refusal_step(RING_REJECT_TRIES, RING_REJECT_WAIT), RingStep::AnswerInstead);
+        // Every try is used before the call is answered, and the whole of it is a ring or so, not a minute.
+        let mut tries = 1;
+        while ring_refusal_step(tries, RING_REJECT_WAIT) == RingStep::RejectAgain {
+            tries += 1;
+        }
+        assert_eq!(tries, RING_REJECT_TRIES);
+        assert!(RING_REJECT_WAIT * u32::from(RING_REJECT_TRIES) <= Duration::from_secs(4));
     }
 
     #[test]
