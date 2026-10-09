@@ -43,6 +43,11 @@ pub enum TerminationIntent {
     /// you're next in the queue" line gave up waiting. Follow-up flows treat
     /// this like a missed call (call them back) with a hold apology.
     AbandonedInQueue,
+    /// The plugin's own call screening refused the call while it rang (a
+    /// blocked or filtered number with nothing to be said to it): rejected by
+    /// the rule the person set, not by anyone pressing Reject, and the record
+    /// says which.
+    Screened,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,8 +412,14 @@ impl SessionTracker {
             (true, Some(TerminationIntent::AbandonedInQueue)) => {
                 ("abandoned_in_queue", "hung_up_in_queue")
             }
+            // Refused while it rang, and picked up all the same (the phone did
+            // not act on the reject and the call was answered to be refused at
+            // the greeting, or someone took it on the handset): it was answered,
+            // and why it was to end is still said.
+            (true, Some(TerminationIntent::Screened)) => ("completed", "screened"),
             (true, _) => ("completed", "remote_or_operator"),
             (false, Some(TerminationIntent::OperatorReject)) => ("rejected", "operator_reject"),
+            (false, Some(TerminationIntent::Screened)) => ("rejected", "screened"),
             (false, Some(TerminationIntent::OperatorHangup)) => ("rejected", "operator_hangup"),
             // Defensive: the agent only hangs up after answering, so this cannot
             // normally occur — classify as missed rather than leave it unmatched.
@@ -514,6 +525,28 @@ mod tests {
         assert_eq!(ended.reason, "operator_reject");
         assert_eq!(ended.duration_ms, 0);
         assert_eq!(ended.caller_id.as_deref(), Some("+61400000001"));
+    }
+
+    /// A call the screening refused while it rang is rejected, never missed
+    /// (nobody is rung or texted back for it), and its record tells it from a
+    /// person's Reject. Answered all the same, it is a completed call that
+    /// still says why it was to end, whatever hangs it up afterwards.
+    #[test]
+    fn a_call_screened_while_it_rings_is_rejected_and_says_so() {
+        let mut t = SessionTracker::new();
+        ring(&mut t, "call_a");
+        t.caller_id("+61400000001".into());
+        t.note_intent(TerminationIntent::Screened);
+        let ended = t.terminate().unwrap();
+        assert_eq!((ended.outcome, ended.reason), ("rejected", "screened"));
+        assert_eq!(ended.duration_ms, 0);
+
+        ring(&mut t, "call_b");
+        t.note_intent(TerminationIntent::Screened);
+        t.answered();
+        t.note_intent(TerminationIntent::AgentHangup);
+        let ended = t.terminate().unwrap();
+        assert_eq!((ended.outcome, ended.reason), ("completed", "screened"));
     }
 
     #[test]

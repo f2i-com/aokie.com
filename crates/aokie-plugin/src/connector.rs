@@ -1241,9 +1241,9 @@ impl Plugin {
         // texted. A flow or an agent that answers every incoming text would
         // otherwise write back to a bank's code or a carrier's notice. (A
         // sender id of letters is refused above: it is not a number at all.)
-        if to.chars().filter(char::is_ascii_digit).count() < SMS_PERSON_MIN_DIGITS {
+        if sms_service_number(&to) {
             return Err(CmdError::failed(
-                "sms.send refused: the recipient is a short code or a service number (fewer than 7 digits), and only a person's phone number is texted",
+                "sms.send refused: the recipient is a short code or a service number, and only a person's phone number is texted",
             )
             .into());
         }
@@ -5478,6 +5478,31 @@ impl From<CmdError> for SmsSendError {
 /// numbers, written without their country, have seven.
 const SMS_PERSON_MIN_DIGITS: usize = 7;
 
+/// Whether an `sms.send` recipient is a short code or a service number, not a
+/// person's: fewer than seven digits; or eight digits that begin with 1
+/// (Australia's 19xx xxxx premium numbers, the dearest thing a flow can write
+/// back to: no country's eight-digit subscriber numbers begin with 1); or
+/// either of those with Australia's country code put in front ("+61 19xx
+/// xxxx", "+61 55555"), as a host that writes every sender in international
+/// form would give them.
+fn sms_service_number(to: &str) -> bool {
+    let digits: String = to.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() < SMS_PERSON_MIN_DIGITS {
+        return true;
+    }
+    let service = |national: &str| {
+        national.len() < SMS_PERSON_MIN_DIGITS || (national.len() == 8 && national.starts_with('1'))
+    };
+    if to.trim_start().starts_with('+') {
+        // Another country's numbers are not read: only its digits are counted, above.
+        return digits.strip_prefix("61").is_some_and(service);
+    }
+    match digits.strip_prefix("001161") {
+        Some(national) => service(national),
+        None => service(&digits),
+    }
+}
+
 /// An SMS messageId is a correlation id and part of an idempotency key, so it
 /// must be 1..=128 safe identifier characters (the event envelope caps
 /// `correlationId` at 128).
@@ -9057,6 +9082,11 @@ mod tests {
             ("55555", "msg-short-1"),
             ("19 12 34", "msg-short-2"),
             ("+61101", "msg-short-3"),
+            // A premium number of eight digits, and the same or a short code with the country in front.
+            ("1912 3456", "msg-short-4"),
+            ("+61 1912 3456", "msg-short-5"),
+            ("+61 55555", "msg-short-6"),
+            ("0011 61 19 123 456", "msg-short-7"),
         ] {
             sink.lines.clear();
             let err = plugin
@@ -9071,20 +9101,32 @@ mod tests {
             let ev = sms_refusal_event(&sink, id);
             assert_eq!(ev["data"]["reason"], json!(err.message));
         }
-        // Seven digits is someone's number somewhere: it gets as far as it did before (no radio here).
-        sink.lines.clear();
-        let err = plugin
-            .dispatch_command(
-                "sms.send",
-                &json!({"to": "555 0123", "body": "Hello", "messageId": "msg-seven-1"}),
-                &mut sink,
-            )
-            .unwrap_err();
-        assert!(
-            err.message.contains("radio is not running"),
-            "{}",
-            err.message
-        );
+        // Seven digits is someone's number somewhere, and so are these: each gets as far as it did before
+        // (no radio here).
+        for (to, id) in [
+            ("555 0123", "msg-person-1"),
+            ("0412 345 678", "msg-person-2"),
+            ("+61 412 345 678", "msg-person-3"),
+            ("9123 4567", "msg-person-4"),
+            ("+61 2 9123 4567", "msg-person-5"),
+            ("+64 9 123 4567", "msg-person-6"),
+            ("+1 212 555 0123", "msg-person-7"),
+            ("+65 9123 4567", "msg-person-8"),
+        ] {
+            sink.lines.clear();
+            let err = plugin
+                .dispatch_command(
+                    "sms.send",
+                    &json!({"to": to, "body": "Hello", "messageId": id}),
+                    &mut sink,
+                )
+                .unwrap_err();
+            assert!(
+                err.message.contains("radio is not running"),
+                "{to}: {}",
+                err.message
+            );
+        }
     }
 
     #[test]

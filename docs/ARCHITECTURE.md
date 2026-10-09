@@ -55,6 +55,8 @@ never a guess:
 | yes | (remote) | completed | remote_or_operator |
 | yes | DeviceLost | completed | device_lost |
 | no | OperatorReject | rejected | operator_reject |
+| no | Screened (the screening refused it while it rang) | rejected | screened |
+| yes | Screened (and picked up all the same) | completed | screened |
 | no | DeviceLost | missed | device_lost |
 | no | (none) | missed | remote_or_operator |
 
