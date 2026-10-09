@@ -5,3 +5,5 @@
 # checkout (core.autocrlf=true) must not change what they see. The scans also fold
 # line endings, so a working copy checked out before this rule still passes.
 *.rs text eol=lf
+# The stand-in dongle runs inside Linux containers too.
+*.py text eol=lf

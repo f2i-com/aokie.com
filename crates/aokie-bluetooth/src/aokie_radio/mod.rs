@@ -35,6 +35,7 @@ pub mod sco_dump;
 pub mod sdp;
 pub mod sdp_client;
 pub(crate) mod transport_recovery;
+pub mod usb_hci;
 pub mod vcard;
 
 #[cfg(target_os = "windows")]

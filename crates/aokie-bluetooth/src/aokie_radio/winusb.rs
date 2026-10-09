@@ -1,5 +1,6 @@
 #![cfg(target_os = "windows")]
 
+use super::usb_hci::{sco_alt_setting_for_voice, SCO_ALT_SETTINGS_16_BIT, SCO_ALT_SETTINGS_8_BIT};
 use std::collections::VecDeque;
 use std::mem::{size_of, zeroed};
 use std::ptr::NonNull;
@@ -284,11 +285,6 @@ const GUID_DEVINTERFACE_USB_DEVICE: GUID = GUID::from_u128(0xa5dcbf10_6530_11d2_
 const GUID_DEVINTERFACE_WINUSB_REALTEK: GUID =
     GUID::from_u128(0x226e0e8f_afc0_4a68_864d_ef7e9553e1ea);
 const SCO_ALT_SETTINGS_TO_PROBE: [u8; 7] = [0, 1, 2, 3, 4, 5, 6];
-/// BTstack USB-transport alt-setting tables. Bit 5 of voice_setting
-/// (input sample size) selects which table; the connection count
-/// indexes into it. mSBC + transparent + 1 connection → alt 1.
-const SCO_ALT_SETTINGS_8_BIT: [u8; 3] = [1, 2, 3];
-const SCO_ALT_SETTINGS_16_BIT: [u8; 3] = [2, 4, 5];
 
 pub fn enumerate_radio_interfaces() -> Result<Vec<RadioInterface>, String> {
     let mut out = Vec::new();
@@ -2733,24 +2729,6 @@ fn add_transport_pipes(out: &mut TransportPipeSet, slot: InterfaceSlot, pipes: &
             }
             _ => {}
         }
-    }
-}
-
-fn sco_alt_setting_for_voice(voice_setting: u16, connection_count: usize) -> Option<u8> {
-    // BTstack `hci_transport_h2_winusb.c:907-913` picks the alt setting
-    // purely from voice_setting bit 5 (input sample size) and the
-    // connection count — there is no transparent → alt 6 special case.
-    // mSBC over USB rides alt 1 (MPS=9) with 24-byte HCI SCO payloads
-    // (see `AOKIE_SCO_USB_PAYLOAD_BYTES`). Routing transparent voice to
-    // a separate alt-6 pipe was an over-read of the Core spec USB
-    // Transport Layer table: BTstack's `hci.c` keeps the same path for
-    // CVSD and mSBC and that is the configuration proven to work on the
-    // Broadcom 21ec dongle in our worktree comparison.
-    let index = connection_count.checked_sub(1)?;
-    if voice_setting & 0x0020 != 0 {
-        SCO_ALT_SETTINGS_16_BIT.get(index).copied()
-    } else {
-        SCO_ALT_SETTINGS_8_BIT.get(index).copied()
     }
 }
 
