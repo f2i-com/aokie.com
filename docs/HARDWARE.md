@@ -113,6 +113,47 @@ udev permission rule, and Aokie may need to detach the kernel `btusb` driver for
 the session. The shared radio stack is portable, but Linux packaging and the
 real-hardware call/SMS/audio matrix are not yet release-qualified.
 
+## macOS
+
+**Not yet run on a Mac.** The radio stack's USB transport builds for macOS
+(Apple silicon and Intel) and is the same libusb transport Linux uses; what
+follows is what the code does and what only a Mac can answer.
+
+No driver is installed and nothing has to be restored afterwards: Aokie opens
+the dongle through libusb, which is built into the program (no Homebrew
+needed). Bluetooth permission is not asked for, because Aokie does not use
+macOS's Bluetooth at all: it talks to the dongle over raw USB.
+
+The open question is whether macOS's own Bluetooth takes the dongle when it is
+plugged in. Some Macs and macOS versions attach their Bluetooth to an external
+USB controller and some leave it alone.
+
+* **macOS leaves it alone:** Aokie claims the dongle as an ordinary user.
+* **macOS's Bluetooth holds it:** libusb may take a device from a macOS driver
+  only for a process that runs as root, or one that carries the
+  `com.apple.vm.device-access` entitlement, which Apple grants to
+  virtualisation apps. Aokie then says so and does not start. Do **not** run
+  the app that hosts Aokie with `sudo`: its keychain would be root's, and the
+  files it writes under your home folder would become root's.
+
+To see which it is, with the dongle plugged in:
+
+```sh
+cargo run -p aokie-bluetooth --example dongle_probe
+```
+
+It lists each USB Bluetooth controller with its endpoints, then opens it and
+asks the controller who it is (an HCI Reset: the dongle is not paired or
+changed). `OK` means Aokie can use it as you. If it says macOS's Bluetooth is
+using the dongle, running that one probe again under `sudo` tells whether
+taking it from macOS works at all on this Mac; that is a test, not a way to
+run Aokie. OAIY's `tools/mac/doctor.sh` prints the same picture from macOS's
+side (its "USB Bluetooth dongle" section).
+
+Call audio is the part most likely to need work on real hardware: SCO audio
+rides isochronous USB transfers, whose timing through libusb on macOS has not
+been measured.
+
 ## Adding a dongle
 
 First exercise an external controller through managed-beta unknown-device mode.

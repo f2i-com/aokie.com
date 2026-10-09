@@ -306,7 +306,7 @@ impl AokieHciTransport {
         // an `unused_mut` warning on the Linux build.
         let handle = device
             .open()
-            .map_err(|e| format!("libusb open {}: {}", path, fmt_err(e)))?;
+            .map_err(|e| format!("libusb open {}: {}{}", path, fmt_err(e), held_hint(e)))?;
 
         // Walk descriptors once to find the HCI interface (class
         // 0xE0/0x01/0x01) and pre-classify its endpoints. Most
@@ -318,9 +318,10 @@ impl AokieHciTransport {
         let (interface_number, alt_setting, pipes) = locate_hci_interface(&config)
             .ok_or_else(|| format!("no HCI interface on USB Bluetooth class device {}", path))?;
 
-        // Detach btusb (or whoever's holding the interface) so we can
-        // claim it. kernel_driver_active is Linux-only — on other
-        // platforms it returns Err which we map to "no driver attached".
+        // Detach the system's own Bluetooth driver (btusb on Linux,
+        // macOS's host-controller transport on a Mac) so we can claim
+        // the interface. Where libusb cannot tell (an Err), it is taken
+        // as "no driver attached" and the claim below says otherwise.
         let kernel_was_attached = handle
             .kernel_driver_active(interface_number)
             .unwrap_or(false);
@@ -329,21 +330,27 @@ impl AokieHciTransport {
                 .detach_kernel_driver(interface_number)
                 .map_err(|e| {
                     format!(
-                        "libusb detach_kernel_driver({}): {} — system Bluetooth (BlueZ) is using the dongle. \
-                         Stop bluetoothd or install the udev rule (see Linux port docs).",
+                        "libusb detach_kernel_driver({}): {} — {}",
                         interface_number,
-                        fmt_err(e)
+                        fmt_err(e),
+                        SYSTEM_HOLDS_IT
                     )
                 })?;
         }
 
-        handle.claim_interface(interface_number).map_err(|e| {
-            format!(
-                "libusb claim_interface({}): {}",
+        if let Err(e) = handle.claim_interface(interface_number) {
+            // A driver we detached goes back: a dongle left with no
+            // driver at all would be dead to the system until replugged.
+            if kernel_was_attached {
+                let _ = handle.attach_kernel_driver(interface_number);
+            }
+            return Err(format!(
+                "libusb claim_interface({}): {}{}",
                 interface_number,
-                fmt_err(e)
-            )
-        })?;
+                fmt_err(e),
+                held_hint(e)
+            ));
+        }
 
         let pipes = classify_hci_pipes(&pipes);
         let _ = alt_setting; // alt 0 is the default; SCO alt-setting changes happen in Phase L4.
@@ -1090,6 +1097,30 @@ fn locate_alt_pipes(
         }
     }
     None
+}
+
+/// What to do when the system's own Bluetooth has the dongle and will
+/// not give it up. On Linux that is BlueZ through `btusb`; on a Mac it
+/// is macOS's Bluetooth, and libusb may take a device from a macOS
+/// driver only for a process that runs as root (or carries an
+/// entitlement Apple gives to virtualisation apps). The app that hosts
+/// Aokie must not be run as root (its keychain and its files would be
+/// root's), so the text sends the reader to the page that says how to
+/// find out what holds the dongle, not to `sudo`.
+#[cfg(target_os = "macos")]
+const SYSTEM_HOLDS_IT: &str = "macOS's own Bluetooth is using the dongle, and macOS gives a USB device it is using only to a root process. \
+     Aokie can use a dongle that macOS leaves alone: docs/HARDWARE.md (macOS) says how to see which it is.";
+#[cfg(not(target_os = "macos"))]
+const SYSTEM_HOLDS_IT: &str = "system Bluetooth (BlueZ) is using the dongle. \
+     Stop bluetoothd or install the udev rule (see Linux port docs).";
+
+/// [`SYSTEM_HOLDS_IT`] after an error that means "someone else has it"
+/// (no access, or busy); nothing after any other error.
+fn held_hint(e: rusb::Error) -> String {
+    match e {
+        rusb::Error::Access | rusb::Error::Busy => format!(" — {}", SYSTEM_HOLDS_IT),
+        _ => String::new(),
+    }
 }
 
 fn fmt_err(e: rusb::Error) -> String {
