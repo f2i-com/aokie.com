@@ -113,6 +113,14 @@ udev permission rule, and Aokie may need to detach the kernel `btusb` driver for
 the session. The shared radio stack is portable, but Linux packaging and the
 real-hardware call/SMS/audio matrix are not yet release-qualified.
 
+The libusb transport has not talked to a real dongle yet. What it has been run
+against is a stand-in: `scripts/virtual-dongle` serves a USB Bluetooth
+controller over USB/IP, the kernel attaches it and binds `btusb` to it as it
+would a real one, and a test drives the transport through taking the device
+from `btusb`, bring-up, events, ACL data, a voice link on each codec's
+alternate setting, and the dongle being pulled out. That proves the USB
+plumbing, not call audio: see the README there for what it can and cannot say.
+
 ## macOS
 
 **Not yet run on a Mac.** The radio stack's USB transport builds for macOS

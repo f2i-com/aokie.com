@@ -1,22 +1,26 @@
-//! Linux Bluetooth-dongle transport — libusb / rusb backend.
+//! Linux and macOS Bluetooth-dongle transport — libusb / rusb backend.
 //!
-//! Real device enumeration, kernel-driver detach, HCI command/event
-//! I/O over interrupt-IN, ACL data over bulk-IN/OUT, and SCO audio
-//! over isochronous endpoints (live in alt-setting 1). The portable
-//! HCI/L2CAP/RFCOMM/HFP/MAP/PBAP stack reaches the dongle through
-//! `transport.rs` which fans out to either this file or the WinUSB
-//! backend depending on target.
+//! Real device enumeration, system-driver detach, HCI command/event
+//! I/O, ACL data over bulk-IN/OUT, and SCO audio over isochronous
+//! endpoints. The portable HCI/L2CAP/RFCOMM/HFP/MAP/PBAP stack reaches
+//! the dongle through `transport.rs` which fans out to either this file
+//! or the WinUSB backend depending on target.
 //!
 //! ### USB Bluetooth class layout (Bluetooth Core spec, Vol 4 Part B §2.1.1)
 //!
-//! | Endpoint     | Address | Purpose                                       |
-//! |--------------|---------|-----------------------------------------------|
-//! | Control      | 0x00    | HCI commands (host → controller)              |
-//! | Interrupt-IN | 0x81    | HCI events (controller → host)                |
-//! | Bulk-OUT     | 0x02    | ACL data (host → controller)                  |
-//! | Bulk-IN      | 0x82    | ACL data (controller → host)                  |
-//! | Isoch-OUT    | 0x03    | SCO audio (host → controller, alt > 0)        |
-//! | Isoch-IN     | 0x83    | SCO audio (controller → host, alt > 0)        |
+//! | Interface | Endpoint     | Address | Purpose                            |
+//! |-----------|--------------|---------|------------------------------------|
+//! | 0         | Control      | 0x00    | HCI commands (host → controller)   |
+//! | 0         | Interrupt-IN | 0x81    | HCI events (controller → host)     |
+//! | 0         | Bulk-OUT     | 0x02    | ACL data (host → controller)       |
+//! | 0         | Bulk-IN      | 0x82    | ACL data (controller → host)       |
+//! | 1         | Isoch-OUT    | 0x03    | SCO audio (host → controller)      |
+//! | 1         | Isoch-IN     | 0x83    | SCO audio (controller → host)      |
+//!
+//! The voice endpoints sit on an interface of their own (the second)
+//! whose alternate settings size them: setting 0 carries nothing, and a
+//! voice link switches that interface, never the first, to the setting
+//! its sample size and link count call for (`usb_hci`).
 //!
 //! HCI command via control transfer:
 //!   bmRequestType = 0x20  (host-to-device, class, interface)
@@ -25,18 +29,26 @@
 //!   wIndex        = interface-number (always 0 for HCI)
 //!   data          = HCI command (no packet-type prefix)
 //!
-//! HCI event via interrupt-IN: each transfer delivers one complete
-//! event packet (event_code u8, param_len u8, params...). No
-//! cross-packet accumulation needed.
+//! ### How the pipes are read
 //!
-//! ### Kernel-driver detach
+//! Every IN pipe is read through a transfer that stays with libusb across
+//! the runtime's polls (`xfer`), never through libusb's blocking calls: a
+//! blocking read cancelled by its own timeout loses the USB packets that
+//! had already arrived. Events are read one USB packet at a time and put
+//! together by their own header (`usb_hci::EventStream`), which is how
+//! Linux's `btusb` reads them; ACL comes in whole transfers that the
+//! runtime's accumulator cuts into packets; voice rides a ring of
+//! isochronous transfers each way.
 //!
-//! On a vanilla Linux desktop, `btusb` claims interface 0 of every
-//! recognized Bluetooth dongle at plug-time. We have to detach it
-//! before we can claim. We track whether `btusb` was originally
-//! attached so the Drop impl can put it back when Aokie shuts
-//! down — without that, the dongle would stay orphaned until the
-//! user replugs.
+//! ### System-driver detach
+//!
+//! On a vanilla Linux desktop, `btusb` claims the dongle's interfaces at
+//! plug-time; a Mac's own Bluetooth may do the same. We have to detach
+//! it before we can claim. We track which interfaces were detached so the
+//! Drop impl can put the driver back when Aokie shuts down — without
+//! that, the dongle would stay orphaned until the user replugs. (On macOS
+//! libusb may detach a system driver only for a root process; see
+//! `SYSTEM_HOLDS_IT`.)
 //!
 //! ### Device-path format
 //!
@@ -45,37 +57,24 @@
 //! physically replugged. The Pairing UI will hand whichever path
 //! the user picks back to `open(path)` verbatim.
 
+mod xfer;
+
 use std::collections::VecDeque;
-use std::os::raw::{c_int, c_uint};
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use rusb::{Direction, GlobalContext, TransferType, UsbContext};
+use libusb1_sys::constants::{LIBUSB_TRANSFER_TYPE_BULK, LIBUSB_TRANSFER_TYPE_INTERRUPT};
+use rusb::{Direction, GlobalContext, TransferType};
 
 use crate::aokie_radio::hci;
+use crate::aokie_radio::usb_hci::{
+    choose_sco_alt, msbc_alt_available, sco_alt_setting_for_voice, EventStream, ScoAltChoice,
+};
+use xfer::{IsoIn, IsoOut, QueuedIn};
 
-// libusb-1.0 transfer-status constants we actually care about. The
-// libusb1-sys crate exposes these but only as plain `c_int`; we
-// re-declare them with named consts so the call sites read.
-const LIBUSB_TRANSFER_COMPLETED: c_int = 0;
-const LIBUSB_TRANSFER_TYPE_ISOCHRONOUS: u8 = 1;
-
-/// SCO endpoints come alive only after `set_alternate_setting(>=1)`.
-/// Alt 1 covers single CVSD/mSBC links (24-byte SCO MPS at 8 kHz; the
-/// Bluetooth Core spec table 4.1.5 reserves higher alts for multi-link
-/// or 16 kHz cases we don't ship today). The runtime only opens one
-/// SCO link at a time, so hardcoding alt 1 covers every voice path
-/// the receptionist actually runs.
-const SCO_ACTIVE_ALT_SETTING: u8 = 1;
+/// The alternate setting of the voice interface that carries nothing.
 const SCO_INACTIVE_ALT_SETTING: u8 = 0;
-
-/// Iso transfers per SCO read/write call. The single-transfer model
-/// keeps the FFI surface minimal — Phase L4b can promote this to a
-/// 4-deep ring once we have a Linux box to validate end-to-end audio
-/// quality.
-const SCO_ISO_PACKETS_PER_TRANSFER: u16 = 4;
 
 /// USB device class for Wireless Controller — the parent class for
 /// Bluetooth dongles on the standard interface layout. Subclass 0x01
@@ -90,9 +89,15 @@ const USB_PROTOCOL_BLUETOOTH: u8 = 0x01;
 const BT_HCI_CMD_REQUEST_TYPE: u8 = 0x20;
 const BT_HCI_CMD_REQUEST: u8 = 0x00;
 
-/// HCI events fit comfortably in 260 bytes (max 255 params + 2-byte
-/// header + slack). Same buffer size the WinUSB path uses.
-const HCI_EVENT_BUFFER: usize = 260;
+/// How long a write (an HCI command, an ACL packet) may take. Writes are
+/// not polls: the runtime's few-millisecond read waits must not cut one
+/// short, or half an ACL packet goes out and the link is lost.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// The least the queued ACL read asks for: one whole ACL packet of the
+/// largest size a classic controller hands over (1021 bytes and a 4-byte
+/// header), so that a packet is one transfer.
+const ACL_READ_BYTES: usize = 1028;
 
 /// Bound on how many non-matching events we'll defer while waiting
 /// for a Command Complete. Ample for any real init sequence; high
@@ -191,23 +196,31 @@ pub struct ScoTransportConfig {
 }
 
 // =============================================================================
-// AokieHciTransport — owns a libusb DeviceHandle and the deferred-event queue.
+// AokieHciTransport — owns a libusb DeviceHandle and the transfers on it.
 // =============================================================================
 
+/// The two voice pipes while a voice link is up.
+struct VoiceStreams {
+    input: IsoIn,
+    output: IsoOut,
+}
+
 pub struct AokieHciTransport {
-    handle: rusb::DeviceHandle<GlobalContext>,
     interface_number: u8,
-    /// Whether the kernel had `btusb` (or another driver) bound to
-    /// the interface at open time. We detached it so we could claim
-    /// the interface; on Drop we reattach so system Bluetooth comes
-    /// back without a replug.
-    kernel_was_attached: bool,
+    /// The interface that carries the voice endpoints and what each of
+    /// its alternate settings offers; `None` when the dongle has none or
+    /// it could not be claimed (calls then carry no audio).
+    voice: Option<VoiceInterface>,
+    /// Interfaces the system's own driver (`btusb`, or macOS's Bluetooth)
+    /// was detached from at open. On Drop it is attached again so system
+    /// Bluetooth comes back without a replug.
+    detached: Vec<u8>,
     /// Cached endpoint descriptors for the active alt-setting so reads
     /// /writes don't re-walk the descriptor tree on every call.
     pipes: HciPipes,
-    /// Per-pipe read timeouts (ms). Defaults match the WinUSB path:
-    /// 5 ms for the event/acl/sco endpoints. `set_read_timeouts`
-    /// updates them.
+    /// How long `read_event` / `read_acl` wait on their queued read
+    /// before reporting a timeout (`set_read_timeouts`). A wait that runs
+    /// out cancels nothing.
     timeouts: ReadTimeouts,
     /// Events received while waiting for a Command Complete that
     /// didn't match the expected opcode. `read_event` drains these
@@ -217,42 +230,51 @@ pub struct AokieHciTransport {
     /// Serializes write_command → read_command_complete pairs so two
     /// concurrent callers can't have their replies tangled.
     command_lock: Mutex<()>,
+    /// The reads kept queued on the HCI event and ACL IN pipes: created
+    /// on first use, never cancelled by a poll that finds nothing, only
+    /// by a pipe flush or by drop.
+    event_reader: Mutex<Option<QueuedIn>>,
+    acl_reader: Mutex<Option<QueuedIn>>,
+    /// Bytes off the event pipe that are not a whole event yet.
+    event_stream: Mutex<EventStream>,
+    /// The voice pipes' rings, while a voice link is up.
+    voice_streams: Option<VoiceStreams>,
     /// Most recent SCO config — None until configure_sco_alt_setting
-    /// runs (Phase L4).
+    /// runs.
     sco_transport_config: Option<ScoTransportConfig>,
     /// Hex-dump every transfer when AOKIE_RADIO_DUMP=1.
     dump: PacketDump,
+    /// Last on purpose: every transfer above holds this handle's raw
+    /// pointer and must be gone before it closes. (`Drop` takes them down
+    /// by hand as well; the order is the second lock on the same door.)
+    handle: rusb::DeviceHandle<GlobalContext>,
 }
 
 #[derive(Debug)]
 struct ReadTimeouts {
     event_ms: AtomicU32,
     acl_ms: AtomicU32,
-    sco_ms: AtomicU32,
 }
 
 impl Default for ReadTimeouts {
     fn default() -> Self {
+        // The WinUSB transport's defaults: a controller may take seconds
+        // over its first commands.
         Self {
-            event_ms: AtomicU32::new(1000),
-            acl_ms: AtomicU32::new(1000),
-            sco_ms: AtomicU32::new(1000),
+            event_ms: AtomicU32::new(5000),
+            acl_ms: AtomicU32::new(5000),
         }
     }
 }
 
 impl ReadTimeouts {
     #[inline]
-    fn event_ms(&self) -> u32 {
-        self.event_ms.load(Ordering::Relaxed)
+    fn event(&self) -> Duration {
+        Duration::from_millis(self.event_ms.load(Ordering::Relaxed) as u64)
     }
     #[inline]
-    fn acl_ms(&self) -> u32 {
-        self.acl_ms.load(Ordering::Relaxed)
-    }
-    #[inline]
-    fn sco_ms(&self) -> u32 {
-        self.sco_ms.load(Ordering::Relaxed)
+    fn acl(&self) -> Duration {
+        Duration::from_millis(self.acl_ms.load(Ordering::Relaxed) as u64)
     }
 }
 
@@ -288,10 +310,26 @@ impl PacketDump {
 }
 
 impl AokieHciTransport {
+    /// The first controller that opens. One that will not open is said
+    /// and passed over, as the WinUSB transport does; when none opens and
+    /// at least one was there, the last one's reason is the error, so a
+    /// dongle the system holds is not reported as "no dongle".
     pub fn open_first() -> Result<Option<Self>, String> {
-        let interfaces = enumerate_hci_radio_interfaces()?;
-        match interfaces.into_iter().next() {
-            Some(iface) => Ok(Some(Self::open(&iface.path)?)),
+        let mut last_error = None;
+        for interface in enumerate_hci_radio_interfaces()? {
+            match Self::open(&interface.path) {
+                Ok(transport) => return Ok(Some(transport)),
+                Err(e) => {
+                    eprintln!(
+                        "[AokieRadio] Could not open HCI transport at {}: {}",
+                        interface.path, e
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+        match last_error {
+            Some(e) => Err(e),
             None => Ok(None),
         }
     }
@@ -299,72 +337,80 @@ impl AokieHciTransport {
     pub fn open(path: &str) -> Result<Self, String> {
         let (bus, address) = parse_path(path)?;
         let device = find_device(bus, address)?;
-        // rusb 0.9 publishes `claim_interface` / `detach_kernel_driver`
-        // / `set_alternate_setting` as `&self` methods (libusb is
-        // internally thread-safe, so the wrapper doesn't need to take
-        // exclusive access). Plain `let` is enough — `mut` would draw
-        // an `unused_mut` warning on the Linux build.
         let handle = device
             .open()
             .map_err(|e| format!("libusb open {}: {}{}", path, fmt_err(e), held_hint(e)))?;
 
-        // Walk descriptors once to find the HCI interface (class
-        // 0xE0/0x01/0x01) and pre-classify its endpoints. Most
-        // dongles put HCI at interface 0; treat that as the default
-        // but verify the class bytes match.
+        // Walk the descriptors once: which interface is HCI (commands,
+        // events, ACL), which carries voice, and what each of the voice
+        // interface's alternate settings offers.
         let config = device
             .config_descriptor(0)
             .map_err(|e| format!("libusb config_descriptor: {}", fmt_err(e)))?;
-        let (interface_number, alt_setting, pipes) = locate_hci_interface(&config)
+        let layout = plan_layout(&read_descriptors(&config))
             .ok_or_else(|| format!("no HCI interface on USB Bluetooth class device {}", path))?;
 
         // Detach the system's own Bluetooth driver (btusb on Linux,
         // macOS's host-controller transport on a Mac) so we can claim
-        // the interface. Where libusb cannot tell (an Err), it is taken
-        // as "no driver attached" and the claim below says otherwise.
-        let kernel_was_attached = handle
-            .kernel_driver_active(interface_number)
-            .unwrap_or(false);
-        if kernel_was_attached {
-            handle
-                .detach_kernel_driver(interface_number)
-                .map_err(|e| {
-                    format!(
-                        "libusb detach_kernel_driver({}): {} — {}",
-                        interface_number,
-                        fmt_err(e),
-                        SYSTEM_HOLDS_IT
-                    )
-                })?;
+        // the interfaces.
+        let mut detached = Vec::new();
+        if claim(&handle, layout.hci_interface)? {
+            detached.push(layout.hci_interface);
         }
-
-        if let Err(e) = handle.claim_interface(interface_number) {
-            // A driver we detached goes back: a dongle left with no
-            // driver at all would be dead to the system until replugged.
-            if kernel_was_attached {
-                let _ = handle.attach_kernel_driver(interface_number);
+        let mut voice = None;
+        if let Some(number) = layout.voice_interface {
+            if number == layout.hci_interface {
+                voice = Some(VoiceInterface {
+                    number,
+                    alts: layout.voice_alts.clone(),
+                });
+            } else {
+                // Texts and call control need only the first interface, so
+                // a voice interface that cannot be had is said, not fatal.
+                match claim(&handle, number) {
+                    Ok(was_held) => {
+                        if was_held {
+                            detached.push(number);
+                        }
+                        voice = Some(VoiceInterface {
+                            number,
+                            alts: layout.voice_alts.clone(),
+                        });
+                    }
+                    Err(e) => eprintln!(
+                        "[AokieRadio] the dongle's voice interface {} could not be claimed, so calls will carry no audio: {}",
+                        number, e
+                    ),
+                }
             }
-            return Err(format!(
-                "libusb claim_interface({}): {}{}",
-                interface_number,
-                fmt_err(e),
-                held_hint(e)
-            ));
         }
-
-        let pipes = classify_hci_pipes(&pipes);
-        let _ = alt_setting; // alt 0 is the default; SCO alt-setting changes happen in Phase L4.
+        if let Some(voice) = voice.as_ref() {
+            for alt in &voice.alts {
+                eprintln!(
+                    "[AokieRadio] SCO alt-setting probe: interface {} alt {} in={} out={}",
+                    voice.number,
+                    alt.setting,
+                    describe_pipe(alt.sco_in),
+                    describe_pipe(alt.sco_out),
+                );
+            }
+        }
 
         Ok(Self {
-            handle,
-            interface_number,
-            kernel_was_attached,
-            pipes,
+            interface_number: layout.hci_interface,
+            voice,
+            detached,
+            pipes: classify_hci_pipes(&layout.hci_pipes),
             timeouts: ReadTimeouts::default(),
             deferred_events: Mutex::new(VecDeque::new()),
             command_lock: Mutex::new(()),
+            event_reader: Mutex::new(None),
+            acl_reader: Mutex::new(None),
+            event_stream: Mutex::new(EventStream::default()),
+            voice_streams: None,
             sco_transport_config: None,
             dump: PacketDump::from_env(),
+            handle,
         })
     }
 
@@ -390,18 +436,31 @@ impl AokieHciTransport {
         hci::expect_status_ok(&params, "HCI Reset")
     }
 
-    /// Linux libusb stub. The WinUSB path uses this to drop kernel-
-    /// buffered URBs from a previous session; libusb's `claim_interface`
-    /// already issues an implicit reset, so this is a no-op on Linux.
+    /// Start the event and ACL pipes clean. libusb keeps no buffer of its
+    /// own between the controller and a transfer, so what there is to
+    /// drop is what our own queued reads and the event stream hold from
+    /// an earlier use of this transport: take the reads back and forget
+    /// the half event. (The HCI Reset that follows empties the
+    /// controller's side.)
     pub fn flush_in_pipes(&self) -> Result<(), String> {
+        for reader in [&self.event_reader, &self.acl_reader] {
+            if let Ok(mut guard) = reader.lock() {
+                if let Some(queued) = guard.as_mut() {
+                    queued.cancel();
+                }
+            }
+        }
+        if let Ok(mut stream) = self.event_stream.lock() {
+            stream.clear();
+        }
         Ok(())
     }
 
-    /// Linux libusb stub. The WinUSB counterpart drops bulk-IN bytes
-    /// queued for a now-dead ACL handle so they don't prepend onto
-    /// the next ACL session's first read. libusb-on-Linux doesn't
-    /// have the same kernel-buffer behaviour at handle granularity,
-    /// so this is a no-op.
+    /// Nothing to do here. The WinUSB counterpart drops what Windows has
+    /// buffered for a dead ACL handle and leaves its queued read alone;
+    /// with libusb the controller's bytes go straight into the queued
+    /// transfer, which must be left alone for the same reason as there (a
+    /// fast-reconnecting phone's first packet may already be in it).
     pub fn flush_acl_in_pipe(&self) -> Result<(), String> {
         Ok(())
     }
@@ -452,9 +511,9 @@ impl AokieHciTransport {
                 0x0000,
                 self.interface_number as u16,
                 command,
-                Duration::from_millis(self.timeouts.event_ms().max(100) as u64),
+                WRITE_TIMEOUT,
             )
-            .map_err(|e| format!("libusb write_control (HCI cmd): {}", fmt_err(e)))?;
+            .map_err(|e| format!("libusb write_control (HCI cmd): {}", fmt_write_err(e)))?;
         if written != command.len() {
             return Err(format!(
                 "libusb write_control short transfer: wrote {} of {} bytes",
@@ -475,26 +534,66 @@ impl AokieHciTransport {
                 return Ok(packet);
             }
         }
-        self.read_event_from_wire()
+        let packet = self.read_event_pipe()?;
+        self.dump.log("evt <", &packet);
+        Ok(packet)
     }
 
-    fn read_event_from_wire(&self) -> Result<Vec<u8>, String> {
+    /// One whole HCI event off the event pipe (never the deferred queue).
+    /// Shared by `read_event` and `read_command_complete` so both wait on
+    /// the same transfer.
+    ///
+    /// The pipe is read one USB packet at a time and the event is put
+    /// together by its own length. When the wait runs out part-way
+    /// through an event, the part that has arrived stays in the stream
+    /// and the read stays with libusb; the next call carries on.
+    fn read_event_pipe(&self) -> Result<Vec<u8>, String> {
         let event_in = self
             .pipes
             .event_in
             .ok_or_else(|| "libusb interface has no HCI event endpoint".to_string())?;
-        let mut buf = vec![0u8; HCI_EVENT_BUFFER];
-        let read = self
-            .handle
-            .read_interrupt(
+        let mut stream = self
+            .event_stream
+            .lock()
+            .map_err(|e| format!("HCI event stream lock poisoned: {}", e))?;
+        let deadline = Instant::now() + self.timeouts.event();
+        loop {
+            if let Some(event) = stream.pop() {
+                return Ok(event);
+            }
+            let packet = self.poll_queued(
+                &self.event_reader,
                 event_in.id,
-                &mut buf,
-                Duration::from_millis(self.timeouts.event_ms() as u64),
-            )
-            .map_err(|e| format!("libusb read_interrupt (HCI event): {}", fmt_err(e)))?;
-        buf.truncate(read);
-        self.dump.log("evt <", &buf);
-        Ok(buf)
+                LIBUSB_TRANSFER_TYPE_INTERRUPT,
+                // Exactly one USB packet: a transfer of that size ends
+                // with every packet, full or short, so an event that is a
+                // whole number of packets long is not held back until the
+                // next event arrives.
+                (event_in.max_packet_size as usize).max(1),
+                "HCI event",
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
+            stream.push(&packet);
+        }
+    }
+
+    /// Poll the read kept queued on one IN pipe, making it on first use.
+    fn poll_queued(
+        &self,
+        reader: &Mutex<Option<QueuedIn>>,
+        endpoint: u8,
+        kind: u8,
+        len: usize,
+        label: &'static str,
+        wait: Duration,
+    ) -> Result<Vec<u8>, String> {
+        let mut guard = reader
+            .lock()
+            .map_err(|e| format!("{} reader lock poisoned: {}", label, e))?;
+        if guard.is_none() {
+            *guard = Some(QueuedIn::new(&self.handle, endpoint, kind, len, label)?);
+        }
+        guard.as_mut().expect("reader was just created").poll(wait)
     }
 
     pub fn set_read_timeouts(
@@ -503,20 +602,16 @@ impl AokieHciTransport {
         acl_timeout_ms: Option<u32>,
         sco_timeout_ms: Option<u32>,
     ) -> Result<(), String> {
-        // The runtime calls this with single-digit millisecond values
-        // for SCO so the audio loop can pump packets at real-time
-        // cadence — leaving the 1000ms defaults in place would stall
-        // every iteration on a missing-frame timeout. Atomic stores
-        // are enough: timeouts are read once per transfer (microsecond
-        // hot path) and rarely written.
+        // Event and ACL reads stay queued across waits (`xfer::QueuedIn`),
+        // so these are poll waits, not transfer timeouts that would cancel
+        // a transfer mid-packet. The voice pipes' rings pace themselves:
+        // a read takes what is back and a write waits only for room.
+        let _ = sco_timeout_ms;
         self.timeouts
             .event_ms
             .store(event_timeout_ms, Ordering::Relaxed);
         if let Some(ms) = acl_timeout_ms {
             self.timeouts.acl_ms.store(ms, Ordering::Relaxed);
-        }
-        if let Some(ms) = sco_timeout_ms {
-            self.timeouts.sco_ms.store(ms, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -526,52 +621,88 @@ impl AokieHciTransport {
         voice_setting: u16,
         connection_count: usize,
     ) -> Result<(), String> {
-        let _ = (voice_setting, connection_count); // observability only
-                                                   // Switch the HCI interface to alt 1 so the SCO endpoints
-                                                   // become live (max-packet-size flips from 0 → 24 bytes for
-                                                   // single-link CVSD on most chipsets, 60 bytes for mSBC).
-        self.handle
-            .set_alternate_setting(self.interface_number, SCO_ACTIVE_ALT_SETTING)
-            .map_err(|e| {
-                format!(
-                    "libusb set_alternate_setting({}, {}): {}",
-                    self.interface_number,
-                    SCO_ACTIVE_ALT_SETTING,
-                    fmt_err(e)
-                )
-            })?;
+        let Some(asked) = sco_alt_setting_for_voice(voice_setting, connection_count) else {
+            return Ok(());
+        };
+        let Some((number, available)) = self
+            .voice
+            .as_ref()
+            .map(|voice| (voice.number, voice.usable_alts()))
+        else {
+            return Ok(());
+        };
+        // A dongle that lacks the setting asked for carries the link on
+        // the first 16-bit one it has; a missing setting must not end the
+        // call (the WinUSB transport's rule, from dongles in the field).
+        let alt = match choose_sco_alt(asked, &available) {
+            ScoAltChoice::Asked(alt) => alt,
+            ScoAltChoice::Instead { asked, alt } => {
+                eprintln!(
+                    "[AokieRadio] SCO alt {} not exposed by dongle (available={:?}); falling back to alt {}",
+                    asked, available, alt,
+                );
+                alt
+            }
+            ScoAltChoice::Nothing { asked } => {
+                eprintln!(
+                    "[AokieRadio] SCO alt {} not exposed and no 16-bit fallback available (probe={:?}); skipping alt-config",
+                    asked, available,
+                );
+                return Ok(());
+            }
+        };
 
-        // Re-walk the descriptor for the new alt-setting so we pick up
-        // the SCO endpoint MPS we just unlocked.
-        let device = self.handle.device();
-        let config = device
-            .config_descriptor(0)
-            .map_err(|e| format!("libusb config_descriptor (post alt-set): {}", fmt_err(e)))?;
-        let new_pipes = locate_alt_pipes(&config, self.interface_number, SCO_ACTIVE_ALT_SETTING)
+        // A voice link still set up (no Disconnection Complete came
+        // between two calls) is taken down first, so its transfers are
+        // back with us before the interface changes under them.
+        if self.voice_streams.is_some() {
+            self.disable_sco_alt_setting()?;
+        }
+
+        self.switch_voice_interface(number, alt)?;
+        let pipes = self
+            .voice
+            .as_ref()
+            .and_then(|voice| voice.alt(alt))
             .ok_or_else(|| {
                 format!(
                     "no alt-setting {} on interface {} after switch",
-                    SCO_ACTIVE_ALT_SETTING, self.interface_number
+                    alt, number
                 )
             })?;
-        let classified = classify_hci_pipes(&new_pipes);
-        // The event/ACL endpoints typically don't change between alt
-        // settings, but be defensive and merge — keep alt-0 values for
-        // anything alt-1 doesn't redeclare.
-        if let Some(p) = classified.sco_in {
-            self.pipes.sco_in = Some(p);
-        }
-        if let Some(p) = classified.sco_out {
-            self.pipes.sco_out = Some(p);
-        }
+        self.pipes.sco_in = pipes.sco_in;
+        self.pipes.sco_out = pipes.sco_out;
 
-        let mps = self.pipes.sco_in.map(|p| p.max_packet_size);
+        let (Some(sco_in), Some(sco_out)) = (pipes.sco_in, pipes.sco_out) else {
+            return Err(format!(
+                "alt-setting {} of interface {} has no pair of voice endpoints",
+                alt, number
+            ));
+        };
+        let streams = IsoIn::new(&self.handle, sco_in.id, sco_in.max_packet_size).and_then(
+            |input| {
+                Ok(VoiceStreams {
+                    input,
+                    output: IsoOut::new(&self.handle, sco_out.id, sco_out.max_packet_size)?,
+                })
+            },
+        );
+        let streams = match streams {
+            Ok(streams) => streams,
+            Err(e) => {
+                let _ = self.switch_voice_interface(number, SCO_INACTIVE_ALT_SETTING);
+                self.pipes.sco_in = None;
+                self.pipes.sco_out = None;
+                return Err(e);
+            }
+        };
+        self.voice_streams = Some(streams);
         self.sco_transport_config = Some(ScoTransportConfig {
-            alternate_setting: SCO_ACTIVE_ALT_SETTING,
-            in_pipe_id: self.pipes.sco_in.map(|p| p.id),
-            out_pipe_id: self.pipes.sco_out.map(|p| p.id),
-            max_packet_size: mps,
-            isoch_buffer_len: mps.map(|m| m as usize * SCO_ISO_PACKETS_PER_TRANSFER as usize),
+            alternate_setting: alt,
+            in_pipe_id: Some(sco_in.id),
+            out_pipe_id: Some(sco_out.id),
+            max_packet_size: Some(sco_in.max_packet_size),
+            isoch_buffer_len: Some(sco_in.max_packet_size as usize * xfer::VOICE_IN_FRAMES),
             isoch_buffers_registered: true,
         });
         Ok(())
@@ -580,28 +711,67 @@ impl AokieHciTransport {
     pub fn disable_sco_alt_setting(&mut self) -> Result<(), String> {
         // Match WinUSB's idempotent contract: the runtime calls this
         // on every SCO disconnect even when no SCO link was ever up.
-        // If the alt-setting was never raised, set_alternate_setting
-        // back to 0 is still safe — libusb just no-ops if the device
-        // is already at the requested alt.
-        let _ = self
-            .handle
-            .set_alternate_setting(self.interface_number, SCO_INACTIVE_ALT_SETTING);
+        //
+        // The rings come down first: dropping them takes every transfer
+        // back from libusb (and leaks one that will not come back rather
+        // than free memory libusb may still write).
+        self.voice_streams = None;
+        if let Some(number) = self.voice.as_ref().map(|voice| voice.number) {
+            let _ = self.switch_voice_interface(number, SCO_INACTIVE_ALT_SETTING);
+        }
+        self.pipes.sco_in = None;
+        self.pipes.sco_out = None;
         self.sco_transport_config = None;
         Ok(())
+    }
+
+    /// Switch the voice interface to an alternate setting, if the dongle
+    /// is still there.
+    ///
+    /// Every switch goes through here because of the asking first. libusb
+    /// 1.0.26 (what Debian 12 ships) unlocks the handle's mutex without
+    /// having locked it when it is asked to switch an interface of a
+    /// device that has gone, and its close then aborts the process on that
+    /// mutex: a dongle pulled out during a call would take the whole
+    /// program with it. (Found by the stand-in dongle's unplug test under
+    /// valgrind; libusb 1.0.27 has it right.) The asking reads the device's
+    /// configuration, which libusb answers from what the system still
+    /// lists and takes no lock for.
+    fn switch_voice_interface(&self, interface: u8, alt: u8) -> Result<(), String> {
+        if matches!(
+            self.handle.active_configuration(),
+            Err(rusb::Error::NoDevice)
+        ) {
+            return Err(format!(
+                "libusb set_alternate_setting({}, {}): the dongle is gone",
+                interface, alt
+            ));
+        }
+        self.handle
+            .set_alternate_setting(interface, alt)
+            .map_err(|e| {
+                format!(
+                    "libusb set_alternate_setting({}, {}): {}",
+                    interface,
+                    alt,
+                    fmt_err(e)
+                )
+            })
     }
 
     pub fn sco_transport_config(&self) -> Option<ScoTransportConfig> {
         self.sco_transport_config
     }
 
-    /// Whether the controller exposes a usable wide-band-speech (mSBC)
-    /// SCO alt-setting. The Linux libusb backend doesn't enumerate the
-    /// alt-setting table the way the WinUSB path does, so we
-    /// conservatively report `false` — the HFP layer falls back to
-    /// advertising CVSD-only in `AT+BAC`. Override at runtime with
-    /// `AOKIE_HFP_CODEC=wbs` if mSBC is wanted on Linux.
+    /// Whether the dongle has an alternate setting wide-band speech
+    /// (mSBC) can ride: voice setting 0x0043 (transparent, 8-bit input)
+    /// asks for an 8-bit setting, and one connection for setting 1. The
+    /// same question the WinUSB transport asks, answered from the
+    /// descriptors.
     pub fn supports_msbc_alt_setting(&self) -> bool {
-        false
+        self.voice
+            .as_ref()
+            .is_some_and(|voice| msbc_alt_available(&voice.usable_alts()))
     }
 
     pub fn read_command_complete(&self, opcode: u16) -> Result<Vec<u8>, String> {
@@ -611,7 +781,8 @@ impl AokieHciTransport {
         // already.
         let mut ignored = 0;
         loop {
-            let event = self.read_event_from_wire()?;
+            let event = self.read_event_pipe()?;
+            self.dump.log("evt <", &event);
             match hci::parse_command_complete(&event, opcode) {
                 Ok(_) => return Ok(event),
                 Err(_) if ignored < MAX_DEFERRED_EVENTS => {
@@ -638,12 +809,8 @@ impl AokieHciTransport {
         self.dump.log("acl >", packet);
         let written = self
             .handle
-            .write_bulk(
-                acl_out.id,
-                packet,
-                Duration::from_millis(self.timeouts.acl_ms() as u64),
-            )
-            .map_err(|e| format!("libusb write_bulk (HCI ACL out): {}", fmt_err(e)))?;
+            .write_bulk(acl_out.id, packet, WRITE_TIMEOUT)
+            .map_err(|e| format!("libusb write_bulk (HCI ACL out): {}", fmt_write_err(e)))?;
         if written != packet.len() {
             return Err(format!(
                 "libusb write_bulk short transfer (HCI ACL out): wrote {} of {} bytes",
@@ -659,161 +826,45 @@ impl AokieHciTransport {
             .pipes
             .acl_in
             .ok_or_else(|| "libusb interface has no HCI ACL in endpoint".to_string())?;
-        // libusb requires the buffer to be a multiple of the endpoint's
-        // max-packet-size for OUT transfers and at-least max-packet-size
-        // for IN; clamp `max_len` upward so we never short-buffer a
-        // larger inbound packet. The runtime's accumulator handles the
-        // "we asked for more than we got" case fine, so the headroom
-        // costs nothing.
-        let mps = acl_in.max_packet_size as usize;
-        let cap = max_len.max(mps);
-        let mut buf = vec![0u8; cap];
-        let read = self
-            .handle
-            .read_bulk(
-                acl_in.id,
-                &mut buf,
-                Duration::from_millis(self.timeouts.acl_ms() as u64),
-            )
-            .map_err(|e| format!("libusb read_bulk (HCI ACL in): {}", fmt_err(e)))?;
-        buf.truncate(read);
-        self.dump.log("acl <", &buf);
-        Ok(buf)
+        // A whole number of USB packets, and room for a whole ACL packet:
+        // a bulk transfer ends at the first short packet, so one transfer
+        // is normally one ACL packet. A read already queued keeps the
+        // length it was made with; the runtime's accumulator treats the
+        // pipe as a byte stream either way.
+        let mps = (acl_in.max_packet_size as usize).max(1);
+        let len = max_len.max(ACL_READ_BYTES).next_multiple_of(mps);
+        let packet = self.poll_queued(
+            &self.acl_reader,
+            acl_in.id,
+            LIBUSB_TRANSFER_TYPE_BULK,
+            len,
+            "HCI ACL in",
+            self.timeouts.acl(),
+        )?;
+        self.dump.log("acl <", &packet);
+        Ok(packet)
     }
 
     pub fn write_sco(&mut self, packet: &[u8]) -> Result<(), String> {
-        let sco_out = self
-            .pipes
-            .sco_out
+        let streams = self
+            .voice_streams
+            .as_mut()
             .ok_or_else(|| "libusb interface has no HCI SCO out endpoint".to_string())?;
-        if !matches!(sco_out.kind, PipeKind::Isochronous) {
-            // Some chipsets expose SCO as bulk on alt 0 (rare); take the
-            // simple path then. The runtime only ever calls write_sco
-            // after configure_sco_alt_setting raised the alt, so this
-            // branch is mostly defensive.
-            let written = self
-                .handle
-                .write_bulk(
-                    sco_out.id,
-                    packet,
-                    Duration::from_millis(self.timeouts.sco_ms() as u64),
-                )
-                .map_err(|e| format!("libusb write_bulk (HCI SCO out): {}", fmt_err(e)))?;
-            self.dump.log("sco >", packet);
-            if written != packet.len() {
-                return Err(format!(
-                    "libusb write_bulk short transfer (HCI SCO out): wrote {} of {} bytes",
-                    written,
-                    packet.len()
-                ));
-            }
-            return Ok(());
-        }
         self.dump.log("sco >", packet);
-        // For OUT, fan the packet across SCO_ISO_PACKETS_PER_TRANSFER iso
-        // packets sized to the endpoint MPS. If the HCI SCO packet is
-        // smaller than that, the trailing iso packets just carry zero
-        // bytes — the controller drops them silently.
-        let mps = sco_out.max_packet_size as usize;
-        if mps == 0 {
-            return Err("libusb SCO out endpoint reports max_packet_size=0 \
-                        (alt-setting not raised yet?)"
-                .to_string());
-        }
-        let buf_len = SCO_ISO_PACKETS_PER_TRANSFER as usize * mps;
-        let mut buffer = vec![0u8; buf_len];
-        let copy_len = packet.len().min(buf_len);
-        buffer[..copy_len].copy_from_slice(&packet[..copy_len]);
-        // Per-packet length: distribute the packet bytes across the iso
-        // descriptors, leaving any trailing descriptors at length 0.
-        let mut packet_lengths = [0u32; SCO_ISO_PACKETS_PER_TRANSFER as usize];
-        let mut remaining = copy_len;
-        for slot in packet_lengths.iter_mut() {
-            let n = remaining.min(mps);
-            *slot = n as u32;
-            remaining -= n;
-            if remaining == 0 {
-                break;
-            }
-        }
-        unsafe {
-            run_iso_transfer(
-                &self.handle,
-                sco_out.id,
-                buffer.as_mut_ptr(),
-                buf_len,
-                &packet_lengths,
-                self.timeouts.sco_ms(),
-            )?;
-        }
-        Ok(())
+        streams.output.write(packet)
     }
 
+    /// The voice bytes that have arrived since the last call (possibly
+    /// none). `max_len` is not a bound here any more than on the WinUSB
+    /// side: the ring hands over every transfer that is back, and the
+    /// runtime's assembler cuts the stream into HCI SCO packets.
     pub fn read_sco(&mut self, max_len: usize) -> Result<Vec<u8>, String> {
-        let sco_in = self
-            .pipes
-            .sco_in
+        let _ = max_len;
+        let streams = self
+            .voice_streams
+            .as_mut()
             .ok_or_else(|| "libusb interface has no HCI SCO in endpoint".to_string())?;
-        if !matches!(sco_in.kind, PipeKind::Isochronous) {
-            // Defensive bulk-SCO branch, mirror of write_sco above.
-            let mps = sco_in.max_packet_size as usize;
-            let cap = max_len.max(mps.max(64));
-            let mut buf = vec![0u8; cap];
-            let read = self
-                .handle
-                .read_bulk(
-                    sco_in.id,
-                    &mut buf,
-                    Duration::from_millis(self.timeouts.sco_ms() as u64),
-                )
-                .map_err(|e| format!("libusb read_bulk (HCI SCO in): {}", fmt_err(e)))?;
-            buf.truncate(read);
-            self.dump.log("sco <", &buf);
-            return Ok(buf);
-        }
-        let mps = sco_in.max_packet_size as usize;
-        if mps == 0 {
-            return Err("libusb SCO in endpoint reports max_packet_size=0 \
-                        (alt-setting not raised yet?)"
-                .to_string());
-        }
-        let buf_len = SCO_ISO_PACKETS_PER_TRANSFER as usize * mps;
-        // We always submit a full-sized buffer so the controller can
-        // pack as many frames as it has into a single transfer; we
-        // truncate to whatever it actually filled before returning.
-        let mut buffer = vec![0u8; buf_len];
-        // For IN transfers, set every iso packet length to MPS — that's
-        // libusb's signal of "give me up to this much per packet".
-        let packet_lengths = [mps as u32; SCO_ISO_PACKETS_PER_TRANSFER as usize];
-        let descs = unsafe {
-            run_iso_transfer(
-                &self.handle,
-                sco_in.id,
-                buffer.as_mut_ptr(),
-                buf_len,
-                &packet_lengths,
-                self.timeouts.sco_ms(),
-            )?
-        };
-        // Walk the per-packet descriptors and concat actual_length
-        // bytes from each successful one. Skip stalled / overflowed
-        // packets — runtime treats SCO drops as silent gaps.
-        let mut data = Vec::with_capacity(buf_len);
-        for (i, desc) in descs.iter().enumerate() {
-            if desc.status != LIBUSB_TRANSFER_COMPLETED {
-                continue;
-            }
-            let offset = i * mps;
-            let n = desc.actual_length as usize;
-            if n == 0 || offset + n > buffer.len() {
-                continue;
-            }
-            data.extend_from_slice(&buffer[offset..offset + n]);
-            if data.len() >= max_len {
-                data.truncate(max_len);
-                break;
-            }
-        }
+        let data = streams.input.read()?;
         self.dump.log("sco <", &data);
         Ok(data)
     }
@@ -821,17 +872,32 @@ impl AokieHciTransport {
 
 impl Drop for AokieHciTransport {
     fn drop(&mut self) {
+        // Every transfer back from libusb before the interfaces are let
+        // go and the handle closes.
+        self.voice_streams = None;
+        for reader in [&self.event_reader, &self.acl_reader] {
+            match reader.lock() {
+                Ok(mut guard) => *guard = None,
+                Err(poisoned) => *poisoned.into_inner() = None,
+            }
+        }
         // Best-effort release. Ignoring errors here is the right call
         // — we're shutting down and nothing useful comes from
         // panicking the runtime thread on a USB cleanup hiccup.
+        if let Some(number) = self.voice.as_ref().map(|voice| voice.number) {
+            let _ = self.switch_voice_interface(number, SCO_INACTIVE_ALT_SETTING);
+            if number != self.interface_number {
+                let _ = self.handle.release_interface(number);
+            }
+        }
         let _ = self.handle.release_interface(self.interface_number);
-        if self.kernel_was_attached {
-            // Reattach btusb so system Bluetooth is usable again
-            // without a physical replug. If this fails (kernel module
-            // unloaded, bus controlled by something else), the user's
-            // next BlueZ scan will wake the driver back up; this is
-            // strictly an ergonomics call.
-            let _ = self.handle.attach_kernel_driver(self.interface_number);
+        // Reattach the system's driver so system Bluetooth is usable
+        // again without a physical replug. If this fails (kernel module
+        // unloaded, bus controlled by something else), the user's next
+        // BlueZ scan will wake the driver back up; this is strictly an
+        // ergonomics call.
+        for &interface in &self.detached {
+            let _ = self.handle.attach_kernel_driver(interface);
         }
     }
 }
@@ -870,19 +936,28 @@ pub fn diagnose_first_available() -> Result<Option<InterfaceDiagnostics>, String
     }
 }
 
+/// The dongle's pipes as its descriptors give them: the HCI interface's,
+/// then the voice interface's for every alternate setting (as the WinUSB
+/// side reports them). Reads descriptors only: the dongle is not opened,
+/// so this answers even while the system's own Bluetooth holds it.
 pub fn diagnose_interface_path(path: &str) -> Result<InterfaceDiagnostics, String> {
     let (bus, address) = parse_path(path)?;
     let device = find_device(bus, address)?;
     let config = device
         .config_descriptor(0)
         .map_err(|e| format!("libusb config_descriptor: {}", fmt_err(e)))?;
-    let (interface_number, alternate_setting, pipes) =
-        locate_hci_interface(&config).ok_or_else(|| format!("no HCI interface on {}", path))?;
+    let layout = plan_layout(&read_descriptors(&config))
+        .ok_or_else(|| format!("no HCI interface on {}", path))?;
+    let mut pipes = layout.hci_pipes.clone();
+    for alt in &layout.voice_alts {
+        pipes.extend(alt.sco_in);
+        pipes.extend(alt.sco_out);
+    }
     let classified = classify_hci_pipes(&pipes);
     Ok(InterfaceDiagnostics {
         device_path: path.to_string(),
-        interface_number,
-        alternate_setting,
+        interface_number: layout.hci_interface,
+        alternate_setting: 0,
         pipes,
         classified,
     })
@@ -1027,32 +1102,181 @@ fn find_device(bus: u8, address: u8) -> Result<rusb::Device<GlobalContext>, Stri
     Err(format!("no USB device at bus {}, address {}", bus, address))
 }
 
-/// Walk the configuration's interface descriptors looking for the HCI
-/// interface (class 0xE0/0x01/0x01) at alt-setting 0. Returns the
-/// interface number, the alt-setting, and the endpoint inventory.
-fn locate_hci_interface(config: &rusb::ConfigDescriptor) -> Option<(u8, u8, Vec<PipeInfo>)> {
-    for interface in config.interfaces() {
-        let mut alt0_match: Option<rusb::InterfaceDescriptor> = None;
-        for descriptor in interface.descriptors() {
-            let is_hci = descriptor.class_code() == USB_CLASS_WIRELESS
-                && descriptor.sub_class_code() == USB_SUBCLASS_BLUETOOTH
-                && descriptor.protocol_code() == USB_PROTOCOL_BLUETOOTH;
-            if is_hci && descriptor.setting_number() == 0 {
-                alt0_match = Some(descriptor);
-                break;
-            }
+/// Claim `interface`, first taking it from the system's own driver when
+/// one holds it. Says whether a driver was detached (and so is owed back
+/// when the transport closes).
+fn claim(handle: &rusb::DeviceHandle<GlobalContext>, interface: u8) -> Result<bool, String> {
+    // Where libusb cannot tell (an Err), it is taken as "no driver
+    // attached" and the claim below says otherwise.
+    let was_held = handle.kernel_driver_active(interface).unwrap_or(false);
+    if was_held {
+        handle.detach_kernel_driver(interface).map_err(|e| {
+            format!(
+                "libusb detach_kernel_driver({}): {} — {}",
+                interface,
+                fmt_err(e),
+                SYSTEM_HOLDS_IT
+            )
+        })?;
+    }
+    if let Err(e) = handle.claim_interface(interface) {
+        // A driver we detached goes back: a dongle left with no driver
+        // at all would be dead to the system until replugged.
+        if was_held {
+            let _ = handle.attach_kernel_driver(interface);
         }
-        if let Some(descriptor) = alt0_match {
-            let interface_number = descriptor.interface_number();
-            let alt_setting = descriptor.setting_number();
-            let mut pipes = Vec::new();
-            for endpoint in descriptor.endpoint_descriptors() {
-                pipes.push(endpoint_to_pipe_info(&endpoint, alt_setting));
-            }
-            return Some((interface_number, alt_setting, pipes));
+        return Err(format!(
+            "libusb claim_interface({}): {}{}",
+            interface,
+            fmt_err(e),
+            held_hint(e)
+        ));
+    }
+    Ok(was_held)
+}
+
+fn describe_pipe(pipe: Option<PipeInfo>) -> String {
+    match pipe {
+        Some(pipe) => format!(
+            "0x{:02x} mps={} interval={}",
+            pipe.id, pipe.max_packet_size, pipe.interval
+        ),
+        None => "none".to_string(),
+    }
+}
+
+/// One alternate setting of one interface, as the configuration
+/// descriptor gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AltDescriptor {
+    interface: u8,
+    setting: u8,
+    /// Wireless controller / Bluetooth / Bluetooth programming interface.
+    bluetooth: bool,
+    pipes: Vec<PipeInfo>,
+}
+
+/// What one alternate setting of the voice interface offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VoiceAlt {
+    setting: u8,
+    sco_in: Option<PipeInfo>,
+    sco_out: Option<PipeInfo>,
+}
+
+/// The interface that carries the voice endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VoiceInterface {
+    number: u8,
+    alts: Vec<VoiceAlt>,
+}
+
+impl VoiceInterface {
+    fn alt(&self, setting: u8) -> Option<&VoiceAlt> {
+        self.alts.iter().find(|alt| alt.setting == setting)
+    }
+
+    /// The settings a voice link can ride: both endpoints there, and
+    /// both carrying bytes (setting 0 has them at size 0, or not at all).
+    fn usable_alts(&self) -> Vec<u8> {
+        usable_alts(&self.alts)
+    }
+}
+
+fn usable_alts(alts: &[VoiceAlt]) -> Vec<u8> {
+    alts.iter()
+        .filter(|alt| {
+            matches!(
+                (alt.sco_in, alt.sco_out),
+                (Some(sco_in), Some(sco_out))
+                    if sco_in.max_packet_size > 0 && sco_out.max_packet_size > 0
+            )
+        })
+        .map(|alt| alt.setting)
+        .collect()
+}
+
+/// Which interface is which on a dongle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Layout {
+    hci_interface: u8,
+    hci_pipes: Vec<PipeInfo>,
+    voice_interface: Option<u8>,
+    voice_alts: Vec<VoiceAlt>,
+}
+
+fn read_descriptors(config: &rusb::ConfigDescriptor) -> Vec<AltDescriptor> {
+    let mut out = Vec::new();
+    for interface in config.interfaces() {
+        for descriptor in interface.descriptors() {
+            let setting = descriptor.setting_number();
+            out.push(AltDescriptor {
+                interface: descriptor.interface_number(),
+                setting,
+                bluetooth: descriptor.class_code() == USB_CLASS_WIRELESS
+                    && descriptor.sub_class_code() == USB_SUBCLASS_BLUETOOTH
+                    && descriptor.protocol_code() == USB_PROTOCOL_BLUETOOTH,
+                pipes: descriptor
+                    .endpoint_descriptors()
+                    .map(|endpoint| endpoint_to_pipe_info(&endpoint, setting))
+                    .collect(),
+            });
         }
     }
-    None
+    out
+}
+
+/// Find the HCI interface and the voice interface among a
+/// configuration's alternate settings.
+///
+/// HCI is the first Bluetooth-class interface whose setting 0 has the
+/// event (interrupt IN) endpoint. Voice is the Bluetooth-class interface
+/// with isochronous endpoints in any of its settings: the standard
+/// layout's second interface, or the HCI interface itself on a dongle
+/// that keeps everything on one. Vendor interfaces (firmware download,
+/// DFU) are neither.
+fn plan_layout(alts: &[AltDescriptor]) -> Option<Layout> {
+    let has = |alt: &AltDescriptor, kind: PipeKind| alt.pipes.iter().any(|pipe| pipe.kind == kind);
+    let hci = alts
+        .iter()
+        .find(|alt| alt.bluetooth && alt.setting == 0 && has(alt, PipeKind::Interrupt))
+        .or_else(|| alts.iter().find(|alt| alt.bluetooth && alt.setting == 0))?;
+    let carries_voice = |interface: u8| {
+        alts.iter().any(|alt| {
+            alt.interface == interface && alt.bluetooth && has(alt, PipeKind::Isochronous)
+        })
+    };
+    let mut candidates: Vec<u8> = alts
+        .iter()
+        .map(|alt| alt.interface)
+        .filter(|&interface| interface != hci.interface && carries_voice(interface))
+        .collect();
+    candidates.dedup();
+    let voice_interface = candidates
+        .first()
+        .copied()
+        .or_else(|| carries_voice(hci.interface).then_some(hci.interface));
+    let voice_alts = match voice_interface {
+        Some(interface) => alts
+            .iter()
+            .filter(|alt| alt.interface == interface)
+            .map(|alt| {
+                let classified = classify_hci_pipes(&alt.pipes);
+                VoiceAlt {
+                    setting: alt.setting,
+                    sco_in: classified.sco_in,
+                    sco_out: classified.sco_out,
+                }
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    Some(Layout {
+        hci_interface: hci.interface,
+        hci_pipes: hci.pipes.clone(),
+        voice_interface,
+        voice_alts,
+    })
 }
 
 fn endpoint_to_pipe_info(endpoint: &rusb::EndpointDescriptor, alternate_setting: u8) -> PipeInfo {
@@ -1068,35 +1292,12 @@ fn endpoint_to_pipe_info(endpoint: &rusb::EndpointDescriptor, alternate_setting:
             Direction::In => PipeDirection::In,
             Direction::Out => PipeDirection::Out,
         },
-        max_packet_size: endpoint.max_packet_size(),
+        // The low 11 bits are the size; the bits above them count extra
+        // transactions per microframe on a high-speed endpoint.
+        max_packet_size: endpoint.max_packet_size() & 0x07ff,
         interval: endpoint.interval(),
         alternate_setting,
     }
-}
-
-/// Walk a specific (interface_number, alt_setting) and return its
-/// endpoint inventory. Used when `configure_sco_alt_setting` swaps
-/// the HCI interface from alt 0 → alt 1: the SCO endpoints publish
-/// their real `max_packet_size` only after the alt-setting flip.
-fn locate_alt_pipes(
-    config: &rusb::ConfigDescriptor,
-    interface_number: u8,
-    alternate_setting: u8,
-) -> Option<Vec<PipeInfo>> {
-    for interface in config.interfaces() {
-        for descriptor in interface.descriptors() {
-            if descriptor.interface_number() == interface_number
-                && descriptor.setting_number() == alternate_setting
-            {
-                let mut pipes = Vec::new();
-                for endpoint in descriptor.endpoint_descriptors() {
-                    pipes.push(endpoint_to_pipe_info(&endpoint, alternate_setting));
-                }
-                return Some(pipes);
-            }
-        }
-    }
-    None
 }
 
 /// What to do when the system's own Bluetooth has the dongle and will
@@ -1133,200 +1334,78 @@ fn fmt_err(e: rusb::Error) -> String {
     }
 }
 
-/// Per-packet status read back from a completed iso transfer. The
-/// public type stays plain Rust (no FFI shapes leaked) so the
-/// `read_sco` body doesn't have to use `libusb1_sys` types directly.
-#[derive(Debug, Clone, Copy)]
-struct IsoPacketResult {
-    actual_length: u32,
-    status: c_int,
-}
-
-/// Submit a single iso transfer and block until it completes, fails,
-/// or times out. Returns the per-packet completion descriptors so the
-/// caller can decide how much of the buffer to keep.
-///
-/// Safety: `buffer` must point to a valid writable region of at least
-/// `buffer_len` bytes that outlives this call. `packet_lengths` declares
-/// the per-iso-packet length budget; its length sets `num_iso_packets`.
-unsafe fn run_iso_transfer(
-    handle: &rusb::DeviceHandle<GlobalContext>,
-    endpoint: u8,
-    buffer: *mut u8,
-    buffer_len: usize,
-    packet_lengths: &[u32],
-    timeout_ms: u32,
-) -> Result<Vec<IsoPacketResult>, String> {
-    use libusb1_sys::*;
-
-    let num_iso_packets = packet_lengths.len();
-    if num_iso_packets == 0 || num_iso_packets > c_int::MAX as usize {
-        return Err(format!("invalid iso packet count: {}", num_iso_packets));
+/// A write's error. A write that timed out is a failure, not "nothing
+/// yet", so its text must not be the one `is_timeout_error` looks for.
+fn fmt_write_err(e: rusb::Error) -> String {
+    match e {
+        rusb::Error::Timeout => format!(
+            "the dongle did not take it within {} ms",
+            WRITE_TIMEOUT.as_millis()
+        ),
+        other => other.to_string(),
     }
-
-    let xfer = libusb_alloc_transfer(num_iso_packets as c_int);
-    let xfer = match NonNull::new(xfer) {
-        Some(p) => p,
-        None => return Err("libusb_alloc_transfer returned null".to_string()),
-    };
-    let xfer_ptr = xfer.as_ptr();
-
-    // The completion latch. The callback writes 1; the event-loop
-    // driver below polls until it sees that. Using a heap-pinned int
-    // (Box::leak'd lifetime) instead of a stack local because libusb's
-    // contract permits the callback to fire as soon as we submit.
-    let completed_box = Box::new(0_i32);
-    let completed_ptr = Box::into_raw(completed_box);
-
-    // Safe to write fields directly — libusb_alloc_transfer zero-inits.
-    (*xfer_ptr).dev_handle = handle.as_raw();
-    (*xfer_ptr).flags = 0;
-    (*xfer_ptr).endpoint = endpoint;
-    (*xfer_ptr).transfer_type = LIBUSB_TRANSFER_TYPE_ISOCHRONOUS;
-    (*xfer_ptr).timeout = timeout_ms as c_uint;
-    (*xfer_ptr).status = 0;
-    (*xfer_ptr).length = buffer_len as c_int;
-    (*xfer_ptr).actual_length = 0;
-    (*xfer_ptr).callback = iso_complete_callback;
-    (*xfer_ptr).user_data = completed_ptr as *mut _;
-    (*xfer_ptr).buffer = buffer;
-    (*xfer_ptr).num_iso_packets = num_iso_packets as c_int;
-
-    // Set per-iso-packet length on each descriptor in the trailing
-    // flexible array. `iso_packet_desc.as_mut_ptr()` returns a pointer
-    // at the start of the array; offsets index packets.
-    let descs_ptr = (*xfer_ptr).iso_packet_desc.as_mut_ptr();
-    for (i, &len) in packet_lengths.iter().enumerate() {
-        let desc = descs_ptr.add(i);
-        (*desc).length = len;
-        (*desc).actual_length = 0;
-        (*desc).status = 0;
-    }
-
-    let submit_rc = libusb_submit_transfer(xfer_ptr);
-    if submit_rc != 0 {
-        libusb_free_transfer(xfer_ptr);
-        let _reclaim = Box::from_raw(completed_ptr);
-        return Err(format!(
-            "libusb_submit_transfer (iso ep 0x{:02x}): {}",
-            endpoint, submit_rc
-        ));
-    }
-
-    // Drive the libusb event loop until the callback flips the latch.
-    // We pass `completed_ptr` so libusb returns early if any other
-    // pending transfer signals via the same flag (we only have one
-    // in flight, so this just shortens the loop).
-    let ctx = handle.context().as_raw();
-    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms as u64 + 50);
-    loop {
-        if *completed_ptr != 0 {
-            break;
-        }
-        let tv = libc::timeval {
-            tv_sec: 0,
-            tv_usec: 50_000,
-        };
-        libusb_handle_events_timeout_completed(ctx, &tv, completed_ptr);
-        if std::time::Instant::now() > deadline {
-            // Cancel the transfer. libusb will fire the callback with
-            // status = CANCELLED once it processes the cancellation —
-            // we MUST wait for that callback before freeing the
-            // transfer struct, because libusb_free_transfer on an
-            // active transfer is undefined behavior per the docs.
-            //
-            // We give the cancel up to 5 s of event-loop draining
-            // (the deadline-after-deadline below). If the callback
-            // still hasn't fired, the device is likely unplugged or
-            // hung — at that point we leak the transfer + completion
-            // box rather than risk UB. The leak is bounded (one
-            // transfer struct + one i32 per stuck SCO call) and
-            // recoverable on app restart.
-            let _ = libusb_cancel_transfer(xfer_ptr);
-            let cancel_deadline = std::time::Instant::now() + Duration::from_millis(5000);
-            while *completed_ptr == 0 && std::time::Instant::now() < cancel_deadline {
-                let tv = libc::timeval {
-                    tv_sec: 0,
-                    tv_usec: 50_000,
-                };
-                libusb_handle_events_timeout_completed(ctx, &tv, completed_ptr);
-            }
-            break;
-        }
-    }
-
-    let signalled = *completed_ptr != 0;
-    if !signalled {
-        // Leak: see comment above. Logging once gives us a forensic
-        // breadcrumb if this ever fires in the field.
-        eprintln!(
-            "[aokie_radio::libusb] iso transfer ep 0x{:02x} stuck after cancel — leaking \
-             to avoid UB. Most likely the dongle was unplugged.",
-            endpoint
-        );
-        return Err("libusb timeout".to_string());
-    }
-
-    // Safe to read + free: the callback fired, so libusb is done with
-    // the transfer struct.
-    let mut results = Vec::with_capacity(num_iso_packets);
-    for i in 0..num_iso_packets {
-        let desc = descs_ptr.add(i);
-        results.push(IsoPacketResult {
-            actual_length: (*desc).actual_length,
-            status: (*desc).status,
-        });
-    }
-    let xfer_status = (*xfer_ptr).status;
-
-    libusb_free_transfer(xfer_ptr);
-    let _reclaim = Box::from_raw(completed_ptr);
-
-    if xfer_status != LIBUSB_TRANSFER_COMPLETED {
-        // Per-packet status is still useful even when the whole transfer
-        // didn't complete cleanly (cancellation, partial success); return
-        // them so the caller can scrape what's there. The status int gets
-        // logged at the dump path.
-        eprintln!(
-            "[aokie_radio::libusb] iso transfer ep 0x{:02x} status={}",
-            endpoint, xfer_status
-        );
-    }
-    Ok(results)
-}
-
-// Match libusb1-sys's `libusb_transfer_cb_fn` exactly: an `extern "system"`
-// function pointer with no `unsafe` qualifier on the type. (On Linux
-// x86_64 / aarch64 this lowers to the same SysV ABI as `extern "C"`.)
-// The unsafe is moved inside the body where the raw-pointer derefs live.
-extern "system" fn iso_complete_callback(transfer: *mut libusb1_sys::libusb_transfer) {
-    if transfer.is_null() {
-        return;
-    }
-    unsafe {
-        let user_data = (*transfer).user_data as *mut i32;
-        if !user_data.is_null() {
-            *user_data = 1;
-        }
-    }
-}
-
-// Helper used by the libusb stub methods that haven't been ported
-// yet (a few tail entries on the transport surface). The current
-// callers were folded into the typed-error path; keep the helper
-// available behind allow(dead_code) for the next port pass.
-#[allow(dead_code)]
-fn not_implemented(method: &str) -> String {
-    format!(
-        "aokie_radio::libusb::{} — Linux transport not implemented yet \
-         (see PLAN.md → Linux port)",
-        method
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pipe(id: u8, kind: PipeKind, max_packet_size: u16, alternate_setting: u8) -> PipeInfo {
+        PipeInfo {
+            id,
+            kind,
+            direction: if id & 0x80 != 0 {
+                PipeDirection::In
+            } else {
+                PipeDirection::Out
+            },
+            max_packet_size,
+            interval: if kind == PipeKind::Bulk { 0 } else { 1 },
+            alternate_setting,
+        }
+    }
+
+    /// The standard layout, as a BCM20702 gives it: HCI on interface 0,
+    /// voice on interface 1 in six settings, then two vendor interfaces.
+    fn standard_dongle() -> Vec<AltDescriptor> {
+        let mut alts = vec![AltDescriptor {
+            interface: 0,
+            setting: 0,
+            bluetooth: true,
+            pipes: vec![
+                pipe(0x81, PipeKind::Interrupt, 16, 0),
+                pipe(0x82, PipeKind::Bulk, 64, 0),
+                pipe(0x02, PipeKind::Bulk, 64, 0),
+            ],
+        }];
+        for (setting, size) in [(0u8, 0u16), (1, 9), (2, 17), (3, 25), (4, 33), (5, 49)] {
+            alts.push(AltDescriptor {
+                interface: 1,
+                setting,
+                bluetooth: true,
+                pipes: vec![
+                    pipe(0x83, PipeKind::Isochronous, size, setting),
+                    pipe(0x03, PipeKind::Isochronous, size, setting),
+                ],
+            });
+        }
+        alts.push(AltDescriptor {
+            interface: 2,
+            setting: 0,
+            bluetooth: false,
+            pipes: vec![
+                pipe(0x84, PipeKind::Bulk, 32, 0),
+                pipe(0x04, PipeKind::Bulk, 32, 0),
+            ],
+        });
+        alts.push(AltDescriptor {
+            interface: 3,
+            setting: 0,
+            bluetooth: false,
+            pipes: vec![],
+        });
+        alts
+    }
 
     #[test]
     fn parse_path_round_trips() {
@@ -1351,49 +1430,13 @@ mod tests {
     #[test]
     fn classify_hci_pipes_picks_first_of_each_kind() {
         let pipes = vec![
-            PipeInfo {
-                id: 0x81,
-                kind: PipeKind::Interrupt,
-                direction: PipeDirection::In,
-                max_packet_size: 16,
-                interval: 1,
-                alternate_setting: 0,
-            },
-            PipeInfo {
-                id: 0x82,
-                kind: PipeKind::Bulk,
-                direction: PipeDirection::In,
-                max_packet_size: 64,
-                interval: 0,
-                alternate_setting: 0,
-            },
-            PipeInfo {
-                id: 0x02,
-                kind: PipeKind::Bulk,
-                direction: PipeDirection::Out,
-                max_packet_size: 64,
-                interval: 0,
-                alternate_setting: 0,
-            },
-            PipeInfo {
-                id: 0x83,
-                kind: PipeKind::Isochronous,
-                direction: PipeDirection::In,
-                max_packet_size: 17,
-                interval: 1,
-                alternate_setting: 0,
-            },
-            PipeInfo {
-                id: 0x03,
-                kind: PipeKind::Isochronous,
-                direction: PipeDirection::Out,
-                max_packet_size: 17,
-                interval: 1,
-                alternate_setting: 0,
-            },
+            pipe(0x81, PipeKind::Interrupt, 16, 0),
+            pipe(0x82, PipeKind::Bulk, 64, 0),
+            pipe(0x02, PipeKind::Bulk, 64, 0),
+            pipe(0x83, PipeKind::Isochronous, 17, 0),
+            pipe(0x03, PipeKind::Isochronous, 17, 0),
         ];
-        let pipes_ref = pipes.clone();
-        let classified = classify_hci_pipes(&pipes_ref);
+        let classified = classify_hci_pipes(&pipes);
         assert_eq!(classified.event_in.unwrap().id, 0x81);
         assert_eq!(classified.acl_in.unwrap().id, 0x82);
         assert_eq!(classified.acl_out.unwrap().id, 0x02);
@@ -1407,24 +1450,107 @@ mod tests {
         // event_in — keeps deterministic behavior for chips with a
         // wakeup interrupt endpoint alongside the HCI event one.
         let pipes = vec![
-            PipeInfo {
-                id: 0x81,
-                kind: PipeKind::Interrupt,
-                direction: PipeDirection::In,
-                max_packet_size: 16,
-                interval: 1,
-                alternate_setting: 0,
-            },
-            PipeInfo {
-                id: 0x84,
-                kind: PipeKind::Interrupt,
-                direction: PipeDirection::In,
-                max_packet_size: 8,
-                interval: 1,
-                alternate_setting: 0,
-            },
+            pipe(0x81, PipeKind::Interrupt, 16, 0),
+            pipe(0x84, PipeKind::Interrupt, 8, 0),
         ];
         let classified = classify_hci_pipes(&pipes);
         assert_eq!(classified.event_in.unwrap().id, 0x81);
+    }
+
+    #[test]
+    fn the_voice_endpoints_are_found_on_the_second_interface() {
+        let layout = plan_layout(&standard_dongle()).expect("a layout");
+        assert_eq!(layout.hci_interface, 0);
+        assert_eq!(layout.hci_pipes.len(), 3);
+        // The voice interface is 1, not the vendor interface 2 (whose
+        // bulk pipes are a firmware channel) and not HCI's own.
+        assert_eq!(layout.voice_interface, Some(1));
+        assert_eq!(layout.voice_alts.len(), 6);
+        // Setting 0 carries nothing, so it is not one a link can ride.
+        assert_eq!(usable_alts(&layout.voice_alts), vec![1, 2, 3, 4, 5]);
+        let two = layout.voice_alts.iter().find(|alt| alt.setting == 2).unwrap();
+        assert_eq!(two.sco_in.unwrap().id, 0x83);
+        assert_eq!(two.sco_in.unwrap().max_packet_size, 17);
+        assert_eq!(two.sco_out.unwrap().id, 0x03);
+    }
+
+    #[test]
+    fn a_standard_dongle_carries_both_codecs() {
+        let layout = plan_layout(&standard_dongle()).unwrap();
+        let usable = usable_alts(&layout.voice_alts);
+        // 16-bit CVSD asks for setting 2, transparent mSBC for setting 1.
+        assert_eq!(
+            choose_sco_alt(sco_alt_setting_for_voice(0x0060, 1).unwrap(), &usable),
+            ScoAltChoice::Asked(2)
+        );
+        assert_eq!(
+            choose_sco_alt(sco_alt_setting_for_voice(0x0043, 1).unwrap(), &usable),
+            ScoAltChoice::Asked(1)
+        );
+        assert!(msbc_alt_available(&usable));
+    }
+
+    #[test]
+    fn a_dongle_with_everything_on_one_interface_is_its_own_voice_interface() {
+        let alts = vec![
+            AltDescriptor {
+                interface: 0,
+                setting: 0,
+                bluetooth: true,
+                pipes: vec![
+                    pipe(0x81, PipeKind::Interrupt, 16, 0),
+                    pipe(0x82, PipeKind::Bulk, 64, 0),
+                    pipe(0x02, PipeKind::Bulk, 64, 0),
+                    pipe(0x83, PipeKind::Isochronous, 0, 0),
+                    pipe(0x03, PipeKind::Isochronous, 0, 0),
+                ],
+            },
+            AltDescriptor {
+                interface: 0,
+                setting: 1,
+                bluetooth: true,
+                pipes: vec![
+                    pipe(0x81, PipeKind::Interrupt, 16, 1),
+                    pipe(0x82, PipeKind::Bulk, 64, 1),
+                    pipe(0x02, PipeKind::Bulk, 64, 1),
+                    pipe(0x83, PipeKind::Isochronous, 17, 1),
+                    pipe(0x03, PipeKind::Isochronous, 17, 1),
+                ],
+            },
+        ];
+        let layout = plan_layout(&alts).unwrap();
+        assert_eq!(layout.hci_interface, 0);
+        assert_eq!(layout.voice_interface, Some(0));
+        assert_eq!(usable_alts(&layout.voice_alts), vec![1]);
+    }
+
+    #[test]
+    fn a_dongle_with_no_voice_endpoints_still_has_its_hci_interface() {
+        let alts = vec![standard_dongle().remove(0)];
+        let layout = plan_layout(&alts).unwrap();
+        assert_eq!(layout.hci_interface, 0);
+        assert_eq!(layout.voice_interface, None);
+        assert!(layout.voice_alts.is_empty());
+    }
+
+    #[test]
+    fn a_device_with_no_bluetooth_interface_has_no_layout() {
+        let alts = vec![AltDescriptor {
+            interface: 0,
+            setting: 0,
+            bluetooth: false,
+            pipes: vec![pipe(0x81, PipeKind::Interrupt, 8, 0)],
+        }];
+        assert_eq!(plan_layout(&alts), None);
+    }
+
+    #[test]
+    fn a_write_that_times_out_is_not_read_as_nothing_yet() {
+        use crate::aokie_radio::manager::is_timeout_error;
+        // A read that found nothing is "nothing yet" to the runtime ...
+        assert!(is_timeout_error(&xfer::nothing_yet("HCI event")));
+        assert!(is_timeout_error(&fmt_err(rusb::Error::Timeout)));
+        // ... and a write the dongle did not take is a failure.
+        assert!(!is_timeout_error(&fmt_write_err(rusb::Error::Timeout)));
     }
 }
