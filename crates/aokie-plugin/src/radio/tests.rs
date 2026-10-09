@@ -383,6 +383,20 @@ fn realtime_waits_for_late_identity_before_beginning_or_reclassifying() {
     assert!(realtime_identity_settled(true, std::time::Duration::ZERO));
 }
 
+/// A reject the phone does not act on falls back to answering the call so
+/// that it is refused at the greeting. On the realtime route a call can be
+/// answered that way only once the route has let it go to the local voice,
+/// which for a screened caller is when the personalization hold has run out:
+/// until then the answer waits on "still preparing", and the caller would ring
+/// through. So the fall-back must come later than that hold.
+#[cfg(feature = "voice")]
+#[test]
+fn a_reject_the_phone_ignores_falls_back_only_after_the_realtime_route_let_the_call_go() {
+    use crate::screen::{RING_REJECT_TRIES, RING_REJECT_WAIT};
+    assert!(RING_REJECT_WAIT * u32::from(RING_REJECT_TRIES) > ANSWER_OVERLAY_WAIT);
+    assert!(ANSWER_OVERLAY_WAIT > ANSWER_ID_WAIT);
+}
+
 #[cfg(feature = "voice")]
 #[test]
 fn realtime_failure_policy_never_hangs_up_under_human_ownership() {
