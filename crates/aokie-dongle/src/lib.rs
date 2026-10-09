@@ -19,8 +19,8 @@
 //!   `aokie_dongle::find_device` / `aokie_dongle::winusb` resolve
 //!   without repeating the module name.
 //! * `aokie_dongle_linux` (Linux) — udev rule emission.
-//! * [`bluetooth`] (Windows) — radio→app event bridge + preferred-dongle
-//!   selection.
+//! * [`bluetooth`] (Windows, Linux, macOS) — radio→app event bridge +
+//!   preferred-dongle selection.
 //! * [`bluetooth_prefs`] — cross-platform dongle-preference store.
 
 #[cfg(target_os = "windows")]
@@ -36,7 +36,8 @@ pub use aokie_dongle::*;
 #[cfg(target_os = "linux")]
 pub mod aokie_dongle_linux;
 
-#[cfg(target_os = "windows")]
+// The bridge from the radio stack's events to the app's: wherever that stack has a transport (build.rs).
+#[cfg(aokie_radio)]
 pub mod bluetooth;
 
 pub mod bluetooth_prefs;

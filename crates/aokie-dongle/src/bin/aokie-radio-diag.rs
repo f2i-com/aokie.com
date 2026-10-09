@@ -1,10 +1,10 @@
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(aokie_radio))]
 fn main() {
-    eprintln!("aokie-radio-diag is only supported on Windows");
+    eprintln!("aokie-radio-diag needs a system the radio stack has a USB transport for (Windows, Linux, macOS)");
     std::process::exit(1);
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
@@ -12,9 +12,10 @@ fn main() {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn run() -> Result<(), String> {
-    use aokie_bluetooth::aokie_radio::{manager, winusb};
+    // (the transport of this system: WinUSB on Windows, libusb on Linux and macOS, under one set of names)
+    use aokie_bluetooth::aokie_radio::{manager, transport as winusb};
 
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".to_string());
@@ -22,6 +23,15 @@ fn run() -> Result<(), String> {
         "help" | "--help" | "-h" => {
             print_usage();
         }
+        // (the catalog's USB devices and the driver Windows has bound to each: a Windows question. The other
+        // systems bind no driver of ours; `interfaces` lists what libusb sees there.)
+        #[cfg(not(target_os = "windows"))]
+        "usb-list" => {
+            for interface in winusb::enumerate_radio_interfaces()? {
+                println!("{} {}", interface_source(interface.source), interface.path);
+            }
+        }
+        #[cfg(target_os = "windows")]
         "usb-list" => {
             for device in aokie_dongle::list_devices(true)? {
                 println!(
@@ -38,7 +48,7 @@ fn run() -> Result<(), String> {
         "interfaces" => {
             let interfaces = winusb::enumerate_radio_interfaces()?;
             if interfaces.is_empty() {
-                println!("no WinUSB radio interfaces found");
+                println!("no USB radio interfaces found");
             }
             for interface in interfaces {
                 println!("{} {}", interface_source(interface.source), interface.path);
@@ -47,7 +57,7 @@ fn run() -> Result<(), String> {
         "hci-interfaces" => {
             let interfaces = winusb::enumerate_hci_radio_interfaces()?;
             if interfaces.is_empty() {
-                println!("no HCI-shaped WinUSB radio interfaces found");
+                println!("no HCI-shaped USB radio interfaces found");
             }
             for interface in interfaces {
                 println!("{} {}", interface_source(interface.source), interface.path);
@@ -55,19 +65,19 @@ fn run() -> Result<(), String> {
         }
         "diagnose" => match winusb::diagnose_first_available()? {
             Some(report) => print_interface_diagnostics(&report),
-            None => println!("no openable WinUSB radio interface found"),
+            None => println!("no openable USB radio interface found"),
         },
         "address" => match winusb::read_first_local_address()? {
             Some(address) => println!("{} {}", address.local_address, address.device_path),
-            None => println!("no readable WinUSB radio controller found"),
+            None => println!("no readable USB radio controller found"),
         },
         "probe" => match winusb::probe_first_controller()? {
             Some(probe) => print_probe(&probe),
-            None => println!("no probeable WinUSB radio controller found"),
+            None => println!("no probeable USB radio controller found"),
         },
         "init" => match manager::initialize_first_controller()? {
             Some(report) => print_init(&report),
-            None => println!("no initializable WinUSB radio controller found"),
+            None => println!("no initializable USB radio controller found"),
         },
         "listen-events" => {
             let duration = duration_arg(args.next(), 5)?;
@@ -115,7 +125,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn run_live_runtime(duration: std::time::Duration) -> Result<(), String> {
     use aokie_bluetooth::aokie_radio::pairing_store::default_store_path;
     use aokie_bluetooth::aokie_radio::runtime::{AokieRuntime, RuntimeEvent};
@@ -165,13 +175,13 @@ fn run_live_runtime(duration: std::time::Duration) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn print_usage() {
     println!("Usage: aokie-radio-diag <command> [seconds]");
     println!("Commands:");
     println!("  usb-list        List present USB devices from the Aokie catalog");
-    println!("  interfaces      List WinUSB radio interface paths");
-    println!("  hci-interfaces  List openable WinUSB interfaces with HCI event/ACL pipes");
+    println!("  interfaces      List USB radio interface paths");
+    println!("  hci-interfaces  List openable USB interfaces with HCI event/ACL pipes");
     println!("  diagnose        Open first radio interface and print pipe diagnostics");
     println!("  address         Reset first controller and read BD_ADDR");
     println!("  probe           Reset first controller and read version/features/buffers");
@@ -182,7 +192,7 @@ fn print_usage() {
     println!("  live-runtime    Drive AokieRuntime for [seconds] (auto-answers first call)");
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn duration_arg(
     value: Option<String>,
     default_seconds: u64,
@@ -196,48 +206,48 @@ fn duration_arg(
     Ok(std::time::Duration::from_secs(seconds.clamp(1, 60)))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn load_pairing_store(
 ) -> Result<aokie_bluetooth::aokie_radio::pairing_store::AokiePairingStore, String> {
     let data_dir = aokie_core::paths::app_data_dir()
-        .ok_or_else(|| "could not resolve Windows app data directory".to_string())?;
+        .ok_or_else(|| "could not resolve the app data directory".to_string())?;
     let path = aokie_bluetooth::aokie_radio::pairing_store::default_store_path(&data_dir);
     aokie_bluetooth::aokie_radio::pairing_store::AokiePairingStore::load(path)
 }
 
-#[cfg(target_os = "windows")]
-fn interface_source(source: aokie_bluetooth::aokie_radio::winusb::InterfaceSource) -> &'static str {
+#[cfg(aokie_radio)]
+fn interface_source(source: aokie_bluetooth::aokie_radio::transport::InterfaceSource) -> &'static str {
     match source {
-        aokie_bluetooth::aokie_radio::winusb::InterfaceSource::AokieWinUsb => "aokie-winusb",
-        aokie_bluetooth::aokie_radio::winusb::InterfaceSource::GenericUsbDevice => "usb-device",
-        aokie_bluetooth::aokie_radio::winusb::InterfaceSource::RealtekWinUsb => "realtek-winusb",
+        aokie_bluetooth::aokie_radio::transport::InterfaceSource::AokieWinUsb => "aokie-winusb",
+        aokie_bluetooth::aokie_radio::transport::InterfaceSource::GenericUsbDevice => "usb-device",
+        aokie_bluetooth::aokie_radio::transport::InterfaceSource::RealtekWinUsb => "realtek-winusb",
     }
 }
 
-#[cfg(target_os = "windows")]
-fn pipe_kind(kind: aokie_bluetooth::aokie_radio::winusb::PipeKind) -> String {
+#[cfg(aokie_radio)]
+fn pipe_kind(kind: aokie_bluetooth::aokie_radio::transport::PipeKind) -> String {
     match kind {
-        aokie_bluetooth::aokie_radio::winusb::PipeKind::Bulk => "bulk".to_string(),
-        aokie_bluetooth::aokie_radio::winusb::PipeKind::Interrupt => "interrupt".to_string(),
-        aokie_bluetooth::aokie_radio::winusb::PipeKind::Isochronous => "isochronous".to_string(),
-        aokie_bluetooth::aokie_radio::winusb::PipeKind::Control => "control".to_string(),
-        aokie_bluetooth::aokie_radio::winusb::PipeKind::Unknown(value) => {
+        aokie_bluetooth::aokie_radio::transport::PipeKind::Bulk => "bulk".to_string(),
+        aokie_bluetooth::aokie_radio::transport::PipeKind::Interrupt => "interrupt".to_string(),
+        aokie_bluetooth::aokie_radio::transport::PipeKind::Isochronous => "isochronous".to_string(),
+        aokie_bluetooth::aokie_radio::transport::PipeKind::Control => "control".to_string(),
+        aokie_bluetooth::aokie_radio::transport::PipeKind::Unknown(value) => {
             format!("unknown({value})")
         }
     }
 }
 
-#[cfg(target_os = "windows")]
-fn pipe_direction(direction: aokie_bluetooth::aokie_radio::winusb::PipeDirection) -> &'static str {
+#[cfg(aokie_radio)]
+fn pipe_direction(direction: aokie_bluetooth::aokie_radio::transport::PipeDirection) -> &'static str {
     match direction {
-        aokie_bluetooth::aokie_radio::winusb::PipeDirection::In => "in",
-        aokie_bluetooth::aokie_radio::winusb::PipeDirection::Out => "out",
+        aokie_bluetooth::aokie_radio::transport::PipeDirection::In => "in",
+        aokie_bluetooth::aokie_radio::transport::PipeDirection::Out => "out",
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn print_interface_diagnostics(
-    report: &aokie_bluetooth::aokie_radio::winusb::InterfaceDiagnostics,
+    report: &aokie_bluetooth::aokie_radio::transport::InterfaceDiagnostics,
 ) {
     println!("path: {}", report.device_path);
     println!(
@@ -259,8 +269,8 @@ fn print_interface_diagnostics(
     println!("classified: {:?}", report.classified);
 }
 
-#[cfg(target_os = "windows")]
-fn print_probe(probe: &aokie_bluetooth::aokie_radio::winusb::ControllerProbe) {
+#[cfg(aokie_radio)]
+fn print_probe(probe: &aokie_bluetooth::aokie_radio::transport::ControllerProbe) {
     println!("path: {}", probe.device_path);
     println!("local address: {}", probe.local_address);
     println!(
@@ -281,7 +291,7 @@ fn print_probe(probe: &aokie_bluetooth::aokie_radio::winusb::ControllerProbe) {
     );
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn print_init(report: &aokie_bluetooth::aokie_radio::manager::ControllerInitReport) {
     println!("initialized: {}", report.device_path);
     println!("local address: {}", report.local_address);
@@ -292,7 +302,7 @@ fn print_init(report: &aokie_bluetooth::aokie_radio::manager::ControllerInitRepo
     println!("simple pairing: {}", report.simple_pairing_enabled);
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn print_event_listen(report: &aokie_bluetooth::aokie_radio::manager::ControllerListenReport) {
     print_init(&report.init);
     println!("events: {}", report.events.len());
@@ -305,7 +315,7 @@ fn print_event_listen(report: &aokie_bluetooth::aokie_radio::manager::Controller
     );
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn print_acl_listen(report: &aokie_bluetooth::aokie_radio::manager::ControllerAclListenReport) {
     print_init(&report.init);
     println!("acl exchanges: {}", report.acl_exchanges.len());
@@ -318,7 +328,7 @@ fn print_acl_listen(report: &aokie_bluetooth::aokie_radio::manager::ControllerAc
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn print_runtime(report: &aokie_bluetooth::aokie_radio::manager::ControllerRuntimeListenReport) {
     print_init(&report.init);
     println!("hci events: {}", report.events.len());
@@ -356,7 +366,7 @@ fn print_runtime(report: &aokie_bluetooth::aokie_radio::manager::ControllerRunti
     );
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn print_event_record(event: &aokie_bluetooth::aokie_radio::manager::ControllerEventRecord) {
     println!(
         "  0x{:02x} {}: {}{}",
@@ -371,7 +381,7 @@ fn print_event_record(event: &aokie_bluetooth::aokie_radio::manager::ControllerE
     );
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn print_acl_exchange(
     index: usize,
     exchange: &aokie_bluetooth::aokie_radio::manager::AclExchangeRecord,
@@ -382,7 +392,7 @@ fn print_acl_exchange(
     );
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn print_hfp_event(event: &aokie_bluetooth::aokie_radio::manager::HfpEventRecord) {
     println!("  HFP {}: {}", event.name, event.summary);
 }

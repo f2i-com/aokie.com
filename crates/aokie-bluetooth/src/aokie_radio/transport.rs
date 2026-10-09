@@ -9,7 +9,7 @@
 //!
 //!   `runtime`, `manager` ──────► `transport::*`
 //!                                       │
-//!         #[cfg(windows)] ◄─────────────┴────────────► #[cfg(linux)]
+//!         #[cfg(windows)] ◄─────────────┴────────────► #[cfg(linux | macos)]
 //!                │                                            │
 //!         `super::winusb`                            `super::libusb`
 //!         (Win32 WinUSB API)                         (libusb-1.0 / rusb)
@@ -33,5 +33,5 @@
 #[cfg(target_os = "windows")]
 pub use super::winusb::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use super::libusb::*;

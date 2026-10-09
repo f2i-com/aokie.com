@@ -1,8 +1,9 @@
 //! Bluetooth HFP module backed by the in-tree `aokie_radio` runtime.
 //!
 //! Provides Hands-Free Profile (HFP) audio for the AI receptionist. All
-//! HCI / L2CAP / RFCOMM / SCO traffic is driven directly over WinUSB by
-//! `aokie_radio`; the previous BTstack FFI bridge has been removed.
+//! HCI / L2CAP / RFCOMM / SCO traffic is driven directly over USB by
+//! `aokie_radio` (WinUSB on Windows, libusb on Linux and macOS); the previous
+//! BTstack FFI bridge has been removed.
 //!
 //! The `BluetoothManager` exposes both polling (`try_recv_*`) and awaiting
 //! (`recv_*`) APIs; the current event loop uses polling, but we keep the
@@ -128,7 +129,7 @@ pub struct AudioData {
     pub sample_rate: u16,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn aokie_pairing_store_path() -> std::path::PathBuf {
     use aokie_bluetooth::aokie_radio::pairing_store::default_store_path;
     let dir = aokie_core::paths::app_data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -136,12 +137,12 @@ fn aokie_pairing_store_path() -> std::path::PathBuf {
 }
 
 /// Bluetooth HFP manager — thin wrapper over `aokie_radio::AokieRuntime`.
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub struct BluetoothManager {
     runtime: aokie_bluetooth::aokie_radio::runtime::AokieRuntime,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 impl BluetoothManager {
     pub fn new() -> Result<Self, String> {
         Self::new_with_preferred_dongle(None)
@@ -409,14 +410,14 @@ impl BluetoothManager {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 impl Drop for BluetoothManager {
     fn drop(&mut self) {
         self.runtime.shutdown();
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn bluetooth_event_from_runtime(
     event: aokie_bluetooth::aokie_radio::runtime::RuntimeEvent,
 ) -> BluetoothEvent {
@@ -507,7 +508,7 @@ fn bluetooth_event_from_runtime(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub fn bluetooth_event_from_aokie_hfp(
     event: aokie_bluetooth::aokie_radio::hfp::HfpEvent,
 ) -> Option<BluetoothEvent> {
@@ -562,7 +563,7 @@ pub fn bluetooth_event_from_aokie_hfp(
     }
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(all(test, aokie_radio))]
 mod tests {
     use super::*;
 

@@ -1,16 +1,17 @@
-// Bluetooth host stack — works on Windows (via WinUSB) and Linux (via
-// libusb / rusb). The portable code (HCI/L2CAP/RFCOMM/SDP/HFP/SCO/OBEX/
-// MAP/PBAP framing + state machines) is the bulk of this module and
-// builds on any host. Only the transport layer is OS-specific:
+// Bluetooth host stack — works on Windows (via WinUSB) and on Linux and
+// macOS (via libusb / rusb). The portable code (HCI/L2CAP/RFCOMM/SDP/HFP/
+// SCO/OBEX/MAP/PBAP framing + state machines) is the bulk of this module
+// and builds on any host. Only the transport layer is OS-specific:
 //
 //   * `winusb` — Windows. Talks to the dongle through WinUSB.
-//   * `libusb` — Linux. Talks to the dongle through libusb-1.0 / rusb.
+//   * `libusb` — Linux and macOS. Talks to the dongle through libusb-1.0
+//     / rusb (on macOS libusb is built into the program).
 //   * `transport` — facade that re-exports the right one per cfg.
 //
-// Other targets (macOS / non-USB hosts) are not in scope; the module
-// gate below excludes them so we never accidentally try to compile
-// the transport stubs against an OS that has neither.
-#![cfg(any(target_os = "windows", target_os = "linux"))]
+// Other targets (hosts with neither) are not in scope; the module gate
+// below excludes them so we never accidentally try to compile the
+// transport against an OS that has no raw USB path.
+#![cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 
 pub mod bmessage;
 pub mod hci;
@@ -39,7 +40,7 @@ pub mod vcard;
 #[cfg(target_os = "windows")]
 pub mod winusb;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod libusb;
 
 pub mod transport;

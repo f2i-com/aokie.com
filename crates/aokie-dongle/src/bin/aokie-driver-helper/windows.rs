@@ -1,4 +1,5 @@
-#![cfg(target_os = "windows")]
+//! The elevated WinUSB driver helper itself. Windows only: `main.rs` beside this file compiles it there, and gives
+//! the other systems, which install no driver, a program that says so.
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -165,7 +166,7 @@ macro_rules! log_err {
     }};
 }
 
-fn main() {
+pub fn main() {
     let now = chrono::Local::now();
     log_line!(
         "[aokie-driver-helper] starting at {} (pid={})",
