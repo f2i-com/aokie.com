@@ -1189,6 +1189,18 @@ impl Plugin {
         }
     }
 
+    /// Whether `number` is on the block list (`blockedNumbers`): a number the
+    /// line does not deal with. Read from the store, which is what the
+    /// screening policy is built from.
+    fn is_blocked_number(&self, number: &str) -> bool {
+        self.store
+            .config
+            .settings
+            .get("blockedNumbers")
+            .and_then(Value::as_str)
+            .is_some_and(|list| crate::screen::list_has(list, number))
+    }
+
     /// `sms.send` proper. Every refusal before the text reaches the radio (or
     /// before the dev simulator journals its `aokie.sms.sent`) is
     /// [`SmsSendError::Refused`]: the phone was never touched, so no radio
@@ -1211,6 +1223,17 @@ impl Plugin {
         if !is_safe_sms_message_id(&message_id) {
             return Err(CmdError::failed(
                 "sms.send messageId must be 1..=128 safe identifier characters",
+            )
+            .into());
+        }
+        // A number on the block list is never texted, whoever asks: a flow's
+        // follow-up, the calendar, an agent's reply, the website. The list is
+        // who the line does not deal with, and screening only ever hung up on
+        // their calls: every text of theirs could still be answered, and a
+        // missed call of theirs texted back.
+        if self.is_blocked_number(&to) {
+            return Err(CmdError::failed(
+                "sms.send refused: the recipient is on the blocked list (blockedNumbers), and a blocked number is not texted",
             )
             .into());
         }
@@ -3068,6 +3091,13 @@ impl Plugin {
                 }
                 if purpose.as_deref().is_some_and(|p| p.chars().count() > 1000) {
                     return Err(CmdError::failed("purpose: too long (max 1000 chars)"));
+                }
+                // Nor rung: a call back or an outreach to a blocked number is
+                // refused here, whatever placed it.
+                if self.is_blocked_number(&number) {
+                    return Err(CmdError::failed(
+                        "call.dial refused: the number is on the blocked list (blockedNumbers), and a blocked number is not rung",
+                    ));
                 }
                 self.check_consent("call.dial", crate::consent::Scope::Bluetooth)?;
                 let s = &self.store.config.settings;
@@ -8952,6 +8982,81 @@ mod tests {
         let ev = sms_refusal_event(&sink, "msg-noradio-1");
         assert_eq!(ev["data"]["to"], json!(" +61432123456 "), "as given");
         assert_eq!(ev["data"]["reason"], json!(err.message));
+    }
+
+    #[test]
+    fn sms_send_to_a_blocked_number_is_refused_whoever_asks_and_acknowledges_the_message_id() {
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+        plugin.store.config.settings.insert(
+            "blockedNumbers".into(),
+            json!("+61 432 123 456\n0400 111 222"),
+        );
+        sink.lines.clear();
+        // However the number is written, and before consent or a radio is looked at.
+        for (to, id) in [
+            ("0432 123 456", "msg-blocked-1"),
+            ("+61400111222", "msg-blocked-2"),
+        ] {
+            sink.lines.clear();
+            let err = plugin
+                .dispatch_command(
+                    "sms.send",
+                    &json!({"to": to, "body": "See you at 9:30", "messageId": id}),
+                    &mut sink,
+                )
+                .unwrap_err();
+            assert_eq!(err.code, "command_failed");
+            assert!(err.message.contains("blocked list"), "{}", err.message);
+            let ev = sms_refusal_event(&sink, id);
+            assert_eq!(ev["data"]["reason"], json!(err.message));
+        }
+        // A number that is not on it gets as far as it did before: there is no radio here.
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "0499 999 999", "body": "Hello", "messageId": "msg-open-1"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(
+            err.message.contains("radio is not running"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn call_dial_to_a_blocked_number_is_refused_and_nothing_reaches_the_radio() {
+        let mut plugin = Plugin::ephemeral(true);
+        let (handle, control_rx) = crate::radio::RadioHandle::test_handle();
+        handle
+            .status
+            .connected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        plugin.radio = Some(handle);
+        for (key, value) in [
+            ("outboundEnabled", json!(true)),
+            ("quietHoursStart", json!(0)),
+            ("quietHoursEnd", json!(0)),
+            ("blockedNumbers", json!("0400 111 222")),
+        ] {
+            plugin.store.config.settings.insert(key.into(), value);
+        }
+        let mut sink = VecSink::default();
+        let err = plugin
+            .dispatch_command(
+                "call.dial",
+                &json!({"number": "+61 400 111 222", "openingLine": "Hi, this is the clinic.", "purpose": "a call back"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("blocked list"), "{}", err.message);
+        assert!(control_rx.try_recv().is_err(), "nothing reached the radio");
     }
 
     #[test]

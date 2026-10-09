@@ -42,6 +42,21 @@ impl ScreenPolicy {
     }
 }
 
+/// Whether a block list as the settings hold it (`blockedNumbers`: numbers
+/// apart by commas, semicolons or new lines) has `number`, by the rule the
+/// policy screens callers with: the same last nine digits, of six or more.
+///
+/// The policy hangs up on a blocked number's CALL. This is the same list read
+/// for what goes OUT: a blocked number is not texted or rung either.
+pub(crate) fn list_has(list: &str, number: &str) -> bool {
+    let wanted = digit_suffix(number);
+    wanted.len() >= 6
+        && list
+            .split(|c: char| c == ',' || c == '\n' || c == ';')
+            .map(digit_suffix)
+            .any(|entry| entry.len() >= 6 && entry == wanted)
+}
+
 pub(crate) fn digit_suffix(raw: &str) -> String {
     let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
     let n = digits.chars().count();
@@ -234,6 +249,29 @@ mod tests {
         // Short fragments never block (worse than no filter at all).
         let short = policy("243", None, false);
         assert_eq!(short.verdict(Some("0491570156")), None);
+    }
+
+    /// The list as the settings hold it, read for what goes out: the same
+    /// rule as a caller's (formats, fragments), and nothing but the list (no
+    /// accept pattern: that is about who is answered when they call).
+    #[test]
+    fn a_settings_list_has_a_number_however_either_is_written() {
+        let list = "+61 491 570 156, 0400111222\n(03) 9000 1234; 243";
+        assert!(list_has(list, "0491570156"));
+        assert!(list_has(list, "+61491570156"));
+        assert!(list_has(list, " (04) 0011-1222 "));
+        assert!(list_has(list, "+61 3 9000 1234"));
+        assert!(!list_has(list, "0499999999"));
+        // A fragment on the list blocks nobody, and a fragment is never blocked.
+        assert!(!list_has(list, "0491570243"));
+        assert!(!list_has(list, "243"));
+        assert!(!list_has("", "0491570156"));
+        assert!(!list_has(list, ""));
+        // What the policy says of a caller, the list says of a recipient.
+        let p = policy("+61 491 570 156, 0400111222", None, false);
+        for n in ["0491570156", "+61400111222", "0499999999"] {
+            assert_eq!(p.verdict(Some(n)) == Some("blocked"), list_has("+61 491 570 156, 0400111222", n), "{n}");
+        }
     }
 
     #[test]
