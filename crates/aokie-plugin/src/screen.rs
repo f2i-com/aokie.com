@@ -4,6 +4,11 @@
 //! phones whose caller id only arrives post-answer, like the live Pixel's
 //! CLCC-only delivery). Record-driven rules (blocked Customers, whitelist)
 //! live in FLOWS per the spec; this module is the fast number layer.
+//!
+//! Where the caller's number is known while the phone still rings and there
+//! is no message to say to them, the call is refused there instead and never
+//! picked up (`ring_verdict`): answering a blocked number to hang up on it
+//! tells whoever dials it that the line is live.
 
 /// Parsed screening policy. Built once at radio start from the settings-fed
 /// environment (`blockedNumbers` / `acceptPattern` / `rejectPrivate` /
@@ -150,6 +155,21 @@ impl ScreenPolicy {
         !self.blocked.is_empty() || self.accept.is_some() || self.reject_private
     }
 
+    /// The verdict for a call that is still RINGING: `Some(reason)` when it is
+    /// to be refused without being picked up. Only for a call to us, whose
+    /// number is known already (a withheld number is told from a late one only
+    /// after the answer, so "private" is never decided here), and only when
+    /// there is no message to say to that caller: saying one needs the call
+    /// answered, and the greeting site does that.
+    pub fn ring_verdict(&self, outbound: bool, caller_id: Option<&str>) -> Option<&'static str> {
+        if outbound {
+            return None;
+        }
+        let id = caller_id.map(str::trim).filter(|id| !id.is_empty())?;
+        let reason = self.verdict(Some(id))?;
+        self.message_for(reason).is_empty().then_some(reason)
+    }
+
     /// The screening verdict for a caller id (None/"" = withheld):
     /// `Some(reason)` means the call is screened out. Reasons are the
     /// privacy-safe codes "blocked" / "filtered" / "private".
@@ -284,6 +304,29 @@ mod tests {
         assert_eq!(p.verdict(Some("+14155550100")), Some("filtered"));
         // A withheld id is NOT the pattern's business (that's rejectPrivate).
         assert_eq!(p.verdict(None), None);
+    }
+
+    /// A screened caller is refused while the phone rings only when their
+    /// number is known and nothing is to be said to them; everyone else is
+    /// left to the answer and the greeting site, as before.
+    #[test]
+    fn a_ringing_call_is_refused_only_for_a_known_screened_number_with_no_message() {
+        let mut p = policy("0491570156", Some(r"^(\+?61|0)4"), true);
+        assert_eq!(p.ring_verdict(false, Some("+61491570156")), Some("blocked"));
+        assert_eq!(p.ring_verdict(false, Some(" 0299998888 ")), Some("filtered"));
+        // Someone who is answered.
+        assert_eq!(p.ring_verdict(false, Some("0400111222")), None);
+        // No number yet: withheld or merely late is not known while it rings.
+        assert_eq!(p.ring_verdict(false, None), None);
+        assert_eq!(p.ring_verdict(false, Some("  ")), None);
+        // A call we placed is never screened.
+        assert_eq!(p.ring_verdict(true, Some("0491570156")), None);
+        // With a line to say to them, the call is answered to say it.
+        p.blocked_message = "This number is not accepted.".into();
+        assert_eq!(p.ring_verdict(false, Some("0491570156")), None);
+        assert_eq!(p.ring_verdict(false, Some("0299998888")), Some("filtered"));
+        p.message = "Please call back showing your number.".into();
+        assert_eq!(p.ring_verdict(false, Some("0299998888")), None);
     }
 
     #[test]

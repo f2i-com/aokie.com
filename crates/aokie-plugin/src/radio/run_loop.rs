@@ -1679,6 +1679,9 @@ pub(super) fn run_loop(
         // Never for OUTBOUND sessions (Phase 2): "not yet active" there means
         // the REMOTE side hasn't picked up — an ATA into our own dialing
         // attempt is nonsense.
+        // A screened caller refused while the phone still rings: decided
+        // below, acted on once the session is let go.
+        let mut refuse_at_ring: Option<&'static str> = None;
         if auto_answer {
             if let Some(s) = tracker.current_mut() {
                 if !s.auto_answered && !s.is_active() && !s.outbound {
@@ -1805,7 +1808,23 @@ pub(super) fn run_loop(
                         };
                         #[cfg(not(feature = "voice"))]
                         let (hold, overlay_ready) = (false, false);
-                        if hold {
+                        // A screened caller with nothing to be said to them
+                        // is refused while the phone still rings: not picked up
+                        // at all, and without waiting out the personalization
+                        // window. With a message to say, or with no number yet,
+                        // the call is answered and screened at the greeting, as
+                        // before.
+                        #[cfg(feature = "voice")]
+                        let ring_screened =
+                            screen_policy.ring_verdict(s.outbound, s.caller_id.as_deref());
+                        #[cfg(not(feature = "voice"))]
+                        let ring_screened: Option<&'static str> = None;
+                        if let Some(reason) = ring_screened {
+                            // Not answered, and not looked at again for this call.
+                            s.auto_answered = true;
+                            refuse_at_ring = Some(reason);
+                            idle = false;
+                        } else if hold {
                             idle = false;
                         } else {
                             match bt.answer_call() {
@@ -1837,6 +1856,21 @@ pub(super) fn run_loop(
                         }
                     }
                 }
+            }
+        }
+
+        if let Some(reason) = refuse_at_ring {
+            // Recorded before the phone acts, so the call's end reads
+            // "rejected", never "missed": a screened caller is not rung or
+            // texted back as a missed call.
+            tracker.note_intent(crate::call_session::TerminationIntent::OperatorReject);
+            match bt.reject_call() {
+                Ok(()) => eprintln!(
+                    "[aokie-plugin] call screened while ringing ({reason}) — rejected, not answered"
+                ),
+                Err(e) => eprintln!(
+                    "[aokie-plugin] call screened while ringing ({reason}) — the reject failed ({e}); it is left ringing, not answered"
+                ),
             }
         }
 
