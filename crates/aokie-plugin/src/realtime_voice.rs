@@ -1303,6 +1303,13 @@ fn parse_server_text(
 /// Stateful linear PCM resampler. Keeping phase and the previous sample
 /// across chunks prevents the boundary clicks and cumulative drift caused by
 /// independently resampling every SCO packet.
+///
+/// Going down (the provider's 24 kHz to the phone's 8 or 16 kHz) the input is
+/// low-passed first ([`ANTI_ALIAS_TAPS`] taps, a Blackman-windowed sinc cut at
+/// 0.45 of the output's rate): linear interpolation alone kept what lies above
+/// the output's Nyquist frequency, and folded it into the call's band (24 to
+/// 8 kHz took every third sample: a 5 kHz tone came out at 3 kHz, at full
+/// level), so a voice's s, sh and f and its breaths were heard as hiss.
 #[derive(Debug, Clone)]
 pub struct StreamingResampler {
     from: u32,
@@ -1310,17 +1317,59 @@ pub struct StreamingResampler {
     previous: Option<i16>,
     input_index: u64,
     next_output_position: u64,
+    /// The anti-alias filter's taps (going down; empty otherwise) and its last inputs, the newest last.
+    taps: Vec<f32>,
+    history: VecDeque<f32>,
+}
+
+/// The anti-alias filter's length: at 24 kHz its transition is about 1 kHz wide (3.1 to 4.1 kHz for 8 kHz out), its
+/// stop band -74 dB, its delay 63 input samples (2.6 ms).
+pub const ANTI_ALIAS_TAPS: usize = 127;
+
+/// A Blackman-windowed sinc low-pass of [`ANTI_ALIAS_TAPS`] taps cut at `cutoff` of the sample rate (0 to 0.5), its
+/// gain 1 at DC.
+fn low_pass(cutoff: f64) -> Vec<f32> {
+    let n = ANTI_ALIAS_TAPS;
+    let middle = (n - 1) as f64 / 2.0;
+    let raw: Vec<f64> = (0..n)
+        .map(|i| {
+            let x = i as f64 - middle;
+            let sinc = if x == 0.0 { 2.0 * cutoff } else { (std::f64::consts::TAU * cutoff * x).sin() / (std::f64::consts::PI * x) };
+            let phase = std::f64::consts::TAU * i as f64 / (n - 1) as f64;
+            sinc * (0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos())
+        })
+        .collect();
+    let sum: f64 = raw.iter().sum();
+    raw.iter().map(|t| (t / sum) as f32).collect()
 }
 
 impl StreamingResampler {
     pub fn new(from: u32, to: u32) -> Self {
+        let (from, to) = (from.max(1), to.max(1));
         Self {
-            from: from.max(1),
-            to: to.max(1),
+            from,
+            to,
             previous: None,
             input_index: 0,
             next_output_position: 0,
+            taps: if to < from { low_pass(0.45 * to as f64 / from as f64) } else { Vec::new() },
+            history: VecDeque::new(),
         }
+    }
+
+    /// `x` through the anti-alias filter (as it is where none: going up, or at one rate).
+    fn filtered(&mut self, x: i16) -> i16 {
+        if self.taps.is_empty() {
+            return x;
+        }
+        if self.history.is_empty() {
+            // (primed with the first sample: a steady level stays that level from the start)
+            self.history.extend(std::iter::repeat(x as f32).take(self.taps.len()));
+        }
+        self.history.pop_front();
+        self.history.push_back(x as f32);
+        let y: f32 = self.taps.iter().zip(&self.history).map(|(t, v)| t * v).sum();
+        y.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
     }
 
     pub fn from_rate(&self) -> u32 {
@@ -1331,7 +1380,8 @@ impl StreamingResampler {
         let mut output = Vec::with_capacity(
             input.len().saturating_mul(self.to as usize) / self.from as usize + 2,
         );
-        for &current in input {
+        for &raw in input {
+            let current = self.filtered(raw);
             if let Some(previous) = self.previous {
                 let right = self.input_index.saturating_mul(self.to as u64);
                 let left = right.saturating_sub(self.to as u64);
@@ -1543,6 +1593,52 @@ mod tests {
         }
         assert_eq!(actual, expected);
         assert!((actual.len() as isize - 2_400).abs() <= 2);
+    }
+
+    /// A tone's level through the resampler (past the filter's start).
+    fn level_through(from: u32, to: u32, hz: f64) -> f64 {
+        let input: Vec<i16> = (0..from as usize / 2).map(|n| (10_000.0 * (std::f64::consts::TAU * hz * n as f64 / from as f64).sin()).round() as i16).collect();
+        let out = StreamingResampler::new(from, to).process(&input);
+        let rms = |x: &[i16]| (x.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / x.len() as f64).sqrt();
+        20.0 * (rms(&out[out.len() / 4..]) / rms(&input[input.len() / 4..])).log10()
+    }
+
+    #[test]
+    fn going_down_to_the_phone_what_lies_above_its_band_is_not_folded_into_it() {
+        // 24 to 8 kHz: speech's band passes, a 5 kHz tone (once folded to 3 kHz at full level) does not
+        for hz in [300.0, 1_000.0, 2_500.0] {
+            let db = level_through(WIRE_SAMPLE_RATE, 8_000, hz);
+            assert!(db.abs() < 0.5, "{hz} Hz at 8 kHz: {db:+.1} dB");
+        }
+        for hz in [4_500.0, 5_000.0, 7_000.0, 10_000.0] {
+            let db = level_through(WIRE_SAMPLE_RATE, 8_000, hz);
+            assert!(db < -40.0, "{hz} Hz folded into an 8 kHz call at {db:+.1} dB");
+        }
+        // 24 to 16 kHz (wideband): up to 3 kHz passes, 5 and 6 kHz a little down (linear interpolation's own roll-off,
+        // as before the filter), and 9 to 11 kHz (folded to 5 to 7 kHz) does not
+        for hz in [300.0, 1_000.0, 3_000.0] {
+            let db = level_through(WIRE_SAMPLE_RATE, 16_000, hz);
+            assert!(db.abs() < 0.5, "{hz} Hz at 16 kHz: {db:+.1} dB");
+        }
+        for hz in [5_000.0, 6_000.0] {
+            let db = level_through(WIRE_SAMPLE_RATE, 16_000, hz);
+            assert!(db > -2.0, "{hz} Hz at 16 kHz: {db:+.1} dB");
+        }
+        for hz in [9_000.0, 10_000.0, 11_000.0] {
+            let db = level_through(WIRE_SAMPLE_RATE, 16_000, hz);
+            assert!(db < -40.0, "{hz} Hz folded into a 16 kHz call at {db:+.1} dB");
+        }
+    }
+
+    #[test]
+    fn going_down_the_filter_keeps_its_place_across_chunks() {
+        let input: Vec<i16> = (0..4_800).map(|n| ((n * 7919 % 2001) as i16 - 1000) * 9).collect();
+        for to in [8_000, 16_000] {
+            let expected = StreamingResampler::new(WIRE_SAMPLE_RATE, to).process(&input);
+            let mut chunked = StreamingResampler::new(WIRE_SAMPLE_RATE, to);
+            let actual: Vec<i16> = input.chunks(41).flat_map(|c| chunked.process(c)).collect();
+            assert_eq!(actual, expected, "{to} Hz");
+        }
     }
 
     #[test]
