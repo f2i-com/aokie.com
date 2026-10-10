@@ -114,10 +114,21 @@ pub fn ensure_required_models() -> ModelInstallReport {
             ));
             continue;
         }
+        // Said in the log: the radio thread does nothing else until this is
+        // done (it reports the dongle afterwards), and on a first start
+        // that is minutes with nothing else to show for them.
+        let megabytes = bundle.files.iter().map(|file| file.size).sum::<u64>() / 1_000_000;
+        eprintln!(
+            "[aokie-plugin] fetching the {} speech model ({megabytes} MB); the radio reports the dongle once the models are in",
+            bundle.name
+        );
         let result = match &client {
             Ok(client) => install_bundle(client, &app_data, bundle),
             Err(error) => Err(format!("create HTTPS client: {error}")),
         };
+        if result.is_ok() {
+            eprintln!("[aokie-plugin] the {} speech model is in", bundle.name);
+        }
         if let Err(error) = result {
             *slot = Some(format!(
                 "{} model installation failed: {error}",

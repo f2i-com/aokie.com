@@ -40,6 +40,24 @@ own radio thread opens the dongle and brings it up, `dongle.diagnostics`,
 and closed, and the plugin shuts down and gives the dongle back. That build
 is the heavy one (minutes; it links libwebrtc).
 
+That step builds the plugin without its speech stack: the radio does not need
+it. To run a plugin built **with voice**, give it one that
+`scripts/bundle-unix.sh` laid out, and time to fetch its speech models on a
+first start (773 MB) before its radio reports the dongle:
+
+```sh
+sh scripts/bundle-unix.sh
+sudo env WITH_PLUGIN=1 AOKIE_PLUGIN=target/aokie-plugin-bundle/aokie-plugin \
+     AOKIE_PLUGIN_CHECK_WAIT=1500 sh scripts/virtual-dongle/run.sh
+```
+
+It has to be a bundle's plugin, not the one in the build folder. The speech
+engines load ONNX Runtime 1.25.0 from beside the program, and a bundle has it
+there; a build folder has only the older runtime sherpa-onnx brings. With that
+one the engines do not load, and once the models are there the process aborts
+on its way out, inside the ONNX binding's own exit handler, after it has
+answered the shutdown and given the dongle back.
+
 ## What it checks
 
 * the dongle is found and described from its descriptors, the voice endpoints
