@@ -85,6 +85,32 @@ const USB_CLASS_WIRELESS: u8 = 0xE0;
 const USB_SUBCLASS_BLUETOOTH: u8 = 0x01;
 const USB_PROTOCOL_BLUETOOTH: u8 = 0x01;
 
+/// Vendor-specific class: Broadcom's own dongles (the BCM20702A0 sold as
+/// `0a5c:21ec` among them) and the Broadcom-based ones other vendors sell
+/// give their HCI and voice interfaces 0xFF/0x01/0x01, the standard
+/// layout under a vendor class. Those are Bluetooth from these vendors
+/// only (the vendors Linux's btusb takes them from); Apple's are a Mac's
+/// own controllers and are left out.
+const USB_CLASS_VENDOR: u8 = 0xFF;
+const BROADCOM_VENDOR_CLASS_VIDS: [u16; 8] = [
+    0x0a5c, // Broadcom
+    0x0b05, // ASUSTek
+    0x050d, // Belkin
+    0x13d3, // IMC Networks
+    0x413c, // Dell
+    0x0930, // Toshiba
+    0x0489, // Foxconn / Hon Hai
+    0x04ca, // Lite-On
+];
+
+/// Is a descriptor of this class, from this vendor, a Bluetooth one?
+fn is_bluetooth_class(vid: u16, class: u8, sub_class: u8, protocol: u8) -> bool {
+    sub_class == USB_SUBCLASS_BLUETOOTH
+        && protocol == USB_PROTOCOL_BLUETOOTH
+        && (class == USB_CLASS_WIRELESS
+            || (class == USB_CLASS_VENDOR && BROADCOM_VENDOR_CLASS_VIDS.contains(&vid)))
+}
+
 /// Bluetooth control endpoint requestType: host→device, class,
 /// interface-recipient.
 const BT_HCI_CMD_REQUEST_TYPE: u8 = 0x20;
@@ -348,7 +374,11 @@ impl AokieHciTransport {
         let config = device
             .config_descriptor(0)
             .map_err(|e| format!("libusb config_descriptor: {}", fmt_err(e)))?;
-        let layout = plan_layout(&read_descriptors(&config))
+        let vid = device
+            .device_descriptor()
+            .map_err(|e| format!("libusb device_descriptor: {}", fmt_err(e)))?
+            .vendor_id();
+        let layout = plan_layout(&read_descriptors(&config, vid))
             .ok_or_else(|| format!("no HCI interface on USB Bluetooth class device {}", path))?;
 
         // Detach the system's own Bluetooth driver (btusb on Linux,
@@ -1002,7 +1032,11 @@ pub fn diagnose_interface_path(path: &str) -> Result<InterfaceDiagnostics, Strin
     let config = device
         .config_descriptor(0)
         .map_err(|e| format!("libusb config_descriptor: {}", fmt_err(e)))?;
-    let layout = plan_layout(&read_descriptors(&config))
+    let vid = device
+        .device_descriptor()
+        .map_err(|e| format!("libusb device_descriptor: {}", fmt_err(e)))?
+        .vendor_id();
+    let layout = plan_layout(&read_descriptors(&config, vid))
         .ok_or_else(|| format!("no HCI interface on {}", path))?;
     let mut pipes = layout.hci_pipes.clone();
     for alt in &layout.voice_alts {
@@ -1120,12 +1154,15 @@ fn device_supports_bluetooth(device: &rusb::Device<GlobalContext>) -> bool {
     let Ok(desc) = device.device_descriptor() else {
         return false;
     };
+    let vid = desc.vendor_id();
     // Devices that publish the class at the device descriptor level —
     // simplest case, single-function dongles.
-    if desc.class_code() == USB_CLASS_WIRELESS
-        && desc.sub_class_code() == USB_SUBCLASS_BLUETOOTH
-        && desc.protocol_code() == USB_PROTOCOL_BLUETOOTH
-    {
+    if is_bluetooth_class(
+        vid,
+        desc.class_code(),
+        desc.sub_class_code(),
+        desc.protocol_code(),
+    ) {
         return true;
     }
     // Composite devices (most modern dongles, including the BCM20702
@@ -1137,10 +1174,12 @@ fn device_supports_bluetooth(device: &rusb::Device<GlobalContext>) -> bool {
     };
     for interface in config.interfaces() {
         for descriptor in interface.descriptors() {
-            if descriptor.class_code() == USB_CLASS_WIRELESS
-                && descriptor.sub_class_code() == USB_SUBCLASS_BLUETOOTH
-                && descriptor.protocol_code() == USB_PROTOCOL_BLUETOOTH
-            {
+            if is_bluetooth_class(
+                vid,
+                descriptor.class_code(),
+                descriptor.sub_class_code(),
+                descriptor.protocol_code(),
+            ) {
                 return true;
             }
         }
@@ -1261,7 +1300,9 @@ struct Layout {
     voice_alts: Vec<VoiceAlt>,
 }
 
-fn read_descriptors(config: &rusb::ConfigDescriptor) -> Vec<AltDescriptor> {
+/// `vid` is the device's vendor: whether a vendor-class interface is
+/// Bluetooth depends on it ([`is_bluetooth_class`]).
+fn read_descriptors(config: &rusb::ConfigDescriptor, vid: u16) -> Vec<AltDescriptor> {
     let mut out = Vec::new();
     for interface in config.interfaces() {
         for descriptor in interface.descriptors() {
@@ -1269,9 +1310,12 @@ fn read_descriptors(config: &rusb::ConfigDescriptor) -> Vec<AltDescriptor> {
             out.push(AltDescriptor {
                 interface: descriptor.interface_number(),
                 setting,
-                bluetooth: descriptor.class_code() == USB_CLASS_WIRELESS
-                    && descriptor.sub_class_code() == USB_SUBCLASS_BLUETOOTH
-                    && descriptor.protocol_code() == USB_PROTOCOL_BLUETOOTH,
+                bluetooth: is_bluetooth_class(
+                    vid,
+                    descriptor.class_code(),
+                    descriptor.sub_class_code(),
+                    descriptor.protocol_code(),
+                ),
                 pipes: descriptor
                     .endpoint_descriptors()
                     .map(|endpoint| endpoint_to_pipe_info(&endpoint, setting))
@@ -1587,6 +1631,21 @@ mod tests {
         assert_eq!(layout.hci_interface, 0);
         assert_eq!(layout.voice_interface, None);
         assert!(layout.voice_alts.is_empty());
+    }
+
+    #[test]
+    fn a_broadcom_dongle_under_the_vendor_class_is_bluetooth() {
+        // A BCM20702A0 (0a5c:21ec) as a Mac lists it: device and
+        // interfaces 0 and 1 at 0xFF/0x01/0x01, its firmware channel at
+        // 0xFF/0xFF/0xFF and its DFU interface at 0xFE/0x01/0x01.
+        assert!(is_bluetooth_class(0x0a5c, 0xff, 0x01, 0x01));
+        assert!(!is_bluetooth_class(0x0a5c, 0xff, 0xff, 0xff));
+        assert!(!is_bluetooth_class(0x0a5c, 0xfe, 0x01, 0x01));
+        // The standard class is Bluetooth whoever made it ...
+        assert!(is_bluetooth_class(0x0bda, 0xe0, 0x01, 0x01));
+        // ... and the vendor class only from the vendors that use it so.
+        assert!(!is_bluetooth_class(0x0bda, 0xff, 0x01, 0x01));
+        assert!(!is_bluetooth_class(0x05ac, 0xff, 0x01, 0x01));
     }
 
     #[test]
