@@ -8,8 +8,26 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # sherpa-rs-sys runs bindgen at build time (its SHERPA_SKIP_GENERATE_BINDINGS
 # fallback is broken in 0.6.8 — src/bindings.rs isn't packaged in the published
 # crate), so point bindgen at the installed LLVM's libclang.
+#
+# This is Windows' folder, and cargo's [env] has no target scope: it reaches a
+# build on any system that has not set LIBCLANG_PATH itself, where it names a
+# folder that is not there and bindgen then finds no libclang at all. Off
+# Windows, set LIBCLANG_PATH to the system's own (scripts/bundle-unix.sh does).
 [env]
 LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# LiveKit's libwebrtc for a Mac is a static archive with Objective-C categories
+# in it (NSString+StdString among them), and the linker leaves a category out
+# unless it is told to load every Objective-C object of an archive (-ObjC).
+# Without it the plugin links and then aborts while it is being loaded, before
+# main: "+[NSString stringForStdString:]: unrecognized selector sent to class",
+# thrown from a static initializer (RTCH264ProfileLevelId.mm). Seen on the
+# first build on a Mac; LiveKit's own instructions ask for the same flag.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-ObjC"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-ObjC"]
