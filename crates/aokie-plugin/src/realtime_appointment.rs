@@ -322,42 +322,64 @@ pub(crate) fn is_conservative_agreement(value: &str) -> bool {
             && (!value.ends_with('?') || value.starts_with("yes") || value.starts_with("yeah")))
 }
 
+/// The day the caller chose in `agreement` against the request's `date`.
+///
+/// An explicit date must be the date. Of the days named (weekdays, today,
+/// tomorrow), the LAST one is the caller's choice — as for the time below, a
+/// caller revises and reschedules within one turn: "cancel the one on
+/// Thursday at 2 and make it Friday at 10" chooses Friday. Two days offered as
+/// alternatives ("Thursday or Friday") are no choice yet. Each refusal says
+/// what to do next: the agent is given it as the tool's answer, and given a
+/// bare "does not match" it stalled ("Let me get that in for you now.") and
+/// booked nothing.
 fn validate_spoken_date(agreement: &str, date: NaiveDate, today: NaiveDate) -> Result<(), String> {
     let speech = normalized_speech(agreement);
-    if crate::conversation_policy::explicit_date(agreement, today).is_some_and(|spoken| spoken != date) {
-        return Err("appointment date does not match the caller's explicit date".into());
+    if let Some(spoken) = crate::conversation_policy::explicit_date(agreement, today).filter(|spoken| *spoken != date) {
+        return Err(format!(
+            "appointment date does not match the caller's explicit date: they said {}; check the date, or ask \
+             them in one short question which day they want, then call this tool again",
+            spoken.format("%A %-d %B")
+        ));
     }
-    let relative: Vec<(&str, NaiveDate)> =
-        [("today", today), ("tomorrow", today + Duration::days(1))]
-            .into_iter()
-            .filter(|(word, _)| speech.contains(word))
-            .collect();
-    if relative.len() > 1
-        || relative
-            .first()
-            .is_some_and(|(_, expected)| *expected != date)
-    {
-        return Err("appointment date does not match the caller's selected day".into());
-    }
-
-    let mentioned: Vec<Weekday> = [
-        ("monday", Weekday::Mon),
-        ("tuesday", Weekday::Tue),
-        ("wednesday", Weekday::Wed),
-        ("thursday", Weekday::Thu),
-        ("friday", Weekday::Fri),
-        ("saturday", Weekday::Sat),
-        ("sunday", Weekday::Sun),
+    let mut named: Vec<(usize, usize, &str, Result<NaiveDate, Weekday>)> = [
+        ("monday", Err(Weekday::Mon)),
+        ("tuesday", Err(Weekday::Tue)),
+        ("wednesday", Err(Weekday::Wed)),
+        ("thursday", Err(Weekday::Thu)),
+        ("friday", Err(Weekday::Fri)),
+        ("saturday", Err(Weekday::Sat)),
+        ("sunday", Err(Weekday::Sun)),
+        ("today", Ok(today)),
+        ("tomorrow", Ok(today + Duration::days(1))),
     ]
     .into_iter()
-    .filter_map(|(word, weekday)| speech.contains(word).then_some(weekday))
+    .flat_map(|(word, day)| speech.match_indices(word).map(move |(at, _)| (at, at + word.len(), word, day)))
     .collect();
-    if mentioned.len() > 1
-        || mentioned
-            .first()
-            .is_some_and(|weekday| *weekday != date.weekday())
-    {
-        return Err("appointment date does not match the caller's selected weekday".into());
+    named.sort_by_key(|(at, ..)| *at);
+    let Some(&(chosen_at, _, chosen_word, chosen)) = named.last() else {
+        return Ok(());
+    };
+    if let Some(&(_, before_end, before_word, before)) = named.len().checked_sub(2).map(|i| &named[i]) {
+        let between = &speech[before_end..chosen_at];
+        if before != chosen && between.split(|c: char| !c.is_alphanumeric()).any(|word| word == "or") {
+            return Err(format!(
+                "the caller offered two days ({before_word} or {chosen_word}); ask them in one short question \
+                 which one they want, then call this tool again with their answer"
+            ));
+        }
+    }
+    let matches = match chosen {
+        Ok(day) => day == date,
+        Err(weekday) => weekday == date.weekday(),
+    };
+    if !matches {
+        return Err(format!(
+            "appointment date does not match the caller's selected day: {} is a {}, and they said {chosen_word} \
+             (today is {}); call this tool again with the date they chose",
+            date,
+            date.format("%A"),
+            today.format("%A %-d %B %Y")
+        ));
     }
     Ok(())
 }
@@ -674,6 +696,28 @@ mod tests {
         assert_eq!(request.agreement_turn, 6);
         assert!(request.request_id.starts_with("appt_"));
         assert_eq!(request.request_id.len(), 37);
+    }
+
+    #[test]
+    fn a_reschedule_that_names_the_old_day_books_the_new_one() {
+        // A live call (Sun 11 Oct 2026): the caller cancels Thursday's and asks for Friday at 10 in one turn, then
+        // agrees. Two weekdays in that turn read as "Thursday or Friday" and the booking was refused.
+        let sunday = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
+        let request = json!({"callerName": "Lance", "service": "Lawn mowing", "date": "2026-10-16", "time": "10:00", "agreementPhrase": "Yes, please, that'd be great actually."});
+        let history = [
+            "Hi, I'd like to make a lawn mowing appointment, please.".to_string(),
+            "Actually, I'd like to cancel my other appointment, which was on the Thursday at 2pm and make it a Friday at 10am.".to_string(),
+            "Yes, please, that'd be great actually.".to_string(),
+        ];
+        let booked = validate(&request, "call_c6c658180f8b488cb99e64ca8e3f67f7", Some((3, "Yes, please, that'd be great actually.")), &history, sunday).unwrap();
+        assert_eq!((booked.date.as_str(), booked.time.as_str()), ("2026-10-16", "10:00"));
+        // the day they named last is their choice; days offered as alternatives are not, and the refusal says what to do
+        assert!(validate_spoken_date("not Thursday, Friday please", NaiveDate::from_ymd_opt(2026, 10, 16).unwrap(), sunday).is_ok());
+        let offered = validate_spoken_date("Thursday or Friday please", NaiveDate::from_ymd_opt(2026, 10, 16).unwrap(), sunday).unwrap_err();
+        assert!(offered.contains("thursday or friday") && offered.contains("call this tool again"), "{offered}");
+        let wrong = validate_spoken_date("Friday at 10 please", NaiveDate::from_ymd_opt(2026, 10, 15).unwrap(), sunday).unwrap_err();
+        assert!(wrong.contains("is a Thursday") && wrong.contains("call this tool again"), "{wrong}");
+        assert!(validate_spoken_date("tomorrow at 9", NaiveDate::from_ymd_opt(2026, 10, 12).unwrap(), sunday).is_ok());
     }
 
     #[test]
