@@ -33,6 +33,25 @@ case "$(uname -s)" in
 esac
 command -v cargo > /dev/null || { echo "bundle-unix.sh needs cargo (https://rustup.rs)"; exit 1; }
 
+# The speech stack's build reads C headers with bindgen, which loads libclang. A Mac has one inside Xcode's
+# toolchain (or the command line tools', or Homebrew's llvm), and the build does not always look there: on GitHub's
+# macOS 15 runner it found none and stopped. It is looked for here and named to the build.
+if [ "$(uname -s)" = Darwin ] && [ -n "$features" ] && [ -z "${LIBCLANG_PATH:-}" ]; then
+  developer=$(xcode-select -p 2>/dev/null || true)
+  for dir in "$developer/Toolchains/XcodeDefault.xctoolchain/usr/lib" "$developer/usr/lib" \
+             /Library/Developer/CommandLineTools/usr/lib /opt/homebrew/opt/llvm*/lib /usr/local/opt/llvm*/lib; do
+    if [ -e "$dir/libclang.dylib" ]; then LIBCLANG_PATH=$dir; break; fi
+  done
+  if [ -n "${LIBCLANG_PATH:-}" ]; then
+    export LIBCLANG_PATH
+    echo "libclang: $LIBCLANG_PATH"
+  else
+    echo "no libclang.dylib was found (Xcode's command line tools bring one: xcode-select --install; so does"
+    echo "\`brew install llvm\`). The speech stack's build needs it; set LIBCLANG_PATH to the folder it is in."
+    exit 1
+  fi
+fi
+
 cd "$repo"
 echo "building the plugin${features:+ (features: $features)}"
 if [ -n "$features" ]; then
