@@ -388,7 +388,7 @@ pub(super) fn emit_transcript_settlements(
 /// this emits `aokie.hardware.error` carrying `code: "control_failed"`, the
 /// action and the operation id from the accepted result — so a flow/UI can
 /// correlate "my command didn't happen" instead of trusting a premature verb.
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) fn emit_control_failed(
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,

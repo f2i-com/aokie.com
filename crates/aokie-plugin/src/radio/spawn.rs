@@ -1,16 +1,18 @@
-//! The `spawn` entry points (Windows radio thread / non-Windows stub) and the answer tone.
+//! The `spawn` entry points (the radio thread where the radio stack has a USB transport: Windows, Linux, macOS;
+//! a refusal elsewhere) and the answer tone.
 
 #[allow(unused_imports)]
 use super::*;
 
-// â”€â”€ Windows: the real radio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â”€â”€ The real radio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Start the live radio on a background thread. Returns immediately with a
 /// handle; initialisation happens asynchronously and is reflected in
 /// [`RadioStatus`] (and via an `aokie.dongle.ready` / `aokie.hardware.error`
-/// event). `preferred_path` pins a specific WinUSB dongle path, or `None`
-/// takes the first enumerated HCI controller.
-#[cfg(target_os = "windows")]
+/// event). `preferred_path` pins a specific dongle path (a WinUSB path on
+/// Windows, `usb:<bus>:<address>` on Linux and macOS), or `None` takes the
+/// first enumerated HCI controller.
+#[cfg(aokie_radio)]
 pub fn spawn(
     data_dir: std::path::PathBuf,
     preferred_path: Option<String>,
@@ -25,6 +27,16 @@ pub fn spawn(
     use crate::backend::{RadioBackend, TransportMode};
     use std::sync::mpsc;
 
+    // `native` is Windows' own Bluetooth stack. Asked for anywhere else it is refused here, where the caller hears
+    // it, not on the thread, where only the log would.
+    if transport_mode == TransportMode::Native && !cfg!(target_os = "windows") {
+        return Err(
+            "transportMode=native uses Windows' own Bluetooth stack; on this system Aokie reaches the phone \
+             through a USB dongle (transportMode=dongle)"
+                .to_string(),
+        );
+    }
+
     let (control_tx, control_rx) = mpsc::channel::<RadioControl>();
     let status = Arc::new(RadioStatus::default());
     let status_thread = status.clone();
@@ -37,13 +49,22 @@ pub fn spawn(
         // RFCOMM â†’ HFP dispatch overflowed the 1 MiB Windows default.
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
+            // Says the thread is over. Declared first, so dropped last: after the
+            // backend made below has closed its transport, on every way out.
+            struct ThreadFinished(Arc<RadioStatus>);
+            impl Drop for ThreadFinished {
+                fn drop(&mut self) {
+                    self.0.thread_finished.store(true, Ordering::Release);
+                }
+            }
+            let _finished = ThreadFinished(status_thread.clone());
             // Transport selection (settings.transportMode): the WinUSB dongle
             // is the proven full-control backend; `native` uses the built-in
             // Windows Bluetooth stack (aokie-winbt) so no driver install is
             // needed; `auto` prefers native when a Windows adapter exists.
             let use_native = match transport_mode {
                 TransportMode::Native => true,
-                TransportMode::Auto => aokie_winbt::runtime::adapter_present(),
+                TransportMode::Auto => native_adapter_present(),
                 TransportMode::Dongle => false,
             };
             // Software "virtual replug": on a cold boot the dongle's SCO iso
@@ -54,7 +75,7 @@ pub fn spawn(
             // the device + WinUSB re-bind before we open it.
             if !use_native {
                 if let Some(hwid) = reenumerate_hwid.as_deref() {
-                match aokie_dongle::winusb::restart_device(hwid) {
+                match virtual_replug(hwid) {
                     Ok(()) => {
                         eprintln!("[aokie-plugin] restarted {hwid} (virtual replug: remove + re-add) â€” settling 3s");
                         std::thread::sleep(std::time::Duration::from_millis(3000));
@@ -70,14 +91,14 @@ pub fn spawn(
             // transfer fails (empty + Win32 87). The original Tauri app gets
             // this for free via WebView2. timeBeginPeriod is ref-counted and
             // paired with timeEndPeriod below.
-            unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
+            raise_timer_resolution();
             let mut bt: Box<dyn RadioBackend> = if use_native {
-                match crate::backend::NativeRadioBackend::start() {
-                    Ok(b) => Box::new(b),
+                match start_native_backend() {
+                    Ok(b) => b,
                     Err(e) => {
                         eprintln!("[aokie-plugin] radio failed to start (native backend): {e}");
                         *status_thread.last_error.lock().unwrap() = Some(e);
-                        unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+                        restore_timer_resolution();
                         return;
                     }
                 }
@@ -87,7 +108,7 @@ pub fn spawn(
                     Err(e) => {
                         eprintln!("[aokie-plugin] radio failed to start: {e}");
                         *status_thread.last_error.lock().unwrap() = Some(e);
-                        unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+                        restore_timer_resolution();
                         return;
                     }
                 }
@@ -116,7 +137,7 @@ pub fn spawn(
                     );
                     eprintln!("[aokie-plugin] {msg}");
                     *status_thread.last_error.lock().unwrap() = Some(msg);
-                    unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+                    restore_timer_resolution();
                     return;
                 }
             };
@@ -152,7 +173,7 @@ pub fn spawn(
             status_exit.call_active.store(false, Ordering::Relaxed);
             *status_exit.current_call_id.lock().unwrap() = None;
             remote_media_thread.observe_physical_call(None, false);
-            unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+            restore_timer_resolution();
         })
         .map_err(|e| format!("spawn radio thread: {e}"))?;
 
@@ -167,7 +188,7 @@ pub fn spawn(
 /// OUTBOUND SCO audio path actually reaches the caller on a given dongle â€” real
 /// TTS speech replaces it once outbound audio is confirmed. Fades each note in
 /// and out to avoid clicks.
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) fn greeting_tone(sample_rate: u16) -> Vec<i16> {
     let sr = sample_rate.max(8000) as f32;
     let mut out = Vec::new();
@@ -183,9 +204,9 @@ pub(super) fn greeting_tone(sample_rate: u16) -> Vec<i16> {
     out
 }
 
-// â”€â”€ Non-Windows: no radio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â”€â”€ No USB transport: no radio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(aokie_radio))]
 pub fn spawn(
     _data_dir: std::path::PathBuf,
     _preferred_path: Option<String>,
@@ -194,7 +215,70 @@ pub fn spawn(
     _reenumerate_hwid: Option<String>,
     _greeting: Option<String>,
     _ack_mode: bool,
+    _host_rpc: Arc<crate::host_rpc::HostRpc>,
     _transport_mode: crate::backend::TransportMode,
 ) -> Result<RadioHandle, String> {
-    Err("the Aokie radio is only supported on Windows (WinUSB)".to_string())
+    Err(
+        "the Aokie radio needs a system its USB transport is written for (Windows, Linux or macOS)"
+            .to_string(),
+    )
 }
+
+// What is Windows' own in the radio thread. Each has a twin for the other systems that have the radio, so that the
+// thread's body is one text for all of them.
+
+/// Whether Windows has a Bluetooth adapter of its own (`transportMode=auto` then prefers the native backend).
+#[cfg(target_os = "windows")]
+fn native_adapter_present() -> bool {
+    aokie_winbt::runtime::adapter_present()
+}
+
+/// No native backend off Windows: `auto` means the dongle.
+#[cfg(all(aokie_radio, not(target_os = "windows")))]
+fn native_adapter_present() -> bool {
+    false
+}
+
+/// The built-in Windows Bluetooth stack's backend.
+#[cfg(target_os = "windows")]
+fn start_native_backend() -> Result<Box<dyn crate::backend::RadioBackend>, String> {
+    Ok(Box::new(crate::backend::NativeRadioBackend::start()?))
+}
+
+/// Not reached (`spawn` refuses `native` off Windows before the thread starts); an error all the same.
+#[cfg(all(aokie_radio, not(target_os = "windows")))]
+fn start_native_backend() -> Result<Box<dyn crate::backend::RadioBackend>, String> {
+    Err("the native Bluetooth backend is Windows' own".to_string())
+}
+
+/// Windows' software "virtual replug" of the dongle (remove and re-add the device).
+#[cfg(target_os = "windows")]
+fn virtual_replug(hardware_id: &str) -> Result<(), String> {
+    aokie_dongle::winusb::restart_device(hardware_id)
+}
+
+/// The setting names a Windows hardware id, and the cold-boot fault it works around is the WinUSB binding's: on
+/// the other systems it is said and passed over.
+#[cfg(all(aokie_radio, not(target_os = "windows")))]
+fn virtual_replug(_hardware_id: &str) -> Result<(), String> {
+    Err("the virtual replug is a Windows step; it is not needed on this system".to_string())
+}
+
+/// Raise this process's timer resolution to 1 ms for the radio's lifetime (see the note where it is called).
+/// Windows counts the calls: every raise is paired with [`restore_timer_resolution`].
+#[cfg(target_os = "windows")]
+fn raise_timer_resolution() {
+    unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
+}
+
+#[cfg(target_os = "windows")]
+fn restore_timer_resolution() {
+    unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+}
+
+/// Linux and macOS time a sleep finely enough as they are: nothing to raise.
+#[cfg(all(aokie_radio, not(target_os = "windows")))]
+fn raise_timer_resolution() {}
+
+#[cfg(all(aokie_radio, not(target_os = "windows")))]
+fn restore_timer_resolution() {}

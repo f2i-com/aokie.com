@@ -21,7 +21,7 @@ pub(super) fn reply_owner_is_current(
     expected.is_some_and(|expected| remote_media.aokie_owner_fence().as_ref() == Some(expected))
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[derive(Debug, Clone)]
 pub(super) struct RealtimeRuntimeConfig {
     pub(super) endpoint: String,
@@ -50,7 +50,7 @@ pub(super) fn oaiy_route_selected(realtime_selected: bool, endpoint: Option<&str
             .is_some_and(|provider| provider == OAIY_PROVIDER_ID)
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn realtime_runtime_config() -> Result<Option<RealtimeRuntimeConfig>, String> {
     if std::env::var("AOKIE_REALTIME_VOICE_MODE").as_deref() != Ok("desktop_realtime") {
         return Ok(None);
@@ -117,7 +117,7 @@ pub(super) fn realtime_runtime_config() -> Result<Option<RealtimeRuntimeConfig>,
 /// legacy marker/tool contract whose tokens are normally intercepted before
 /// TTS. The business persona remains useful as bounded notes, with marker
 /// delimiters neutralised, followed by strict no-action/no-secret rules.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn realtime_safe_instructions(persona: &str, allow_finish_call: bool) -> String {
     let notes: String = persona
         .replace("[[", "(")
@@ -141,7 +141,7 @@ pub(super) fn realtime_safe_instructions(persona: &str, allow_finish_call: bool)
 /// write failed: the replay thread will deliver the same idempotency key. A
 /// missing/dead outbox is never treated as success, and no direct form-write
 /// capability is exposed to the model.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn emit_realtime_appointment_request(
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
@@ -391,7 +391,7 @@ pub(super) fn realtime_failed_payload(
 /// business context, with action-marker brackets neutralised and bounded as
 /// the wrapper bounds it. Other providers speak model output directly and
 /// get Aokie's full realtime wrapper, as before.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn realtime_instructions(
     oaiy_route: bool,
     persona: &str,
@@ -656,7 +656,7 @@ pub(super) fn should_resume_realtime_after_owner_loss(desktop_realtime_responder
 }
 
 /// A token for one realtime session, never reused within the process.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 fn next_session_token() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -683,7 +683,7 @@ pub(super) fn realtime_allow_transfer(
         && consent.takeover_enabled
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) struct RealtimeCallLane {
     pub(super) session: crate::realtime_voice::RealtimeVoiceSession,
     pub(super) call_id: String,
@@ -727,7 +727,7 @@ pub(super) struct RealtimeCallLane {
     pub(super) pending_hangup: Option<PendingRealtimeHangup>,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) struct PendingRealtimeBusinessLookup {
     pub(super) tool_call_id: String,
     pub(super) name: String,
@@ -739,13 +739,13 @@ pub(super) struct PendingRealtimeBusinessLookup {
 /// in that interval could start a second response before Desktop has supplied
 /// the first function output. Preserve every sample in order, then release it
 /// in 100 ms commands immediately after the tool result clears that fence.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[derive(Default)]
 pub(super) struct DeferredRealtimeInput {
     pub(super) samples: std::collections::VecDeque<i16>,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 impl DeferredRealtimeInput {
     pub(super) const MAX_MS: usize = 15_000;
     pub(super) const FLUSH_MS: usize = 100;
@@ -779,7 +779,7 @@ impl DeferredRealtimeInput {
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) struct PendingRealtimeHangup {
     pub(super) tool_call_id: String,
     pub(super) response_id: String,
@@ -789,7 +789,7 @@ pub(super) struct PendingRealtimeHangup {
     pub(super) attempts: u8,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 impl RealtimeCallLane {
     pub(super) fn new(session: crate::realtime_voice::RealtimeVoiceSession) -> Self {
         let call_id = session.call_id().to_string();

@@ -24,6 +24,11 @@ keyring = { version = "3", default-features = false, features = [
     "linux-native",
 ] }
 
+# keychain_seal.rs: the cipher for values sealed at rest on macOS, where the key lives in the login Keychain.
+# Windows seals with DPAPI and does not link it; the cipher's own tests run on every system (dev-dependencies).
+[target.'cfg(target_os = "macos")'.dependencies]
+ring = "0.17"
+
 # crashlog.rs redirects native stderr/stdout to a forensic log file via
 # SetStdHandle; all of it is `#[cfg(windows)]`-gated internally.
 [target.'cfg(windows)'.dependencies]
@@ -38,3 +43,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
 ] }
+
+[dev-dependencies]
+ring = "0.17"

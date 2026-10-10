@@ -166,11 +166,10 @@ impl Transfer {
         // SAFETY: plain allocation; a null return is handled.
         let raw = NonNull::new(unsafe { ffi::libusb_alloc_transfer(frames as c_int) })
             .ok_or_else(|| "libusb_alloc_transfer: out of memory".to_string())?;
-        // SAFETY: `Box::into_raw` never returns null.
-        let buffer = unsafe {
-            NonNull::new_unchecked(Box::into_raw(vec![0u8; capacity].into_boxed_slice()) as *mut u8)
-        };
-        let latch = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(AtomicI32::new(0)))) };
+        // Leaked on purpose: `Drop` takes both back (`Box::from_raw`) once
+        // libusb has nothing to do with them any more.
+        let buffer = NonNull::from(Box::leak(vec![0u8; capacity].into_boxed_slice())).cast::<u8>();
+        let latch = NonNull::from(Box::leak(Box::new(AtomicI32::new(0))));
         // SAFETY: `raw` is a transfer libusb has just allocated (zeroed)
         // and nobody else knows of. The buffer and the latch outlive it:
         // `Drop` frees them only after the transfer is back and freed.

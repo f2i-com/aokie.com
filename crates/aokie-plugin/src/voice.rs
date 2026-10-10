@@ -716,9 +716,18 @@ fn ensure_ort_dylib() {
     if std::env::var_os("ORT_DYLIB_PATH").is_some() {
         return;
     }
+    // The same two, under the name each system gives the library: the file
+    // of Microsoft's release as it is on macOS and Linux (never run there
+    // yet: only the names are known).
+    #[cfg(target_os = "windows")]
+    const NAMES: [&str; 2] = ["onnxruntime_1.25.0.dll", "onnxruntime.dll"];
+    #[cfg(target_os = "macos")]
+    const NAMES: [&str; 2] = ["libonnxruntime.1.25.0.dylib", "libonnxruntime.dylib"];
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    const NAMES: [&str; 2] = ["libonnxruntime.so.1.25.0", "libonnxruntime.so"];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for name in ["onnxruntime_1.25.0.dll", "onnxruntime.dll"] {
+            for name in NAMES {
                 let dll = dir.join(name);
                 if dll.exists() {
                     std::env::set_var("ORT_DYLIB_PATH", &dll);

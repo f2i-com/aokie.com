@@ -33,7 +33,7 @@ pub(super) fn hold_auto_answer(
 /// Connect the in-plugin agent's LLM client (llama.cpp :8080 / ollama :11434
 /// / the configured aiEndpoint) and keep the health slot truthful. Shared by
 /// the lazy first-reply path and the ring-time pre-warm.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn connect_agent_client(
     agent_endpoint: &Arc<Mutex<Option<String>>>,
     agent_model: Option<String>,

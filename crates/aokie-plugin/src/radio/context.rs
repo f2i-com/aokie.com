@@ -3,7 +3,7 @@
 #[allow(unused_imports)]
 use super::*;
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) struct CallVoiceContext {
     /// Volatile realtime captions lane (guide §9.2) — one per call epoch;
     /// `None` until the call id is known.
@@ -87,7 +87,7 @@ pub(super) struct CallVoiceContext {
     pub(super) desktop_realtime_responder: bool,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 impl CallVoiceContext {
     /// A brand-new caller's context — the same values every field was
     /// individually reset to at the old per-call boundary.

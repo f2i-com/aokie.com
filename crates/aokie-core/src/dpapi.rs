@@ -8,24 +8,34 @@
 //! store the returned `dpapi:<base64>` token; only the same Windows
 //! user on the same machine can open it again.
 //!
-//! Non-Windows builds get `Err` from both directions — the caller
-//! decides its own dev fallback (the pairing store keeps 0600
-//! plaintext hex on Linux, which only carries the dev libusb
-//! transport; production dongle deployments are Windows-only).
+//! macOS has no DPAPI, but it has the login Keychain: there the same
+//! two calls seal under a key the Keychain keeps for the user
+//! (`keychain_seal.rs`), and the token is `keychain1:<base64>`. The
+//! module keeps its name; read it as "the system's own sealing".
+//!
+//! Linux builds get `Err` from both directions — the caller decides
+//! its own dev fallback (the pairing store keeps 0600 plaintext hex
+//! there, which only carries the dev libusb transport).
 
 /// Storage prefix marking a DPAPI-sealed value. Kept distinct from the
 /// outbox's internal prefix use so a sealed pairing-store value is
 /// self-describing in isolation.
 pub const DPAPI_PREFIX: &str = "dpapi:";
 
-/// True when `stored` carries a DPAPI-sealed value (vs legacy plaintext).
+/// Storage prefix of a value sealed on macOS: AES-256-GCM under a key
+/// that lives in the user's login Keychain (`keychain_seal.rs`).
+pub const KEYCHAIN_PREFIX: &str = "keychain1:";
+
+/// True when `stored` carries a sealed value (vs legacy plaintext),
+/// whichever system sealed it. A value sealed on the other system is
+/// still sealed: it does not open here, and it is not plaintext.
 pub fn is_sealed(stored: &str) -> bool {
-    stored.starts_with(DPAPI_PREFIX)
+    stored.starts_with(DPAPI_PREFIX) || stored.starts_with(KEYCHAIN_PREFIX)
 }
 
 /// True when this platform can seal (i.e. `protect` can succeed).
 pub fn platform_supported() -> bool {
-    cfg!(windows)
+    cfg!(any(windows, target_os = "macos"))
 }
 
 /// Seal `plain` under the current user's DPAPI scope. Returns the
@@ -63,7 +73,16 @@ pub fn protect(plain: &[u8]) -> Result<String, String> {
     }
 }
 
-#[cfg(not(windows))]
+/// macOS: seal under the key in the user's login Keychain. Returns the
+/// `keychain1:<base64>` storage token; `Err` when the Keychain will not
+/// give the key (locked, or the user refused), which callers treat as
+/// they treat a DPAPI failure: nothing is stored unsealed.
+#[cfg(target_os = "macos")]
+pub fn protect(plain: &[u8]) -> Result<String, String> {
+    crate::keychain_seal::protect(plain)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn protect(_plain: &[u8]) -> Result<String, String> {
     Err("DPAPI is not available on this platform".to_string())
 }
@@ -107,7 +126,17 @@ pub fn unprotect(stored: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-#[cfg(not(windows))]
+/// macOS: open a `keychain1:<base64>` token sealed by `protect` as the
+/// same user on the same Mac. A token Windows sealed does not open here.
+#[cfg(target_os = "macos")]
+pub fn unprotect(stored: &str) -> Result<Vec<u8>, String> {
+    if stored.starts_with(DPAPI_PREFIX) {
+        return Err("value was sealed by Windows DPAPI: it does not open on a Mac".to_string());
+    }
+    crate::keychain_seal::unprotect(stored)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn unprotect(_stored: &str) -> Result<Vec<u8>, String> {
     Err("DPAPI is not available on this platform".to_string())
 }
@@ -116,8 +145,8 @@ pub fn unprotect(_stored: &str) -> Result<Vec<u8>, String> {
 // outbox's; not worth a crate for two call sites.
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-#[cfg_attr(not(windows), allow(dead_code))]
-fn b64_encode(data: &[u8]) -> String {
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+pub(crate) fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [
@@ -142,8 +171,8 @@ fn b64_encode(data: &[u8]) -> String {
     out
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
-fn b64_decode(text: &str) -> Option<Vec<u8>> {
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+pub(crate) fn b64_decode(text: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         B64.iter().position(|&b| b == c).map(|i| i as u32)
     }
@@ -187,6 +216,7 @@ mod tests {
     #[test]
     fn is_sealed_detects_prefix() {
         assert!(is_sealed("dpapi:AAAA"));
+        assert!(is_sealed("keychain1:AAAA"));
         assert!(!is_sealed("00112233"));
         assert!(!is_sealed(""));
     }
@@ -213,7 +243,15 @@ mod tests {
         assert!(unprotect("dpapi:AAAA").is_err());
     }
 
-    #[cfg(not(windows))]
+    #[cfg(windows)]
+    #[test]
+    fn a_value_sealed_on_a_mac_does_not_open_on_windows() {
+        // Sealed, so never taken for plaintext; and not openable here.
+        assert!(is_sealed("keychain1:AAAA"));
+        assert!(unprotect("keychain1:AAAA").is_err());
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn non_windows_fails_closed_both_directions() {
         assert!(protect(b"secret").is_err());

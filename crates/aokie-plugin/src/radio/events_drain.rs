@@ -3,7 +3,7 @@
 #[allow(unused_imports)]
 use super::*;
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "voice"), allow(unused_variables))]
 pub(super) fn drain_bluetooth_events(
@@ -103,7 +103,7 @@ pub(super) fn drain_bluetooth_events(
                 *phantom_ring_count = 0;
             }
         }
-        #[cfg(all(target_os = "windows", feature = "voice"))]
+        #[cfg(all(aokie_radio, feature = "voice"))]
         if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallIncoming)
             && should_prepare_local_speech(realtime_selected, false)
         {

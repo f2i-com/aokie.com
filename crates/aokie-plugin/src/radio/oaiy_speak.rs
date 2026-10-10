@@ -36,7 +36,7 @@ pub(super) const OAIY_APOLOGY_FIRST_AUDIO: Duration = Duration::from_millis(2_50
 const OAIY_SAY_MAX: Duration = Duration::from_secs(30);
 
 /// Where a fixed line on a call is said.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[derive(Clone, Copy)]
 pub(super) struct LineVoice<'a> {
     /// The OAIY route's realtime config, whose speak mode says the line in
@@ -47,7 +47,7 @@ pub(super) struct LineVoice<'a> {
     pub(super) own_tts: bool,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 impl<'a> LineVoice<'a> {
     /// Off the OAIY route: Aokie's own TTS, exactly as before.
     pub(super) fn own() -> Self {
@@ -103,7 +103,7 @@ impl OaiySaid {
 
 /// The `formlogic.realtime.start` of a speak-mode session: the line as the
 /// greeting, no brief, no tools, nothing about the caller.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn oaiy_say_config(
     config: &RealtimeRuntimeConfig,
     call_id: &str,
@@ -144,7 +144,7 @@ fn next_say_generation() -> u64 {
 /// could not be (no first audio within `first_audio_within`, the session
 /// failed, the link stalled), or when `ctl` reports an urgent control.
 /// Blocks the radio thread for the line, as `tts_speak` does.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn say_in_oaiy_voice(
     bt: &mut dyn crate::backend::RadioBackend,
@@ -321,7 +321,7 @@ pub(super) fn say_in_oaiy_voice(
 /// then Aokie's own TTS where `voice.own_tts` allows it, else nothing.
 /// Returns the audio duration that reached the caller. `egress_hold` holds
 /// the first audio until the answer has settled (screen messages).
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn say_fixed_line(
     bt: &mut dyn crate::backend::RadioBackend,

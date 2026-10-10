@@ -9,6 +9,12 @@ use super::*;
 #[derive(Default)]
 pub struct RadioStatus {
     pub initialized: AtomicBool,
+    /// Set by the radio thread as the last thing it does, after its backend
+    /// is gone. A backend closes its USB transport when it is dropped, and
+    /// off Windows that is what hands the dongle back to the system's own
+    /// Bluetooth driver: a shutdown waits for this there
+    /// (`RadioHandle::wait_thread_finished`).
+    pub thread_finished: AtomicBool,
     /// Counts the controller's `Initialized` reports (first open, a replug,
     /// a software reset), so `dongle.reset` can tell the controller came
     /// back rather than never left.

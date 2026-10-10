@@ -242,6 +242,60 @@ fn the_libusb_transport_against_the_stand_in_dongle() {
     );
     println!("a 40-byte event in three packets over 90 ms: whole, after {empty_polls} polls that found nothing");
 
+    // ---- half an event read, then nobody reads for a while -------------
+    // The first packet is taken off the pipe; the rest arrives while the
+    // caller is away, into the read that was left queued. However long the
+    // caller stays away, what it reads next is the rest of that event: the
+    // half already taken must not have been given up as stale meanwhile,
+    // or the rest would be read as the start of an event.
+    radio.set_read_timeouts(1000, Some(5), Some(5)).expect("timeouts");
+    assert_eq!(vendor(&radio, 0x03, &[]), vec![0]);
+    radio.set_read_timeouts(5, Some(5), Some(5)).expect("timeouts");
+    let first_packet_in = Instant::now() + Duration::from_millis(60);
+    while Instant::now() < first_packet_in {
+        match radio.read_event() {
+            Err(e) if e.contains("libusb timeout") => {}
+            other => panic!("only the event's first packet was due: {:?}", other),
+        }
+    }
+    std::thread::sleep(Duration::from_millis(2500));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let late = loop {
+        assert!(Instant::now() < deadline, "the rest of the event never came");
+        match radio.read_event() {
+            Ok(event) => break event,
+            Err(e) if e.contains("libusb timeout") => {}
+            Err(e) => panic!("read_event: {}", e),
+        }
+    };
+    assert_eq!(
+        late, expected,
+        "an event whose reader was away for 2.5 s came out changed"
+    );
+    println!("an event half-read, then left for 2.5 s: whole");
+
+    // ---- an event broken off half-way ----------------------------------
+    // Its first packet comes and its second never does. A stream that held
+    // on to the half for ever would read every later event from the wrong
+    // place. With the caller reading all along (so the rest is not waiting
+    // anywhere), the half is let go after two seconds, and the event that
+    // comes next is read as what it is.
+    radio.set_read_timeouts(1000, Some(5), Some(5)).expect("timeouts");
+    assert_eq!(vendor(&radio, 0x06, &[]), vec![0]);
+    radio.set_read_timeouts(5, Some(5), Some(5)).expect("timeouts");
+    let given_up = Instant::now() + Duration::from_millis(2600);
+    while Instant::now() < given_up {
+        match radio.read_event() {
+            Err(e) if e.contains("libusb timeout") => {}
+            other => panic!("half an event was handed out as an event: {:?}", other),
+        }
+    }
+    radio.set_read_timeouts(1000, Some(5), Some(5)).expect("timeouts");
+    let after_the_break = vendor(&radio, 0x01, &[]);
+    assert_eq!(after_the_break.len(), 27, "{:02x?}", after_the_break);
+    assert_eq!(&after_the_break[1..], (1..27).collect::<Vec<u8>>().as_slice());
+    println!("an event broken off half-way: let go after 2 s, the next event read right");
+
     // ---- ACL data, held back as a slow link would -----------------------
     radio.set_read_timeouts(1000, Some(5), Some(5)).expect("timeouts");
     assert_eq!(vendor(&radio, 0x05, &[20]), vec![0]);

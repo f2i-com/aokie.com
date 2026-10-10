@@ -6,14 +6,14 @@ use super::*;
 /// How the loop starts a realtime session for a call: `RealtimeVoiceSession::spawn`
 /// in the radio (a WebSocket to the OAIY route), a recording stand-in with no
 /// socket in the tests that drive the loop.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) type SpawnSession<'a> = &'a dyn Fn(
     crate::realtime_voice::SessionConfig,
 ) -> Result<crate::realtime_voice::RealtimeVoiceSession, String>;
 
 /// What the transfer machine reads and acts on for this radio turn, against a
 /// given mailbox (the process-wide one in the radio, a private one in tests).
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn transfer_env_with<'a>(
     broker: &'a crate::assistance::AssistanceBroker,
     sink: &'a mut dyn Sink,
@@ -46,7 +46,7 @@ pub(super) fn transfer_env_with<'a>(
 /// first: the answer waits for the line the model spoke to drain, the outcome
 /// must not overtake it). Nothing is dropped: the frames stay with the call's
 /// transfer machine until a session can carry them.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn send_held_outcomes(
     lane: Option<&mut RealtimeCallLane>,
     transfer: &mut crate::transfer::call::TransferCall,
@@ -65,7 +65,7 @@ pub(super) fn send_held_outcomes(
 /// Carry out what the transfer machine asked for: answer a tool call, tell
 /// OAIY how a transfer ended (on a session that negotiated the contract, or on
 /// the next one that does), and write the durable audit events.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn apply_transfer_effects(
     effects: Vec<crate::transfer::call::Effect>,
     mut lane: Option<&mut RealtimeCallLane>,
@@ -124,7 +124,7 @@ pub(super) fn apply_transfer_effects(
 
 /// Why a call's open transfer request is being withdrawn from outside the
 /// service loop.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TransferWithdrawal {
     /// The call is over and its context is about to be replaced.
@@ -150,7 +150,7 @@ pub(super) enum TransferWithdrawal {
 /// the request: that takeover is being connected and is left untouched (its
 /// acceptance is reported once), and the caller of this must not put the call
 /// on hold.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn withdraw_open_transfer(
     why: TransferWithdrawal,
@@ -246,7 +246,7 @@ pub(super) fn finish_call_answer(
 
 /// What the caller said in this call, oldest first: the `user` entries of its
 /// history (the realtime lane pushes only the caller's finished transcripts there).
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 fn caller_turns_said(history: &[serde_json::Value]) -> Vec<&str> {
     history
         .iter()
@@ -262,7 +262,7 @@ fn caller_turns_said(history: &[serde_json::Value]) -> Vec<&str> {
 /// The caller's own words (the last three turns, the phrase check reads them
 /// and they never leave this machine) and number come from the call's context
 /// and the radio's tracker, never from the tool call.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn begin_transfer_tool(
     tool_call_id: &str,
@@ -331,7 +331,7 @@ pub(super) fn begin_transfer_tool(
 /// the fresh session can say how long the AI was away, and the stop carries
 /// the reason OAIY tells a handoff from the end of the call by. A session that
 /// did not negotiate the contract keeps the text it always had.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn stop_session_for_ownership_change(
     ctx: &mut CallVoiceContext,
@@ -369,7 +369,7 @@ pub(super) fn stop_session_for_ownership_change(
 /// handoff it says how the AI got the caller back (`start.resume`) and greets
 /// with the return line; every other resume is exactly what it was. Nothing is
 /// consumed: a start that fails is tried again with the same record.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn resume_start(
     ctx: &CallVoiceContext,
     broker: &crate::assistance::AssistanceBroker,
@@ -386,7 +386,7 @@ pub(super) fn resume_start(
 
 /// The fresh session exists: it becomes the call's lane, and only now is the
 /// handoff over (`finish_resume`), so a start that failed keeps its record.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn adopt_resumed_session(
     ctx: &mut CallVoiceContext,
     session: crate::realtime_voice::RealtimeVoiceSession,
@@ -407,7 +407,7 @@ pub(super) fn adopt_resumed_session(
 /// means nothing and gets no reply. The transfer machine decides what it
 /// changes; the result reaches OAIY as the `cancelled` outcome, or as a typed
 /// notice when nothing was withdrawn.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_transfer_cancel(
     request_id: &str,
@@ -446,7 +446,7 @@ pub(super) fn handle_transfer_cancel(
 /// Lay a live call's voice context aside (the hold juggle parking a caller) and
 /// put `replacement` in its place. The transfer request the call still holds is
 /// withdrawn first: nothing polls a stowed context.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn stow_call_context(
     ctx: &mut CallVoiceContext,
@@ -494,7 +494,7 @@ pub(super) fn stow_call_context(
 
 /// [`stow_call_context`] for a build without the realtime lane: no call has a
 /// transfer to withdraw, so the context is just swapped.
-#[cfg(all(target_os = "windows", not(feature = "voice")))]
+#[cfg(all(aokie_radio, not(feature = "voice")))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn stow_call_context(
     ctx: &mut CallVoiceContext,
@@ -515,7 +515,7 @@ pub(super) fn stow_call_context(
 /// hears `cancelled` on its session, the audit trail closes the request), and
 /// the old context is returned to be dropped. Dropping it any other way would
 /// free the mailbox (the open request discards itself) but tell nobody.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn retire_call_context(
     ctx: &mut CallVoiceContext,
@@ -544,7 +544,7 @@ pub(super) fn retire_call_context(
 }
 
 /// [`retire_call_context`] for a build without the realtime lane.
-#[cfg(all(target_os = "windows", not(feature = "voice")))]
+#[cfg(all(aokie_radio, not(feature = "voice")))]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(super) fn retire_call_context(
     ctx: &mut CallVoiceContext,
@@ -575,7 +575,7 @@ pub(super) fn carry_call_context(
     std::mem::replace(ctx, replacement)
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn service_realtime_lane(
     bt: &mut dyn crate::backend::RadioBackend,
@@ -2446,7 +2446,7 @@ pub(super) fn service_realtime_lane(
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn service_realtime_failures(
     bt: &mut dyn crate::backend::RadioBackend,

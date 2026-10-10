@@ -123,25 +123,49 @@ plumbing, not call audio: see the README there for what it can and cannot say.
 
 ## macOS
 
-**Not yet run on a Mac.** The radio stack's USB transport builds for macOS
-(Apple silicon and Intel) and is the same libusb transport Linux uses; what
-follows is what the code does and what only a Mac can answer.
+**Not yet built or run on a Mac.** Everything below was made and checked
+without one. The Mac shares its code with Linux: the phone link is compiled
+wherever the radio stack has a USB transport (Windows, Linux, macOS), and only
+what calls Windows itself stays Windows'. So the same code was built, tested
+and run on Linux, against a stand-in dongle (`scripts/virtual-dongle`). For an
+Apple-silicon Mac it was type-checked from a Windows PC as far as that goes:
+the radio stack, the dongle bridge, the sealing, and the plugin without its
+speech stack (nothing was linked). The plugin with voice could not be checked
+for macOS from Windows, because its speech libraries' build scripts need the
+Mac's own tools; that part rests on the Linux build, which shares its code.
+What only a Mac can answer is listed at the end.
 
-No driver is installed and nothing has to be restored afterwards: Aokie opens
-the dongle through libusb, which is built into the program (no Homebrew
-needed). Bluetooth permission is not asked for, because Aokie does not use
-macOS's Bluetooth at all: it talks to the dongle over raw USB.
+### What a Mac build is
 
-The open question is whether macOS's own Bluetooth takes the dongle when it is
-plugged in. Some Macs and macOS versions attach their Bluetooth to an external
-USB controller and some leave it alone.
+* **The same plugin.** Calls, texts, contacts, pairing, the receptionist: the
+  radio stack and everything above it are the code Windows runs.
+* **No driver.** Aokie opens the dongle through libusb, which is built into
+  the program (no Homebrew needed). Nothing is installed and nothing has to be
+  restored afterwards. `dongle.list` says so (`driverModel: "none"`), and the
+  dongle setup screen then has no driver steps: it lists the dongle and, when
+  the radio has not opened it, says why in the radio's own words.
+* **No Bluetooth permission.** Aokie does not use macOS's Bluetooth at all: it
+  talks to the dongle over raw USB.
+* **Secrets in the Keychain.** Where Windows seals with DPAPI (paired phones'
+  link keys, the manager PIN, the outbox's call and text records), a Mac seals
+  with AES-256-GCM under a key kept in your login Keychain. The rule is the
+  same: nothing is ever stored unsealed, and a Keychain that will not give the
+  key stops the write. macOS ties "Always Allow" to a program's signature, so
+  a plugin you have rebuilt is a new program to the Keychain, which asks again.
+* **`transportMode`** is `dongle`. `native` is Windows' own Bluetooth stack and
+  is refused with a message that says so.
+
+### The open question: who has the dongle
+
+Whether macOS's own Bluetooth takes the dongle when it is plugged in differs
+between Macs and macOS versions.
 
 * **macOS leaves it alone:** Aokie claims the dongle as an ordinary user.
 * **macOS's Bluetooth holds it:** libusb may take a device from a macOS driver
   only for a process that runs as root, or one that carries the
   `com.apple.vm.device-access` entitlement, which Apple grants to
   virtualisation apps. Aokie then says so and does not start. Do **not** run
-  the app that hosts Aokie with `sudo`: its keychain would be root's, and the
+  the app that hosts Aokie with `sudo`: its Keychain would be root's, and the
   files it writes under your home folder would become root's.
 
 To see which it is, with the dongle plugged in:
@@ -150,17 +174,73 @@ To see which it is, with the dongle plugged in:
 cargo run -p aokie-bluetooth --example dongle_probe
 ```
 
-It lists each USB Bluetooth controller with its endpoints, then opens it and
-asks the controller who it is (an HCI Reset: the dongle is not paired or
-changed). `OK` means Aokie can use it as you. If it says macOS's Bluetooth is
-using the dongle, running that one probe again under `sudo` tells whether
-taking it from macOS works at all on this Mac; that is a test, not a way to
-run Aokie. OAIY's `tools/mac/doctor.sh` prints the same picture from macOS's
-side (its "USB Bluetooth dongle" section).
+It lists each USB Bluetooth controller with its endpoints (from descriptors:
+nothing is touched), then opens one and asks it who it is (an HCI Reset: the
+dongle is not paired or changed). `opened, reset and answering` means Aokie can
+use it as you. If it says macOS's Bluetooth is using the dongle, running that
+one probe again under `sudo` tells whether taking it from macOS works at all on
+this Mac; that is a test, not a way to run Aokie. OAIY's `tools/mac/doctor.sh`
+prints the same picture from macOS's side (its "USB Bluetooth dongle" section).
 
-Call audio is the part most likely to need work on real hardware: SCO audio
-rides isochronous USB transfers, whose timing through libusb on macOS has not
-been measured.
+**Which controller.** On Windows only a dongle bound to Aokie's driver can be
+opened. Here no driver marks a dongle, and every USB Bluetooth controller is a
+candidate: on an Intel Mac or a Linux laptop the computer's own Bluetooth is
+one of them. The probe opens the only controller it finds, or the one whose
+path you give it, never several. Aokie's radio opens the first it finds unless
+one has been chosen; with more than one connected, the dongle screen offers
+**Use this dongle** (`dongle.setPreferred`), and a chosen dongle that is not
+plugged in is not replaced by another controller. An Apple-silicon Mac's own
+Bluetooth is not a USB device, so there the dongle is the only one.
+
+### Building and trying it
+
+Xcode's command-line tools, Rust and `cmake` are needed (the speech stack has
+native parts). Then:
+
+```sh
+sh scripts/bundle-unix.sh
+```
+
+builds the plugin with voice and lays out the folder OAIY Desktop loads, with
+the manifest's entry changed to `aokie-plugin` (the one difference from the
+Windows manifest) and ONNX Runtime 1.25.0 fetched for the speech engines that
+run on it (Microsoft publishes it for Apple silicon, not for Intel Macs, where
+those engines stay off). Its last lines say where to copy the folder; OAIY Desktop
+then asks you to trust the plugin, as it does for any plugin that is not
+signed. `AOKIE_FEATURES="" sh scripts/bundle-unix.sh` builds without the speech
+stack: a plugin that pairs, texts and lets calls ring through, and a much
+shorter build to find out whether the dongle works at all.
+
+A plugin built with voice fetches its speech models the first time it starts,
+before its radio thread reports the dongle (as on Windows). That takes minutes
+on a first start: until it is done the dongle screen says the radio is not up,
+and its "Start Aokie again" gives up after half a minute. Wait for the
+download rather than starting again; the plugin's log says what it is fetching.
+
+The tests: `AOKIE_SEAL_EPHEMERAL=1 cargo test --workspace` (and the same in
+front of `cargo test -p aokie-plugin --features voice`). Several crates' tests
+seal something (a paired phone's link key, the manager PIN); the variable makes
+a debug build seal under a key that lives in the test process only, so a test
+run neither writes to your Keychain nor waits on its prompt, once for every
+test program. Release builds ignore it. No test covers the Keychain itself, or
+the outbox sealed with it: a test's outbox is not sealed off Windows.
+
+A build for other people is another matter: it would have to be signed and
+notarised, and libusb is LGPL-2.1, which sets terms for a library linked into a
+program (`crates/aokie-bluetooth/Cargo.toml` says what the choices are).
+
+### What only a Mac can answer
+
+1. Who has the dongle (above).
+2. libusb's macOS half. The transport's own code ran on Linux; libusb's IOKit
+   backend under it did not. Events and data are plain transfers; call audio
+   rides isochronous transfers, whose timing through libusb on macOS has not
+   been measured. Expect texts and pairing to be the first things that work
+   and call audio to be the part that needs a Mac to tune.
+3. Whether the speech stack's native libraries build there (sherpa-onnx,
+   speexdsp, libwebrtc) and are found beside the plugin when it starts.
+4. The Keychain's prompts for a plugin that OAIY Desktop starts.
+5. OAIY Desktop loading a plugin on macOS at all.
 
 ## Adding a dongle
 

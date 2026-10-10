@@ -70,6 +70,7 @@ use rusb::{Direction, GlobalContext, TransferType};
 use crate::aokie_radio::hci;
 use crate::aokie_radio::usb_hci::{
     choose_sco_alt, msbc_alt_available, sco_alt_setting_for_voice, EventStream, ScoAltChoice,
+    STALE_EVENT,
 };
 use xfer::{IsoIn, IsoOut, QueuedIn};
 
@@ -561,7 +562,7 @@ impl AokieHciTransport {
             if let Some(event) = stream.pop() {
                 return Ok(event);
             }
-            let packet = self.poll_queued(
+            let polled = self.poll_queued(
                 &self.event_reader,
                 event_in.id,
                 LIBUSB_TRANSFER_TYPE_INTERRUPT,
@@ -572,7 +573,28 @@ impl AokieHciTransport {
                 (event_in.max_packet_size as usize).max(1),
                 "HCI event",
                 deadline.saturating_duration_since(Instant::now()),
-            )?;
+            );
+            let packet = match polled {
+                Ok(packet) => packet,
+                Err(e) => {
+                    // The read has just come back with nothing, so the rest
+                    // of a half event is not waiting in it: only now may the
+                    // half be judged stale. (Judged before the read, a caller
+                    // who had been away would drop the half it holds while
+                    // the rest sat in the queued read, and take the rest for
+                    // the start of an event.)
+                    if crate::aokie_radio::manager::is_timeout_error(&e) {
+                        let dropped = stream.drop_stale(Instant::now(), STALE_EVENT);
+                        if dropped > 0 {
+                            eprintln!(
+                                "[AokieRadio] HCI event stream: {} bytes of an event never got the rest of it; dropped, the next packet starts an event",
+                                dropped
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            };
             stream.push(&packet);
         }
     }
@@ -917,6 +939,40 @@ pub fn enumerate_radio_interfaces() -> Result<Vec<RadioInterface>, String> {
         out.push(RadioInterface {
             path,
             source: InterfaceSource::GenericUsbDevice,
+        });
+    }
+    Ok(out)
+}
+
+/// A USB Bluetooth controller as the system lists it, for a setup screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbRadioDevice {
+    /// What `AokieHciTransport::open` takes: `usb:<bus>:<address>`.
+    pub path: String,
+    pub vid: u16,
+    pub pid: u16,
+}
+
+/// The USB Bluetooth controllers plugged in, with the ids a catalog goes
+/// by. Read from the descriptors the system already holds: no device is
+/// opened, so this is safe to ask while the radio is running on one of
+/// them and answers the same whoever holds the dongle. (Windows lists its
+/// devices another way, with the driver bound to each; this is the other
+/// systems' list, where no driver is installed.)
+pub fn list_usb_radio_devices() -> Result<Vec<UsbRadioDevice>, String> {
+    let mut out = Vec::new();
+    let devices = rusb::devices().map_err(|e| format!("libusb devices(): {}", fmt_err(e)))?;
+    for device in devices.iter() {
+        if !device_supports_bluetooth(&device) {
+            continue;
+        }
+        let Ok(descriptor) = device.device_descriptor() else {
+            continue;
+        };
+        out.push(UsbRadioDevice {
+            path: format_path(device.bus_number(), device.address()),
+            vid: descriptor.vendor_id(),
+            pid: descriptor.product_id(),
         });
     }
     Ok(out)

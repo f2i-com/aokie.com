@@ -3,7 +3,7 @@
 #[allow(unused_imports)]
 use super::*;
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_flushed_turn(
     bt: &mut dyn crate::backend::RadioBackend,

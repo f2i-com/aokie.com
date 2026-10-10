@@ -3,7 +3,7 @@
 #[allow(unused_imports)]
 use super::*;
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 #[allow(clippy::too_many_arguments)]
 // `greeting` and friends are only mutated by the voice build's Configure arm.
 #[cfg_attr(not(feature = "voice"), allow(unused_variables))]

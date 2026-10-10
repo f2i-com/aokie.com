@@ -3,7 +3,7 @@
 #[allow(unused_imports)]
 use super::*;
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 #[allow(clippy::too_many_arguments)]
 // Several params only matter to the voice build's spoken hold/queue arms.
 #[cfg_attr(not(feature = "voice"), allow(unused_variables))]

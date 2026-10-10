@@ -1,10 +1,10 @@
 //! `RadioBackend` — the transport seam between the plugin's voice pipeline
 //! (the `radio` module, transport-ignorant) and a phone-link engine. Two backends:
 //!
-//! - [`UsbRadioBackend`] — the WinUSB dongle runtime (full AT/HFP control:
-//!   switchboard, call waiting, codec forcing). Today this is the only
-//!   feature-complete backend.
-//! - [`NativeRadioBackend`] — the built-in Windows Bluetooth stack via
+//! - [`UsbRadioBackend`] — the USB dongle runtime (full AT/HFP control:
+//!   switchboard, call waiting, codec forcing): WinUSB on Windows, libusb on
+//!   Linux and macOS. Today this is the only feature-complete backend.
+//! - [`NativeRadioBackend`] (Windows) — the built-in Windows Bluetooth stack via
 //!   `aokie-winbt` (no driver install; call control via the WinRT Calls API,
 //!   audio via the Hands-Free WASAPI endpoints, SMS via MAP-over-RFCOMM).
 //!
@@ -106,17 +106,19 @@ pub trait RadioBackend: Send {
     /// transport the call's audio path is owned by Windows (and may sit
     /// entirely outside our WASAPI pump), so ending the call is wrong.
     fn sco_dead_air_watchdog(&self) -> bool;
-    /// Short human label for logs and health ("WinUSB dongle" / "Windows native Bluetooth").
+    /// Short human label for logs and health ("WinUSB dongle" / "USB dongle (libusb)" /
+    /// "Windows native Bluetooth").
     fn backend_name(&self) -> &'static str;
 }
 
-/// WinUSB dongle backend — the proven full-control transport.
-#[cfg(target_os = "windows")]
+/// USB dongle backend — the proven full-control transport: the radio stack's own host over raw USB (WinUSB on
+/// Windows, libusb on Linux and macOS).
+#[cfg(aokie_radio)]
 pub struct UsbRadioBackend {
     inner: aokie_dongle::bluetooth::BluetoothManager,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 impl UsbRadioBackend {
     pub fn new(preferred_path: Option<String>) -> Result<Self, String> {
         Ok(Self {
@@ -127,7 +129,7 @@ impl UsbRadioBackend {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 impl RadioBackend for UsbRadioBackend {
     fn try_recv_event(&mut self) -> Option<BluetoothEvent> {
         self.inner.try_recv_event()
@@ -218,7 +220,11 @@ impl RadioBackend for UsbRadioBackend {
         self.inner.reset_transport()
     }
     fn backend_name(&self) -> &'static str {
-        "WinUSB dongle"
+        if cfg!(target_os = "windows") {
+            "WinUSB dongle"
+        } else {
+            "USB dongle (libusb)"
+        }
     }
 }
 
