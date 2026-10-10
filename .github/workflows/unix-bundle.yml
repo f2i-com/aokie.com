@@ -64,6 +64,18 @@ jobs:
             echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib"
           } >> "$GITHUB_ENV"
 
+      # What this Mac has that the build will ask for, said before the build so that a stop is read against it.
+      - name: The Mac's tools
+        if: runner.os == 'macOS'
+        run: |
+          sw_vers | tr '\n' ' '; echo; uname -m
+          developer="$(xcode-select -p)"; echo "xcode-select: $developer"
+          clang --version | head -2
+          cmake --version | head -1
+          for dir in "$developer/Toolchains/XcodeDefault.xctoolchain/usr/lib" "$developer/usr/lib" /Library/Developer/CommandLineTools/usr/lib /opt/homebrew/opt/llvm*/lib; do
+            if [ -d "$dir" ]; then echo "$dir: $(ls "$dir" | grep -c -i 'libclang') libclang file(s) $(ls "$dir" | grep -i 'libclang' | head -3 | tr '\n' ' ')"; else echo "$dir: not there"; fi
+          done
+
       - name: Build and lay out the plugin
         run: sh scripts/bundle-unix.sh "$PWD/aokie"
 
