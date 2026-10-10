@@ -18,7 +18,12 @@ Usage: plugin_check.py PATH/TO/aokie-plugin
 
 AOKIE_PLUGIN_CHECK_WAIT: how many seconds to wait for the radio (default
 30). A plugin built with voice fetches its speech models before its radio
-thread looks at the dongle's events, on a first start: give it minutes.
+thread looks at the dongle's events, on a first start: give it minutes. And
+give this a plugin from a folder scripts/bundle-unix.sh laid out, which has
+ONNX Runtime 1.25.0 beside it: without that runtime a plugin that has its
+models aborts on its way out (the README says why).
+AOKIE_PLUGIN_CHECK_LOG: how many of the last lines of the plugin's own log
+to print when all went well (they are printed anyway when something did not).
 """
 import json
 import os

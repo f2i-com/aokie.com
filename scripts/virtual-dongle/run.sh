@@ -15,6 +15,9 @@
 # WITH_PLUGIN=1 also builds the plugin and runs it whole against the stand-in (plugin_check.py): started as OAIY
 # Desktop starts it, its radio up on the dongle, its setup commands answered, shut down, the dongle given back.
 # That build is the heavy one (it links libwebrtc, which on Linux asks for clang 21: the Dockerfile has it).
+# AOKIE_PLUGIN=PATH runs a plugin that is already built instead (the one in a folder scripts/bundle-unix.sh made);
+# for a plugin built with voice set AOKIE_PLUGIN_CHECK_WAIT to some minutes, since a first start fetches the speech
+# models before the radio reports the dongle. A plugin with voice has to be a bundle's: see the README.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -141,10 +144,14 @@ fi
 
 if [ "${WITH_PLUGIN:-0}" = 1 ]; then
   echo "=== the whole plugin"
-  cargo build -q -p aokie-plugin
+  plugin=${AOKIE_PLUGIN:-}
+  if [ -z "$plugin" ]; then
+    cargo build -q -p aokie-plugin
+    plugin="${CARGO_TARGET_DIR:-$repo/target}/debug/aokie-plugin"
+  fi
   # Linux has no sealing for the outbox's payloads, so a real outbox there refuses them; the check accepts the
   # plaintext trade-off in so many words (outbox.rs), as a developer would. A Mac seals with its Keychain.
-  AOKIE_ALLOW_UNPROTECTED_OUTBOX=1 python3 "$here/plugin_check.py" "${CARGO_TARGET_DIR:-$repo/target}/debug/aokie-plugin"
+  AOKIE_ALLOW_UNPROTECTED_OUTBOX=1 python3 "$here/plugin_check.py" "$plugin"
   sleep 1
   after=$(driver_of "$sys:1.0")
   if [ "$before" != "$after" ]; then
