@@ -96,6 +96,12 @@ the managed-beta path for dongles not in the catalog, Linux, the native Windows
 Bluetooth backend (texts, contacts and call control without a driver, but no call
 audio), and known phone issues.
 
+**macOS and Linux** are not supported yet, but the same plugin builds for them: there
+the dongle is opened through libusb and no driver is installed. It has been built,
+tested and run on Linux against a stand-in dongle; it has not been run on a Mac or with
+a real dongle off Windows. [docs/HARDWARE.md](docs/HARDWARE.md#macos) says what a Mac
+build is, how to try one, and what only a Mac can answer.
+
 ## How it fits together
 
 ```text
@@ -306,6 +312,11 @@ step, against a stub host: no device, network or plugin is touched.
 compile matrix, the tests, clippy, the cross-repository contract check (it needs a
 FormLogic checkout beside this one, or `FORMLOGIC_REPO`) and the self-host render test.
 Add `-Companion`, `-Audit`, `-Fmt`, `-Msrv` or `-AndroidTarget` for the opt-in gates.
+
+The phone link's libusb side (Linux and macOS) has a check of its own that needs no
+hardware: [scripts/virtual-dongle](scripts/virtual-dongle/README.md) serves a stand-in
+USB Bluetooth controller to a Linux kernel in a container and runs the transport, and
+with `WITH_PLUGIN=1` the whole plugin, against it.
 
 Automatic CI is paused: the CI and self-host smoke workflows run from GitHub Actions
 **Run workflow**. Review deny-level Clippy findings and RustSec advisories before

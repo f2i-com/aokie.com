@@ -5,6 +5,7 @@
 //! crate builds for, whichever transport that system uses.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 /// HCI events off a USB interrupt pipe, one whole event at a time.
 ///
@@ -18,12 +19,52 @@ use std::collections::VecDeque;
 #[derive(Debug, Default)]
 pub struct EventStream {
     bytes: VecDeque<u8>,
+    /// When bytes last arrived (see [`EventStream::drop_stale`]).
+    last_bytes_at: Option<Instant>,
 }
+
+/// How long half an event may wait for its other half. A real event's
+/// packets follow one another within milliseconds.
+pub const STALE_EVENT: Duration = Duration::from_secs(2);
 
 impl EventStream {
     /// Bytes as they came off the pipe, in order.
     pub fn push(&mut self, bytes: &[u8]) {
-        self.bytes.extend(bytes);
+        self.push_at(bytes, Instant::now());
+    }
+
+    /// [`EventStream::push`] with the time given (tests).
+    pub fn push_at(&mut self, bytes: &[u8], now: Instant) {
+        if !bytes.is_empty() {
+            self.bytes.extend(bytes);
+            self.last_bytes_at = Some(now);
+        }
+    }
+
+    /// Let go of half an event that has waited longer than `max_age` for
+    /// the rest of itself. Returns how many bytes were dropped.
+    ///
+    /// Call it only when a read of the pipe has just found nothing. The
+    /// age is counted from when bytes were last taken off the pipe, and a
+    /// caller that was away has not looked: the rest may be waiting in a
+    /// read it left queued.
+    ///
+    /// The stream trusts each event's own length, so a single missing byte
+    /// would put every later event out of place for good. Nothing here
+    /// loses bytes; but a stream that cannot recover from it if something
+    /// ever does is a phone link that stays dead until restarted. A new
+    /// event always starts a new USB packet, so after the drop the next
+    /// packet is read as the start of an event again.
+    pub fn drop_stale(&mut self, now: Instant, max_age: Duration) -> usize {
+        match self.last_bytes_at {
+            Some(at) if !self.bytes.is_empty() && now.saturating_duration_since(at) > max_age => {
+                let dropped = self.bytes.len();
+                self.bytes.clear();
+                self.last_bytes_at = None;
+                dropped
+            }
+            _ => 0,
+        }
     }
 
     /// The next whole event, if all of it has arrived.
@@ -44,6 +85,7 @@ impl EventStream {
     /// Forget what is waiting (the pipe was flushed under it).
     pub fn clear(&mut self) {
         self.bytes.clear();
+        self.last_bytes_at = None;
     }
 }
 
@@ -215,6 +257,42 @@ mod tests {
         assert_eq!(stream.pending(), 1);
         stream.clear();
         assert_eq!(stream.pending(), 0);
+    }
+
+    #[test]
+    fn half_an_event_that_never_gets_its_other_half_is_let_go() {
+        let start = Instant::now();
+        let mut stream = EventStream::default();
+        let e = event(0x2f, 30);
+        stream.push_at(&e[..16], start);
+        // Still young: it waits (an event in pieces over some milliseconds
+        // is the ordinary case).
+        assert_eq!(stream.drop_stale(start + Duration::from_millis(500), STALE_EVENT), 0);
+        assert_eq!(stream.pending(), 16);
+        // Two seconds on, the rest is not coming.
+        assert_eq!(stream.drop_stale(start + Duration::from_secs(3), STALE_EVENT), 16);
+        assert_eq!(stream.pending(), 0);
+        // The next packet is the start of an event again, not the middle
+        // of the one that was lost.
+        let next = event(0x0e, 4);
+        stream.push_at(&next, start + Duration::from_secs(3));
+        assert_eq!(stream.pop(), Some(next));
+    }
+
+    #[test]
+    fn a_whole_event_is_never_stale_and_new_bytes_restart_the_wait() {
+        let start = Instant::now();
+        let mut stream = EventStream::default();
+        // Nothing waiting: nothing to drop, however long it has been.
+        assert_eq!(stream.drop_stale(start + Duration::from_secs(60), STALE_EVENT), 0);
+        let e = event(0x03, 40);
+        stream.push_at(&e[..16], start);
+        // More of it arrives at 1.5 s: the wait starts again from there.
+        stream.push_at(&e[16..32], start + Duration::from_millis(1500));
+        assert_eq!(stream.drop_stale(start + Duration::from_millis(3000), STALE_EVENT), 0);
+        stream.push_at(&e[32..], start + Duration::from_millis(3100));
+        assert_eq!(stream.pop(), Some(e));
+        assert_eq!(stream.drop_stale(start + Duration::from_secs(60), STALE_EVENT), 0);
     }
 
     #[test]

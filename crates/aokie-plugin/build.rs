@@ -4,6 +4,22 @@
 //! than failing.
 
 fn main() {
+    // One name for "this build has the radio": the systems `aokie-bluetooth` has a USB transport for (WinUSB on
+    // Windows, libusb on Linux and macOS). The phone link is gated on it; code that calls Windows itself (the
+    // driver install, the native Bluetooth backend, DPAPI, the 1 ms timer) stays `target_os = "windows"`.
+    println!("cargo:rustc-check-cfg=cfg(aokie_radio)");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if matches!(os.as_str(), "windows" | "linux" | "macos") {
+        println!("cargo:rustc-cfg=aokie_radio");
+    }
+    // The speech libraries (sherpa-onnx, ONNX Runtime) are shared libraries that ship beside the programs. Windows
+    // looks beside a program for them by itself; macOS and Linux look where the program's own run path says, so
+    // the programs are given the folder they are in as one. Without it a bundle's plugin does not start there.
+    match os.as_str() {
+        "macos" => println!("cargo:rustc-link-arg-bins=-Wl,-rpath,@executable_path"),
+        "linux" => println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN"),
+        _ => {}
+    }
     let git_ref = std::process::Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])
         .output()

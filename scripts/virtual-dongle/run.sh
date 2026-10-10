@@ -11,6 +11,10 @@
 # Bluetooth controller), lets the kernel's own Bluetooth driver bind it (WITH_BTUSB=0 to skip: then nothing has to
 # be taken from a system driver), runs `dongle_probe`, the transport test and the unplug test, checks that the
 # system's driver got the dongle back, and undoes everything it did. Nothing is on the air.
+#
+# WITH_PLUGIN=1 also builds the plugin and runs it whole against the stand-in (plugin_check.py): started as OAIY
+# Desktop starts it, its radio up on the dongle, its setup commands answered, shut down, the dongle given back.
+# That build is the heavy one (it links libwebrtc, which on Linux asks for clang 21: the Dockerfile has it).
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -133,6 +137,20 @@ echo "the system's driver on the dongle after the test: $after (voice interface:
 if [ "$before" != "$after" ]; then
   echo "FAILED: the system's driver ($before) was not given the dongle back (now: $after)"
   exit 1
+fi
+
+if [ "${WITH_PLUGIN:-0}" = 1 ]; then
+  echo "=== the whole plugin"
+  cargo build -q -p aokie-plugin
+  # Linux has no sealing for the outbox's payloads, so a real outbox there refuses them; the check accepts the
+  # plaintext trade-off in so many words (outbox.rs), as a developer would. A Mac seals with its Keychain.
+  AOKIE_ALLOW_UNPROTECTED_OUTBOX=1 python3 "$here/plugin_check.py" "${CARGO_TARGET_DIR:-$repo/target}/debug/aokie-plugin"
+  sleep 1
+  after=$(driver_of "$sys:1.0")
+  if [ "$before" != "$after" ]; then
+    echo "FAILED: the plugin did not give the dongle back to the system's driver ($before, now: $after)"
+    exit 1
+  fi
 fi
 
 echo "=== the unplug test"

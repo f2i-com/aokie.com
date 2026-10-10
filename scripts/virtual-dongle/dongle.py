@@ -30,6 +30,8 @@ Beyond the commands every controller answers it has a few of its own
           voice bytes received and how many of them were out of sequence
   0xfc05  from now on send every ACL packet back, held for N ms per USB
           packet it would take (parameter: N)
+  0xfc06  a Command Complete, then the first packet of a 32-byte event and
+          never the second: an event broken off half-way
 
 Usage: dongle.py [PORT]   (default 3240, on 127.0.0.1 only)
 """
@@ -306,6 +308,9 @@ class Dongle:
         elif opcode == 0xFC05:
             self.acl_echo_gap = params[0] if params else 0
             complete(b"\x00")
+        elif opcode == 0xFC06:
+            complete(b"\x00")
+            self.events.append((time.monotonic() + 0.02, bytes([0xFF, 30]) + bytes(range(14))))
         else:
             # Reset, Set Event Mask, the Write commands: done, no more to say.
             complete(b"\x00")

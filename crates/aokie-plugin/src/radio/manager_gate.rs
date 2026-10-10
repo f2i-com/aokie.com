@@ -118,7 +118,7 @@ pub(super) fn pin_gate_step(acc: &mut String, heard: &str, expected_len: usize) 
 /// Phase 3: speak a deterministic manager-gate line and record it as a bot
 /// turn (truthful transcript; the model's history gets it too so follow-up
 /// replies stay grounded in what was actually said).
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn speak_manager_line(
     bt: &mut dyn crate::backend::RadioBackend,
@@ -163,7 +163,7 @@ pub(super) fn speak_manager_line(
 /// manager-action-apply binding (outboxed, acked, retried); a block-number
 /// change applies through the same three-layer machinery as abuse
 /// auto-block (live policy + env now, persisted at the next host poll).
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn manager_plan_and_execute(
     host: &Arc<crate::host_rpc::HostRpc>,
     sink: &mut dyn Sink,

@@ -24,7 +24,7 @@ pub(super) const REPLY_CHANNEL_BOUND: usize = 8;
 /// value: a stream started from a STABLE live-STT hypothesis mid-utterance is
 /// ADOPTED by the reply path when the final turn says the same thing — the
 /// first sentence is then already waiting in the channel.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) struct ReplyStream {
     pub(super) rx: std::sync::mpsc::Receiver<ReplyMsg>,
     pub(super) cancel: Arc<AtomicBool>,
@@ -35,7 +35,7 @@ pub(super) struct ReplyStream {
     pub(super) started: Instant,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn spawn_reply_stream(
     client: &crate::agent::LlmClient,
     messages: serde_json::Value,
@@ -83,7 +83,7 @@ pub(super) fn spawn_reply_stream(
 /// the end-call marker when agent hangup is on + the nudge tail when the
 /// previous reply was interrupted. ONE composer for the real reply AND the
 /// speculative start, so the adopted generation was primed identically.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn compose_agent_system_prompt(
     persona: &str,
     agent_hangup: bool,

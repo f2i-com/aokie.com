@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn realtime_prompt_never_inherits_legacy_action_markers() {
     let prompt = realtime_safe_instructions(
@@ -22,7 +22,7 @@ fn realtime_prompt_never_inherits_legacy_action_markers() {
     assert!(prompt.contains("call finish_call without speaking first"));
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn realtime_appointment_request_is_minimal_essential_and_durable() {
     let dir = tempfile::tempdir().unwrap();
@@ -146,7 +146,7 @@ fn realtime_appointment_request_is_minimal_essential_and_durable() {
     assert!(no_outbox.lines.is_empty());
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn realtime_business_lookup_poll_is_nonblocking_and_delivers_result() {
     let host = crate::host_rpc::HostRpc::new();
@@ -183,7 +183,7 @@ fn realtime_business_lookup_poll_is_nonblocking_and_delivers_result() {
     assert_eq!(host.pending_count(), 0);
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn abandoned_realtime_business_lookup_forgets_its_host_request() {
     let host = crate::host_rpc::HostRpc::new();
@@ -203,7 +203,7 @@ fn abandoned_realtime_business_lookup_forgets_its_host_request() {
     assert_eq!(host.pending_count(), 0);
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn realtime_tool_wait_pcm_is_bounded_coalesced_and_ordered() {
     const RATE: u32 = 16_000;
@@ -520,7 +520,7 @@ fn oaiy_failure_apologises_with_any_voice_and_other_routes_still_need_proof() {
     assert!(!realtime_apology_can_speak(false, 0, None, Some(&proven)));
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn oaiy_gets_the_persona_as_its_brief_and_other_providers_keep_the_wrapper() {
     let persona = "  A small hair salon. Cuts take 45 minutes. [[BOOK: x]]  ";
@@ -569,7 +569,7 @@ fn an_agent_dial_gives_oaiy_no_outbound_rules_of_aokies_own() {
     );
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn fixed_lines_use_oaiys_speak_mode_on_its_route_and_the_local_voice_elsewhere() {
     let config = RealtimeRuntimeConfig {
@@ -939,7 +939,7 @@ fn transcript_settlement_is_durable_when_delivery_fails_after_insert() {
     );
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 struct CompanionEndCallerFixture {
     tracker: crate::call_session::SessionTracker,
     status: Arc<RadioStatus>,
@@ -947,7 +947,7 @@ struct CompanionEndCallerFixture {
     request: CompanionEndCallerRequest,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 fn companion_end_caller_fixture() -> CompanionEndCallerFixture {
     use aokie_media::{MediaMode, SessionBinding};
 
@@ -1024,7 +1024,7 @@ fn companion_end_caller_fixture() -> CompanionEndCallerFixture {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 #[test]
 fn companion_end_caller_enqueue_is_not_completion_and_timeout_fails_back() {
     let mut fixture = companion_end_caller_fixture();
@@ -1073,7 +1073,7 @@ fn companion_end_caller_enqueue_is_not_completion_and_timeout_fails_back() {
     assert!(pending.is_none());
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 #[test]
 fn companion_end_caller_exact_termination_completes_once() {
     let mut fixture = companion_end_caller_fixture();
@@ -1113,7 +1113,7 @@ fn companion_end_caller_exact_termination_completes_once() {
     ));
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 #[test]
 fn companion_end_caller_link_loss_never_counts_as_completion() {
     let mut fixture = companion_end_caller_fixture();
@@ -1143,7 +1143,7 @@ fn companion_end_caller_link_loss_never_counts_as_completion() {
     );
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 #[test]
 fn companion_end_caller_write_failure_and_state_change_fail_back() {
     let mut write_fixture = companion_end_caller_fixture();
@@ -1205,7 +1205,7 @@ fn companion_end_caller_write_failure_and_state_change_fail_back() {
     );
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 #[test]
 fn companion_end_caller_duplicate_is_refused_without_disturbing_first_reply() {
     let mut fixture = companion_end_caller_fixture();
@@ -1864,7 +1864,7 @@ fn spoofable_ani_never_grants_manager_access_without_pin() {
 /// TTS), the standing instruction teaches EXACTLY the marker the pump
 /// detects, and it explicitly protects ordinary frustration from being
 /// flagged. The prompt composer must always carry the rule.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn abuse_notice_and_instruction_are_wired() {
     assert!(ABUSE_LINE.len() > 30 && ABUSE_LINE.contains("abusive"));
@@ -1894,7 +1894,7 @@ fn abuse_notice_and_instruction_are_wired() {
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn assistance_prompt_and_caller_text_are_control_safe() {
     let prompt = compose_agent_system_prompt("persona", false, None, false);
@@ -1932,7 +1932,7 @@ fn assistance_prompt_and_caller_text_are_control_safe() {
     assert!(!spoken.contains("[["));
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn transfer_terminal_speech_never_crosses_human_active() {
     use crate::assistance::{AssistanceIntent, AssistanceResolution};
@@ -2181,7 +2181,7 @@ fn an_ordinary_sentence_is_never_mistaken_for_the_end_call_marker() {
 /// AK-008: the barge scan must CAPTURE the audio it inspects and remember
 /// where speech started, so the caller's words spoken over Aokie are
 /// prepended to their turn instead of being consumed by detection.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn barge_scan_captures_audio_and_marks_speech_start() {
     let frame = 80usize; // 10 ms @ 8 kHz
@@ -2256,7 +2256,7 @@ fn barge_scan_captures_audio_and_marks_speech_start() {
 /// a FinishSpan span (phone number, [[important]] detail) keeps playing
 /// through its bounded extension and then stops; an urgent control
 /// (hangup/reject) stops everything regardless of policy.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn playback_policy_yield_vs_finish_span() {
     use std::time::{Duration, Instant};
@@ -2556,7 +2556,7 @@ fn greeting_holds_briefly_for_the_personalization_overlay() {
 /// §6.3 delivery-truth v1: the audible-prefix estimator UNDERCLAIMS —
 /// duration-weighted against exact totals when synthesis finished,
 /// capped by a chars-per-second ceiling, floored to a word boundary.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn audible_prefix_estimate_is_conservative() {
     let text = "Your appointment is on Thursday at ten in the morning";
@@ -2654,7 +2654,7 @@ fn audible_prefix_estimate_is_conservative() {
 /// Phase 2 pacing: the first chunk always goes (it starts the playout
 /// clock); after that the queued total may lead real playout by at most
 /// the configured lead — cancel latency is bounded by that lead.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn playout_pacing_bounds_the_queue_lead() {
     use std::time::Duration;
@@ -2690,7 +2690,7 @@ fn playout_pacing_bounds_the_queue_lead() {
 /// AK-008: un-armed frames (AEC convergence grace / pre-first-audio) are
 /// still captured AND marked for the scratchpad — they may hold the
 /// caller's first words — but never trip the barge.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn barge_scan_unarmed_captures_but_never_trips() {
     let frame = 80usize;
@@ -3665,7 +3665,7 @@ fn http_speech_fallback_is_sticky_per_call() {
     state.configure(Some("   ".to_string()));
     assert_eq!(state.endpoint_for_call(), None);
 }
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn overlap_capture_initializes_without_a_greeting_and_survives_phrases() {
     let mut aec = None;

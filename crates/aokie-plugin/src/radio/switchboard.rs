@@ -16,7 +16,7 @@ use super::*;
 
 /// One point-in-time view of the phone-side call topology, assembled from
 /// the indicator stream + the freshest post-swap CLCC burst.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[derive(Debug, Clone)]
 pub(super) struct SwapSnapshot {
     /// callheld indicator (0 none / 1 held+active / 2 held only).
@@ -30,7 +30,7 @@ pub(super) struct SwapSnapshot {
     pub(super) clcc: Option<Vec<ClccLeg>>,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn swap_snapshot(
     status: &Arc<RadioStatus>,
     tracker: &crate::call_session::SessionTracker,
@@ -62,7 +62,7 @@ pub(super) fn swap_snapshot(
 /// Fires one AT+CLCC after `clcc_after` so the snapshot gains authoritative
 /// leg status/numbers. Returns the LAST snapshot — a timeout returns the
 /// unsatisfied state and the pure judge functions own the interpretation.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn settle_swap(
     bt: &mut dyn crate::backend::RadioBackend,
@@ -111,7 +111,7 @@ pub(super) fn settle_swap(
 
 /// Verdict after the ACCEPT swap (CHLD=2 answering a knock while the
 /// primary talks). Pure — unit-tested against every observed failure shape.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AcceptVerdict {
     /// Knock resolved into a held+active pair — the newcomer has the line.
@@ -129,7 +129,7 @@ pub(super) enum AcceptVerdict {
     KnockGone,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn judge_accept(snap: &SwapSnapshot, knock_id: &str) -> AcceptVerdict {
     if !snap.current_alive {
         return AcceptVerdict::PrimaryGone;
@@ -147,7 +147,7 @@ pub(super) fn judge_accept(snap: &SwapSnapshot, knock_id: &str) -> AcceptVerdict
 /// The callheld indicator alone cannot name WHO is active afterwards (it
 /// reads 1 for success AND for a no-op) — fresh CLCC evidence wins when the
 /// legs' numbers allow it.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SwapBackVerdict {
     /// The primary is the active leg again; the newcomer is held.
@@ -180,7 +180,7 @@ pub(super) enum SwapBackVerdict {
     Inconclusive,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn judge_swap_back(
     snap: &SwapSnapshot,
     primary: Option<&str>,
@@ -261,7 +261,7 @@ pub(super) fn judge_swap_back(
 
 /// The indicator-only resolver (never Inconclusive) — the FINAL word when
 /// CLCC evidence stays transitional/absent after a re-query.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn resolve_swap_back_by_indicator(snap: &SwapSnapshot) -> SwapBackVerdict {
     match (snap.callheld, snap.current_alive) {
         (2, _) => SwapBackVerdict::ActiveDied,
@@ -276,7 +276,7 @@ pub(super) fn resolve_swap_back_by_indicator(snap: &SwapSnapshot) -> SwapBackVer
 /// 1.2s query caught a mid-transition list on the first live test), judge
 /// with the consistency rules, and on Inconclusive re-query ONCE before
 /// falling back to the indicator. Only ever returns actionable verdicts.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn settle_and_judge_swap_back(
     bt: &mut dyn crate::backend::RadioBackend,

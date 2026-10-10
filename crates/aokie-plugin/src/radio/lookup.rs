@@ -7,7 +7,7 @@ use super::*;
 /// it without blocking the radio/SCO loop; the legacy responder may still use
 /// the bounded wait after playing its audible filler. Every failure path is
 /// converted to an explicit UNAVAILABLE result so the model never guesses.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) struct PendingBusinessLookup {
     pub(super) host: Arc<crate::host_rpc::HostRpc>,
     pub(super) id: Option<u64>,
@@ -15,7 +15,7 @@ pub(super) struct PendingBusinessLookup {
     pub(super) deadline: Instant,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 impl Drop for PendingBusinessLookup {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
@@ -24,7 +24,7 @@ impl Drop for PendingBusinessLookup {
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn begin_business_lookup(
     host: &Arc<crate::host_rpc::HostRpc>,
     sink: &mut dyn Sink,
@@ -275,7 +275,7 @@ pub(super) mod lookup_announcement_tests {
 /// line said the date was open/booked and still told the caller "that date
 /// isn't in our current booking window" — records-composed speech is the same
 /// pattern the SMS loop already uses).
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn finish_business_lookup(pending: Option<PendingBusinessLookup>) -> (String, Option<String>) {
     let Some(mut pending) = pending else {
         return ("LOOKUP UNAVAILABLE (host offline)".to_string(), None);
@@ -295,7 +295,7 @@ pub(super) fn finish_business_lookup(pending: Option<PendingBusinessLookup>) -> 
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn poll_business_lookup(
     pending: &mut PendingBusinessLookup,
     now: Instant,
@@ -319,7 +319,7 @@ pub(super) fn poll_business_lookup(
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn decode_business_lookup_result(result: crate::host_rpc::HostResult) -> (String, Option<String>) {
     match result {
         Ok(v) => {
@@ -360,7 +360,7 @@ pub(super) fn decode_business_lookup_result(result: crate::host_rpc::HostResult)
 /// discover + 1-token-process the reply prefix on a WORKER thread. Called at
 /// ring (base persona) and again when the call-scoped overlay lands (its
 /// persona replaces the prefix, so the first warm no longer matches).
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn spawn_llm_prefix_warm(
     agent_endpoint: &Arc<Mutex<Option<String>>>,
     agent_model: Option<String>,

@@ -16,7 +16,7 @@ use super::*;
 /// anything short of a full play). Underclaiming costs only a little natural
 /// redundancy in the repair; overclaiming loses information the caller never
 /// heard.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn estimate_audible_prefix(text: &str, rate: f32, cut: &CutEstimate) -> (String, bool) {
     let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() || cut.audible_ms == 0 {
@@ -50,13 +50,13 @@ pub(super) fn estimate_audible_prefix(text: &str, rate: f32, cut: &CutEstimate) 
 /// How far ahead of real playout the SCO TX queue is kept topped up (phase 2).
 /// Small enough that a cancel/flush silences the line almost immediately;
 /// large enough to ride out pump-iteration jitter without underruns.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) const PLAYOUT_LEAD: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Pure pacing decision: may another chunk be queued yet? The first chunk
 /// always may (it starts the playout clock); after that the queued total may
 /// lead the playout clock by at most [`PLAYOUT_LEAD`].
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn may_queue_more(
     first: bool,
     queued_samples: usize,
@@ -83,14 +83,14 @@ pub(super) fn may_queue_more(
 /// at 1. Each lane only ever consumes results carrying ITS id, so a probe of
 /// the caller's previous (already-answered) utterance can never be credited
 /// as live overlap by the NEXT reply's lane.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) static PROBE_LANE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 /// The live-hypothesis lane's fixed probe-lane id (main loop, bot silent).
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) const LIVE_HYP_LANE: u32 = 0;
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) struct SttProbeLane<'a> {
     pub(super) stt_tx: &'a std::sync::mpsc::Sender<SttWork>,
     pub(super) results: &'a std::sync::mpsc::Receiver<SttResult>,
@@ -120,7 +120,7 @@ pub(super) struct SttProbeLane<'a> {
     pub(super) audio_played: bool,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 impl<'a> SttProbeLane<'a> {
     pub(super) fn new(
         stt_tx: &'a std::sync::mpsc::Sender<SttWork>,
@@ -335,7 +335,7 @@ impl<'a> SttProbeLane<'a> {
 ///
 /// `rate` is the span's speaking-speed multiplier (1.0 = normal; WSOLA on the
 /// worker). `finish_extra` is the span's interrupt policy.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn tts_speak(
     bt: &mut dyn crate::backend::RadioBackend,
@@ -654,7 +654,7 @@ pub(super) fn tts_speak(
 /// [`crate::speech_plan::SpeechSpan`]s): the aggregated playback outcome,
 /// the marker-free text of the whole plan, and the marker-free text of the
 /// spans that actually PLAYED (what transcripts/history may record).
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) struct PlannedSpeech {
     pub(super) outcome: SpeakOutcome,
     /// Everything the plan intended to say (markers stripped).
@@ -684,7 +684,7 @@ pub(super) struct PlannedSpeech {
 /// are not up for interruption and the caller's audio during them is
 /// discarded by the juggle). A hangup/reject arriving mid-line still cuts
 /// it and is returned so the caller can honour it.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn speak_announcement(
     bt: &mut dyn crate::backend::RadioBackend,
     synth: &crate::synth::SynthHandle,
@@ -717,7 +717,7 @@ pub(super) fn speak_announcement(
     probe.action.take()
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn speak_planned(
     bt: &mut dyn crate::backend::RadioBackend,
@@ -814,7 +814,7 @@ pub(super) fn speak_planned(
 /// the termination intent (so `call.ended` reads the right outcome), flush
 /// the queued audio tail, and act on the phone. A failed radio action emits
 /// the authoritative `control_failed` diagnostic against the operation id.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn perform_cancel_action(
     action: CancelAction,
     bt: &mut dyn crate::backend::RadioBackend,

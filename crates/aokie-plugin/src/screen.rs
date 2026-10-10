@@ -123,7 +123,7 @@ pub(crate) fn digit_suffix(raw: &str) -> String {
 impl ScreenPolicy {
     /// A policy that screens nobody and knows no manager, with nothing read
     /// from the environment: for tests that drive the radio loop.
-    #[cfg(all(test, target_os = "windows", feature = "voice"))]
+    #[cfg(all(test, aokie_radio, feature = "voice"))]
     pub(crate) fn permissive() -> Self {
         Self {
             blocked: Vec::new(),

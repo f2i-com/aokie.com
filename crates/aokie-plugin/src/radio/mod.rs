@@ -17,13 +17,17 @@
 //! serialises writers, so essential call/SMS records survive a Desktop
 //! restart exactly as they do on the command path.
 //!
-//! The whole radio surface is Windows-only (WinUSB); on other targets
-//! [`spawn`] returns an error and the plugin simply never has a radio.
+//! The radio is compiled wherever the radio stack has a USB transport
+//! (`aokie_radio`, build.rs: WinUSB on Windows, libusb on Linux and macOS);
+//! on any other target [`spawn`] returns an error and the plugin simply
+//! never has a radio. What is Windows' own in it (the native Bluetooth
+//! backend, the virtual replug, the 1 ms timer) sits behind small functions
+//! in `spawn.rs` that do nothing elsewhere.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-#[cfg(any(feature = "voice", target_os = "windows"))]
+#[cfg(any(feature = "voice", aokie_radio))]
 use std::time::{Duration, Instant};
 
 use aokie_core::events::DesktopEvent;
@@ -39,7 +43,7 @@ use crate::outbox::Outbox;
 /// short spoken question at a time. THE persona lives in the always-compiled
 /// contract module (audit CROSS-SCHEMA-001) and is test-locked to the shared
 /// cross-repo fixture; editable live via the `persona` setting / a flow push.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 use crate::contract::DEFAULT_AGENT_PERSONA;
 
 mod audio_reply;
@@ -158,10 +162,10 @@ use self::watchdogs::*;
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, target_os = "windows", feature = "voice"))]
+#[cfg(all(test, aokie_radio, feature = "voice"))]
 mod realtime_tool_tests;
 
-#[cfg(all(test, target_os = "windows", feature = "voice"))]
+#[cfg(all(test, aokie_radio, feature = "voice"))]
 mod service_loop_tests;
 
 /// §12.3 synthetic audio rig: drives the REAL paced-playback machinery
@@ -172,5 +176,5 @@ mod service_loop_tests;
 /// the duplex DECISIONS (echo rejection, scratchpad capture, barge timing,
 /// interrupt policy, spoken-command cuts, ducking) end-to-end at the sample
 /// level, deterministically.
-#[cfg(all(test, target_os = "windows", feature = "voice"))]
+#[cfg(all(test, aokie_radio, feature = "voice"))]
 mod synthetic_audio;

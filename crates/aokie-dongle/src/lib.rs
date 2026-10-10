@@ -40,4 +40,16 @@ pub mod aokie_dongle_linux;
 #[cfg(aokie_radio)]
 pub mod bluetooth;
 
+/// A USB Bluetooth controller plugged into a Linux or macOS computer.
+#[cfg(all(aokie_radio, not(target_os = "windows")))]
+pub use aokie_bluetooth::aokie_radio::transport::UsbRadioDevice;
+
+/// The USB Bluetooth controllers plugged into a Linux or macOS computer, as libusb lists them. No driver is
+/// installed on those systems (the radio opens the dongle as it is), so there is no driver to report: the
+/// Windows list, with the driver bound to each device, is `list_devices`'s.
+#[cfg(all(aokie_radio, not(target_os = "windows")))]
+pub fn list_usb_radios() -> Result<Vec<UsbRadioDevice>, String> {
+    aokie_bluetooth::aokie_radio::transport::list_usb_radio_devices()
+}
+
 pub mod bluetooth_prefs;

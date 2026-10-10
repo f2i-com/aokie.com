@@ -3,7 +3,7 @@
 #[allow(unused_imports)]
 use super::*;
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pump_audio_and_reply(
     bt: &mut dyn crate::backend::RadioBackend,

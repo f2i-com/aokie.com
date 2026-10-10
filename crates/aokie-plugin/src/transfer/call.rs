@@ -416,7 +416,7 @@ impl TransferCall {
 
     /// Test seam: the gap since the last request has passed, so the next one is
     /// judged on what the caller said and not on the clock.
-    #[cfg(all(test, target_os = "windows", feature = "voice"))]
+    #[cfg(all(test, aokie_radio, feature = "voice"))]
     pub(crate) fn forget_the_last_end(&mut self) {
         self.last_ended = None;
     }

@@ -81,7 +81,7 @@ impl<'a> ControlProbe<'a> {
 /// conservatively estimate how much of a CUT span the caller actually heard.
 /// The engine knows exactly what was QUEUED to the SCO and how long audio had
 /// been flowing when the cut landed; remote playout stays an estimate.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct CutEstimate {
     /// Estimated audible playout at the cut: wall time since the first audio
@@ -96,7 +96,7 @@ pub(super) struct CutEstimate {
     pub(super) synthesized_ms: Option<u64>,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) struct SpeakOutcome {
     pub(super) dur: std::time::Duration,
     pub(super) barged: bool,
@@ -187,7 +187,7 @@ pub(super) fn normalize_endpoint(endpoint: Option<String>) -> Option<String> {
 /// first above-threshold frame's offset is recorded in `speech_start`, so the
 /// caller's words spoken BEFORE the barge trips can be prepended to their
 /// utterance instead of being lost to detection.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn detect_barge(
     aec: &mut crate::aec::EchoCanceller,
@@ -221,12 +221,12 @@ pub(super) fn detect_barge(
 /// BETWEEN the VAD gate and the barge threshold — marking capture at the
 /// barge threshold made the bot deaf to it. Capture marks at THIS gate; the
 /// acoustic barge still requires the sustained, higher `trip_thr`.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) const CAPTURE_RMS: f32 = 350.0;
 
 /// Capture must be ready even if an early caller turn skips the greeting.
 /// Keep the same canceller across phrases so its echo reference is retained.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn ensure_overlap_capture(
     aec: &mut Option<crate::aec::EchoCanceller>,
     enabled: bool,
@@ -243,7 +243,7 @@ pub(super) fn ensure_overlap_capture(
 /// `cleaned` to the capture buffer, note the first frame above the CAPTURE
 /// gate (armed or not — the scratchpad always hears), and report whether
 /// sustained speech above the TRIP threshold barged (armed only).
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_barge_frames(
     cleaned: &[i16],
@@ -284,7 +284,7 @@ pub(super) fn scan_barge_frames(
 /// transport. Live, this is the SCO link on the [`BluetoothManager`]; the
 /// synthetic rig (mod `synthetic_audio`) drives a scripted link that serves
 /// echo-mix mic frames and records everything that "played".
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) trait AudioLink {
     /// Non-blocking mic drain: one captured chunk, if any arrived.
     fn try_recv_audio(&mut self) -> Option<Vec<i16>>;
@@ -292,7 +292,7 @@ pub(super) trait AudioLink {
     fn send_audio(&mut self, pcm: &[i16]);
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 impl<'a> AudioLink for dyn crate::backend::RadioBackend + 'a {
     fn try_recv_audio(&mut self) -> Option<Vec<i16>> {
         crate::backend::RadioBackend::try_recv_audio(self).map(|audio| {
@@ -314,7 +314,7 @@ impl<'a> AudioLink for dyn crate::backend::RadioBackend + 'a {
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) struct TtsChunkPlayback {
     pub(super) t0: std::time::Instant,
     pub(super) t_first: std::time::Instant,
@@ -359,12 +359,12 @@ pub(super) struct TtsChunkPlayback {
 
 /// Ducked outbound level once the caller talks over a playing span, and the
 /// per-chunk (~20 ms) ramp step toward it.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) const DUCK_GAIN: f32 = 0.35;
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) const DUCK_RAMP_STEP: f32 = 0.15;
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 impl TtsChunkPlayback {
     pub(super) fn new(sample_rate: u16, finish_extra: Option<std::time::Duration>) -> Self {
         let t0 = std::time::Instant::now();
@@ -622,7 +622,7 @@ impl TtsChunkPlayback {
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn http_tts_chunk_samples(sample_rate: u16) -> usize {
     (sample_rate as usize / 50).max(160)
 }
@@ -633,7 +633,7 @@ pub(super) fn http_tts_chunk_samples(sample_rate: u16) -> usize {
 /// and auto-answer stops the moment the receptionist demonstrably can't speak.
 /// A barged outcome with no audio is inconclusive (the caller cut it off) and
 /// leaves the slot unchanged.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn note_tts_outcome(status: &RadioStatus, out: &SpeakOutcome) {
     let mut slot = status.tts_error.lock().unwrap();
     if out.dur > std::time::Duration::ZERO {

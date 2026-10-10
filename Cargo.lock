@@ -163,6 +163,7 @@ dependencies = [
  "dirs 5.0.1",
  "keyring",
  "rand 0.8.6",
+ "ring",
  "serde",
  "serde_json",
  "url",

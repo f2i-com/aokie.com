@@ -31,17 +31,17 @@ pub struct CompanionEndCallerFailure {
     pub message: String,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) const COMPANION_END_CALL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(8);
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) struct PendingCompanionEndCaller {
     pub(super) request: CompanionEndCallerRequest,
     pub(super) reply: Sender<Result<(), CompanionEndCallerFailure>>,
     pub(super) deadline: Instant,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) fn validate_companion_end_caller(
     request: &CompanionEndCallerRequest,
     tracker: &crate::call_session::SessionTracker,
@@ -70,7 +70,7 @@ pub(super) fn validate_companion_end_caller(
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) fn start_companion_end_caller<F>(
     request: CompanionEndCallerRequest,
     reply: Sender<Result<(), CompanionEndCallerFailure>>,
@@ -130,7 +130,7 @@ where
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) fn perform_companion_end_caller(
     request: CompanionEndCallerRequest,
     reply: Sender<Result<(), CompanionEndCallerFailure>>,
@@ -155,7 +155,7 @@ pub(super) fn perform_companion_end_caller(
     )
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) fn complete_companion_end_caller(
     pending: &mut Option<PendingCompanionEndCaller>,
     terminated_call_id: &str,
@@ -171,7 +171,7 @@ pub(super) fn complete_companion_end_caller(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) fn resolve_companion_end_caller_termination(
     pending: &mut Option<PendingCompanionEndCaller>,
     remote_media: &crate::remote_media::RemoteMediaHandle,
@@ -196,7 +196,7 @@ pub(super) fn resolve_companion_end_caller_termination(
     complete_companion_end_caller(pending, terminated_call_id);
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) fn fail_companion_end_caller(
     pending: &mut Option<PendingCompanionEndCaller>,
     remote_media: &crate::remote_media::RemoteMediaHandle,
@@ -213,7 +213,7 @@ pub(super) fn fail_companion_end_caller(
     }));
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) fn poll_companion_end_caller(
     pending: &mut Option<PendingCompanionEndCaller>,
     tracker: &crate::call_session::SessionTracker,
@@ -274,7 +274,7 @@ pub(super) fn poll_companion_end_caller(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 pub(super) fn return_companion_end_caller_to_aokie(
     request: &CompanionEndCallerRequest,
     remote_media: &crate::remote_media::RemoteMediaHandle,
@@ -371,6 +371,27 @@ impl RadioHandle {
                 wait.as_secs_f64()
             )
         })
+    }
+
+    /// Wait for the radio thread to be over, its backend dropped and the
+    /// dongle's USB transport closed with it (`RadioStatus::thread_finished`).
+    /// True once it is. Where the system has a Bluetooth driver of its own
+    /// to give the dongle back to, a shutdown waits here before the process
+    /// goes: one that exits first leaves the dongle with no driver until it
+    /// is replugged. (A test's handle has no thread behind it.)
+    #[cfg(all(aokie_radio, not(target_os = "windows")))]
+    pub fn wait_thread_finished(&self, wait: std::time::Duration) -> bool {
+        if cfg!(test) {
+            return true;
+        }
+        let deadline = std::time::Instant::now() + wait;
+        while !self.status.thread_finished.load(Ordering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
     }
 
     pub fn is_initialized(&self) -> bool {

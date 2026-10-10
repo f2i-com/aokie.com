@@ -680,4 +680,119 @@ const installs = (page) => page.log.filter((l) => l[0] === 'command' && l[1] ===
   assert.deepEqual(installs(page), [{ vid: unboundDongle.vid, pid: unboundDongle.pid }]);
 }
 
+// ---- Linux and macOS: no driver is installed for the dongle ---------------------
+
+const libusbDongle = { vid: 2652, pid: 8684, vidHex: '0x0A5C', pidHex: '0x21EC', description: 'USB Bluetooth controller', driver: 'none (libusb)', hardwareId: 'usb:1:5', matchesCatalog: true, compatibility: 'catalogued', driverBound: true };
+const noDriverList = { connected: [libusbDongle], driverModel: 'none', driverSigning: { flavour: 'unsupported', acceptanceRequired: false, preauthorised: false } };
+
+{
+  // The radio is up: the step is done, and nothing on it speaks of a driver to install or restore.
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: { 'settings.get': { settings: {} }, 'dongle.diagnostics': radioUp, 'dongle.list': noDriverList },
+  });
+  await pickDongle(page, libusbDongle);
+  const html = page.el('tab-dongle').innerHTML;
+  assert.match(html, /no driver needed/);
+  assert.match(html, /needs no driver for the dongle/);
+  assert.match(html, /Aokie’s radio is up on the dongle \(00:1A:7D:DA:71:13\)\. Press Next to pair your phone\./);
+  assert.doesNotMatch(html, /WinUSB|Windows|Step \d of 3|dg-continue|dg-install|dg-restore|elevated helper|BTHUSB/);
+  assert.equal(doneCalls(setup).length > 0, true, 'the dongle step is done once the radio is up');
+  assert.deepEqual(installs(page), []);
+}
+
+{
+  // The radio could not open the dongle (on a Mac: macOS's own Bluetooth has it): the step says why, in the
+  // radio's words, and offers to start Aokie again. Still no driver step.
+  const held = 'libusb claim_interface(0): Access denied — macOS\'s own Bluetooth is using the dongle';
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': { radio: { initialized: false, connected: false, localAddress: null, error: held }, outbox: { pending: 0, failed: 0, dead: 0 } },
+      'dongle.list': noDriverList,
+    },
+  });
+  const html = page.el('tab-dongle').innerHTML;
+  assert.match(html, /Aokie’s radio has not opened the dongle: libusb claim_interface\(0\): Access denied — macOS&#39;s own Bluetooth is using the dongle/);
+  assert.match(html, /data-act="dg-setup-start"/);
+  assert.doesNotMatch(html, /has its driver|WinUSB|Step \d of 3|dg-restore/);
+  assert.equal(doneCalls(setup).length, 0, 'the step is not done while the radio is down');
+}
+
+{
+  // The normal tab (no setup wizard) on such a system: the radio's state is shown there too, with the reset card.
+  const page = await openScreen({
+    payloads: {
+      'phone.status': { connected: false, paired: false },
+      'phone.listPaired': { devices: [] },
+      'dongle.diagnostics': radioUp,
+      'call.current': { call: null },
+      'call.switchboard': { waiting: null, parked: null },
+      'settings.get': { settings: {} },
+      'dongle.list': noDriverList,
+    },
+  });
+  await page.clickDocument({ 'data-tab': 'dongle' });
+  await settle();
+  const html = page.el('tab-dongle').innerHTML;
+  assert.match(html, /<h3>USB Bluetooth dongle<\/h3>/);
+  assert.match(html, /Aokie’s radio is up on the dongle \(00:1A:7D:DA:71:13\)\.<\/p>/);
+  assert.doesNotMatch(html, /Press Next/);
+  assert.match(html, /Reset the dongle/);
+  assert.doesNotMatch(html, /WinUSB|BTHUSB|elevated helper/);
+}
+
+{
+  // Two Bluetooth controllers on such a system (a laptop's own is one): no driver marks which is Aokie's, so the
+  // person says, and the choice is sent as dongle.setPreferred.
+  const builtIn = { ...libusbDongle, vid: 32903, pid: 2607, vidHex: '0x8087', pidHex: '0x0A2F', hardwareId: 'usb:1:3', matchesCatalog: false, compatibility: 'unverified' };
+  let preferred = null;
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioUp,
+      'dongle.list': () => ({ ...noDriverList, connected: [builtIn, libusbDongle], preferred }),
+      'dongle.setPreferred': (payload) => {
+        preferred = { vid: payload.vid, pid: payload.pid };
+        return { preferred };
+      },
+    },
+  });
+  await pickDongle(page, libusbDongle);
+  assert.match(page.el('tab-dongle').innerHTML, /data-act="dg-prefer"/);
+  await page.click('dongle', 'dg-prefer', { 'data-pick': libusbDongle.vid + ':' + libusbDongle.pid });
+  await settle();
+  const sent = page.log.filter((l) => l[0] === 'command' && l[1] === 'dongle.setPreferred').map((l) => l[2]);
+  assert.deepEqual(sent, [{ vid: libusbDongle.vid, pid: libusbDongle.pid }]);
+  assert.match(page.el('tab-dongle').innerHTML, /Aokie is set to use this one/);
+  assert.doesNotMatch(page.el('tab-dongle').innerHTML, /data-act="dg-prefer"/);
+  // With one controller there is nothing to choose.
+  const single = await openScreen({
+    setup: setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' }),
+    payloads: { 'settings.get': { settings: {} }, 'dongle.diagnostics': radioUp, 'dongle.list': noDriverList },
+  });
+  await pickDongle(single, libusbDongle);
+  assert.doesNotMatch(single.el('tab-dongle').innerHTML, /dg-prefer/);
+}
+
+{
+  // Windows is as it was: a bound dongle is "WinUSB installed" and can be handed back.
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: { 'settings.get': { settings: {} }, 'dongle.diagnostics': radioUp, 'dongle.list': { connected: [boundDongle], driverModel: 'winusb' } },
+  });
+  await pickDongle(page, boundDongle);
+  const html = page.el('tab-dongle').innerHTML;
+  assert.match(html, /WinUSB installed/);
+  assert.match(html, /Step 1 of 3/);
+  assert.match(html, /data-act="dg-restore-arm"/);
+  assert.match(html, /USB Bluetooth dongle driver/);
+}
+
 console.log('Receptionist setup-mode checks passed (isolated host; no live commands).');

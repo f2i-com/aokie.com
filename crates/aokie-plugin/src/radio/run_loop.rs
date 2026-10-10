@@ -7,7 +7,7 @@ use super::*;
 /// emission until the caller id lands (or a short timeout); drain audio
 /// (Stage 2 feeds the AI here); service control requests. Runs until the
 /// control channel closes or a Shutdown is received.
-#[cfg(target_os = "windows")]
+#[cfg(aokie_radio)]
 // `greeting` is only mutated (via RadioControl::Configure) in the voice build.
 #[cfg_attr(not(feature = "voice"), allow(unused_mut))]
 pub(super) fn run_loop(
@@ -23,7 +23,7 @@ pub(super) fn run_loop(
     data_dir: &std::path::Path,
     remote_media: crate::remote_media::RemoteMediaHandle,
 ) {
-    #[cfg(not(all(target_os = "windows", feature = "voice")))]
+    #[cfg(not(all(aokie_radio, feature = "voice")))]
     let _ = &host_rpc;
     use std::time::Duration;
     #[cfg(feature = "voice")]
@@ -603,23 +603,23 @@ pub(super) fn run_loop(
     // probe channel, giving streaming partial text; a STABLE partial starts a
     // SPECULATIVE reply generation so the answer is largely ready at the
     // endpoint instead of starting there.
-    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[cfg(all(aokie_radio, feature = "voice"))]
     let mut live_hyp: Option<String> = None;
-    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[cfg(all(aokie_radio, feature = "voice"))]
     let mut live_hyp_prev: Option<String> = None;
-    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[cfg(all(aokie_radio, feature = "voice"))]
     let mut live_hyp_shipped: usize = 0;
-    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[cfg(all(aokie_radio, feature = "voice"))]
     let mut live_hyp_at: Option<Instant> = None;
-    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[cfg(all(aokie_radio, feature = "voice"))]
     let mut live_probe_in_flight = false;
-    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[cfg(all(aokie_radio, feature = "voice"))]
     let mut spec_reply: Option<ReplyStream> = None;
     // Ring-warm handoff: the off-thread LLM warm CONNECTS a client and parks
     // it here; the loop adopts it so the FIRST caller turn can speculate and
     // reply without the lazy connect (which previously only happened at the
     // first reply — first-turn speculation never fired).
-    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[cfg(all(aokie_radio, feature = "voice"))]
     let pending_agent_client: Arc<Mutex<Option<crate::agent::LlmClient>>> =
         Arc::new(Mutex::new(None));
     // Controls that arrived DURING an agent reply (audit AK-003): the
@@ -879,7 +879,7 @@ pub(super) fn run_loop(
     // when an engine is already loaded); this makes the FIRST call as fast as
     // every later one. Both sends are to worker threads, so the radio loop
     // never blocks on the load.
-    #[cfg(all(target_os = "windows", feature = "voice"))]
+    #[cfg(all(aokie_radio, feature = "voice"))]
     {
         if should_prepare_local_speech(realtime_selected, false) {
             let _ = stt_tx.send(SttWork::Warm);
@@ -1183,7 +1183,7 @@ pub(super) fn run_loop(
         // moves, the toggles are separated by an enforced settle dwell, and
         // every failure shape converges to a safe single-call state instead
         // of speaking into the void. Runs once per waiting caller.
-        #[cfg(all(target_os = "windows", feature = "voice"))]
+        #[cfg(all(aokie_radio, feature = "voice"))]
         run_auto_hold_juggle(
             bt,
             outbox,
@@ -1233,7 +1233,7 @@ pub(super) fn run_loop(
             // `cancelled`, and the audit trail closes the request it opened.
             // The context that holds it is about to be replaced, which would
             // otherwise drop it without a word.
-            #[cfg(target_os = "windows")]
+            #[cfg(aokie_radio)]
             withdraw_open_transfer(
                 TransferWithdrawal::CallEnded,
                 &mut ctx,
@@ -1620,7 +1620,7 @@ pub(super) fn run_loop(
             }
         }
 
-        #[cfg(all(target_os = "windows", feature = "voice"))]
+        #[cfg(all(aokie_radio, feature = "voice"))]
         service_realtime_lane(
             bt,
             outbox,
@@ -1655,7 +1655,7 @@ pub(super) fn run_loop(
             &crate::realtime_voice::RealtimeVoiceSession::spawn,
         );
 
-        #[cfg(all(target_os = "windows", feature = "voice"))]
+        #[cfg(all(aokie_radio, feature = "voice"))]
         service_realtime_failures(
             bt,
             outbox,
@@ -1978,7 +1978,7 @@ pub(super) fn run_loop(
         // Poll the volatile typed-help mailbox without ever blocking the
         // radio/audio loop. Once the authorised answer arrives, revalidate
         // the complete call fence and relay only marker-free attributed text.
-        #[cfg(all(target_os = "windows", feature = "voice"))]
+        #[cfg(all(aokie_radio, feature = "voice"))]
         service_assistance(
             bt,
             outbox,
@@ -2008,7 +2008,7 @@ pub(super) fn run_loop(
         // Voice build: energy-VAD segment the caller's speech â†’ ship each finished
         // utterance to the STT worker. ~350 RMS (i16 units) gates speech; ~700 ms
         // of trailing silence ends an utterance; sub-350 ms blips are dropped.
-        #[cfg(all(target_os = "windows", feature = "voice"))]
+        #[cfg(all(aokie_radio, feature = "voice"))]
         pump_audio_and_reply(
             bt,
             outbox,

@@ -96,7 +96,7 @@ impl AssistanceAuditLifecycle {
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) struct PendingAssistanceCall {
     pub(super) request_id: String,
     pub(super) fence: crate::assistance::AssistanceCallFence,
@@ -104,7 +104,7 @@ pub(super) struct PendingAssistanceCall {
     pub(super) audit: AssistanceAuditLifecycle,
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 impl Drop for PendingAssistanceCall {
     fn drop(&mut self) {
         crate::assistance::global().discard(&self.request_id);
@@ -114,7 +114,7 @@ impl Drop for PendingAssistanceCall {
 /// A responder's answer is authorised and revision-fenced by the gateway,
 /// but its text remains data, not instructions. Remove every control marker,
 /// collapse whitespace and cap the caller-facing payload before TTS.
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn caller_facing_assistance_answer(answer: &str) -> Option<String> {
     let pace = crate::speech_plan::PaceState::default();
     let clean =
@@ -130,7 +130,7 @@ pub(super) fn caller_facing_assistance_answer(answer: &str) -> Option<String> {
     Some(format!("I heard back from the team: {bounded}"))
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn assistance_terminal_line(
     intent: crate::assistance::AssistanceIntent,
     resolution: &crate::assistance::AssistanceResolution,
@@ -167,7 +167,7 @@ pub(super) fn assistance_terminal_line(
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn assistance_request_initial_line(
     intent: crate::assistance::AssistanceIntent,
     _malformed_transfer: bool,
@@ -182,7 +182,7 @@ pub(super) fn assistance_request_initial_line(
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn caller_facing_decline(
     intent: crate::assistance::AssistanceIntent,
     answer: &str,
@@ -199,7 +199,7 @@ pub(super) fn caller_facing_decline(
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "voice"))]
+#[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn service_assistance(
     bt: &mut dyn crate::backend::RadioBackend,

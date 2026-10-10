@@ -30,8 +30,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # Acoustic echo cancellation for full-duplex / barge-in (voice feature). Bundles
 # the speexdsp C echo canceller via aec-rs-sys, so no system libspeexdsp needed.
 aec-rs = { version = "1.0", optional = true }
-# WinUSB driver install (dongle.installDriver) + dongle enumeration. Windows-only surface behind
-# cfg(target_os = "windows") inside the crate; on other targets the plugin returns an unsupported error.
+# The radio bridge (every system the radio stack has a USB transport for), dongle enumeration, and on Windows the
+# WinUSB driver install (dongle.installDriver), which the other systems do not have: they install no driver.
 aokie-dongle = { path = "../aokie-dongle" }
 # Optional in-process speech (TTS greeting + STT), behind the `voice` feature.
 # `sherpa` adds the sherpa-onnx VITS/Piper + Kokoro TTS engines (selectable via

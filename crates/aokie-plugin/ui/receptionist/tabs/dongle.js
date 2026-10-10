@@ -23,6 +23,12 @@
  * up by the running radio, so the step offers to start Aokie again
  * (PluginHost.restartPlugin). On the built-in Bluetooth transport there is
  * no dongle to set up and the step says so. The reset card is not shown.
+ *
+ * Linux and macOS (`dongle.list` answers `driverModel: 'none'`): no driver is
+ * installed there, Aokie opens the dongle as it is. The tab then has no
+ * driver steps at all: it lists the dongle, says so, and when the radio has
+ * not opened the dongle it says why in the radio's own words (on a Mac, that
+ * macOS's Bluetooth is holding it).
  */
 (function () {
   'use strict';
@@ -105,6 +111,38 @@
   /** dongle.list's driverSigning: whether this build signs the driver on this computer. */
   function signing() {
     return (list && list.driverSigning) || null;
+  }
+
+  /** A system that installs no driver for the dongle (Linux, macOS): Aokie opens it as it is. */
+  function noDriver() {
+    return !!(list && list.driverModel === 'none');
+  }
+
+  /** The dongle chosen for Aokie (dongle.setPreferred), as dongle.list reports it. */
+  function isPreferred(d) {
+    var p = list && list.preferred;
+    return !!(p && d && Number(p.vid) === Number(d.vid) && Number(p.pid) === Number(d.pid));
+  }
+
+  /** Choose the dongle Aokie opens (no-driver systems, several controllers). */
+  function prefer(d) {
+    busy = true;
+    error = null;
+    render();
+    HOST.command('dongle.setPreferred', { vid: d.vid, pid: d.pid })
+      .then(
+        function () {
+          HOST.toast('success', 'Aokie will use ' + dongleLabel(d) + ' (USB ' + idLabel(d) + '). Start Aokie again to open it.');
+          return refresh();
+        },
+        function (e) {
+          error = errMsg(e);
+        }
+      )
+      .then(function () {
+        busy = false;
+        render();
+      });
   }
 
   /** The managed beta, not pre-authorised: the person must accept before installing. */
@@ -397,7 +435,7 @@
     var S = TABS.setup;
     if (!S || !S.active() || builtInTransport()) return;
     if (radioUp()) S.progress(1, 'Dongle ready');
-    else if (step === 'select') S.progress(0, 'Choose your Bluetooth dongle');
+    else if (step === 'select') S.progress(0, noDriver() ? 'Plug in your Bluetooth dongle' : 'Choose your Bluetooth dongle');
     else if (step === 'install') S.progress(1 / 3, 'Install the WinUSB driver');
     else if (step === 'verify') S.progress(2 / 3, 'Verifying the driver');
     else S.progress(2 / 3, 'Start Aokie with the dongle');
@@ -405,12 +443,12 @@
 
   /** Setup mode: the radio's state above the wizard's steps. */
   function setupStatusHtml() {
-    if (!setupActive() || setupRadio === undefined) return '';
+    if ((!setupActive() && !noDriver()) || setupRadio === undefined) return '';
     if (radioUp()) {
       return (
         '<p class="rcp-status-ok">' + ICONS.check + ' Aokie’s radio is up on the dongle' +
         (setupRadio.localAddress ? ' (' + esc(setupRadio.localAddress) + ')' : '') +
-        '. Press Next to pair your phone.</p>'
+        (setupActive() ? '. Press Next to pair your phone.' : '.') + '</p>'
       );
     }
     // Consent keeps the radio off (enforce mode): starting Aokie again would
@@ -429,10 +467,19 @@
       if (conn[i].driverBound) bound = true;
     }
     if (!bound && !radioStarting && !radioStartError) return '';
+    // No driver step: the reason is whatever the radio said when it tried (on
+    // a Mac, that macOS's own Bluetooth holds the dongle), or that the dongle
+    // was plugged in after Aokie started.
+    var why = noDriver()
+      ? 'Aokie’s radio has not opened the dongle' +
+        (setupRadio && setupRadio.error
+          ? ': ' + esc(setupRadio.error) + '. If that is put right, start Aokie again to open the dongle.'
+          : '. If it was plugged in after Aokie started, start Aokie again to open it. It takes a few seconds.')
+      : 'The dongle has its driver, but Aokie’s radio has not opened it: Aokie started before the driver was there. ' +
+        'Start Aokie again to open the dongle. It takes a few seconds.';
     return (
       '<div class="rcp-callout is-warn">' + ICONS.alert +
-      '<span>The dongle has its driver, but Aokie’s radio has not opened it: Aokie started before the driver was there. ' +
-      'Start Aokie again to open the dongle. It takes a few seconds.</span></div>' +
+      '<span>' + why + '</span></div>' +
       '<div class="rcp-actions">' +
       '<button type="button" class="rcp-button is-primary" data-act="dg-setup-start"' + (radioStarting ? ' disabled' : '') + '>' +
       (radioStarting ? 'Starting Aokie — opening the dongle…' : 'Start Aokie with this dongle') +
@@ -463,6 +510,7 @@
   // ---- rendering ----------------------------------------------------------
 
   function stepHeading() {
+    if (noDriver()) return '<p class="rcp-step-meta"><strong>Your Bluetooth dongle</strong></p>';
     var stepIndex = step === 'select' ? 1 : step === 'install' ? 2 : 3;
     var title =
       step === 'select'
@@ -511,9 +559,11 @@
             (d.matchesCatalog
               ? '<span class="rcp-badge is-ok">supported</span>'
               : '<span class="rcp-badge is-neutral">unknown chipset</span>') +
-            (d.driverBound
-              ? '<span class="rcp-badge is-ok">WinUSB installed</span>'
-              : '<span class="rcp-badge is-pending">driver required</span>') +
+            (noDriver()
+              ? '<span class="rcp-badge is-ok">no driver needed</span>'
+              : d.driverBound
+                ? '<span class="rcp-badge is-ok">WinUSB installed</span>'
+                : '<span class="rcp-badge is-pending">driver required</span>') +
             '</span>' +
             '</label>'
         );
@@ -529,7 +579,21 @@
     if (sel && !sel.driverBound) {
       actions.push('<button type="button" class="rcp-button is-primary" data-act="dg-continue">Continue</button>');
     }
-    if (sel && sel.driverBound) {
+    if (sel && noDriver()) {
+      actions.push(
+        '<span class="rcp-status-ok">' + ICONS.check + ' This computer needs no driver for the dongle: Aokie opens it as it is.</span>'
+      );
+      // No driver marks a dongle as Aokie's here, so with several Bluetooth
+      // controllers connected (a laptop's own is one) the person says which.
+      if (conn.length > 1 && !isPreferred(sel)) {
+        actions.push(
+          '<button type="button" class="rcp-button is-primary" data-act="dg-prefer" data-pick="' + esc(key(sel)) + '"' +
+            (busy ? ' disabled' : '') + '>Use this dongle</button>'
+        );
+      } else if (isPreferred(sel)) {
+        actions.push('<span class="rcp-step-meta">Aokie is set to use this one.</span>');
+      }
+    } else if (sel && sel.driverBound) {
       actions.push(
         '<span class="rcp-status-ok">' + ICONS.check + " This dongle already has the WinUSB driver — it's ready for Aokie.</span>"
       );
@@ -648,12 +712,15 @@
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
       '<small>Dongle setup</small>' +
-      '<h3>USB Bluetooth dongle driver</h3>' +
+      '<h3>' + (noDriver() ? 'USB Bluetooth dongle' : 'USB Bluetooth dongle driver') + '</h3>' +
       '</div>' +
       '</div>' +
       '<div class="rcp-card__body">' +
-      '<p class="rcp-inline-note">Guided setup for the USB Bluetooth dongle: pick the device, install the WinUSB ' +
-      "driver (one Windows prompt), and verify it's ready.</p>" +
+      (noDriver()
+        ? '<p class="rcp-inline-note">Plug the USB Bluetooth dongle in. This computer needs no driver for it: ' +
+          'Aokie opens the dongle when it starts.</p>'
+        : '<p class="rcp-inline-note">Guided setup for the USB Bluetooth dongle: pick the device, install the WinUSB ' +
+          "driver (one Windows prompt), and verify it's ready.</p>") +
       setupStatusHtml() +
       stepHeading() +
       body +
@@ -665,8 +732,11 @@
           '</div>'
         : '') +
       '</div>' +
-      '<p class="rcp-footnote">All device work happens in the plugin and its elevated helper — this screen only ' +
-      'sequences it. Restoring the Windows driver at any time hands the dongle back to BTHUSB.</p>' +
+      (noDriver()
+        ? '<p class="rcp-footnote">Aokie talks to the dongle directly over USB. Nothing is installed on this computer ' +
+          'for it, and closing Aokie gives the dongle back.</p>'
+        : '<p class="rcp-footnote">All device work happens in the plugin and its elevated helper — this screen only ' +
+          'sequences it. Restoring the Windows driver at any time hands the dongle back to BTHUSB.</p>') +
       '</section>' +
       // Recovery for a working receptionist, not part of setting one up.
       (setupActive() ? '' : resetCardHtml());
@@ -746,6 +816,9 @@
       } else if (act === 'dg-restore') {
         var sel = selectedDevice();
         if (sel && key(sel) === btn.getAttribute('data-pick')) restore(sel);
+      } else if (act === 'dg-prefer') {
+        var chosen = selectedDevice();
+        if (chosen && key(chosen) === btn.getAttribute('data-pick')) prefer(chosen);
       } else if (act === 'dg-verify-again') {
         // The verify target may be ABSENT from the live list mid-rebind —
         // retry against the captured target, not the (possibly null)
@@ -778,7 +851,10 @@
         return;
       }
       render();
-      refresh();
+      refresh().then(function () {
+        // Where there is no driver step, the radio's state is the tab's news.
+        if (root && noDriver() && !setupActive()) checkRadio();
+      });
     },
     unmount: function () {
       root = null;

@@ -950,9 +950,21 @@ impl Plugin {
         let transport_mode = crate::backend::TransportMode::from_setting(
             self.store.config.settings.get("transportMode"),
         );
+        // Which dongle. On Windows only a dongle bound to Aokie's driver can be opened, so the first one found is
+        // Aokie's. On Linux and macOS no driver marks a dongle and every USB Bluetooth controller is a candidate, a
+        // laptop's own included: where one has been chosen (dongle.setPreferred), that one is opened, and if it is
+        // not plugged in the radio does not start on another one instead.
+        let preferred_path = match self.preferred_dongle_path() {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("[aokie-plugin] live radio unavailable: {e}");
+                self.radio_start_error = Some(e);
+                return;
+            }
+        };
         match crate::radio::spawn(
             self.data_dir.clone(),
-            None,
+            preferred_path,
             auto_answer,
             answer_tone,
             reenumerate_hwid,
@@ -983,6 +995,33 @@ impl Plugin {
                 self.radio_start_error = Some(e.to_string());
             }
         }
+    }
+
+    /// The path of the dongle chosen with `dongle.setPreferred`, on the systems where the radio has to be told
+    /// which controller is the dongle (Linux, macOS). `Ok(None)`: none was chosen (or this is Windows, where the
+    /// driver binding says which), so the first controller found is opened.
+    #[cfg(all(aokie_radio, not(target_os = "windows")))]
+    fn preferred_dongle_path(&self) -> Result<Option<String>, String> {
+        let Some(chosen) = self.store.config.preferred_dongle.as_ref() else {
+            return Ok(None);
+        };
+        let listed = aokie_dongle::list_usb_radios()
+            .map_err(|e| format!("the USB devices could not be listed to find the chosen dongle: {e}"))?;
+        match listed
+            .into_iter()
+            .find(|d| d.vid == chosen.vid && d.pid == chosen.pid)
+        {
+            Some(dongle) => Ok(Some(dongle.path)),
+            None => Err(format!(
+                "the chosen dongle ({:04x}:{:04x}) is not plugged in; Aokie does not open another Bluetooth controller in its place",
+                chosen.vid, chosen.pid
+            )),
+        }
+    }
+
+    #[cfg(not(all(aokie_radio, not(target_os = "windows"))))]
+    fn preferred_dongle_path(&self) -> Result<Option<String>, String> {
+        Ok(None)
     }
 
     /// Tell the radio whether the OAIY route may offer a call the transfer
@@ -1582,6 +1621,16 @@ impl Plugin {
                                 })),
                             ));
                         }
+                    }
+                    // The radio has acknowledged, from inside its loop; its thread still has the backend to drop,
+                    // which closes the USB transport. Off Windows that close is what hands the dongle back to the
+                    // system's own Bluetooth driver, and a process that exits first leaves the dongle with no
+                    // driver until it is replugged: wait for the thread, for a bounded time, before `main` returns.
+                    #[cfg(all(aokie_radio, not(target_os = "windows")))]
+                    if !radio.wait_thread_finished(std::time::Duration::from_secs(5)) {
+                        eprintln!(
+                            "[aokie-plugin] the radio thread had not finished closing the dongle after 5 s; exiting all the same"
+                        );
                     }
                 }
                 self.shutdown_requested = true;
@@ -2199,12 +2248,25 @@ impl Plugin {
                 // driverBound (WinUSB attached = ready for Aokie). Lets the UI show "your dongle is
                 // plugged in — install its driver" vs "ready".
                 let (connected, live_err) = self.list_connected_dongles();
+                // Whether a driver has to be installed for the dongle at all: `winusb` on Windows, `none` on
+                // Linux and macOS, where the radio opens the dongle as it is (the setup screen then has no
+                // driver step, and every connected dongle is driverBound).
+                let driver_model = if cfg!(target_os = "windows") { "winusb" } else { "none" };
+                let note = if cfg!(target_os = "windows") {
+                    "connected[] are live USB devices; driverBound=true means the WinUSB driver is attached and the dongle is ready to pair."
+                } else {
+                    "connected[] are live USB devices; this system installs no driver for the dongle, so driverBound is true for each: Aokie opens it as it is."
+                };
                 Ok(json!({
                     "dongles": dongles,
                     "connected": connected,
+                    // The dongle chosen with dongle.setPreferred, if any. Where no driver marks a dongle as
+                    // Aokie's, this is what says which controller the radio opens.
+                    "preferred": self.store.config.preferred_dongle,
+                    "driverModel": driver_model,
                     "driverSigning": driver_signing(),
                     "liveEnumeration": live_err.is_none(),
-                    "note": live_err.unwrap_or_else(|| "connected[] are live USB devices; driverBound=true means the WinUSB driver is attached and the dongle is ready to pair.".to_string()),
+                    "note": live_err.unwrap_or_else(|| note.to_string()),
                 }))
             }
             "dongle.getPreferred" => {
@@ -4141,7 +4203,7 @@ impl Plugin {
     #[cfg(not(target_os = "windows"))]
     fn install_driver(&self, _payload: &Value) -> Result<Value, CmdError> {
         Err(CmdError::failed(
-            "dongle.installDriver is only supported on Windows (WinUSB)",
+            "dongle.installDriver is a Windows step (WinUSB): this system installs no driver, Aokie opens the dongle as it is",
         ))
     }
 
@@ -4172,7 +4234,7 @@ impl Plugin {
     #[cfg(not(target_os = "windows"))]
     fn restore_driver(&self, _payload: &Value) -> Result<Value, CmdError> {
         Err(CmdError::failed(
-            "dongle.restoreDriver is only supported on Windows (WinUSB)",
+            "dongle.restoreDriver is a Windows step (WinUSB): this system installed no driver, so there is none to restore",
         ))
     }
 
@@ -4191,7 +4253,7 @@ impl Plugin {
     #[cfg(not(target_os = "windows"))]
     fn remove_certs(&self, _payload: &Value) -> Result<Value, CmdError> {
         Err(CmdError::failed(
-            "dongle.removeCerts is only supported on Windows",
+            "dongle.removeCerts is a Windows step: no certificate is installed on this system",
         ))
     }
 
@@ -4248,11 +4310,45 @@ impl Plugin {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    /// Linux and macOS: the USB Bluetooth controllers libusb lists. No driver is installed on these systems (the
+    /// radio opens the dongle as it is), so each is `driverBound`: ready, as far as drivers go. Whether the
+    /// system's own Bluetooth lets go of it is found when the radio opens it, and `dongle.diagnostics` says so.
+    #[cfg(all(aokie_radio, not(target_os = "windows")))]
+    fn list_connected_dongles(&self) -> (Vec<Value>, Option<String>) {
+        match aokie_dongle::list_usb_radios() {
+            Ok(devices) => (
+                devices
+                    .into_iter()
+                    .map(|d| {
+                        let matches_catalog = dongle_catalog::dongle_tier(d.vid, d.pid).is_some();
+                        json!({
+                            "vid": d.vid,
+                            "pid": d.pid,
+                            "vidHex": format!("0x{:04X}", d.vid),
+                            "pidHex": format!("0x{:04X}", d.pid),
+                            "description": "USB Bluetooth controller",
+                            "driver": "none (libusb)",
+                            "hardwareId": d.path,
+                            "matchesCatalog": matches_catalog,
+                            "compatibility": if matches_catalog { "catalogued" } else { "unverified" },
+                            "driverBound": true,
+                        })
+                    })
+                    .collect(),
+                None,
+            ),
+            Err(e) => (
+                Vec::new(),
+                Some(format!("live USB enumeration failed: {e}")),
+            ),
+        }
+    }
+
+    #[cfg(not(aokie_radio))]
     fn list_connected_dongles(&self) -> (Vec<Value>, Option<String>) {
         (
             Vec::new(),
-            Some("live USB enumeration is Windows-only".to_string()),
+            Some("live USB enumeration is not available on this system".to_string()),
         )
     }
 
@@ -5232,7 +5328,10 @@ fn file_has_plaintext_manager_pin(path: &std::path::Path) -> bool {
             .map(|v| !v.trim().is_empty() && !aokie_core::dpapi::is_sealed(v))
             .unwrap_or(false),
         Err(_) => {
-            text.contains("\"managerPin\"") && !text.contains(aokie_core::dpapi::DPAPI_PREFIX)
+            // (either system's sealed-token marker: `dpapi:` on Windows, `keychain1:` on a Mac)
+            text.contains("\"managerPin\"")
+                && !text.contains(aokie_core::dpapi::DPAPI_PREFIX)
+                && !text.contains(aokie_core::dpapi::KEYCHAIN_PREFIX)
         }
     }
 }

@@ -32,6 +32,14 @@ that nothing has to be taken from it. `AOKIE_CARGO_ARGS="--features
 rusb/vendored"` builds libusb from the sources `rusb` carries, which is the
 libusb a Mac build links.
 
+`WITH_PLUGIN=1` (`docker run -e WITH_PLUGIN=1 ...`) goes one step further:
+it builds the plugin and runs it whole against the stand-in
+(`plugin_check.py`). The plugin is started as OAIY Desktop starts it, its
+own radio thread opens the dongle and brings it up, `dongle.diagnostics`,
+`dongle.list` and `phone.status` are answered, a pairing window is opened
+and closed, and the plugin shuts down and gives the dongle back. That build
+is the heavy one (minutes; it links libwebrtc).
+
 ## What it checks
 
 * the dongle is found and described from its descriptors, the voice endpoints
@@ -53,7 +61,9 @@ libusb a Mac build links.
   interface to setting 0;
 * closing with a link up, and opening again;
 * pulling the dongle out with transfers on every pipe ends the reads with an
-  error (not "nothing yet", not a hang) and the close returns.
+  error (not "nothing yet", not a hang) and the close returns;
+* with `WITH_PLUGIN=1`: the plugin's radio comes up on the dongle and goes
+  down cleanly, as above.
 
 ## What it cannot check
 

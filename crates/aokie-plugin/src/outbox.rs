@@ -42,7 +42,10 @@ pub const DEAD_RETENTION_DAYS: i64 = 14;
 // QUARANTINES the event (typed dead row, metadata retained, payload absent)
 // instead of writing plaintext; a decrypt failure is a typed dead-letter
 // (`payload_unreadable`), never an empty payload emitted as though real.
-// Non-Windows builds have no OS payload protection: file-backed outboxes
+// macOS seals with a key held in the user's login Keychain
+// (`aokie_core::dpapi`'s macOS half), stored as "keychain1:<base64>", under
+// the same rules: a Keychain that will not give the key quarantines the event.
+// Linux builds have no OS payload protection: file-backed outboxes
 // refuse sensitive writes unless `AOKIE_ALLOW_UNPROTECTED_OUTBOX=1` makes
 // the dev trade-off EXPLICIT; in-memory (test) outboxes use dev plaintext.
 
@@ -57,6 +60,8 @@ const QUARANTINED_PAYLOAD: &str = "quarantined:";
 pub enum PayloadProtection {
     /// Windows DPAPI (per-user). The production mode.
     Dpapi,
+    /// macOS: a key in the user's login Keychain (`aokie_core::dpapi`).
+    Keychain,
     /// Explicit dev/test plaintext (non-Windows with the env override, and
     /// in-memory test outboxes). Loud, never the silent default for files.
     DevPlaintext,
@@ -72,11 +77,20 @@ fn platform_protection() -> PayloadProtection {
     }
     #[cfg(not(windows))]
     {
+        // A test's file-backed outbox is there for what SQLite does (two
+        // connections to one file, a reopen), not for sealing: it gets what
+        // `open_in_memory` gets off Windows. On a Mac that also keeps a test
+        // run out of the developer's Keychain.
+        if cfg!(test) {
+            return PayloadProtection::DevPlaintext;
+        }
         if std::env::var("AOKIE_ALLOW_UNPROTECTED_OUTBOX").as_deref() == Ok("1") {
             eprintln!(
                 "[aokie-plugin] AOKIE_ALLOW_UNPROTECTED_OUTBOX=1 — outbox payloads stored PLAINTEXT (dev override)"
             );
             PayloadProtection::DevPlaintext
+        } else if cfg!(target_os = "macos") {
+            PayloadProtection::Keychain
         } else {
             PayloadProtection::Unavailable
         }
@@ -154,6 +168,8 @@ fn protect_payload(mode: PayloadProtection, plain: &str) -> Result<String, Strin
         PayloadProtection::Dpapi => dpapi_protect(plain),
         #[cfg(not(windows))]
         PayloadProtection::Dpapi => Err("DPAPI is not available on this platform".to_string()),
+        // (the core's sealing: on a Mac the Keychain's key; an error on a system that has none)
+        PayloadProtection::Keychain => aokie_core::dpapi::protect(plain.as_bytes()),
         PayloadProtection::DevPlaintext => Ok(plain.to_string()),
         PayloadProtection::Unavailable => Err(
             "no OS payload protection on this platform (set AOKIE_ALLOW_UNPROTECTED_OUTBOX=1 to accept plaintext in dev)"
@@ -169,6 +185,12 @@ fn unprotect_payload(stored: &str) -> Result<String, String> {
     if let Some(reason) = stored.strip_prefix(QUARANTINED_PAYLOAD) {
         return Err(format!("payload was quarantined at write ({reason})"));
     }
+    if stored.starts_with(aokie_core::dpapi::KEYCHAIN_PREFIX) {
+        // Sealed on a Mac. Elsewhere this is an error, never plaintext.
+        let bytes = aokie_core::dpapi::unprotect(stored)?;
+        return String::from_utf8(bytes)
+            .map_err(|_| "sealed payload is not text once opened".to_string());
+    }
     if let Some(_b64) = stored.strip_prefix(DPAPI_PREFIX) {
         #[cfg(windows)]
         {
@@ -183,8 +205,11 @@ fn unprotect_payload(stored: &str) -> Result<String, String> {
 }
 
 // Minimal std-only base64 (standard alphabet, padded) — not worth a crate.
+// (The DPAPI token's: the other systems' sealed tokens are made in aokie-core.)
+#[cfg_attr(not(windows), allow(dead_code))]
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -210,6 +235,7 @@ fn b64_encode(data: &[u8]) -> String {
     out
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn b64_decode(text: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         B64.iter().position(|&b| b == c).map(|i| i as u32)
@@ -442,13 +468,17 @@ impl Outbox {
     /// successful pass the WAL is checkpointed and the file vacuumed so no
     /// plaintext survives in old pages.
     fn migrate_legacy_plaintext(&self) {
-        if self.protection != PayloadProtection::Dpapi {
+        if !matches!(
+            self.protection,
+            PayloadProtection::Dpapi | PayloadProtection::Keychain
+        ) {
             return; // nothing stronger to migrate TO on this platform/mode
         }
         let rows: Vec<(i64, String)> = {
             let Ok(mut stmt) = self.conn.prepare(
                 "SELECT id, payload_json FROM aokie_outbox
                  WHERE payload_json NOT LIKE 'dpapi1:%'
+                   AND payload_json NOT LIKE 'keychain1:%'
                    AND payload_json NOT LIKE 'quarantined:%'",
             ) else {
                 return;
