@@ -80,17 +80,15 @@ impl MsbcDecoder {
                 }
                 let q = reader.read(nbits);
                 let levels = (1u32 << nbits) - 1;
-                // SBC dequantization (A2DP §12.6.5 / Bluedroid):
-                //   subband = ((2*q + 1) / levels - 1) * 2^sf
-                // Note the scale is 2^sf (NOT 2^(sf+1)). The encoder
-                // normalizes a subband sample with peak < 2^sf into
-                // [-1, 1] by dividing by 2^sf, so the decoder uses the
-                // same factor to undo it. Using 2^(sf+1) produces values
-                // 2× too large and clips when the encoder fills the
-                // full quantized range, as Bluedroid (Android / Pixel)
-                // does on the wire.
+                // SBC dequantization (A2DP §12.6.4):
+                //   subband = ((2*q + 1) / levels - 1) * 2^(sf+1)
+                // the spec's scalefactor, 2^(scale_factor+1), as BlueZ's
+                // `sbc_unpack_frame` takes it (its shift is the scale
+                // factor plus one): a phone's encoder writes sf as the
+                // smallest n with |peak| < 2^(n+1). With 2^sf a phone was
+                // heard 6 dB too quiet.
                 let normalized = (q as f32 + 0.5) * 2.0 / (levels as f32) - 1.0;
-                let scale = (1u32 << sf[sb] as u32) as f32;
+                let scale = (1u32 << (sf[sb] as u32 + 1)) as f32;
                 subbands[block][sb] = normalized * scale;
             }
         }

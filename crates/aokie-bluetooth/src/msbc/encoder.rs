@@ -85,10 +85,10 @@ impl MsbcEncoder {
         }
 
         // 2. Compute scale factors per subband. The scale factor `sf[sb]`
-        //    is the smallest integer `n` such that all subband samples
-        //    in that subband fit in `n+1` signed bits — i.e. their
-        //    magnitudes are < 2^n. We look at the absolute peak across
-        //    all blocks for that subband.
+        //    is the smallest integer `n` such that the subband's samples'
+        //    magnitudes are < 2^(n+1) (A2DP §12.6.4; BlueZ's
+        //    `sbc_calc_scalefactors` writes the same). We look at the
+        //    absolute peak across all blocks for that subband.
         let mut peak = [0.0f32; NUM_SUBBANDS];
         for block in 0..NUM_BLOCKS {
             for sb in 0..NUM_SUBBANDS {
@@ -100,10 +100,10 @@ impl MsbcEncoder {
         }
         let mut sf = [0u8; NUM_SUBBANDS];
         for sb in 0..NUM_SUBBANDS {
-            // Scale factors live in 0..=15. log2 of the peak rounded up
-            // gives the exponent; clamp to the valid range.
+            // Scale factors live in 0..=15: the exponent of the peak, one
+            // less than log2 of it rounded up; clamp to the valid range.
             let mut n: i32 = 0;
-            let mut bound: f32 = 1.0;
+            let mut bound: f32 = 2.0;
             while peak[sb] >= bound && n < 15 {
                 n += 1;
                 bound *= 2.0;
@@ -117,13 +117,15 @@ impl MsbcEncoder {
         // 4. Quantize each subband sample.
         //    sample_quantized = ⌊((s/2^sf + 1) * (2^bits - 1) / 2)⌋
         //
-        // Normalize by 2^sf (matching the spec / Bluedroid, NOT
-        // 2^(sf+1)). With sf chosen as the smallest n with |peak| < 2^n,
-        // s/2^sf lies in (-1, 1), so the quantized value fills the
-        // full [0, levels] range. Using 2^(sf+1) would put it in the
-        // middle half [levels/4, 3*levels/4] — round-trip-consistent
-        // with our own decoder, but a peer running the spec formula
-        // (Android/Bluedroid in particular) reads it back at half scale.
+        // Normalize by 2^(sf+1), the spec's scalefactor (A2DP §12.6.4:
+        // scalefactor = 2^(scale_factor+1)), which a peer's decoder
+        // multiplies back by (BlueZ's `sbc_unpack_frame`, the phones').
+        // With sf the smallest n with |peak| < 2^(n+1), s/2^(sf+1) lies
+        // in (-1, 1) and fills the quantized range. This wrote sf one
+        // higher than the spec and normalized by 2^sf: the same
+        // quantized values, but a phone heard them 6 dB too loud
+        // (clipping its loudest syllables), and our own decoder, which
+        // matched it, heard a phone 6 dB too quiet.
         let mut quantized = [[0u32; NUM_SUBBANDS]; NUM_BLOCKS];
         for block in 0..NUM_BLOCKS {
             for sb in 0..NUM_SUBBANDS {
@@ -131,7 +133,7 @@ impl MsbcEncoder {
                 if nbits == 0 {
                     continue;
                 }
-                let scale = 1.0f32 / (1u32 << sf[sb] as u32) as f32;
+                let scale = 1.0f32 / (1u32 << (sf[sb] as u32 + 1)) as f32;
                 let normalized = subbands[block][sb] * scale; // ≈ in (-1, 1)
                 let levels = (1u32 << nbits) - 1;
                 // Map (-1, 1) → [0, levels].
