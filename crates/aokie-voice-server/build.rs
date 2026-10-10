@@ -4,6 +4,15 @@
 //! than failing.
 
 fn main() {
+    // The speech libraries (sherpa-onnx, ONNX Runtime) are shared libraries that ship beside this program. Windows
+    // looks beside a program for them by itself; macOS and Linux look where the program's own run path says, so
+    // it is given the folder it is in as one (as the plugin is, in its build.rs). Without it the voice server of a
+    // bundle does not start there: it cannot find the library that is in its own folder.
+    match std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+        "macos" => println!("cargo:rustc-link-arg-bins=-Wl,-rpath,@executable_path"),
+        "linux" => println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN"),
+        _ => {}
+    }
     let git_ref = std::process::Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])
         .output()
