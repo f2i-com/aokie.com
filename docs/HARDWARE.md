@@ -134,16 +134,27 @@ that is missing the plugin does not start and its log names the library.
 
 ## macOS
 
-**Built on a Mac, and never run on one with a dongle.** The plugin with voice
+**Run on a Mac with a dongle; not yet with a phone.** The plugin with voice
 has been built on GitHub's macOS 15 Apple-silicon runner (the workflow **Unix
 bundles**, 10 October 2026), and its bundle started there from its folder: it
 answers OAIY's first calls, finds no dongle, keeps its radio off and shuts down
 cleanly. Two things only a Mac build could show were met and fixed on the way:
 libwebrtc's Objective-C categories have to be linked in (`-ObjC`, in
 `.cargo/config.toml`), or the plugin aborts while it is loaded; and the build's
-libclang has to be named (`scripts/bundle-unix.sh` does). Nobody has had it on
-a Mac with a dongle, a phone or a Keychain prompt: the radio, pairing, calls
-and texts there are untried.
+libclang has to be named (`scripts/bundle-unix.sh` does).
+
+On 11 October 2026 it ran on an M5 Pro Mac (macOS 27) with a Broadcom
+BCM20702A0 (`0a5c:21ec`), built there by `bundle-unix.sh` (cmake from PyPI,
+`uv tool install cmake`, with `CMAKE_POLICY_VERSION_MINIMUM=3.5` for cmake 4).
+macOS attached no driver of its own to the dongle, and Aokie took it as an
+ordinary user: `dongle_probe` opened, reset and read it, and the bundled
+plugin's radio came up on it (the Broadcom voice routing set, the name
+written, a pairing window opened and closed) and gave it back when it shut
+down. That dongle calls its HCI and voice interfaces vendor-specific
+(0xFF/0x01/0x01, not the standard 0xE0/0x01/0x01), which the transport had
+not taken for Bluetooth until then: it now does, from Broadcom and the
+vendors that sell Broadcom's dongles. Pairing a phone, calls and texts, and
+the Keychain's prompt are still untried there.
 
 Everything else below was made and checked without a Mac. The Mac shares its
 code with Linux: the phone link is compiled
@@ -275,14 +286,18 @@ program (`crates/aokie-bluetooth/Cargo.toml` says what the choices are).
 
 ### What only a Mac can answer
 
-1. Who has the dongle (above).
-2. libusb's macOS half. The transport's own code ran on Linux; libusb's IOKit
-   backend under it did not. Events and data are plain transfers; call audio
-   rides isochronous transfers, whose timing through libusb on macOS has not
-   been measured. Expect texts and pairing to be the first things that work
-   and call audio to be the part that needs a Mac to tune.
-3. Whether the speech stack's native libraries build there (sherpa-onnx,
-   speexdsp, libwebrtc) and are found beside the plugin when it starts.
+1. Who has the dongle (above). On macOS 27 on Apple silicon, with a
+   BCM20702A0: nobody, and Aokie takes it as the user.
+2. libusb's macOS half. Its IOKit backend opened the dongle, claimed both
+   interfaces and carried commands and events (the plugin's radio came up).
+   Call audio rides isochronous transfers, whose timing through libusb on
+   macOS has not been measured: expect texts and pairing to be the first
+   things that work and call audio to be the part that needs a Mac to tune.
+3. The speech stack's native libraries (sherpa-onnx, speexdsp, libwebrtc)
+   build there, and the plugin finds them beside it when it starts (and ONNX
+   Runtime 1.25.0). A bundle has no links in it: OAIY Desktop refuses to
+   install or trust a plugin that has one, so `bundle-unix.sh` copies the
+   file a link names.
 4. The Keychain's prompts for a plugin that OAIY Desktop starts.
 5. OAIY Desktop loading a plugin on macOS at all.
 

@@ -16,8 +16,9 @@
 # Nothing is installed and nothing is signed: the last lines say where OAIY Desktop looks for a plugin and that it
 # will ask you to trust this one, as it asks for any plugin that is not signed.
 #
-# Never run on a Mac yet. What it does there that Linux cannot check: the speech libraries are .dylib files, found
-# by the plugin through its own folder (crates/aokie-plugin/build.rs gives the programs that run path).
+# Run on a Mac (Apple silicon, macOS 27; cmake from PyPI will do, with CMAKE_POLICY_VERSION_MINIMUM=3.5 for cmake 4).
+# What it does there that Linux cannot check: the speech libraries are .dylib files, found by the plugin through its
+# own folder (crates/aokie-plugin/build.rs gives the programs that run path).
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -116,11 +117,12 @@ cp -R "$repo/crates/aokie-plugin/ui" "$out/ui"
 cp "$repo/docs/models-manifest.json" "$repo/docs/MODEL_LICENSES.md" "$out/"
 
 # The speech libraries the build left beside the programs (sherpa-onnx and the ONNX Runtime it brings). A build
-# without voice has none.
+# without voice has none. A link among them (libonnxruntime.dylib, naming the versioned file) goes in as a copy of
+# the file it names: OAIY Desktop installs and trusts a plugin made of files only, and refuses one with a link in it.
 libs=0
 for file in "$target/release"/libsherpa-onnx*."$lib"* "$target/release"/libonnxruntime*."$lib"*; do
   [ -e "$file" ] || continue
-  cp -P "$file" "$out/"
+  cp -L "$file" "$out/"
   libs=$((libs + 1))
 done
 
@@ -168,6 +170,8 @@ for file in $(grep -o '"ui/[^"]*"\|"definitions/[^"]*"' "$out/manifest.json" | t
 done
 [ "$missing" = 0 ] || exit 1
 [ -x "$out/aokie-plugin" ] || { echo "the bundle's aokie-plugin is not a program that can be run"; exit 1; }
+links=$(find "$out" -type l)
+[ -z "$links" ] || { echo "the bundle has links in it, which OAIY Desktop refuses to install: $links"; exit 1; }
 
 echo
 echo "the bundle: $out"
@@ -187,6 +191,6 @@ if [ "$(uname -s)" = Linux ]; then
   echo "  desktop install has). Where it is missing the plugin does not start, and its log says which library."
 fi
 echo
-echo "To try it: close OAIY Desktop, copy the folder to"
-echo "  $data/plugins/aokie"
-echo "start OAIY Desktop, and under Connections, Plugins, press \"Trust this plugin\" on Aokie's card, then Start."
+echo "To try it: in OAIY Desktop, under Connections, Plugins, give this folder's path to install it (or copy the"
+echo "folder to $data/plugins/aokie: OAIY looks there each time it lists its plugins, so it need not be"
+echo "restarted), then press \"Trust this plugin\" on Aokie's card, and Start."
