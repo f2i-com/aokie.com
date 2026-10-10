@@ -132,6 +132,10 @@ if [ -n "$features" ]; then
     echo "  instead of answering them itself (a call OAIY's voice answers does not need it)."
   fi
 fi
+if [ "$(uname -s)" = Linux ]; then
+  echo "  On Linux the plugin uses the system's libusb (libusb-1.0.so.0: Debian and Ubuntu's libusb-1.0-0, which a"
+  echo "  desktop install has). Where it is missing the plugin does not start, and its log says which library."
+fi
 echo
 echo "To try it: close OAIY Desktop, copy the folder to"
 echo "  $data/plugins/aokie"

@@ -14,7 +14,13 @@ Nothing is on the air: no phone can pair with the stand-in, so calls and
 texts are beyond this. It is the step before them: "the plugin starts and
 its radio is up" on a system that is not Windows.
 
-Usage: plugin_check.py PATH/TO/aokie-plugin
+Usage: plugin_check.py [--no-dongle] PATH/TO/aokie-plugin
+
+--no-dongle is for a machine with no dongle and no stand-in (a build
+machine): the plugin is started from its folder, answers, lists no dongle,
+and shuts down cleanly. No consent is recorded, so the radio never starts
+and no speech model is fetched: it is the check that a bundle laid out by
+scripts/bundle-unix.sh runs from its folder alone, and nothing more.
 
 AOKIE_PLUGIN_CHECK_WAIT: how many seconds to wait for the radio (default
 30). A plugin built with voice fetches its speech models before its radio
@@ -101,8 +107,26 @@ def check(condition, what):
     print("  ok: " + what, flush=True)
 
 
+def no_dongle(plugin):
+    """What a bundle has to do on a machine with no dongle: start, answer, and go."""
+    listed = plugin.command("dongle.list")
+    check(listed.get("liveEnumeration") is True, "dongle.list scans live USB devices")
+    print("  %d Bluetooth controller(s) on this machine's USB" % len(listed.get("connected", [])), flush=True)
+    if sys.platform != "win32":
+        check(listed.get("driverModel") == "none", "this system installs no driver for the dongle")
+    status = plugin.command("phone.status")
+    check(status.get("connected") is not True, "no phone is connected (phone.status: %s)" % json.dumps(status)[:200])
+    radio = plugin.command("dongle.diagnostics").get("radio") or {}
+    check(not radio.get("initialized"), "the radio is off: nobody has said it may start")
+    health = plugin.rpc("plugin.health", {}).get("result") or {}
+    print("  plugin.health: %s" % json.dumps(health)[:300], flush=True)
+    plugin.rpc("plugin.shutdown", {})
+    check(plugin.proc.wait(15) == 0, "the plugin shut down cleanly")
+
+
 def main():
-    exe = sys.argv[1]
+    args = [a for a in sys.argv[1:] if a != "--no-dongle"]
+    exe = args[0]
     data_dir = tempfile.mkdtemp(prefix="aokie-plugin-check-")
     plugin = Plugin(exe, data_dir)
     try:
@@ -112,6 +136,10 @@ def main():
         # With no consent the radio stays off: the dongle is not touched.
         consent = plugin.command("consent.get")
         check(consent.get("blocked") is not None or consent.get("grant") is None, "no consent yet, so no radio")
+        if "--no-dongle" in sys.argv[1:]:
+            no_dongle(plugin)
+            print("the plugin started from its folder, answered, and went down cleanly", flush=True)
+            return
         plugin.command("consent.set", {
             "version": consent.get("requiredVersion", 1),
             "scopes": {"bluetooth": True, "transcription": False, "sms": True, "contacts": True},
