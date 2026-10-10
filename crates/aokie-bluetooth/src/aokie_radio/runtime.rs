@@ -3244,6 +3244,7 @@ fn run_runtime(
                     if *scstatus == 0 {
                         active_sco_handle = Some(*connection_handle);
                         active_sco_tx_packet_len = Some(*tx_packet_length as usize);
+                        sco_assembler.set_handle(active_sco_handle);
                         last_sco_rx_bytes_at = None;
                         sco_rx_silence_logged_at = None;
                         // Every call's audio starts from an EMPTY queue —
@@ -3831,6 +3832,14 @@ fn run_runtime(
                             // first packet isn't shifted by leftover
                             // bytes from this one.
                             sco_assembler.reset();
+                            sco_assembler.set_handle(None);
+                            if sco_tx_queue.underruns() > 0 || sco_assembler.resynced_bytes() > 0 {
+                                eprintln!(
+                                    "[AokieRadio] SCO so far: outgoing audio ran dry mid-speech {} time(s), {} incoming byte(s) slid past to find a packet's header",
+                                    sco_tx_queue.underruns(),
+                                    sco_assembler.resynced_bytes(),
+                                );
+                            }
                             // Fresh H2 codec state for the next call so
                             // the rotating sync sequence starts at 0x08,
                             // the loss detector doesn't fire on the
@@ -4329,7 +4338,15 @@ fn run_runtime(
                     // fatal. Don't `?` it through to the runtime —
                     // a single bad byte from a USB hiccup would
                     // otherwise kill the call.
-                    match sco_assembler.push_bytes(&bytes) {
+                    let resynced = sco_assembler.resynced_bytes();
+                    let pushed = sco_assembler.push_bytes(&bytes);
+                    if sco_assembler.resynced_bytes() > resynced {
+                        eprintln!(
+                            "[AokieRadio] SCO RX: {} byte(s) slid past to find a packet's header (an isochronous packet lost?)",
+                            sco_assembler.resynced_bytes() - resynced
+                        );
+                    }
+                    match pushed {
                         Ok(packets) => {
                             for packet in packets {
                                 if is_msbc {
@@ -5726,15 +5743,20 @@ fn cvsd_tx_plan(
     // audio) chronically underrun the controller's SCO FIFO and
     // produce silence on the air.
     //
-    // Also clamp to the SCO link's negotiated tx_packet_length so each
-    // HCI packet maps to exactly one air packet (no controller-side
-    // fragmentation for short links like HV3 = 30 bytes). Filter out
-    // 0 — the spec allows tx_packet_length=0 for transparent-data air
+    // Also clamp to what one air packet of the SCO link carries, so each
+    // HCI packet maps to one air packet at most. The link's
+    // tx_packet_length counts air bytes, CVSD's 1-bit samples at 64 kbit/s
+    // (HV3's and EV3's 30 bytes are 3.75 ms of sound), and what goes over
+    // USB is 16-bit linear PCM at 8 kHz, 16 bytes a ms: an air byte is two
+    // of ours. Clamped to the air bytes themselves, a 30-byte link sent
+    // 30-byte packets (1.875 ms of sound) that take two USB frames (2 ms):
+    // the controller ran dry some 6% of the time, a steady crackle. Filter
+    // out 0 — the spec allows tx_packet_length=0 for transparent-data air
     // mode, and an unfiltered 0 would `min` the payload down to nothing
     // and silently stop sending audio.
     let link_max = active_sco_tx_packet_len
         .filter(|&n| n > 0)
-        .unwrap_or(AOKIE_SCO_USB_PAYLOAD_BYTES * 2);
+        .map_or(AOKIE_SCO_USB_PAYLOAD_BYTES * 2, |air_bytes| air_bytes * 2);
     let payload_len = manager::max_sco_payload_len(buffer_size)
         .min(AOKIE_SCO_USB_PAYLOAD_BYTES * 2)
         .min(link_max)
@@ -6125,8 +6147,14 @@ mod tests {
         let transparent = msbc_tx_plan(&buffers).unwrap();
         assert_eq!(transparent.payload_len, 24);
         assert_eq!(transparent.packet_interval_us, 3_000);
-        let limited = cvsd_tx_plan(&buffers, Some(30)).unwrap();
-        assert_eq!(limited.payload_len, 30);
+        // HV3's and EV3's 30 air bytes are 3.75 ms of sound, more than a
+        // packet's 3 ms: the same packets (they were 30 bytes of PCM,
+        // 1.875 ms each in 2 ms of USB frames, and the controller ran dry)
+        let air30 = cvsd_tx_plan(&buffers, Some(30)).unwrap();
+        assert_eq!((air30.payload_len, air30.packet_interval_us), (48, 3_000));
+        // a link shorter than 3 ms of sound: one air packet's worth of PCM
+        let short = cvsd_tx_plan(&buffers, Some(10)).unwrap();
+        assert_eq!((short.payload_len, short.packet_interval_us), (20, 1_250));
     }
 
     #[test]
