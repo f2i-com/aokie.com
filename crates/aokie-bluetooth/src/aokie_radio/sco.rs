@@ -29,6 +29,11 @@ pub struct LinearPcmStats {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScoPacketAssembler {
     buffer: VecDeque<u8>,
+    /// The SCO link's connection handle, once it is up ([`Self::set_handle`]): a packet whose header names another
+    /// is a misaligned stream (an isochronous packet lost on the way in), and the bytes are slid past one at a time
+    /// until a header lines up again. Without it, one lost USB packet shifted the framing for the rest of the call.
+    handle: Option<u16>,
+    resynced_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +49,15 @@ pub struct LinearPcmTxQueue {
     /// resulting slope-overload reads as static at every TTS-burst tail
     /// where the queue dries up mid-packet.
     last_emitted: i16,
+    /// Samples left of the fade-in after the queue ran dry: audio that comes back mid-word starts from silence over
+    /// [`FADE_IN_SAMPLES`] instead of with a jump (a click).
+    fade_in: usize,
+    /// The queue ran dry with audio still playing (the last sample not yet silence): how many times.
+    underruns: usize,
 }
+
+/// The fade back in after the outgoing queue ran dry: 3 ms at 8 kHz, 1.5 ms at 16 kHz.
+const FADE_IN_SAMPLES: usize = 24;
 
 impl ScoStats {
     pub fn record_packet(&mut self, packet: &[u8]) -> Result<(), String> {
@@ -90,6 +103,16 @@ impl ScoPacketAssembler {
         Self::default()
     }
 
+    /// The SCO link's handle (`None` when it goes down): packets for it are what the stream carries.
+    pub fn set_handle(&mut self, handle: Option<u16>) {
+        self.handle = handle.map(|h| h & 0x0fff);
+    }
+
+    /// Bytes slid past to find a packet's header again, since this assembler was made.
+    pub fn resynced_bytes(&self) -> usize {
+        self.resynced_bytes
+    }
+
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         self.buffer.extend(bytes);
         let mut packets = Vec::new();
@@ -99,6 +122,13 @@ impl ScoPacketAssembler {
                 break;
             }
 
+            if let Some(handle) = self.handle {
+                if u16::from_le_bytes([self.buffer[0], self.buffer[1]]) & 0x0fff != handle {
+                    self.buffer.pop_front();
+                    self.resynced_bytes += 1;
+                    continue;
+                }
+            }
             let payload_len = self.buffer[2] as usize;
             let packet_len = 3 + payload_len;
             if self.buffer.len() < packet_len {
@@ -133,7 +163,43 @@ impl LinearPcmTxQueue {
             capacity_samples,
             dropped_samples: 0,
             last_emitted: 0,
+            fade_in: 0,
+            underruns: 0,
         }
+    }
+
+    /// The next sample to send: the queue's oldest, faded in where the queue had run dry; else a decay toward zero
+    /// from the last one sent (~12.5% a sample, under 4 LSB snapping to 0: the noise floor well within one HCI
+    /// packet from full scale), never a jump to it. CVSD's adaptive step cannot follow a one-sample drop from full
+    /// scale to zero (its slope overload reads as static), nor a jump back up, and in mSBC both are clicks.
+    fn next_sample(&mut self) -> i16 {
+        match self.samples.pop_front() {
+            Some(s) => {
+                let s = if self.fade_in > 0 {
+                    let gain = (FADE_IN_SAMPLES - self.fade_in + 1) as i32;
+                    self.fade_in -= 1;
+                    (s as i32 * gain / FADE_IN_SAMPLES as i32) as i16
+                } else {
+                    s
+                };
+                self.last_emitted = s;
+                s
+            }
+            None => {
+                if self.last_emitted != 0 && self.fade_in == 0 {
+                    self.underruns += 1;
+                }
+                let next = (self.last_emitted as i32 * 7) / 8;
+                self.last_emitted = if next.abs() < 4 { 0 } else { next as i16 };
+                self.fade_in = FADE_IN_SAMPLES;
+                self.last_emitted
+            }
+        }
+    }
+
+    /// How many times the queue ran dry with audio still playing (each one a short gap the caller may hear).
+    pub fn underruns(&self) -> usize {
+        self.underruns
     }
 
     pub fn push_samples(&mut self, samples: &[i16]) -> usize {
@@ -150,27 +216,7 @@ impl LinearPcmTxQueue {
         payload_len: usize,
     ) -> Result<Vec<u8>, String> {
         build_linear_pcm_sco_packet(connection_handle, payload_len, |sample_count| {
-            (0..sample_count)
-                .map(|_| match self.samples.pop_front() {
-                    Some(s) => {
-                        self.last_emitted = s;
-                        s
-                    }
-                    None => {
-                        // Queue dried up — decay toward zero instead of
-                        // jumping there. ~12.5% per sample, with values
-                        // under 4 LSB snapping to 0, reaches the noise
-                        // floor in well under one HCI packet (3 ms) from
-                        // typical full-scale audio. Smooths the
-                        // slope-overload distortion CVSD's adaptive step
-                        // would emit if we hard-cut from full-scale
-                        // audio to zero mid-packet.
-                        let next = (self.last_emitted as i32 * 7) / 8;
-                        self.last_emitted = if next.abs() < 4 { 0 } else { next as i16 };
-                        self.last_emitted
-                    }
-                })
-                .collect()
+            (0..sample_count).map(|_| self.next_sample()).collect()
         })
     }
 
@@ -194,14 +240,14 @@ impl LinearPcmTxQueue {
         self.samples.clear();
     }
 
-    /// Fill `frame` with the oldest samples from the queue, padding the
-    /// tail with zero (silence) if the queue runs dry. Used by the mSBC
-    /// outbound path: the encoder needs exactly `MSBC_SAMPLES_PER_FRAME`
+    /// Fill `frame` with the oldest samples from the queue, decaying to
+    /// silence if the queue runs dry (and fading back in after): the mSBC
+    /// outbound path's. The encoder needs exactly `MSBC_SAMPLES_PER_FRAME`
     /// samples per frame and we'd rather emit silence than starve the
-    /// controller's SCO FIFO.
+    /// controller's SCO FIFO. (It padded with zeros: a step, a click.)
     pub fn fill_frame(&mut self, frame: &mut [i16]) {
         for slot in frame.iter_mut() {
-            *slot = self.samples.pop_front().unwrap_or(0);
+            *slot = self.next_sample();
         }
     }
 }
@@ -306,6 +352,51 @@ pub fn linear_pcm_samples_from_payload(payload: &[u8]) -> Result<Vec<i16>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_that_lost_bytes_finds_its_packets_again() {
+        let packet = |n: u8| build_sco_packet(0x002a, 0, &[n; 48]).unwrap();
+        let mut assembler = ScoPacketAssembler::new();
+        assembler.set_handle(Some(0x002a));
+        assert_eq!(assembler.push_bytes(&packet(1)).unwrap().len(), 1);
+        // an isochronous packet of the next lost: its first 17 bytes never came
+        let mut stream = packet(2)[17..].to_vec();
+        stream.extend(packet(3));
+        stream.extend(packet(4));
+        let got = assembler.push_bytes(&stream).unwrap();
+        assert_eq!(
+            got.iter().map(|p| p[3]).collect::<Vec<_>>(),
+            [3, 4],
+            "back in step from the next whole packet"
+        );
+        assert_eq!(assembler.resynced_bytes(), 34);
+    }
+
+    #[test]
+    fn audio_that_runs_dry_decays_and_comes_back_faded_in() {
+        let mut queue = LinearPcmTxQueue::new(4_800);
+        queue.push_samples(&[10_000; 10]);
+        let mut frame = [0i16; 24];
+        queue.fill_frame(&mut frame);
+        assert_eq!(&frame[..10], &[10_000; 10]);
+        assert!(
+            frame[10] > 0 && frame[10] < 10_000,
+            "a decay, not a step to zero: {}",
+            frame[10]
+        );
+        assert!(frame[10..].windows(2).all(|w| w[1] <= w[0]));
+        assert_eq!(queue.underruns(), 1);
+        // the audio comes back: from silence up, not with a jump
+        queue.push_samples(&[10_000; 48]);
+        queue.fill_frame(&mut frame);
+        assert!(frame[0] < 1_000, "{}", frame[0]);
+        assert!(frame.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(frame[23], 10_000);
+        // a queue that was silent all along is no underrun
+        let mut idle = LinearPcmTxQueue::new(100);
+        idle.fill_frame(&mut frame);
+        assert_eq!(idle.underruns(), 0);
+    }
 
     #[test]
     fn parses_and_builds_sco_packets() {
