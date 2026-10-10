@@ -336,8 +336,7 @@ fn validate_spoken_date(agreement: &str, date: NaiveDate, today: NaiveDate) -> R
     let speech = normalized_speech(agreement);
     if let Some(spoken) = crate::conversation_policy::explicit_date(agreement, today).filter(|spoken| *spoken != date) {
         return Err(format!(
-            "appointment date does not match the caller's explicit date: they said {}; check the date, or ask \
-             them in one short question which day they want, then call this tool again",
+            "the caller said {}, not this date: use their date, or ask them which day, then call this tool again",
             spoken.format("%A %-d %B")
         ));
     }
@@ -363,8 +362,7 @@ fn validate_spoken_date(agreement: &str, date: NaiveDate, today: NaiveDate) -> R
         let between = &speech[before_end..chosen_at];
         if before != chosen && between.split(|c: char| !c.is_alphanumeric()).any(|word| word == "or") {
             return Err(format!(
-                "the caller offered two days ({before_word} or {chosen_word}); ask them in one short question \
-                 which one they want, then call this tool again with their answer"
+                "the caller named two days ({before_word} or {chosen_word}): ask which one, then call this tool again"
             ));
         }
     }
@@ -374,11 +372,9 @@ fn validate_spoken_date(agreement: &str, date: NaiveDate, today: NaiveDate) -> R
     };
     if !matches {
         return Err(format!(
-            "appointment date does not match the caller's selected day: {} is a {}, and they said {chosen_word} \
-             (today is {}); call this tool again with the date they chose",
+            "{} is a {}, but the caller said {chosen_word}: fix the date, then call this tool again",
             date,
-            date.format("%A"),
-            today.format("%A %-d %B %Y")
+            date.format("%A")
         ));
     }
     Ok(())
@@ -566,10 +562,7 @@ pub fn validate_with_readback(
         && readback_confirms(assistant_recent, &service, parsed_date, parsed_time, today);
     if !quote_matches && !readback_affirmed {
         return Err(
-            "agreement phrase does not match the caller's recent turns; ask one short natural \
-             confirmation question (never ask the caller to repeat exact wording), then call \
-             this tool again quoting their answer"
-                .into(),
+            "the agreement phrase is not what the caller said: ask them to confirm in one short question (never to repeat exact words), then call this tool again quoting their answer".into(),
         );
     }
     // The caller's consent: either the latest turn is itself a clear
@@ -590,10 +583,7 @@ pub fn validate_with_readback(
     });
     if !(latest_is_agreement || (latest_is_detail && booking_request_nearby)) {
         return Err(
-            "the caller has not clearly agreed to this slot yet; ask one short natural \
-             confirmation question (for example: 'Shall I put that request in for Thursday at \
-             10?'), then call this tool again"
-                .into(),
+            "the caller has not clearly agreed to this time yet: ask them to confirm it in one short question, then call this tool again".into(),
         );
     }
     // A newer date-bearing turn supersedes an earlier selection. Keep multiple
