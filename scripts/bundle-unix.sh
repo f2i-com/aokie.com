@@ -33,21 +33,32 @@ case "$(uname -s)" in
 esac
 command -v cargo > /dev/null || { echo "bundle-unix.sh needs cargo (https://rustup.rs)"; exit 1; }
 
-# The speech stack's build reads C headers with bindgen, which loads libclang. A Mac has one inside Xcode's
-# toolchain (or the command line tools', or Homebrew's llvm), and the build does not always look there: on GitHub's
-# macOS 15 runner it found none and stopped. It is looked for here and named to the build.
-if [ "$(uname -s)" = Darwin ] && [ -n "$features" ] && [ -z "${LIBCLANG_PATH:-}" ]; then
-  developer=$(xcode-select -p 2>/dev/null || true)
-  for dir in "$developer/Toolchains/XcodeDefault.xctoolchain/usr/lib" "$developer/usr/lib" \
-             /Library/Developer/CommandLineTools/usr/lib /opt/homebrew/opt/llvm*/lib /usr/local/opt/llvm*/lib; do
-    if [ -e "$dir/libclang.dylib" ]; then LIBCLANG_PATH=$dir; break; fi
-  done
+# The speech stack's build reads C headers with bindgen, which loads libclang from where LIBCLANG_PATH says. The
+# repository's cargo configuration names Windows' LLVM folder there for every system that has not set its own
+# (.cargo/config.toml: [env] has no target scope), so on a Mac or on Linux the build finds no libclang at all and
+# stops minutes in. This system's own is looked for here and named to the build: a Mac has one inside Xcode's
+# toolchain (or the command line tools', or Homebrew's llvm), Linux in its LLVM packages' folders.
+if [ -n "$features" ] && [ -z "${LIBCLANG_PATH:-}" ]; then
+  if [ "$(uname -s)" = Darwin ]; then
+    developer=$(xcode-select -p 2>/dev/null || true)
+    for dir in "$developer/Toolchains/XcodeDefault.xctoolchain/usr/lib" "$developer/usr/lib" \
+               /Library/Developer/CommandLineTools/usr/lib /opt/homebrew/opt/llvm*/lib /usr/local/opt/llvm*/lib; do
+      if [ -e "$dir/libclang.dylib" ]; then LIBCLANG_PATH=$dir; break; fi
+    done
+    missing="Xcode's command line tools bring one (xcode-select --install); so does \`brew install llvm\`"
+  else
+    # The newest LLVM first: libwebrtc's build asks for clang 21 or later.
+    for dir in $(ls -d /usr/lib/llvm-*/lib 2>/dev/null | sort -t- -k2 -n -r) /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+      if ls "$dir"/libclang*.so* > /dev/null 2>&1; then LIBCLANG_PATH=$dir; break; fi
+    done
+    missing="Debian and Ubuntu have it in libclang-<version>-dev"
+  fi
   if [ -n "${LIBCLANG_PATH:-}" ]; then
     export LIBCLANG_PATH
     echo "libclang: $LIBCLANG_PATH"
   else
-    echo "no libclang.dylib was found (Xcode's command line tools bring one: xcode-select --install; so does"
-    echo "\`brew install llvm\`). The speech stack's build needs it; set LIBCLANG_PATH to the folder it is in."
+    echo "no libclang was found. $missing."
+    echo "The speech stack's build needs it; set LIBCLANG_PATH to the folder it is in."
     exit 1
   fi
 fi
