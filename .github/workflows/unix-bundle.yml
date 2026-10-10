@@ -41,9 +41,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
-        with:
-          key: unix-bundle-${{ matrix.label }}
+      # No build cache: this is an occasional build, and a cache gives back a build folder without the speech
+      # libraries sherpa-onnx's build script had put in it (cargo does not track them), which is a bundle whose
+      # plugin cannot start. The third run met exactly that on its Linux leg.
 
       # libusb and udev for the USB transport, ALSA and the X libraries for libwebrtc, and clang 21: libwebrtc is
       # built against a libc++ of its own that asks for it, and Ubuntu 22.04 has 14.

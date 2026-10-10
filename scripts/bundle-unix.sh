@@ -64,21 +64,41 @@ if [ -n "$features" ] && [ -z "${LIBCLANG_PATH:-}" ]; then
 fi
 
 cd "$repo"
-echo "building the plugin${features:+ (features: $features)}"
-if [ -n "$features" ]; then
-  cargo build --release -p aokie-plugin --features "$features"
-else
-  cargo build --release -p aokie-plugin
-fi
-voice_server=""
-if [ -n "$features" ] && [ "${AOKIE_VOICE_SERVER:-1}" = 1 ]; then
-  echo "building the voice server"
-  if cargo build --release -p aokie-voice-server; then
-    voice_server="$target/release/aokie-voice-server"
+build() {
+  echo "building the plugin${features:+ (features: $features)}"
+  if [ -n "$features" ]; then
+    cargo build --release -p aokie-plugin --features "$features"
   else
-    echo "the voice server did not build here: the bundle goes on without it (the plugin's own speech stack stays)"
+    cargo build --release -p aokie-plugin
   fi
-fi
+  voice_server=""
+  if [ -n "$features" ] && [ "${AOKIE_VOICE_SERVER:-1}" = 1 ]; then
+    echo "building the voice server"
+    if cargo build --release -p aokie-voice-server; then
+      voice_server="$target/release/aokie-voice-server"
+    else
+      echo "the voice server did not build here: the bundle goes on without it (the plugin's own speech stack stays)"
+    fi
+  fi
+}
+speech_libraries_built() {
+  ls "$target/release"/libsherpa-onnx*."$lib"* > /dev/null 2>&1
+}
+build
+
+# The speech libraries are put beside the programs by sherpa-onnx's build script, and only when that script runs.
+# A build folder that came back from a cache without them (CI's cache keeps what cargo tracks, and cargo does not
+# track these) gives a plugin that links and cannot start: it asks for a library that is nowhere. So that script
+# is made to run again, and a bundle that would still be without them is not laid out.
+case ",$features," in
+  *,voice,*)
+    if ! speech_libraries_built; then
+      echo "the speech libraries are not beside the build: building sherpa-onnx's part again"
+      cargo clean --release -p sherpa-rs-sys
+      build
+      speech_libraries_built || { echo "the speech libraries are still not in $target/release: the plugin could not start from a bundle of this build"; exit 1; }
+    fi ;;
+esac
 
 rm -rf "$out"
 mkdir -p "$out"

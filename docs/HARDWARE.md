@@ -134,8 +134,19 @@ that is missing the plugin does not start and its log names the library.
 
 ## macOS
 
-**Not yet built or run on a Mac.** Everything below was made and checked
-without one. The Mac shares its code with Linux: the phone link is compiled
+**Built on a Mac, and never run on one with a dongle.** The plugin with voice
+has been built on GitHub's macOS 15 Apple-silicon runner (the workflow **Unix
+bundles**, 10 October 2026), and its bundle started there from its folder: it
+answers OAIY's first calls, finds no dongle, keeps its radio off and shuts down
+cleanly. Two things only a Mac build could show were met and fixed on the way:
+libwebrtc's Objective-C categories have to be linked in (`-ObjC`, in
+`.cargo/config.toml`), or the plugin aborts while it is loaded; and the build's
+libclang has to be named (`scripts/bundle-unix.sh` does). Nobody has had it on
+a Mac with a dongle, a phone or a Keychain prompt: the radio, pairing, calls
+and texts there are untried.
+
+Everything else below was made and checked without a Mac. The Mac shares its
+code with Linux: the phone link is compiled
 wherever the radio stack has a USB transport (Windows, Linux, macOS), and only
 what calls Windows itself stays Windows'. So the same code was built, tested
 and run on Linux, against a stand-in dongle (`scripts/virtual-dongle`). For an
@@ -235,6 +246,10 @@ from its folder on the build machine and asked what OAIY asks a plugin first
 (`python3 scripts/virtual-dongle/plugin_check.py --no-dongle <the program>`): it
 answers, lists no dongle, keeps its radio off, and shuts down cleanly. That says
 the bundle runs from its folder on that system, and nothing about a dongle.
+The workflow uses no build cache: a build folder that comes back from one has
+lost the speech libraries a build script had put in it, and `bundle-unix.sh`
+now builds that part again when it finds them missing rather than lay out a
+plugin that cannot start.
 The Mac's programs are signed there by nobody (ad hoc), which is what an
 Apple-silicon Mac asks before it runs a program; a downloaded one may still be
 held back by macOS until you allow it, as OAIY's own app is (OAIY's
