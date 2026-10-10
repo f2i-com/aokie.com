@@ -1,0 +1,104 @@
+# Unix bundles: the Aokie plugin for an Apple-silicon Mac and for Linux, each as an archive OAIY Desktop installs,
+# made on demand.
+#
+# A manual run only (Actions, "Unix bundles", Run workflow): nothing starts it by itself. Each leg runs
+# scripts/bundle-unix.sh on a runner of its system and uploads the folder it lays out, as a .tar.gz, as an artifact
+# of the run. Nothing is published, tagged or signed with a publisher's key, and the run is given no secret: OAIY
+# Desktop asks its owner to trust the plugin, as it does for any plugin that is not signed.
+#
+# The Mac's leg is how a Mac build is made without a Mac at hand, and with nothing to install on the Mac that uses
+# it: the plugin links macOS's own frameworks, so only a Mac can build it. Its programs are signed ad hoc there (a
+# signature an Apple-silicon Mac will run, with no identity behind it).
+#
+# Before it is uploaded, each bundle is started from its folder alone and asked what OAIY Desktop asks a plugin
+# first (scripts/virtual-dongle/plugin_check.py --no-dongle): a build machine has no dongle, so the radio is not
+# part of this, and neither is anything a phone does. docs/HARDWARE.md says what has and has not been tried.
+name: Unix bundles
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Aokie plugin (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: macos-arm64
+          - os: ubuntu-22.04
+            label: linux-x86_64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: unix-bundle-${{ matrix.label }}
+
+      # libusb and udev for the USB transport, ALSA and the X libraries for libwebrtc, and clang 21: libwebrtc is
+      # built against a libc++ of its own that asks for it, and Ubuntu 22.04 has 14.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libusb-1.0-0-dev libudev-dev pkg-config cmake \
+            libasound2-dev libssl-dev libglib2.0-dev libx11-dev libxext-dev
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main" | sudo tee /etc/apt/sources.list.d/llvm21.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-21 lld-21 libclang-21-dev
+          {
+            echo "CC=clang-21"
+            echo "CXX=clang++-21"
+            echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib"
+          } >> "$GITHUB_ENV"
+
+      - name: Build and lay out the plugin
+        run: sh scripts/bundle-unix.sh "$PWD/aokie"
+
+      # On a Mac every program and library is signed ad hoc, so that macOS runs it on Apple silicon. Before the
+      # check below: what is checked is what is uploaded.
+      - name: Sign ad hoc (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          find aokie -type f \( -perm +111 -o -name '*.dylib' \) -print0 | xargs -0 -n1 codesign --force --sign -
+          codesign -dv aokie/aokie-plugin 2>&1 | head -6
+          otool -L aokie/aokie-plugin | head -24
+
+      - name: The bundled plugin starts from its folder and answers
+        run: python3 scripts/virtual-dongle/plugin_check.py --no-dongle "$PWD/aokie/aokie-plugin"
+
+      # A .tar.gz keeps each program's mode, which a plugin's program needs to be started. The speech libraries'
+      # links are written out as files (-h): OAIY Desktop takes regular files and folders from an archive, and
+      # nothing else.
+      - name: Package
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Linux ]; then
+            for program in aokie/aokie-plugin aokie/aokie-voice-server; do
+              [ -f "$program" ] || continue
+              if ldd "$program" | grep -i 'not found'; then echo "::error::$program asks for a library that is neither in the bundle nor on this system"; exit 1; fi
+            done
+          fi
+          tar -czhf "aokie-plugin-${{ matrix.label }}.tar.gz" aokie
+          shasum -a 256 "aokie-plugin-${{ matrix.label }}.tar.gz"
+          tar -tzvf "aokie-plugin-${{ matrix.label }}.tar.gz" | head -40
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aokie-plugin-${{ matrix.label }}
+          path: aokie-plugin-${{ matrix.label }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30

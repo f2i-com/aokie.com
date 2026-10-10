@@ -121,6 +121,17 @@ from `btusb`, bring-up, events, ACL data, a voice link on each codec's
 alternate setting, and the dongle being pulled out. That proves the USB
 plumbing, not call audio: see the README there for what it can and cannot say.
 
+**A bundle with nothing to build.** `scripts/bundle-unix.sh` lays the plugin
+out as a folder, and the workflow **Unix bundles** (macOS, below, says how it is
+started) makes that folder on Ubuntu 22.04 as
+`aokie-plugin-linux-x86_64.tar.gz`. With the workflow's own commands in an
+Ubuntu 22.04 container, that archive was built and then installed into OAIY
+Desktop (its `.deb`) on a clean Ubuntu 24.04 by its path, as the `.tar.gz` and
+as a `.zip` of the same folder, trusted, and started: the plugin answers OAIY,
+and with no consent recorded and no dongle it keeps its radio off and says so.
+It uses the system's libusb (`libusb-1.0-0`), which a desktop install has; where
+that is missing the plugin does not start and its log names the library.
+
 ## macOS
 
 **Not yet built or run on a Mac.** Everything below was made and checked
@@ -210,6 +221,24 @@ then asks you to trust the plugin, as it does for any plugin that is not
 signed. `AOKIE_FEATURES="" sh scripts/bundle-unix.sh` builds without the speech
 stack: a plugin that pairs, texts and lets calls ring through, and a much
 shorter build to find out whether the dongle works at all.
+
+**Without building on the Mac.** GitHub's Mac can make the same folder: on the
+repository's page, **Actions**, **Unix bundles**, **Run workflow**
+(`.github/workflows/unix-bundle.yml`; it runs only when started like that, and
+publishes nothing). Each of its legs, one on a Mac and one on Ubuntu, runs
+`bundle-unix.sh` and uploads `aokie-plugin-macos-arm64.tar.gz` or
+`aokie-plugin-linux-x86_64.tar.gz` as the run's artifact. In OAIY Desktop, under
+**Connections**, **Plugins**, give that file's path to install it, then **Trust
+this plugin** and **Start**. Nothing has to be installed on the Mac that uses
+it: no Rust, no cmake, no Xcode tools. Before the upload each bundle is started
+from its folder on the build machine and asked what OAIY asks a plugin first
+(`python3 scripts/virtual-dongle/plugin_check.py --no-dongle <the program>`): it
+answers, lists no dongle, keeps its radio off, and shuts down cleanly. That says
+the bundle runs from its folder on that system, and nothing about a dongle.
+The Mac's programs are signed there by nobody (ad hoc), which is what an
+Apple-silicon Mac asks before it runs a program; a downloaded one may still be
+held back by macOS until you allow it, as OAIY's own app is (OAIY's
+`docs/MAC.md`).
 
 A plugin built with voice fetches its speech models the first time it starts,
 before its radio thread reports the dongle (as on Windows). That takes minutes
