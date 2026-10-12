@@ -67,7 +67,9 @@ in `AOKIE_FIRMWARE_DIR`, then in `firmware/rtl_bt` beside the plugin's program, 
 (Linux) in `/lib/firmware/rtl_bt`. Where the files are not there it says so in the log
 and the controller runs its ROM, as before. `aokie-radio-diag init` loads it too, and
 `probe` says which the controller runs. Checked on a `0bda:8771` dongle (ROM version
-1, 120 pieces): the ROM's `0x8761` became the firmware's `0xd922`.
+1, 120 pieces): the ROM's `0x8761` became the firmware's `0xd922`, a phone found and paired
+with "Aokie AI Assistant" (on the ROM it never listed it), and a test call through it had
+clear audio, as the tester heard it (2026-10-12). Texts and contacts not yet tried on it.
 
 ## Phones
 
