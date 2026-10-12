@@ -12,7 +12,7 @@
 #   powershell -File scripts/check-release.ps1 -AndroidTarget # + Companion Android target check (AK-19)
 #
 # Hardware-dependent suites (live radio, dongle-attached) stay out of scope
-# here by design — they are labelled and run supervised on the dev machine.
+# here by design - they are labelled and run supervised on the dev machine.
 # The self-host container smoke is the selfhost-smoke.yml manual workflow
 # (needs Linux + Docker); render-test.sh runs anywhere with sh.
 
@@ -44,7 +44,7 @@ function Invoke-Gate {
     }
 }
 
-# ── Feature-combination compile matrix (the repo's standing rule) ──
+# -- Feature-combination compile matrix (the repo's standing rule) --
 Invoke-Gate 'check: default features' $repo { cargo check -p aokie-plugin }
 Invoke-Gate 'check: voice' $repo { cargo check -p aokie-plugin --features voice }
 Invoke-Gate 'check: voice,managed-beta-driver (shipping combo)' $repo {
@@ -57,7 +57,7 @@ Invoke-Gate 'check: ONNX CUDA API and Candle engines' $repo {
     cargo check -p aokie-ai --features onnx-cuda,candle
 }
 
-# ── Tests ──
+# -- Tests --
 Invoke-Gate 'test: workspace (default features, transcribe-rs OpenAI engine on a loopback mock)' $repo {
     cargo test --workspace --features transcribe-rs/openai
 }
@@ -67,7 +67,7 @@ Invoke-Gate 'test: plugin (voice)' $repo {
     cargo test -p aokie-plugin --features voice -- --test-threads=2
 }
 
-# ── Lints ──
+# -- Lints --
 Invoke-Gate 'clippy: workspace (deny-level lints)' $repo {
     cargo clippy --workspace --all-targets --features transcribe-rs/openai
 }
@@ -75,44 +75,44 @@ Invoke-Gate 'clippy: plugin (voice)' $repo {
     cargo clippy -p aokie-plugin --all-targets --features voice
 }
 
-# ── Companion app — opt-in (npm toolchain) ──
+# -- Companion app - opt-in (npm toolchain) --
 if ($Companion) {
     Invoke-Gate 'companion: npm ci' (Join-Path $repo 'apps/aokie-mobile') { npm ci }
     Invoke-Gate 'companion: vitest' (Join-Path $repo 'apps/aokie-mobile') { npm test }
     Invoke-Gate 'companion: build (tsc + vite)' (Join-Path $repo 'apps/aokie-mobile') { npm run build }
 } else {
-    Write-Host "`n(skipped: Companion app — pass -Companion to include)" -ForegroundColor Yellow
+    Write-Host "`n(skipped: Companion app - pass -Companion to include)" -ForegroundColor Yellow
 }
 
-# ── Supply chain — opt-in (network) ──
+# -- Supply chain - opt-in (network) --
 if ($Audit) {
     Invoke-Gate 'cargo audit (RustSec)' $repo { cargo audit }
 } else {
-    Write-Host "(skipped: cargo audit — pass -Audit to include)" -ForegroundColor Yellow
+    Write-Host "(skipped: cargo audit - pass -Audit to include)" -ForegroundColor Yellow
 }
 
-# ── Cross-repo contract digest (audit FL-34) — cheap, always on; fails loudly
+# -- Cross-repo contract digest (audit FL-34) - cheap, always on; fails loudly
 # when the formlogic checkout is missing (set FORMLOGIC_REPO). The transfer_v1
 # contract is also compared with OAIY's copy of it: the folder
 # OAIY_TRANSFER_CONTRACTS names, else a sibling ../oaiy checkout. With neither, the
 # gate says SKIPPED in so many words (it does not fail: the OAIY checkout is not
 # needed to release this repository), so a green release check never silently
-# means the comparison ran. ──
+# means the comparison ran. --
 Invoke-Gate 'contracts: cross-repo digest (FL-34, transfer_v1 against OAIY when present)' $repo {
     node scripts/check-contracts.mjs --find-oaiy
 }
 
-# ── Self-host template rendering (audit AK-14) — cheap, always on ──
+# -- Self-host template rendering (audit AK-14) - cheap, always on --
 Invoke-Gate 'self-host: render acceptance (AK-14)' $repo {
     sh deploy/companion-self-host/render-test.sh
 }
 
-# ── Hygiene gates (audit AK-19) — opt-in, each fails loudly when its
-# toolchain is missing rather than self-skipping ──
+# -- Hygiene gates (audit AK-19) - opt-in, each fails loudly when its
+# toolchain is missing rather than self-skipping --
 if ($Fmt) {
     Invoke-Gate 'cargo fmt --check' $repo { cargo fmt --check }
 } else {
-    Write-Host "(skipped: cargo fmt --check — pass -Fmt to include; NOTE the tree carries pre-audit fmt drift)" -ForegroundColor Yellow
+    Write-Host "(skipped: cargo fmt --check - pass -Fmt to include; NOTE the tree carries pre-audit fmt drift)" -ForegroundColor Yellow
 }
 if ($Msrv) {
     # rust-version pins live in the shipping crates' Cargo.tomls; compiling
@@ -126,14 +126,14 @@ if ($Msrv) {
         cargo +1.88.0 check -p aokie-dongle --features managed-beta-driver --bins
     }
 } else {
-    Write-Host "(skipped: MSRV compile — pass -Msrv to include; requires 'rustup toolchain install 1.88.0')" -ForegroundColor Yellow
+    Write-Host "(skipped: MSRV compile - pass -Msrv to include; requires 'rustup toolchain install 1.88.0')" -ForegroundColor Yellow
 }
 if ($AndroidTarget) {
     Invoke-Gate 'companion: Android target check' $repo {
         cargo check -p aokie-mobile --target aarch64-linux-android
     }
 } else {
-    Write-Host "(skipped: Android target compile — pass -AndroidTarget to include; requires the NDK + 'rustup target add aarch64-linux-android')" -ForegroundColor Yellow
+    Write-Host "(skipped: Android target compile - pass -AndroidTarget to include; requires the NDK + 'rustup target add aarch64-linux-android')" -ForegroundColor Yellow
 }
 
 if ($failed) {
