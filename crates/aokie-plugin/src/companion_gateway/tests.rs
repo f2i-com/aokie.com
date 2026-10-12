@@ -5330,16 +5330,18 @@ async fn delayed_admission_rotation_keeps_heartbeats_ahead_of_lease_expiry() {
     assert_eq!(active.lease.phase, LeasePhase::Active);
     let logical_session = harness.session.plugin_session_nonce.clone();
 
-    // Put the predecessor lease one second from expiry. The delayed
-    // replacement represents the broker + endpoint challenge/open that
-    // used to run synchronously on this same authority path.
-    let now = unix_now().unwrap();
+    // Put the predecessor lease two seconds from expiry: the clock counts
+    // whole seconds, so with one the heartbeat could already fall in that
+    // second. The delayed replacement represents the broker + endpoint
+    // challenge/open that used to run synchronously on this same authority
+    // path.
+    let deadline = unix_now().unwrap() + 2;
     harness
         .session
         .leases
         .get_mut(&active.lease.jti)
         .expect("the active lease is current")
-        .expires_at = now + 1;
+        .expires_at = deadline;
     let host_rpc = HostRpc::new();
     let (request_id, _line, response) = host_rpc.begin("companion.admission", json!({}));
     let authority = test_authority();
@@ -5390,7 +5392,7 @@ async fn delayed_admission_rotation_keeps_heartbeats_ahead_of_lease_expiry() {
     harness.settle(&renewed_frames, TransportDelivery::Delivered);
     assert!(rotation.is_pending());
     assert_eq!(
-        harness.session.expire_relay_leases(now + 2, &harness.media),
+        harness.session.expire_relay_leases(deadline, &harness.media),
         0,
         "the queued heartbeat must renew before the old lease deadline is swept"
     );
@@ -5509,12 +5511,17 @@ async fn delayed_real_relay_rotation_opens_off_the_authority_path() {
         &mut harness,
         "request_real_admission_rotation_nonblocking",
     );
+    // Two seconds from expiry, from the clock as it is now: the setup above
+    // (a server, an authority, a takeover) took over a second on a loaded CI
+    // runner, so a deadline counted from the test's start had passed before
+    // the heartbeat, and the clock counts whole seconds.
+    let deadline = unix_now().unwrap() + 2;
     harness
         .session
         .leases
         .get_mut(&active.lease.jti)
         .unwrap()
-        .expires_at = now + 1;
+        .expires_at = deadline;
     let heartbeat = json!({
         "kind": "lease_heartbeat",
         "schemaVersion": SCHEMA_VERSION,
@@ -5529,7 +5536,7 @@ async fn delayed_real_relay_rotation_opens_off_the_authority_path() {
     harness.settle(&renewed_frames, TransportDelivery::Delivered);
     assert_eq!(renewed.status, PluginLeaseStatus::Renewed);
     assert_eq!(
-        harness.session.expire_relay_leases(now + 2, &harness.media),
+        harness.session.expire_relay_leases(deadline, &harness.media),
         0
     );
     assert!(rotation.is_pending());
