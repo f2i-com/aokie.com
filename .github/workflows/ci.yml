@@ -388,6 +388,9 @@ jobs:
           $dll | Copy-Item -Destination bundle/
           Copy-Item target/release/sherpa-onnx-c-api.dll bundle/
           Copy-Item target/release/sherpa-onnx-cxx-api.dll bundle/
+          # Realtek's RTL8761B firmware, its config and their licence, pinned: Aokie loads them into such a dongle at each
+          # start (realtek.rs), which a phone does not see on its ROM alone
+          ./scripts/fetch-realtek-firmware.ps1 -Destination bundle/firmware/rtl_bt
           ./scripts/verify-bundle-assets.ps1 -Bundle bundle -Voice
 
           # Cross-check: the helper bytes being PACKAGED must hash to the pin
@@ -608,6 +611,9 @@ jobs:
           $dll | Copy-Item -Destination bundle/
           Copy-Item target/release/sherpa-onnx-c-api.dll bundle/
           Copy-Item target/release/sherpa-onnx-cxx-api.dll bundle/
+          # Realtek's RTL8761B firmware, its config and their licence, pinned: Aokie loads them into such a dongle at each
+          # start (realtek.rs), which a phone does not see on its ROM alone
+          ./scripts/fetch-realtek-firmware.ps1 -Destination bundle/firmware/rtl_bt
           ./scripts/verify-bundle-assets.ps1 -Bundle bundle -Voice
 
           $pinned = (Get-Content pinned-helper-sha.txt -Raw).Trim()

@@ -1,6 +1,6 @@
 use crate::aokie_radio::pairing_store::AokiePairingStore;
 use crate::aokie_radio::transport::{self as winusb, AokieHciTransport};
-use crate::aokie_radio::{hci, hfp, l2cap, sco};
+use crate::aokie_radio::{hci, hfp, l2cap, realtek, sco};
 use std::time::{Duration, Instant};
 
 pub const AOKIE_CLASSIC_NAME: &str = "Aokie AI Assistant";
@@ -628,7 +628,22 @@ pub(crate) fn initialize_transport(
     transport.reset()?;
     transport.set_event_mask(AOKIE_EVENT_MASK)?;
 
-    let version = transport.read_local_version()?;
+    let mut version = transport.read_local_version()?;
+    // A Realtek controller on its ROM (an RTL8761B dongle) takes the settings below and is then seen by no phone:
+    // its firmware loaded first, as Realtek's own driver and Linux's btrtl load it (`realtek.rs`). The reset that ends
+    // the loading clears the event mask, set again. A controller that refused it goes on with its ROM, as before.
+    match realtek::load_firmware(transport, &version) {
+        Ok(Some(loaded)) => {
+            transport.set_event_mask(AOKIE_EVENT_MASK)?;
+            version = loaded;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("[AokieRadio] Realtek firmware not loaded ({e}): the controller goes on with its ROM");
+            transport.reset()?;
+            transport.set_event_mask(AOKIE_EVENT_MASK)?;
+        }
+    }
     let features = transport.read_local_supported_features()?;
     let buffer_size = transport.read_buffer_size()?;
     let local_address = transport.read_bd_addr()?;
