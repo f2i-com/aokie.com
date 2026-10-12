@@ -193,7 +193,7 @@ async function openScreen({ setup, payloads = {}, restartPlugin, hidden = false 
     visibleTabs: () => ['overview', 'consent', 'dongle', 'phone', 'settings', 'companion'].filter((t) => !el('tab-' + t).hidden),
     /** Click a [data-act] button inside a tab panel. */
     async click(panel, act, extra = {}) {
-      for (const fn of el('tab-' + panel).listeners.click || []) fn({ target: clickTarget({ 'data-act': act, ...extra }) });
+      for (const fn of el('tab-' + panel).listeners.click || []) fn({ target: clickTarget({ 'data-act': act, ...extra }), preventDefault() {} });
       await settle();
     },
     /** Click an element carrying `attrs` anywhere (the document's delegation). */
@@ -781,18 +781,53 @@ const noDriverList = { connected: [libusbDongle], driverModel: 'none', driverSig
 }
 
 {
-  // Windows is as it was: a bound dongle is "WinUSB installed" and can be handed back.
+  // Windows: a bound dongle is "WinUSB installed", picked by itself as the only one, and can be handed back. In
+  // the wizard the step's own heading says what this is (no card heading), the three driver steps are done, the
+  // dongle the radio is up on says so, and the buttons are the card's foot (the bar).
   const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
   const page = await openScreen({
     setup,
     payloads: { 'settings.get': { settings: {} }, 'dongle.diagnostics': radioUp, 'dongle.list': { connected: [boundDongle], driverModel: 'winusb' } },
   });
-  await pickDongle(page, boundDongle);
   const html = page.el('tab-dongle').innerHTML;
+  assert.match(html, /<input type="radio" name="dongle-pick" data-pick="2652:8684" checked \/>/, 'the only dongle is picked by itself');
   assert.match(html, /WinUSB installed/);
-  assert.match(html, /Step 1 of 3/);
-  assert.match(html, /data-act="dg-restore-arm"/);
-  assert.match(html, /USB Bluetooth dongle driver/);
+  assert.match(html, /in use/);
+  assert.equal((html.match(/<li class="is-done"/g) || []).length, 3, 'all three driver steps done');
+  assert.match(html, /<div class="rcp-actions rcp-dongle__bar">.*data-act="dg-rescan".*data-act="dg-restore-arm"/);
+  assert.doesNotMatch(html, /USB Bluetooth dongle driver|rcp-footnote|Guided setup/, 'the wizard step draws its own heading');
+}
+
+{
+  // Other hardware on the WinUSB driver (a lighting controller): listed apart and folded, never picked, nothing
+  // offered for it, and it does not count as a dongle with its driver.
+  const lights = { vid: 2821, pid: 6575, vidHex: '0x0B05', pidHex: '0x19AF', description: 'AURA LED Controller', matchesCatalog: false, driverBound: true };
+  const unbound = { ...boundDongle, driverBound: false };
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: { 'settings.get': { settings: {} }, 'dongle.diagnostics': radioDown, 'dongle.list': { connected: [lights, unbound], driverModel: 'winusb' } },
+  });
+  const html = () => page.el('tab-dongle').innerHTML;
+  assert.match(html(), /data-pick="2652:8684" checked/, 'the one dongle is picked, not the lights');
+  assert.doesNotMatch(html(), /data-pick="2821:6575"/, 'the lights cannot be picked');
+  assert.match(html(), /<details class="rcp-other-usb">.*Other USB devices on the WinUSB driver \(1\).*AURA LED Controller/);
+  assert.doesNotMatch(html(), /has its driver, but Aokie’s radio has not opened it/, 'the lights are not the dongle');
+  assert.match(html(), /data-act="dg-continue"/);
+  assert.doesNotMatch(html(), /dg-restore-arm/);
+  // The fold stays as the person left it across renders.
+  await page.click('dongle', 'dg-other-toggle');
+  assert.match(html(), /<details class="rcp-other-usb" open>/);
+  await page.click('dongle', 'dg-rescan');
+  assert.match(html(), /<details class="rcp-other-usb" open>/);
+  // A pick of the lights (a stale list) offers nothing either.
+  await pickDongle(page, lights);
+  assert.doesNotMatch(html(), /dg-restore-arm|dg-continue/);
+  // On to the driver: the dongle's own Back is named for what it does (the wizard has a Back of its own).
+  await pickDongle(page, unbound);
+  await page.click('dongle', 'dg-continue');
+  assert.match(html(), /data-act="dg-back">Choose another dongle</);
+  assert.match(html(), /<li class="is-done".*<li class="is-current" aria-current="step">.*Install its driver/);
 }
 
 console.log('Receptionist setup-mode checks passed (isolated host; no live commands).');

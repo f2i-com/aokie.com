@@ -73,6 +73,8 @@
   var radioStarting = false; // PluginHost.restartPlugin + waiting for the radio
   var radioStartError = null;
   var radioStartTimer = null;
+  // "Other USB devices" unfolded (kept across renders, which rebuild the list).
+  var otherOpen = false;
 
   function setupActive() {
     return !!(TABS.setup && TABS.setup.active());
@@ -107,6 +109,64 @@
   function connectedDevices() {
     return (list && list.connected) || [];
   }
+
+  /** "0bda:8771": a USB id as the catalog and the chip names below write it. */
+  function hexKey(d) {
+    var hex = function (n) {
+      var s = Number(n).toString(16);
+      while (s.length < 4) s = '0' + s;
+      return s;
+    };
+    return hex(d.vid) + ':' + hex(d.pid);
+  }
+
+  /** The chip in each dongle of Aokie's catalog (aokie-core's dongle_catalog.rs). */
+  var CHIPS = {
+    '0a5c:21e8': 'Broadcom BCM20702',
+    '0a5c:21ec': 'Broadcom BCM20702',
+    '0bda:8771': 'Realtek RTL8761B',
+    '0bda:c822': 'Realtek RTL8821C',
+    '0a12:0001': 'CSR8510 A10',
+  };
+
+  /** The chip's name where the device's own name does not say it already. */
+  function chipOf(d) {
+    var chip = CHIPS[hexKey(d)] || '';
+    return chip && dongleLabel(d).toLowerCase().indexOf(chip.toLowerCase()) < 0 ? chip : '';
+  }
+
+  /** The catalog's tier for a device ('certified' or 'beta'), '' where the catalog does not list it. */
+  function tierOf(d) {
+    var known = (list && list.dongles) || [];
+    for (var i = 0; i < known.length; i++) {
+      if (Number(known[i].vid) === Number(d.vid) && Number(known[i].pid) === Number(d.pid)) return String(known[i].tier || '');
+    }
+    return '';
+  }
+
+  /** A device to offer as Aokie's dongle: one Aokie knows, one that still needs its driver (listed as a
+   *  Bluetooth adapter), or one whose name says Bluetooth (Aokie's driver keeps the device's own name).
+   *  Anything else on WinUSB is other hardware that uses the same driver (a lighting or keyboard controller,
+   *  for one): it is listed apart, and nothing is offered for it. */
+  function isCandidate(d) {
+    return noDriver() || !!d.matchesCatalog || !d.driverBound || /bluetooth/i.test(dongleLabel(d));
+  }
+
+  function candidates() {
+    return connectedDevices().filter(isCandidate);
+  }
+
+  /** The dongle Aokie's radio is up on, where that can be told: the only candidate with its driver. */
+  function inUse(d) {
+    if (!radioUp() || !d.driverBound || !isCandidate(d)) return false;
+    var bound = candidates().filter(function (c) {
+      return c.driverBound;
+    });
+    return bound.length === 1 && key(bound[0]) === key(d);
+  }
+
+  var ICON_BLUETOOTH = U.svg('<path d="m7 7 10 10-5 5V2l5 5L7 17"/>', 16);
+  var ICON_DONE = U.svg('<path d="M20 6 9 17l-5-5"/>', 12);
 
   /** dongle.list's driverSigning: whether this build signs the driver on this computer. */
   function signing() {
@@ -169,6 +229,13 @@
         error = null;
         // Keep the selection pinned to the same physical id across refreshes.
         if (selectedKey && !selectedDevice()) selectedKey = null;
+        // Nothing picked yet: the dongle chosen for Aokie, else the only one there is to pick.
+        if (!selectedKey) {
+          var offered = candidates();
+          var chosen = offered.filter(isPreferred);
+          if (chosen.length === 1) selectedKey = key(chosen[0]);
+          else if (offered.length === 1) selectedKey = key(offered[0]);
+        }
         loading = false;
         render();
         return list;
@@ -446,7 +513,7 @@
     if ((!setupActive() && !noDriver()) || setupRadio === undefined) return '';
     if (radioUp()) {
       return (
-        '<p class="rcp-status-ok">' + ICONS.check + ' Aokie’s radio is up on the dongle' +
+        '<p class="rcp-status-ok rcp-radio-up">' + ICONS.check + ' Aokie’s radio is up on the dongle' +
         (setupRadio.localAddress ? ' (' + esc(setupRadio.localAddress) + ')' : '') +
         (setupActive() ? '. Press Next to pair your phone.' : '.') + '</p>'
       );
@@ -461,8 +528,9 @@
         '. Go back to the consent step, then return here.</span></div>'
       );
     }
+    // A dongle with its driver (not other hardware on WinUSB: that says nothing of the dongle).
     var bound = false;
-    var conn = connectedDevices();
+    var conn = candidates();
     for (var i = 0; i < conn.length; i++) {
       if (conn[i].driverBound) bound = true;
     }
@@ -509,24 +577,97 @@
 
   // ---- rendering ----------------------------------------------------------
 
-  function stepHeading() {
-    if (noDriver()) return '<p class="rcp-step-meta"><strong>Your Bluetooth dongle</strong></p>';
-    var stepIndex = step === 'select' ? 1 : step === 'install' ? 2 : 3;
-    var title =
-      step === 'select'
-        ? 'Choose your Bluetooth dongle'
-        : step === 'install'
-          ? 'Install the WinUSB driver'
-          : step === 'verify'
-            ? 'Verifying the driver'
-            : 'Dongle ready';
+  /** The driver wizard's three steps, as marks: done, the one open, still to come (Windows only: a system
+   *  that installs no driver has no steps). A picked dongle that has its driver already is all three done. */
+  function stepperHtml() {
+    if (noDriver()) return '';
+    var sel = selectedDevice();
+    var at =
+      step === 'select' ? (sel && sel.driverBound && isCandidate(sel) ? 3 : 0) : step === 'install' ? 1 : step === 'verify' ? 2 : 3;
+    var names = ['Choose the dongle', 'Install its driver', 'Check it'];
+    var items = [];
+    for (var i = 0; i < names.length; i++) {
+      var state = i < at ? 'is-done' : i === at ? 'is-current' : 'is-todo';
+      items.push(
+        '<li class="' + state + '"' + (i === at ? ' aria-current="step"' : '') + '>' +
+          '<span class="rcp-stepper__mark">' + (i < at ? ICON_DONE : String(i + 1)) + '</span>' +
+          '<span class="rcp-stepper__name">' + esc(names[i]) + '</span>' +
+          '<span class="rcp-sr">' + (i < at ? ', done' : i === at ? ', now' : '') + '</span>' +
+          '</li>'
+      );
+    }
+    return '<ol class="rcp-stepper" aria-label="Setting up the dongle">' + items.join('') + '</ol>';
+  }
+
+  /** One dongle to pick: what it is (the chip, where the catalog names it), its USB id, and how it stands. */
+  function dongleRowHtml(d) {
+    var isSel = selectedKey === key(d);
+    var chip = chipOf(d);
+    var tier = tierOf(d);
+    var badges =
+      (inUse(d) ? '<span class="rcp-badge is-ok">in use</span>' : '') +
+      (d.matchesCatalog
+        ? '<span class="rcp-badge ' + (tier === 'certified' ? 'is-ok' : 'is-neutral') + '">' + (tier ? esc(tier) : 'supported') + '</span>'
+        : '<span class="rcp-badge is-neutral">unknown chipset</span>') +
+      (noDriver()
+        ? '<span class="rcp-badge is-ok">no driver needed</span>'
+        : d.driverBound
+          ? '<span class="rcp-badge is-ok">WinUSB installed</span>'
+          : '<span class="rcp-badge is-pending">driver required</span>');
     return (
-      '<p class="rcp-step-meta"><strong>Step ' + stepIndex + ' of 3 — ' + esc(title) + '</strong></p>'
+      '<label class="rcp-wizard-row' + (isSel ? ' is-selected' : '') + '">' +
+      '<input type="radio" name="dongle-pick" data-pick="' + esc(key(d)) + '"' + (isSel ? ' checked' : '') + ' />' +
+      '<span class="rcp-wizard-row__icon">' + ICON_BLUETOOTH + '</span>' +
+      '<span class="rcp-wizard-row__name">' + esc(dongleLabel(d)) +
+      '<small>' + (chip ? esc(chip) + ' · ' : '') + 'USB ' + esc(idLabel(d)) + '</small></span>' +
+      '<span class="rcp-wizard-row__badges">' + badges + '</span>' +
+      '</label>'
+    );
+  }
+
+  /** Other hardware on the WinUSB driver: listed apart and folded, with nothing offered for it. */
+  function otherDevicesHtml(others) {
+    if (!others.length) return '';
+    var items = others.map(function (d) {
+      return '<li><span>' + esc(dongleLabel(d)) + '</span><small>USB ' + esc(idLabel(d)) + '</small></li>';
+    });
+    return (
+      '<details class="rcp-other-usb"' + (otherOpen ? ' open' : '') + '>' +
+      '<summary data-act="dg-other-toggle">Other USB devices on the WinUSB driver (' + others.length + ')</summary>' +
+      '<p class="rcp-step-meta">Not Bluetooth dongles: other hardware uses the same driver (a lighting or keyboard ' +
+      'controller, for one). Aokie changes nothing on them.</p>' +
+      '<ul>' + items.join('') + '</ul>' +
+      '</details>'
+    );
+  }
+
+  /** A step's buttons in one bar, the way on at its right (in OAIY's wizard it stays in view). */
+  function barHtml(left, right) {
+    return (
+      '<div class="rcp-actions rcp-dongle__bar">' +
+      left.join('') +
+      (right.length ? '<span class="rcp-dongle__bar-end">' + right.join('') + '</span>' : '') +
+      '</div>'
+    );
+  }
+
+  function errorHtml() {
+    if (!error) return '';
+    return (
+      '<div class="rcp-error" role="alert">' + esc(error) +
+      (step === 'verify'
+        ? ' <button type="button" class="rcp-button" data-act="dg-verify-again"' + (busy ? ' disabled' : '') + '>Check again</button>'
+        : '') +
+      '</div>'
     );
   }
 
   function selectStepHtml() {
     var conn = connectedDevices();
+    var offered = candidates();
+    var others = conn.filter(function (d) {
+      return !isCandidate(d);
+    });
     var html = [];
     if (list && list.liveEnumeration === false) {
       html.push(
@@ -535,8 +676,8 @@
       );
     }
     if (list === null && loading) {
-      html.push('<p class="rcp-loading" style="padding: 12px 0 0;">Scanning USB devices…</p>');
-    } else if (conn.length === 0) {
+      html.push('<p class="rcp-loading">Scanning USB devices…</p>');
+    } else if (offered.length === 0) {
       html.push(
         '<p class="rcp-step-meta">' +
           (loading
@@ -546,63 +687,42 @@
           '</p>'
       );
     } else {
-      var rows = [];
-      for (var i = 0; i < conn.length; i++) {
-        var d = conn[i];
-        var isSel = selectedKey === key(d);
-        rows.push(
-          '<label class="rcp-wizard-row' + (isSel ? ' is-selected' : '') + '">' +
-            '<input type="radio" name="dongle-pick" data-pick="' + esc(key(d)) + '"' + (isSel ? ' checked' : '') + ' />' +
-            '<span class="rcp-wizard-row__name">' + esc(dongleLabel(d)) +
-            '<small> · USB ' + esc(idLabel(d)) + '</small></span>' +
-            '<span class="rcp-wizard-row__badges">' +
-            (d.matchesCatalog
-              ? '<span class="rcp-badge is-ok">supported</span>'
-              : '<span class="rcp-badge is-neutral">unknown chipset</span>') +
-            (noDriver()
-              ? '<span class="rcp-badge is-ok">no driver needed</span>'
-              : d.driverBound
-                ? '<span class="rcp-badge is-ok">WinUSB installed</span>'
-                : '<span class="rcp-badge is-pending">driver required</span>') +
-            '</span>' +
-            '</label>'
-        );
-      }
-      html.push('<div class="rcp-wizard-list">' + rows.join('') + '</div>');
+      if (offered.length > 1 && !selectedDevice()) html.push('<p class="rcp-step-meta">Choose the dongle Aokie should use.</p>');
+      html.push('<div class="rcp-wizard-list">' + offered.map(dongleRowHtml).join('') + '</div>');
     }
+    html.push(otherDevicesHtml(others));
 
     var sel = selectedDevice();
-    var actions = [
-      '<button type="button" class="rcp-button" data-act="dg-rescan"' + (loading ? ' disabled' : '') + '>' +
-        (loading ? 'Scanning…' : 'Rescan') + '</button>',
-    ];
-    if (sel && !sel.driverBound) {
-      actions.push('<button type="button" class="rcp-button is-primary" data-act="dg-continue">Continue</button>');
-    }
+    if (sel && !isCandidate(sel)) sel = null;
+    var right = [];
     if (sel && noDriver()) {
-      actions.push(
-        '<span class="rcp-status-ok">' + ICONS.check + ' This computer needs no driver for the dongle: Aokie opens it as it is.</span>'
+      html.push(
+        '<p class="rcp-status-ok">' + ICONS.check + ' This computer needs no driver for the dongle: Aokie opens it as it is.</p>'
       );
       // No driver marks a dongle as Aokie's here, so with several Bluetooth
       // controllers connected (a laptop's own is one) the person says which.
       if (conn.length > 1 && !isPreferred(sel)) {
-        actions.push(
+        right.push(
           '<button type="button" class="rcp-button is-primary" data-act="dg-prefer" data-pick="' + esc(key(sel)) + '"' +
             (busy ? ' disabled' : '') + '>Use this dongle</button>'
         );
       } else if (isPreferred(sel)) {
-        actions.push('<span class="rcp-step-meta">Aokie is set to use this one.</span>');
+        html.push('<p class="rcp-step-meta">Aokie is set to use this one.</p>');
       }
     } else if (sel && sel.driverBound) {
-      actions.push(
-        '<span class="rcp-status-ok">' + ICONS.check + " This dongle already has the WinUSB driver — it's ready for Aokie.</span>"
-      );
-      actions.push(
+      // The radio's own line above says it is ready where it is up.
+      if (!radioUp()) {
+        html.push(
+          '<p class="rcp-status-ok">' + ICONS.check + " This dongle already has the WinUSB driver — it's ready for Aokie.</p>"
+        );
+      }
+      right.push(
         '<button type="button" class="rcp-button is-warn" data-act="dg-restore-arm" data-pick="' + esc(key(sel)) + '"' +
           (busy ? ' disabled' : '') + '>Restore Windows driver</button>'
       );
+    } else if (sel) {
+      right.push('<button type="button" class="rcp-button is-primary" data-act="dg-continue">Continue</button>');
     }
-    html.push('<div class="rcp-actions">' + actions.join('') + '</div>');
 
     if (sel && restoreArm === key(sel)) {
       html.push(
@@ -617,29 +737,48 @@
           '</div>'
       );
     }
+    html.push(errorHtml());
+    html.push(
+      barHtml(
+        ['<button type="button" class="rcp-button" data-act="dg-rescan"' + (loading ? ' disabled' : '') + '>' + (loading ? 'Scanning…' : 'Rescan') + '</button>'],
+        right
+      )
+    );
     return html.join('');
   }
 
   function installStepHtml() {
     var sel = selectedDevice();
-    if (!sel) return '<p class="rcp-error">The selected dongle disappeared — rescan and pick it again.</p>';
+    if (!sel) {
+      return (
+        '<p class="rcp-error">The selected dongle disappeared — rescan and pick it again.</p>' +
+        barHtml(['<button type="button" class="rcp-button" data-act="dg-back">Choose another dongle</button>'], [])
+      );
+    }
+    var chip = chipOf(sel);
     return (
-      '<p class="rcp-step-meta">Installing for <strong>' + esc(dongleLabel(sel)) + '</strong> (USB ' + esc(idLabel(sel)) + ').' +
+      '<div class="rcp-wizard-row is-selected is-static">' +
+      '<span class="rcp-wizard-row__icon">' + ICON_BLUETOOTH + '</span>' +
+      '<span class="rcp-wizard-row__name">' + esc(dongleLabel(sel)) +
+      '<small>' + (chip ? esc(chip) + ' · ' : '') + 'USB ' + esc(idLabel(sel)) + '</small></span>' +
+      '</div>' +
       (!sel.matchesCatalog
-        ? " This chipset isn't in the supported catalog — the host will refuse the install unless the unknown-dongle override is set."
+        ? "<p class=\"rcp-step-meta\">This chipset isn't in the supported catalog — the host will refuse the install unless the unknown-dongle override is set.</p>"
         : '') +
-      '</p>' +
       '<p class="rcp-step-meta">Windows will show a <strong>User Account Control</strong> prompt — choose <strong>Yes</strong>. ' +
       'Only this exact device is rebound (the installer pins its hardware identity), and you can restore the standard ' +
       'Windows driver at any time.</p>' +
       signingHtml() +
-      '<div class="rcp-actions">' +
-      '<button type="button" class="rcp-button" data-act="dg-back"' + (busy ? ' disabled' : '') + '>Back</button>' +
-      '<button type="button" class="rcp-button is-primary" data-act="dg-install"' +
-      (busy || (signingNeedsAcceptance() && !acceptSigning) ? ' disabled' : '') + '>' +
-      (busy ? 'Installing — watch for the Windows prompt…' : 'Install WinUSB driver') +
-      '</button>' +
-      '</div>'
+      errorHtml() +
+      barHtml(
+        ['<button type="button" class="rcp-button" data-act="dg-back"' + (busy ? ' disabled' : '') + '>Choose another dongle</button>'],
+        [
+          '<button type="button" class="rcp-button is-primary" data-act="dg-install"' +
+            (busy || (signingNeedsAcceptance() && !acceptSigning) ? ' disabled' : '') + '>' +
+            (busy ? 'Installing — watch for the Windows prompt…' : 'Install WinUSB driver') +
+            '</button>',
+        ]
+      )
     );
   }
 
@@ -673,7 +812,11 @@
   }
 
   function verifyStepHtml() {
-    return '<p class="rcp-step-meta">Checking that the dongle re-appeared as WinUSB-bound…</p>';
+    return (
+      '<p class="rcp-step-meta">Checking that the dongle came back with its WinUSB driver…</p>' +
+      '<span class="rcp-dongle__wait" aria-hidden="true"><i></i></span>' +
+      errorHtml()
+    );
   }
 
   function doneStepHtml() {
@@ -688,16 +831,16 @@
         : '<p class="rcp-step-meta">Next: open the ' +
           '<button type="button" class="rcp-link-btn" data-tabgo="phone">Phone setup tab</button>' +
           ' and pair your handset (Bluetooth pairing → "Pair a phone").</p>') +
-      '<div class="rcp-actions">' +
-      '<button type="button" class="rcp-button" data-act="dg-again">Set up another dongle</button>' +
-      '</div>'
+      errorHtml() +
+      barHtml(['<button type="button" class="rcp-button" data-act="dg-again">Set up another dongle</button>'], [])
     );
   }
 
   function render() {
     if (!root) return;
     reportProgress();
-    if (setupActive() && builtInTransport()) {
+    var setup = setupActive();
+    if (setup && builtInTransport()) {
       root.innerHTML = builtInHtml();
       return;
     }
@@ -707,39 +850,40 @@
     else if (step === 'verify') body = verifyStepHtml();
     else body = doneStepHtml();
 
+    // In OAIY's wizard the step's own heading says what this is: the card holds the radio's state, the
+    // steps and the step open, its buttons last.
     root.innerHTML =
-      '<section class="rcp-card">' +
-      '<div class="rcp-card__heading">' +
-      '<div class="rcp-card__heading-copy">' +
-      '<small>Dongle setup</small>' +
-      '<h3>' + (noDriver() ? 'USB Bluetooth dongle' : 'USB Bluetooth dongle driver') + '</h3>' +
-      '</div>' +
-      '</div>' +
+      '<section class="rcp-card rcp-dongle">' +
+      (setup
+        ? ''
+        : '<div class="rcp-card__heading">' +
+          '<div class="rcp-card__heading-copy">' +
+          '<small>Dongle setup</small>' +
+          '<h3>' + (noDriver() ? 'USB Bluetooth dongle' : 'USB Bluetooth dongle driver') + '</h3>' +
+          '</div>' +
+          '</div>') +
       '<div class="rcp-card__body">' +
-      (noDriver()
-        ? '<p class="rcp-inline-note">Plug the USB Bluetooth dongle in. This computer needs no driver for it: ' +
-          'Aokie opens the dongle when it starts.</p>'
-        : '<p class="rcp-inline-note">Guided setup for the USB Bluetooth dongle: pick the device, install the WinUSB ' +
-          "driver (one Windows prompt), and verify it's ready.</p>") +
+      (setup
+        ? ''
+        : noDriver()
+          ? '<p class="rcp-inline-note">Plug the USB Bluetooth dongle in. This computer needs no driver for it: ' +
+            'Aokie opens the dongle when it starts.</p>'
+          : '<p class="rcp-inline-note">Guided setup for the USB Bluetooth dongle: pick the device, install the WinUSB ' +
+            "driver (one Windows prompt), and verify it's ready.</p>") +
       setupStatusHtml() +
-      stepHeading() +
+      stepperHtml() +
       body +
-      (error
-        ? '<div class="rcp-error" style="padding: 10px 0 0;">' + esc(error) +
-          (step === 'verify'
-            ? ' <button type="button" class="rcp-button" data-act="dg-verify-again"' + (busy ? ' disabled' : '') + '>Check again</button>'
-            : '') +
-          '</div>'
-        : '') +
       '</div>' +
-      (noDriver()
-        ? '<p class="rcp-footnote">Aokie talks to the dongle directly over USB. Nothing is installed on this computer ' +
-          'for it, and closing Aokie gives the dongle back.</p>'
-        : '<p class="rcp-footnote">All device work happens in the plugin and its elevated helper — this screen only ' +
-          'sequences it. Restoring the Windows driver at any time hands the dongle back to BTHUSB.</p>') +
+      (setup
+        ? ''
+        : noDriver()
+          ? '<p class="rcp-footnote">Aokie talks to the dongle directly over USB. Nothing is installed on this computer ' +
+            'for it, and closing Aokie gives the dongle back.</p>'
+          : '<p class="rcp-footnote">All device work happens in the plugin and its elevated helper — this screen only ' +
+            'sequences it. Restoring the Windows driver at any time hands the dongle back to BTHUSB.</p>') +
       '</section>' +
       // Recovery for a working receptionist, not part of setting one up.
-      (setupActive() ? '' : resetCardHtml());
+      (setup ? '' : resetCardHtml());
   }
 
   /** The "Reset the dongle" card: software recovery without unplugging. */
@@ -792,7 +936,12 @@
       var btn = e.target && e.target.closest ? e.target.closest('[data-act]') : null;
       if (!btn || btn.disabled) return;
       var act = btn.getAttribute('data-act');
-      if (act === 'dg-rescan') refresh();
+      if (act === 'dg-other-toggle') {
+        // The list is rebuilt on every render: its fold follows this state, not the browser's own toggle.
+        e.preventDefault();
+        otherOpen = !otherOpen;
+        render();
+      } else if (act === 'dg-rescan') refresh();
       else if (act === 'dg-continue') {
         step = 'install';
         error = null;

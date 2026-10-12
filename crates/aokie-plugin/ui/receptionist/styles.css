@@ -1093,6 +1093,155 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 
 .rcp-wizard-row__badges { display: flex; flex-wrap: wrap; gap: 6px; }
 
+.rcp-wizard-row__icon {
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  place-items: center;
+  border-radius: var(--r-ctl);
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.rcp-wizard-row__name small { display: block; margin-top: 1px; }
+.rcp-wizard-row.is-static { cursor: default; }
+
+/* Read by a screen reader only. */
+.rcp-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* The driver wizard's steps: done ones ticked, the open one marked, a thread between. */
+.rcp-stepper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rcp-stepper li {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.rcp-stepper li:last-child { flex: 0 1 auto; }
+
+.rcp-stepper li:not(:last-child)::after {
+  min-width: 14px;
+  height: 1px;
+  flex: 1 1 auto;
+  background: var(--border);
+  content: '';
+}
+
+.rcp-stepper li.is-done:not(:last-child)::after { background: color-mix(in srgb, var(--green) 45%, var(--border)); }
+
+.rcp-stepper__mark {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  place-items: center;
+  border: 1px solid var(--strong-border);
+  border-radius: 50%;
+  background: var(--surface-solid);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.rcp-stepper__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rcp-stepper li.is-current { color: var(--text); }
+
+.rcp-stepper li.is-current .rcp-stepper__mark {
+  border-color: var(--primary);
+  color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+
+.rcp-stepper li.is-done .rcp-stepper__mark {
+  border-color: color-mix(in srgb, var(--green) 55%, transparent);
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+/* Aokie's radio is up: the step's news, in a box of its own. */
+.rcp-radio-up {
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--green) 35%, var(--border));
+  border-radius: var(--r-ctl);
+  background: var(--green-soft);
+  line-height: 1.5;
+}
+
+.rcp-radio-up svg { flex: none; }
+
+/* Other hardware on the WinUSB driver: folded, listed only. */
+.rcp-other-usb {
+  padding: 8px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-ctl);
+}
+
+.rcp-other-usb summary {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.rcp-other-usb summary:hover { color: var(--text); }
+.rcp-other-usb[open] summary { margin-bottom: 6px; }
+.rcp-other-usb ul { display: flex; flex-direction: column; gap: 4px; margin: 8px 0 2px; padding: 0; list-style: none; }
+.rcp-other-usb li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; color: var(--muted); font-size: 12.5px; }
+.rcp-other-usb li small { color: var(--faint); font-family: var(--font-mono); font-size: 11px; }
+
+/* The dongle card: its parts one gap apart, its buttons last, the way on at their right. */
+.rcp-dongle > .rcp-card__body { display: flex; flex-direction: column; gap: 10px; }
+.rcp-dongle > .rcp-card__body > * { margin-top: 0; margin-bottom: 0; }
+.rcp-dongle .rcp-wizard-list { margin-top: 0; }
+.rcp-dongle__bar { margin-top: 2px; }
+.rcp-dongle__bar-end { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+
+/* Waiting for the dongle to come back with its driver. */
+.rcp-dongle__wait {
+  position: relative;
+  display: block;
+  width: min(100%, 260px);
+  height: 5px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: var(--surface-soft);
+}
+
+.rcp-dongle__wait > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 34%;
+  border-radius: inherit;
+  background: var(--primary);
+  animation: rcp-dongle-wait 1.3s ease-in-out infinite;
+}
+
+@keyframes rcp-dongle-wait {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(310%); }
+}
+
 /* ── Companion: QR, identity, people ────────────────────────────────────── */
 
 .rcp-qr {
@@ -1280,6 +1429,25 @@ html[data-oaiy-setup] .rcp .rcp-card,
 .rcp.is-setup .rcp-card {
   gap: 10px;
   padding: 13px 14px 14px;
+}
+
+/* The dongle step's buttons are the card's foot, and stay at the frame's bottom edge while the list
+   above them scrolls, so the way on is always in view. */
+html[data-oaiy-setup] .rcp-dongle .rcp-dongle__bar,
+.rcp.is-setup .rcp-dongle .rcp-dongle__bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  margin: 4px -14px -14px;
+  padding: 10px 14px 12px;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 var(--r-card) var(--r-card);
+  background: var(--surface-solid);
+}
+
+@media (max-width: 560px) {
+  /* Only the open step's name, where three do not fit. */
+  .rcp-stepper li:not(.is-current) .rcp-stepper__name { display: none; }
 }
 
 /* ── Narrow windows ─────────────────────────────────────────────────────── */
