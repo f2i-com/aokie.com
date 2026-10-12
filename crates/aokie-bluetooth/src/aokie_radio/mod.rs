@@ -28,6 +28,7 @@ pub mod obex;
 pub mod pairing_store;
 pub mod pbap;
 pub mod pbap_runtime;
+pub mod realtek;
 pub mod rfcomm;
 pub mod runtime;
 pub mod sco;

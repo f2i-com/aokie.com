@@ -643,11 +643,17 @@ unsafe fn send_command(handle: WINUSB_INTERFACE_HANDLE, command: &[u8]) -> Resul
         Length: command.len() as u16,
     };
     let mut transferred = 0;
+    // WinUsb_ControlTransfer takes a buffer it may write to, and refuses one in read-only memory with
+    // ERROR_NOACCESS (998): a command written as a constant (`&[0x6d, 0xfc, 0x00]`, Realtek's Read ROM Version) is
+    // such a buffer. The command is sent from a copy of its own.
+    let mut buffer = command.to_vec();
+    // SAFETY: `handle` is the open interface this transport holds; `buffer` is `command.len()` bytes, owned and
+    // writable for the call; `transferred` outlives it; no OVERLAPPED is given, so the call completes before return.
     if WinUsb_ControlTransfer(
         handle,
         setup,
-        command.as_ptr() as *mut u8,
-        command.len() as u32,
+        buffer.as_mut_ptr(),
+        buffer.len() as u32,
         &mut transferred,
         null(),
     ) == 0

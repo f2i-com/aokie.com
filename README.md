@@ -87,7 +87,7 @@ the text or audio the enabled operation needs.
 | Chipset | VID:PID | Tier |
 |---|---|---|
 | Broadcom BCM20702 | `0a5c:21e8`, `0a5c:21ec` | Certified: answer, hear, speak and SMS run end to end |
-| Realtek RTL8761 | `0bda:8771` | Beta: enumerates and pairs; call audio may vary by firmware |
+| Realtek RTL8761 | `0bda:8771` | Beta: Aokie loads Realtek's firmware into it at each start (docs/HARDWARE.md); call audio not yet run end to end |
 | Realtek RTL8821CE | `0bda:c822` | Beta |
 | CSR CSR8510 A10 | `0a12:0001` | Beta |
 

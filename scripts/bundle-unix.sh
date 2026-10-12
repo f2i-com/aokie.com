@@ -162,6 +162,28 @@ if [ -n "$features" ] && [ "${AOKIE_FETCH_ORT:-1}" = 1 ]; then
   fi
 fi
 
+# Realtek's RTL8761B (USB) firmware, its config and their licence (pinned, as scripts/fetch-realtek-firmware.ps1
+# pins them): Aokie loads them into such a dongle at each start (realtek.rs), which a phone does not see on its ROM
+# alone. Linux has them in /lib/firmware/rtl_bt already where linux-firmware is installed; a Mac has nowhere else.
+# AOKIE_FETCH_REALTEK=0: none.
+if [ "${AOKIE_FETCH_REALTEK:-1}" = 1 ]; then
+  rtl_commit=afabaf773c4c2e2c841429933a6a084a5af4d14d
+  mkdir -p "$out/firmware/rtl_bt"
+  for entry in \
+    rtl_bt/rtl8761bu_fw.bin=1d7a9597349ad89344fa16c1913d3e39e9a12e966e417ca16871bc79bbe59edb \
+    rtl_bt/rtl8761bu_config.bin=6c28a3f07c6a30ed208c4b64862a23f02b7d93543ea980edd24df16bab45095f \
+    LICENSES/LICENCE.rtlwifi_firmware.txt=a61351665b4f264f6c631364f85b907d8f8f41f8b369533ef4021765f9f3b62e; do
+    path="${entry%%=*}"; sum="${entry#*=}"; dest="$out/firmware/rtl_bt/$(basename "$path")"
+    if curl -fsSL -o "$dest" "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/$rtl_commit/$path"; then
+      got=$(sha256_of "$dest")
+      [ "$got" = "$sum" ] || { rm -f "$dest"; echo "$path is not the pinned file (sha256 $got): removed"; exit 1; }
+    else
+      rm -f "$dest"
+      echo "Realtek's $path could not be fetched (no network?): an RTL8761B dongle runs its ROM, which phones do not see"
+    fi
+  done
+fi
+
 # Every file the manifest names must be in the bundle: a screen or a definition that is missing is a plugin OAIY
 # refuses to load.
 missing=0

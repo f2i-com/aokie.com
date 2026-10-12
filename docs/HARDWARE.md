@@ -33,12 +33,41 @@ the HFP/SCO/MAP path has been exercised on real silicon.
 |---|---|---|---|
 | Broadcom BCM20702 | `0a5c:21e8` | Certified | Common 2.4 GHz combo dongle |
 | Broadcom BCM20702 | `0a5c:21ec` | Certified | Variant of the above |
-| Realtek RTL8761 | `0bda:8771` | Beta | Chipset in many ASUS / TP-Link dongles |
+| Realtek RTL8761 | `0bda:8771` | Beta | Chipset in many ASUS / TP-Link dongles; Aokie loads Realtek's firmware into it at each start (below) |
 | Realtek RTL8821CE | `0bda:c822` | Beta | Combo cards in some HP / Lenovo laptops |
 | CSR CSR8510 A10 | `0a12:0001` | Beta | Ubiquitous BT 4.0 dongle; no vendor firmware load |
 
 **Certified** = the full answer/hear/speak/SMS path has been run end to end.
 **Beta** = enumerates and pairs; the SCO audio path may vary by firmware.
+
+### Realtek: the firmware Aokie loads
+
+A Realtek controller runs its ROM until its firmware is loaded into it, at every start
+(the patch lives in the controller's RAM: an HCI reset keeps it, a replug or a power loss
+clears it). On its ROM alone an RTL8761B dongle (`0bda:8771`) takes Aokie's name, class
+and scan settings and is then seen by no phone; Windows' own Bluetooth driver does not
+start one either, Realtek's driver being the one that loads the firmware, and Aokie
+replaces that driver. So Aokie loads it, as Linux's `drivers/bluetooth/btrtl.c` does
+(`crates/aokie-bluetooth/src/aokie_radio/realtek.rs`, from `initialize_transport`,
+before the name and scan settings): a controller that reports Realtek (93), subversion
+`0x8761`, HCI revision `0x000b` and HCI version 10 is on the RTL8761B's ROM; its ROM
+version is read (`0xfc6d`), the patch for it is taken from `rtl8761bu_fw.bin` (the
+"Realtech" container: the trailer's project must be the RTL8761B's, 14), the firmware's
+version is written over the patch's last four bytes, `rtl8761bu_config.bin` is
+appended, and the whole goes to the controller in pieces of 252 bytes (`0xfc20`). The
+controller then reports the firmware's version (`0xdfc6` / `0xd922`), and one with
+the firmware already loaded is left as it is.
+
+The two files are Realtek's, as linux-firmware redistributes them, under
+`LICENCE.rtlwifi_firmware.txt` (redistribution of the unmodified binary, its notice
+kept): `scripts/fetch-realtek-firmware.ps1` (and `bundle-unix.sh`) fetch them from
+linux-firmware's GitLab mirror at a pinned commit, each checked against its pinned
+SHA-256, into the bundle's `firmware/rtl_bt`, the licence beside them. The loader looks
+in `AOKIE_FIRMWARE_DIR`, then in `firmware/rtl_bt` beside the plugin's program, then
+(Linux) in `/lib/firmware/rtl_bt`. Where the files are not there it says so in the log
+and the controller runs its ROM, as before. `aokie-radio-diag init` loads it too, and
+`probe` says which the controller runs. Checked on a `0bda:8771` dongle (ROM version
+1, 120 pieces): the ROM's `0x8761` became the firmware's `0xd922`.
 
 ## Phones
 
