@@ -104,8 +104,13 @@ audio), and known phone issues.
 is opened through libusb and no driver is installed. It has run on an M5 Pro Mac with a
 Broadcom dongle, a paired phone and test calls; texts are untried there.
 [docs/HARDWARE.md](docs/HARDWARE.md#macos) says what a Mac build is, how to build one, and
-what only a Mac can answer. **Linux** is not supported yet, but the same plugin builds
-there; it has been built, tested and run against a stand-in dongle.
+what only a Mac can answer. **On Linux** (x86_64) a release has a bundle too, in beta: the
+dongle is opened through the system's libusb once the setup step's udev rule gives it to
+you, only a dongle in the catalog is used (a laptop's own Bluetooth is left to the
+system), and what Aokie keeps is sealed under a key in the desktop's keyring. It has been
+built, tested and run against a stand-in dongle, and started with no dongle on Ubuntu
+26.04; calls and texts with a real dongle are untried there
+([docs/HARDWARE.md](docs/HARDWARE.md#linux)).
 
 ## How it fits together
 
@@ -158,7 +163,8 @@ and the starter and its flows in [FormLogic](https://github.com/f2i-com/formlogi
 ## Install it into OAIY
 
 1. **Get a plugin bundle:** a release zip, `aokie-plugin-windows-<version>.zip` (or
-   `aokie-plugin-macos-arm64-<version>.zip` on an Apple-silicon Mac), or one you
+   `aokie-plugin-macos-arm64-<version>.zip` on an Apple-silicon Mac,
+   `aokie-plugin-linux-x86_64-<version>.zip` on Linux), or one you
    [build](#build-from-source).
 2. **Install it.** In OAIY Desktop, open **Connections → Plugins → Install a plugin** and
    choose the bundle's folder, `.zip` or `.tar.gz` (the Setup page offers the same as
