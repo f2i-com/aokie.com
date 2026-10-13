@@ -7,21 +7,37 @@
 //!
 //! Where the caller's number is known while the phone still rings and there
 //! is no message to say to them, the call is refused there instead and never
-//! picked up (`ring_verdict`): answering a blocked number to hang up on it
+//! picked up (`ring_action`): answering a blocked number to hang up on it
 //! tells whoever dials it that the line is live. A reject is only a request to
 //! the phone, so it is watched (`RingRefusal`): sent again when the call still
 //! rings, and after that the call is answered and refused at the greeting, as
 //! every screened call was before. A screened caller never rings through.
+//!
+//! The allowed list (`allowedNumbers`, in force while `callsAllowedOnly` is
+//! on) is who the receptionist answers at all: a caller not on it is left
+//! ringing on the phone for the owner (`otherCallers: "ring"`), or refused
+//! while it rings (`"reject"`). Either needs the number before the call is
+//! picked up, so a call whose number has not come is waited for a moment
+//! (`RING_ID_WAIT`, with AT+CLCC asked meanwhile), and is never answered on
+//! the list's behalf without one.
 
 /// Parsed screening policy. Built once at radio start from the settings-fed
 /// environment (`blockedNumbers` / `acceptPattern` / `rejectPrivate` /
-/// `screenMessage`).
+/// `screenMessage` / `allowedNumbers` / `callsAllowedOnly` / `otherCallers`).
 pub struct ScreenPolicy {
     /// Digits-only last-9 suffixes (the same matching rule as `phone_eq`
     /// everywhere else in the product).
     blocked: Vec<String>,
     accept: Option<regex::Regex>,
     pub reject_private: bool,
+    /// The allowed list (`allowedNumbers`), as digits-only last-9 suffixes.
+    allowed: Vec<String>,
+    /// `callsAllowedOnly`: only a caller on the allowed list is answered.
+    pub calls_allowed_only: bool,
+    /// `otherCallers`: a call from anyone else is left ringing on the phone
+    /// for the owner (true, `"ring"`, the default) or refused while it rings
+    /// (false, `"reject"`).
+    pub others_ring: bool,
     /// Spoken to a FILTERED / PRIVATE caller before hangup ("" = silent).
     /// The polite "call back with caller ID" line.
     pub message: String,
@@ -40,14 +56,33 @@ pub struct ScreenPolicy {
 
 impl ScreenPolicy {
     /// The line to speak for a given verdict reason before hangup ("" =
-    /// hang up silently). Blocked numbers get their own message.
+    /// hang up silently). Blocked numbers get their own message, and a
+    /// caller not on the allowed list is told nothing at all.
     pub fn message_for(&self, reason: &str) -> &str {
-        if reason == "blocked" {
-            self.blocked_message.trim()
-        } else {
-            self.message.trim()
+        match reason {
+            "blocked" => self.blocked_message.trim(),
+            "not_allowed" => "",
+            _ => self.message.trim(),
         }
     }
+}
+
+/// How long a ringing call's number is waited for, when the allowed list or
+/// `rejectPrivate` needs it before the call is picked up: +CLIP rides the
+/// RING, and the AT+CLCC asked meanwhile answers within a moment.
+pub(crate) const RING_ID_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// What is done with a call to us while it rings (`ScreenPolicy::ring_action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RingAction {
+    /// Answer it (the greeting site screens it further, as before).
+    Answer,
+    /// Not yet: its number may still come.
+    Wait,
+    /// Leave it ringing on the phone for the owner: not on the allowed list.
+    Leave,
+    /// Refuse it without picking it up, for this reason.
+    Refuse(&'static str),
 }
 
 /// How long the phone has to end a ringing call it was told to reject, before
@@ -110,6 +145,15 @@ pub(crate) fn list_has(list: &str, number: &str) -> bool {
             .any(|entry| entry.len() >= 6 && entry == wanted)
 }
 
+/// A list as the settings hold it, as digits-only last-9 suffixes (fragments
+/// of under six digits dropped: they would match too much).
+fn suffixes(list: &str) -> Vec<String> {
+    list.split(|c: char| c == ',' || c == '\n' || c == ';')
+        .map(digit_suffix)
+        .filter(|s| s.len() >= 6)
+        .collect()
+}
+
 pub(crate) fn digit_suffix(raw: &str) -> String {
     let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
     let n = digits.chars().count();
@@ -129,6 +173,9 @@ impl ScreenPolicy {
             blocked: Vec::new(),
             accept: None,
             reject_private: false,
+            allowed: Vec::new(),
+            calls_allowed_only: false,
+            others_ring: true,
             message: String::new(),
             blocked_message: String::new(),
             auto_block_abuse: false,
@@ -136,13 +183,21 @@ impl ScreenPolicy {
         }
     }
 
+    /// A policy that answers only `numbers` and leaves everyone else
+    /// ringing (`others_ring`) or refuses them: for tests that drive the
+    /// radio loop.
+    #[cfg(all(test, aokie_radio, feature = "voice"))]
+    pub(crate) fn allowing_only(numbers: &str, others_ring: bool) -> Self {
+        Self {
+            allowed: suffixes(numbers),
+            calls_allowed_only: true,
+            others_ring,
+            ..Self::permissive()
+        }
+    }
+
     pub fn from_env() -> Self {
-        let blocked = std::env::var("AOKIE_BLOCKED_NUMBERS")
-            .unwrap_or_default()
-            .split(|c: char| c == ',' || c == '\n' || c == ';')
-            .map(digit_suffix)
-            .filter(|s| s.len() >= 6)
-            .collect();
+        let blocked = suffixes(&std::env::var("AOKIE_BLOCKED_NUMBERS").unwrap_or_default());
         let accept = std::env::var("AOKIE_ACCEPT_PATTERN")
             .ok()
             .map(|p| p.trim().to_string())
@@ -157,20 +212,21 @@ impl ScreenPolicy {
                 }
             });
         let reject_private = std::env::var_os("AOKIE_REJECT_PRIVATE").is_some();
+        let allowed = suffixes(&std::env::var("AOKIE_ALLOWED_NUMBERS").unwrap_or_default());
+        let calls_allowed_only = std::env::var_os("AOKIE_CALLS_ALLOWED_ONLY").is_some();
+        let others_ring = std::env::var("AOKIE_OTHER_CALLERS").map_or(true, |v| v.trim() != "reject");
         let message = std::env::var("AOKIE_SCREEN_MESSAGE").unwrap_or_default();
         let blocked_message = std::env::var("AOKIE_BLOCKED_MESSAGE").unwrap_or_default();
         // Model output can end the current call but cannot persist a block.
         let auto_block_abuse = false;
-        let manager = std::env::var("AOKIE_MANAGER_NUMBERS")
-            .unwrap_or_default()
-            .split(|c: char| c == ',' || c == '\n' || c == ';')
-            .map(digit_suffix)
-            .filter(|s| s.len() >= 6)
-            .collect();
+        let manager = suffixes(&std::env::var("AOKIE_MANAGER_NUMBERS").unwrap_or_default());
         Self {
             blocked,
             accept,
             reject_private,
+            allowed,
+            calls_allowed_only,
+            others_ring,
             message,
             blocked_message,
             auto_block_abuse,
@@ -200,34 +256,90 @@ impl ScreenPolicy {
     }
 
     pub fn is_active(&self) -> bool {
-        !self.blocked.is_empty() || self.accept.is_some() || self.reject_private
+        !self.blocked.is_empty()
+            || self.accept.is_some()
+            || self.reject_private
+            || self.calls_allowed_only
     }
 
-    /// The verdict for a call that is still RINGING: `Some(reason)` when it is
-    /// to be refused without being picked up. Only for a call to us, whose
-    /// number is known already (a withheld number is told from a late one only
-    /// after the answer, so "private" is never decided here), and only when
-    /// there is no message to say to that caller: saying one needs the call
-    /// answered, and the greeting site does that.
-    pub fn ring_verdict(&self, outbound: bool, caller_id: Option<&str>) -> Option<&'static str> {
-        if outbound {
-            return None;
+    /// Whether `caller_id` is on the allowed list (a withheld number never is).
+    pub fn is_allowed(&self, caller_id: Option<&str>) -> bool {
+        let suffix = digit_suffix(caller_id.unwrap_or("").trim());
+        suffix.len() >= 6 && self.allowed.iter().any(|a| *a == suffix)
+    }
+
+    /// Whether the caller's number is needed before a call to us is picked
+    /// up (and asked of the phone when it did not come with the RING).
+    pub(crate) fn needs_ring_id(&self) -> bool {
+        self.calls_allowed_only || self.reject_private
+    }
+
+    /// Whether a caller not on the allowed list is refused (`otherCallers:
+    /// "reject"`) rather than left ringing for the owner.
+    fn refuses_others(&self) -> bool {
+        self.calls_allowed_only && !self.others_ring
+    }
+
+    /// What to do with a call TO US that rings: `caller_id` as known so far,
+    /// `withheld` once the phone has said the caller hides their number (the
+    /// incoming call in AT+CLCC, with no number), `ringing` how long it has
+    /// rung. A screened caller is refused there only when nothing is to be
+    /// said to them: saying a line needs the call answered, and the greeting
+    /// site does that. A number that never comes is answered as before (a
+    /// withheld one is told from a late one after the answer), except while
+    /// the allowed list is in force: it cannot vouch for an unknown caller.
+    pub(crate) fn ring_action(
+        &self,
+        caller_id: Option<&str>,
+        withheld: bool,
+        ringing: std::time::Duration,
+    ) -> RingAction {
+        let id = caller_id.map(str::trim).filter(|id| !id.is_empty());
+        if id.is_none() && !withheld {
+            if !self.calls_allowed_only && !self.reject_private {
+                return RingAction::Answer;
+            }
+            if ringing < RING_ID_WAIT {
+                return RingAction::Wait;
+            }
+            if !self.calls_allowed_only {
+                return RingAction::Answer;
+            }
+            return if self.others_ring {
+                RingAction::Leave
+            } else {
+                RingAction::Refuse("not_allowed")
+            };
         }
-        let id = caller_id.map(str::trim).filter(|id| !id.is_empty())?;
-        let reason = self.verdict(Some(id))?;
-        self.message_for(reason).is_empty().then_some(reason)
+        match self.verdict(id) {
+            Some(reason) if self.message_for(reason).is_empty() => RingAction::Refuse(reason),
+            Some(_) => RingAction::Answer,
+            None if self.calls_allowed_only && !self.is_allowed(id) => RingAction::Leave,
+            None => RingAction::Answer,
+        }
+    }
+
+    /// The verdict for a second caller knocking during a call: screened as
+    /// any caller is, and, while the allowed list is in force, anyone not on
+    /// it too (there is no ringing to leave them to: the phone is busy).
+    pub fn knock_verdict(&self, caller_id: Option<&str>) -> Option<&'static str> {
+        self.verdict(caller_id)
+            .or_else(|| (self.calls_allowed_only && !self.is_allowed(caller_id)).then_some("not_allowed"))
     }
 
     /// The screening verdict for a caller id (None/"" = withheld):
     /// `Some(reason)` means the call is screened out. Reasons are the
-    /// privacy-safe codes "blocked" / "filtered" / "private".
+    /// privacy-safe codes "blocked" / "filtered" / "private" /
+    /// "not_allowed". A caller not on the allowed list is screened out only
+    /// when others are refused: while they are left ringing for the owner,
+    /// one the owner answers is the receptionist's like any other.
     pub fn verdict(&self, caller_id: Option<&str>) -> Option<&'static str> {
         let id = caller_id.unwrap_or("").trim();
         if id.is_empty() {
             return if self.reject_private {
                 Some("private")
             } else {
-                None
+                self.refuses_others().then_some("not_allowed")
             };
         }
         let suffix = digit_suffix(id);
@@ -238,6 +350,9 @@ impl ScreenPolicy {
             if !re.is_match(id) {
                 return Some("filtered");
             }
+        }
+        if self.refuses_others() && !self.is_allowed(Some(id)) {
+            return Some("not_allowed");
         }
         None
     }
@@ -256,11 +371,23 @@ mod tests {
                 .collect(),
             accept: accept.map(|p| regex::Regex::new(p).unwrap()),
             reject_private: private,
+            allowed: Vec::new(),
+            calls_allowed_only: false,
+            others_ring: true,
             message: String::new(),
             blocked_message: String::new(),
             auto_block_abuse: false,
             manager: Vec::new(),
         }
+    }
+
+    /// `p` with the allowed list in force: `numbers` on it, and the others
+    /// left ringing (`ring`) or refused.
+    fn allowing(mut p: ScreenPolicy, numbers: &str, ring: bool) -> ScreenPolicy {
+        p.allowed = suffixes(numbers);
+        p.calls_allowed_only = true;
+        p.others_ring = ring;
+        p
     }
 
     fn with_manager(mut p: ScreenPolicy, numbers: &str) -> ScreenPolicy {
@@ -354,27 +481,93 @@ mod tests {
         assert_eq!(p.verdict(None), None);
     }
 
-    /// A screened caller is refused while the phone rings only when their
-    /// number is known and nothing is to be said to them; everyone else is
+    /// A screened caller is refused while the phone rings only when it is
+    /// known to be one and nothing is to be said to them; everyone else is
     /// left to the answer and the greeting site, as before.
     #[test]
-    fn a_ringing_call_is_refused_only_for_a_known_screened_number_with_no_message() {
+    fn a_ringing_call_is_refused_only_for_a_known_screened_caller_with_no_message() {
+        use std::time::Duration;
+        let ring = |p: &ScreenPolicy, id: Option<&str>| p.ring_action(id, false, Duration::ZERO);
         let mut p = policy("0491570156", Some(r"^(\+?61|0)4"), true);
-        assert_eq!(p.ring_verdict(false, Some("+61491570156")), Some("blocked"));
-        assert_eq!(p.ring_verdict(false, Some(" 0299998888 ")), Some("filtered"));
+        assert_eq!(ring(&p, Some("+61491570156")), RingAction::Refuse("blocked"));
+        assert_eq!(ring(&p, Some(" 0299998888 ")), RingAction::Refuse("filtered"));
         // Someone who is answered.
-        assert_eq!(p.ring_verdict(false, Some("0400111222")), None);
-        // No number yet: withheld or merely late is not known while it rings.
-        assert_eq!(p.ring_verdict(false, None), None);
-        assert_eq!(p.ring_verdict(false, Some("  ")), None);
-        // A call we placed is never screened.
-        assert_eq!(p.ring_verdict(true, Some("0491570156")), None);
+        assert_eq!(ring(&p, Some("0400111222")), RingAction::Answer);
+        // No number yet: rejectPrivate waits a moment for it…
+        assert_eq!(ring(&p, None), RingAction::Wait);
+        assert_eq!(ring(&p, Some("  ")), RingAction::Wait);
+        // …and a number that never comes is answered as before: a withheld
+        // one is told from a late one at the greeting.
+        assert_eq!(p.ring_action(None, false, RING_ID_WAIT), RingAction::Answer);
+        // The phone said the caller hides their number: refused while it rings.
+        assert_eq!(p.ring_action(None, true, Duration::ZERO), RingAction::Refuse("private"));
         // With a line to say to them, the call is answered to say it.
         p.blocked_message = "This number is not accepted.".into();
-        assert_eq!(p.ring_verdict(false, Some("0491570156")), None);
-        assert_eq!(p.ring_verdict(false, Some("0299998888")), Some("filtered"));
+        assert_eq!(ring(&p, Some("0491570156")), RingAction::Answer);
+        assert_eq!(ring(&p, Some("0299998888")), RingAction::Refuse("filtered"));
         p.message = "Please call back showing your number.".into();
-        assert_eq!(p.ring_verdict(false, Some("0299998888")), None);
+        assert_eq!(ring(&p, Some("0299998888")), RingAction::Answer);
+        assert_eq!(p.ring_action(None, true, Duration::ZERO), RingAction::Answer);
+        // Without the allowed list or rejectPrivate, a call without a number
+        // is not waited for.
+        let open = policy("0491570156", None, false);
+        assert_eq!(ring(&open, None), RingAction::Answer);
+        assert_eq!(open.ring_action(None, true, Duration::ZERO), RingAction::Answer);
+    }
+
+    /// The allowed list: its numbers are answered, however they are written;
+    /// anyone else is left ringing for the owner (or refused, with `reject`),
+    /// and a caller with no number is never answered on the list's behalf.
+    #[test]
+    fn the_allowed_list_answers_its_numbers_and_leaves_or_refuses_the_rest() {
+        use std::time::Duration;
+        let p = allowing(policy("", None, false), "+61 400 111 222\n0432 602 110", true);
+        assert!(p.is_active());
+        assert!(p.is_allowed(Some("0400111222")));
+        assert!(p.is_allowed(Some("+61432602110")));
+        assert!(!p.is_allowed(Some("0283901963")));
+        assert!(!p.is_allowed(None));
+        let now = Duration::ZERO;
+        assert_eq!(p.ring_action(Some("0400111222"), false, now), RingAction::Answer);
+        assert_eq!(p.ring_action(Some("+61283901963"), false, now), RingAction::Leave);
+        // No number: waited for, then left ringing; withheld: left at once.
+        assert_eq!(p.ring_action(None, false, now), RingAction::Wait);
+        assert_eq!(p.ring_action(None, false, RING_ID_WAIT), RingAction::Leave);
+        assert_eq!(p.ring_action(None, true, now), RingAction::Leave);
+        // Left ringing, they are not screened: one the owner answers is the
+        // receptionist's like any other.
+        assert_eq!(p.verdict(Some("0283901963")), None);
+        assert_eq!(p.verdict(None), None);
+
+        let r = allowing(policy("", None, false), "0400111222", false);
+        assert_eq!(r.ring_action(Some("0400111222"), false, now), RingAction::Answer);
+        assert_eq!(r.ring_action(Some("0283901963"), false, now), RingAction::Refuse("not_allowed"));
+        assert_eq!(r.ring_action(None, false, now), RingAction::Wait);
+        assert_eq!(r.ring_action(None, false, RING_ID_WAIT), RingAction::Refuse("not_allowed"));
+        assert_eq!(r.ring_action(None, true, now), RingAction::Refuse("not_allowed"));
+        // Refused, they are screened at the greeting too (a reject the phone
+        // did not act on is answered to be refused there), without a word.
+        assert_eq!(r.verdict(Some("0283901963")), Some("not_allowed"));
+        assert_eq!(r.verdict(None), Some("not_allowed"));
+        assert_eq!(r.verdict(Some("0400111222")), None);
+        let mut said = allowing(policy("", None, false), "0400111222", false);
+        said.message = "Please call back showing your number.".into();
+        assert_eq!(said.message_for("not_allowed"), "");
+        assert_eq!(said.ring_action(Some("0283901963"), false, now), RingAction::Refuse("not_allowed"));
+
+        // The block list and rejectPrivate still come first.
+        let both = allowing(policy("0400111222", None, true), "0400111222", true);
+        assert_eq!(both.ring_action(Some("0400111222"), false, now), RingAction::Refuse("blocked"));
+        assert_eq!(both.ring_action(None, true, now), RingAction::Refuse("private"));
+        // A second caller knocking during a call is not put through unless
+        // they are on the list, whatever happens to the others' calls.
+        assert_eq!(p.knock_verdict(Some("0283901963")), Some("not_allowed"));
+        assert_eq!(p.knock_verdict(None), Some("not_allowed"));
+        assert_eq!(p.knock_verdict(Some("0400111222")), None);
+        assert_eq!(policy("", None, false).knock_verdict(Some("0283901963")), None);
+        // An empty list in force answers nobody.
+        let none = allowing(policy("", None, false), "", true);
+        assert_eq!(none.ring_action(Some("0400111222"), false, now), RingAction::Leave);
     }
 
     /// A reject is a request: the phone has a moment to act on it, is told once

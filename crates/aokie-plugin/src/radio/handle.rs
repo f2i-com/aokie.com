@@ -432,6 +432,14 @@ impl RadioHandle {
             "inbound"
         }
     }
+    /// Whether the allowed list left `call_id` ringing for the owner
+    /// ("ringing"), and the owner took it on the phone ("taken").
+    pub fn left_to_owner(&self, call_id: &str) -> Option<&'static str> {
+        match self.status.left_to_owner.lock().unwrap().as_ref() {
+            Some((id, took)) if id == call_id => Some(if *took { "taken" } else { "ringing" }),
+            _ => None,
+        }
+    }
     pub fn call_started_at(&self) -> Option<String> {
         self.status.call_started_at.lock().unwrap().clone()
     }

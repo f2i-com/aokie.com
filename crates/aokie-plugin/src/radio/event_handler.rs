@@ -350,6 +350,12 @@ pub(super) fn handle_event(
                 _ => *snapshot = Some((std::time::Instant::now(), vec![rendered])),
             }
             drop(snapshot);
+            // The call to us that rings, listed with no number: its caller
+            // hides it. What lets the allowed list and rejectPrivate decide
+            // before the call is picked up (ScreenPolicy::ring_action).
+            if leg_status == 4 && number.as_deref().unwrap_or("").trim().is_empty() {
+                tracker.caller_withheld();
+            }
             // Structured twin — same burst window, consumed by the
             // verified-swap machinery (numbers matter there, rendering
             // doesn't).

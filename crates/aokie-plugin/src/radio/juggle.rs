@@ -116,12 +116,13 @@ pub(super) fn run_auto_hold_juggle(
             if primary_active && !busy && auto_hold_switch.is_some() {
                 *auto_hold_done_for = Some(w.call_id.clone());
                 // Screened callers (blocked list / accept-filter miss /
-                // withheld id with rejectPrivate) NEVER interrupt a live
+                // withheld id with rejectPrivate / not on the allowed list
+                // while it is in force) NEVER interrupt a live
                 // conversation: no juggle, no queue spot — they ring out
                 // at the network and their give-up leaves no missed-call
                 // record (user policy 2026-07-15). A call from them on an
                 // IDLE line still gets the normal answer-then-screen flow.
-                let knock_screen = screen_policy.verdict(if w.from.is_empty() {
+                let knock_screen = screen_policy.knock_verdict(if w.from.is_empty() {
                     None
                 } else {
                     Some(w.from.as_str())

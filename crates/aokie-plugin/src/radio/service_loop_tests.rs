@@ -810,3 +810,44 @@ fn an_ask_the_ai_never_acted_on_is_spent_when_it_gets_the_caller_back() {
     assert!(calls_the_tool_again(&mut l, "tool_2").is_none(), "the host is being asked");
     assert_eq!(plans_asked(&l), 1);
 }
+
+/// The allowed list: OAIY is told of a ringing call only once the receptionist
+/// will answer it. A caller not on the list is left ringing for the owner and
+/// nothing is started for them; when the owner answers in Aokie the call is
+/// OAIY's, and a caller on the list is started as before.
+#[test]
+fn a_caller_left_ringing_for_the_owner_reaches_oaiy_only_once_the_owner_hands_them_over() {
+    let ringing = |number: &str| {
+        let mut l = Loop::new();
+        l.tracker = crate::call_session::SessionTracker::new();
+        l.tracker.ring(CALL.into(), aokie_core::events::now_iso8601());
+        l.tracker.caller_id(number.into());
+        l.screen = crate::screen::ScreenPolicy::allowing_only("0491 570 006", true);
+        // (the ring's personalization window is over)
+        l.answer_hold_started = Some(Instant::now() - std::time::Duration::from_secs(10));
+        l
+    };
+    let mut other = ringing("02 8390 1963");
+    for _ in 0..3 {
+        other.pass();
+    }
+    assert_eq!(other.sessions(), 0, "nothing is started for a call left ringing");
+    other.tracker.current_mut().unwrap().left_ringing = true;
+    other.tracker.hand_to_receptionist();
+    other.tracker.answered();
+    other.pass();
+    assert_eq!(other.sessions(), 1, "answered in Aokie, the call is OAIY's");
+
+    let mut listed = ringing("+61 491 570 006");
+    listed.pass();
+    assert_eq!(listed.sessions(), 1, "a caller on the list is started while the phone rings, as before");
+
+    // Answered on the phone instead: the owner's call, and nothing is started.
+    let mut taken = ringing("02 8390 1963");
+    taken.pass();
+    taken.tracker.current_mut().unwrap().left_ringing = true;
+    taken.tracker.answered();
+    taken.pass();
+    taken.pass();
+    assert_eq!(taken.sessions(), 0, "the owner's call is not given to OAIY");
+}
