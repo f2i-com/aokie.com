@@ -114,6 +114,14 @@ def no_dongle(plugin):
     print("  %d Bluetooth controller(s) on this machine's USB" % len(listed.get("connected", [])), flush=True)
     if sys.platform != "win32":
         check(listed.get("driverModel") == "none", "this system installs no driver for the dongle")
+    if sys.platform.startswith("linux"):
+        # The dongle is given to the user by Aokie's udev rule; a controller the catalog does not name (a laptop's own
+        # Bluetooth) is left to the system, and each says whether this user can open it.
+        check(listed.get("accessModel") == "udev", "on Linux the dongle is opened once a udev rule allows it")
+        for d in listed.get("connected", []):
+            check(d.get("access") in ("granted", "needed", "unknown"), "%s says whether it can be opened" % d.get("hardwareId"))
+            check(d.get("usable") is bool(d.get("matchesCatalog")) or os.environ.get("AOKIE_INSTALL_UNKNOWN_DONGLE"),
+                  "%s is Aokie's only if the catalog names it" % d.get("hardwareId"))
     status = plugin.command("phone.status")
     check(status.get("connected") is not True, "no phone is connected (phone.status: %s)" % json.dumps(status)[:200])
     radio = plugin.command("dongle.diagnostics").get("radio") or {}

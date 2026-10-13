@@ -2268,6 +2268,9 @@ impl Plugin {
                 // Linux and macOS, where the radio opens the dongle as it is (the setup screen then has no
                 // driver step, and every connected dongle is driverBound).
                 let driver_model = if cfg!(target_os = "windows") { "winusb" } else { "none" };
+                // What the user needs to open a dongle on a no-driver system: on Linux the udev rule
+                // dongle.installDriver puts in place (each connected dongle's `access` says whether it is needed).
+                let access_model = if cfg!(target_os = "linux") { "udev" } else { "none" };
                 let note = if cfg!(target_os = "windows") {
                     "connected[] are live USB devices; driverBound=true means the WinUSB driver is attached and the dongle is ready to pair."
                 } else {
@@ -2280,6 +2283,7 @@ impl Plugin {
                     // Aokie's, this is what says which controller the radio opens.
                     "preferred": self.store.config.preferred_dongle,
                     "driverModel": driver_model,
+                    "accessModel": access_model,
                     "driverSigning": driver_signing(),
                     "liveEnumeration": live_err.is_none(),
                     "note": live_err.unwrap_or_else(|| note.to_string()),
@@ -4226,10 +4230,55 @@ impl Plugin {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    /// Linux: let this user open the dongle. No driver is installed (the radio takes the dongle from `btusb` itself
+    /// when it opens it); what stands in the way is the dongle's device node, which is root's. The udev rule
+    /// (`aokie_dongle_linux::udev_rule_path`) hands the catalog's dongles, and this one with the unknown-dongle
+    /// opt-in, to the user at the console; it is put in place through pkexec (the desktop's own password prompt)
+    /// and applied to the dongle plugged in. vid/pid from the payload, else the preferred dongle. A controller the
+    /// catalog does not name is refused without the opt-in: a computer's own Bluetooth is one.
+    #[cfg(target_os = "linux")]
+    fn install_driver(&self, payload: &Value) -> Result<Value, CmdError> {
+        use aokie_core::dongle_catalog::{DongleCompatTier, DongleId};
+        use aokie_dongle::aokie_dongle_linux::{install_rule, render_udev_rule, udev_rule_path};
+        let obj = payload.as_object().cloned().unwrap_or_default();
+        let (vid, pid) = if obj.contains_key("vid") || obj.contains_key("pid") {
+            (require_u16(&obj, "vid")?, require_u16(&obj, "pid")?)
+        } else if let Some(pref) = &self.store.config.preferred_dongle {
+            (pref.vid, pref.pid)
+        } else {
+            return Err(CmdError::failed(
+                "dongle.installDriver needs vid + pid (or set a preferred dongle via dongle.setPreferred first)",
+            ));
+        };
+        let known = dongle_catalog::dongle_tier(vid, pid).is_some();
+        if !known && !dongle_catalog::unknown_dongle_opted_in() {
+            return Err(CmdError::failed(format!(
+                "{vid:04x}:{pid:04x} is not a dongle Aokie knows, and on Linux a computer's own Bluetooth is a controller \
+                 like it: Aokie leaves it to the system. To let Aokie take it anyway, set \
+                 AOKIE_INSTALL_UNKNOWN_DONGLE={} before OAIY starts.",
+                dongle_catalog::UNKNOWN_DONGLE_OPT_IN
+            )));
+        }
+        let mut ids = dongle_catalog::list_known_dongles();
+        if !known {
+            ids.push(DongleId { vid, pid, tier: DongleCompatTier::Beta });
+        }
+        let permissive = std::env::var("AOKIE_UDEV_PERMISSIVE").as_deref() == Ok("1");
+        install_rule(&render_udev_rule(&ids, permissive), vid, pid)
+            .map_err(|e| CmdError::failed(format!("the dongle's access rule was not put in place: {e}")))?;
+        Ok(json!({
+            "installed": true,
+            "vid": vid,
+            "pid": pid,
+            "backend": "udev",
+            "rule": udev_rule_path(),
+        }))
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     fn install_driver(&self, _payload: &Value) -> Result<Value, CmdError> {
         Err(CmdError::failed(
-            "dongle.installDriver is a Windows step (WinUSB): this system installs no driver, Aokie opens the dongle as it is",
+            "dongle.installDriver is a Windows (WinUSB) and Linux (access) step: this system installs nothing, Aokie opens the dongle as it is",
         ))
     }
 
@@ -4347,7 +4396,8 @@ impl Plugin {
                     .into_iter()
                     .map(|d| {
                         let matches_catalog = dongle_catalog::dongle_tier(d.vid, d.pid).is_some();
-                        json!({
+                        #[allow(unused_mut)]
+                        let mut device = json!({
                             "vid": d.vid,
                             "pid": d.pid,
                             "vidHex": format!("0x{:04X}", d.vid),
@@ -4358,7 +4408,16 @@ impl Plugin {
                             "matchesCatalog": matches_catalog,
                             "compatibility": if matches_catalog { "catalogued" } else { "unverified" },
                             "driverBound": true,
-                        })
+                        });
+                        // Linux: whether this user can open it (else dongle.installDriver's rule is needed), and
+                        // whether the radio may take it at all: a controller the catalog does not name is left to
+                        // the system without the unknown-dongle opt-in (a laptop's own Bluetooth is one).
+                        #[cfg(target_os = "linux")]
+                        {
+                            device["access"] = json!(aokie_dongle::aokie_dongle_linux::access(&d.path).as_str());
+                            device["usable"] = json!(matches_catalog || dongle_catalog::unknown_dongle_opted_in());
+                        }
+                        device
                     })
                     .collect(),
                 None,
@@ -6463,15 +6522,16 @@ mod tests {
     fn hardware_commands_fail_typed_not_fake_success() {
         let mut plugin = Plugin::ephemeral(false);
         let mut sink = VecSink::default();
-        // dongle.installDriver is wired to the WinUSB installer now. With no vid/pid and no preferred
-        // dongle it fails TYPED asking for them (never a fake success); off-Windows it's unsupported.
+        // dongle.installDriver is wired to the WinUSB installer on Windows and to the udev rule on Linux. With no
+        // vid/pid and no preferred dongle it fails TYPED asking for them (never a fake success); on a Mac, which
+        // installs nothing, it's unsupported.
         let err = plugin
             .dispatch_command("dongle.installDriver", &Value::Null, &mut sink)
             .unwrap_err();
         assert_eq!(err.code, "command_failed");
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         assert!(err.message.contains("vid"), "got: {}", err.message);
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         assert!(err.message.contains("Windows"), "got: {}", err.message);
 
         let err = plugin
@@ -6480,6 +6540,23 @@ mod tests {
         assert!(err.message.contains("not yet wired to hardware"));
         // Diagnostics surfaces outbox health even in the error message.
         assert!(err.message.contains("dead"));
+    }
+
+    /// Linux: a controller the catalog does not name (a laptop's own Bluetooth is one, an Intel AX200 here) is
+    /// refused before anything is asked of the person: no rule, no password prompt.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_leaves_a_controller_the_catalog_does_not_name_to_the_system() {
+        if dongle_catalog::unknown_dongle_opted_in() {
+            return;
+        }
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+        let err = plugin
+            .dispatch_command("dongle.installDriver", &json!({"vid": 0x8087, "pid": 0x0029}), &mut sink)
+            .unwrap_err();
+        assert_eq!(err.code, "command_failed");
+        assert!(err.message.contains("8087:0029") && err.message.contains("leaves it to the system"), "got: {}", err.message);
     }
 
     #[test]

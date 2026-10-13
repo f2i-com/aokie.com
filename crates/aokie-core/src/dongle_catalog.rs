@@ -189,6 +189,20 @@ impl InstallRejection {
 /// or by a simple `=1` a script author copies without understanding.
 pub const UNKNOWN_DONGLE_OPT_IN: &str = "YES_I_REBIND_AT_MY_OWN_RISK";
 
+/// Whether the operator has opted in to Aokie taking a dongle that is not in the catalog:
+/// `AOKIE_INSTALL_UNKNOWN_DONGLE` holds [`UNKNOWN_DONGLE_OPT_IN`] (a debug build also takes `1`, for bringing up a
+/// new chipset). Read fresh on every call. On Windows it lets the WinUSB driver be bound to such a dongle; on Linux it
+/// lets the radio open one, where without it every controller the catalog does not name is left to the system: a
+/// laptop's own Bluetooth is a USB controller there, and the system's Bluetooth (a keyboard on it) with it.
+pub fn unknown_dongle_opted_in() -> bool {
+    match std::env::var("AOKIE_INSTALL_UNKNOWN_DONGLE") {
+        Ok(v) if v == UNKNOWN_DONGLE_OPT_IN => true,
+        #[cfg(debug_assertions)]
+        Ok(v) if v == "1" => true,
+        _ => false,
+    }
+}
+
 /// Device classes that are NEVER a Bluetooth dongle. Matched
 /// case-insensitively against `SPDRP_CLASS`. This is a deny-list, not an
 /// allow-list, because a legitimate dongle legitimately appears under
