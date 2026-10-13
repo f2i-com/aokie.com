@@ -1012,6 +1012,26 @@ pub fn enumerate_hci_radio_interfaces() -> Result<Vec<RadioInterface>, String> {
     // Linux doesn't have a parallel "WinUSB-claimed" vs "generic-USB"
     // distinction the way the Windows path does, so the HCI-narrowed
     // and the broad enumeration return the same set.
+    //
+    // But on Linux the computer's own Bluetooth is a USB controller too (a
+    // laptop's Intel, Realtek or MediaTek card), the system's Bluetooth and
+    // everything paired with it (a keyboard) on it, and the radio opens the
+    // first controller here when no dongle is chosen. Where Windows opens only
+    // a dongle Aokie's driver was bound to, Linux offers the radio only a
+    // dongle the catalog names, or any once the operator has given the
+    // unknown-dongle opt-in Windows asks before binding one. (A Mac's own
+    // Bluetooth is no USB device libusb can open.)
+    if cfg!(target_os = "linux") {
+        let any = aokie_core::dongle_catalog::unknown_dongle_opted_in();
+        return Ok(list_usb_radio_devices()?
+            .into_iter()
+            .filter(|d| any || aokie_core::dongle_catalog::dongle_tier(d.vid, d.pid).is_some())
+            .map(|d| RadioInterface {
+                path: d.path,
+                source: InterfaceSource::GenericUsbDevice,
+            })
+            .collect());
+    }
     enumerate_radio_interfaces()
 }
 

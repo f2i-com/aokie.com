@@ -353,13 +353,7 @@ pub fn find_device(vid: u16, pid: u16) -> Result<Option<UsbDevice>, String> {
 /// `=1`; debug builds also accept `1` for local bring-up of a new
 /// chipset. Read fresh on every call (env can change between installs).
 pub fn allow_unknown_dongle() -> bool {
-    use aokie_core::dongle_catalog::UNKNOWN_DONGLE_OPT_IN;
-    match std::env::var("AOKIE_INSTALL_UNKNOWN_DONGLE") {
-        Ok(v) if v == UNKNOWN_DONGLE_OPT_IN => true,
-        #[cfg(debug_assertions)]
-        Ok(v) if v == "1" => true,
-        _ => false,
-    }
+    aokie_core::dongle_catalog::unknown_dongle_opted_in()
 }
 
 /// AOK-DRIVER-001 install gate, shared by the unelevated dispatcher and

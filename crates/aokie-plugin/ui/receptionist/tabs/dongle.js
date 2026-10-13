@@ -178,6 +178,43 @@
     return !!(list && list.driverModel === 'none');
   }
 
+  /** Linux: the user opens the dongle once a udev rule gives it to them (`dongle.installDriver` puts it in place). */
+  function udevAccess() {
+    return !!(list && list.accessModel === 'udev');
+  }
+
+  /** Linux: a controller Aokie leaves to the system (not in the catalog, no unknown-dongle opt-in): a laptop's own
+   *  Bluetooth is one. */
+  function leftToSystem(d) {
+    return udevAccess() && d.usable === false;
+  }
+
+  /** Linux: a dongle this user cannot open yet. */
+  function accessNeeded(d) {
+    return udevAccess() && !leftToSystem(d) && d.access === 'needed';
+  }
+
+  /** Linux: put the rule in place that lets this user open `d` (the desktop asks for the password). */
+  function allow(d) {
+    busy = true;
+    error = null;
+    render();
+    HOST.command('dongle.installDriver', { vid: d.vid, pid: d.pid })
+      .then(
+        function () {
+          HOST.toast('success', 'Aokie may use ' + dongleLabel(d) + ' (USB ' + idLabel(d) + ') now. Start Aokie again to open it.');
+          return refresh();
+        },
+        function (e) {
+          error = errMsg(e);
+        }
+      )
+      .then(function () {
+        busy = false;
+        render();
+      });
+  }
+
   /** The dongle chosen for Aokie (dongle.setPreferred), as dongle.list reports it. */
   function isPreferred(d) {
     var p = list && list.preferred;
@@ -609,7 +646,11 @@
       (d.matchesCatalog
         ? '<span class="rcp-badge ' + (tier === 'certified' ? 'is-ok' : 'is-neutral') + '">' + (tier ? esc(tier) : 'supported') + '</span>'
         : '<span class="rcp-badge is-neutral">unknown chipset</span>') +
-      (noDriver()
+      (leftToSystem(d)
+        ? '<span class="rcp-badge is-neutral">left to the system</span>'
+        : accessNeeded(d)
+          ? '<span class="rcp-badge is-pending">access needed</span>'
+        : noDriver()
         ? '<span class="rcp-badge is-ok">no driver needed</span>'
         : d.driverBound
           ? '<span class="rcp-badge is-ok">WinUSB installed</span>'
@@ -695,7 +736,23 @@
     var sel = selectedDevice();
     if (sel && !isCandidate(sel)) sel = null;
     var right = [];
-    if (sel && noDriver()) {
+    if (sel && leftToSystem(sel)) {
+      // (not offered to the radio: on Linux a computer's own Bluetooth is a USB controller like a dongle)
+      html.push(
+        '<p class="rcp-step-meta">This is not a dongle Aokie knows, and this computer’s own Bluetooth is a controller ' +
+          'like it, so Aokie leaves it to the system. Plug in a supported USB Bluetooth dongle for Aokie.</p>'
+      );
+    } else if (sel && accessNeeded(sel)) {
+      html.push(
+        '<p class="rcp-step-meta">Linux gives a USB device to the person using the computer once a rule says so. Aokie ' +
+          'puts that rule in place for its dongles (your password is asked), and takes the dongle from the system’s ' +
+          'Bluetooth only while Aokie runs.</p>'
+      );
+      right.push(
+        '<button type="button" class="rcp-button is-primary" data-act="dg-allow" data-pick="' + esc(key(sel)) + '"' +
+          (busy ? ' disabled' : '') + '>Allow Aokie to use this dongle</button>'
+      );
+    } else if (sel && noDriver()) {
       html.push(
         '<p class="rcp-status-ok">' + ICONS.check + ' This computer needs no driver for the dongle: Aokie opens it as it is.</p>'
       );
@@ -968,6 +1025,9 @@
       } else if (act === 'dg-prefer') {
         var chosen = selectedDevice();
         if (chosen && key(chosen) === btn.getAttribute('data-pick')) prefer(chosen);
+      } else if (act === 'dg-allow') {
+        var granted = selectedDevice();
+        if (granted && key(granted) === btn.getAttribute('data-pick')) allow(granted);
       } else if (act === 'dg-verify-again') {
         // The verify target may be ABSENT from the live list mid-rebind —
         // retry against the captured target, not the (possibly null)

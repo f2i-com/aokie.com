@@ -125,6 +125,9 @@ fi
 echo "the system's driver on the dongle before the test: $before (voice interface: $(driver_of "$sys:1.1"))"
 
 export AOKIE_VIRTUAL_DONGLE="usb:$bus:$dev"
+# The stand-in has a test id (1209:0001) no catalog names, and on Linux the radio opens only a dongle the catalog
+# names unless the operator opts in to an unknown one (a laptop's own Bluetooth is a USB controller too): this is that.
+export AOKIE_INSTALL_UNKNOWN_DONGLE=YES_I_REBIND_AT_MY_OWN_RISK
 cd "$repo"
 
 # AOKIE_CARGO_ARGS: more for cargo, e.g. "--features rusb/vendored" to run against libusb built from the sources
