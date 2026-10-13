@@ -289,6 +289,11 @@ mod tests {
     use super::*;
 
     fn temp_store_path(tag: &str) -> PathBuf {
+        // Off Windows a store seals its keys under a key the login Keychain or the desktop's Secret Service keeps: a
+        // test run keeps that key in its own process instead (a debug build's AOKIE_SEAL_EPHEMERAL), so that it puts
+        // nothing into the developer's keyring and runs where there is none (a container, CI).
+        #[cfg(not(windows))]
+        std::env::set_var("AOKIE_SEAL_EPHEMERAL", "1");
         std::env::temp_dir().join(format!(
             "aokie_pairing_store_{}_{}_{}.json",
             tag,
