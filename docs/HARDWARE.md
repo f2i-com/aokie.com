@@ -139,10 +139,47 @@ likely vendor-specific failure point.
 
 ## Linux
 
-Linux uses libusb rather than WinUSB. The selected VID/PID needs an appropriate
-udev permission rule, and Aokie may need to detach the kernel `btusb` driver for
-the session. The shared radio stack is portable, but Linux packaging and the
-real-hardware call/SMS/audio matrix are not yet release-qualified.
+Linux uses libusb rather than WinUSB, and installs no driver. What stands between
+the plugin and the dongle is the dongle's device node, which is root's: the dongle
+setup step's **Allow Aokie to use this dongle** (`dongle.installDriver` on Linux)
+puts a udev rule at `/etc/udev/rules.d/70-aokie.rules` through pkexec (the
+desktop's own password prompt) that gives the catalog's dongles to the user at the
+console (`TAG+="uaccess"`; numbered before `73-seat-late.rules`, where logind turns
+that tag into the user's access, or it would come too late), and applies it to the
+dongle plugged in. `AOKIE_UDEV_PERMISSIVE=1` writes it for every account instead
+(`MODE="0666"`), for a system without logind. The radio takes the dongle from the
+kernel's `btusb` when it opens it, and gives it back when it stops.
+
+**Only a dongle the catalog names is opened.** A laptop's own Bluetooth is a USB
+controller too (an Intel, Realtek or MediaTek card, with the system's Bluetooth
+and everything paired with it on it), and the radio used to open the first
+controller it found when no dongle was chosen. On Linux a controller the catalog
+does not name is left to the system, listed by `dongle.list` as `usable: false`,
+and `dongle.installDriver` refuses it, unless `AOKIE_INSTALL_UNKNOWN_DONGLE` gives
+the opt-in Windows asks before binding such a dongle (OAIY Desktop forwards both
+variables to Aokie alone, from 0.1.4+14). Each listed controller also says whether
+this user can open it (`access`: `granted` or `needed`).
+
+**What Aokie keeps is sealed, as on a Mac.** The phone's pairing keys, the
+outbox's texts and transcripts, and the AI providers' API keys go under a key in
+the desktop's Secret Service (GNOME Keyring, KWallet: libdbus, which a desktop
+has), where the Mac's is in the Keychain. Before this, Linux sealed nothing (the
+outbox refused every sensitive write) and the API keys were in the kernel's
+keyring, gone at every restart. A session with no Secret Service (a server with no
+desktop) stores nothing sealed and says so. OAIY Desktop gives a plugin
+`XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` to reach it (from 0.1.4+14).
+
+A release carries a Linux bundle, `aokie-plugin-linux-x86_64-<tag>.zip`, built on
+Ubuntu 22.04 by `plugin-release-linux` (and attached to the release by
+`publish-linux`). The real-hardware call/SMS/audio matrix is not yet qualified on
+Linux.
+
+On 13 October 2026 it was built here and started on a GPD Win Max (Ubuntu 26.04,
+an Intel AX200 for the laptop's own Bluetooth) with no dongle: `dongle.list`
+listed the AX200 as `8087:0029`, `access: needed`, `usable: false`;
+`dongle.installDriver` for it was refused before any prompt; a value sealed under
+the Secret Service's key opened again; and the bundle was installed into OAIY
+Desktop from its folder.
 
 The libusb transport has not talked to a real dongle yet. What it has been run
 against is a stand-in: `scripts/virtual-dongle` serves a USB Bluetooth

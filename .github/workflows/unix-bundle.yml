@@ -45,14 +45,15 @@ jobs:
       # libraries sherpa-onnx's build script had put in it (cargo does not track them), which is a bundle whose
       # plugin cannot start. The third run met exactly that on its Linux leg.
 
-      # libusb and udev for the USB transport, ALSA and the X libraries for libwebrtc, and clang 21: libwebrtc is
-      # built against a libc++ of its own that asks for it, and Ubuntu 22.04 has 14.
+      # libusb and udev for the USB transport, libdbus for the Secret Service the sealing key is kept in, ALSA and the X
+      # libraries for libwebrtc, and clang 21: libwebrtc is built against a libc++ of its own that asks for it, and
+      # Ubuntu 22.04 has 14.
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libusb-1.0-0-dev libudev-dev pkg-config cmake \
+            libusb-1.0-0-dev libudev-dev libdbus-1-dev pkg-config cmake \
             libasound2-dev libssl-dev libglib2.0-dev libx11-dev libxext-dev
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
           echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main" | sudo tee /etc/apt/sources.list.d/llvm21.list
