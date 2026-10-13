@@ -165,7 +165,7 @@ that is missing the plugin does not start and its log names the library.
 
 ## macOS
 
-**Run on a Mac with a dongle; not yet with a phone.** The plugin with voice
+**Run on a Mac with a dongle and a phone; a release carries a Mac bundle.** The plugin with voice
 has been built on GitHub's macOS 15 Apple-silicon runner (the workflow **Unix
 bundles**, 10 October 2026), and its bundle started there from its folder: it
 answers OAIY's first calls, finds no dongle, keeps its radio off and shuts down
@@ -185,7 +185,8 @@ down. That dongle calls its HCI and voice interfaces vendor-specific
 (0xFF/0x01/0x01, not the standard 0xE0/0x01/0x01), which the transport had
 not taken for Bluetooth until then: it now does, from Broadcom and the
 vendors that sell Broadcom's dongles. Pairing a phone, calls and texts, and
-the Keychain's prompt are still untried there.
+the Keychain's prompt were untried then; since, a phone has been paired there
+and test calls answered by OAIY's voice. Texts are still untried on a Mac.
 
 Everything else below was made and checked without a Mac. The Mac shares its
 code with Linux: the phone link is compiled
@@ -269,7 +270,16 @@ builds the plugin with voice and lays out the folder OAIY Desktop loads, with
 the manifest's entry changed to `aokie-plugin` (the one difference from the
 Windows manifest) and ONNX Runtime 1.25.0 fetched for the speech engines that
 run on it (Microsoft publishes it for Apple silicon, not for Intel Macs, where
-those engines stay off). Its last lines say where to copy the folder; OAIY Desktop
+those engines stay off). libusb goes beside the plugin as a library of its own,
+`libusb-1.0.0.dylib`: the script fetches libusb's release (1.0.27, the version
+the `libusb1-sys` crate carries, its digest pinned), builds it as a library
+for macOS 11 and later, and has cargo link the plugin to it in place of the
+copy that crate would build in (a `links` override, `target.<host>."usb-1.0"`,
+in a configuration file of its own). It refuses to lay out a bundle whose
+plugin still has libusb built in, and puts libusb's licence and that source in
+`third-party/libusb-1.0.27/`. A plain `cargo build` on a Mac still builds
+libusb in, which is fine for a program that stays on the Mac it was built on.
+Its last lines say where to copy the folder; OAIY Desktop
 then asks you to trust the plugin, as it does for any plugin that is not
 signed. `AOKIE_FEATURES="" sh scripts/bundle-unix.sh` builds without the speech
 stack: a plugin that pairs, texts and lets calls ring through, and a much
@@ -311,9 +321,20 @@ run neither writes to your Keychain nor waits on its prompt, once for every
 test program. Release builds ignore it. No test covers the Keychain itself, or
 the outbox sealed with it: a test's outbox is not sealed off Windows.
 
-A build for other people is another matter: it would have to be signed and
-notarised, and libusb is LGPL-2.1, which sets terms for a library linked into a
-program (`crates/aokie-bluetooth/Cargo.toml` says what the choices are).
+**A release's Mac bundle.** Each release (production and managed beta) carries
+`aokie-plugin-macos-arm64-<tag>.zip`, made by the `plugin-release-macos` job of
+`.github/workflows/ci.yml` on GitHub's Mac: `bundle-unix.sh`, every program and
+library signed ad hoc, the bundle started from its folder (`plugin_check.py
+--no-dongle`), then `release-manifest.json`, `SHA256SUMS.txt` and a
+`package-manifest.json` signed with Aokie's package key, as the Windows bundle
+is, so OAIY verifies it as Aokie's and needs no "Trust this plugin". The zip is
+unpacked again and checked before `publish-macos` attaches it to the release.
+libusb is LGPL-2.1: Aokie loads it as the library beside the plugin, which may
+be replaced with one's own build (`third-party/libusb-1.0.27/README.md` says
+how, and that OAIY then asks to trust the changed plugin). The programs carry
+no Apple Developer ID and are not notarised: OAIY's install unpacks them itself,
+so macOS does not mark them as downloaded, but the login Keychain treats each new build
+as a new program and asks again before Aokie uses its key.
 
 ### What only a Mac can answer
 
