@@ -15,8 +15,14 @@
 //! prompt) is an error the caller fails closed on, never a reason to
 //! store or return something unsealed.
 //!
+//! Linux has the same in the Secret Service (GNOME Keyring, KWallet),
+//! which the desktop unlocks at log-in: the key is kept there in the
+//! same way, and a session with no Secret Service running (a server with
+//! no desktop) is an error the caller fails closed on, as a locked
+//! Keychain is.
+//!
 //! The cipher is plain code with the key passed in, so it is tested on
-//! every system; only the fetching of the key is macOS's.
+//! every system; only the fetching of the key is macOS's and Linux's.
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -82,11 +88,17 @@ pub fn open_with_key(key: &[u8; KEY_LEN], stored: &str) -> Result<Vec<u8>, Strin
     Ok(plain.to_vec())
 }
 
-/// The Keychain item that holds the data key.
-#[cfg(target_os = "macos")]
+/// The Keychain (or Secret Service) item that holds the data key.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const KEYCHAIN_SERVICE: &str = "com.aokie.sealed-values";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const KEYCHAIN_ACCOUNT: &str = "data-key-v1";
+
+/// The store the key is in, for what is said when it will not give it.
+#[cfg(target_os = "macos")]
+const STORE: &str = "Keychain";
+#[cfg(target_os = "linux")]
+const STORE: &str = "Secret Service (the desktop's keyring)";
 
 /// The data key, from the user's login Keychain; made and stored there the
 /// first time. Asked of the Keychain once per process: the user is not
@@ -100,8 +112,9 @@ const KEYCHAIN_ACCOUNT: &str = "data-key-v1";
 ///
 /// macOS ties "always allow" to the program's code signature. A program
 /// rebuilt without a stable signature is a new program to the Keychain,
-/// which then asks again.
-#[cfg(target_os = "macos")]
+/// which then asks again. (The Secret Service gives an unlocked
+/// collection's items to the user's programs without asking.)
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn data_key() -> Result<[u8; KEY_LEN], String> {
     use std::sync::Mutex;
     static KEY: Mutex<Option<[u8; KEY_LEN]>> = Mutex::new(None);
@@ -124,14 +137,14 @@ fn data_key() -> Result<[u8; KEY_LEN], String> {
         return Ok(fresh);
     }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-        .map_err(|e| format!("Keychain item: {e}"))?;
+        .map_err(|e| format!("{STORE} item: {e}"))?;
     let read = |entry: &keyring::Entry| -> Result<Option<[u8; KEY_LEN]>, String> {
         match entry.get_secret() {
             Ok(bytes) => <[u8; KEY_LEN]>::try_from(bytes.as_slice())
                 .map(Some)
-                .map_err(|_| "the Keychain's sealing key has the wrong length".to_string()),
+                .map_err(|_| format!("the {STORE}'s sealing key has the wrong length")),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(format!("the Keychain did not give the sealing key: {e}")),
+            Err(e) => Err(format!("the {STORE} did not give the sealing key: {e}")),
         }
     };
     let key = match read(&entry)? {
@@ -143,25 +156,25 @@ fn data_key() -> Result<[u8; KEY_LEN], String> {
                 .map_err(|_| "the system gave no random bytes for a key".to_string())?;
             entry
                 .set_secret(&fresh)
-                .map_err(|e| format!("the Keychain did not take the sealing key: {e}"))?;
+                .map_err(|e| format!("the {STORE} did not take the sealing key: {e}"))?;
             // What the Keychain holds is the key, not what was handed to
             // it: should another process have stored one in the same
             // moment, both go by the one that is there.
-            read(&entry)?.ok_or_else(|| "the Keychain lost the sealing key".to_string())?
+            read(&entry)?.ok_or_else(|| format!("the {STORE} lost the sealing key"))?
         }
     };
     *held = Some(key);
     Ok(key)
 }
 
-/// Seal `plain` under the key in the user's login Keychain.
-#[cfg(target_os = "macos")]
+/// Seal `plain` under the key in the user's login Keychain (or Secret Service).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn protect(plain: &[u8]) -> Result<String, String> {
     seal_with_key(&data_key()?, plain)
 }
 
-/// Open a token [`protect`] made, as the same user on the same Mac.
-#[cfg(target_os = "macos")]
+/// Open a token [`protect`] made, as the same user on the same computer.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn unprotect(stored: &str) -> Result<Vec<u8>, String> {
     open_with_key(&data_key()?, stored)
 }

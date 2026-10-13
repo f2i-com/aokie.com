@@ -89,7 +89,8 @@ fn platform_protection() -> PayloadProtection {
                 "[aokie-plugin] AOKIE_ALLOW_UNPROTECTED_OUTBOX=1 — outbox payloads stored PLAINTEXT (dev override)"
             );
             PayloadProtection::DevPlaintext
-        } else if cfg!(target_os = "macos") {
+        } else if cfg!(any(target_os = "macos", target_os = "linux")) {
+            // (the Keychain's key on a Mac, the Secret Service's on Linux)
             PayloadProtection::Keychain
         } else {
             PayloadProtection::Unavailable
@@ -168,7 +169,8 @@ fn protect_payload(mode: PayloadProtection, plain: &str) -> Result<String, Strin
         PayloadProtection::Dpapi => dpapi_protect(plain),
         #[cfg(not(windows))]
         PayloadProtection::Dpapi => Err("DPAPI is not available on this platform".to_string()),
-        // (the core's sealing: on a Mac the Keychain's key; an error on a system that has none)
+        // (the core's sealing: on a Mac the Keychain's key, on Linux the Secret Service's; an error on a system that
+        // has none)
         PayloadProtection::Keychain => aokie_core::dpapi::protect(plain.as_bytes()),
         PayloadProtection::DevPlaintext => Ok(plain.to_string()),
         PayloadProtection::Unavailable => Err(
@@ -186,7 +188,7 @@ fn unprotect_payload(stored: &str) -> Result<String, String> {
         return Err(format!("payload was quarantined at write ({reason})"));
     }
     if stored.starts_with(aokie_core::dpapi::KEYCHAIN_PREFIX) {
-        // Sealed on a Mac. Elsewhere this is an error, never plaintext.
+        // Sealed on a Mac or on Linux. Elsewhere this is an error, never plaintext.
         let bytes = aokie_core::dpapi::unprotect(stored)?;
         return String::from_utf8(bytes)
             .map_err(|_| "sealed payload is not text once opened".to_string());

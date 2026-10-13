@@ -21,12 +21,18 @@ url = "2"
 keyring = { version = "3", default-features = false, features = [
     "apple-native",
     "windows-native",
-    "linux-native",
+    # Linux: the Secret Service (GNOME Keyring, KWallet), which keeps a secret across log-ins and restarts, through
+    # libdbus (libdbus-1-dev to build; every desktop has libdbus-1-3). The kernel's keyring ("linux-native") lost it
+    # at every restart: a provider's API key, and the key values sealed at rest are sealed under, with it.
+    "sync-secret-service",
+    # (the Secret Service's session encrypted in Rust, not with OpenSSL)
+    "crypto-rust",
 ] }
 
-# keychain_seal.rs: the cipher for values sealed at rest on macOS, where the key lives in the login Keychain.
-# Windows seals with DPAPI and does not link it; the cipher's own tests run on every system (dev-dependencies).
-[target.'cfg(target_os = "macos")'.dependencies]
+# keychain_seal.rs: the cipher for values sealed at rest on macOS and Linux, where the key lives in the login
+# Keychain or the Secret Service. Windows seals with DPAPI and does not link it; the cipher's own tests run on every
+# system (dev-dependencies).
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 ring = "0.17"
 
 # crashlog.rs redirects native stderr/stdout to a forensic log file via

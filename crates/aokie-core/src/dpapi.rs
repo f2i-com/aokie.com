@@ -10,12 +10,14 @@
 //!
 //! macOS has no DPAPI, but it has the login Keychain: there the same
 //! two calls seal under a key the Keychain keeps for the user
-//! (`keychain_seal.rs`), and the token is `keychain1:<base64>`. The
-//! module keeps its name; read it as "the system's own sealing".
+//! (`keychain_seal.rs`), and the token is `keychain1:<base64>`. Linux
+//! does the same with the key in the Secret Service (GNOME Keyring,
+//! KWallet), the token named alike. The module keeps its name; read it
+//! as "the system's own sealing".
 //!
-//! Linux builds get `Err` from both directions — the caller decides
+//! Other systems get `Err` from both directions — the caller decides
 //! its own dev fallback (the pairing store keeps 0600 plaintext hex
-//! there, which only carries the dev libusb transport).
+//! there).
 
 /// Storage prefix marking a DPAPI-sealed value. Kept distinct from the
 /// outbox's internal prefix use so a sealed pairing-store value is
@@ -35,7 +37,7 @@ pub fn is_sealed(stored: &str) -> bool {
 
 /// True when this platform can seal (i.e. `protect` can succeed).
 pub fn platform_supported() -> bool {
-    cfg!(any(windows, target_os = "macos"))
+    cfg!(any(windows, target_os = "macos", target_os = "linux"))
 }
 
 /// Seal `plain` under the current user's DPAPI scope. Returns the
@@ -73,16 +75,17 @@ pub fn protect(plain: &[u8]) -> Result<String, String> {
     }
 }
 
-/// macOS: seal under the key in the user's login Keychain. Returns the
-/// `keychain1:<base64>` storage token; `Err` when the Keychain will not
-/// give the key (locked, or the user refused), which callers treat as
-/// they treat a DPAPI failure: nothing is stored unsealed.
-#[cfg(target_os = "macos")]
+/// macOS and Linux: seal under the key in the user's login Keychain or
+/// Secret Service. Returns the `keychain1:<base64>` storage token; `Err`
+/// when the store will not give the key (locked, refused, or no Secret
+/// Service running), which callers treat as they treat a DPAPI failure:
+/// nothing is stored unsealed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn protect(plain: &[u8]) -> Result<String, String> {
     crate::keychain_seal::protect(plain)
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn protect(_plain: &[u8]) -> Result<String, String> {
     Err("DPAPI is not available on this platform".to_string())
 }
@@ -126,17 +129,18 @@ pub fn unprotect(stored: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// macOS: open a `keychain1:<base64>` token sealed by `protect` as the
-/// same user on the same Mac. A token Windows sealed does not open here.
-#[cfg(target_os = "macos")]
+/// macOS and Linux: open a `keychain1:<base64>` token sealed by `protect`
+/// as the same user on the same computer. A token Windows sealed does not
+/// open here (nor does one sealed on another computer: its key is not here).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn unprotect(stored: &str) -> Result<Vec<u8>, String> {
     if stored.starts_with(DPAPI_PREFIX) {
-        return Err("value was sealed by Windows DPAPI: it does not open on a Mac".to_string());
+        return Err("value was sealed by Windows DPAPI: it does not open here".to_string());
     }
     crate::keychain_seal::unprotect(stored)
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn unprotect(_stored: &str) -> Result<Vec<u8>, String> {
     Err("DPAPI is not available on this platform".to_string())
 }
@@ -251,12 +255,25 @@ mod tests {
         assert!(unprotect("keychain1:AAAA").is_err());
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     #[test]
-    fn non_windows_fails_closed_both_directions() {
+    fn a_system_without_sealing_fails_closed_both_directions() {
         assert!(protect(b"secret").is_err());
         assert!(unprotect("dpapi:AAAA").is_err());
         assert!(!platform_supported());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_seals_as_a_mac_does_and_a_windows_value_does_not_open_there() {
+        assert!(platform_supported());
+        assert!(unprotect("dpapi:AAAA").is_err(), "sealed by Windows: not here");
+        // (the key in this test process, a debug build's door, not in the desktop's Secret Service)
+        std::env::set_var("AOKIE_SEAL_EPHEMERAL", "1");
+        let sealed = protect(b"secret").unwrap();
+        assert!(sealed.starts_with(KEYCHAIN_PREFIX) && !sealed.contains("secret"), "{sealed}");
+        assert!(is_sealed(&sealed));
+        assert_eq!(unprotect(&sealed).unwrap(), b"secret".to_vec());
     }
 
     #[test]

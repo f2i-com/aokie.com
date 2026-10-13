@@ -19,8 +19,8 @@ pub mod consent;
 pub mod crashlog;
 pub mod dongle_catalog;
 pub mod dpapi;
-// The Mac's half of `dpapi`: the cipher is tested on every system, the Keychain is macOS's.
-#[cfg(any(target_os = "macos", test))]
+// The Mac's and Linux's half of `dpapi`: the cipher is tested on every system, the key store is theirs.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub mod keychain_seal;
 pub mod events;
 pub mod model_verify_cache;
