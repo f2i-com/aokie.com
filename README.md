@@ -96,11 +96,12 @@ the managed-beta path for dongles not in the catalog, Linux, the native Windows
 Bluetooth backend (texts, contacts and call control without a driver, but no call
 audio), and known phone issues.
 
-**macOS and Linux** are not supported yet, but the same plugin builds for them: there
-the dongle is opened through libusb and no driver is installed. It has been built,
-tested and run on Linux against a stand-in dongle; it has not been run on a Mac or with
-a real dongle off Windows. [docs/HARDWARE.md](docs/HARDWARE.md#macos) says what a Mac
-build is, how to try one, and what only a Mac can answer.
+**On a Mac** (Apple silicon) a release has a bundle of its own, in beta: there the dongle
+is opened through libusb and no driver is installed. It has run on an M5 Pro Mac with a
+Broadcom dongle, a paired phone and test calls; texts are untried there.
+[docs/HARDWARE.md](docs/HARDWARE.md#macos) says what a Mac build is, how to build one, and
+what only a Mac can answer. **Linux** is not supported yet, but the same plugin builds
+there; it has been built, tested and run against a stand-in dongle.
 
 ## How it fits together
 
@@ -152,7 +153,8 @@ and the starter and its flows in [FormLogic](https://github.com/f2i-com/formlogi
 
 ## Install it into OAIY
 
-1. **Get a plugin bundle:** a release zip, `aokie-plugin-windows-<version>.zip`, or one you
+1. **Get a plugin bundle:** a release zip, `aokie-plugin-windows-<version>.zip` (or
+   `aokie-plugin-macos-arm64-<version>.zip` on an Apple-silicon Mac), or one you
    [build](#build-from-source).
 2. **Install it.** In OAIY Desktop, open **Connections → Plugins → Install a plugin** and
    choose the bundle's folder, `.zip` or `.tar.gz` (the Setup page offers the same as
@@ -291,6 +293,14 @@ It ships no driver package, its executables are not Authenticode-signed, and its
 Aokie's. Its dongle setup screen asks the operator to accept the driver it signs on that
 PC before it installs it, so nothing needs setting first; `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`
 still pre-authorises a machine.
+
+Both kinds of release also carry a Mac bundle, `aokie-plugin-macos-arm64-<tag>.zip`, made by
+`plugin-release-macos` on GitHub's Mac with `scripts/bundle-unix.sh`: the same plugin without
+the driver helper or the driver, libusb as a library beside it (LGPL-2.1: its licence and
+source in `third-party/`), its programs signed ad hoc (no Apple Developer ID), and its
+`package-manifest.json` signed with the same key. `publish-macos` attaches it to the release
+once the Windows job has made it, with a paragraph in its notes; a manual run with
+`attach_macos_to: <tag>` attaches one to a release made before.
 
 ## Test
 

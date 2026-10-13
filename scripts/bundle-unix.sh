@@ -13,6 +13,11 @@
 # name from beside the plugin: Microsoft's release, checked against the digest it publishes (AOKIE_FETCH_ORT=0 to
 # skip; there is no 1.25.0 for an Intel Mac).
 #
+# On a Mac, libusb goes beside the plugin as a library of its own (libusb-1.0.0.dylib), built here from libusb's
+# release, with its licence and that source in third-party/libusb-<version>: libusb is LGPL-2.1, and a plugin given
+# to anyone else may load it but not have it built in. The bundle is refused if the plugin still has it built in.
+# Linux links the system's libusb, also as a library of its own.
+#
 # Nothing is installed and nothing is signed: the last lines say where OAIY Desktop looks for a plugin and that it
 # will ask you to trust this one, as it asks for any plugin that is not signed.
 #
@@ -64,13 +69,63 @@ if [ -n "$features" ] && [ -z "${LIBCLANG_PATH:-}" ]; then
   fi
 fi
 
+sha256_of() {
+  if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# libusb on a Mac. The crate that binds it (libusb1-sys) builds its own copy into the program, which is what a
+# `cargo build` on a Mac does. For the bundle libusb is built instead as a library from libusb's own release (the
+# same version that crate carries; its digest pinned) and cargo is given that in place of the crate's build script
+# (a `links` override: target.<host>."usb-1.0", in a configuration file of its own). Its install name is
+# @rpath/libusb-1.0.0.dylib, found beside the plugin through the run path build.rs gives it.
+libusb_version=1.0.27
+libusb_sum=ffaa41d741a8a3bee244ac8e54a72ea05bf2879663c098c82fc5757853441575
+libusb_config=""
+if [ "$(uname -s)" = Darwin ]; then
+  libusb_work="$target/libusb-$libusb_version"
+  libusb_prefix="$libusb_work/install"
+  libusb_archive="$libusb_work/libusb-$libusb_version.tar.bz2"
+  mkdir -p "$libusb_work"
+  if [ ! -s "$libusb_archive" ]; then
+    echo "fetching libusb-$libusb_version.tar.bz2"
+    curl -fsSL -o "$libusb_archive" "https://github.com/libusb/libusb/releases/download/v$libusb_version/libusb-$libusb_version.tar.bz2" || rm -f "$libusb_archive"
+    [ -s "$libusb_archive" ] || { echo "libusb $libusb_version could not be fetched (no network?): a Mac bundle needs it beside the plugin"; exit 1; }
+  fi
+  got=$(sha256_of "$libusb_archive")
+  [ "$got" = "$libusb_sum" ] || { rm -f "$libusb_archive"; echo "libusb-$libusb_version.tar.bz2 is not the published release (sha256 $got): removed"; exit 1; }
+  if [ ! -f "$libusb_prefix/lib/libusb-1.0.0.dylib" ]; then
+    echo "building libusb $libusb_version as a library"
+    rm -rf "$libusb_work/src"
+    mkdir -p "$libusb_work/src"
+    tar -xjf "$libusb_archive" -C "$libusb_work/src"
+    # (for the macOS that Rust's own programs ask for at least, not this Mac's)
+    (cd "$libusb_work/src/libusb-$libusb_version" && export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}" \
+      && ./configure --prefix="$libusb_prefix" --disable-static --enable-shared > "$libusb_work/configure.log" 2>&1 \
+      && make -j"$(sysctl -n hw.ncpu)" > "$libusb_work/make.log" 2>&1 && make install > "$libusb_work/install.log" 2>&1) \
+      || { echo "libusb $libusb_version did not build: see $libusb_work/*.log"; exit 1; }
+    install_name_tool -id @rpath/libusb-1.0.0.dylib "$libusb_prefix/lib/libusb-1.0.0.dylib"
+    # (a changed install name voids the library's signature: an Apple-silicon Mac runs it again once signed ad hoc)
+    codesign --force --sign - "$libusb_prefix/lib/libusb-1.0.0.dylib"
+  fi
+  host=$(rustc -vV | sed -n 's/^host: //p')
+  libusb_config="$libusb_work/cargo-libusb.toml"
+  cat > "$libusb_config" <<EOF
+# written by scripts/bundle-unix.sh: libusb as a library, in place of libusb1-sys's build script
+[target.$host."usb-1.0"]
+rustc-link-lib = ["dylib=usb-1.0"]
+rustc-link-search = ["native=$libusb_prefix/lib"]
+include = "$libusb_prefix/include/libusb-1.0"
+version_number = "$libusb_version"
+EOF
+fi
+
 cd "$repo"
 build() {
   echo "building the plugin${features:+ (features: $features)}"
   if [ -n "$features" ]; then
-    cargo build --release -p aokie-plugin --features "$features"
+    cargo build --release -p aokie-plugin --features "$features" ${libusb_config:+--config "$libusb_config"}
   else
-    cargo build --release -p aokie-plugin
+    cargo build --release -p aokie-plugin ${libusb_config:+--config "$libusb_config"}
   fi
   voice_server=""
   if [ -n "$features" ] && [ "${AOKIE_VOICE_SERVER:-1}" = 1 ]; then
@@ -106,6 +161,37 @@ mkdir -p "$out"
 cp "$target/release/aokie-plugin" "$out/"
 [ -z "$voice_server" ] || cp "$voice_server" "$out/"
 
+# libusb beside the plugin (a Mac): the plugin must load it from there and have none of it built in, or the bundle
+# is not laid out. Its licence and the source it was built from go with it, and what may be done with them.
+if [ -n "$libusb_config" ]; then
+  otool -L "$out/aokie-plugin" | grep -q '@rpath/libusb-1.0.0.dylib' \
+    || { echo "the plugin does not load libusb from beside it (otool -L names no @rpath/libusb-1.0.0.dylib)"; exit 1; }
+  if nm -gU "$out/aokie-plugin" | grep -q ' _libusb_init$'; then
+    echo "the plugin has libusb built in (it defines libusb_init): libusb's licence does not allow that in a bundle"; exit 1
+  fi
+  cp "$libusb_prefix/lib/libusb-1.0.0.dylib" "$out/"
+  third="$out/third-party/libusb-$libusb_version"
+  mkdir -p "$third"
+  cp "$libusb_archive" "$third/"
+  tar -xjf "$libusb_archive" -C "$third" --strip-components=1 "libusb-$libusb_version/COPYING" "libusb-$libusb_version/AUTHORS"
+  cat > "$third/README.md" <<EOF
+# libusb $libusb_version
+
+Aokie's plugin talks to the Bluetooth dongle through libusb, which it loads from \`libusb-1.0.0.dylib\` beside it.
+libusb is free software under the GNU Lesser General Public License, version 2.1 or later (\`COPYING\`); its
+authors are in \`AUTHORS\`.
+
+\`libusb-$libusb_version.tar.bz2\` is the source that library was built from: libusb's own release
+(https://github.com/libusb/libusb/releases/tag/v$libusb_version, sha256 $libusb_sum), built with
+\`./configure --disable-static --enable-shared\`, its install name then set to \`@rpath/libusb-1.0.0.dylib\`.
+
+You may build libusb yourself, changed or not, and put your \`libusb-1.0.0.dylib\` in place of this one (with
+the same install name, signed at least ad hoc). The plugin loads whichever is there. A bundle signed by its
+publisher is checked file by file by OAIY Desktop, which refuses it once a file has changed: remove
+\`package-manifest.json\` as well, and OAIY then asks you to trust the changed plugin as your own.
+EOF
+fi
+
 # The manifest: the repository's, with this system's program as its entry. Exactly one line may change.
 manifest="$repo/crates/aokie-plugin/manifest.json"
 [ "$(grep -c '"command": "aokie-plugin.exe"' "$manifest")" = 1 ] || { echo "manifest.json's entry is not the one this script rewrites"; exit 1; }
@@ -128,9 +214,6 @@ done
 
 # ONNX Runtime 1.25.0 for the engines that run on it (Parakeet, Pocket TTS). sherpa-onnx brings an older one of
 # its own under the unversioned name; the versioned name is the one those engines look for first (voice.rs).
-sha256_of() {
-  if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
-}
 if [ -n "$features" ] && [ "${AOKIE_FETCH_ORT:-1}" = 1 ]; then
   case "$(uname -s)-$(uname -m)" in
     Darwin-arm64)  ort_pack=onnxruntime-osx-arm64-1.25.0;     ort_sum=65405dc8793c86cadb98b5e07f6d3bdde84f8300f1b030d4736b41c17610d6c1 ;;
