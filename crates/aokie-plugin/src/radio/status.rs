@@ -41,6 +41,11 @@ pub struct RadioStatus {
     /// ISO-8601 instant the current call started RINGING (not answered) —
     /// the Live Call screen's timer runs from here.
     pub call_started_at: Mutex<Option<String>>,
+    /// The call the allowed list left ringing for the owner, and whether the
+    /// owner then took it on the phone: what `call.current` tells the
+    /// Overview, to say whose call it is. Cleared when the owner hands it to
+    /// the receptionist; read against the current call's id.
+    pub left_to_owner: Mutex<Option<(String, bool)>>,
     /// Devices seen connected during this radio session (the durable link
     /// keys live in the aokie pairing store; this is the live view).
     pub paired: Mutex<Vec<PairedDevice>>,

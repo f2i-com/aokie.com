@@ -53,6 +53,10 @@ phone keeps its number: there is nothing to port and no SIP.
 - **Screens callers.** Blocked numbers, callers outside an accept pattern and, if you
   choose, withheld numbers hear a short message and are refused; they never reach the
   agent.
+- **Answers only the numbers you allow, if you choose.** While you try it out, the
+  receptionist can answer calls and texts from an allowed list alone: anyone else is
+  left ringing for you (or rejected), their texts get no reply, and nobody off the list
+  is rung or texted.
 - **Asks first.** The radio stays off until consent is recorded, and each use
   (Bluetooth, contacts, texts, transcription, recording, remote captions) is chosen
   explicitly.

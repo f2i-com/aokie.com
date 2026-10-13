@@ -644,7 +644,7 @@ pub(super) fn service_realtime_lane(
         if realtime_lane.is_none() {
             if let Some(resume_id) = realtime_resume_call.clone() {
                 let resumable = tracker.current().is_some_and(|call| {
-                    call.is_active() && call.id == resume_id && (!call.outbound || call.agent_owned)
+                    call.is_active() && call.id == resume_id && call.receptionist_owns()
                 }) && !remote_media.radio_reserved()
                     && bt.get_sample_rate() > 0;
                 if resumable {
@@ -749,7 +749,7 @@ pub(super) fn service_realtime_lane(
                 let promoted = promote_greet_for.as_deref() == Some(call.id.as_str());
                 if local_voice_before_identity(
                     oaiy_route,
-                    call.outbound && !call.agent_owned,
+                    !call.receptionist_owns(),
                     call.is_active(),
                     promote_greet_for.is_some(),
                 ) {
@@ -768,12 +768,27 @@ pub(super) fn service_realtime_lane(
                     // A call already answered (only the OAIY route gets
                     // here with one) has no ring left to personalize in:
                     // screening still gates `begin` on the settled identity.
-                    let wait_for_identity = !call.is_active()
-                        && hold_auto_answer(
-                            call.caller_id.as_deref().is_some_and(|id| !id.is_empty()),
-                            overlay_ready,
-                            started.elapsed(),
+                    // Nor for a call the allowed list is still deciding
+                    // about, or leaves ringing for the owner: OAIY would be
+                    // told a call began that the receptionist may never
+                    // answer. One the owner answers in Aokie is prepared then.
+                    let left_to_owner = !call.is_active()
+                        && !call.outbound
+                        && matches!(
+                            screen_policy.ring_action(
+                                call.caller_id.as_deref(),
+                                call.caller_withheld,
+                                std::time::Duration::from_millis(call.ringing_for_ms() as u64),
+                            ),
+                            crate::screen::RingAction::Wait | crate::screen::RingAction::Leave
                         );
+                    let wait_for_identity = left_to_owner
+                        || (!call.is_active()
+                            && hold_auto_answer(
+                                call.caller_id.as_deref().is_some_and(|id| !id.is_empty()),
+                                overlay_ready,
+                                started.elapsed(),
+                            ));
                     if !wait_for_identity {
                         let is_manager = screen_policy.is_manager(call.caller_id.as_deref());
                         let legacy = manager_line_is_local(oaiy_route, is_manager)
@@ -1570,7 +1585,7 @@ pub(super) fn service_realtime_lane(
                             && lane.pending_hangup.is_none()
                             && lane.begun
                             && tracker.current().is_some_and(|call| {
-                                call.is_active() && (!call.outbound || call.agent_owned) && call.id == lane.call_id
+                                call.is_active() && call.receptionist_owns() && call.id == lane.call_id
                             })
                             && reply_owner_is_current(&remote_media, lane.owner.as_ref())
                         {
@@ -1931,7 +1946,7 @@ pub(super) fn service_realtime_lane(
                     lane.pending_tool_call.take()
                 {
                     let exact_call = tracker.current().is_some_and(|call| {
-                        call.is_active() && (!call.outbound || call.agent_owned) && call.id == lane.call_id
+                        call.is_active() && call.receptionist_owns() && call.id == lane.call_id
                     });
                     let exact_owner =
                         reply_owner_is_current(&remote_media, lane.owner.as_ref());
@@ -2251,7 +2266,7 @@ pub(super) fn service_realtime_lane(
 
                 if let Some((tool_call_id, name, ok, output, continue_response)) = completion {
                     let exact_call = tracker.current().is_some_and(|call| {
-                        call.is_active() && (!call.outbound || call.agent_owned) && call.id == lane.call_id
+                        call.is_active() && call.receptionist_owns() && call.id == lane.call_id
                     });
                     if !exact_call
                         || !reply_owner_is_current(&remote_media, lane.owner.as_ref())
@@ -2337,7 +2352,7 @@ pub(super) fn service_realtime_lane(
                 if due {
                     let mut pending = lane.pending_hangup.take().expect("due hangup request");
                     let exact_call = tracker.current().is_some_and(|call| {
-                        call.is_active() && (!call.outbound || call.agent_owned) && call.id == lane.call_id
+                        call.is_active() && call.receptionist_owns() && call.id == lane.call_id
                     });
                     let human_reserved = remote_media.radio_reserved();
                     let exact_owner =

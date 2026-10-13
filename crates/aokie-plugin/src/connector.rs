@@ -1240,6 +1240,17 @@ impl Plugin {
             .is_some_and(|list| crate::screen::list_has(list, number))
     }
 
+    /// Why the allowed list keeps `number` from being dealt with by `key`
+    /// (`textsAllowedOnly` for texts, `callsAllowedOnly` for calls): None
+    /// while that switch is off, or the number is on `allowedNumbers`.
+    fn not_allowed_by(&self, key: &str, number: &str) -> Option<String> {
+        let settings = &self.store.config.settings;
+        let allowed = settings.get("allowedNumbers").and_then(Value::as_str).unwrap_or("");
+        (setting_on(settings, key) && !crate::screen::list_has(allowed, number)).then(|| {
+            format!("the number is not on the allowed list (allowedNumbers), and {key} is on")
+        })
+    }
+
     /// `sms.send` proper. Every refusal before the text reaches the radio (or
     /// before the dev simulator journals its `aokie.sms.sent`) is
     /// [`SmsSendError::Refused`]: the phone was never touched, so no radio
@@ -1275,6 +1286,11 @@ impl Plugin {
                 "sms.send refused: the recipient is on the blocked list (blockedNumbers), and a blocked number is not texted",
             )
             .into());
+        }
+        // While texts are kept to the allowed list, only its numbers are
+        // texted: an answer to anyone else's text, a follow-up, a call back.
+        if let Some(why) = self.not_allowed_by("textsAllowedOnly", &to) {
+            return Err(CmdError::failed(format!("sms.send refused: {why}")).into());
         }
         // Nor a short code or a service number: only a person's number is
         // texted. A flow or an agent that answers every incoming text would
@@ -2700,6 +2716,7 @@ impl Plugin {
                                 crate::contract::call_state::RINGING
                             },
                             "startedAt": radio.call_started_at(),
+                            "leftToOwner": radio.left_to_owner(&call_id),
                             "callEpoch": media.as_ref().map(|media| media.call_epoch),
                             "ownerEpoch": media.as_ref().map(|media| media.owner_epoch),
                             "serviceMode": media.as_ref().map(|media| media.service_mode),
@@ -3171,6 +3188,12 @@ impl Plugin {
                         "call.dial refused: the number is on the blocked list (blockedNumbers), and a blocked number is not rung",
                     ));
                 }
+                // Nor, while calls are kept to the allowed list, a number not
+                // on it: a missed call left ringing for the owner is not rung
+                // back by the receptionist.
+                if let Some(why) = self.not_allowed_by("callsAllowedOnly", &number) {
+                    return Err(CmdError::failed(format!("call.dial refused: {why}")));
+                }
                 self.check_consent("call.dial", crate::consent::Scope::Bluetooth)?;
                 let s = &self.store.config.settings;
                 let enabled = s
@@ -3620,6 +3643,9 @@ impl Plugin {
                         "blockedNumbers"
                             | "acceptPattern"
                             | "rejectPrivate"
+                            | "allowedNumbers"
+                            | "callsAllowedOnly"
+                            | "otherCallers"
                             | "screenMessage"
                             | "blockedMessage"
                             | "autoBlockAbuse"
@@ -4601,6 +4627,32 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
         kind: SettingKind::Bool,
         applies_live: true,
     },
+    // The allowed list: who the receptionist deals with while
+    // `callsAllowedOnly` / `textsAllowedOnly` are on (a line of numbers, as
+    // blockedNumbers). A call from anyone else is left ringing for the owner
+    // (`otherCallers: "ring"`) or rejected while it rings (`"reject"`); a
+    // text from anyone else is not answered, and only listed numbers are
+    // texted or rung.
+    SettingSpec {
+        key: "allowedNumbers",
+        kind: SettingKind::Str { max_chars: 4000 },
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "callsAllowedOnly",
+        kind: SettingKind::Bool,
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "otherCallers",
+        kind: SettingKind::Enum(&["ring", "reject"]),
+        applies_live: true,
+    },
+    SettingSpec {
+        key: "textsAllowedOnly",
+        kind: SettingKind::Bool,
+        applies_live: true,
+    },
     SettingSpec {
         key: "screenMessage",
         kind: SettingKind::Str { max_chars: 500 },
@@ -5343,6 +5395,8 @@ fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
     for (key, env) in [
         ("blockedNumbers", "AOKIE_BLOCKED_NUMBERS"),
         ("acceptPattern", "AOKIE_ACCEPT_PATTERN"),
+        ("allowedNumbers", "AOKIE_ALLOWED_NUMBERS"),
+        ("otherCallers", "AOKIE_OTHER_CALLERS"),
         ("screenMessage", "AOKIE_SCREEN_MESSAGE"),
         ("blockedMessage", "AOKIE_BLOCKED_MESSAGE"),
         ("managerNumbers", "AOKIE_MANAGER_NUMBERS"),
@@ -5375,6 +5429,11 @@ fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
     } else {
         std::env::remove_var("AOKIE_REJECT_PRIVATE");
     }
+    if setting_on(settings, "callsAllowedOnly") {
+        std::env::set_var("AOKIE_CALLS_ALLOWED_ONLY", "1");
+    } else {
+        std::env::remove_var("AOKIE_CALLS_ALLOWED_ONLY");
+    }
     // Default ON (Phase 1): only an explicit false writes the opt-out var.
     let auto_block = settings
         .get("autoBlockAbuse")
@@ -5385,6 +5444,13 @@ fn apply_screening_env(settings: &serde_json::Map<String, Value>) {
     } else {
         std::env::set_var("AOKIE_AUTO_BLOCK_ABUSE", "0");
     }
+}
+
+/// A switch in the settings: true, or the string "true" (older stores).
+fn setting_on(settings: &serde_json::Map<String, Value>, key: &str) -> bool {
+    settings
+        .get(key)
+        .is_some_and(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
 }
 
 fn validate_setting(key: &str, value: &Value) -> Result<(), CmdError> {
@@ -9255,6 +9321,104 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("blocked list"), "{}", err.message);
         assert!(control_rx.try_recv().is_err(), "nothing reached the radio");
+    }
+
+    /// While texts or calls are kept to the allowed list, nobody else is
+    /// texted or rung, however the number is written; with the switch off the
+    /// list keeps nobody out.
+    #[test]
+    fn the_allowed_list_keeps_texts_and_dials_to_its_numbers_while_it_is_on() {
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"consentMode": "warn", "allowedNumbers": "+61 432 602 110\n0400 111 222", "textsAllowedOnly": true}),
+                &mut sink,
+            )
+            .unwrap();
+        sink.lines.clear();
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "02 8390 1963", "body": "Thanks for your message", "messageId": "msg-other-1"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "command_failed");
+        assert!(err.message.contains("allowed list") && err.message.contains("textsAllowedOnly"), "{}", err.message);
+        let ev = sms_refusal_event(&sink, "msg-other-1");
+        assert_eq!(ev["data"]["reason"], json!(err.message));
+        // A listed number gets as far as it did before: there is no radio here.
+        for (to, id) in [("0432 602 110", "msg-listed-1"), ("+61400111222", "msg-listed-2")] {
+            let err = plugin
+                .dispatch_command("sms.send", &json!({"to": to, "body": "Hello", "messageId": id}), &mut sink)
+                .unwrap_err();
+            assert!(err.message.contains("radio is not running"), "{to}: {}", err.message);
+        }
+        // Off, the list keeps nobody out.
+        plugin
+            .dispatch_command("settings.set", &json!({"textsAllowedOnly": false}), &mut sink)
+            .unwrap();
+        let err = plugin
+            .dispatch_command(
+                "sms.send",
+                &json!({"to": "02 8390 1963", "body": "Hello", "messageId": "msg-other-2"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("radio is not running"), "{}", err.message);
+
+        // Calls: the same, with callsAllowedOnly.
+        let mut plugin = Plugin::ephemeral(true);
+        let (handle, control_rx) = crate::radio::RadioHandle::test_handle();
+        handle
+            .status
+            .connected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        plugin.radio = Some(handle);
+        for (key, value) in [
+            ("outboundEnabled", json!(true)),
+            ("quietHoursStart", json!(0)),
+            ("quietHoursEnd", json!(0)),
+            ("allowedNumbers", json!("0400 111 222")),
+            ("callsAllowedOnly", json!(true)),
+        ] {
+            plugin.store.config.settings.insert(key.into(), value);
+        }
+        let err = plugin
+            .dispatch_command(
+                "call.dial",
+                &json!({"number": "+61 2 8390 1963", "openingLine": "Hi, this is the clinic.", "purpose": "a call back"}),
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("allowed list") && err.message.contains("callsAllowedOnly"), "{}", err.message);
+        assert!(control_rx.try_recv().is_err(), "nothing reached the radio");
+    }
+
+    /// The allowed-list settings are typed like the rest: `otherCallers` is
+    /// "ring" or "reject", and nothing else is kept.
+    #[test]
+    fn the_allowed_list_settings_are_typed() {
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command(
+                "settings.set",
+                &json!({"allowedNumbers": "0400 111 222", "callsAllowedOnly": true, "otherCallers": "reject", "textsAllowedOnly": true}),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(plugin.store.config.settings["otherCallers"], json!("reject"));
+        assert!(plugin
+            .dispatch_command("settings.set", &json!({"otherCallers": "voicemail"}), &mut sink)
+            .is_err());
+        assert!(plugin
+            .dispatch_command("settings.set", &json!({"callsAllowedOnly": "yes please"}), &mut sink)
+            .is_err());
+        assert_eq!(plugin.store.config.settings["otherCallers"], json!("reject"));
     }
 
     #[test]

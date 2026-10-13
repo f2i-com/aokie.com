@@ -104,6 +104,15 @@ pub(super) fn service_controls(
         };
         match next {
             Ok(RadioControl::Answer { op }) => {
+                // A call left ringing for the owner is the receptionist's
+                // once they answer it here.
+                tracker.hand_to_receptionist();
+                {
+                    let mut left = status.left_to_owner.lock().unwrap();
+                    if left.as_ref().is_some_and(|(id, _)| tracker.call_id() == Some(id.as_str())) {
+                        *left = None;
+                    }
+                }
                 if let Err(e) = bt.answer_call() {
                     eprintln!("[aokie-plugin] radio answer failed: {e}");
                     // AOK-CTRL-001: the command result only said "accepted" —

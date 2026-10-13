@@ -1073,7 +1073,11 @@
         '<div class="rcp-ringing">' +
           '<small>' + (outbound ? 'OUTBOUND CALL' : 'INCOMING CALL') + '</small>' +
           '<h4>' + esc(caller) + '</h4>' +
-          (outbound ? '<p>Waiting for the other person to answer.</p>' : '') +
+          (outbound
+            ? '<p>Waiting for the other person to answer.</p>'
+            : call.leftToOwner === 'ringing'
+              ? '<p>Not on your allowed numbers, so it is left ringing for you. Answer hands the call to the receptionist.</p>'
+              : '') +
           '<div class="rcp-call-actions">' +
           (outbound ?
           '<button type="button" class="rcp-call-action is-reject" data-act="call-hangup"' + (state.busyCall ? ' disabled' : '') + '>' +
@@ -1089,9 +1093,13 @@
 
     // Active call.
     setPill(pill, pillText, 'is-live', callDuration(call) || 'Live call');
-    var owner = replyOwner();
-    var note =
-      owner === 'agent'
+    // A call left ringing for the owner that they answered on the phone is
+    // theirs: the receptionist neither speaks nor listens.
+    var taken = call.leftToOwner === 'taken';
+    var owner = taken ? 'owner' : replyOwner();
+    var note = taken
+      ? 'You answered this call on the phone — the receptionist stays out of it'
+      : owner === 'agent'
         ? 'The AI receptionist owns this conversation — operator speech is muted'
         : owner === 'operator'
           ? 'Operator mode — you can speak to the caller'
@@ -1105,7 +1113,7 @@
         ICONS.phone + ' Hang up</button>' +
         '</div>'
     );
-    speakRow.hidden = false;
+    speakRow.hidden = taken;
     var muted = owner !== 'operator';
     input.disabled = state.busyCall || muted;
     input.placeholder = muted ? 'Disabled while the AI receptionist replies' : 'Say something to the caller…';

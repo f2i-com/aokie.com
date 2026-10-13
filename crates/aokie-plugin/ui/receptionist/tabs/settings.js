@@ -63,6 +63,11 @@
     reenumerateHwid: '',
     legacyPairingPin: false,
     agentHangup: false,
+    allowedNumbers: '',
+    callsAllowedOnly: false,
+    otherCallers: 'ring',
+    textsAllowedOnly: false,
+    rejectPrivate: false,
   };
 
   /** Parse a boolean setting the way the plugin does (legacy "true"/"false"
@@ -138,6 +143,11 @@
         typeof src.reenumerateHwid === 'string' ? src.reenumerateHwid : d.reenumerateHwid,
       legacyPairingPin: boolSetting(src.legacyPairingPin, d.legacyPairingPin),
       agentHangup: boolSetting(src.agentHangup, d.agentHangup),
+      allowedNumbers: typeof src.allowedNumbers === 'string' ? src.allowedNumbers : d.allowedNumbers,
+      callsAllowedOnly: boolSetting(src.callsAllowedOnly, d.callsAllowedOnly),
+      otherCallers: src.otherCallers === 'reject' || src.otherCallers === 'ring' ? src.otherCallers : d.otherCallers,
+      textsAllowedOnly: boolSetting(src.textsAllowedOnly, d.textsAllowedOnly),
+      rejectPrivate: boolSetting(src.rejectPrivate, d.rejectPrivate),
     };
   }
 
@@ -166,8 +176,9 @@
     ['Replies', 'agent', 'Agent', ' › Front desk project: /brief.md and the knowledge files'],
     ['Call and text instructions', 'agent', 'Agent', ' › Phone (the phone chip at the top): Answer phone calls, and your instructions for calls and for texts'],
     // Missed-call callbacks and call screening (who is answered, blocked
-    // numbers) are set only there; they write Aokie's own screening and
-    // outbound keys, so this form does not offer a second copy.
+    // numbers) are set there; they write Aokie's own screening and outbound
+    // keys. The allowed list (and hidden numbers, which go with it) is also
+    // here, in "Who is answered": it is what to set while trying Aokie out.
     ['Callbacks and screening', 'agent', 'Agent', ' › Phone: missed-call callbacks, who is answered, and blocked numbers'],
     ['Speech', 'services', 'Services', ': speech to text, and the call voice'],
     ['Model', 'engines', 'Engines', ', which the Front desk agent’s OAIY provider follows (Agent › Settings › AI providers)'],
@@ -487,6 +498,41 @@
     );
   }
 
+  /** The allowed list: who the receptionist deals with while trying it
+   *  out, and what happens to everyone else (and to hidden numbers). */
+  function allowedHtml() {
+    var others = [
+      ['ring', 'Leave them ringing on your phone'],
+      ['reject', 'Reject them'],
+    ];
+    return section(
+      'Who is answered',
+      field(
+        'Allowed numbers',
+        '<textarea rows="4" data-key="allowedNumbers" placeholder="0400 111 222&#10;+61 2 9876 5432">' +
+          esc(settings.allowedNumbers) + '</textarea>'
+      ) +
+        hint('One number a line (or with commas). A number matches however it is written: its last nine digits.') +
+        check('callsAllowedOnly', 'Answer calls only from these numbers') +
+        field(
+          'Calls from other numbers',
+          '<select data-key="otherCallers"' + (settings.callsAllowedOnly ? '' : ' disabled') + '>' +
+            others.map(function (o) {
+              return '<option value="' + o[0] + '"' + (settings.otherCallers === o[0] ? ' selected' : '') + '>' + esc(o[1]) + '</option>';
+            }).join('') +
+            '</select>'
+        ) +
+        hint(
+          'Left ringing, the call shows on the Overview with Answer (the receptionist takes it) and Reject; answer it on the phone to take it yourself, and the receptionist stays out of it. ' +
+            'While this is on, the receptionist never rings a number that is not on the list (a call back of a missed call, say).'
+        ) +
+        check('textsAllowedOnly', 'Reply to texts only from these numbers') +
+        hint('Texts from other numbers still arrive and are kept; nothing is sent back to them.') +
+        check('rejectPrivate', 'Do not answer hidden or private numbers') +
+        hint('Rejected while the phone rings when it says the number is hidden; a phone that only shows the number once a call is answered has it hung up straight away instead.')
+    );
+  }
+
   /** The greeting and the brief Aokie sends with each call. */
   function greetingHtml(route) {
     return section(
@@ -598,6 +644,7 @@
       '<form class="rcp-form rcp-wide" id="set-form">' +
       section('Where calls go', routeHtml(), 'rcp-wide') +
       answeringHtml(route) +
+      allowedHtml() +
       greetingHtml(route) +
       (viaRealtime ? '' : tuningHtml()) +
       advancedHtml(viaRealtime) +
@@ -691,6 +738,11 @@
     var boolKey = t.getAttribute('data-bool');
     if (boolKey != null && e.type === 'change') {
       settings[boolKey] = !!t.checked;
+      // (what happens to other callers is asked only while the list is in force)
+      if (boolKey === 'callsAllowedOnly' && root) {
+        var others = root.querySelector('select[data-key="otherCallers"]');
+        if (others) others.disabled = !t.checked;
+      }
     }
   }
 

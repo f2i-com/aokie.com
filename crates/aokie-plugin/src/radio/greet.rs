@@ -114,7 +114,7 @@ pub(super) fn play_tone_and_greet(
                     && !s.greeted
                     && s.is_active()
                     && sr > 0
-                    && (!s.outbound || s.agent_owned) =>
+                    && s.receptionist_owns() =>
             {
                 // The caller sometimes OPENS the conversation before the
                 // greeting speaks (long ring window + personalize hold =

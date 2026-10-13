@@ -84,7 +84,7 @@ pub(super) fn pump_audio_and_reply(
             // receptionist has no business on that line.
             if !tracker
                 .current()
-                .is_some_and(|s| s.is_active() && (!s.outbound || s.agent_owned))
+                .is_some_and(|s| s.is_active() && s.receptionist_owns())
             {
                 continue;
             }
@@ -270,7 +270,7 @@ pub(super) fn pump_audio_and_reply(
             && !ctx.manager_gate.awaiting_pin && !remote_media.radio_reserved()
             && !realtime_selected && !ctx.desktop_realtime_responder
             && tracker.current().is_some_and(|s| s.is_active()
-                && (!s.outbound || s.agent_owned)
+                && s.receptionist_owns()
                 && !screen_policy.is_manager(s.caller_id.as_deref()))
             && interjections::acknowledgement_due(
                 ctx.last_acknowledgement.elapsed(), stt_buf.len(), *stt_silence,

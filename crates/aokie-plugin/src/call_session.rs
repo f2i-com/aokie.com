@@ -72,6 +72,23 @@ pub struct CallSession {
     started: Instant,
     answered: Option<Instant>,
     pub caller_id: Option<String>,
+    /// The phone said this caller hides their number: the call to us was in
+    /// its AT+CLCC list with no number. Not set merely because none has come.
+    pub caller_withheld: bool,
+    /// AT+CLCC was asked while the call rang, for a number that had not come
+    /// with the RING (once a call).
+    pub ring_id_asked: bool,
+    /// The call was left ringing for the owner (not on the allowed list).
+    /// Cleared when the owner hands it to the receptionist (Answer in
+    /// Aokie); still set when it is answered, the owner took it on the phone.
+    pub left_ringing: bool,
+    /// The owner answered, in Aokie, a call left ringing for them: the
+    /// receptionist's from then on, never left ringing again.
+    pub handed_over: bool,
+    /// The owner answered on the phone a call that was left ringing for them:
+    /// theirs, as a call they dial on the handset is. The receptionist
+    /// neither greets nor listens.
+    pub owner_took: bool,
     intent: Option<TerminationIntent>,
     /// `aokie.call.incoming` is delayed briefly for caller-id collection;
     /// this holds "not yet emitted" plus when the wait started.
@@ -114,6 +131,13 @@ impl CallSession {
 
     pub fn is_active(&self) -> bool {
         self.phase == Phase::Active
+    }
+
+    /// Whether the receptionist runs this call's conversation: a call to us
+    /// (unless the owner took it on the phone), or one the plugin dialed. A
+    /// call the owner dials on the handset is only observed.
+    pub fn receptionist_owns(&self) -> bool {
+        (!self.outbound || self.agent_owned) && !self.owner_took
     }
 
     /// Milliseconds since the call started ringing.
@@ -224,6 +248,11 @@ impl SessionTracker {
             started: Instant::now(),
             answered: None,
             caller_id: None,
+            caller_withheld: false,
+            ring_id_asked: false,
+            left_ringing: false,
+            handed_over: false,
+            owner_took: false,
             intent: None,
             pending_incoming_since: Some(Instant::now()),
             greeted: false,
@@ -264,6 +293,11 @@ impl SessionTracker {
             started: Instant::now(),
             answered: None,
             caller_id: number,
+            caller_withheld: false,
+            ring_id_asked: false,
+            left_ringing: false,
+            handed_over: false,
+            owner_took: false,
             intent: None,
             pending_incoming_since: None,
             greeted: false,
@@ -293,13 +327,37 @@ impl SessionTracker {
         }
     }
 
+    /// The phone listed the call to us that still rings with no number: its
+    /// caller hides it. Only for a ringing call to us whose number has not
+    /// come (a number, once known, is never taken back).
+    pub fn caller_withheld(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            if !s.outbound && !s.is_active() && s.caller_id.as_deref().unwrap_or("").trim().is_empty() {
+                s.caller_withheld = true;
+            }
+        }
+    }
+
     /// The call went active. Idempotent; ignored when idle (a stray
-    /// answered indicator with no call must not fabricate a session).
+    /// answered indicator with no call must not fabricate a session). A call
+    /// still left ringing for the owner was answered on the phone: theirs.
     pub fn answered(&mut self) {
         if let Some(s) = self.session.as_mut() {
             s.phase = Phase::Active;
             if s.answered.is_none() {
                 s.answered = Some(Instant::now());
+                s.owner_took = s.left_ringing && !s.outbound;
+            }
+        }
+    }
+
+    /// The owner answered, in Aokie, a call left ringing for them: the
+    /// receptionist takes it, as it would have.
+    pub fn hand_to_receptionist(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            if !s.is_active() {
+                s.left_ringing = false;
+                s.handed_over = true;
             }
         }
     }
@@ -752,5 +810,57 @@ mod tests {
         t.caller_id("+61".into());
         t.note_intent(TerminationIntent::OperatorHangup);
         assert!(t.current().is_none());
+    }
+
+    /// A call left ringing for the owner is theirs when they answer it on
+    /// the phone, and the receptionist's when they answer it in Aokie.
+    #[test]
+    fn a_call_left_ringing_belongs_to_whoever_answers_it() {
+        let mut t = SessionTracker::new();
+        ring(&mut t, "call_a");
+        t.current_mut().unwrap().left_ringing = true;
+        t.answered();
+        let s = t.current().unwrap();
+        assert!(s.owner_took && !s.receptionist_owns(), "answered on the phone: the owner's");
+        t.terminate();
+
+        ring(&mut t, "call_b");
+        t.current_mut().unwrap().left_ringing = true;
+        t.hand_to_receptionist();
+        t.answered();
+        let s = t.current().unwrap();
+        assert!(s.handed_over && !s.owner_took && s.receptionist_owns(), "answered in Aokie: the receptionist's");
+        t.terminate();
+
+        // An ordinary call is the receptionist's, a handset dial the owner's.
+        ring(&mut t, "call_c");
+        t.answered();
+        assert!(t.current().unwrap().receptionist_owns());
+        t.terminate();
+        t.dial("call_d".into(), Some("0400111222".into()), "2026-10-13T05:00:00Z".into(), false);
+        t.answered();
+        assert!(!t.current().unwrap().receptionist_owns());
+    }
+
+    /// The phone saying the ringing caller hides their number is kept only
+    /// while no number has come, and only for a call to us that rings.
+    #[test]
+    fn a_withheld_number_is_noted_only_for_a_ringing_call_without_one() {
+        let mut t = SessionTracker::new();
+        ring(&mut t, "call_a");
+        t.caller_withheld();
+        assert!(t.current().unwrap().caller_withheld);
+        t.terminate();
+
+        ring(&mut t, "call_b");
+        t.caller_id("+61400111222".into());
+        t.caller_withheld();
+        assert!(!t.current().unwrap().caller_withheld, "a number came");
+        t.terminate();
+
+        ring(&mut t, "call_c");
+        t.answered();
+        t.caller_withheld();
+        assert!(!t.current().unwrap().caller_withheld, "not while it rings");
     }
 }
