@@ -69,6 +69,22 @@ pub fn build_service_search_attribute_request(
     service_class_uuid: u16,
     max_attribute_bytes: u16,
 ) -> Vec<u8> {
+    build_service_search_attribute_request_continued(
+        transaction_id,
+        service_class_uuid,
+        max_attribute_bytes,
+        &[],
+    )
+}
+
+/// The same request carrying the continuation state the server's last
+/// response ended with: it asks for the next part of the AttributeLists.
+pub fn build_service_search_attribute_request_continued(
+    transaction_id: u16,
+    service_class_uuid: u16,
+    max_attribute_bytes: u16,
+    continuation_state: &[u8],
+) -> Vec<u8> {
     let mut search_pattern = Vec::new();
     encode_data_element(DataElement::Uuid16(service_class_uuid), &mut search_pattern);
 
@@ -79,8 +95,10 @@ pub fn build_service_search_attribute_request(
     encode_data_element(DataElement::Sequence(&search_pattern), &mut params);
     params.extend_from_slice(&max_attribute_bytes.to_be_bytes());
     encode_data_element(DataElement::Sequence(&attr_id_list), &mut params);
-    // Continuation state — empty: this is a fresh request.
-    params.push(0);
+    // Continuation state — empty on a fresh request (at most 16 bytes).
+    let continuation_state = &continuation_state[..continuation_state.len().min(16)];
+    params.push(continuation_state.len() as u8);
+    params.extend_from_slice(continuation_state);
 
     let mut pdu = Vec::with_capacity(5 + params.len());
     pdu.push(PDU_SERVICE_SEARCH_ATTRIBUTE_REQUEST);
@@ -153,6 +171,95 @@ pub fn parse_service_search_attribute_response(
         attribute_lists,
         continuation_state,
     })
+}
+
+/// SDP ErrorResponse PDU id.
+pub const PDU_ERROR_RESPONSE: u8 = 0x01;
+
+/// What the bytes of an SDP reply amount to so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SdpReply<'a> {
+    /// Not all of the PDU has come yet.
+    Partial,
+    /// A whole ServiceSearchAttributeResponse.
+    Response(ServiceSearchAttributeResponse<'a>),
+    /// An ErrorResponse, or a whole PDU that cannot be read: waiting longer
+    /// changes nothing (review 4 #25: the MAP SDP step waited out its 30 s
+    /// timeout for these).
+    Failed(String),
+}
+
+/// Read the SDP reply in `buffer`.
+pub fn read_sdp_reply(buffer: &[u8]) -> SdpReply<'_> {
+    if buffer.len() < 5 {
+        return SdpReply::Partial;
+    }
+    let param_len = u16::from_be_bytes([buffer[3], buffer[4]]) as usize;
+    if buffer.len() < 5 + param_len {
+        return SdpReply::Partial;
+    }
+    if buffer[0] == PDU_ERROR_RESPONSE {
+        let code = (param_len >= 2).then(|| u16::from_be_bytes([buffer[5], buffer[6]]));
+        let name = match code {
+            Some(0x0001) => "unsupported SDP version",
+            Some(0x0002) => "invalid service record handle",
+            Some(0x0003) => "invalid request syntax",
+            Some(0x0004) => "invalid PDU size",
+            Some(0x0005) => "invalid continuation state",
+            Some(0x0006) => "insufficient resources",
+            _ => "unknown error",
+        };
+        return SdpReply::Failed(format!(
+            "the phone answered SDP ErrorResponse 0x{:04x} ({name})",
+            code.unwrap_or(0)
+        ));
+    }
+    match parse_service_search_attribute_response(buffer) {
+        Ok(response) => SdpReply::Response(response),
+        Err(e) => SdpReply::Failed(e),
+    }
+}
+
+/// MAS record attribute: the instance's MASInstanceID (Uint8).
+pub const ATTR_MAS_INSTANCE_ID: u16 = 0x0315;
+/// MAS record attribute: SupportedMessageTypes (Uint8 bit mask).
+pub const ATTR_SUPPORTED_MESSAGE_TYPES: u16 = 0x0316;
+/// SupportedMessageTypes bits for SMS (GSM, CDMA).
+pub const MESSAGE_TYPES_SMS: u8 = 0x02 | 0x04;
+
+/// The MAS instance to text through: its RFCOMM channel and, when its record
+/// names one, its MASInstanceID. The first record whose SupportedMessageTypes
+/// has SMS wins; then the first that does not say (the attribute missing);
+/// then the first with an RFCOMM channel, which is what was always taken.
+/// Review 4 #25: on a phone listing its e-mail instance first, that one is
+/// not the texts'.
+pub fn mas_for_sms(attribute_lists: &[u8]) -> Result<(u8, Option<u8>), String> {
+    let mut unsaid = None;
+    let mut first = None;
+    for record in iter_records(attribute_lists)? {
+        let Some(channel) = extract_rfcomm_channel(record)? else {
+            continue;
+        };
+        let uint8 = |attr| -> Option<u8> {
+            let value = find_attribute(record, attr).ok()??;
+            match parse_data_element(value).ok()?.0 {
+                ParsedDataElement::Uint8(v) => Some(v),
+                _ => None,
+            }
+        };
+        let instance = uint8(ATTR_MAS_INSTANCE_ID);
+        let types = uint8(ATTR_SUPPORTED_MESSAGE_TYPES);
+        if types.is_some_and(|t| t & MESSAGE_TYPES_SMS != 0) {
+            return Ok((channel, instance));
+        }
+        if types.is_none() {
+            unsaid.get_or_insert((channel, instance));
+        }
+        first.get_or_insert((channel, instance));
+    }
+    unsaid
+        .or(first)
+        .ok_or_else(|| "MAP MAS service record did not advertise an RFCOMM channel".to_string())
 }
 
 /// Walk the `AttributeLists` sequence and yield each matching record's
@@ -242,7 +349,8 @@ pub fn extract_rfcomm_channel(record_payload: &[u8]) -> Result<Option<u8>, Strin
         // its parameter — for RFCOMM the channel; for L2CAP the PSM
         // (which we ignore here).
         let (uuid_elem, uuid_used) = parse_data_element(proto_payload)?;
-        let ParsedDataElement::Uuid16(uuid) = uuid_elem else {
+        // A 32- or 128-bit UUID on the Base UUID is the same protocol.
+        let Some(uuid) = uuid_elem.as_uuid16() else {
             // Some phones encode RFCOMM's UUID as a Uint16 (descriptor
             // 0x09) rather than Uuid16 (descriptor 0x19). Tolerate the
             // alternate encoding so we don't fail on real-world input.
@@ -322,6 +430,30 @@ mod tests {
         assert_eq!(parsed.maximum_attribute_byte_count, 0xffff);
         // Search pattern: a single Uuid16 element. Should be 0x19, 0x11, 0x2f.
         assert_eq!(parsed.service_search_pattern, &[0x19, 0x11, 0x2f]);
+    }
+
+    /// Review 4 #25: a continued request carries the server's continuation
+    /// state, and a reply reads as partial, a response or a failure.
+    #[test]
+    fn continued_requests_and_replies_read() {
+        let bytes = build_service_search_attribute_request_continued(7, UUID_MAP_MAS, 0xffff, &[1, 2, 3]);
+        let parsed = crate::aokie_radio::sdp::parse_service_search_attribute_request(&bytes).unwrap();
+        assert_eq!(parsed.continuation_state, &[1, 2, 3]);
+        assert_eq!(
+            build_service_search_attribute_request(7, UUID_MAP_MAS, 0xffff),
+            build_service_search_attribute_request_continued(7, UUID_MAP_MAS, 0xffff, &[])
+        );
+        assert_eq!(read_sdp_reply(&[0x07, 0x00]), SdpReply::Partial);
+        assert_eq!(read_sdp_reply(&[0x07, 0x00, 0x01, 0x00, 0x09, 0x00]), SdpReply::Partial);
+        assert!(matches!(
+            read_sdp_reply(&[0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x05]),
+            SdpReply::Failed(reason) if reason.contains("0x0005") && reason.contains("continuation")
+        ));
+        let server = SdpServer::new_with_hfp();
+        let response = server
+            .handle_request(&build_service_search_attribute_request(1, 0x111e, 0xffff))
+            .unwrap();
+        assert!(matches!(read_sdp_reply(&response), SdpReply::Response(r) if r.continuation_state.is_empty()));
     }
 
     #[test]

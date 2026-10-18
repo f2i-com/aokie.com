@@ -117,6 +117,9 @@ pub(crate) struct MapLoop {
     poll_fail_streak: u32,
     /// Phone the seen-set + subscription flags belong to.
     state_phone: Option<u64>,
+    /// The texts answered lately: one handed over again is not sent twice
+    /// (review 4 #17).
+    texts: crate::select::TextAnswers,
 }
 
 impl MapLoop {
@@ -136,6 +139,7 @@ impl MapLoop {
             last_poll_error: None,
             poll_fail_streak: 0,
             state_phone: None,
+            texts: crate::select::TextAnswers::default(),
         }
     }
 
@@ -147,6 +151,17 @@ impl MapLoop {
         body: &str,
         msg_type: Option<String>,
     ) -> Result<(), String> {
+        // A text this thread answered is given that answer again, not sent
+        // twice (review 4 #17), unless it failed for certain.
+        if let Some(answer) = self.texts.replay(message_id).cloned() {
+            eprintln!("[aokie-winbt] text {message_id} was already answered — given that answer again, not sent twice");
+            let result = match &answer {
+                BluetoothEvent::SmsSendFailed { reason, .. } => Err(reason.clone()),
+                _ => Ok(()),
+            };
+            let _ = self.event_tx.send(answer);
+            return result;
+        }
         let (_connected, phone) = connection_snapshot(&self.shared);
         // Gate on the KNOWN phone, not the HFP line: Windows drops the idle
         // link and every op re-forges it on demand (live-proven 2026-07-19).
@@ -162,25 +177,30 @@ impl MapLoop {
             )
             .map(|_| ())
         } else {
-            Err("phone not connected".to_string())
+            Err(crate::select::NO_PHONE.to_string())
         };
         match result {
             Ok(()) => {
                 // Stamp the quiet window BEFORE the event so a poll that
                 // lands between ack and event still defers (POLL_SKIP_AFTER_REPLY).
                 self.last_send_at = Some(Instant::now());
-                let _ = self.event_tx.send(BluetoothEvent::SmsSent {
+                let answer = BluetoothEvent::SmsSent {
                     message_id: message_id.to_string(),
                     recipient_phone: recipient.to_string(),
-                });
+                };
+                self.texts.remember(message_id, answer.clone());
+                let _ = self.event_tx.send(answer);
                 Ok(())
             }
             Err(reason) => {
-                let _ = self.event_tx.send(BluetoothEvent::SmsSendFailed {
+                let answer = BluetoothEvent::SmsSendFailed {
                     message_id: message_id.to_string(),
                     recipient_phone: recipient.to_string(),
                     reason: reason.clone(),
-                });
+                    outcome_unknown: crate::select::send_failure_in_doubt(&reason),
+                };
+                self.texts.remember(message_id, answer.clone());
+                let _ = self.event_tx.send(answer);
                 Err(reason)
             }
         }

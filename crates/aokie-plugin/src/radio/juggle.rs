@@ -132,6 +132,14 @@ pub(super) fn run_auto_hold_juggle(
                     eprintln!(
                         "[aokie-plugin] AUTO-HOLD: knocking caller is screened ({reason}) — no juggle, no queue spot; they ring out and leave no missed-call record"
                     );
+                } else if status.consent_expired() {
+                    // Review 4 #21: past the consent grant's expiry no new
+                    // call is taken (the ring path and `call.answer` refuse
+                    // one too): the first caller is not put on hold for it.
+                    eprintln!(
+                        "[aokie-plugin] AUTO-HOLD: consent has expired — {} is not taken; they keep hearing the network's call waiting (re-consent in the Consent tab)",
+                        w.call_id
+                    );
                 } else if !hold_voice {
                     // OAIY route with no voice for the announcements (OAIY's
                     // speak mode unavailable, Aokie's own TTS absent): they

@@ -133,6 +133,16 @@ impl EmitMode {
     }
 }
 
+/// What [`emit_event`]'s refusal says when the outbox already holds other
+/// content under the event's key ([`is_payload_collision`]).
+pub const PAYLOAD_COLLISION: &str = "already holds different content";
+
+/// Whether an [`emit_event`] error is the outbox refusing an event because
+/// its key already holds other content.
+pub fn is_payload_collision(error: &str) -> bool {
+    error.contains(PAYLOAD_COLLISION)
+}
+
 /// Emit one event as an `event.emit` notification.
 ///
 /// * `force_outbox` routes even non-essential events through the
@@ -177,7 +187,7 @@ pub fn emit_event(
                 // emitting the rejected content under its key would make the
                 // host record the wrong occurrence. Refuse, loudly.
                 return Err(format!(
-                    "event.emit refused for {}: idempotency key {} already holds different content",
+                    "event.emit refused for {}: idempotency key {} {PAYLOAD_COLLISION}",
                     event.name, event.idempotency_key
                 ));
             }
@@ -247,11 +257,48 @@ pub fn emit_event(
 }
 
 /// Write one event to the host with no outbox row behind it (the outbox
-/// could not take it): delivered now or not at all.
+/// could not take it): delivered now or not at all. One delivered is
+/// remembered ([`emitted_live_only`]).
 fn emit_live(sink: &mut dyn Sink, event: &DesktopEvent) -> Result<(), String> {
     let line = rpc::notification_line("event.emit", json!({ "event": event }));
     sink.send_line(&line)
-        .map_err(|e| format!("event.emit failed for {} (not durable: the outbox could not take it): {e}", event.name))
+        .map_err(|e| format!("event.emit failed for {} (not durable: the outbox could not take it): {e}", event.name))?;
+    remember_live_only(&event.idempotency_key);
+    Ok(())
+}
+
+/// The keys of the events this process gave the host live, with no outbox
+/// row behind them (the disk was full, say), newest last, at most
+/// [`LIVE_ONLY_KEPT`]. A text's sent or failed that went out so is its
+/// outcome all the same: the sweep for texts left without one, and a retry
+/// under the text's id, must not give it a second (review 4 #33). Kept for
+/// the life of the process; a later process has only the outbox to go on.
+static LIVE_ONLY: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// How many live-only keys are remembered: far more than the texts of the
+/// minutes a full disk lasts before someone notices.
+const LIVE_ONLY_KEPT: usize = 256;
+
+fn remember_live_only(key: &str) {
+    let mut keys = LIVE_ONLY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if keys.iter().any(|kept| kept == key) {
+        return;
+    }
+    if keys.len() >= LIVE_ONLY_KEPT {
+        keys.pop_front();
+    }
+    keys.push_back(key.to_string());
+}
+
+/// Whether the event keyed `key` went to the host live, with no outbox row
+/// behind it, in this process ([`emit_event`]).
+pub fn emitted_live_only(key: &str) -> bool {
+    LIVE_ONLY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|kept| kept == key)
 }
 
 /// One replay pass (ack mode): re-emit every DUE unacknowledged row —
@@ -383,6 +430,12 @@ pub fn spawn_replay_thread(
                             crate::outbox::DEAD_RETENTION_DAYS
                         ),
                     }
+                    // And the command journal's results, which hold the
+                    // numbers texted and rung (review 4 #15: pruned only at
+                    // start, a plugin that ran for weeks kept them all).
+                    crate::command_journal::prune_file(
+                        &outbox_path.with_file_name(crate::connector::COMMAND_JOURNAL_FILE),
+                    );
                 }
             }
         });

@@ -109,9 +109,96 @@ pub(crate) fn recent_ring_number(
         .and_then(|e| e.number.clone())
 }
 
+/// What the messaging thread says when no phone is known to text from.
+pub(crate) const NO_PHONE: &str = "phone not connected";
+
+/// Whether a text the messaging thread could not send may have reached the
+/// phone all the same (review 4 #3). Only two failures say it did not:
+/// there was no phone to send it to, or the phone answered a request with an
+/// error (it did not take the text). Any other may have come after its PUT
+/// went out, with the phone's answer what was lost.
+pub(crate) fn send_failure_in_doubt(reason: &str) -> bool {
+    !(reason == NO_PHONE || reason.contains(": server returned 0x"))
+}
+
+/// The texts the messaging thread answered lately, each with its answer
+/// (review 4 #17: Windows' own stack kept none, so a host's retry under a
+/// text's id sent it twice). Handed over again, a text is given its answer
+/// again and not sent, unless it failed for certain: that one never reached
+/// the phone, or the phone refused it, and it is sent again.
+#[derive(Default)]
+pub(crate) struct TextAnswers {
+    answered: std::collections::VecDeque<(String, aokie_dongle::bluetooth::BluetoothEvent)>,
+}
+
+/// How many answers are kept: a host retries within a minute or two.
+const TEXT_ANSWERS_KEPT: usize = 64;
+
+impl TextAnswers {
+    /// The answer to give a text handed over again, if it is not to be sent.
+    pub(crate) fn replay(&self, message_id: &str) -> Option<&aokie_dongle::bluetooth::BluetoothEvent> {
+        use aokie_dongle::bluetooth::BluetoothEvent;
+        self.answered
+            .iter()
+            .rev()
+            .find(|(id, _)| id == message_id)
+            .map(|(_, answer)| answer)
+            .filter(|answer| {
+                !matches!(answer, BluetoothEvent::SmsSendFailed { outcome_unknown: false, .. })
+            })
+    }
+
+    pub(crate) fn remember(&mut self, message_id: &str, answer: aokie_dongle::bluetooth::BluetoothEvent) {
+        self.answered.retain(|(id, _)| id != message_id);
+        if self.answered.len() >= TEXT_ANSWERS_KEPT {
+            self.answered.pop_front();
+        }
+        self.answered.push_back((message_id.to_string(), answer));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 4 #17: a text handed over again is answered, not sent twice,
+    /// unless it failed for certain; a failure that may have reached the
+    /// phone is in doubt.
+    #[test]
+    fn a_text_handed_over_again_is_sent_once_unless_it_failed_for_certain() {
+        use aokie_dongle::bluetooth::BluetoothEvent;
+        let failed = |id: &str, outcome_unknown| BluetoothEvent::SmsSendFailed {
+            message_id: id.to_string(),
+            recipient_phone: "0400111222".to_string(),
+            reason: "x".to_string(),
+            outcome_unknown,
+        };
+        let mut texts = TextAnswers::default();
+        assert!(texts.replay("m1").is_none(), "a new text is sent");
+        texts.remember(
+            "m1",
+            BluetoothEvent::SmsSent {
+                message_id: "m1".to_string(),
+                recipient_phone: "0400111222".to_string(),
+            },
+        );
+        assert!(matches!(texts.replay("m1"), Some(BluetoothEvent::SmsSent { .. })));
+        texts.remember("m2", failed("m2", true));
+        assert!(texts.replay("m2").is_some(), "in doubt: not sent again");
+        texts.remember("m3", failed("m3", false));
+        assert!(texts.replay("m3").is_none(), "failed for certain: sent again");
+        // Its second try is what is remembered.
+        texts.remember("m3", failed("m3", true));
+        assert!(texts.replay("m3").is_some());
+        for i in 0..TEXT_ANSWERS_KEPT {
+            texts.remember(&format!("x{i}"), failed("x", true));
+        }
+        assert!(texts.replay("m1").is_none(), "only the last few dozen are kept");
+
+        assert!(!send_failure_in_doubt(NO_PHONE));
+        assert!(!send_failure_in_doubt("MAS PUT: server returned 0xc3 (expected one of [160])"));
+        assert!(send_failure_in_doubt("RFCOMM read timed out"));
+    }
 
     fn endpoints(list: &[(&str, &str)]) -> Vec<(String, String)> {
         list.iter()

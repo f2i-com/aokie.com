@@ -42,7 +42,7 @@ use super::pbap::{PbapPceSession, PbapState};
 use super::rfcomm::{ClientDlciEvent, RfcommClientEvent, RfcommClientState};
 use super::sdp_client::{
     build_service_search_attribute_request, extract_rfcomm_channel, iter_records,
-    parse_service_search_attribute_response, UUID_PBAP_PSE,
+    parse_service_search_attribute_response, read_sdp_reply, SdpReply, UUID_PBAP_PSE,
 };
 use super::vcard::Contact;
 
@@ -415,9 +415,21 @@ impl PbapRuntime {
                         );
                         return Ok(());
                     }
-                    Err(_) => {
-                        // Need more bytes — restore phase and wait.
-                        self.phase = PbapRuntimePhase::AwaitingSdpResponse { local_cid, buffer };
+                    Err(e) => {
+                        match read_sdp_reply(&buffer) {
+                            // Need more bytes — restore phase and wait.
+                            SdpReply::Partial => {
+                                self.phase = PbapRuntimePhase::AwaitingSdpResponse { local_cid, buffer };
+                            }
+                            // An ErrorResponse, or a whole reply that cannot
+                            // be read: no use waiting (review 4 #25).
+                            SdpReply::Failed(reason) => {
+                                self.fail(format!("PBAP SDP: {reason}"), Some(local_cid), l2cap_state, out);
+                            }
+                            SdpReply::Response(_) => {
+                                self.fail(format!("PBAP SDP: {e}"), Some(local_cid), l2cap_state, out);
+                            }
+                        }
                         return Ok(());
                     }
                 }

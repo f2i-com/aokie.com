@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { setProtocolClockOffsetSeconds } from "../protocolClock";
 import {
   LOCAL_MEDIA_PROOF_MAX_TTL_MS,
   parseCompanionAvailability,
@@ -20,6 +21,7 @@ import {
   parseServerProfiles,
   parseSyncReady,
   parseV2EndCaller,
+  parseV2Assistance,
   parseV2AssistanceAnswerAccepted,
   parseV2IdleSync,
   parseV2Snapshot,
@@ -813,5 +815,58 @@ describe("native audio endpoint state", () => {
     expect(() => parseNativeAudioDevices({ ...active, selectedInputId: "speaker:7" })).toThrow();
     expect(() => parseNativeAudioDevices({ ...active, selectedInputId: "bluetooth:99", selectedOutputId: "bluetooth:99" })).toThrow();
     expect(() => parseNativeAudioDevices({ ...active, canSelect: false })).toThrow();
+  });
+});
+
+describe("server-clock expiries from native code", () => {
+  afterEach(() => {
+    setProtocolClockOffsetSeconds(0);
+    vi.useRealTimers();
+  });
+
+  // Review 4 #10: an assistance request's and an End-caller challenge's expiry are the server's times, which
+  // native code checks on protocol time. On its own clock a phone a minute fast dropped both as expired.
+  it("checks an assistance request and an End-caller challenge on protocol time", () => {
+    const serverNow = 1_800_000_000;
+    vi.useFakeTimers();
+    vi.setSystemTime((serverNow + 60) * 1_000);
+    const assistance = {
+      kind: "assistance_request",
+      schemaVersion: 2,
+      appId: "app_test",
+      eventId: "event_test",
+      requestId: "request_test",
+      callId: "call_test",
+      callEpoch: 2,
+      ownerEpoch: 3,
+      switchboardRevision: 4,
+      remoteRevision: 5,
+      question: "Can they come at four?",
+      expiresAt: serverNow + 30,
+    };
+    const challenge = {
+      kind: "end_caller_challenge",
+      schemaVersion: 2,
+      appId: "app_test",
+      requestId: "request_test",
+      confirmationId: "confirmation_test",
+      deviceId: "device_test",
+      callId: "call_test",
+      callEpoch: 2,
+      ownerEpoch: 3,
+      switchboardRevision: 4,
+      remoteRevision: 5,
+      leaseId: "lease_test",
+      fence: 6,
+      expiresAt: serverNow + 30,
+    };
+    expect(() => parseV2Assistance(assistance)).toThrow();
+    expect(() => parseV2EndCaller(challenge)).toThrow();
+    setProtocolClockOffsetSeconds(-60);
+    expect(parseV2Assistance(assistance)).toMatchObject({ requestId: "request_test", transferOffered: false });
+    expect(parseV2EndCaller(challenge)).toEqual(challenge);
+    // Still refused once past the server's expiry, or too far ahead of it.
+    expect(() => parseV2Assistance({ ...assistance, expiresAt: serverNow })).toThrow();
+    expect(() => parseV2EndCaller({ ...challenge, expiresAt: serverNow + 301 })).toThrow();
   });
 });

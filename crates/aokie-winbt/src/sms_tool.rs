@@ -47,9 +47,12 @@ pub fn run(phone_address: u64, to: &str, body: &str, max_wait: Duration) {
         attempt += 1;
         print!("[attempt {attempt}] opening MAP MAS + PUT bMessage… ");
         let _ = std::io::Write::flush(&mut std::io::stdout());
-        match map.send_sms(&msg_id, to, body, None) {
+        // A message id of its own each try: the messaging loop answers a
+        // text it already failed in doubt with that failure, not a new try.
+        let try_id = format!("{msg_id}-{attempt}");
+        match map.send_sms(&try_id, to, body, None) {
             Ok(()) => {
-                println!("OK — SMS accepted by the phone (messageId {msg_id})");
+                println!("OK — SMS accepted by the phone (messageId {try_id})");
                 break;
             }
             Err(e) => println!("failed: {e}"),

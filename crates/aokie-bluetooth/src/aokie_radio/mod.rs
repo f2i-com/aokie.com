@@ -63,3 +63,35 @@ pub fn sco_tx_stream_resets() -> u64 {
         0
     }
 }
+
+/// Whether the radio logs each step of its routine traffic (every OBEX
+/// answer of a message-folder session, every AT+CIND? keepalive):
+/// `AOKIE_RADIO_DEBUG_LOGS=1`. Off, those come as summaries (review 4 #16:
+/// an idle phone filled OAIY's 1,000-line log ring in 20-30 minutes).
+pub fn debug_logs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("AOKIE_RADIO_DEBUG_LOGS")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// A Bluetooth address for the log (review 4 #30): its last two bytes
+/// ("…:5E:F1"), enough to tell two phones apart in one log, not to trace a
+/// device. In full under `AOKIE_VERBOSE_LOGS=1`.
+pub struct LogAddr<'a>(pub &'a str);
+
+impl std::fmt::Display for LogAddr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if aokie_core::redact::verbose_logs_active() {
+            return f.write_str(self.0);
+        }
+        let parts: Vec<&str> = self.0.split(':').collect();
+        if parts.len() == 6 {
+            write!(f, "…:{}:{}", parts[4], parts[5])
+        } else {
+            write!(f, "<address, {} chars>", self.0.chars().count())
+        }
+    }
+}

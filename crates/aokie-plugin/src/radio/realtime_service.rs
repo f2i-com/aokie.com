@@ -371,8 +371,10 @@ pub(super) fn stop_session_for_ownership_change(
 
 /// How the fresh session for a call the AI has back starts: after a transfer
 /// handoff it says how the AI got the caller back (`start.resume`) and greets
-/// with the return line; every other resume is exactly what it was. Nothing is
-/// consumed: a start that fails is tried again with the same record.
+/// with the return line; after OAIY's stream dropped while the agent was
+/// finishing the call, with a line that leads to its goodbye (review 4 #12);
+/// every other resume is exactly what it was. Nothing is consumed: a start
+/// that fails is tried again with the same record.
 #[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) fn resume_start(
     ctx: &CallVoiceContext,
@@ -382,6 +384,8 @@ pub(super) fn resume_start(
     let resume = ctx.transfer.peek_resume(now, broker);
     let greeting = if resume.is_some() {
         crate::transfer::RETURN_GREETING.to_string()
+    } else if ctx.reconnect_note.as_ref().is_some_and(|note| note.finishing) {
+        RECONNECT_FINISHING_GREETING.to_string()
     } else {
         "Thanks for waiting. How can I continue helping?".to_string()
     };
@@ -399,6 +403,9 @@ pub(super) fn adopt_resumed_session(
     let mut lane = RealtimeCallLane::new(session);
     lane.allow_transfer_sent = allow_transfer;
     lane.resumed = true;
+    // What its start was told after OAIY's stream dropped is said once, to
+    // this session, and again by its begin (review 4 #5).
+    lane.reconnect_note = ctx.reconnect_note.take().map(|note| note.text);
     // The requests this call already made stay made (review 3 #13): the
     // fresh session's repeat of one is the duplicate it is.
     lane.completed_appointment_requests = ctx.queued_appointments.clone();
@@ -720,13 +727,14 @@ pub(super) fn service_realtime_lane(
                             &remote_media.snapshot().consent,
                         );
                         // After OAIY's stream dropped, the fresh session is
-                        // told what it missed (review 3 #13).
-                        let mut instructions =
-                            realtime_instructions(oaiy_route, persona, agent_hangup);
-                        if let Some(note) = ctx.reconnect_note.as_deref() {
-                            instructions.push_str("\n\n");
-                            instructions.push_str(note);
-                        }
+                        // told what it missed (review 3 #13), within the
+                        // brief's cap (review 4 #6).
+                        let instructions = realtime_instructions_with_note(
+                            oaiy_route,
+                            persona,
+                            agent_hangup,
+                            ctx.reconnect_note.as_ref().map(|note| note.text.as_str()),
+                        );
                         match spawn_session(
                             crate::realtime_voice::SessionConfig {
                                 endpoint: config.endpoint.clone(),
@@ -751,8 +759,7 @@ pub(super) fn service_realtime_lane(
                             Ok(session) => {
                                 // The handoff is over only once the fresh
                                 // session exists; a start that failed keeps
-                                // its record.
-                                ctx.reconnect_note = None;
+                                // its record (and the session takes the note).
                                 *realtime_lane =
                                     Some(adopt_resumed_session(ctx, session, allow_transfer));
                                 *realtime_resume_call = None;
@@ -1813,14 +1820,22 @@ pub(super) fn service_realtime_lane(
                             // caller overlay ("Hi Sam!") usually lands
                             // between ring and answer. Begin carries the
                             // freshest call-scoped values so the spoken
-                            // greeting is the personalized one.
+                            // greeting is the personalized one. OAIY takes
+                            // begin's instructions in place of the start's,
+                            // so a session resuming after OAIY's stream
+                            // dropped says its note again (review 4 #5).
                             let begin_instructions = ctx
                                 .call_agent_overlay
                                 .as_ref()
                                 .filter(|overlay| overlay.call_id == lane.call_id)
                                 .and_then(|overlay| overlay.persona.as_deref())
                                 .map(|persona| {
-                                    realtime_instructions(oaiy_route, persona, agent_hangup)
+                                    realtime_instructions_with_note(
+                                        oaiy_route,
+                                        persona,
+                                        agent_hangup,
+                                        lane.reconnect_note.as_deref(),
+                                    )
                                 });
                             // A session that resumes a call the caller was
                             // already greeted on keeps its start's resume
@@ -2141,7 +2156,8 @@ pub(super) fn service_realtime_lane(
                             latest_caller_turn,
                             &caller_history,
                             &assistant_recent,
-                            chrono::Local::now().date_naive(),
+                            // The day the session was told it is (review 4 #31).
+                            lane.today,
                         ) {
                             Err(error) => {
                                 // The refusal reason must be diagnosable

@@ -305,6 +305,14 @@ pub struct HfpHandsFreeState {
     answer_retried: bool,
     /// A refused AT+CHUP on this live call was sent once more.
     hangup_retried: bool,
+    /// Counts the phone's call-state changes (a call up or down, a setup,
+    /// a hold, a caller waiting). Review 4 #11: a refused AT+CHUP is only
+    /// sent again when none came since it went out.
+    call_changes: u32,
+    /// `call_changes` when our last AT+CHUP went out on a live call; `None`
+    /// when it went out on a ringing or dialing one (never sent again: the
+    /// owner answering on the handset meanwhile would be hung up).
+    hangup_sent_live: Option<u32>,
     /// The dongle can carry wide-band speech, so mSBC is offered in AT+BAC.
     /// A +BCS naming a codec we never offered is answered with our list
     /// again, never confirmed (HFP §4.11.3).
@@ -340,6 +348,8 @@ impl Default for HfpHandsFreeState {
             setup_refused: false,
             answer_retried: false,
             hangup_retried: false,
+            call_changes: 0,
+            hangup_sent_live: None,
             wbs_supported: false,
             selected_codec: None,
         }
@@ -532,6 +542,29 @@ impl HfpHandsFreeState {
     }
 
     pub fn apply_result(&mut self, result: &HfpAgResult) -> Vec<HfpEvent> {
+        let before = self.call_shape();
+        let events = self.apply_result_to_state(result);
+        if self.call_shape() != before {
+            self.call_changes = self.call_changes.wrapping_add(1);
+        }
+        events
+    }
+
+    /// What the phone's calls look like now; a change is counted in
+    /// `call_changes`.
+    fn call_shape(&self) -> (bool, bool, bool, bool, i32, bool, bool) {
+        (
+            self.call_active,
+            self.incoming_call,
+            self.outgoing_setup,
+            self.call_waiting,
+            self.call_held,
+            self.terminate_pending,
+            self.second_setup_unverified,
+        )
+    }
+
+    fn apply_result_to_state(&mut self, result: &HfpAgResult) -> Vec<HfpEvent> {
         match result {
             HfpAgResult::Ok => {
                 self.supported_features_exchanged = true;
@@ -662,6 +695,7 @@ impl HfpHandsFreeState {
                 if (self.incoming_call || self.outgoing_setup) && !self.call_active {
                     self.setup_refused = true;
                 }
+                self.hangup_sent_live = self.call_active.then_some(self.call_changes);
             }
             _ => {}
         }
@@ -679,12 +713,17 @@ impl HfpHandsFreeState {
     /// ringing, and a refused AT+CHUP on a live call, are sent once more: a
     /// refusal is often the phone racing its own state, and left alone the
     /// call rings out, or the line stays open after the agent hung up.
+    /// The AT+CHUP is only sent again when the call was live when it went
+    /// out and nothing changed since (review 4 #11): a ring refusal crossing
+    /// the owner's answer on the handset would hang up the owner's call, and
+    /// one crossing the caller's own hang-up could refuse the next caller.
     /// Returns the command to send again, if any.
     pub fn after_refusal(&mut self, command: &str) -> Option<HfpAtCommand> {
         match command {
             "AT+CHUP" => {
                 self.setup_refused = false;
-                if self.call_active && !self.hangup_retried {
+                let sent_live = self.hangup_sent_live.take();
+                if self.call_active && !self.hangup_retried && sent_live == Some(self.call_changes) {
                     self.hangup_retried = true;
                     return Some(HfpAtCommand::RejectOrHangup);
                 }
@@ -1321,10 +1360,15 @@ fn parse_ag_result_line(line: &str) -> Option<HfpAgResult> {
     }
     if let Some(value) = line.strip_prefix("+CIEV:") {
         let values = parse_number_list(value);
-        if values.len() >= 2 {
+        // An index past 255 is no indicator (`as u8` read +CIEV: 258 as
+        // indicator 2, the call indicator): it falls through to Unknown.
+        if let (Some(index), Some(value)) = (
+            values.first().and_then(|i| u8::try_from(*i).ok()),
+            values.get(1),
+        ) {
             return Some(HfpAgResult::IndicatorUpdate {
-                index: values[0] as u8,
-                value: values[1],
+                index,
+                value: *value,
             });
         }
     }
@@ -1358,7 +1402,10 @@ fn parse_ag_result_line(line: &str) -> Option<HfpAgResult> {
         return Some(HfpAgResult::CallHoldModes(modes));
     }
     if let Some(value) = line.strip_prefix("+BCS:") {
-        return parse_i32(value).map(|codec| HfpAgResult::SelectedCodec(codec as u8));
+        // A codec id past 255 is none we offered (`as u8` read 257 as CVSD):
+        // 0 is no codec, so it is answered with our list (codec_offered).
+        return parse_i32(value)
+            .map(|codec| HfpAgResult::SelectedCodec(u8::try_from(codec).unwrap_or(0)));
     }
 
     Some(HfpAgResult::Unknown(line.to_string()))
@@ -1867,6 +1914,66 @@ mod tests {
             state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
             vec![HfpEvent::CallTerminated]
         );
+    }
+
+    /// Review 4 #11: a refused AT+CHUP is sent once more only when the call
+    /// was live when it went out and nothing about the calls changed since.
+    #[test]
+    fn a_refused_hangup_is_sent_again_only_on_the_same_live_call() {
+        // A ring refusal crossing the owner's answer on the handset: the
+        // retry would hang up the owner's call.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
+        state.mark_command_sent(&HfpAtCommand::RejectOrHangup);
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 });
+        assert!(state.call_active());
+        assert_eq!(state.after_refusal("AT+CHUP"), None);
+
+        // A live call's hang-up with nothing changed: sent once more, once.
+        state.mark_command_sent(&HfpAtCommand::RejectOrHangup);
+        assert_eq!(state.after_refusal("AT+CHUP"), Some(HfpAtCommand::RejectOrHangup));
+        state.mark_command_sent(&HfpAtCommand::RejectOrHangup);
+        assert_eq!(state.after_refusal("AT+CHUP"), None, "once only");
+
+        // A live call's hang-up crossing the caller's own hang-up and a new
+        // call coming up: not sent at the new call.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
+        state.mark_command_sent(&HfpAtCommand::RejectOrHangup);
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 });
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
+        assert!(state.call_active());
+        assert_eq!(state.after_refusal("AT+CHUP"), None);
+
+        // A second caller knocking meanwhile is a change too.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
+        state.mark_command_sent(&HfpAtCommand::RejectOrHangup);
+        state.apply_result(&HfpAgResult::CallWaitingNotification("+15550001111".into()));
+        assert_eq!(state.after_refusal("AT+CHUP"), None);
+        // An unrelated indicator (signal, battery) is not.
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
+        state.mark_command_sent(&HfpAtCommand::RejectOrHangup);
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 5, value: 3 });
+        assert_eq!(state.after_refusal("AT+CHUP"), Some(HfpAtCommand::RejectOrHangup));
+    }
+
+    /// Review 4: an indicator index or codec id past 255 is not read modulo
+    /// 256 (+CIEV: 258,1 was the call indicator, +BCS: 257 was CVSD).
+    #[test]
+    fn indicator_and_codec_numbers_past_255_do_not_wrap() {
+        let results =
+            parse_ag_results(b"\r\n+CIEV: 258,1\r\n+BCS: 257\r\n+BCS: -1\r\n+CIEV: 2,1\r\n+CIEV: 2\r\n").unwrap();
+        assert!(matches!(&results[0], HfpAgResult::Unknown(line) if line.starts_with("+CIEV")));
+        assert_eq!(results[1], HfpAgResult::SelectedCodec(0));
+        assert_eq!(results[2], HfpAgResult::SelectedCodec(0));
+        assert_eq!(results[3], HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
+        assert!(matches!(&results[4], HfpAgResult::Unknown(_)), "a +CIEV with no value");
+        let mut state = HfpHandsFreeState::new();
+        state.set_wbs_supported(true);
+        assert!(!state.codec_offered(0), "answered with our list, never confirmed");
     }
 
     /// Review 1 #4: a call whose call,0 was lost ends when a snapshot shows

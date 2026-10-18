@@ -7120,6 +7120,9 @@ async fn handle_gateway_frame(
                     offset_seconds: SERVER_CLOCK.offset(),
                 },
             );
+            // And Android keeps it for the pushes that wake this app before
+            // Rust runs (review 4 #10).
+            record_server_clock_for_android(app).await;
             app.emit("aokie-companion://v2-snapshot", frame)
                 .map_err(|_| "could not deliver protocol-v2 snapshot".to_string())?;
             if assistance_cleared {
@@ -10054,6 +10057,46 @@ fn local_unix_now() -> Result<u64, String> {
 /// what Rust hands it against `System.currentTimeMillis`.
 fn server_to_local_unix(server: u64) -> u64 {
     aokie_protocol::clock::corrected_now(server, SERVER_CLOCK.offset().saturating_neg())
+}
+
+/// The offset last handed to Android, and when.
+static RECORDED_SERVER_CLOCK: std::sync::Mutex<Option<(i64, Instant)>> = std::sync::Mutex::new(None);
+
+/// How often an offset that has not changed is handed to Android again, so
+/// the time it keeps it from stays recent.
+const SERVER_CLOCK_RECORD_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// How soon a record Android did not take is tried again.
+const SERVER_CLOCK_RECORD_RETRY: Duration = Duration::from_secs(60);
+
+/// Whether `offset` is to be handed to Android now: none was, it changed, or
+/// the last was handed over [`SERVER_CLOCK_RECORD_EVERY`] ago.
+fn server_clock_record_due(last: Option<(i64, Instant)>, offset: i64, now: Instant) -> bool {
+    last.is_none_or(|(recorded, at)| {
+        recorded != offset || now.saturating_duration_since(at) >= SERVER_CLOCK_RECORD_EVERY
+    })
+}
+
+/// Hand Android the offset (review 4 #10): a push that wakes this app before
+/// Rust runs checks its server-clock expiry with the offset this phone had,
+/// rather than none, and an expiry that does not fit this phone's own clock
+/// no longer drops the push. Not a secret; nothing here enters the WebView.
+async fn record_server_clock_for_android(app: &AppHandle) {
+    let offset = SERVER_CLOCK.offset();
+    let now = Instant::now();
+    {
+        let mut last = RECORDED_SERVER_CLOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !server_clock_record_due(*last, offset, now) {
+            return;
+        }
+        *last = Some((offset, now));
+    }
+    if let Err(error) = crate::android_runtime::record_server_clock(app, offset).await {
+        eprintln!("[AokieCompanion][realtime] stage=server_clock_record_failed detail={error}");
+        let retry_from = now.checked_sub(SERVER_CLOCK_RECORD_EVERY - SERVER_CLOCK_RECORD_RETRY);
+        *RECORDED_SERVER_CLOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            retry_from.map(|at| (offset, at));
+    }
 }
 
 fn managed_gateway_url(value: &str) -> Result<Url, String> {
@@ -16540,6 +16583,17 @@ mod tests {
             lease_local_deadline(arrived, now, now + 86_400),
             arrived + MAX_LOCAL_LEASE_LIFETIME
         );
+    }
+
+    /// Review 4 #10: the offset is handed to Android when it is new or has
+    /// changed, and again now and then while it holds.
+    #[test]
+    fn the_server_clock_is_handed_to_android_when_it_changes_and_now_and_then() {
+        let now = Instant::now();
+        assert!(server_clock_record_due(None, 0, now));
+        assert!(!server_clock_record_due(Some((0, now)), 0, now + Duration::from_secs(60)));
+        assert!(server_clock_record_due(Some((0, now)), -42, now + Duration::from_secs(1)));
+        assert!(server_clock_record_due(Some((0, now)), 0, now + SERVER_CLOCK_RECORD_EVERY));
     }
 
     #[test]

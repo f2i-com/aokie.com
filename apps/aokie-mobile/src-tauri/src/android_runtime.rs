@@ -586,6 +586,55 @@ pub(crate) async fn reconcile_offer(
     Ok(result > 0)
 }
 
+/// Hand Android the server-clock offset native code checks protocol times
+/// with (review 4 #10): the pushes that wake this app before Rust runs check
+/// their server-clock expiries with it (`AokieServerClock.kt`), which keeps it
+/// with when it came.
+#[cfg(target_os = "android")]
+pub(crate) async fn record_server_clock(app: &AppHandle, offset_seconds: i64) -> Result<(), String> {
+    use jni::objects::JValue;
+    use tauri::Manager;
+    use tokio::sync::oneshot;
+
+    if offset_seconds.abs() > aokie_protocol::clock::MAX_CLOCK_OFFSET_SECONDS {
+        return Err("server-clock offset is out of bounds".into());
+    }
+    let window = app
+        .get_webview_window("main")
+        .ok_or("main Android webview is unavailable")?;
+    let (send, receive) = oneshot::channel();
+    window
+        .with_webview(move |webview| {
+            webview.jni_handle().exec(move |env, activity, _webview| {
+                let result = env
+                    .call_method(
+                        activity,
+                        "recordAokieServerClock",
+                        "(J)I",
+                        &[JValue::Long(offset_seconds)],
+                    )
+                    .and_then(|value| value.i())
+                    .map_err(|error| jni_failure(env, error));
+                let _ = send.send(result);
+            });
+        })
+        .map_err(|error| error.to_string())?;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), receive)
+        .await
+        .map_err(|_| "Android server-clock record timed out".to_string())?
+        .map_err(|_| "Android server-clock record was cancelled".to_string())??;
+    if result > 0 {
+        Ok(())
+    } else {
+        Err("Android server-clock record failed".into())
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) async fn record_server_clock(_app: &AppHandle, _offset_seconds: i64) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(target_os = "android")]
 pub(crate) async fn invalidate_push_token(app: &AppHandle) -> Result<(), String> {
     if call_int_no_args(app, "invalidateAokiePushToken").await? > 0 {

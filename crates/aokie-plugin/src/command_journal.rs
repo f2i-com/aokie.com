@@ -197,6 +197,28 @@ impl CommandJournal {
     }
 }
 
+/// Prune the journal at `path` on a connection of its own: the outbox
+/// replay thread's maintenance tick does, every ten minutes (review 4 #15:
+/// results were pruned only at start, so a plugin that ran for weeks kept
+/// every number it texted or rang). No journal is made where there is none.
+/// Returns how many results went.
+pub fn prune_file(path: &Path) -> usize {
+    if !path.exists() {
+        return 0;
+    }
+    match CommandJournal::open(path).and_then(|journal| journal.prune_completed(RETENTION_DAYS)) {
+        Ok(0) => 0,
+        Ok(n) => {
+            eprintln!("[aokie-plugin] command journal: pruned {n} result(s) past {RETENTION_DAYS} days");
+            n
+        }
+        Err(e) => {
+            eprintln!("[aokie-plugin] command journal prune failed: {e}");
+            0
+        }
+    }
+}
+
 fn payload_hash(payload: &Value) -> Result<String, String> {
     let canonical = canonicalize(payload);
     let encoded = serde_json::to_vec(&canonical).map_err(|e| e.to_string())?;
@@ -312,6 +334,37 @@ mod tests {
             journal.prepare("open", "call.dial", &json!({"number": "+61400000002"})),
             Ok(Prepare::Pending)
         );
+    }
+
+    /// Review 4 #15: the replay thread's maintenance tick prunes the journal
+    /// on a connection of its own, while the plugin's stays open; no journal
+    /// is made where there is none.
+    #[test]
+    fn the_journal_is_pruned_while_the_plugin_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("command-journal.sqlite3");
+        assert_eq!(prune_file(&path), 0);
+        assert!(!path.exists(), "none made");
+        let mut journal = CommandJournal::open(&path).unwrap();
+        journal.prepare("old", "sms.send", &json!({"to": "+61400000000"})).unwrap();
+        journal.complete("old", &json!({"to": "+61400000000"})).unwrap();
+        journal.prepare("new", "sms.send", &json!({"to": "+61400000001"})).unwrap();
+        journal.complete("new", &json!({"to": "+61400000001"})).unwrap();
+        journal
+            .conn
+            .execute(
+                "UPDATE command_journal SET completed_at = datetime('now', '-8 days') WHERE request_id = 'old'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(prune_file(&path), 1);
+        assert_eq!(journal.prepare("old", "sms.send", &json!({"to": "+61400000000"})), Ok(Prepare::New));
+        assert!(matches!(
+            journal.prepare("new", "sms.send", &json!({"to": "+61400000001"})),
+            Ok(Prepare::Replay(_))
+        ));
+        let tick = include_str!("event_bridge.rs");
+        assert!(tick.contains("crate::command_journal::prune_file("), "the maintenance tick prunes it");
     }
 
     /// Review 2026-10: a corrupt journal file stopped the plugin at every

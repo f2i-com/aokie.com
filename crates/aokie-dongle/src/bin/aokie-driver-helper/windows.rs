@@ -191,7 +191,8 @@ impl Drop for HelperRunning {
 /// Take the helpers' mutex, or say why not: one helper at a time, whichever
 /// Aokie started it (review 3 #18). One that ended without letting it go (it
 /// crashed, or was ended) is not running, so the mutex it left is taken:
-/// only helpers take this one; the dispatcher only looks.
+/// only helpers take this one. (The dispatcher tells whether a helper runs by
+/// the helper process it recorded, not by this name, review 4 #18.)
 fn hold_helper_mutex() -> Result<HelperRunning, String> {
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};

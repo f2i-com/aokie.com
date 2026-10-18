@@ -34,9 +34,15 @@ use super::map_mas::{MasMceSession, MasState, Operation, OperationOutput};
 use super::obex::{FixedPayload, Packet};
 use super::rfcomm::{ClientDlciEvent, RfcommClientEvent, RfcommClientState};
 use super::sdp_client::{
-    build_service_search_attribute_request, extract_rfcomm_channel, iter_records,
-    parse_service_search_attribute_response, UUID_MAP_MAS,
+    build_service_search_attribute_request, build_service_search_attribute_request_continued,
+    mas_for_sms, read_sdp_reply, SdpReply, UUID_MAP_MAS,
 };
+
+/// How many continuation requests one MAS record query may take, and how
+/// many AttributeLists bytes it may gather: past these the phone's answer
+/// is not records.
+const MAX_SDP_CONTINUATIONS: u8 = 16;
+const MAX_SDP_ATTRIBUTE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum MapRuntimeEvent {
@@ -58,6 +64,10 @@ enum MapRuntimePhase {
     AwaitingSdpResponse {
         local_cid: u16,
         buffer: Vec<u8>,
+        /// The AttributeLists bytes of the responses before this one, when
+        /// the phone split its records (an SDP continuation state).
+        attribute_lists: Vec<u8>,
+        continuations: u8,
     },
     AwaitingRfcommOpen {
         server_channel: u8,
@@ -168,6 +178,19 @@ impl MapRuntime {
             self.phase,
             MapRuntimePhase::Resting { .. } | MapRuntimePhase::RestingShared { .. }
         )
+    }
+
+    /// Whether a PUT has gone out to the phone and its answer has not come:
+    /// for a text, the phone may have it from here on, so one lost now is
+    /// in doubt, not failed for certain (review 4 #3).
+    pub fn put_awaiting_answer(&self) -> bool {
+        match &self.phase {
+            MapRuntimePhase::DrivingMas { session, .. }
+            | MapRuntimePhase::DrivingMasShared { session, .. } => {
+                matches!(session.state(), MasState::AwaitingPut)
+            }
+            _ => false,
+        }
     }
 
     /// Phase 4g.d: feed a follow-up op into a resting runtime. Returns
@@ -393,12 +416,15 @@ impl MapRuntime {
             MapRuntimePhase::AwaitingSdpResponse {
                 local_cid,
                 mut buffer,
+                mut attribute_lists,
+                continuations,
             } if local_cid == cid => {
                 buffer.extend_from_slice(&bytes);
-                match parse_service_search_attribute_response(&buffer) {
-                    Ok(resp) if resp.continuation_state.is_empty() => {
+                match read_sdp_reply(&buffer) {
+                    SdpReply::Response(resp) if resp.continuation_state.is_empty() => {
+                        attribute_lists.extend_from_slice(resp.attribute_lists);
                         let server_channel = match self
-                            .extract_mas_channel_from_attribute_lists(resp.attribute_lists)
+                            .extract_mas_channel_from_attribute_lists(&attribute_lists)
                         {
                             Ok(c) => c,
                             Err(e) => {
@@ -469,18 +495,54 @@ impl MapRuntime {
                         };
                         Ok(())
                     }
-                    Ok(_) => {
-                        self.fail(
-                            "MAP SDP: continuation state present (unexpected for our small query)"
-                                .to_string(),
-                            Some(local_cid),
-                            l2cap_state,
-                            out,
+                    SdpReply::Response(resp) => {
+                        // The phone split its records over several responses
+                        // (review 4 #25: this failed the text): ask for the
+                        // next part with the continuation state it gave.
+                        attribute_lists.extend_from_slice(resp.attribute_lists);
+                        if continuations >= MAX_SDP_CONTINUATIONS
+                            || attribute_lists.len() > MAX_SDP_ATTRIBUTE_BYTES
+                        {
+                            self.fail(
+                                format!(
+                                    "MAP SDP: the phone's records ran past {} parts / {} bytes",
+                                    MAX_SDP_CONTINUATIONS, MAX_SDP_ATTRIBUTE_BYTES
+                                ),
+                                Some(local_cid),
+                                l2cap_state,
+                                out,
+                            );
+                            return Ok(());
+                        }
+                        self.sdp_transaction_id = self.sdp_transaction_id.wrapping_add(1);
+                        let req = build_service_search_attribute_request_continued(
+                            self.sdp_transaction_id,
+                            UUID_MAP_MAS,
+                            0xffff,
+                            resp.continuation_state,
                         );
+                        out.push(l2cap_state.send_on_channel(local_cid, &req)?);
+                        self.phase = MapRuntimePhase::AwaitingSdpResponse {
+                            local_cid,
+                            buffer: Vec::new(),
+                            attribute_lists,
+                            continuations: continuations + 1,
+                        };
                         Ok(())
                     }
-                    Err(_) => {
-                        self.phase = MapRuntimePhase::AwaitingSdpResponse { local_cid, buffer };
+                    SdpReply::Partial => {
+                        self.phase = MapRuntimePhase::AwaitingSdpResponse {
+                            local_cid,
+                            buffer,
+                            attribute_lists,
+                            continuations,
+                        };
+                        Ok(())
+                    }
+                    SdpReply::Failed(e) => {
+                        // An ErrorResponse, or a reply that cannot be read:
+                        // no use waiting out the SDP timeout for it.
+                        self.fail(format!("MAP SDP: {}", e), Some(local_cid), l2cap_state, out);
                         Ok(())
                     }
                 }
@@ -594,17 +656,22 @@ impl MapRuntime {
                                         return Ok(());
                                     }
                                 };
-                                eprintln!(
-                                    "[AokieRadio] MAP OBEX response opcode 0x{:02x} (state before: {:?})",
-                                    parsed.opcode, session.state()
-                                );
+                                // Each step only with AOKIE_RADIO_DEBUG_LOGS (review 4 #16).
+                                if super::debug_logs() {
+                                    eprintln!(
+                                        "[AokieRadio] MAP OBEX response opcode 0x{:02x} (state before: {:?})",
+                                        parsed.opcode, session.state()
+                                    );
+                                }
                                 if let Some(next_req) = session.handle_response(&parsed) {
                                     let uih = client.build_outbound_uih(&next_req)?;
                                     out.push(l2cap_state.send_on_channel(local_cid, &uih)?);
-                                    eprintln!(
-                                        "[AokieRadio] MAP MAS sent next request — new state {:?}",
-                                        session.state()
-                                    );
+                                    if super::debug_logs() {
+                                        eprintln!(
+                                            "[AokieRadio] MAP MAS sent next request — new state {:?}",
+                                            session.state()
+                                        );
+                                    }
                                 }
                                 match session.state() {
                                     MasState::Done => {
@@ -817,11 +884,14 @@ impl MapRuntime {
                             return Ok(());
                         }
                     };
-                    eprintln!(
-                        "[AokieRadio] MAP OBEX response opcode 0x{:02x} (state before: {:?})",
-                        parsed.opcode,
-                        session.state()
-                    );
+                    // Each step only with AOKIE_RADIO_DEBUG_LOGS (review 4 #16).
+                    if super::debug_logs() {
+                        eprintln!(
+                            "[AokieRadio] MAP OBEX response opcode 0x{:02x} (state before: {:?})",
+                            parsed.opcode,
+                            session.state()
+                        );
+                    }
                     if let Some(next_req) = session.handle_response(&parsed) {
                         let acl = l2cap_state.rfcomm_send_uih_on_client_dlci(
                             local_cid,
@@ -829,10 +899,12 @@ impl MapRuntime {
                             &next_req,
                         )?;
                         out.push(acl);
-                        eprintln!(
-                            "[AokieRadio] MAP MAS sent next request — new state {:?}",
-                            session.state()
-                        );
+                        if super::debug_logs() {
+                            eprintln!(
+                                "[AokieRadio] MAP MAS sent next request — new state {:?}",
+                                session.state()
+                            );
+                        }
                     }
                     match session.state() {
                         MasState::Done => {
@@ -906,6 +978,8 @@ impl MapRuntime {
                         self.phase = MapRuntimePhase::AwaitingSdpResponse {
                             local_cid: cid,
                             buffer: Vec::new(),
+                            attribute_lists: Vec::new(),
+                            continuations: 0,
                         };
                     }
                 }
@@ -938,17 +1012,21 @@ impl MapRuntime {
         Ok(())
     }
 
+    /// The texts' MAS instance's RFCOMM channel; its MASInstanceID, when
+    /// the record names one, is the one the OBEX CONNECT carries.
     fn extract_mas_channel_from_attribute_lists(
-        &self,
+        &mut self,
         attribute_lists: &[u8],
     ) -> Result<u8, String> {
-        let records = iter_records(attribute_lists)?;
-        for record in records {
-            if let Some(channel) = extract_rfcomm_channel(record)? {
-                return Ok(channel);
-            }
+        let (channel, instance) = mas_for_sms(attribute_lists)?;
+        if let Some(instance) = instance.filter(|i| *i != self.mas_instance_id) {
+            eprintln!(
+                "[AokieRadio] MAP SDP: the texts' MAS instance is {} (was {})",
+                instance, self.mas_instance_id
+            );
+            self.mas_instance_id = instance;
         }
-        Err("MAP MAS service record did not advertise an RFCOMM channel".to_string())
+        Ok(channel)
     }
 
     fn fail(
@@ -1137,6 +1215,139 @@ mod tests {
             events
         );
         assert!(runtime.is_failed());
+    }
+
+    /// A runtime whose SDP channel (local 0x0040) is open and whose request
+    /// has gone out.
+    fn runtime_awaiting_sdp() -> (MapRuntime, L2capState) {
+        use crate::aokie_radio::l2cap::{build_acl_packet, build_basic_frame, CID_SIGNALING};
+        let mut runtime = MapRuntime::new(
+            0x002a,
+            Operation::ListMessages { folder: Folder::Inbox, max_list_count: 16, filter_message_type: 0xfc },
+            0,
+        );
+        let mut l2cap = L2capState::new();
+        let _ = runtime.start(&mut l2cap).unwrap();
+        for signal in [
+            &[0x03, 0x80, 0x08, 0x00, 0x70, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00][..],
+            &[0x04, 0x07, 0x04, 0x00, 0x40, 0x00, 0x00, 0x00][..],
+            &[0x05, 0x81, 0x06, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00][..],
+        ] {
+            let acl = build_acl_packet(0x002a, 0x02, 0, &build_basic_frame(CID_SIGNALING, signal));
+            l2cap.handle_acl_packet(&acl).unwrap();
+        }
+        let _ = runtime.tick(&mut l2cap).unwrap();
+        assert!(matches!(runtime.phase, MapRuntimePhase::AwaitingSdpResponse { .. }));
+        (runtime, l2cap)
+    }
+
+    /// Feed one SDP PDU on the SDP channel and tick; the ACL packets out.
+    fn feed_sdp(runtime: &mut MapRuntime, l2cap: &mut L2capState, pdu: &[u8]) -> Vec<Vec<u8>> {
+        use crate::aokie_radio::l2cap::{build_acl_packet, build_basic_frame};
+        let acl = build_acl_packet(0x002a, 0x02, 0, &build_basic_frame(0x0040, pdu));
+        l2cap.handle_acl_packet(&acl).unwrap();
+        runtime.tick(l2cap).unwrap()
+    }
+
+    fn sdp_response(attribute_bytes: &[u8], continuation: &[u8]) -> Vec<u8> {
+        let mut params = (attribute_bytes.len() as u16).to_be_bytes().to_vec();
+        params.extend_from_slice(attribute_bytes);
+        params.push(continuation.len() as u8);
+        params.extend_from_slice(continuation);
+        let mut pdu = vec![0x07, 0x00, 0x01];
+        pdu.extend_from_slice(&(params.len() as u16).to_be_bytes());
+        pdu.extend_from_slice(&params);
+        pdu
+    }
+
+    /// A MAS record: its RFCOMM channel, MASInstanceID and message types.
+    fn mas_record(channel: u8, instance: u8, types: Option<u8>) -> Vec<u8> {
+        use crate::aokie_radio::sdp::{encode_data_element, DataElement, UUID_L2CAP, UUID_RFCOMM};
+        let mut attrs = Vec::new();
+        let seq = |items: &[DataElement<'_>]| {
+            let mut inner = Vec::new();
+            for item in items {
+                encode_data_element(*item, &mut inner);
+            }
+            let mut out = Vec::new();
+            encode_data_element(DataElement::Sequence(&inner), &mut out);
+            out
+        };
+        encode_data_element(DataElement::Uint16(0x0001), &mut attrs);
+        attrs.extend(seq(&[DataElement::Uuid16(UUID_MAP_MAS)]));
+        encode_data_element(DataElement::Uint16(0x0004), &mut attrs);
+        let mut pdl = seq(&[DataElement::Uuid16(UUID_L2CAP)]);
+        pdl.extend(seq(&[DataElement::Uuid16(UUID_RFCOMM), DataElement::Uint8(channel)]));
+        encode_data_element(DataElement::Sequence(&pdl), &mut attrs);
+        encode_data_element(DataElement::Uint16(0x0315), &mut attrs);
+        encode_data_element(DataElement::Uint8(instance), &mut attrs);
+        if let Some(types) = types {
+            encode_data_element(DataElement::Uint16(0x0316), &mut attrs);
+            encode_data_element(DataElement::Uint8(types), &mut attrs);
+        }
+        let mut record = Vec::new();
+        encode_data_element(DataElement::Sequence(&attrs), &mut record);
+        record
+    }
+
+    /// Review 4 #25: an SDP ErrorResponse fails the step at once (it waited
+    /// out the 30 s timeout), and so does a whole reply that cannot be read.
+    #[test]
+    fn an_sdp_error_response_fails_at_once() {
+        let (mut runtime, mut l2cap) = runtime_awaiting_sdp();
+        let _ = feed_sdp(&mut runtime, &mut l2cap, &[0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03]);
+        assert!(runtime.is_failed());
+        assert!(runtime.take_events().iter().any(|e| matches!(
+            e,
+            MapRuntimeEvent::Failed(reason) if reason.contains("ErrorResponse 0x0003")
+        )));
+        let (mut runtime, mut l2cap) = runtime_awaiting_sdp();
+        let _ = feed_sdp(&mut runtime, &mut l2cap, &[0x05, 0x00, 0x01, 0x00, 0x00]);
+        assert!(runtime.is_failed(), "a whole PDU of the wrong kind");
+        // A reply still coming in is waited for.
+        let (mut runtime, mut l2cap) = runtime_awaiting_sdp();
+        let _ = feed_sdp(&mut runtime, &mut l2cap, &[0x07, 0x00, 0x01, 0x00, 0x40]);
+        assert!(!runtime.is_failed());
+    }
+
+    /// Review 4 #25: a reply split with a continuation state is asked for in
+    /// parts and put together; the texts' MAS record is picked by its
+    /// message types (the e-mail instance listed first is passed over), with
+    /// its MASInstanceID.
+    #[test]
+    fn sdp_continuations_are_followed_and_the_sms_instance_is_picked() {
+        use crate::aokie_radio::l2cap::{parse_acl_frame, parse_basic_frame};
+        use crate::aokie_radio::sdp::{encode_data_element, DataElement};
+        let mut records = mas_record(5, 0, Some(0x01)); // e-mail only
+        records.extend(mas_record(7, 1, Some(0x0e))); // SMS GSM/CDMA + MMS
+        let mut lists = Vec::new();
+        encode_data_element(DataElement::Sequence(&records), &mut lists);
+        let (first, second) = lists.split_at(lists.len() / 2);
+
+        let (mut runtime, mut l2cap) = runtime_awaiting_sdp();
+        let out = feed_sdp(&mut runtime, &mut l2cap, &sdp_response(first, &[0xab, 0xcd]));
+        assert!(!runtime.is_failed());
+        let request = out
+            .iter()
+            .filter_map(|p| parse_acl_frame(p).ok())
+            .filter_map(|acl| parse_basic_frame(acl.payload).ok().map(|f| f.payload.to_vec()))
+            .find(|pdu| pdu.first() == Some(&0x06))
+            .expect("a continuation request");
+        assert!(request.ends_with(&[0x02, 0xab, 0xcd]), "carries the continuation state: {request:02x?}");
+        let _ = feed_sdp(&mut runtime, &mut l2cap, &sdp_response(second, &[]));
+        assert!(!runtime.is_failed(), "{:?}", runtime.take_events());
+        assert!(matches!(runtime.phase, MapRuntimePhase::AwaitingRfcommOpen { server_channel: 7, .. }));
+        assert_eq!(runtime.mas_instance_id, 1);
+
+        // Records that do not say what they carry: the first, as before.
+        let mut records = mas_record(4, 0, None);
+        records.extend(mas_record(9, 2, None));
+        let mut lists = Vec::new();
+        encode_data_element(DataElement::Sequence(&records), &mut lists);
+        let (mut runtime, mut l2cap) = runtime_awaiting_sdp();
+        let _ = feed_sdp(&mut runtime, &mut l2cap, &sdp_response(&lists, &[]));
+        assert!(matches!(runtime.phase, MapRuntimePhase::AwaitingRfcommOpen { server_channel: 4, .. }));
+        assert_eq!(runtime.mas_instance_id, 0);
     }
 
     #[test]

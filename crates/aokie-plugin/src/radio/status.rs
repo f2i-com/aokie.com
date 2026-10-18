@@ -230,6 +230,13 @@ pub struct RadioStatus {
     /// caller's number, for the call that takes it up again after the
     /// reconnect (`CallSession::resumes`, review 3 #35).
     pub lost_call: Mutex<Option<(String, Option<String>)>>,
+    /// The texts handed to this radio that have no outcome yet, by message
+    /// id, each with its attempt (review 4 #4, #17). A retry under the id
+    /// while one is on its way is answered as a duplicate: not sent, and not
+    /// counted against the daily cap. The attempt keys the text's definite
+    /// failure (`aokie:<messageId>:sms.failed.<attempt>:v1`), so a text that
+    /// failed for certain can be sent again under its id, and fail again.
+    pub texts_in_flight: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl RadioStatus {

@@ -7684,3 +7684,41 @@ fn a_desktop_clock_minutes_off_connects_and_keeps_the_gateways_full_lease() {
         assert_eq!(lease_ttl_ms_at(&claims, server_now).unwrap(), 20_000, "skew {skew}");
     }
 }
+
+/// Review 4 #29: the gateway socket takes what the gateway and the phone take,
+/// 256 KiB a message and a frame, not tungstenite's 64 MiB.
+#[test]
+fn the_gateway_socket_is_bounded_as_the_gateway_and_the_phone_are() {
+    let config = gateway_socket_config();
+    assert_eq!(config.max_message_size, Some(256 * 1024));
+    assert_eq!(config.max_frame_size, Some(256 * 1024));
+}
+
+/// Review 4 #16: routine admission rotations, and a deferral retried each
+/// second for the same reason, are logged once in a while with a count; the
+/// first rotation, one that resets continuity and a new reason, at once.
+#[test]
+fn admission_rotations_are_logged_once_in_a_while_with_how_many() {
+    let start = Instant::now();
+    let mut log = AdmissionRotationLog::default();
+    assert!(log.log_start(), "the first rotation's start is logged");
+    assert_eq!(log.rotated(start, false), Some(1));
+    assert!(!log.log_start(), "later starts are not");
+    let every_four_minutes = |n: u32| start + Duration::from_secs(240) * n;
+    for n in 1..15 {
+        assert_eq!(log.rotated(every_four_minutes(n), false), None, "rotation {n}");
+    }
+    assert_eq!(log.rotated(every_four_minutes(15), false), Some(15), "an hour on, with the count");
+    assert_eq!(log.rotated(every_four_minutes(16), true), Some(1), "a continuity reset at once");
+
+    let later = every_four_minutes(17);
+    assert_eq!(log.deferred(later, "reconnect broker unavailable"), Some(1));
+    for second in 1..30 {
+        assert_eq!(log.deferred(later + Duration::from_secs(second), "reconnect broker unavailable"), None);
+    }
+    assert_eq!(log.deferred(later + Duration::from_secs(30), "expired admission refused"), Some(30), "a new reason at once");
+    assert_eq!(log.deferred(later + Duration::from_secs(90), "expired admission refused"), Some(1));
+    // A rotation ends the streak: the next deferral is logged.
+    assert_eq!(log.rotated(later + Duration::from_secs(91), false), None);
+    assert_eq!(log.deferred(later + Duration::from_secs(92), "expired admission refused"), Some(1));
+}

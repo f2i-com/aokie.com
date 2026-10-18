@@ -3939,6 +3939,7 @@ impl crate::backend::RadioBackend for StoppingBackend {
             message_id: "sms_open".into(),
             recipient_phone: "0400111222".into(),
             reason: "the Bluetooth radio stopped before the phone took the text".into(),
+            outcome_unknown: false,
         });
         true
     }
@@ -4126,6 +4127,72 @@ fn a_call_taken_up_after_a_lost_link_names_the_call_it_resumes() {
     assert_eq!(incoming["params"]["event"]["data"]["resumesCall"], json!(lost));
     assert_eq!(incoming["params"]["event"]["data"]["from"], json!("0491570157"));
     assert!(status.lost_call.lock().unwrap().is_none(), "taken once");
+}
+
+/// Review 4 #31: a realtime booking's "tomorrow" is checked against the day
+/// the session was told it is ("Today is …", fixed when it began), not a
+/// clock that has passed midnight since: just after midnight the caller's
+/// "tomorrow" was refused.
+#[cfg(all(aokie_radio, feature = "voice"))]
+#[test]
+fn a_realtime_booking_is_checked_against_the_day_its_session_was_told() {
+    let (session, _detached) = crate::realtime_voice::RealtimeVoiceSession::detached("call_1", 7);
+    let lane = RealtimeCallLane::new(session);
+    assert_eq!(lane.today, chrono::Local::now().date_naive());
+    let source = include_str!("realtime_service.rs").replace("\r\n", "\n");
+    let at = source.find("validate_with_readback(").expect("the service validates bookings");
+    let call = &source[at..at + 500];
+    assert!(call.contains("lane.today") && !call.contains("Local::now()"), "{call}");
+    // What that day decides: the session began on Sunday 18 October, and
+    // the caller's "tomorrow" (said at 00:05 on the 19th) is the 19th.
+    let told = chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+    let latest = "Tomorrow at 10 please, it's Sam for a haircut.";
+    let request = json!({"callerName": "Sam", "service": "Haircut", "date": "2026-10-19", "time": "10:00", "agreementPhrase": latest});
+    let history = vec![latest.to_string(), "Hi, I'd like to make an appointment, please.".to_string()];
+    let check = |today| crate::realtime_appointment::validate(&request, "call_1", Some((3, latest)), &history, today);
+    assert!(check(told).is_ok(), "{:?}", check(told));
+    assert!(check(told + chrono::Duration::days(1)).is_err(), "the live clock's day reads it as the 20th");
+}
+
+/// Review 4 #21: the hold juggle takes no knocking caller past the consent
+/// grant's expiry: the check comes before the first caller is told to hold.
+#[test]
+fn the_hold_juggle_takes_no_new_caller_past_the_consent_expiry() {
+    let source = include_str!("juggle.rs").replace("\r\n", "\n");
+    let check = source.find("} else if status.consent_expired() {").expect("the juggle checks the expiry");
+    let ask = source.find("HOLD_PRIMARY_ASK_LINE").expect("the hold announcement");
+    let screen = source.find("knocking caller is screened").expect("the screening refusal");
+    assert!(screen < check && check < ask, "checked with the other refusals, before anything is said");
+    let status = RadioStatus::default();
+    status.consent_expires_at.store(1, Ordering::Relaxed);
+    assert!(status.consent_expired());
+}
+
+/// Review 4 #1: the owner took the receptionist's call on the handset, the
+/// link went and came back: the call still up on the phone is the owner's,
+/// observed (no AT+BCC pulling the audio back, no hang-up, no greeting). An
+/// audio close only moments before the link went is the link going: that
+/// call is still the receptionist's.
+#[test]
+fn a_call_the_owner_took_to_the_handset_stays_theirs_after_a_lost_link() {
+    use aokie_dongle::bluetooth::BluetoothEvent as E;
+    for (on_handset_for, hers) in [(std::time::Duration::from_secs(5), false), (std::time::Duration::ZERO, true)] {
+        let status = std::sync::Arc::new(RadioStatus::default());
+        let mut tracker = crate::call_session::SessionTracker::new();
+        let mut sink = crate::event_bridge::VecSink::default();
+        handle_event(E::DeviceConnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
+        handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+        handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
+        handle_event(E::AudioOnHandset, &mut tracker, None, &mut sink, &status);
+        tracker.current_mut().unwrap().audio_on_handset_since = Instant::now().checked_sub(on_handset_for);
+        handle_event(E::DeviceDisconnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
+        handle_event(E::DeviceConnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
+        handle_event(E::CallActiveAtConnect, &mut tracker, None, &mut sink, &status);
+        let s = tracker.current().expect("the call is tracked");
+        assert_eq!(s.receptionist_owns(), hers, "on the handset for {on_handset_for:?}");
+        assert_eq!(s.resumes.is_some(), hers);
+        assert_eq!(dead_air_watch_call(tracker.current()).is_some(), hers, "the watchdog leaves the owner's call alone");
+    }
 }
 
 /// Review 3 #35: a setting taken away no longer leaves its last value for

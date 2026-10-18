@@ -756,6 +756,25 @@ fn transport_error(reason: String) -> SocketError {
     }
 }
 
+/// Whether OAIY's Close ends the call's stream on purpose, so the call is not
+/// reconnected for it (review 4 #12). OAIY's voice server closes with no code
+/// at the end of every call task, whatever ended it: an in-process voice
+/// restart, its hub going, a stream it gave up on. It ends a call on purpose
+/// by other means (finish_call, a fatal `error`), so a bare Close, and the
+/// codes a server going away or restarting sends, are the stream failing
+/// under the call, reconnected once. A Close with any other code (normal,
+/// policy, protocol, size: a peer that says it is done, or refuses what it
+/// was sent) is that peer's decision, and a reconnect would meet it again.
+fn close_ends_the_call(frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>) -> bool {
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    frame.is_some_and(|frame| {
+        !matches!(
+            frame.code,
+            CloseCode::Away | CloseCode::Abnormal | CloseCode::Error | CloseCode::Restart | CloseCode::Again
+        )
+    })
+}
+
 /// The worker's side of the radio's event queue.
 ///
 /// The queue is short (`EVENT_DEPTH`) and OAIY sends a reply's audio faster
@@ -904,6 +923,9 @@ impl EventOutlet {
 pub(crate) struct DetachedSession {
     control_rx: Receiver<ControlCommand>,
     event_tx: SyncSender<RealtimeEvent>,
+    /// What the last begin [`DetachedSession::drain`] read said: its
+    /// instructions and greeting.
+    begun_with: std::sync::Mutex<Option<(Option<String>, Option<String>)>>,
 }
 
 #[cfg(all(test, aokie_radio, feature = "voice"))]
@@ -928,6 +950,7 @@ impl RealtimeVoiceSession {
             DetachedSession {
                 control_rx,
                 event_tx,
+                begun_with: std::sync::Mutex::new(None),
             },
         )
     }
@@ -957,13 +980,25 @@ impl DetachedSession {
                 ControlCommand::Stop { reason } => SentControl::Stop { reason },
                 ControlCommand::TransferOutcome { frame } => SentControl::TransferOutcome { frame },
                 ControlCommand::TransferNotice { frame } => SentControl::TransferNotice { frame },
-                ControlCommand::Begin { .. } => SentControl::Begin,
+                ControlCommand::Begin {
+                    instructions,
+                    greeting,
+                } => {
+                    *self.begun_with.lock().unwrap() = Some((instructions, greeting));
+                    SentControl::Begin
+                }
                 ControlCommand::CancelOutput { item_id, .. } => {
                     SentControl::CancelOutput { item_id }
                 }
             });
         }
         sent
+    }
+
+    /// The instructions and greeting of the last begin [`DetachedSession::drain`]
+    /// read, if it read one.
+    pub(crate) fn begun_with(&self) -> Option<(Option<String>, Option<String>)> {
+        self.begun_with.lock().unwrap().clone()
     }
 
     #[allow(dead_code)]
@@ -1404,13 +1439,15 @@ where
                         .map_err(|e| transport_error(format!("Desktop realtime pong failed: {e}")))?,
                     Message::Pong(_) | Message::Frame(_) => {}
                     Message::Close(frame) => {
-                        // OAIY closed the call's stream itself (review 3
-                        // #13): its decision, not a broken socket, and the
-                        // call is not reconnected for it.
-                        return Err(frame
+                        // OAIY's writer closes the stream at the end of every
+                        // call task, a voice restart's too (review 4 #12):
+                        // only a Close that says the call is over on purpose
+                        // is not reconnected for (see `close_ends_the_call`).
+                        let deliberate = close_ends_the_call(frame.as_ref());
+                        let reason = frame
                             .map(|frame| format!("Desktop realtime closed: {}", frame.reason))
-                            .unwrap_or_else(|| "Desktop realtime closed".to_string())
-                            .into());
+                            .unwrap_or_else(|| "Desktop realtime closed".to_string());
+                        return Err(if deliberate { reason.into() } else { transport_error(reason) });
                     }
                 }
             }
@@ -3266,20 +3303,42 @@ mod tests {
     }
 
     /// The stream ending, or a receive error, is the stream failing (the
-    /// call reconnects once); OAIY closing it itself is not (review 3 #13).
+    /// call reconnects once). So is OAIY's bare Close (review 4 #12): its
+    /// writer sends one at the end of every call task, an in-process voice
+    /// restart's too, and a server going away or restarting says so. A Close
+    /// that says the peer is done, or refuses what it was sent, is not.
     #[test]
-    fn the_stream_ending_is_the_stream_failing_and_oaiy_closing_it_is_not() {
+    fn the_stream_ending_or_oaiys_task_ending_is_the_stream_failing_and_a_deliberate_close_is_not() {
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
         let (result, _, events) = run_against(vec![ready_frame()], false, READY_TIMEOUT, Vec::new(), |_| {});
         let error = result.unwrap_err();
         assert!(error.transport, "{error:?}");
         assert!(matches!(events[0], RealtimeEventKind::Ready { .. }));
         let (result, _, _) = run_against(vec![ready_frame(), Err("reset".into())], false, READY_TIMEOUT, Vec::new(), |_| {});
         assert!(result.unwrap_err().transport);
-        let (result, _, _) =
-            run_against(vec![ready_frame(), Ok(Message::Close(None))], false, READY_TIMEOUT, Vec::new(), |_| {});
-        let error = result.unwrap_err();
-        assert!(!error.transport, "{error:?}");
+        let closed = |frame: Option<CloseFrame>| {
+            let (result, sent, _) =
+                run_against(vec![ready_frame(), Ok(Message::Close(frame))], false, READY_TIMEOUT, Vec::new(), |_| {});
+            (result.unwrap_err(), sent)
+        };
+        // What OAIY's writer sends as any call task ends.
+        let (error, sent) = closed(None);
+        assert!(error.transport, "{error:?}");
         assert!(error.reason.contains("closed"), "{error:?}");
+        assert!(
+            sent.iter().all(|frame| frame["type"] != "formlogic.realtime.stop"),
+            "nothing is said into a stream OAIY has closed"
+        );
+        for code in [CloseCode::Away, CloseCode::Error, CloseCode::Restart, CloseCode::Again] {
+            let (error, _) = closed(Some(CloseFrame { code, reason: "restarting".into() }));
+            assert!(error.transport, "{code:?}: {error:?}");
+        }
+        for code in [CloseCode::Normal, CloseCode::Policy, CloseCode::Protocol, CloseCode::Size] {
+            let (error, _) = closed(Some(CloseFrame { code, reason: "the call ended".into() }));
+            assert!(!error.transport, "{code:?}: {error:?}");
+            assert!(error.reason.contains("the call ended"), "{error:?}");
+        }
     }
 
     #[test]

@@ -30,10 +30,14 @@
 
 #![allow(dead_code)] // Phase 4d — runtime integration follows in 4e.
 
+use std::time::{Duration, Instant};
+
+use super::map_listing::{attributes, element_end};
 use super::obex::{
     build_connect_response, BodyAssembler, FixedPayload, Header, Packet, HDR_CONNECTION_ID,
-    HDR_TARGET, HDR_TYPE, OP_CONNECT, OP_DISCONNECT, OP_PUT, RSP_BAD_REQUEST, RSP_CONTINUE,
-    RSP_NOT_FOUND, RSP_NOT_IMPLEMENTED, RSP_OK, RSP_SERVICE_UNAVAILABLE,
+    HDR_TARGET, HDR_TYPE, NOTIFICATION_BODY_LIMIT, OP_CONNECT, OP_DISCONNECT, OP_PUT,
+    RSP_BAD_REQUEST, RSP_CONTINUE, RSP_NOT_FOUND, RSP_NOT_IMPLEMENTED, RSP_OK,
+    RSP_SERVICE_UNAVAILABLE,
 };
 
 /// MNS target UUID (MAP §3.2.1). Big-endian on the wire. Spec value:
@@ -111,16 +115,24 @@ pub struct MnsServer {
     /// here using the same 3-byte BE length header `pbap_runtime`
     /// reads on its outbound channels.
     obex_buffer: Vec<u8>,
+    /// When the last packet of a PUT still being assembled came. A chain
+    /// the phone leaves unfinished longer than `PUT_CHAIN_DEADLINE` is let
+    /// go when the next PUT comes (review 4 #24).
+    put_chunk_at: Option<Instant>,
 }
+
+/// How long a multi-packet notification PUT may wait for its next packet.
+pub const PUT_CHAIN_DEADLINE: Duration = Duration::from_secs(30);
 
 impl MnsServer {
     pub fn new() -> Self {
         Self {
             state: MnsState::AwaitingConnect,
             connection_id: None,
-            body: BodyAssembler::new(),
+            body: BodyAssembler::with_limit(NOTIFICATION_BODY_LIMIT),
             pending_events: Vec::new(),
             obex_buffer: Vec::new(),
+            put_chunk_at: None,
         }
     }
 
@@ -130,7 +142,8 @@ impl MnsServer {
     pub fn reset(&mut self) {
         self.state = MnsState::AwaitingConnect;
         self.connection_id = None;
-        self.body = BodyAssembler::new();
+        self.body = BodyAssembler::with_limit(NOTIFICATION_BODY_LIMIT);
+        self.put_chunk_at = None;
         self.obex_buffer.clear();
         // Pending events deliberately preserved so the runtime can
         // still drain a NewMessage that came in immediately before
@@ -145,6 +158,29 @@ impl MnsServer {
         std::mem::take(&mut self.pending_events)
     }
 
+    /// Let go of a PUT chain whose next packet has not come within
+    /// `PUT_CHAIN_DEADLINE` (back to Connected). Checked when the next PUT
+    /// comes; a caller's tick may call it too, so a chain the phone gave up
+    /// on does not leave the session looking mid-PUT. True when one was let
+    /// go.
+    pub fn expire_stale_put(&mut self) -> bool {
+        let stale = matches!(self.state, MnsState::AssemblingPut)
+            && self
+                .put_chunk_at
+                .is_some_and(|at| at.elapsed() >= PUT_CHAIN_DEADLINE);
+        if stale {
+            eprintln!(
+                "[AokieRadio] MNS PUT chain waited over {:?} for its next packet — dropped ({}B)",
+                PUT_CHAIN_DEADLINE,
+                self.body.bytes().len()
+            );
+            self.body = BodyAssembler::with_limit(NOTIFICATION_BODY_LIMIT);
+            self.put_chunk_at = None;
+            self.state = MnsState::Connected;
+        }
+        stale
+    }
+
     /// Feed raw RFCOMM UIH payload bytes. Reassembles them into
     /// complete OBEX packets via the 3-byte BE length header and
     /// dispatches each through `handle_request`. Returns the OBEX
@@ -152,7 +188,11 @@ impl MnsServer {
     /// (RFCOMM layer) wraps each one in a UIH frame and writes it.
     ///
     /// Stops at the first malformed packet and surfaces it as an
-    /// error reply; the runtime should then tear the channel down.
+    /// error reply. A packet whose length cannot be (under 3 bytes, or
+    /// past the most we said we take) leaves the stream unreadable: the
+    /// buffer is emptied, the session is Failed, and only a new CONNECT
+    /// starts it again (review 4 #13: the bad header stayed at the front
+    /// of the buffer, every later packet hit it, and the buffer grew).
     pub fn feed_bytes(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
         self.obex_buffer.extend_from_slice(bytes);
         eprintln!(
@@ -167,7 +207,14 @@ impl MnsServer {
                 Ok(Some(n)) => n,
                 Ok(None) => break,
                 Err(reason) => {
-                    eprintln!("[AokieRadio] MNS OBEX header malformed: {}", reason);
+                    eprintln!(
+                        "[AokieRadio] MNS OBEX header malformed: {} — {}B dropped, waiting for a new CONNECT",
+                        reason,
+                        self.obex_buffer.len()
+                    );
+                    self.obex_buffer.clear();
+                    self.body = BodyAssembler::with_limit(NOTIFICATION_BODY_LIMIT);
+                    self.put_chunk_at = None;
                     self.state = MnsState::Failed(format!("OBEX header malformed: {}", reason));
                     out.push(build_simple_response(RSP_BAD_REQUEST));
                     break;
@@ -288,6 +335,10 @@ impl MnsServer {
             );
             return build_simple_response(RSP_SERVICE_UNAVAILABLE);
         }
+        // The phone left the last PUT unfinished: this packet starts anew
+        // (and a continuation of the old one, with no Type, is refused
+        // below).
+        self.expire_stale_put();
         // Validate Connection-Id matches what we issued.
         let conn_id = packet.header(HDR_CONNECTION_ID).and_then(|h| match h {
             Header::Quad { value, .. } => Some(*value),
@@ -336,10 +387,13 @@ impl MnsServer {
                 "[AokieRadio] MNS body assembler rejected packet: {}",
                 reason
             );
+            self.body = BodyAssembler::with_limit(NOTIFICATION_BODY_LIMIT);
+            self.put_chunk_at = None;
             self.state = MnsState::Failed(reason.clone());
             return build_simple_response(RSP_BAD_REQUEST);
         }
         if !is_final {
+            self.put_chunk_at = Some(Instant::now());
             self.state = MnsState::AssemblingPut;
             eprintln!("[AokieRadio] MNS PUT non-final → CONTINUE (assembled body so far)");
             return build_simple_response(RSP_CONTINUE);
@@ -352,7 +406,10 @@ impl MnsServer {
             // body and push the event.
             eprintln!("[AokieRadio] MNS PUT_FINAL without EndOfBody — accepting accumulated body");
         }
-        let body_bytes = std::mem::take(&mut self.body).into_bytes();
+        self.put_chunk_at = None;
+        let body_bytes =
+            std::mem::replace(&mut self.body, BodyAssembler::with_limit(NOTIFICATION_BODY_LIMIT))
+                .into_bytes();
         // The MNS event-report XML can include sender_phone /
         // sender_name attributes — keep the body length visible (useful
         // when debugging non-arriving notifications) but redact the
@@ -368,7 +425,7 @@ impl MnsServer {
         eprintln!("[AokieRadio] MNS parsed event: {:?}", event);
         self.pending_events.push(event);
         // Body assembler reset so the next PUT starts fresh.
-        self.body = BodyAssembler::new();
+        self.body = BodyAssembler::with_limit(NOTIFICATION_BODY_LIMIT);
         self.state = MnsState::Connected;
         build_simple_response(RSP_OK)
     }
@@ -393,22 +450,24 @@ pub fn parse_event_report(input: &[u8]) -> MnsEvent {
         };
     };
     let after = start + b"<event".len();
-    let Some(end) = bytes[after..].iter().position(|b| *b == b'>') else {
+    // The same reading as the listing's (review 4 #27): a `>` inside a
+    // quoted value does not end the element, and unquoted values count.
+    let Some(end) = element_end(bytes, after) else {
         return MnsEvent::Unparseable {
             reason: "<event> tag was never closed".to_string(),
         };
     };
-    let attr_section = &text[after..after + end];
+    let attr_section = &text[after..end];
     let mut event_type: Option<String> = None;
     let mut handle: Option<String> = None;
     let mut folder: Option<String> = None;
     let mut msg_type: Option<String> = None;
-    for (name, value) in iter_attributes(attr_section) {
-        match name {
-            "type" => event_type = Some(value.to_string()),
-            "handle" => handle = Some(value.to_string()),
-            "folder" => folder = Some(value.to_string()),
-            "msg_type" => msg_type = Some(value.to_string()),
+    for (name, value) in attributes(attr_section) {
+        match name.as_str() {
+            "type" => event_type = Some(value),
+            "handle" => handle = Some(value),
+            "folder" => folder = Some(value),
+            "msg_type" => msg_type = Some(value),
             _ => {}
         }
     }
@@ -457,74 +516,6 @@ fn find_event_open_tag(haystack: &[u8]) -> Option<usize> {
     None
 }
 
-/// Iterate `name="value"` attribute pairs out of an attribute section.
-/// Same shape as `map_listing::parse_msg_attributes` but yields
-/// (name, value) tuples instead of populating a struct.
-fn iter_attributes(section: &str) -> impl Iterator<Item = (&str, &str)> + '_ {
-    let mut chars = section.char_indices().peekable();
-    std::iter::from_fn(move || loop {
-        let (i, c) = *chars.peek()?;
-        if c.is_ascii_whitespace() || c == '/' {
-            chars.next();
-            continue;
-        }
-        let name_start = i;
-        let mut name_end = name_start;
-        while let Some(&(j, ch)) = chars.peek() {
-            if ch == '=' || ch.is_ascii_whitespace() {
-                name_end = j;
-                break;
-            }
-            chars.next();
-            name_end = j + ch.len_utf8();
-        }
-        while let Some(&(_, ch)) = chars.peek() {
-            if ch.is_ascii_whitespace() {
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        if let Some(&(_, '=')) = chars.peek() {
-            chars.next();
-        } else {
-            return None;
-        }
-        while let Some(&(_, ch)) = chars.peek() {
-            if ch.is_ascii_whitespace() {
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        let quote = match chars.peek().copied() {
-            Some((_, q)) if q == '"' || q == '\'' => {
-                chars.next();
-                q
-            }
-            _ => return None,
-        };
-        let value_start = chars.peek().map(|&(j, _)| j).unwrap_or(section.len());
-        let mut value_end = value_start;
-        loop {
-            match chars.next() {
-                Some((j, ch)) if ch == quote => {
-                    value_end = j;
-                    break;
-                }
-                Some((j, ch)) => {
-                    value_end = j + ch.len_utf8();
-                }
-                None => break,
-            }
-        }
-        return Some((
-            &section[name_start..name_end],
-            &section[value_start..value_end],
-        ));
-    })
-}
-
 /// Inspect the OBEX byte stream and return the number of bytes that
 /// constitute the next complete packet, or `None` if more bytes are
 /// needed. Mirrors `pbap_runtime::try_take_obex_packet` — we duplicate
@@ -539,6 +530,14 @@ fn try_take_obex_packet(buffer: &[u8]) -> Result<Option<usize>, String> {
         return Err(format!(
             "OBEX packet declares length {} (must be >= 3 for the header)",
             len
+        ));
+    }
+    // Our CONNECT reply told the phone the most we take; a longer packet
+    // is a misread length (and would hold the buffer up to 64 KiB).
+    if len > DEFAULT_MAX_PACKET_LENGTH as usize {
+        return Err(format!(
+            "OBEX packet declares length {} (we take at most {})",
+            len, DEFAULT_MAX_PACKET_LENGTH
         ));
     }
     if buffer.len() < len {
@@ -863,6 +862,100 @@ mod tests {
             "reassembled body must parse as NewMessage; got {:?}",
             events
         );
+    }
+
+    /// Review 4 #13: a packet whose declared length is under 3 bytes was
+    /// never drained, so every later packet (a fresh CONNECT included) hit
+    /// it and the buffer grew. Now it is dropped and a new CONNECT works.
+    #[test]
+    fn a_malformed_length_is_dropped_and_a_new_connect_starts_again() {
+        let mut server = MnsServer::new();
+        let replies = server.feed_bytes(&[0x80, 0x00, 0x01]);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(Packet::parse(&replies[0], FixedPayload::None).unwrap().opcode, RSP_BAD_REQUEST);
+        assert!(matches!(server.state(), MnsState::Failed(_)));
+        let connect = build_connect_request(Some(&MNS_TARGET_UUID), DEFAULT_MAX_PACKET_LENGTH);
+        for _ in 0..3 {
+            let replies = server.feed_bytes(&connect);
+            assert_eq!(replies.len(), 1);
+            assert_eq!(Packet::parse(&replies[0], FixedPayload::Connect).unwrap().opcode, RSP_OK);
+            assert_eq!(server.state(), &MnsState::Connected);
+            assert!(server.obex_buffer.is_empty());
+        }
+        // A length past what our CONNECT reply allows is a misread too: it
+        // does not hold the buffer while 64 KiB "arrive".
+        let replies = server.feed_bytes(&[0x02, 0xff, 0xff, 0x00]);
+        assert_eq!(replies.len(), 1);
+        assert!(server.obex_buffer.is_empty());
+        assert!(matches!(server.state(), MnsState::Failed(_)));
+        assert_eq!(server.feed_bytes(&connect).len(), 1);
+        assert_eq!(server.state(), &MnsState::Connected);
+    }
+
+    /// Review 4 #24: a notification body has a size limit, and a PUT chain
+    /// the phone leaves unfinished is let go when the next PUT comes.
+    #[test]
+    fn notification_bodies_are_capped_and_a_stale_put_chain_is_dropped() {
+        use crate::aokie_radio::obex::{Packet as ObexPacket, OP_PUT, OP_PUT_FINAL};
+        let chunk = |first: bool| {
+            let mut headers = vec![Header::connection_id(ASSIGNED_CONNECTION_ID)];
+            if first {
+                headers.push(Header::obex_type(TYPE_EVENT_REPORT));
+            }
+            headers.push(Header::body(vec![b' '; 8000]));
+            ObexPacket { opcode: OP_PUT, fixed_payload: Vec::new(), headers }.encode()
+        };
+        let mut server = established_server();
+        let mut last = RSP_CONTINUE;
+        for i in 0..20 {
+            let reply = server.feed_bytes(&chunk(i == 0));
+            last = Packet::parse(&reply[0], FixedPayload::None).unwrap().opcode;
+            if last != RSP_CONTINUE {
+                break;
+            }
+        }
+        assert_eq!(last, RSP_BAD_REQUEST, "refused past {NOTIFICATION_BODY_LIMIT} bytes");
+        assert!(server.body.bytes().is_empty(), "the body is let go");
+
+        // A chain left waiting past the deadline: the next PUT starts anew.
+        let mut server = established_server();
+        let reply = server.feed_bytes(&chunk(true));
+        assert_eq!(Packet::parse(&reply[0], FixedPayload::None).unwrap().opcode, RSP_CONTINUE);
+        assert!(!server.expire_stale_put(), "not yet");
+        server.put_chunk_at = Instant::now().checked_sub(PUT_CHAIN_DEADLINE + Duration::from_secs(1));
+        let xml = br#"<MAP-event-report><event type="NewMessage" handle="0042"/></MAP-event-report>"#;
+        let fresh = ObexPacket {
+            opcode: OP_PUT_FINAL,
+            fixed_payload: Vec::new(),
+            headers: vec![
+                Header::connection_id(ASSIGNED_CONNECTION_ID),
+                Header::obex_type(TYPE_EVENT_REPORT),
+                Header::end_of_body(xml.to_vec()),
+            ],
+        }
+        .encode();
+        let reply = server.feed_bytes(&fresh);
+        assert_eq!(Packet::parse(&reply[0], FixedPayload::None).unwrap().opcode, RSP_OK);
+        assert!(matches!(
+            server.take_events().as_slice(),
+            [MnsEvent::NewMessage { handle, .. }] if handle == "0042"
+        ), "not glued to the stale 8000 bytes");
+    }
+
+    /// Review 4 #27: the event element does not end at a `>` inside a
+    /// quoted value, and unquoted values are read.
+    #[test]
+    fn event_report_reads_past_a_quoted_gt_and_unquoted_values() {
+        let xml = br#"<MAP-event-report><event subject="a > b" type="NewMessage" handle="0007" folder="telecom/msg/inbox"/></MAP-event-report>"#;
+        assert!(matches!(
+            parse_event_report(xml),
+            MnsEvent::NewMessage { handle, folder: Some(folder), .. } if handle == "0007" && folder == "telecom/msg/inbox"
+        ));
+        let xml = br#"<MAP-event-report><event type=NewMessage handle=0008 msg_type=SMS_GSM/></MAP-event-report>"#;
+        assert!(matches!(
+            parse_event_report(xml),
+            MnsEvent::NewMessage { handle, msg_type: Some(t), .. } if handle == "0008" && t == "SMS_GSM"
+        ));
     }
 
     #[test]

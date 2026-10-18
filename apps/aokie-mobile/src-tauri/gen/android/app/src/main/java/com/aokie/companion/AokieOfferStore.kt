@@ -2,6 +2,7 @@ package com.aokie.companion
 
 import android.content.Context
 import org.json.JSONObject
+import kotlin.math.abs
 
 internal data class AokieVoiceOffer(
   val eventId: String,
@@ -115,19 +116,30 @@ internal data class AokieVoiceOffer(
           checkedId(json.getString("acceptedTransferRequestId")),
         authoritative = true,
       ).also {
+        // Native code moved this expiry onto this phone's clock (server_to_local_unix), so it is checked on it.
         val now = System.currentTimeMillis() / 1000
         require(it.expiresAt > now && it.expiresAt <= now + 5 * 60)
       }
     }.getOrNull()
 
-    fun fromPush(data: Map<String, String>): AokieVoiceOffer? = runCatching {
+    /**
+     * A push's wake hint. Its `expiresAt` is the server's time; [serverOffsetSeconds] (how far the server's
+     * clock is ahead of this phone's, [AokieServerClock]) moves it onto this phone's clock, which every later
+     * check of the record uses, as the authoritative offer's own expiry is (review 4 #10).
+     */
+    fun fromPush(
+      data: Map<String, String>,
+      serverOffsetSeconds: Long = 0,
+      nowSeconds: Long = System.currentTimeMillis() / 1000,
+    ): AokieVoiceOffer? = runCatching {
       val allowed = setOf(
         "aokieClass", "schemaVersion", "eventId", "offerId", "appId", "callId",
         "callEpoch", "ownerEpoch", "expiresAt",
       )
       require(data.keys.all(allowed::contains))
       require(data["aokieClass"] == "voice_offer" && data["schemaVersion"] == "1")
-      val now = System.currentTimeMillis() / 1000
+      require(abs(serverOffsetSeconds) <= AokieServerClock.MAX_OFFSET_SECONDS)
+      val now = nowSeconds
       AokieVoiceOffer(
         eventId = checkedId(data.getValue("eventId")),
         offerId = checkedId(data.getValue("offerId")),
@@ -139,7 +151,7 @@ internal data class AokieVoiceOffer(
         callId = checkedId(data.getValue("callId")),
         callEpoch = checkedEpoch(data.getValue("callEpoch").toLong(), allowZero = false),
         ownerEpoch = checkedEpoch(data.getValue("ownerEpoch").toLong(), allowZero = true),
-        expiresAt = data.getValue("expiresAt").toLong(),
+        expiresAt = data.getValue("expiresAt").toLong() - serverOffsetSeconds,
       ).also {
         // A push is only a short opaque wake hint. Long-lived or already stale
         // payloads never create a call surface.

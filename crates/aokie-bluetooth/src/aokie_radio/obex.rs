@@ -575,31 +575,62 @@ pub fn build_abort(connection_id: u32) -> Vec<u8> {
 ///
 /// `BodyAssembler` collects chunk1..chunk3 into a single Vec<u8> and
 /// flips `complete = true` when the EndOfBody arrives.
+///
+/// Review 4 #24: a body has a size limit (`with_limit`) so a phone that
+/// keeps sending Body chunks cannot grow it without end. `new()` has
+/// none (the phonebook: no Filter is sent, so a large one with photos
+/// can run to tens of MiB).
 #[derive(Debug, Default)]
 pub struct BodyAssembler {
     bytes: Vec<u8>,
     complete: bool,
+    limit: Option<usize>,
 }
+
+/// The most an MNS event report may hold: one `<event>` element is a few
+/// hundred bytes.
+pub const NOTIFICATION_BODY_LIMIT: usize = 64 * 1024;
+/// The most a MAS listing or message may hold: listings ask for 16 entries
+/// and a message is fetched without attachments.
+pub const MESSAGE_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
 impl BodyAssembler {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// An assembler that refuses a body past `limit` bytes.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: Some(limit),
+            ..Self::default()
+        }
+    }
+
     /// Feed in a parsed response packet. Returns true if the body is
-    /// now complete (i.e. an EndOfBody arrived).
+    /// now complete (i.e. an EndOfBody arrived). A chunk taking the body
+    /// past its limit is an error, and the body is let go.
     pub fn push(&mut self, packet: &Packet) -> Result<bool, String> {
         if self.complete {
             return Err("BodyAssembler: response after EndOfBody".to_string());
         }
         for h in &packet.headers {
             match h {
-                Header::ByteSeq { id, value } if *id == HDR_BODY => {
+                Header::ByteSeq { id, value } if *id == HDR_BODY || *id == HDR_END_OF_BODY => {
+                    if let Some(limit) = self.limit {
+                        if self.bytes.len() + value.len() > limit {
+                            let had = self.bytes.len();
+                            self.bytes = Vec::new();
+                            return Err(format!(
+                                "BodyAssembler: body over its {limit}-byte limit ({had} bytes held, {} more came)",
+                                value.len()
+                            ));
+                        }
+                    }
                     self.bytes.extend_from_slice(value);
-                }
-                Header::ByteSeq { id, value } if *id == HDR_END_OF_BODY => {
-                    self.bytes.extend_from_slice(value);
-                    self.complete = true;
+                    if *id == HDR_END_OF_BODY {
+                        self.complete = true;
+                    }
                 }
                 _ => {}
             }

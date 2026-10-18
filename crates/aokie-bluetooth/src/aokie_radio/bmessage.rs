@@ -192,7 +192,43 @@ pub fn parse(input: &[u8]) -> BMessage {
             body = text;
         }
     }
-    out.body = body;
+    out.body = clean_incoming_text(&body, MAX_INCOMING_BODY_CHARS, true);
+    out.sender_name = out
+        .sender_name
+        .map(|name| clean_incoming_text(&name, MAX_INCOMING_NAME_CHARS, false));
+    out
+}
+
+/// The most of a received text's body that goes on (to OAIY's prompt and
+/// the log of texts): a long SMS is under 1,000 characters, an MMS's text
+/// (a .txt attachment is one of its text parts) can be any length.
+pub const MAX_INCOMING_BODY_CHARS: usize = 4_000;
+/// The most of a sender's name from the phone's address book.
+pub const MAX_INCOMING_NAME_CHARS: usize = 200;
+
+/// Text from the phone, made safe to hand on (review 4 #26): control
+/// characters are dropped (a lone CR becomes a line break and a tab a
+/// space; a name keeps no line breaks), and past `max_chars` characters it
+/// is cut, with an ellipsis saying so.
+pub fn clean_incoming_text(text: &str, max_chars: usize, keep_newlines: bool) -> String {
+    let mut out = String::with_capacity(text.len().min(max_chars * 4));
+    let mut kept = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let c = match c {
+            '\r' if chars.peek() == Some(&'\n') => continue,
+            '\r' | '\n' if keep_newlines => '\n',
+            '\r' | '\n' | '\t' => ' ',
+            c if c.is_control() => continue,
+            c => c,
+        };
+        if kept == max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+        kept += 1;
+    }
     out
 }
 
@@ -401,14 +437,7 @@ pub fn build_sms_push(recipient_phone: &str, body: &str) -> Vec<u8> {
     out.push_str("END:VCARD\r\n");
     out.push_str("BEGIN:BBODY\r\n");
     out.push_str("CHARSET:UTF-8\r\n");
-    let safe_body = escape_msg_body(body);
-    out.push_str(&format!("LENGTH:{}\r\n", safe_body.len()));
-    out.push_str("BEGIN:MSG\r\n");
-    out.push_str(&safe_body);
-    if !safe_body.ends_with("\r\n") {
-        out.push_str("\r\n");
-    }
-    out.push_str("END:MSG\r\n");
+    push_msg_block(&mut out, &escape_msg_body(body));
     out.push_str("END:BBODY\r\n");
     out.push_str("END:BENV\r\n");
     out.push_str("END:BMSG\r\n");
@@ -468,13 +497,7 @@ fn build_mms_push_at(
     out.push_str("END:VCARD\r\n");
     out.push_str("BEGIN:BBODY\r\n");
     out.push_str("CHARSET:UTF-8\r\n");
-    out.push_str(&format!("LENGTH:{}\r\n", safe_mime.len()));
-    out.push_str("BEGIN:MSG\r\n");
-    out.push_str(&safe_mime);
-    if !safe_mime.ends_with("\r\n") {
-        out.push_str("\r\n");
-    }
-    out.push_str("END:MSG\r\n");
+    push_msg_block(&mut out, &safe_mime);
     out.push_str("END:BBODY\r\n");
     out.push_str("END:BENV\r\n");
     out.push_str("END:BMSG\r\n");
@@ -510,14 +533,32 @@ fn build_mms_mime_body(recipient: &str, body: &str, date_header: &str, boundary:
     s
 }
 
+/// The LENGTH line and the MSG block. MAP §3.1.3: LENGTH counts the
+/// message content "including BEGIN:MSG<CRLF> and <CRLF>END:MSG<CRLF>"
+/// (Android's own encoder adds those 22 bytes); it counted the body alone
+/// (review 4 #28). Android reads to END:MSG either way.
+fn push_msg_block(out: &mut String, safe_body: &str) {
+    let mut block = String::with_capacity(safe_body.len() + 24);
+    block.push_str("BEGIN:MSG\r\n");
+    block.push_str(safe_body);
+    if !safe_body.ends_with("\r\n") {
+        block.push_str("\r\n");
+    }
+    block.push_str("END:MSG\r\n");
+    out.push_str(&format!("LENGTH:{}\r\n", block.len()));
+    out.push_str(&block);
+}
+
 /// Prevent a body that happens to contain "END:MSG" from closing the
 /// outer MSG block early. vCard 2.1 line folding indents continuation
 /// lines with a single space; we use the same trick to neutralize any
-/// would-be terminator in the user-supplied body.
+/// would-be terminator in the user-supplied body. Every line break (CRLF,
+/// a lone LF, a lone CR) goes out as CRLF: a lone CR went through as it
+/// was, and `...\rEND:MSG` was never escaped (review 4 #28).
 fn escape_msg_body(body: &str) -> String {
     let mut escaped = String::with_capacity(body.len());
+    let body = body.replace("\r\n", "\n").replace('\r', "\n");
     for line in body.split('\n') {
-        let line = line.trim_end_matches('\r');
         if line.eq_ignore_ascii_case("END:MSG") || line.eq_ignore_ascii_case("BEGIN:MSG") {
             escaped.push(' ');
             escaped.push_str(line);
@@ -612,6 +653,53 @@ BEGIN:BBODY\r\nBEGIN:MSG\r\nHi\r\nEND:MSG\r\nEND:BBODY\r\nEND:BENV\r\nEND:BMSG\r
         // sender_addressing empty since we built no originator.
         assert_eq!(parsed.sender_addressing, None);
         assert_eq!(parsed.body, "Hello world");
+    }
+
+    /// Review 4 #26: a received body (and name) loses its control
+    /// characters, keeps its line breaks, and is cut past the limit.
+    #[test]
+    fn incoming_text_is_cleaned_and_capped() {
+        let raw = "BEGIN:BMSG\r\nTYPE:SMS_GSM\r\nFOLDER:telecom/msg/inbox\r\n\
+BEGIN:VCARD\r\nVERSION:2.1\r\nFN:Sam\u{7}\u{1b}[2J Jones\r\nTEL:+1\r\nEND:VCARD\r\n\
+BEGIN:BENV\r\nBEGIN:BBODY\r\nCHARSET:UTF-8\r\nBEGIN:MSG\r\n\
+Hi\u{0}\u{8} there\tyou\r\nline\rtwo\u{1b}\r\nEND:MSG\r\nEND:BBODY\r\nEND:BENV\r\nEND:BMSG\r\n";
+        let parsed = parse(raw.as_bytes());
+        assert_eq!(parsed.body, "Hi there you\nline\ntwo");
+        assert_eq!(parsed.sender_name.as_deref(), Some("Sam[2J Jones"));
+
+        let long = "x".repeat(MAX_INCOMING_BODY_CHARS + 50);
+        let raw = format!(
+            "BEGIN:BMSG\r\nTYPE:SMS_GSM\r\nBEGIN:BENV\r\nBEGIN:BBODY\r\nBEGIN:MSG\r\n{long}\r\nEND:MSG\r\nEND:BBODY\r\nEND:BENV\r\nEND:BMSG\r\n"
+        );
+        let parsed = parse(raw.as_bytes());
+        assert_eq!(parsed.body.chars().count(), MAX_INCOMING_BODY_CHARS + 1);
+        assert!(parsed.body.ends_with('…'));
+        assert_eq!(clean_incoming_text("a\r\nb\nc", 10, false), "a b c");
+        assert_eq!(clean_incoming_text("👋🏽 ok", 2, true), "👋🏽…", "cut on characters, never inside one");
+    }
+
+    /// Review 4 #28: every line break in an outgoing body goes out as CRLF
+    /// (a lone CR went through, and `\rEND:MSG` was never escaped), and
+    /// LENGTH counts BEGIN:MSG<CRLF> through <CRLF>END:MSG<CRLF>.
+    #[test]
+    fn outgoing_line_breaks_are_crlf_and_length_counts_the_msg_block() {
+        let payload = build_sms_push("+1", "one\rEND:MSG\rtwo\r\nthree\nfour");
+        let raw = String::from_utf8(payload).unwrap();
+        let block_start = raw.find("BEGIN:MSG\r\n").unwrap();
+        let block_end = raw.find("\r\nEND:MSG\r\n").unwrap() + "\r\nEND:MSG\r\n".len();
+        let block = &raw[block_start..block_end];
+        assert_eq!(block, "BEGIN:MSG\r\none\r\n END:MSG\r\ntwo\r\nthree\r\nfour\r\nEND:MSG\r\n");
+        assert!(!block.replace("\r\n", "").contains('\r'), "no lone CR");
+        let length: usize = raw
+            .lines()
+            .find_map(|l| l.strip_prefix("LENGTH:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(length, block.len());
+        assert_eq!(length, "one\r\n END:MSG\r\ntwo\r\nthree\r\nfour".len() + 22);
+        assert_eq!(parse(raw.as_bytes()).body, "one\n END:MSG\ntwo\nthree\nfour");
     }
 
     #[test]

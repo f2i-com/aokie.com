@@ -1051,8 +1051,24 @@ impl Plugin {
     /// `plugin.init`, or in dev mode (no hardware). A radio that is up, and
     /// has opened its dongle, starts the Companion gateway the host approved.
     pub fn revive_radio(&mut self) {
+        // (a helper an earlier process started is a driver step too, review 4 #19)
+        self.adopt_running_driver_helper();
         let driver_step = aokie_dongle::driver_job::current().is_some_and(|job| job.is_running());
         self.revive_radio_unless(driver_step);
+    }
+
+    /// The radio's start at `plugin.init`, held back while a driver step runs
+    /// (review 4 #19): it may be rebinding the very dongle. Held back, the
+    /// start reads as one that may pass, so [`Plugin::revive_radio`] makes it
+    /// once the step is over.
+    fn start_radio_unless(&mut self, driver_step_running: bool) {
+        if driver_step_running && self.radio.is_none() && !self.dev_mode {
+            eprintln!("[aokie-plugin] radio start waits for the driver step that is running");
+            self.radio_start_error =
+                Some("waiting for the driver step that is running (it may be rebinding the dongle)".into());
+            return;
+        }
+        self.ensure_radio_started();
     }
 
     /// [`Plugin::revive_radio`], told whether a driver step is running.
@@ -1183,10 +1199,13 @@ impl Plugin {
     /// died with them in it, and they stayed "queued" for good. The command
     /// journal says which texts went to the radio (`sms.send`, answered
     /// `queued` `via` the radio); the outbox says which have their sent or
-    /// failed. Each other one gets `aokie.sms.failed` with `reason` (and
-    /// `outcomeUnknown`: the phone may have sent it), under the key the
-    /// radio's own would have had, so the host takes one outcome a text.
-    /// Written, as the calls are, only while the sealing key is to be had.
+    /// failed (the text's own, or its last attempt's definite one, review 4
+    /// #4), and this process remembers what went to the host live when the
+    /// outbox could not take it (review 4 #33). Each other one gets
+    /// `aokie.sms.failed` with `reason` (and `outcomeUnknown`: the phone may
+    /// have sent it), under the key the radio's own would have had, so the
+    /// host takes one outcome a text. Written, as the calls are, only while
+    /// the sealing key is to be had.
     fn fail_texts_left_open(&self, reason: &'static str) {
         let sends = match self
             .command_journal
@@ -1198,7 +1217,16 @@ impl Plugin {
                 return;
             }
         };
-        let fails = texts_left_open(&sends, |id| self.text_outcome(id).is_some(), reason);
+        let fails = texts_left_open(
+            &sends,
+            |id, attempt| {
+                self.text_outcome(id).is_some()
+                    || attempt.is_some_and(|attempt| {
+                        self.outbox_or_live_has(&crate::radio::sms_attempt_failed_key(id, attempt))
+                    })
+            },
+            reason,
+        );
         if fails.is_empty() {
             return;
         }
@@ -1344,11 +1372,15 @@ impl Plugin {
         let grant = if enforced { self.consent_loaded().grant } else { None };
         // Review 3 #6: the radio is told the expiry too, and takes no new
         // call past it, whether or not anything asks the plugin anything.
+        // 0 is "never expires": an expiry that cannot be read is stored as
+        // passed (review 4 #20: it was stored as 0, failing open), as
+        // `consent::expired` reads it.
         let expires_at = grant
             .as_ref()
             .and_then(|grant| grant.expires_at.as_deref())
-            .and_then(crate::consent::parse_instant)
-            .map_or(0, |at| at.timestamp());
+            .map_or(0, |expiry| {
+                crate::consent::parse_instant(expiry).map_or(1, |at| at.timestamp().max(1))
+            });
         radio
             .status
             .consent_expires_at
@@ -1588,10 +1620,36 @@ impl Plugin {
                 eprintln!(
                     "[aokie-plugin] sms.send {message_id} was already {outcome} — answered with that, not sent twice"
                 );
-                return Ok(json!({
+                let mut answer = json!({
                     "messageId": message_id,
                     "to": to,
                     "status": outcome,
+                    "duplicate": true,
+                    "via": "radio",
+                });
+                // A failure that is replayed is one in doubt (review 4 #4).
+                if outcome == "failed" {
+                    answer["outcomeUnknown"] = json!(true);
+                }
+                return Ok(answer);
+            }
+            // Nor while it is on its way (review 4 #17): the retry is the
+            // same text, answered by the first one's outcome, and neither
+            // sent nor counted against the daily cap. On both backends.
+            if radio
+                .status
+                .texts_in_flight
+                .lock()
+                .unwrap()
+                .contains_key(&message_id)
+            {
+                eprintln!(
+                    "[aokie-plugin] sms.send {message_id} is already on its way — not sent twice"
+                );
+                return Ok(json!({
+                    "messageId": message_id,
+                    "to": to,
+                    "status": "queued",
                     "duplicate": true,
                     "via": "radio",
                 }));
@@ -1648,16 +1706,30 @@ impl Plugin {
             // radio thread when the AG acks the PUT. A send error means
             // the radio thread is gone and never received the control, so
             // its own `aokie.sms.failed` (radio/controls.rs) cannot follow.
+            // The attempt names this try's definite failure (review 4 #4),
+            // and the result keeps it for the next start's sweep.
+            let attempt = aokie_core::events::occurrence_id();
             radio
-                .send(crate::radio::RadioControl::SendSms {
-                    message_id: message_id.clone(),
-                    to: to.clone(),
-                    body,
-                })
-                .map_err(CmdError::failed)?;
-            return Ok(
-                json!({"messageId": message_id, "to": to, "status": "queued", "via": "radio"}),
-            );
+                .status
+                .texts_in_flight
+                .lock()
+                .unwrap()
+                .insert(message_id.clone(), attempt.clone());
+            if let Err(e) = radio.send(crate::radio::RadioControl::SendSms {
+                message_id: message_id.clone(),
+                to: to.clone(),
+                body,
+            }) {
+                radio.status.texts_in_flight.lock().unwrap().remove(&message_id);
+                return Err(CmdError::failed(e).into());
+            }
+            return Ok(json!({
+                "messageId": message_id,
+                "to": to,
+                "status": "queued",
+                "via": "radio",
+                "attempt": attempt,
+            }));
         }
         // Real mode with no radio: the message can NOT be sent — a
         // fabricated "queued" here is the audit's canonical fake
@@ -1693,9 +1765,12 @@ impl Plugin {
     }
 
     /// The outcome a text already has, by its messageId: `"sent"` or
-    /// `"failed"` when the outbox holds the radio's `aokie.sms.sent` or
-    /// `aokie.sms.failed` for it (review 3 #8). A refusal is not one: it is
-    /// keyed per refusal, and a refused text may be sent again under its id.
+    /// `"failed"` when the radio's `aokie.sms.sent`, or its `aokie.sms.failed`
+    /// in doubt (`outcomeUnknown`), is in the outbox (review 3 #8), or went
+    /// to the host live when the outbox could not take it (review 4 #33). A
+    /// definite failure is not one (review 4 #4): it is keyed per attempt,
+    /// as a refusal is per refusal, and the text may be sent again under its
+    /// id.
     fn text_outcome(&self, message_id: &str) -> Option<&'static str> {
         [
             (crate::contract::events::SMS_SENT, "sent"),
@@ -1707,9 +1782,16 @@ impl Plugin {
                 message_id,
                 aokie_core::events::step_for_event_name(name),
             );
-            matches!(self.outbox.status_of(&key), Ok(Some(_)))
+            self.outbox_or_live_has(&key)
         })
         .map(|(_, outcome)| outcome)
+    }
+
+    /// Whether the event keyed `key` is in the outbox, or went to the host
+    /// live without a row ([`crate::event_bridge::emitted_live_only`]).
+    fn outbox_or_live_has(&self, key: &str) -> bool {
+        matches!(self.outbox.status_of(key), Ok(Some(_)))
+            || crate::event_bridge::emitted_live_only(key)
     }
 
     /// The acknowledgement of a REFUSED `sms.send`: `aokie.sms.failed` with
@@ -1860,6 +1942,7 @@ impl Plugin {
             }
             self.validate_candidate_consent_destinations(&grant, true)?;
             crate::consent::save_signed(&self.data_dir, &envelope).map_err(CmdError::failed)?;
+            self.enforce_recorded_consent_saved();
             self.consent_blocked = None;
             self.ensure_radio_started();
             self.try_start_configured_companion_gateway();
@@ -1903,6 +1986,7 @@ impl Plugin {
         };
         self.validate_candidate_consent_destinations(&grant, false)?;
         let saved = crate::consent::save(&self.data_dir, grant).map_err(CmdError::failed)?;
+        self.enforce_recorded_consent_saved();
         // Consent may now be satisfied — clear the block and try to bring the
         // radio up (idempotent; a no-op if it's already running or unavailable).
         self.consent_blocked = None;
@@ -1918,6 +2002,40 @@ impl Plugin {
             "radioStarted": self.radio.is_some(),
             "blocked": self.consent_blocked,
         }))
+    }
+
+    /// Consent recorded or revoked on this computer is enforced from then on
+    /// (review 4 #22): a `warn` or `off` set before any was recorded (the
+    /// pre-consent override `settings.set` allows) outlived both, and set the
+    /// operator's recorded choices aside. Dev mode never enforces. Changes
+    /// the setting only; whether it changed it.
+    fn enforce_recorded_consent(&mut self) -> bool {
+        let set = crate::consent::ConsentMode::from_setting(
+            self.store.config.settings.get("consentMode").and_then(Value::as_str),
+        );
+        if self.dev_mode || set == crate::consent::ConsentMode::Enforce {
+            return false;
+        }
+        eprintln!(
+            "[aokie-plugin] consent recorded on this computer — consentMode {} is set back to enforce",
+            set.as_str()
+        );
+        self.store
+            .config
+            .settings
+            .insert("consentMode".to_string(), json!("enforce"));
+        self.store.config.config_version += 1;
+        true
+    }
+
+    /// [`Plugin::enforce_recorded_consent`], saved (best-effort: the setting
+    /// holds for this process either way).
+    fn enforce_recorded_consent_saved(&mut self) {
+        if self.enforce_recorded_consent() {
+            if let Err(e) = self.save_config() {
+                eprintln!("[aokie-plugin] consentMode enforce was not saved: {}", e.message);
+            }
+        }
     }
 
     /// AOK-CONSENT-001 `consent.revoke`: delete the grant and IMMEDIATELY
@@ -1942,7 +2060,9 @@ impl Plugin {
         crate::consent::revoke(&self.data_dir).map_err(CmdError::failed)?;
         // Auto-answer off so a phone that reconnects is not answered after a
         // restart; persisted best-effort (the radio is already stopped and
-        // the grant gone, which is what the revoke is).
+        // the grant gone, which is what the revoke is). Consent is enforced
+        // from here on (review 4 #22).
+        self.enforce_recorded_consent();
         self.store
             .config
             .settings
@@ -2216,7 +2336,12 @@ impl Plugin {
         // Arm the live radio at handshake time (real mode) so a call ringing
         // before any command still reaches the flow. Non-blocking: init
         // status surfaces asynchronously via aokie.dongle.ready / hardware.error.
-        self.ensure_radio_started();
+        // A driver helper the last process started may still be rebinding the
+        // dongle (review 4 #19): it is taken up as the driver step first, and
+        // the radio waits for it.
+        self.adopt_running_driver_helper();
+        let driver_step = aokie_dongle::driver_job::current().is_some_and(|job| job.is_running());
+        self.start_radio_unless(driver_step);
         self.apply_transfer_readiness();
         // The Desktop deliberately omits this private, host-proofed material
         // until at least one Companion is approved. Absence is therefore a
@@ -4906,7 +5031,9 @@ impl Plugin {
     /// to its end (OAIY started Aokie again while it ran) is reported, and
     /// waited for, as the step running (review 3 #18;
     /// `aokie_dongle::installer::adopt_running_helper`): the screen keeps
-    /// Install off, and another step is refused meanwhile.
+    /// Install off, and another step is refused meanwhile. Looked for at
+    /// `plugin.init` and before each radio revive too (review 4 #19), so the
+    /// radio does not start on a dongle the helper is still rebinding.
     #[cfg(target_os = "windows")]
     fn adopt_running_driver_helper(&self) {
         aokie_dongle::installer::adopt_running_helper(&self.data_dir.join("winusb-install"));
@@ -5246,24 +5373,38 @@ fn write_calls_left_open(
 }
 
 /// The `aokie.sms.failed` events owed to the texts in `sends` (completed
-/// `sms.send` results) that went to the radio and have no outcome
-/// (`answered`) (review 3 #7, [`Plugin::fail_texts_left_open`]).
+/// `sms.send` results, oldest first) that went to the radio and have no
+/// outcome (`answered`, given the text's id and its last attempt: a text
+/// sent again after a definite failure is owed one for that try, review 4
+/// #4) (review 3 #7, [`Plugin::fail_texts_left_open`]). A retry answered as
+/// a duplicate was no try of its own.
 fn texts_left_open(
     sends: &[Value],
-    answered: impl Fn(&str) -> bool,
+    answered: impl Fn(&str, Option<&str>) -> bool,
     reason: &'static str,
 ) -> Vec<aokie_core::events::DesktopEvent> {
-    let mut fails: Vec<aokie_core::events::DesktopEvent> = Vec::new();
+    // (id, to, last attempt), in the order first handed over.
+    let mut tries: Vec<(&str, &str, Option<&str>)> = Vec::new();
     for send in sends {
         if send.get("via").and_then(Value::as_str) != Some("radio")
             || send.get("status").and_then(Value::as_str) != Some("queued")
+            || send.get("duplicate").and_then(Value::as_bool) == Some(true)
         {
             continue;
         }
         let Some(id) = send.get("messageId").and_then(Value::as_str) else {
             continue;
         };
-        if answered(id) || fails.iter().any(|event| event.correlation_id == id) {
+        let to = send.get("to").and_then(Value::as_str).unwrap_or("");
+        let attempt = send.get("attempt").and_then(Value::as_str);
+        match tries.iter_mut().find(|(seen, _, _)| *seen == id) {
+            Some(last) => *last = (id, to, attempt),
+            None => tries.push((id, to, attempt)),
+        }
+    }
+    let mut fails: Vec<aokie_core::events::DesktopEvent> = Vec::new();
+    for (id, to, attempt) in tries {
+        if answered(id, attempt) {
             continue;
         }
         fails.push(aokie_event(
@@ -5271,7 +5412,7 @@ fn texts_left_open(
             id,
             json!({
                 "messageId": id,
-                "to": send.get("to").and_then(Value::as_str).unwrap_or(""),
+                "to": to,
                 "reason": reason,
                 "outcomeUnknown": true,
                 "at": now_iso8601(),
@@ -7012,6 +7153,31 @@ mod tests {
         assert!(plugin.radio.is_some());
     }
 
+    /// Review 4 #19: `plugin.init` holds the radio's start back while a driver
+    /// step runs (a helper the last process started, taken up first, may be
+    /// rebinding the dongle), and revive starts it once the step is over.
+    #[test]
+    fn the_radio_waits_at_init_for_a_running_driver_step_and_starts_after_it() {
+        let mut plugin = Plugin::ephemeral(false);
+        plugin
+            .store
+            .config
+            .settings
+            .insert("consentMode".into(), json!("warn"));
+        plugin.initialized = true;
+        plugin.start_radio_unless(true);
+        assert!(plugin.radio.is_none());
+        assert!(
+            plugin.radio_start_error.as_deref().is_some_and(|error| error.contains("driver step")),
+            "{:?}",
+            plugin.radio_start_error
+        );
+        plugin.revive_radio_unless(true);
+        assert_eq!(plugin.radio_restarts, 0, "held back while the step runs");
+        plugin.revive_radio_unless(false);
+        assert_eq!(plugin.radio_restarts, 1, "started once it is over");
+    }
+
     /// Review 3 #20: no radio start while a driver step runs (it may be
     /// rebinding the very dongle), and no Companion gateway for a radio that
     /// has not opened its dongle: started with every try, a held or absent
@@ -7108,7 +7274,7 @@ mod tests {
         assert!(plugin.outbox.status_of(&failed_key("msg-sent")).unwrap().is_none(), "the sent one keeps its outcome");
         assert!(plugin.outbox.status_of(&failed_key("msg-sim")).unwrap().is_none(), "the simulator's is not the radio's");
         let sends = vec![json!({"messageId": "msg-open", "to": "+61432123456", "status": "queued", "via": "radio"})];
-        let fails = texts_left_open(&sends, |_| false, "radio_restarted");
+        let fails = texts_left_open(&sends, |_, _| false, "radio_restarted");
         assert_eq!(fails.len(), 1);
         assert_eq!(fails[0].data["reason"], json!("radio_restarted"));
         assert_eq!(fails[0].data["outcomeUnknown"], json!(true));
@@ -10958,6 +11124,138 @@ mod tests {
         assert_eq!(send(&mut plugin, &mut sink, "msg-new")["status"], json!("queued"));
     }
 
+    /// Review 4 #4 / #17: a text that failed for certain (it never reached
+    /// the phone, or the phone refused it) is sent again under its id, each
+    /// try's failure under a key of its own, so the second reaches the host
+    /// too. One that failed in doubt is answered with that failure, not sent.
+    /// A retry while it is on its way is not sent, nor counted against the
+    /// daily cap.
+    #[test]
+    fn a_text_that_failed_for_certain_is_sent_again_and_one_on_its_way_is_not() {
+        let _env = consent_env_lock();
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+        let (radio, controls) = crate::radio::RadioHandle::test_handle();
+        radio.status.connected.store(true, std::sync::atomic::Ordering::Relaxed);
+        let status = radio.status.clone();
+        plugin.radio = Some(radio);
+        let send = |plugin: &mut Plugin, sink: &mut VecSink, id: &str| {
+            plugin
+                .dispatch_command("sms.send", &json!({"to": "+61432123456", "body": "hi", "messageId": id}), sink)
+                .unwrap()
+        };
+        let to_radio = || controls.try_iter().filter(|c| matches!(c, crate::radio::RadioControl::SendSms { .. })).count();
+        let used = |plugin: &Plugin| plugin.store.config.sms_ledger.as_ref().map_or(0, |l| l.count);
+        // What the radio thread does with the text's outcome (event_handler).
+        let fail = |plugin: &Plugin, id: &str, in_doubt: bool| {
+            let attempt = status.texts_in_flight.lock().unwrap().remove(id);
+            let event = crate::radio::sms_failed_event(id, "+61432123456", "the phone refused it", in_doubt, attempt.as_deref());
+            assert_eq!(
+                plugin.outbox.insert_pending(&event, outbox::TARGET_DESKTOP).unwrap(),
+                outbox::InsertOutcome::Inserted,
+                "each failure is its own row"
+            );
+            event
+        };
+
+        let first = send(&mut plugin, &mut sink, "msg-retry");
+        assert_eq!(first["status"], json!("queued"));
+        let attempt = first["attempt"].as_str().expect("the try is named").to_string();
+        assert_eq!(to_radio(), 1);
+        let counted = used(&plugin);
+        // On its way: the retry is the same text.
+        let again = send(&mut plugin, &mut sink, "msg-retry");
+        assert_eq!((again["status"].clone(), again["duplicate"].clone()), (json!("queued"), json!(true)));
+        assert_eq!((to_radio(), used(&plugin)), (0, counted), "not sent, not counted");
+        // Failed for certain: under its try's key; sent again when retried.
+        let failed = fail(&plugin, "msg-retry", false);
+        assert_eq!(failed.idempotency_key, crate::radio::sms_attempt_failed_key("msg-retry", &attempt));
+        assert!(failed.data.get("outcomeUnknown").is_none());
+        let second = send(&mut plugin, &mut sink, "msg-retry");
+        assert_eq!(second["status"], json!("queued"));
+        assert!(second.get("duplicate").is_none());
+        assert_ne!(second["attempt"], json!(attempt), "a try of its own");
+        assert_eq!((to_radio(), used(&plugin)), (1, counted + 1));
+        // Its second failure is a row of its own.
+        fail(&plugin, "msg-retry", false);
+
+        // In doubt: the text's one outcome, and a retry is answered with it.
+        send(&mut plugin, &mut sink, "msg-doubt");
+        assert_eq!(to_radio(), 1);
+        let doubt = fail(&plugin, "msg-doubt", true);
+        assert_eq!(doubt.idempotency_key, aokie_core::events::aokie_idempotency_key("msg-doubt", "sms.failed"));
+        assert_eq!(doubt.data["outcomeUnknown"], json!(true));
+        let replay = send(&mut plugin, &mut sink, "msg-doubt");
+        assert_eq!(
+            (replay["status"].clone(), replay["duplicate"].clone(), replay["outcomeUnknown"].clone()),
+            (json!("failed"), json!(true), json!(true))
+        );
+        assert_eq!(to_radio(), 0, "not sent twice");
+    }
+
+    /// Review 4 #33: an outcome that went to the host live, the outbox
+    /// unable to take it (a full disk), is the text's outcome all the same: a
+    /// retry is answered with it and the sweep owes the text none.
+    #[test]
+    fn an_outcome_that_went_out_live_is_the_texts_outcome() {
+        let _env = consent_env_lock();
+        let plugin = Plugin::ephemeral(false);
+        plugin.outbox.break_for_tests();
+        let sent = aokie_event(
+            crate::contract::events::SMS_SENT,
+            "msg-live-only",
+            json!({"messageId": "msg-live-only", "to": "+61432123456", "at": now_iso8601()}),
+        );
+        let mut sink = VecSink::default();
+        crate::event_bridge::emit_event(
+            &mut sink,
+            &plugin.outbox,
+            &sent,
+            false,
+            crate::event_bridge::EmitMode::AckExpected,
+        )
+        .unwrap();
+        assert_eq!(sink.lines.len(), 1, "it went to the host");
+        assert!(crate::event_bridge::emitted_live_only(&sent.idempotency_key));
+        assert_eq!(plugin.text_outcome("msg-live-only"), Some("sent"));
+        let sends = vec![json!({"messageId": "msg-live-only", "to": "+61432123456", "status": "queued", "via": "radio", "attempt": "a1"})];
+        let owed = texts_left_open(&sends, |id, _| plugin.text_outcome(id).is_some(), "plugin_restarted");
+        assert!(owed.is_empty(), "no second outcome");
+    }
+
+    /// Review 4 #4: the sweep owes a text the outcome of its last try: one
+    /// whose first try failed for certain and whose second has nothing is
+    /// owed one; a retry answered as a duplicate was no try.
+    #[test]
+    fn the_sweep_owes_a_text_its_last_tries_outcome() {
+        let row = |id: &str, attempt: Option<&str>, duplicate: bool| {
+            let mut row = json!({"messageId": id, "to": "+61432123456", "status": "queued", "via": "radio"});
+            if let Some(attempt) = attempt {
+                row["attempt"] = json!(attempt);
+            }
+            if duplicate {
+                row["duplicate"] = json!(true);
+            }
+            row
+        };
+        let sends = vec![
+            row("m1", Some("a1"), false),
+            row("m1", None, true),
+            row("m1", Some("a2"), false),
+            row("m2", Some("b1"), false),
+            row("m2", None, true),
+        ];
+        // Each one's first try failed for certain; m1's second has nothing.
+        let answered = |id: &str, attempt: Option<&str>| matches!((id, attempt), ("m1", Some("a1")) | ("m2", Some("b1")));
+        let owed = texts_left_open(&sends, answered, "radio_restarted");
+        assert_eq!(owed.iter().map(|e| e.correlation_id.as_str()).collect::<Vec<_>>(), vec!["m1"]);
+        assert_eq!(owed[0].data["outcomeUnknown"], json!(true));
+    }
+
     /// Review 3 #10: on Windows' own stack the idle hands-free line drops
     /// between calls and `connected` with it, while a text pages the bonded
     /// phone on its own: sms.send is refused only when no phone is known.
@@ -11291,6 +11589,71 @@ mod tests {
         assert!(plugin.stop_radio_if_consent_expired());
         assert!(plugin.radio.is_none());
         assert!(plugin.consent_blocked.as_deref().is_some_and(|r| r.contains("expired")));
+    }
+
+    /// Review 4 #22: `warn`, set before any consent was recorded, does not
+    /// outlive consent being recorded, nor revoked: enforcement is back on.
+    #[test]
+    fn a_warn_mode_set_before_consent_does_not_outlive_it() {
+        let _env = consent_env_lock();
+        std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
+        for revoke_only in [false, true] {
+            let mut plugin = Plugin::ephemeral(false);
+            plugin.radio_shutdown_wait = std::time::Duration::from_millis(10);
+            let mut sink = VecSink::default();
+            plugin
+                .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+                .unwrap();
+            assert_eq!(plugin.consent_mode(), crate::consent::ConsentMode::Warn);
+            if revoke_only {
+                plugin.dispatch_command("consent.revoke", &json!({}), &mut sink).unwrap();
+            } else {
+                let set = plugin
+                    .dispatch_command("consent.set", &json!({"scopes": {"bluetooth": true}}), &mut sink)
+                    .unwrap();
+                assert_eq!(set["mode"], json!("enforce"));
+            }
+            assert_eq!(plugin.consent_mode(), crate::consent::ConsentMode::Enforce, "revoke only: {revoke_only}");
+            assert_eq!(plugin.store.config.settings["consentMode"], json!("enforce"));
+            // And it cannot be turned down again.
+            assert!(plugin
+                .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+                .is_err());
+        }
+    }
+
+    /// Review 4 #20: an expiry that cannot be read is one that has passed,
+    /// for the radio too (it was told "never").
+    #[test]
+    fn an_unreadable_expiry_has_passed_for_the_radio_too() {
+        let _env = consent_env_lock();
+        std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.radio_shutdown_wait = std::time::Duration::from_millis(10);
+        plugin.store.config.settings.insert("consentMode".into(), json!("enforce"));
+        let mut grant = crate::consent::save(
+            &plugin.data_dir,
+            crate::consent::ConsentGrant {
+                version: crate::consent::CURRENT_CONSENT_VERSION,
+                scopes: crate::consent::ConsentScopes {
+                    bluetooth: true,
+                    ..Default::default()
+                },
+                accepted_at: String::new(),
+                accepted_by: None,
+                expires_at: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        grant.expires_at = Some("next spring".into());
+        std::fs::write(plugin.data_dir.join("consent.json"), serde_json::to_vec(&grant).unwrap()).unwrap();
+        let (radio, _controls) = crate::radio::RadioHandle::test_handle();
+        let status = radio.status.clone();
+        *radio.status.current_call_id.lock().unwrap() = Some("call_live".into());
+        plugin.radio = Some(radio);
+        assert!(!plugin.stop_radio_if_consent_expired(), "not under a live call");
+        assert!(status.consent_expired(), "the radio takes no new call on it");
     }
 
     /// Review 3 #6: with no screen open, OAIY's health poll is all that comes:

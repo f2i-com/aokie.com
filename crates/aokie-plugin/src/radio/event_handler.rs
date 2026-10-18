@@ -3,6 +3,12 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// How long the call's audio must have been on the handset before the phone
+/// link went for the call to be the owner's (review 4 #1). A phone turning
+/// its Bluetooth off closes the audio (0x13, as a move to the handset does)
+/// and then the link, within moments: that call is still the receptionist's.
+const HANDSET_BEFORE_LINK_LOSS: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Map one `BluetoothEvent` to the `aokie.*` contract: drive the call-session
 /// state machine (audit AK-001) + mirror shared status. Available on all
 /// targets (it only touches `BluetoothEvent`, which is not Windows-gated) so
@@ -77,7 +83,14 @@ pub(super) fn handle_event(
             // is gone. A late real CallTerminated lands on an idle tracker
             // and is a no-op (no duplicate terminal event).
             if let Some(s) = tracker.current() {
-                let hers = s.is_active() && s.receptionist_owns();
+                // Review 4 #1: a call whose audio the owner had taken to the
+                // handset is theirs: given back to the receptionist after the
+                // reconnect it was pulled from them (AT+BCC, a hang-up at
+                // 8 s, OAIY greeting into it). An audio close only moments
+                // before the link went is the link going, not the owner.
+                let hers = s.is_active()
+                    && s.receptionist_owns()
+                    && !s.audio_on_handset_for(HANDSET_BEFORE_LINK_LOSS);
                 *status.lost_with_link.lock().unwrap() = Some((hers, std::time::Instant::now()));
                 *status.lost_call.lock().unwrap() =
                     hers.then(|| (s.id.clone(), s.caller_id.clone()));
@@ -703,26 +716,47 @@ pub(super) fn handle_event(
                     .replace(':', "");
                 format!("sms_{device}_{}", p.handle)
             };
-            emit(
-                outbox,
-                sink,
-                aokie_event(
-                    crate::contract::events::SMS_RECEIVED,
-                    &corr,
-                    json!({
-                        "from": p.sender_phone,
-                        "name": p.sender_name,
-                        "body": p.body,
-                        "handle": p.handle,
-                        "at": now_iso8601(),
-                    }),
-                ),
-            );
+            let data = json!({
+                "from": p.sender_phone,
+                "name": p.sender_name,
+                "body": p.body,
+                "handle": p.handle,
+                "at": now_iso8601(),
+            });
+            let event = aokie_event(crate::contract::events::SMS_RECEIVED, &corr, data.clone());
+            match outbox {
+                Some((o, mode)) => match emit_event(sink, o, &event, false, mode) {
+                    // Review 4 #7: the handle already names another message
+                    // (Android gave the deleted newest one's row id to this
+                    // text): a new occurrence, keyed by what it says, so a
+                    // re-fetch of it still dedupes.
+                    Err(e) if crate::event_bridge::is_payload_collision(&e) => {
+                        let occurrence = format!("{:016x}", sms_fingerprint(&p.sender_phone, &p.body));
+                        eprintln!(
+                            "[aokie-plugin] handle {} names another message already — this one is recorded as a new occurrence",
+                            p.handle
+                        );
+                        let again = aokie_event_occurrence(
+                            crate::contract::events::SMS_RECEIVED,
+                            &corr,
+                            &occurrence,
+                            data,
+                        );
+                        if let Err(e) = emit_event(sink, o, &again, false, mode) {
+                            eprintln!("[aokie-plugin] radio emit '{}' failed: {e}", again.name);
+                        }
+                    }
+                    Err(e) => eprintln!("[aokie-plugin] radio emit '{}' failed: {e}", event.name),
+                    Ok(()) => {}
+                },
+                None => emit(None, sink, event),
+            }
         }
         E::SmsSent {
             message_id,
             recipient_phone,
         } => {
+            status.texts_in_flight.lock().unwrap().remove(&message_id);
             emit(
                 outbox,
                 sink,
@@ -737,22 +771,23 @@ pub(super) fn handle_event(
             message_id,
             recipient_phone,
             reason,
+            outcome_unknown,
         } => {
             // The radio abandoned an outbound SMS (MAS PUT failed / aged out
             // across recovery cycles). Surface it truthfully — a queued send
-            // that quietly evaporates is audit C-16's exact failure mode.
+            // that quietly evaporates is audit C-16's exact failure mode. In
+            // doubt, it says so and is the text's one outcome; a definite
+            // one is keyed by its attempt (review 4 #3, #4).
+            let attempt = status.texts_in_flight.lock().unwrap().remove(&message_id);
             emit(
                 outbox,
                 sink,
-                aokie_event(
-                    crate::contract::events::SMS_FAILED,
+                sms_failed_event(
                     &message_id,
-                    json!({
-                        "messageId": message_id,
-                        "to": recipient_phone,
-                        "reason": reason,
-                        "at": now_iso8601(),
-                    }),
+                    &recipient_phone,
+                    &reason,
+                    outcome_unknown,
+                    attempt.as_deref(),
                 ),
             );
         }
@@ -799,4 +834,16 @@ pub(super) fn handle_event(
             );
         }
     }
+}
+
+/// FNV-1a over a received text's sender and body: the occurrence of an
+/// `aokie.sms.received` whose handle already names another message
+/// (review 4 #7). The same text fetched again gets the same one.
+fn sms_fingerprint(from: &str, body: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in from.bytes().chain([0u8]).chain(body.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }

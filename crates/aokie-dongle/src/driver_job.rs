@@ -9,9 +9,11 @@
 //! polls until the step is done or failed. One step runs at a time: another is refused while one runs, whatever
 //! asks for it, and the step itself holds the installer's lock until the helper has exited.
 
+use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// What a driver step is doing, or did last (until the plugin restarts).
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -119,6 +121,64 @@ fn finish(outcome: Result<serde_json::Value, String>) {
     }
 }
 
+/// How long an elevated driver helper is waited for (review 4 #18). Its work takes a minute or two (the Windows prompt
+/// comes before it starts); one still running past this is hung, and an unbounded wait kept the step `running` for ever,
+/// so Install stayed off and the radio was never started again. Past it the step fails, the radio may start again, and
+/// another driver step stays refused while the helper runs.
+pub const HELPER_RUN_LIMIT: Duration = Duration::from_secs(15 * 60);
+
+/// The file beside the helper's job that records which process the helper is ([`HelperProcess`]).
+pub const HELPER_RECORD_FILE: &str = "aokie_driver_helper.json";
+
+/// The elevated helper a driver step started, as the step recorded it beside the job (review 4 #18): whether a helper
+/// is running is whether this process is, not whether some process holds the helpers' mutex, whose name any program in
+/// the session could hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HelperProcess {
+    pub pid: u32,
+    /// When it started, as a Windows FILETIME (100 ns since 1601, UTC): a PID Windows gave another process since is
+    /// not it, and how long it has run is measured from this.
+    pub created: u64,
+}
+
+/// 100 ns intervals from 1601 to 1970.
+const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+
+impl HelperProcess {
+    /// How long it has run at `now` (zero for a start after `now`, a clock set back).
+    pub fn age(&self, now: SystemTime) -> Duration {
+        let now = now
+            .duration_since(UNIX_EPOCH)
+            .map(|since| u64::try_from(since.as_nanos() / 100).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+            .saturating_add(FILETIME_UNIX_EPOCH);
+        Duration::from_nanos(now.saturating_sub(self.created).saturating_mul(100))
+    }
+
+    /// Still waited for at `now`: it has run less than [`HELPER_RUN_LIMIT`].
+    pub fn within_limit(&self, now: SystemTime) -> bool {
+        self.age(now) < HELPER_RUN_LIMIT
+    }
+}
+
+/// Record the helper a step started, beside its job in `work_dir`.
+pub fn record_helper(work_dir: &Path, helper: HelperProcess) -> std::io::Result<()> {
+    let encoded = serde_json::to_vec(&helper).map_err(std::io::Error::other)?;
+    std::fs::write(work_dir.join(HELPER_RECORD_FILE), encoded)
+}
+
+/// The helper last recorded in `work_dir`, if any (not whether it still runs).
+pub fn recorded_helper(work_dir: &Path) -> Option<HelperProcess> {
+    let bytes = std::fs::read(work_dir.join(HELPER_RECORD_FILE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The helper is gone: its record goes.
+pub fn forget_helper(work_dir: &Path) {
+    let _ = std::fs::remove_file(work_dir.join(HELPER_RECORD_FILE));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +235,28 @@ mod tests {
         let panicked = wait_until_finished();
         assert_eq!(panicked.state, "failed");
         assert!(panicked.error.unwrap().contains("panic"));
+    }
+
+    /// Review 4 #18: the helper a step started is recorded beside its job, and is waited for only so long.
+    #[test]
+    fn a_helper_is_recorded_beside_its_job_and_waited_for_only_so_long() {
+        let dir = std::env::temp_dir().join(format!("aokie-driver-job-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(recorded_helper(&dir), None);
+        // 2026-10-18T00:00:00Z as a FILETIME.
+        let started = UNIX_EPOCH + Duration::from_secs(1_792_281_600);
+        let helper = HelperProcess { pid: 4_242, created: 1_792_281_600 * 10_000_000 + FILETIME_UNIX_EPOCH };
+        record_helper(&dir, helper).unwrap();
+        assert_eq!(recorded_helper(&dir), Some(helper));
+        assert_eq!(helper.age(started + Duration::from_secs(90)), Duration::from_secs(90));
+        assert!(helper.within_limit(started + Duration::from_secs(90)));
+        assert!(!helper.within_limit(started + HELPER_RUN_LIMIT), "hung: no longer waited for");
+        assert_eq!(helper.age(started - Duration::from_secs(5)), Duration::ZERO, "a clock set back");
+        // A record this version never writes is none.
+        std::fs::write(dir.join(HELPER_RECORD_FILE), br#"{"pid":1,"created":2,"elevated":true}"#).unwrap();
+        assert_eq!(recorded_helper(&dir), None);
+        forget_helper(&dir);
+        assert_eq!(recorded_helper(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

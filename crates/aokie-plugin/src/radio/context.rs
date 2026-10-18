@@ -84,7 +84,7 @@ pub(super) struct CallVoiceContext {
     /// already requested, and whether the call was being finished. The
     /// session that took over had no memory of the call.
     #[cfg(feature = "voice")]
-    pub(super) reconnect_note: Option<String>,
+    pub(super) reconnect_note: Option<ReconnectNote>,
     /// The caller was assigned the Desktop Realtime responder. This travels
     /// with a parked caller even though its WebSocket never does: a restore
     /// therefore creates a fresh, call-fenced session instead of silently

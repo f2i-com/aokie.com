@@ -2,7 +2,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { MAX_V2_ASSISTANCE_ANSWER_BYTES, parseCallSnapshot, parseCommandAck, sanitizeLine } from "../protocol/codec";
 import { MAX_JSON_SAFE_INTEGER, type CommandEnvelope } from "../protocol/types";
-import { setProtocolClockOffsetSeconds } from "../protocolClock";
+import { protocolNowSeconds, setProtocolClockOffsetSeconds } from "../protocolClock";
 import type {
   BridgeEvent,
   CompanionAvailability,
@@ -829,7 +829,8 @@ export function parseV2Assistance(value: unknown): V2AssistanceRequestEvent | nu
   safeInteger(frame.switchboardRevision, 0, "assistance switchboard revision");
   safeInteger(frame.remoteRevision, 0, "assistance remote revision");
   const expiresAt = safeInteger(frame.expiresAt, 1, "assistance expiry");
-  const nowSeconds = Math.floor(Date.now() / 1_000);
+  // A server-clock time, checked on the clock native code checks it on (see protocolClock.ts).
+  const nowSeconds = protocolNowSeconds();
   if (expiresAt <= nowSeconds || expiresAt - nowSeconds > 300 || typeof frame.question !== "string" || !frame.question.trim() || frame.question.length > 1_000 || /[\u0000-\u001f\u007f]/.test(frame.question)) {
     throw new Error("Invalid protocol-v2 assistance request");
   }
@@ -878,7 +879,8 @@ export function parseV2EndCaller(value: unknown): V2EndCallerEvent {
     safeIdentifier(frame.confirmationId, "caller-ending confirmation ID");
     validateEndCallerAuthority(frame, "caller-ending challenge");
     const expiresAt = safeInteger(frame.expiresAt, 1, "caller-ending challenge expiry");
-    const nowSeconds = Math.floor(Date.now() / 1_000);
+    // A server-clock time, as the End-caller countdown reads it (see protocolClock.ts).
+    const nowSeconds = protocolNowSeconds();
     if (expiresAt <= nowSeconds || expiresAt - nowSeconds > 300) {
       throw new Error("Invalid protocol-v2 caller-ending challenge expiry");
     }

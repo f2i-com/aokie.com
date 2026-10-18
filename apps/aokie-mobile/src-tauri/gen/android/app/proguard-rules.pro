@@ -35,6 +35,7 @@
     public java.lang.String getAokieSecureValue(java.lang.String);
     public int deleteAokieSecureValue(java.lang.String);
     public int aokieSecureStoreAvailable();
+    public int recordAokieServerClock(long);
     public java.lang.String aokieRuntimeDiagnostics();
     public int invalidateAokiePushToken();
     public java.lang.String takeAokieNativeCallAction();

@@ -15,8 +15,8 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SP_DEVINFO_DATA, SUOI_FORCEDELETE,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, HANDLE, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, FILETIME, HANDLE,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetDeviceInstanceIdW, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL, DIREG_DRV,
@@ -24,7 +24,9 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegQueryValueExW, HKEY, KEY_READ, REG_MULTI_SZ, REG_SZ,
 };
-use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, GetProcessId, GetProcessTimes, WaitForSingleObject,
+};
 use windows_sys::Win32::UI::Shell::{
     SHGetFolderPathW, ShellExecuteExW, CSIDL_WINDOWS, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
@@ -1243,21 +1245,53 @@ pub fn run_elevated_helper(helper_path: &Path, job_path: &Path) -> Result<i32, S
             ));
         }
 
-        // Wait for the helper to exit, however long it takes. Giving up after
-        // 120 s (as this did) released the install lock while the elevated
-        // helper was still installing, so a second install could start beside
-        // it. The wait runs on the driver step's own thread
-        // (`crate::driver_job`), never on the plugin's command loop, so a slow
-        // helper holds up only another driver step, which must wait anyway.
+        // The helper's process is recorded beside its job (review 4 #18):
+        // whether a helper runs is whether this process does, for this Aokie
+        // and for one started again while it runs.
         let process = OwnedHandle(exec.hProcess);
+        let record_dir = job_path.parent().map(Path::to_path_buf);
+        if let Some(dir) = record_dir.as_deref() {
+            let empty = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let (mut created, mut exited, mut kernel, mut user) = (empty, empty, empty, empty);
+            let pid = GetProcessId(process.0);
+            if pid != 0 && GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user) != 0 {
+                let helper = crate::driver_job::HelperProcess {
+                    pid,
+                    created: (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
+                };
+                if let Err(e) = crate::driver_job::record_helper(dir, helper) {
+                    eprintln!("[winusb] could not record aokie-driver-helper (pid {pid}): {e}");
+                }
+            }
+        }
+
+        // Wait for the helper to exit. Giving up after 120 s (as this did)
+        // released the install lock while the elevated helper was still
+        // installing, so a second install could start beside it; waiting for
+        // ever kept a hung one's step running for ever. The wait runs on the
+        // driver step's own thread (`crate::driver_job`), never on the
+        // plugin's command loop, and lasts up to the helper limit; past it the
+        // step fails, and the recorded helper keeps another step refused (the
+        // install lock asks whether it runs) until it ends.
         let started = std::time::Instant::now();
         let mut wait = WaitForSingleObject(process.0, 120_000);
         while wait == WAIT_TIMEOUT {
+            if started.elapsed() >= crate::driver_job::HELPER_RUN_LIMIT {
+                return Err(super::installer::helper_hung());
+            }
             eprintln!(
                 "[winusb] aokie-driver-helper still running after {} s: waiting for it to exit",
                 started.elapsed().as_secs()
             );
             wait = WaitForSingleObject(process.0, 120_000);
+        }
+        if wait == WAIT_OBJECT_0 {
+            if let Some(dir) = record_dir.as_deref() {
+                crate::driver_job::forget_helper(dir);
+            }
         }
         if wait == WAIT_FAILED {
             return Err(format!(

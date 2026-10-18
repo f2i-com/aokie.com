@@ -91,15 +91,57 @@ pub enum DataElement<'a> {
     Sequence(&'a [u8]),
 }
 
+/// Every SDP data element type (Core Vol 3 Part B §3). Review 4 #25: the
+/// parser knew only the ones Aokie writes, so one attribute of another type
+/// (a 128-bit UUID, a signed integer, a URL) failed the whole discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedDataElement<'a> {
+    Nil,
     Uint8(u8),
     Uint16(u16),
     Uint32(u32),
+    Uint64(u64),
+    Uint128([u8; 16]),
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    Int128([u8; 16]),
     Uuid16(u16),
+    Uuid32(u32),
+    Uuid128([u8; 16]),
     Bool(bool),
     Text(&'a [u8]),
     Sequence(&'a [u8]),
+    /// A choice of elements, read like a sequence.
+    Alternative(&'a [u8]),
+    Url(&'a [u8]),
+}
+
+/// The Bluetooth Base UUID's last 96 bits (`xxxxxxxx-0000-1000-8000-00805F9B34FB`).
+const BASE_UUID_TAIL: [u8; 12] = [0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80, 0x5f, 0x9b, 0x34, 0xfb];
+
+impl ParsedDataElement<'_> {
+    /// The 16-bit form of a UUID element: a Uuid16, or a Uuid32 / Uuid128
+    /// that is a 16-bit UUID on the Bluetooth Base UUID.
+    pub fn as_uuid16(&self) -> Option<u16> {
+        match self {
+            ParsedDataElement::Uuid16(u) => Some(*u),
+            ParsedDataElement::Uuid32(u) => u16::try_from(*u).ok(),
+            ParsedDataElement::Uuid128(bytes) if bytes[..2] == [0, 0] && bytes[4..] == BASE_UUID_TAIL => {
+                Some(u16::from_be_bytes([bytes[2], bytes[3]]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this element is any UUID (one `as_uuid16` may not reduce).
+    pub fn is_uuid(&self) -> bool {
+        matches!(
+            self,
+            ParsedDataElement::Uuid16(_) | ParsedDataElement::Uuid32(_) | ParsedDataElement::Uuid128(_)
+        )
+    }
 }
 
 pub fn encode_data_element(element: DataElement<'_>, out: &mut Vec<u8>) {
@@ -158,7 +200,41 @@ pub fn parse_data_element(input: &[u8]) -> Result<(ParsedDataElement<'_>, usize)
     let descriptor = *input
         .first()
         .ok_or_else(|| "SDP data element is empty".to_string())?;
+    let fixed = |len: usize, name: &str| -> Result<&[u8], String> {
+        require_len(input, 1 + len, name)?;
+        Ok(&input[1..1 + len])
+    };
+    let bytes16 = |b: &[u8]| -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out.copy_from_slice(b);
+        out
+    };
     match descriptor {
+        0x00 => Ok((ParsedDataElement::Nil, 1)),
+        0x0b => {
+            let b = fixed(8, "SDP uint64")?;
+            Ok((ParsedDataElement::Uint64(u64::from_be_bytes(b.try_into().unwrap_or([0; 8]))), 9))
+        }
+        0x0c => Ok((ParsedDataElement::Uint128(bytes16(fixed(16, "SDP uint128")?)), 17)),
+        0x10 => Ok((ParsedDataElement::Int8(fixed(1, "SDP int8")?[0] as i8), 2)),
+        0x11 => {
+            let b = fixed(2, "SDP int16")?;
+            Ok((ParsedDataElement::Int16(i16::from_be_bytes([b[0], b[1]])), 3))
+        }
+        0x12 => {
+            let b = fixed(4, "SDP int32")?;
+            Ok((ParsedDataElement::Int32(i32::from_be_bytes([b[0], b[1], b[2], b[3]])), 5))
+        }
+        0x13 => {
+            let b = fixed(8, "SDP int64")?;
+            Ok((ParsedDataElement::Int64(i64::from_be_bytes(b.try_into().unwrap_or([0; 8]))), 9))
+        }
+        0x14 => Ok((ParsedDataElement::Int128(bytes16(fixed(16, "SDP int128")?)), 17)),
+        0x1a => {
+            let b = fixed(4, "SDP uuid32")?;
+            Ok((ParsedDataElement::Uuid32(u32::from_be_bytes([b[0], b[1], b[2], b[3]])), 5))
+        }
+        0x1c => Ok((ParsedDataElement::Uuid128(bytes16(fixed(16, "SDP uuid128")?)), 17)),
         0x08 => {
             require_len(input, 2, "SDP uint8")?;
             Ok((ParsedDataElement::Uint8(input[1]), 2))
@@ -195,7 +271,7 @@ pub fn parse_data_element(input: &[u8]) -> Result<(ParsedDataElement<'_>, usize)
         // tier that fits, so the parser has to recognize all three to
         // round-trip its own output and to handle real peer responses
         // that include long service names or option lists.
-        0x25 | 0x26 | 0x27 | 0x35 | 0x36 | 0x37 => {
+        0x25 | 0x26 | 0x27 | 0x35 | 0x36 | 0x37 | 0x3d | 0x3e | 0x3f | 0x45 | 0x46 | 0x47 => {
             let header_len = match descriptor & 0x07 {
                 0x05 => 2,
                 0x06 => 3,
@@ -212,11 +288,15 @@ pub fn parse_data_element(input: &[u8]) -> Result<(ParsedDataElement<'_>, usize)
             require_len(input, header_len + len, "SDP variable element payload")?;
             let payload = &input[header_len..header_len + len];
             let total = header_len + len;
-            if descriptor < 0x30 {
-                Ok((ParsedDataElement::Text(payload), total))
-            } else {
-                Ok((ParsedDataElement::Sequence(payload), total))
-            }
+            Ok((
+                match descriptor >> 3 {
+                    4 => ParsedDataElement::Text(payload),
+                    6 => ParsedDataElement::Sequence(payload),
+                    7 => ParsedDataElement::Alternative(payload),
+                    _ => ParsedDataElement::Url(payload),
+                },
+                total,
+            ))
         }
         _ => Err(format!(
             "unsupported SDP data element descriptor 0x{:02x}",
@@ -277,9 +357,14 @@ fn collect_uuid16s(input: &[u8], out: &mut Vec<u16>) -> Result<(), String> {
     while offset < input.len() {
         let (element, used) = parse_data_element(&input[offset..])?;
         match element {
-            ParsedDataElement::Uuid16(u) => out.push(u),
-            ParsedDataElement::Sequence(inner) => collect_uuid16s(inner, out)?,
-            _ => {}
+            ParsedDataElement::Sequence(inner) | ParsedDataElement::Alternative(inner) => {
+                collect_uuid16s(inner, out)?
+            }
+            other => {
+                if let Some(u) = other.as_uuid16() {
+                    out.push(u);
+                }
+            }
         }
         offset += used;
     }
@@ -325,7 +410,10 @@ impl SdpServer {
     pub fn handle_request(&self, packet: &[u8]) -> Result<Vec<u8>, String> {
         let request = parse_service_search_attribute_request(packet)?;
         let pattern_uuids = parse_uuid_search_pattern(request.service_search_pattern)?;
-        let matched = self.match_records(&pattern_uuids);
+        let matched = match &pattern_uuids {
+            Some(uuids) => self.match_records(uuids),
+            None => Vec::new(),
+        };
 
         // SDP §4.7: AttributeLists is a *Sequence-of-Sequences* — one
         // inner sequence of (AttrId, AttrVal) pairs per matched record,
@@ -374,26 +462,28 @@ impl SdpServer {
 
 /// Parse the inner of a ServiceSearchPattern (already unwrapped from its
 /// outer Sequence by `parse_service_search_attribute_request`) into a
-/// flat list of 16-bit UUIDs. Spec allows 32- and 128-bit UUIDs in the
-/// pattern too, but real-world phone queries always use Uuid16; we error
-/// loudly if we ever see something else so we know to extend support.
-fn parse_uuid_search_pattern(pattern: &[u8]) -> Result<Vec<u16>, String> {
+/// flat list of 16-bit UUIDs. A 32- or 128-bit UUID on the Bluetooth Base
+/// UUID counts as its 16-bit form; any other UUID is in none of our records
+/// (they hold 16-bit ones only), so the pattern matches nothing: `None`.
+fn parse_uuid_search_pattern(pattern: &[u8]) -> Result<Option<Vec<u16>>, String> {
     let mut out = Vec::new();
+    let mut matchable = true;
     let mut offset = 0;
     while offset < pattern.len() {
         let (element, used) = parse_data_element(&pattern[offset..])?;
-        match element {
-            ParsedDataElement::Uuid16(u) => out.push(u),
-            other => {
+        match element.as_uuid16() {
+            Some(u) => out.push(u),
+            None if element.is_uuid() => matchable = false,
+            None => {
                 return Err(format!(
-                    "SDP search pattern contained non-Uuid16 element {:?} (32/128-bit UUIDs not supported yet)",
-                    other
+                    "SDP search pattern contained non-UUID element {:?}",
+                    element
                 ));
             }
         }
         offset += used;
     }
-    Ok(out)
+    Ok(matchable.then_some(out))
 }
 
 /// Build the HFP ServiceRecord for registration.
@@ -1032,6 +1122,66 @@ mod tests {
             parse_data_element(&out).unwrap(),
             (ParsedDataElement::Bool(false), 2)
         );
+    }
+
+    /// Review 4 #25: every SDP element type parses (one attribute of a type
+    /// the parser did not know failed the whole discovery), and a 32- or
+    /// 128-bit UUID on the Base UUID counts as its 16-bit form.
+    #[test]
+    fn every_data_element_type_parses() {
+        let base_128 = |u: u16| {
+            let mut b = [0u8; 17];
+            b[0] = 0x1c;
+            b[3..5].copy_from_slice(&u.to_be_bytes());
+            b[5..].copy_from_slice(&BASE_UUID_TAIL);
+            b
+        };
+        let cases: Vec<(Vec<u8>, ParsedDataElement<'static>)> = vec![
+            (vec![0x00], ParsedDataElement::Nil),
+            (vec![0x0b, 0, 0, 0, 0, 0, 0, 1, 2], ParsedDataElement::Uint64(0x0102)),
+            (vec![0x10, 0xff], ParsedDataElement::Int8(-1)),
+            (vec![0x11, 0xff, 0xfe], ParsedDataElement::Int16(-2)),
+            (vec![0x12, 0xff, 0xff, 0xff, 0xfd], ParsedDataElement::Int32(-3)),
+            (vec![0x13, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc], ParsedDataElement::Int64(-4)),
+            (vec![0x1a, 0x00, 0x00, 0x11, 0x32], ParsedDataElement::Uuid32(0x1132)),
+            (vec![0x3d, 0x02, 0x08, 0x01], ParsedDataElement::Alternative(&[0x08, 0x01])),
+            (vec![0x45, 0x03, b'a', b'/', b'b'], ParsedDataElement::Url(b"a/b")),
+        ];
+        for (bytes, expected) in cases {
+            let (parsed, used) = parse_data_element(&bytes).unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(used, bytes.len());
+        }
+        let mut b128 = vec![0x0c];
+        b128.extend([7u8; 16]);
+        assert_eq!(parse_data_element(&b128).unwrap(), (ParsedDataElement::Uint128([7; 16]), 17));
+        b128[0] = 0x14;
+        assert_eq!(parse_data_element(&b128).unwrap(), (ParsedDataElement::Int128([7; 16]), 17));
+        let uuid = base_128(UUID_HANDSFREE);
+        let (parsed, used) = parse_data_element(&uuid).unwrap();
+        assert_eq!((parsed.as_uuid16(), used), (Some(UUID_HANDSFREE), 17));
+        assert_eq!(ParsedDataElement::Uuid32(0x0001_0000).as_uuid16(), None);
+        assert_eq!(ParsedDataElement::Uuid128([9; 16]).as_uuid16(), None);
+        assert!(parse_data_element(&[0x1c, 0x00]).is_err(), "truncated");
+        assert!(parse_data_element(&[0x0d]).is_err(), "no such size");
+
+        // A record holding them all still yields its UUIDs.
+        let mut record = vec![0x09, 0x00, 0x01, 0x35, 17];
+        record.extend(uuid);
+        record.extend([0x09, 0x00, 0x02, 0x00, 0x09, 0x00, 0x03, 0x3d, 0x03, 0x19, 0x01, 0x00]);
+        assert_eq!(ServiceRecord::new(1, record).searchable_uuids, vec![UUID_L2CAP, UUID_HANDSFREE]);
+
+        // A search by the 128-bit Handsfree UUID finds the HFP record; one
+        // by a vendor UUID finds nothing (it was an error, and no reply).
+        let server = SdpServer::new_with_hfp();
+        let mut request = vec![0x06, 0x00, 0x02, 0x00, 0x1d, 0x35, 0x11];
+        request.extend(base_128(UUID_HANDSFREE));
+        request.extend([0xff, 0xff, 0x35, 0x05, 0x0a, 0x00, 0x00, 0xff, 0xff, 0x00]);
+        let response = server.handle_request(&request).unwrap();
+        assert!(response.windows(AOKIE_HFP_SERVICE_NAME.len()).any(|w| w == AOKIE_HFP_SERVICE_NAME.as_bytes()));
+        request[7..24].copy_from_slice(&[0x1c, 0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        let response = server.handle_request(&request).unwrap();
+        assert_eq!(&response[7..9], &[0x35, 0x00], "no records");
     }
 
     #[test]

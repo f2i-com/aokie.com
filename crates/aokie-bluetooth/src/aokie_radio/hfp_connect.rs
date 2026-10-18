@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use super::l2cap::{ChannelState, L2capState, PsmHandler, PSM_RFCOMM, PSM_SDP};
 use super::sdp_client::{
     build_service_search_attribute_request, extract_rfcomm_channel, iter_records,
-    parse_service_search_attribute_response, UUID_HANDSFREE_AG,
+    parse_service_search_attribute_response, read_sdp_reply, SdpReply, UUID_HANDSFREE_AG,
 };
 
 /// SDP + RFCOMM-open must progress within this window or we fail the
@@ -246,10 +246,20 @@ impl HfpConnectRuntime {
                             out,
                         );
                     }
-                    Err(_) => {
+                    Err(e) => match read_sdp_reply(&buffer) {
                         // Partial response — keep buffering.
-                        self.phase = Phase::AwaitingSdpResponse { local_cid, buffer };
-                    }
+                        SdpReply::Partial => {
+                            self.phase = Phase::AwaitingSdpResponse { local_cid, buffer };
+                        }
+                        // An ErrorResponse, or a whole reply that cannot be
+                        // read: no use waiting out the timeout (review 4 #25).
+                        SdpReply::Failed(reason) => {
+                            self.fail(format!("HFP connect SDP: {reason}"), Some(local_cid), l2cap_state, out);
+                        }
+                        SdpReply::Response(_) => {
+                            self.fail(format!("HFP connect SDP: {e}"), Some(local_cid), l2cap_state, out);
+                        }
+                    },
                 }
             }
             other => {
@@ -532,6 +542,30 @@ mod tests {
             .take_events()
             .iter()
             .any(|e| matches!(e, HfpConnectEvent::Failed(_))));
+    }
+
+    /// Review 4 #25: an SDP ErrorResponse fails the reconnect at once
+    /// instead of waiting out the watchdog; a reply still coming waits.
+    #[test]
+    fn an_sdp_error_response_fails_at_once() {
+        let mut l2cap = L2capState::new();
+        let mut runtime = HfpConnectRuntime::new(HANDLE, false, false);
+        runtime.start(&mut l2cap).expect("start");
+        walk_outbound_l2cap_to_open(&mut l2cap, 0x0040, 0x0070, 0x80, 0x81);
+        runtime.tick(&mut l2cap).expect("tick sdp query");
+        feed_channel_bytes(&mut l2cap, 0x0040, &[0x07, 0x00, 0x01, 0x00, 0x30]);
+        runtime.tick(&mut l2cap).expect("tick partial");
+        assert!(!runtime.is_failed(), "partial: waits");
+
+        let mut l2cap = L2capState::new();
+        let mut runtime = HfpConnectRuntime::new(HANDLE, false, false);
+        runtime.start(&mut l2cap).expect("start");
+        walk_outbound_l2cap_to_open(&mut l2cap, 0x0040, 0x0070, 0x80, 0x81);
+        runtime.tick(&mut l2cap).expect("tick sdp query");
+        feed_channel_bytes(&mut l2cap, 0x0040, &[0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x06]);
+        runtime.tick(&mut l2cap).expect("tick fail");
+        assert!(runtime.is_failed());
+        assert!(runtime.failure_reason().is_some_and(|r| r.contains("ErrorResponse 0x0006")));
     }
 
     #[test]

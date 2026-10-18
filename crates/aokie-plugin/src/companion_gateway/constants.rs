@@ -38,6 +38,17 @@ pub(super) const ADMISSION_ROTATION_OVERLAP: Duration = Duration::from_secs(30);
 /// yield to a retry while the predecessor is still inside its safe lifetime.
 pub(super) const ADMISSION_TRANSPORT_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 pub(super) const ADMISSION_ROTATION_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// A routine admission rotation (every few minutes, for as long as the
+/// Desktop runs) is logged once in this long, with how many there were
+/// (review 4 #16); one that resets continuity, and the first, always.
+pub(super) const ADMISSION_ROTATION_LOG_EVERY: Duration = Duration::from_secs(60 * 60);
+/// A rotation that keeps being deferred for the same reason (a retry each
+/// second) is logged once in this long, with how many there were.
+pub(super) const ADMISSION_DEFERRAL_LOG_EVERY: Duration = Duration::from_secs(60);
+/// The largest message, and frame, the gateway socket takes: what the gateway
+/// and the phone cap theirs at (review 4 #29). tungstenite's own default
+/// would buffer up to 64 MiB of one message from the network.
+pub(super) const MAX_GATEWAY_MESSAGE_BYTES: usize = 256 * 1024;
 // plugin.init's compact bootstrap intentionally omits token expiry. Consume it
 // once and rotate through the Desktop broker quickly rather than assuming the
 // gateway's maximum admission lifetime.

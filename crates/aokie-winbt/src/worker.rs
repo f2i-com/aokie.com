@@ -186,6 +186,7 @@ pub(crate) fn run(
                         message_id: request.message_id,
                         recipient_phone: request.recipient,
                         reason: "native backend: the messaging thread is not running".to_string(),
+                        outcome_unknown: false,
                     });
                 }
             }
@@ -300,8 +301,12 @@ fn seed_phone_from_bond(shared: &NativeShared) {
                     *slot = name.clone();
                 }
             }
+            // Redacted (review 4 #30): the phone's own name is often the
+            // owner's ("Sam's Galaxy").
             eprintln!(
-                "[aokie-winbt] phone seeded from Windows bond: {addr_str} ({name:?}) — MAP ops run on demand over the idle link"
+                "[aokie-winbt] phone seeded from Windows bond: {} ({}) — MAP ops run on demand over the idle link",
+                aokie_bluetooth::aokie_radio::LogAddr(&addr_str),
+                name.as_deref().map_or_else(|| "no name".to_string(), |n| aokie_core::redact::Text(n).to_string())
             );
         }
     }
@@ -322,6 +327,7 @@ fn drain_until_shutdown(control_rx: &Receiver<NativeControl>, event_tx: &Sender<
                     message_id,
                     recipient_phone: recipient,
                     reason: "native backend: no Bluetooth adapter".to_string(),
+                    outcome_unknown: false,
                 });
             }
             NativeControl::Connect(_, reply)

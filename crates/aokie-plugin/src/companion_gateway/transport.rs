@@ -766,12 +766,15 @@ pub(super) async fn open_gateway_socket(
         .insert("x-aokie-plugin-id", plugin_header);
 
     // Bounded like every later write: a black-holed TCP or TLS handshake must
-    // become a retry, not a worker that never reaches its backoff.
-    let (mut socket, upgrade) =
-        tokio::time::timeout(GATEWAY_CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
-            .await
-            .map_err(|_| WorkerError::reconnect("Companion gateway connection timed out"))?
-            .map_err(safe_ws_error)?;
+    // become a retry, not a worker that never reaches its backoff. And what
+    // one message may be, as the gateway and the phone bound it.
+    let (mut socket, upgrade) = tokio::time::timeout(
+        GATEWAY_CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(request, Some(gateway_socket_config()), false),
+    )
+    .await
+    .map_err(|_| WorkerError::reconnect("Companion gateway connection timed out"))?
+    .map_err(safe_ws_error)?;
     // The upgrade's `Date` is the gateway's clock a moment ago: read it before
     // the challenge, so the challenge and every time after it are checked on
     // the gateway's clock rather than this computer's.
@@ -900,6 +903,70 @@ pub(super) fn endpoint_hello_for_session(
     Ok(hello)
 }
 
+/// The gateway socket's limits: a message, and a frame, of at most
+/// [`MAX_GATEWAY_MESSAGE_BYTES`] (review 4 #29).
+pub(super) fn gateway_socket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_GATEWAY_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_GATEWAY_MESSAGE_BYTES))
+}
+
+/// What of the admission's rotations reaches the log (review 4 #16). A
+/// rotation every few minutes for as long as the Desktop runs, and a retry
+/// each second while one is deferred, filled the plugin's log: the first
+/// rotation and any that resets continuity are logged, the routine ones once
+/// in [`ADMISSION_ROTATION_LOG_EVERY`] with how many there were, and a
+/// deferral when its reason changes or once in [`ADMISSION_DEFERRAL_LOG_EVERY`].
+#[derive(Debug, Default)]
+pub(super) struct AdmissionRotationLog {
+    /// Rotations since the last one logged, and when that was.
+    unlogged_rotations: u64,
+    last_rotation_logged: Option<Instant>,
+    /// The deferral last logged (its kind and detail), when, and how many
+    /// like it since.
+    last_deferral: Option<(String, Instant)>,
+    unlogged_deferrals: u64,
+}
+
+impl AdmissionRotationLog {
+    /// Whether a rotation's start is logged: only the first one's.
+    pub(super) fn log_start(&self) -> bool {
+        self.last_rotation_logged.is_none() && self.unlogged_rotations == 0
+    }
+
+    /// A rotation is done: `Some(n)` when it is logged, `n` the rotations it
+    /// stands for (itself and those not logged since the last).
+    pub(super) fn rotated(&mut self, now: Instant, continuity_reset: bool) -> Option<u64> {
+        self.unlogged_rotations = self.unlogged_rotations.saturating_add(1);
+        // A rotation ends a deferral streak: the next deferral is news.
+        self.last_deferral = None;
+        self.unlogged_deferrals = 0;
+        let due = continuity_reset
+            || self.last_rotation_logged.is_none_or(|at| {
+                now.saturating_duration_since(at) >= ADMISSION_ROTATION_LOG_EVERY
+            });
+        if !due {
+            return None;
+        }
+        self.last_rotation_logged = Some(now);
+        Some(std::mem::take(&mut self.unlogged_rotations))
+    }
+
+    /// A rotation was deferred for `reason`: `Some(n)` when it is logged, `n`
+    /// the deferrals since the last one logged, this one included.
+    pub(super) fn deferred(&mut self, now: Instant, reason: &str) -> Option<u64> {
+        self.unlogged_deferrals = self.unlogged_deferrals.saturating_add(1);
+        let due = self.last_deferral.as_ref().is_none_or(|(last, at)| {
+            last != reason || now.saturating_duration_since(*at) >= ADMISSION_DEFERRAL_LOG_EVERY
+        });
+        if !due {
+            return None;
+        }
+        self.last_deferral = Some((reason.to_string(), now));
+        Some(std::mem::take(&mut self.unlogged_deferrals))
+    }
+}
+
 pub(super) fn admission_rotation_times(now: Instant, lifetime: Duration) -> (Instant, Instant) {
     let deadline = now + lifetime;
     let overlap = lifetime.min(ADMISSION_ROTATION_OVERLAP);
@@ -927,6 +994,7 @@ pub(super) async fn run_socket(
     let mut admission_generation = 0_u64;
     let mut admission_rotation: Option<AdmissionRotationTask> = None;
     let mut admission_rotation_error: Option<WorkerError> = None;
+    let mut rotation_log = AdmissionRotationLog::default();
     let mut retiring_transport: Option<(GatewayTransport, Instant)> = None;
     #[cfg(feature = "voice")]
     let mut relay_greeting_tasks = RelayGreetingTasks::default();
@@ -1001,14 +1069,17 @@ pub(super) async fn run_socket(
                     admission_deadline = times.1;
                     admission_retry_at = admission_refresh_at;
                     admission_rotation_error = None;
-                    eprintln!(
-                        "[aokie-plugin][companion] stage=admission_rotated continuity={} transport={} app={} plugin={} active_peers={}",
-                        if preserve_continuity { "preserved" } else { "reset" },
-                        credentials.transport_label(),
-                        credentials.app_id,
-                        credentials.plugin_id,
-                        session.peers.len()
-                    );
+                    if let Some(rotations) = rotation_log.rotated(Instant::now(), !preserve_continuity) {
+                        eprintln!(
+                            "[aokie-plugin][companion] stage=admission_rotated continuity={} transport={} app={} plugin={} active_peers={} rotations={}",
+                            if preserve_continuity { "preserved" } else { "reset" },
+                            credentials.transport_label(),
+                            credentials.app_id,
+                            credentials.plugin_id,
+                            session.peers.len(),
+                            rotations
+                        );
+                    }
                     continue;
                 }
                 Ok(opened) => {
@@ -1021,11 +1092,16 @@ pub(super) async fn run_socket(
                     ));
                 }
                 Err(error) => {
-                    eprintln!(
-                        "[aokie-plugin][companion] stage=admission_rotation_deferred kind={} detail={}",
-                        error.kind.label(),
-                        sanitize_status_message(&error.message)
-                    );
+                    let detail = sanitize_status_message(&error.message);
+                    let reason = format!("{} {detail}", error.kind.label());
+                    if let Some(times) = rotation_log.deferred(Instant::now(), &reason) {
+                        eprintln!(
+                            "[aokie-plugin][companion] stage=admission_rotation_deferred kind={} detail={} times={}",
+                            error.kind.label(),
+                            detail,
+                            times
+                        );
+                    }
                     admission_rotation_error = Some(error);
                 }
             }
@@ -1054,19 +1130,26 @@ pub(super) async fn run_socket(
             ) {
                 Ok(rotation) => {
                     admission_rotation = Some(rotation);
-                    eprintln!(
-                        "[aokie-plugin][companion] stage=admission_rotation_started continuity=overlap transport={} app={} plugin={}",
-                        credentials.transport_label(),
-                        credentials.app_id,
-                        credentials.plugin_id
-                    );
+                    if rotation_log.log_start() {
+                        eprintln!(
+                            "[aokie-plugin][companion] stage=admission_rotation_started continuity=overlap transport={} app={} plugin={}",
+                            credentials.transport_label(),
+                            credentials.app_id,
+                            credentials.plugin_id
+                        );
+                    }
                 }
                 Err(error) => {
-                    eprintln!(
-                        "[aokie-plugin][companion] stage=admission_rotation_deferred kind={} detail={}",
-                        error.kind.label(),
-                        sanitize_status_message(&error.message)
-                    );
+                    let detail = sanitize_status_message(&error.message);
+                    let reason = format!("{} {detail}", error.kind.label());
+                    if let Some(times) = rotation_log.deferred(now, &reason) {
+                        eprintln!(
+                            "[aokie-plugin][companion] stage=admission_rotation_deferred kind={} detail={} times={}",
+                            error.kind.label(),
+                            detail,
+                            times
+                        );
+                    }
                     admission_rotation_error = Some(error);
                     admission_retry_at = now + ADMISSION_ROTATION_RETRY_DELAY;
                 }

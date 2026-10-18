@@ -44,7 +44,8 @@ class AokieFirebaseMessagingService : FirebaseMessagingService() {
   }
 
   private fun receiveVoiceOffer(data: Map<String, String>) {
-    val offer = AokieVoiceOffer.fromPush(data)
+    // Its expiry is the server's time, moved onto this phone's clock (review 4 #10).
+    val offer = AokieVoiceOffer.fromPush(data, AokieServerClock.offsetSeconds(this))
     if (offer == null || !AokieOfferStore.acceptPush(this, offer)) {
       AokieOfferStore.recordDiagnostic(this, "voice_offer_invalid_or_stale")
       return
@@ -91,7 +92,8 @@ class AokieFirebaseMessagingService : FirebaseMessagingService() {
     val title = data["title"]?.takeIf { safeText(it, 80) } ?: "Aokie update"
     val body = data["body"]?.takeIf { safeText(it, 240) } ?: "Open Aokie Companion for current call status."
     val now = System.currentTimeMillis() / 1000
-    val expiresAt = data["expiresAt"]?.toLongOrNull() ?: return
+    // The server's time, on this phone's clock (review 4 #10).
+    val expiresAt = data["expiresAt"]?.toLongOrNull()?.let { AokieServerClock.toLocalSeconds(this, it) } ?: return
     if (expiresAt <= now || expiresAt > now + 24 * 60 * 60) return
     AokieCallNotifications.informational(this, eventId, title, body)
   }
@@ -120,7 +122,8 @@ class AokieFirebaseMessagingService : FirebaseMessagingService() {
     val maximum = 9_007_199_254_740_991L
     if (callEpoch !in 1..maximum || ownerEpoch !in 0..maximum) return
     val now = System.currentTimeMillis() / 1000
-    val expiresAt = data["expiresAt"]?.toLongOrNull() ?: return
+    // The server's time, on this phone's clock (review 4 #10): the notification's timeout is too.
+    val expiresAt = data["expiresAt"]?.toLongOrNull()?.let { AokieServerClock.toLocalSeconds(this, it) } ?: return
     if (expiresAt <= now || expiresAt > now + 5 * 60) return
     AokieCallNotifications.assistanceOffer(this, eventId, expiresAt)
     AokieOfferStore.recordDiagnostic(this, "assistance_offer_authoritative_refresh_required")

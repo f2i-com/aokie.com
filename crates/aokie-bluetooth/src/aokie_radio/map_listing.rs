@@ -76,7 +76,7 @@ pub fn parse_listing(input: &[u8]) -> Vec<MessageEntry> {
             cursor = after;
             continue;
         }
-        let end = match find_byte(bytes, b'>', after) {
+        let end = match element_end(bytes, after) {
             Some(idx) => idx,
             None => break,
         };
@@ -103,30 +103,83 @@ pub fn msg_attribute_pairs(input: &[u8]) -> Vec<Vec<(String, String)>> {
         if !piece.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/') {
             continue;
         }
-        let mut pairs = Vec::new();
-        let mut rest = piece;
-        loop {
-            // The element ends at a `>` outside any value.
-            let eq = rest.find('=');
-            let gt = rest.find('>');
-            let Some(eq) = eq.filter(|eq| gt.is_none_or(|gt| *eq < gt)) else {
-                break;
-            };
-            let name = rest[..eq].trim().rsplit(char::is_whitespace).next().unwrap_or("").to_string();
-            let after = rest[eq + 1..].trim_start();
-            let Some(quote) = after.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-                break;
-            };
-            let body = &after[1..];
-            let Some(close) = body.find(quote) else {
-                break;
-            };
-            pairs.push((name, unescape_xml(&body[..close])));
-            rest = &body[close + 1..];
-        }
-        out.push(pairs);
+        // The element ends at a `>` outside any value.
+        let end = element_end(piece.as_bytes(), 0).unwrap_or(piece.len());
+        out.push(attributes(&piece[..end]));
     }
     out
+}
+
+/// Where the element whose attributes start at `from` ends: the first `>`
+/// outside a quoted value (a `>` inside one is legal XML). With a quote
+/// that never closes, the first `>` (what the parser always took).
+/// Review 4 #27: `parse_listing` and the MNS event report ended the element
+/// at the first `>`, losing the attributes after a value holding one.
+pub(crate) fn element_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    let mut after_eq = false;
+    for (at, &b) in bytes.iter().enumerate().skip(from) {
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        match b {
+            b'>' => return Some(at),
+            b'=' => after_eq = true,
+            b'"' | b'\'' if after_eq => {
+                quote = Some(b);
+                after_eq = false;
+            }
+            _ if b.is_ascii_whitespace() => {}
+            _ => after_eq = false,
+        }
+    }
+    if from >= bytes.len() {
+        return None;
+    }
+    find_byte(bytes, b'>', from)
+}
+
+/// An element's attributes (the text between its name and its `>`) as
+/// (name, value) pairs in order, the values' XML entities decoded. A quoted
+/// value may hold `>`, `/` and the other quote; an unquoted one (not XML,
+/// but some phones' stacks write `read=yes`) runs to the next whitespace,
+/// and a name with no `=` is skipped. Review 4 #27: an unquoted value made
+/// `parse_listing` drop the whole message.
+pub(crate) fn attributes(section: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut rest = section;
+    while let Some(eq) = rest.find('=') {
+        let name = rest[..eq]
+            .trim_end()
+            .rsplit(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("");
+        let after = rest[eq + 1..].trim_start();
+        let (value, tail) = match after.chars().next() {
+            Some(quote @ ('"' | '\'')) => {
+                let body = &after[1..];
+                match body.find(quote) {
+                    Some(close) => (&body[..close], &body[close + 1..]),
+                    None => (body, ""),
+                }
+            }
+            _ => {
+                let end = after.find(char::is_whitespace).unwrap_or(after.len());
+                let value = &after[..end];
+                // `read=yes/>`: the `/` closes the element.
+                let value = if end == after.len() { value.strip_suffix('/').unwrap_or(value) } else { value };
+                (value, &after[end..])
+            }
+        };
+        if !name.is_empty() {
+            pairs.push((name.to_string(), unescape_xml(value)));
+        }
+        rest = tail;
+    }
+    pairs
 }
 
 /// An XML attribute value with its entities decoded: the five named ones
@@ -182,74 +235,13 @@ fn parse_msg_attributes(section: &str) -> Option<MessageEntry> {
     let mut msg_type = None;
     let mut read = None;
 
-    let mut chars = section.char_indices().peekable();
-    while let Some(&(i, c)) = chars.peek() {
-        if c.is_ascii_whitespace() || c == '/' {
-            chars.next();
-            continue;
-        }
-        // Read attribute name up to '='.
-        let name_start = i;
-        let mut name_end = name_start;
-        while let Some(&(j, ch)) = chars.peek() {
-            if ch == '=' || ch.is_ascii_whitespace() {
-                name_end = j;
-                break;
-            }
-            chars.next();
-            name_end = j + ch.len_utf8();
-        }
-        // Skip whitespace + '='.
-        while let Some(&(_, ch)) = chars.peek() {
-            if ch.is_ascii_whitespace() {
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        if let Some(&(_, '=')) = chars.peek() {
-            chars.next();
-        } else {
-            // No '=', skip.
-            continue;
-        }
-        while let Some(&(_, ch)) = chars.peek() {
-            if ch.is_ascii_whitespace() {
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        // Read quoted value.
-        let quote = match chars.peek().copied() {
-            Some((_, q)) if q == '"' || q == '\'' => {
-                chars.next();
-                q
-            }
-            _ => return None,
-        };
-        let value_start = chars.peek().map(|&(j, _)| j).unwrap_or(section.len());
-        let mut value_end = value_start;
-        loop {
-            match chars.next() {
-                Some((j, ch)) if ch == quote => {
-                    value_end = j;
-                    break;
-                }
-                Some((j, ch)) => {
-                    value_end = j + ch.len_utf8();
-                }
-                None => break,
-            }
-        }
-        let name = &section[name_start..name_end];
-        let value = &section[value_start..value_end];
-        match name {
-            "handle" => handle = Some(value.to_string()),
-            "datetime" => datetime = Some(value.to_string()),
-            "sender_name" => sender_name = Some(value.to_string()),
-            "sender_addressing" => sender_addressing = Some(value.to_string()),
-            "type" => msg_type = Some(value.to_string()),
+    for (name, value) in attributes(section) {
+        match name.as_str() {
+            "handle" => handle = Some(value),
+            "datetime" => datetime = Some(value),
+            "sender_name" => sender_name = Some(value),
+            "sender_addressing" => sender_addressing = Some(value),
+            "type" => msg_type = Some(value),
             "read" => read = Some(value.eq_ignore_ascii_case("yes")),
             _ => {}
         }
@@ -314,6 +306,39 @@ mod tests {
         assert_eq!(all[1][1], ("subject".to_string(), "&bogus; &amp".to_string()), "unknown entities stay");
         assert_eq!(unescape_xml("plain"), "plain");
         assert_eq!(unescape_xml("&quot;hi&quot; &apos;"), "\"hi\" '");
+    }
+
+    /// Review 4 #27: a `>` inside a quoted value does not end a listing's
+    /// element, an unquoted value no longer drops the message, and values
+    /// come back unescaped.
+    #[test]
+    fn listing_reads_past_a_quoted_gt_and_takes_unquoted_values() {
+        let xml = br#"<MAP-msg-listing><msg handle="01" subject="a > b" sender_name="Tom &amp; Jo" datetime="20261018T101500+1100" type="SMS_GSM" read="no"/><msg handle=02 type=SMS_GSM read=yes/><msg handle='03' subject='it"s' sender_addressing="+15550001111" read="yes" ></msg></MAP-msg-listing>"#;
+        let entries = parse_listing(xml);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].handle, "01");
+        assert_eq!(entries[0].sender_name.as_deref(), Some("Tom & Jo"));
+        assert_eq!(entries[0].datetime.as_deref(), Some("20261018T101500+1100"), "after the `>` in the subject");
+        assert_eq!(entries[0].msg_type.as_deref(), Some("SMS_GSM"));
+        assert_eq!(entries[0].read, Some(false));
+        assert_eq!(entries[1].handle, "02");
+        assert_eq!(entries[1].msg_type.as_deref(), Some("SMS_GSM"));
+        assert_eq!(entries[1].read, Some(true), "`read=yes/>` is yes");
+        assert_eq!(entries[2].handle, "03");
+        assert_eq!(entries[2].sender_addressing.as_deref(), Some("+15550001111"));
+        let pairs = msg_attribute_pairs(xml);
+        assert_eq!(pairs[1], vec![
+            ("handle".to_string(), "02".to_string()),
+            ("type".to_string(), "SMS_GSM".to_string()),
+            ("read".to_string(), "yes".to_string()),
+        ]);
+        assert_eq!(pairs[2][1], ("subject".to_string(), "it\"s".to_string()));
+        // A quote that never closes: the element ends at the first `>`, as
+        // it always did.
+        let broken = br#"<MAP-msg-listing><msg handle="09" subject="oops></MAP-msg-listing>"#;
+        let entries = parse_listing(broken);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].handle, "09");
     }
 
     const SAMPLE: &str = r#"<?xml version="1.0"?>

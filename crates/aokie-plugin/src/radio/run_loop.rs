@@ -668,7 +668,8 @@ pub(super) fn run_loop(
                         Some(addr) => {
                             auto_connect_attempts += 1;
                             eprintln!(
-                                "[aokie-plugin] auto-connecting to last phone {addr} (attempt {auto_connect_attempts}/{AUTO_CONNECT_MAX_ATTEMPTS})"
+                                "[aokie-plugin] auto-connecting to last phone {} (attempt {auto_connect_attempts}/{AUTO_CONNECT_MAX_ATTEMPTS})",
+                                aokie_dongle::bluetooth::LogAddr(&addr)
                             );
                             match bt.connect(&addr) {
                                 Ok(true) => {

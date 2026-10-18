@@ -627,19 +627,13 @@ pub(super) fn service_controls(
                 body,
             }) => {
                 if let Err(e) = bt.send_sms(message_id.clone(), to.clone(), body, None) {
+                    // It never reached the phone link: failed for certain,
+                    // under its attempt (review 4 #4).
+                    let attempt = status.texts_in_flight.lock().unwrap().remove(&message_id);
                     emit(
                         outbox,
                         sink,
-                        aokie_core::events::aokie_event(
-                            crate::contract::events::SMS_FAILED,
-                            &message_id,
-                            json!({
-                                "messageId": message_id.clone(),
-                                "to": to.clone(),
-                                "reason": e.clone(),
-                                "at": aokie_core::events::now_iso8601(),
-                            }),
-                        ),
+                        sms_failed_event(&message_id, &to, &e, false, attempt.as_deref()),
                     );
                     emit(
                         outbox,

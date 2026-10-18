@@ -728,25 +728,88 @@ impl L2capState {
             }
         }
 
+        // Each frame stands alone (review 4 #14): one that cannot be read or
+        // handled is logged and dropped, and neither the replies already
+        // built nor the frames after it in this packet are lost with it.
         let mut out = Vec::new();
         for frame_bytes in &frame_payloads {
-            let frame = parse_basic_frame(frame_bytes)?;
+            let frame = match parse_basic_frame(frame_bytes) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    eprintln!("[AokieRadio] L2CAP frame dropped ({} bytes): {}", frame_bytes.len(), e);
+                    continue;
+                }
+            };
             if frame.cid == CID_SIGNALING {
-                for command in parse_signaling_commands(frame.payload)? {
-                    for response in self.handle_signaling_command(connection_handle, command) {
-                        out.push(build_acl_packet(
-                            connection_handle,
-                            ACL_PACKET_BOUNDARY_FIRST_NON_FLUSHABLE,
-                            ACL_BROADCAST_POINT_TO_POINT,
-                            &response,
-                        ));
-                    }
+                for response in self.handle_signaling_frame(connection_handle, frame.payload) {
+                    out.push(build_acl_packet(
+                        connection_handle,
+                        ACL_PACKET_BOUNDARY_FIRST_NON_FLUSHABLE,
+                        ACL_BROADCAST_POINT_TO_POINT,
+                        &response,
+                    ));
                 }
             } else {
-                out.extend(self.handle_channel_payload(connection_handle, frame)?);
+                let cid = frame.cid;
+                match self.handle_channel_payload(connection_handle, frame) {
+                    Ok(responses) => out.extend(responses),
+                    Err(e) => eprintln!(
+                        "[AokieRadio] L2CAP cid 0x{:04x}: frame of {} bytes not handled: {}",
+                        cid,
+                        frame_bytes.len().saturating_sub(4),
+                        e
+                    ),
+                }
             }
         }
         Ok(out)
+    }
+
+    /// The replies to one signalling frame's commands, read one at a time.
+    /// A request too short for its code gets a Command Reject (L2CAP §4.1)
+    /// and the commands after it are still read; one whose declared length
+    /// runs past the frame ends the frame (nothing after it can be found),
+    /// with a Command Reject when it is a request. Responses and rejects are
+    /// never answered with a reject.
+    fn handle_signaling_frame(&mut self, connection_handle: u16, payload: &[u8]) -> Vec<Vec<u8>> {
+        let mut replies = Vec::new();
+        let mut offset = 0usize;
+        while offset < payload.len() {
+            let rest = &payload[offset..];
+            let header = match parse_signaling_header(rest) {
+                Ok(header) => header,
+                Err(e) => {
+                    eprintln!("[AokieRadio] L2CAP signalling command dropped: {}", e);
+                    if let &[code, identifier, ..] = rest {
+                        if signaling_code_is_request(code) && identifier != 0 {
+                            replies.push(build_command_reject(
+                                identifier,
+                                COMMAND_REJECT_REASON_COMMAND_NOT_UNDERSTOOD,
+                            ));
+                        }
+                    }
+                    break;
+                }
+            };
+            offset += 4 + header.payload.len();
+            let (code, identifier) = (header.code, header.identifier);
+            match parse_signaling_command(header) {
+                Ok(command) => replies.extend(self.handle_signaling_command(connection_handle, command)),
+                Err(e) => {
+                    eprintln!(
+                        "[AokieRadio] L2CAP signalling code 0x{:02x} ident 0x{:02x} malformed: {}",
+                        code, identifier, e
+                    );
+                    if signaling_code_is_request(code) {
+                        replies.push(build_command_reject(
+                            identifier,
+                            COMMAND_REJECT_REASON_COMMAND_NOT_UNDERSTOOD,
+                        ));
+                    }
+                }
+            }
+        }
+        replies
     }
 
     fn handle_channel_payload(
@@ -1422,6 +1485,12 @@ pub fn parse_signaling_commands(payload: &[u8]) -> Result<Vec<SignalingCommand>,
         offset += command_len;
     }
     Ok(commands)
+}
+
+/// A signalling code that is a request (one the peer waits on an answer
+/// to), as opposed to a response, a Command Reject or an indication.
+fn signaling_code_is_request(code: u8) -> bool {
+    matches!(code, 0x02 | 0x04 | 0x06 | 0x08 | 0x0a | 0x0c | 0x0e | 0x10 | 0x12 | 0x14 | 0x17 | 0x19)
 }
 
 fn parse_signaling_header(payload: &[u8]) -> Result<SignalingHeader<'_>, String> {
@@ -2658,6 +2727,93 @@ mod tests {
         // Default RFCOMM state should NOT have been initialized for
         // an outbound channel — our handler took precedence.
         assert!(state.channel(local_cid).unwrap().rfcomm_state.is_none());
+    }
+
+    /// Review 4 #14: each frame of an ACL packet stands alone. A malformed
+    /// signalling request gets a Command Reject and the frames (and
+    /// commands) around it are still answered; a channel handler's error
+    /// no longer drops the replies built before it or the frames after it.
+    #[test]
+    fn each_frame_and_command_is_handled_on_its_own() {
+        use std::sync::Mutex as StdMutex;
+        let replies_of = |state: &mut L2capState, frames: &[&[u8]]| -> Vec<Vec<SignalingCommand>> {
+            let mut payload = Vec::new();
+            for frame in frames {
+                payload.extend(build_basic_frame(CID_SIGNALING, frame));
+            }
+            let acl = build_acl_packet(0x000b, ACL_PACKET_BOUNDARY_FIRST_NON_FLUSHABLE, 0, &payload);
+            state
+                .handle_acl_packet(&acl)
+                .unwrap()
+                .iter()
+                .map(|reply| {
+                    let acl = parse_acl_frame(reply).unwrap();
+                    parse_signaling_commands(parse_basic_frame(acl.payload).unwrap().payload).unwrap()
+                })
+                .collect()
+        };
+        let info = [SIGNAL_INFORMATION_REQUEST, 0x01, 0x02, 0x00, 0x02, 0x00];
+        // A Connection Request declaring 16 bytes it does not have.
+        let truncated = [SIGNAL_CONNECTION_REQUEST, 0x02, 0x10, 0x00, 0x01];
+        let reject = |identifier| SignalingCommand::Unknown {
+            code: SIGNAL_COMMAND_REJECT,
+            identifier,
+            payload: COMMAND_REJECT_REASON_COMMAND_NOT_UNDERSTOOD.to_le_bytes().to_vec(),
+        };
+        let mut state = L2capState::new();
+        for frames in [[&info[..], &truncated[..]], [&truncated[..], &info[..]]] {
+            let replies = replies_of(&mut state, &frames);
+            assert_eq!(replies.len(), 2, "both frames answered: {replies:?}");
+            assert!(replies.iter().flatten().any(|c| *c == reject(0x02)));
+            assert!(replies
+                .iter()
+                .flatten()
+                .any(|c| matches!(c, SignalingCommand::InformationResponse { identifier: 0x01, .. })));
+        }
+        // In one frame: a Disconnection Request too short for its code is
+        // rejected, and the request after it is still answered.
+        let mut one_frame = vec![SIGNAL_DISCONNECTION_REQUEST, 0x05, 0x02, 0x00, 0x40, 0x00];
+        one_frame.extend_from_slice(&info);
+        let replies = replies_of(&mut state, &[&one_frame]);
+        assert_eq!(replies.iter().flatten().count(), 2);
+        assert!(replies.iter().flatten().any(|c| *c == reject(0x05)));
+        // A malformed response is dropped, never rejected.
+        let short_response = [SIGNAL_CONNECTION_RESPONSE, 0x06, 0x02, 0x00, 0x40, 0x00];
+        assert!(replies_of(&mut state, &[&short_response]).is_empty());
+
+        // A channel whose handler fails on one frame: the frame after it in
+        // the same packet is still handled.
+        let seen: Arc<StdMutex<Vec<Vec<u8>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_for_handler = seen.clone();
+        let handler: PsmHandler = Arc::new(move |_channel, payload| {
+            if payload == [0xff] {
+                return Err("bad frame".to_string());
+            }
+            seen_for_handler.lock().unwrap().push(payload.to_vec());
+            Ok(vec![payload.to_vec()])
+        });
+        let mut state = L2capState::new();
+        let (cid, _) = state.open_outbound_channel_with_handler(0x002a, PSM_RFCOMM, Some(handler));
+        for signal in [
+            &[0x03, 0x80, 0x08, 0x00, 0x70, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00][..],
+            &[0x04, 0x07, 0x04, 0x00, 0x40, 0x00, 0x00, 0x00][..],
+            &[0x05, 0x81, 0x06, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00][..],
+        ] {
+            let acl = build_acl_packet(
+                0x002a,
+                ACL_PACKET_BOUNDARY_FIRST_NON_FLUSHABLE,
+                ACL_BROADCAST_POINT_TO_POINT,
+                &build_basic_frame(CID_SIGNALING, signal),
+            );
+            state.handle_acl_packet(&acl).unwrap();
+        }
+        assert_eq!(state.channel(cid).unwrap().state, ChannelState::Open);
+        let mut payload = build_basic_frame(cid, &[0xff]);
+        payload.extend(build_basic_frame(cid, &[0x01, 0x02]));
+        let acl = build_acl_packet(0x002a, ACL_PACKET_BOUNDARY_FIRST_NON_FLUSHABLE, 0, &payload);
+        let replies = state.handle_acl_packet(&acl).unwrap();
+        assert_eq!(replies.len(), 1, "the good frame's reply");
+        assert_eq!(*seen.lock().unwrap(), vec![vec![0x01, 0x02]]);
     }
 
     #[test]

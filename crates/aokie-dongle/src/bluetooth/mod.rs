@@ -18,6 +18,9 @@ pub use aokie_bluetooth::aokie_radio::runtime::PairingWindow;
 /// Re-exported so the plugin can surface the held SSP numeric comparison in
 /// `phone.status` without a direct aokie-bluetooth dependency (PAIR-001).
 pub use aokie_bluetooth::aokie_radio::runtime::{PairingConfirmSlot, PendingPairingConfirm};
+/// Re-exported so the plugin logs a phone's address as the radio does,
+/// redacted (review 4 #30).
+pub use aokie_bluetooth::aokie_radio::LogAddr;
 
 use serde::{Deserialize, Serialize};
 
@@ -106,6 +109,11 @@ pub enum BluetoothEvent {
         message_id: String,
         recipient_phone: String,
         reason: String,
+        /// The phone may have the text all the same: a PUT of it went out
+        /// and its answer was lost (review 4 #3). It is not sent again
+        /// under its id; a failure without it never reached the phone.
+        #[serde(default)]
+        outcome_unknown: bool,
     },
     /// PAIR-001: SSP numeric comparison held for the operator — both the
     /// phone and the Desktop UI show `numeric_value`; the operator answers
@@ -526,10 +534,12 @@ fn bluetooth_event_from_runtime(
             message_id,
             recipient_phone,
             reason,
+            outcome_unknown,
         } => BluetoothEvent::SmsSendFailed {
             message_id,
             recipient_phone,
             reason,
+            outcome_unknown,
         },
         RuntimeEvent::PairingConfirmRequired {
             address,

@@ -26,7 +26,7 @@
 use super::obex::{
     self, build_connect_request, build_disconnect, build_get_continuation, build_get_request,
     build_put_request, build_setpath, BodyAssembler, Header, Packet, HDR_CONNECTION_ID, HDR_SRM,
-    RSP_CONTINUE, RSP_OK,
+    MESSAGE_BODY_LIMIT, RSP_CONTINUE, RSP_OK,
 };
 
 /// MAS service UUID (MAP §3.2.1). Big-endian on the wire. Spec value:
@@ -236,7 +236,7 @@ impl MasMceSession {
             operation,
             mas_instance_id,
             connection_id: None,
-            body: BodyAssembler::new(),
+            body: BodyAssembler::with_limit(MESSAGE_BODY_LIMIT),
             output: OperationOutput::Pending,
             keep_alive: false,
             current_folder: Vec::new(),
@@ -484,7 +484,7 @@ impl MasMceSession {
         // GET response of every operation, so the previous op's flag
         // must NOT carry over (otherwise the next GET silently skips
         // its required continuation).
-        self.body = BodyAssembler::new();
+        self.body = BodyAssembler::with_limit(MESSAGE_BODY_LIMIT);
         self.output = OperationOutput::Pending;
         self.operation = operation;
         self.srm_active = false;

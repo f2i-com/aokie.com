@@ -14,5 +14,10 @@ serde_json.workspace = true
 sha2 = "0.10"
 uuid.workspace = true
 
+# The steady clock protocol time is held against (src/clock.rs): the boot
+# clock on Linux and Android, CLOCK_MONOTONIC on Apple's systems.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 jsonschema = "0.30"

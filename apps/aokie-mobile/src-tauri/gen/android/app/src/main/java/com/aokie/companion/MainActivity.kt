@@ -224,6 +224,13 @@ class MainActivity : TauriActivity() {
   fun deleteAokieSecureValue(key: String): Int =
     if (runCatching { AokieSecureStore.delete(this, key) }.getOrDefault(false)) 1 else -1
 
+  /**
+   * The server-clock offset native code checks protocol times with, kept with when it came for the pushes that
+   * wake this app before Rust runs (see [AokieServerClock]). Not a secret, and never a WebView value.
+   */
+  fun recordAokieServerClock(offsetSeconds: Long): Int =
+    if (runCatching { AokieServerClock.record(this, offsetSeconds) }.getOrDefault(false)) 1 else -1
+
   fun aokieSecureStoreAvailable(): Int =
     if (runCatching { AokieSecureStore.isAvailable(this) }.getOrDefault(false)) 1 else -1
 

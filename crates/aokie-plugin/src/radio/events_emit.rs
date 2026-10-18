@@ -25,6 +25,59 @@ pub(super) fn emit(outbox: OutboxRef<'_>, sink: &mut dyn Sink, event: DesktopEve
     }
 }
 
+/// The `aokie.sms.failed` the radio owes a text it handed to the phone link
+/// (review 4 #4). A failure in doubt (`outcome_unknown`: the phone may have
+/// sent it) is keyed by the text alone, `aokie:<messageId>:sms.failed:v1`,
+/// as a sent is: it is the text's one outcome, and a retry under its id is
+/// answered with it, not sent. A definite one (the text never reached the
+/// phone, or the phone refused it) is keyed by its attempt
+/// ([`RadioStatus::texts_in_flight`]; a fresh occurrence when it has none),
+/// so the text may be sent again under its id, and that try fail again.
+pub(crate) fn sms_failed_event(
+    message_id: &str,
+    to: &str,
+    reason: &str,
+    outcome_unknown: bool,
+    attempt: Option<&str>,
+) -> DesktopEvent {
+    let mut data = json!({
+        "messageId": message_id,
+        "to": to,
+        "reason": reason,
+        "at": aokie_core::events::now_iso8601(),
+    });
+    if outcome_unknown {
+        data["outcomeUnknown"] = json!(true);
+        return aokie_core::events::aokie_event(crate::contract::events::SMS_FAILED, message_id, data);
+    }
+    let fresh;
+    let occurrence = match attempt {
+        Some(attempt) => attempt,
+        None => {
+            fresh = aokie_core::events::occurrence_id();
+            fresh.as_str()
+        }
+    };
+    aokie_core::events::aokie_event_occurrence(
+        crate::contract::events::SMS_FAILED,
+        message_id,
+        occurrence,
+        data,
+    )
+}
+
+/// The key of the definite `aokie.sms.failed` of one attempt of a text
+/// ([`sms_failed_event`]).
+pub(crate) fn sms_attempt_failed_key(message_id: &str, attempt: &str) -> String {
+    aokie_core::events::aokie_idempotency_key(
+        message_id,
+        &format!(
+            "{}.{attempt}",
+            aokie_core::events::step_for_event_name(crate::contract::events::SMS_FAILED)
+        ),
+    )
+}
+
 /// Emit an `aokie.call.turn.final` transcript turn, matching the contract the
 /// Receptionist pack's app-logic + flow bindings expect: `{callId, turn,
 /// speaker, text}` with a per-turn-unique idempotency key (`turn.<n>.final`) so

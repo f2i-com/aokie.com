@@ -112,6 +112,8 @@ use self::event_handler::*;
 use self::events_drain::*;
 #[allow(unused_imports)]
 use self::events_emit::*;
+// A text's failure, as the radio and the connector's sweep both key it.
+pub(crate) use self::events_emit::{sms_attempt_failed_key, sms_failed_event};
 #[allow(unused_imports)]
 use self::greet::*;
 #[allow(unused_imports)]
