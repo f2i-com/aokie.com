@@ -123,7 +123,7 @@ function DesktopHeader() {
   return (
     <header className="desktop-header">
       <div className="brand-lockup"><AokieMark /><div><strong>Aokie Companion</strong><span className="demo-badge">DEMO PROTOTYPE</span></div></div>
-      <div className="desktop-user"><span className="secure-channel"><ShieldCheck size={15} /> Secure demo channel</span><span className="online-dot" /><span className="user-avatar">LB</span></div>
+      <div className="desktop-user"><span className="secure-channel"><ShieldCheck size={15} /> Secure demo channel</span><span className="online-dot" /><span className="user-avatar">ST</span></div>
     </header>
   );
 }
