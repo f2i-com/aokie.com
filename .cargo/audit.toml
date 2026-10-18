@@ -4,6 +4,14 @@
 # rustls 0.21 / rustls-webpki 0.101.7 stack, so the three RUSTSEC ignores that
 # lived here (2026-0098/-0099/-0104) are GONE — every advisory fails CI again.
 [advisories]
-ignore = []
+# zip 0.6.6 (RUSTSEC-2026-0367 SUID/SGID bits kept, -0368 symlinks out of the
+# destination, -0369 permissions applied through symlinks), 2026-10-19: every one
+# is about extracting an archive someone hostile made. zip comes in only as a
+# build dependency of webrtc-sys-build 0.3.19 (libwebrtc → webrtc-sys; 0.3.19 is
+# the newest, still on zip 0.6), which unpacks LiveKit's own prebuilt WebRTC
+# from its GitHub release over HTTPS into the build's out dir. Nothing of zip is
+# in a shipped program, and no archive from outside reaches it. Drop these when
+# webrtc-sys-build moves to a fixed zip.
+ignore = ["RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369"]
 # Unmaintained crates (backoff, instant, paste, rustls-pemfile) surface as
 # non-failing warnings — left visible so they are not forgotten.

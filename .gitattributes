@@ -7,3 +7,7 @@
 *.rs text eol=lf
 # The stand-in dongle runs inside Linux containers too.
 *.py text eol=lf
+# The Companion's Android sources: tests read them with include_str! and match lines across "\n".
+*.kt text eol=lf
+*.kts text eol=lf
+*.pro text eol=lf
