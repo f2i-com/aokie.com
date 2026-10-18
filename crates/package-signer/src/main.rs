@@ -279,7 +279,7 @@ fn main() {
 
 fn keygen() -> Result<(), String> {
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).map_err(|e| e.to_string())?;
+    getrandom::fill(&mut seed).map_err(|e| e.to_string())?;
     let key = SigningKey::from_bytes(&seed);
     println!("private seed (hex, SECRET — CI secret / operator key file):");
     println!("{}", hex_encode(&seed));

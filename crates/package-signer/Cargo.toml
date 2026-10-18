@@ -7,8 +7,8 @@ description = "First-party Ed25519 package-manifest signing for Aokie release bu
 
 [dependencies]
 ed25519-dalek = { version = "2", features = ["signature", "rand_core"] }
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-getrandom = "0.2"
+getrandom = "0.4"

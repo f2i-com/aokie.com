@@ -44,7 +44,7 @@ chrono = { workspace = true }
 # verify key arrives via the parent process env; grants that don't verify
 # never satisfy the consent gate).
 ed25519-dalek = { version = "2", features = ["signature"] }
-base64 = "0.22"
+base64 = "0.23"
 regex = "1"
 # Same major as the legacy app (aokie-desktop pins 0.31) so the two
 # don't fight over bundled-SQLite versions when built side by side.
