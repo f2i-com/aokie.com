@@ -928,6 +928,11 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   overflow-wrap: anywhere;
 }
 
+/* What callers hear first, under the greeting box: the words in the page's text colour, their labels as a hint's. */
+.rcp-greeting-said { color: var(--text); font-size: 12.5px; }
+.rcp-said-label { display: inline-block; min-width: 11.5em; color: var(--faint); }
+.rcp-said-note { display: block; color: var(--faint); font-size: 11.5px; }
+
 /* A hint belongs to the control above it: closer than the card's gap. */
 .rcp-card > .rcp-field + .rcp-hint,
 .rcp-card > .rcp-check + .rcp-hint,

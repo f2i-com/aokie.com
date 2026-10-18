@@ -533,20 +533,75 @@
     );
   }
 
+  /** What the receptionist says when no greeting is set: the plugin's own (radio/prompts.rs DEFAULT_GREETING, which
+   *  scripts/check-receptionist-ui.mjs holds this to). A blank greeting means this one, never silence. */
+  var DEFAULT_GREETING = 'Hello, thanks for calling. How can I help you today?';
+
+  /** The first word of a name, without the punctuation around it. */
+  function firstName(name) {
+    return (String(name).trim().split(/\s+/)[0] || '').replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  }
+
+  /** `text` without a leading `word` (in any case) when it starts with it as a whole word: [the word as written, the rest]. */
+  function stripWord(text, word) {
+    var head = text.slice(0, word.length);
+    var rest = text.slice(word.length);
+    return head.toLowerCase() === word.toLowerCase() && !/[\p{L}\p{N}]/u.test(rest.charAt(0)) ? [head, rest] : null;
+  }
+
+  /**
+   * The greeting said to a caller OAIY knows (a name in its Contacts, or the one their phone shows), by first name: kept
+   * as it is when it has the name, the name put after a "Hi" or "Hello" it starts with, or else "Hi Sam! " before it.
+   * OAIY Desktop's own rule (voice::callers::personal_greeting, which greets calls that go to OAIY), said here as it is.
+   */
+  function personalGreeting(greeting, name) {
+    var first = firstName(name);
+    var hasName = String(greeting).split(/[^\p{L}\p{N}]+/u).some(function (w) { return w.toLowerCase() === first.toLowerCase(); });
+    if (!first || !String(greeting).trim() || hasName) return greeting;
+    var text = String(greeting).replace(/^\s+/, '');
+    var hellos = ['hi', 'hello', 'hey', "g'day", 'g\u2019day'];
+    for (var i = 0; i < hellos.length; i++) {
+      var found = stripWord(text, hellos[i]);
+      if (found) {
+        // "Hi there!" is "Hi Sam!", not "Hi Sam there!".
+        var there = found[1].charAt(0) === ' ' ? stripWord(found[1].slice(1), 'there') : null;
+        return found[0] + ' ' + first + (there ? there[1] : found[1]);
+      }
+    }
+    return 'Hi ' + first + '! ' + text;
+  }
+
+  /** What callers hear first, as the greeting box reads now: a new caller, and (calls that go to OAIY) one it knows. */
+  function greetingSaidHtml(route) {
+    var said = String(settings.greeting || '').trim() || DEFAULT_GREETING;
+    return (
+      '<span class="rcp-said-label">New callers hear</span> &ldquo;' + esc(said) + '&rdquo;' +
+      (route === 'oaiy'
+        ? '<br><span class="rcp-said-label">Callers OAIY knows hear</span> &ldquo;' + esc(personalGreeting(said, 'Sam')) + '&rdquo;' +
+          '<span class="rcp-said-note">By first name: the one in OAIY&rsquo;s Contacts, or the one their phone shows.</span>'
+        : '')
+    );
+  }
+
+  /** The route the form was drawn for, for the greeting's lines as it is typed. */
+  var greetingRoute = null;
+
   /** The greeting and the brief Aokie sends with each call. */
   function greetingHtml(route) {
+    greetingRoute = route;
     return section(
       'Greeting &amp; brief',
       field(
         'Greeting (spoken first)',
-        '<input type="text" data-key="greeting" placeholder="Thanks for calling! How can I help you today?" value="' +
+        '<input type="text" data-key="greeting" maxlength="1000" placeholder="' + esc(DEFAULT_GREETING) + '" value="' +
           esc(settings.greeting) + '" />'
       ) +
         hint(
           route === 'oaiy'
-            ? 'Spoken first, as soon as the call connects, in the voice chosen in OAIY. Blank = a friendly built-in default.'
-            : 'Spoken first, as soon as the call connects. Blank = a friendly built-in default.'
+            ? 'Spoken first, as soon as the call connects, in the voice chosen in OAIY. Blank = the built-in greeting shown in the box.'
+            : 'Spoken first, as soon as the call connects. Blank = the built-in greeting shown in the box.'
         ) +
+        '<p class="rcp-hint rcp-greeting-said" id="set-greeting-said" aria-live="polite">' + greetingSaidHtml(route) + '</p>' +
         field(
           'Receptionist brief',
           '<textarea rows="6" data-key="persona" placeholder="e.g. We are a small hair salon. Cuts take 45 minutes.">' +
@@ -724,6 +779,11 @@
     var key = t.getAttribute('data-key');
     if (key != null) {
       settings[key] = t.value;
+      // (the greeting's lines follow the box as it is typed)
+      if (key === 'greeting' && root) {
+        var said = root.querySelector('#set-greeting-said');
+        if (said) said.innerHTML = greetingSaidHtml(greetingRoute);
+      }
       return;
     }
     var num = t.getAttribute('data-num');

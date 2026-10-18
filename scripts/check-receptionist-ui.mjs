@@ -194,7 +194,7 @@ assert.equal(element('settings-title').textContent, 'Calls do not go to OAIY');
 
 const settingsSource = await readFile(new URL('tabs/settings.js', base), 'utf8');
 vm.runInContext(settingsSource.replace(/\}\)\(\);\s*$/, `
-  window.testSettings = { settingsPatch, withAokieDefaults };
+  window.testSettings = { settingsPatch, withAokieDefaults, personalGreeting, DEFAULT_GREETING };
 })();`), context);
 const settings = window.testSettings;
 // Keys the form no longer shows keep their saved values: an edit to the
@@ -203,6 +203,21 @@ const saved = settings.withAokieDefaults({ ...oaiyBag, aiModel: 'old-model', tts
 assert.equal(saved.agentHangup, true);
 assert.equal(settings.withAokieDefaults({}).agentHangup, false);
 assert.equal(JSON.stringify(settings.settingsPatch(saved, { ...saved, greeting: 'Hello' })), JSON.stringify({ greeting: 'Hello' }));
+// The greeting box's built-in greeting is the one the plugin says (radio/prompts.rs), and a caller OAIY knows is greeted
+// by first name as OAIY Desktop greets them (its voice::callers::personal_greeting tests, the same cases).
+const prompts = await readFile(new URL('../crates/aokie-plugin/src/radio/prompts.rs', import.meta.url), 'utf8');
+assert.ok(prompts.includes(`pub const DEFAULT_GREETING: &str = "${settings.DEFAULT_GREETING}";`), 'the box shows the plugin\'s own greeting');
+for (const [greeting, name, said] of [
+  ['Hi! Thanks for calling', 'Liam Smith', 'Hi Liam! Thanks for calling'],
+  ['Hello, thanks for calling', 'Liam', 'Hello Liam, thanks for calling'],
+  ['hey there, how can I help?', 'Liam', 'hey Liam, how can I help?'],
+  ["G'day! OAIY here.", 'Liam', "G'day Liam! OAIY here."],
+  ['Thanks for calling OAIY.', 'Liam', 'Hi Liam! Thanks for calling OAIY.'],
+  ['Hiya, OAIY here.', 'Liam', 'Hi Liam! Hiya, OAIY here.'],
+  ['Hi Liam, thanks for calling', 'Liam Smith', 'Hi Liam, thanks for calling'],
+  ['Hi! Thanks for calling', '', 'Hi! Thanks for calling'],
+  [settings.DEFAULT_GREETING, 'Zoë', 'Hello Zoë, thanks for calling. How can I help you today?'],
+]) assert.equal(settings.personalGreeting(greeting, name), said, greeting);
 const phoneSource = await readFile(new URL('tabs/phone.js', base), 'utf8');
 vm.runInContext(phoneSource.replace(/\}\)\(\);\s*$/, `
   window.testPhone = { refreshAll, pairingCardBody, bondedCardBody };
