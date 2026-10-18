@@ -54,6 +54,10 @@ pub const DEAD_RETENTION_DAYS: i64 = 14;
 // macOS seals with a key held in the user's login Keychain
 // (`aokie_core::dpapi`'s macOS half), stored as "keychain1:<base64>", under
 // the same rules: a Keychain that will not give the key quarantines the event.
+// A quarantine at write is not for good while the process runs: the event is
+// held in memory (never on disk) and sealed again once the key is given (a
+// prompt answered late, a Keychain unlocked after login), when its row is
+// filled in and delivered as any other ([`HELD_SEALS`]).
 // Linux builds have no OS payload protection: file-backed outboxes
 // refuse sensitive writes unless `AOKIE_ALLOW_UNPROTECTED_OUTBOX=1` makes
 // the dev trade-off EXPLICIT; in-memory (test) outboxes use dev plaintext.
@@ -63,6 +67,36 @@ const DPAPI_PREFIX: &str = "dpapi1:";
 /// (AOK-DUR-001 quarantine): the row keeps its non-sensitive metadata for
 /// repair, but there is deliberately nothing to emit or redrive.
 const QUARANTINED_PAYLOAD: &str = "quarantined:";
+
+/// An event whose payload could not be sealed when it was written: its
+/// quarantine row is in the file, and the event itself is here, in this
+/// process's memory only, until a seal works.
+struct HeldSeal {
+    /// Which outbox file (or in-memory outbox) the row is in.
+    store: String,
+    event: DesktopEvent,
+    target: String,
+}
+
+/// The events waiting for a seal, for every connection of this process: the
+/// radio's connection writes most of them and the replay thread's, which
+/// reads every second, is the one that finds the key back. Lost if the
+/// process ends first: the quarantine row then stays dead, as it says.
+static HELD_SEALS: std::sync::Mutex<Vec<HeldSeal>> = std::sync::Mutex::new(Vec::new());
+
+/// At most this many events wait for a seal; one past it stays quarantined.
+const MAX_HELD_SEALS: usize = 1000;
+
+/// How often a read asks again for the seal of what is held (a write whose
+/// own seal worked seals them at once).
+const RESEAL_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Names each in-memory outbox (tests), whose held events are its own.
+static MEMORY_STORES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn held_seals() -> std::sync::MutexGuard<'static, Vec<HeldSeal>> {
+    HELD_SEALS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// How this outbox seals payloads at rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,7 +366,8 @@ pub enum InsertOutcome {
     /// AOK-DUR-001: payload protection failed (or is unavailable), so the
     /// event was QUARANTINED — a typed dead row with metadata but NO payload
     /// was written instead of plaintext. The caller must not emit the event
-    /// as though it were durably stored.
+    /// as though it were durably stored. The event is held in memory and its
+    /// row filled in once a seal works, while this process runs.
     QuarantinedProtectFailed,
 }
 
@@ -453,6 +488,21 @@ pub struct Outbox {
     /// While the sealing key could not be had: when to ask again, and how
     /// many times it has failed (see `open_payloads`).
     key_wait: std::cell::Cell<Option<(std::time::Instant, u32)>>,
+    /// Which file this is (its full path), or `memory:<n>`: the key of the
+    /// events it holds for a seal ([`HELD_SEALS`]).
+    store: String,
+    /// When a read last asked for the seal of what is held.
+    resealed_at: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+impl Drop for Outbox {
+    fn drop(&mut self) {
+        // An in-memory outbox's rows go with it, so do the events it held. A file's stay for its other
+        // connections (the replay thread's, the next radio's).
+        if self.store.starts_with("memory:") {
+            held_seals().retain(|held| held.store != self.store);
+        }
+    }
 }
 
 impl Outbox {
@@ -471,7 +521,11 @@ impl Outbox {
         // recent commits on power loss. The outbox writes a handful of rows
         // per call; the extra fsync is noise here.
         conn.execute_batch("PRAGMA synchronous=FULL;")?;
-        let outbox = Self::with_connection(conn, platform_protection())?;
+        let store = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let outbox = Self::with_connection(conn, platform_protection(), store)?;
         outbox.migrate_legacy_plaintext();
         Ok(outbox)
     }
@@ -499,7 +553,7 @@ impl Outbox {
         } else {
             PayloadProtection::DevPlaintext
         };
-        Self::with_connection(Connection::open_in_memory()?, mode)
+        Self::with_connection(Connection::open_in_memory()?, mode, Self::memory_store())
     }
 
     /// TEST-ONLY: an in-memory outbox with an explicit protection mode, so
@@ -508,10 +562,25 @@ impl Outbox {
     pub(crate) fn open_in_memory_with_protection(
         mode: PayloadProtection,
     ) -> rusqlite::Result<Self> {
-        Self::with_connection(Connection::open_in_memory()?, mode)
+        Self::with_connection(Connection::open_in_memory()?, mode, Self::memory_store())
     }
 
-    fn with_connection(conn: Connection, protection: PayloadProtection) -> rusqlite::Result<Self> {
+    /// TEST-ONLY: seal (or fail to) from here on as `mode` does: the key coming back, or going.
+    #[cfg(test)]
+    pub(crate) fn set_protection_for_tests(&mut self, mode: PayloadProtection) {
+        self.protection = mode;
+    }
+
+    fn memory_store() -> String {
+        let n = MEMORY_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("memory:{n}")
+    }
+
+    fn with_connection(
+        conn: Connection,
+        protection: PayloadProtection,
+        store: String,
+    ) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS aokie_outbox (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -563,6 +632,8 @@ impl Outbox {
             conn,
             protection,
             key_wait: std::cell::Cell::new(None),
+            store,
+            resealed_at: std::cell::Cell::new(None),
         })
     }
 
@@ -717,12 +788,19 @@ impl Outbox {
         // AOK-DUR-001: a protect failure must never fall back to plaintext.
         // The event is QUARANTINED instead: a typed dead row retaining the
         // non-sensitive metadata (name, correlation, key, timestamps) with a
-        // marker payload — visible in diagnostics, never emitted or redriven.
-        let (payload, status, last_error) = match protect_payload(self.protection, &plain) {
+        // marker payload — visible in diagnostics, never emitted or redriven
+        // as it is. The event itself is held in memory and sealed again once
+        // the key is given (`reseal_held`), when the row is filled in.
+        let sealed = protect_payload(self.protection, &plain);
+        if sealed.is_ok() {
+            // The key is here: what waited for it goes in first.
+            self.reseal_held();
+        }
+        let (payload, status, last_error) = match sealed {
             Ok(sealed) => (sealed, "pending", None::<String>),
             Err(e) => {
                 eprintln!(
-                    "[aokie-plugin] OUTBOX QUARANTINE: payload protection failed for {} ({e}) — event held without payload, NOT emitted",
+                    "[aokie-plugin] OUTBOX QUARANTINE: payload protection failed for {} ({e}) — event held in memory without a payload on disk, sealed again once the key is given",
                     event.idempotency_key
                 );
                 (
@@ -752,24 +830,39 @@ impl Outbox {
         if inserted == 1 {
             return Ok(if status == "dead" {
                 self.bump_meta_counter("protect_failures")?;
+                self.hold_for_seal(event, target);
                 InsertOutcome::QuarantinedProtectFailed
             } else {
                 InsertOutcome::Inserted
             });
         }
-        let existing: Option<String> = self
+        let existing: Option<(Option<String>, String)> = self
             .conn
             .query_row(
-                "SELECT payload_hash FROM aokie_outbox WHERE idempotency_key = ?1",
+                "SELECT payload_hash, payload_json FROM aokie_outbox WHERE idempotency_key = ?1",
                 params![event.idempotency_key],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?
-            .flatten();
-        match existing {
+            .optional()?;
+        let quarantined = existing
+            .as_ref()
+            .is_some_and(|(_, stored)| stored.starts_with(QUARANTINED_PAYLOAD));
+        match existing.and_then(|(h, _)| h) {
             // Legacy row (pre-v3, no fingerprint): no comparison possible —
             // treat as the harmless duplicate it almost certainly is.
             None => Ok(InsertOutcome::Duplicate),
+            // The same event again over its own quarantine row (a caller
+            // retrying it): filled in now if this seal worked, else still
+            // quarantined. Never a duplicate of a row with nothing behind it.
+            Some(h) if h == hash && quarantined => {
+                if status == "pending" && self.fill_quarantined(&event.idempotency_key, &payload)? == 1 {
+                    self.forget_held(&event.idempotency_key);
+                    Ok(InsertOutcome::Inserted)
+                } else {
+                    self.hold_for_seal(event, target);
+                    Ok(InsertOutcome::QuarantinedProtectFailed)
+                }
+            }
             Some(h) if h == hash => Ok(InsertOutcome::Duplicate),
             Some(_) => {
                 self.bump_meta_counter("payload_collisions")?;
@@ -781,6 +874,141 @@ impl Outbox {
                 Ok(InsertOutcome::PayloadCollision)
             }
         }
+    }
+
+    /// Whether a payload can be sealed now. On a Mac or Linux this asks the
+    /// Keychain (or Secret Service) for the key, and may wait on its prompt.
+    pub fn can_seal(&self) -> bool {
+        protect_payload(self.protection, "").is_ok()
+    }
+
+    /// Whether a seal here may wait on a person: the Keychain's (or Secret
+    /// Service's) prompt, up to 15 s. DPAPI answers at once.
+    pub fn seal_may_wait(&self) -> bool {
+        self.protection == PayloadProtection::Keychain
+    }
+
+    /// Keep `event` for a seal later (its quarantine row is written).
+    fn hold_for_seal(&self, event: &DesktopEvent, target: &str) {
+        let mut held = held_seals();
+        if let Some(slot) = held
+            .iter_mut()
+            .find(|h| h.store == self.store && h.event.idempotency_key == event.idempotency_key)
+        {
+            slot.event = event.clone();
+            return;
+        }
+        if held.len() >= MAX_HELD_SEALS {
+            eprintln!(
+                "[aokie-plugin] OUTBOX QUARANTINE: {} events already wait for a seal; {} stays quarantined",
+                held.len(),
+                event.idempotency_key
+            );
+            return;
+        }
+        held.push(HeldSeal {
+            store: self.store.clone(),
+            event: event.clone(),
+            target: target.to_string(),
+        });
+    }
+
+    fn forget_held(&self, idempotency_key: &str) {
+        held_seals().retain(|h| !(h.store == self.store && h.event.idempotency_key == idempotency_key));
+    }
+
+    /// Put a sealed payload into an event's quarantine row, which then waits
+    /// for delivery as any new row does. Rows changed: 0 when the row is gone
+    /// (pruned) or no longer a quarantine marker.
+    fn fill_quarantined(&self, idempotency_key: &str, sealed: &str) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE aokie_outbox
+                SET payload_json = ?2, status = 'pending', attempts = 0, next_attempt_at = NULL,
+                    last_error = NULL, updated_at = ?3
+              WHERE idempotency_key = ?1 AND status = 'dead' AND payload_json LIKE 'quarantined:%'",
+            params![idempotency_key, sealed, now_iso8601()],
+        )
+    }
+
+    /// Seal what this file's connections held for a seal, oldest first, and
+    /// fill in their rows; stop at the first seal that fails (the key is not
+    /// here yet) and keep the rest.
+    fn reseal_held(&self) {
+        let mine: Vec<HeldSeal> = {
+            let mut held = held_seals();
+            if !held.iter().any(|h| h.store == self.store) {
+                return;
+            }
+            let (mine, others) = std::mem::take(&mut *held)
+                .into_iter()
+                .partition(|h| h.store == self.store);
+            *held = others;
+            mine
+        };
+        let mut waiting = Vec::new();
+        let mut sealing = true;
+        for held in mine {
+            if !sealing {
+                waiting.push(held);
+                continue;
+            }
+            let plain = serde_json::to_string(&held.event).expect("DesktopEvent serialises");
+            let Ok(sealed) = protect_payload(self.protection, &plain) else {
+                sealing = false;
+                waiting.push(held);
+                continue;
+            };
+            let key = &held.event.idempotency_key;
+            let filled = self.fill_quarantined(key, &sealed).and_then(|n| {
+                if n == 1 {
+                    return Ok(1);
+                }
+                // (its row was pruned meanwhile: the event goes in as new, unless another row now holds its key)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO aokie_outbox
+                        (event_name, correlation_id, idempotency_key, target,
+                         payload_json, payload_hash, status, attempts, last_error, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, NULL, ?7, ?7)",
+                    params![
+                        held.event.name,
+                        held.event.correlation_id,
+                        key,
+                        held.target,
+                        sealed,
+                        Self::payload_fingerprint(&held.event),
+                        now_iso8601()
+                    ],
+                )
+            });
+            match filled {
+                Ok(_) => eprintln!(
+                    "[aokie-plugin] outbox: {key} was sealed once the key was given; it is delivered as any other event"
+                ),
+                Err(e) => {
+                    eprintln!("[aokie-plugin] outbox: {key} was sealed, but its row was not written ({e}); held again");
+                    waiting.push(held);
+                }
+            }
+        }
+        if !waiting.is_empty() {
+            let mut held = held_seals();
+            waiting.append(&mut held);
+            *held = waiting;
+        }
+    }
+
+    /// [`reseal_held`](Self::reseal_held) from a read, at most every
+    /// [`RESEAL_EVERY`] and not while the key is known to be away.
+    fn reseal_held_now_and_then(&self) {
+        let now = std::time::Instant::now();
+        if self.key_wait.get().is_some_and(|(until, _)| now < until)
+            || self.resealed_at.get().is_some_and(|at| now < at + RESEAL_EVERY)
+            || !held_seals().iter().any(|h| h.store == self.store)
+        {
+            return;
+        }
+        self.resealed_at.set(Some(now));
+        self.reseal_held();
     }
 
     /// The host durably acknowledged this event. `sent` is terminal, and so is
@@ -1013,6 +1241,7 @@ impl Outbox {
     /// oldest first. `dead` rows are excluded — they need operator
     /// attention, not another timer.
     pub fn retryable(&self, limit: u32) -> rusqlite::Result<Vec<OutboxRow>> {
+        self.reseal_held_now_and_then();
         let raw = self.fetch_raw(
             "SELECT id, event_name, correlation_id, idempotency_key, target,
                     payload_json, status, attempts, last_error, created_at, updated_at
@@ -1029,6 +1258,7 @@ impl Outbox {
     /// `failed`, whose `next_attempt_at` is unset (never emitted) or in the
     /// past. Oldest first. `sent`/`dead` rows never re-emit.
     pub fn due_for_retry(&self, limit: u32) -> rusqlite::Result<Vec<OutboxRow>> {
+        self.reseal_held_now_and_then();
         let now = now_iso8601();
         let raw = self.fetch_raw(
             "SELECT id, event_name, correlation_id, idempotency_key, target,
@@ -1565,6 +1795,77 @@ mod tests {
             .unwrap();
         assert!(ok.due_for_retry(10).unwrap().is_empty());
         assert_eq!(ok.status_of("k2").unwrap(), Some(OutboxStatus::Dead));
+    }
+
+    /// A seal that failed at write (the Keychain's prompt not answered yet) is
+    /// not a quarantine for good: the event waits in memory, a retry of it is
+    /// not taken for a delivered duplicate, and once the key is given its row
+    /// is filled in and delivered. Nothing of it is on disk before then.
+    #[test]
+    fn a_seal_that_failed_at_write_is_made_again_once_the_key_is_given() {
+        let mut ob = Outbox::open_in_memory_with_protection(PayloadProtection::Unavailable).unwrap();
+        let mut ev = event("call_late_key", "aokie.call.turn.final");
+        ev.data = json!({"text": "SECRET-HELD-BODY"});
+        assert_eq!(
+            ob.insert_pending(&ev, TARGET_DESKTOP).unwrap(),
+            InsertOutcome::QuarantinedProtectFailed
+        );
+        // The caller's retry while the key is still away: still quarantined, never a duplicate.
+        assert_eq!(
+            ob.insert_pending(&ev, TARGET_DESKTOP).unwrap(),
+            InsertOutcome::QuarantinedProtectFailed
+        );
+        assert!(ob.due_for_retry(10).unwrap().is_empty());
+        let raw: String = ob
+            .conn
+            .query_row("SELECT payload_json FROM aokie_outbox", [], |r| r.get(0))
+            .unwrap();
+        assert!(!raw.contains("SECRET-HELD-BODY"));
+
+        // The key is given: the next read seals it from memory.
+        ob.set_protection_for_tests(PayloadProtection::DevPlaintext);
+        ob.resealed_at.set(None);
+        let rows = ob.due_for_retry(10).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].payload_json.contains("SECRET-HELD-BODY"));
+        assert_eq!(ob.status_of(&ev.idempotency_key).unwrap(), Some(OutboxStatus::Pending));
+        assert!(!held_seals().iter().any(|h| h.store == ob.store), "no longer held");
+        // The caller's own retry now is the duplicate it is.
+        assert_eq!(ob.insert_pending(&ev, TARGET_DESKTOP).unwrap(), InsertOutcome::Duplicate);
+
+        // A write whose own seal works seals what waited first, on the spot.
+        ob.set_protection_for_tests(PayloadProtection::Unavailable);
+        let waiting = event("call_waiting", "aokie.call.turn.final");
+        assert_eq!(
+            ob.insert_pending(&waiting, TARGET_DESKTOP).unwrap(),
+            InsertOutcome::QuarantinedProtectFailed
+        );
+        ob.set_protection_for_tests(PayloadProtection::DevPlaintext);
+        assert_eq!(
+            ob.insert_pending(&event("call_next", "aokie.call.turn.final"), TARGET_DESKTOP).unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(ob.status_of(&waiting.idempotency_key).unwrap(), Some(OutboxStatus::Pending));
+    }
+
+    /// The event one connection could not seal (the radio's) is sealed by
+    /// another to the same file (the replay thread's), which reads every second.
+    #[test]
+    fn another_connection_to_the_file_seals_what_one_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.sqlite");
+        let mut radio = Outbox::open(&path).unwrap();
+        radio.set_protection_for_tests(PayloadProtection::Unavailable);
+        let replay = Outbox::open(&path).unwrap();
+        let ev = event("call_two_connections", "aokie.call.ended");
+        assert_eq!(
+            radio.insert_pending(&ev, TARGET_DESKTOP).unwrap(),
+            InsertOutcome::QuarantinedProtectFailed
+        );
+        drop(radio);
+        let rows = replay.due_for_retry(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].idempotency_key, ev.idempotency_key);
     }
 
     /// A file that is not a database is set aside and a fresh outbox opens.

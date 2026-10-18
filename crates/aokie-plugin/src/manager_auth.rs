@@ -42,7 +42,10 @@ fn remaining(state: &State, now: u64) -> u64 {
 pub enum Decision {
     Verified,
     Rejected { remaining: u32 },
-    Locked { retry_after_secs: u64 },
+    /// Locked for `retry_after_secs`. `began`: this very attempt started the
+    /// lockout (the owner is told, review 3 #22); otherwise it was locked
+    /// already.
+    Locked { retry_after_secs: u64, began: bool },
 }
 
 /// Constant-time byte-string equality (AOK-304A). No early return on the first
@@ -106,6 +109,7 @@ fn verify_at(data_dir: &Path, expected: &str, given: &str, now: u64) -> Decision
         }
         return Decision::Locked {
             retry_after_secs: left,
+            began: false,
         };
     }
     if !expected.is_empty() && ct_eq(expected.as_bytes(), given.as_bytes()) {
@@ -136,6 +140,7 @@ fn verify_at(data_dir: &Path, expected: &str, given: &str, now: u64) -> Decision
         save(data_dir, &state);
         Decision::Locked {
             retry_after_secs: secs,
+            began: true,
         }
     } else {
         let remaining = MAX_FAILURES - state.failures;
@@ -185,8 +190,8 @@ mod tests {
                 ));
             }
             match verify_at(dir.path(), "731905", "000000", now) {
-                Decision::Locked { retry_after_secs } => retry_after_secs,
-                other => panic!("expected a lockout, got {other:?}"),
+                Decision::Locked { retry_after_secs, began: true } => retry_after_secs,
+                other => panic!("expected a lockout to begin, got {other:?}"),
             }
         };
         assert_eq!(lock_run(t0), 15 * 60);
@@ -198,14 +203,14 @@ mod tests {
         assert_eq!(lock_run(t3), 24 * 60 * 60);
         let t4 = t3 + 24 * 60 * 60;
         assert_eq!(lock_run(t4), 24 * 60 * 60, "the longest step holds");
-        // Locked: even the right PIN waits.
+        // Locked: even the right PIN waits (and it was locked already).
         assert!(matches!(
             verify_at(dir.path(), "731905", "731905", t4 + 60),
-            Decision::Locked { .. }
+            Decision::Locked { began: false, .. }
         ));
         // A clock set back a year: the wait is clamped to the longest step.
         match verify_at(dir.path(), "731905", "731905", t4 - 365 * 24 * 60 * 60) {
-            Decision::Locked { retry_after_secs } => assert!(retry_after_secs <= 24 * 60 * 60),
+            Decision::Locked { retry_after_secs, .. } => assert!(retry_after_secs <= 24 * 60 * 60),
             other => panic!("expected a clamped lockout, got {other:?}"),
         }
         // After it, the right PIN verifies and the steps start over.

@@ -64,6 +64,7 @@ import {
   createCompanionCallState,
 } from "./state/callReducer";
 import { displayError } from "./utils/displayError";
+import { protocolNowMs, protocolNowSeconds } from "./protocolClock";
 import { refreshWhenForegrounded } from "./utils/foregroundRefresh";
 import { nativeCallsTile, notificationPrompt } from "./utils/runtimeTiles";
 
@@ -174,7 +175,7 @@ export function shouldAcceptV2MicrophoneMuteReconciliation(
       === JSON.stringify(v2MicrophoneMuteStableProjection(current));
 }
 
-export function assistanceExpiryDelayMs(expiresAtSeconds: number, nowMs = Date.now()): number {
+export function assistanceExpiryDelayMs(expiresAtSeconds: number, nowMs = protocolNowMs()): number {
   if (!Number.isSafeInteger(expiresAtSeconds) || expiresAtSeconds <= 0 || !Number.isFinite(nowMs)) return 0;
   return Math.max(0, Math.min(expiresAtSeconds * 1_000 - nowMs, 2_147_000_000));
 }
@@ -419,7 +420,7 @@ function consentExpiryIsCurrent(expiresAt: string | undefined, nowMilliseconds: 
 export function v2RemoteConsentCurrent(
   connected: boolean,
   consent: V2CallSnapshotEvent["snapshot"]["remoteConsent"] | undefined,
-  nowMilliseconds = Date.now(),
+  nowMilliseconds = protocolNowMs(),
 ): boolean {
   return Boolean(
     connected
@@ -438,7 +439,7 @@ export function v2RemoteConsentCurrent(
 export function v2SnapshotMaintainsConfirmedTakeoverAuthority(
   target: ConfirmedTakeoverTarget | null,
   snapshot: V2CallSnapshotEvent | null,
-  nowMilliseconds = Date.now(),
+  nowMilliseconds = protocolNowMs(),
 ): boolean {
   if (!target || !snapshot) return false;
   const call = snapshot.snapshot;
@@ -470,7 +471,7 @@ export function v2SnapshotMaintainsConfirmedTakeoverAuthority(
 export function v2SnapshotAuthorizesConfirmedTakeoverArm(
   target: ConfirmedTakeoverTarget | null,
   snapshot: V2CallSnapshotEvent | null,
-  nowMilliseconds = Date.now(),
+  nowMilliseconds = protocolNowMs(),
 ): boolean {
   if (!target || !snapshot || !v2SnapshotMaintainsConfirmedTakeoverAuthority(target, snapshot, nowMilliseconds)) {
     return false;
@@ -1907,7 +1908,7 @@ export function v2TransferTranscript(
   snapshot: V2CallSnapshotEvent | null,
   assistance: V2AssistanceRequestEvent | null,
   maximumTurns = 8,
-  nowSeconds = Math.floor(Date.now() / 1_000),
+  nowSeconds = protocolNowSeconds(),
 ): { available: boolean; reason?: string; captions: NonNullable<V2CallSnapshotEvent["snapshot"]["captions"]> } {
   const call = snapshot?.snapshot;
   if (!assistance?.transferOffered || !Number.isSafeInteger(nowSeconds) || assistance.expiresAt <= nowSeconds ||
@@ -1970,7 +1971,7 @@ function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistan
   const [endConfirmationOpen, setEndConfirmationOpen] = useState(false);
   const [endConfirmationPending, setEndConfirmationPending] = useState(false);
   const [endConfirmationId, setEndConfirmationId] = useState<string | null>(null);
-  const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1_000));
+  const [nowSeconds, setNowSeconds] = useState(() => protocolNowSeconds());
   const connected = transport === "connected" && Boolean(snapshot);
   const grants = new Set(snapshot?.grants ?? []);
   const call = snapshot?.snapshot;
@@ -2013,7 +2014,7 @@ function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistan
   }, [assistance?.requestId]);
   useEffect(() => {
     if (!assistance && endCaller?.kind !== "end_caller_challenge" && !call?.pendingMobileOffers.length) return;
-    const timer = window.setInterval(() => setNowSeconds(Math.floor(Date.now() / 1_000)), 1_000);
+    const timer = window.setInterval(() => setNowSeconds(protocolNowSeconds()), 1_000);
     return () => window.clearInterval(timer);
   }, [assistance, call?.pendingMobileOffers.length, endCaller]);
   const exactNativeSession = isExactCurrentV2NativeMediaSession(lease, nativeMediaState);
@@ -2118,7 +2119,7 @@ function V2LiveRuntime({ runtime, deviceId, transport, snapshot, lease, assistan
   };
 
   const confirmEndCaller = async (challenge: V2EndCallerChallengeEvent) => {
-    if (busy || endConfirmationPending || !isCurrentEndCallerChallenge(challenge, snapshot, lease, Math.floor(Date.now() / 1_000))) return;
+    if (busy || endConfirmationPending || !isCurrentEndCallerChallenge(challenge, snapshot, lease, protocolNowSeconds())) return;
     setBusy(true);
     setEndConfirmationPending(true);
     setEndConfirmationOpen(false);
@@ -2704,7 +2705,7 @@ export function isCurrentEndCallerChallenge(
   event: V2EndCallerEvent | null,
   snapshot: V2CallSnapshotEvent | null,
   lease: V2LeaseEvent | null,
-  nowSeconds = Math.floor(Date.now() / 1_000),
+  nowSeconds = protocolNowSeconds(),
 ): event is V2EndCallerChallengeEvent {
   if (!event || event.kind !== "end_caller_challenge" || !snapshot || !lease) return false;
   const call = snapshot.snapshot;

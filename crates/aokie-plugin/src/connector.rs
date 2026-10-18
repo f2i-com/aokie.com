@@ -236,6 +236,11 @@ pub struct Plugin {
     /// radio is started again by [`Plugin::revive_radio`], at growing gaps.
     radio_restarts: u32,
     radio_restart_at: Option<std::time::Instant>,
+    /// When the running radio was first seen initialised: the restart count
+    /// starts over only once it has stayed up `RADIO_STEADY_UPTIME` (review 3
+    /// #20: a radio that crashed after it initialised was restarted every
+    /// 5 s).
+    radio_up_since: Option<std::time::Instant>,
     /// A shutdown has begun ([`Plugin::shutdown`]): the radio is not started
     /// again behind it.
     stopping: bool,
@@ -291,6 +296,7 @@ impl Plugin {
             radio_left_running: None,
             radio_restarts: 0,
             radio_restart_at: None,
+            radio_up_since: None,
             stopping: false,
         };
         plugin.storage_quarantined = storage_quarantined;
@@ -332,6 +338,7 @@ impl Plugin {
             radio_left_running: None,
             radio_restarts: 0,
             radio_restart_at: None,
+            radio_up_since: None,
             stopping: false,
         }
     }
@@ -472,6 +479,8 @@ impl Plugin {
         {
             std::env::set_var("AOKIE_STT_ENDPOINT_MS", ms.to_string());
             eprintln!("[aokie-plugin] sttEndpointMs setting → AOKIE_STT_ENDPOINT_MS={ms}");
+        } else {
+            restore_launch_env("AOKIE_STT_ENDPOINT_MS");
         }
 
         // AOK-CTRL-001: call-level max-silence window (seconds of MUTUAL
@@ -487,6 +496,8 @@ impl Plugin {
         {
             std::env::set_var("AOKIE_MAX_SILENCE_SECS", secs.to_string());
             eprintln!("[aokie-plugin] maxSilenceSecs setting → AOKIE_MAX_SILENCE_SECS={secs}");
+        } else {
+            restore_launch_env("AOKIE_MAX_SILENCE_SECS");
         }
 
         // Speech pacing: per-call baseline + detail speaking rates (percent)
@@ -500,6 +511,8 @@ impl Plugin {
             if let Some(v) = self.store.config.settings.get(key).and_then(|v| v.as_u64()) {
                 std::env::set_var(var, v.to_string());
                 eprintln!("[aokie-plugin] {key} setting → {var}={v}");
+            } else {
+                restore_launch_env(var);
             }
         }
 
@@ -518,6 +531,8 @@ impl Plugin {
         if ai_receptionist {
             std::env::set_var("AOKIE_AI_RECEPTIONIST", "1");
             eprintln!("[aokie-plugin] aiReceptionist ON → in-plugin streaming agent");
+        } else {
+            restore_launch_env("AOKIE_AI_RECEPTIONIST");
         }
         let codex_live_call_model = self
             .store
@@ -610,7 +625,11 @@ impl Plugin {
                     "[aokie-plugin] aiModel setting → AOKIE_AI_MODEL={}",
                     m.trim()
                 );
+            } else {
+                restore_launch_env("AOKIE_AI_MODEL");
             }
+        } else {
+            restore_launch_env("AOKIE_AI_MODEL");
         }
         if let Some(p) = self
             .store
@@ -621,7 +640,11 @@ impl Plugin {
         {
             if !p.trim().is_empty() {
                 std::env::set_var("AOKIE_AI_PERSONA", p.trim());
+            } else {
+                restore_launch_env("AOKIE_AI_PERSONA");
             }
+        } else {
+            restore_launch_env("AOKIE_AI_PERSONA");
         }
         // Full-duplex / barge-in: when `bargeIn` is truthy AND the agent is on,
         // Aokie keeps listening while it speaks (speexdsp echo-cancels its own
@@ -849,6 +872,8 @@ impl Plugin {
         {
             std::env::set_var("AOKIE_BARGE_RMS", (rms as f32).to_string());
             eprintln!("[aokie-plugin] bargeSensitivity setting → AOKIE_BARGE_RMS={rms}");
+        } else {
+            restore_launch_env("AOKIE_BARGE_RMS");
         }
         // PAIR-001: legacy fixed-PIN ("0000") pairing is OFF unless the
         // operator deliberately enabled the compat setting. The radio warns
@@ -958,8 +983,11 @@ impl Plugin {
                 self.apply_transfer_readiness();
                 // A Companion the host approved waits for the radio's media
                 // endpoint (it was deferred at init, or its gateway went with
-                // a radio whose thread ended): it starts with this radio.
-                self.try_start_configured_companion_gateway();
+                // a radio whose thread ended): it starts once this radio has
+                // opened its dongle ([`Plugin::revive_radio`]). Started here,
+                // with a dongle held or absent, it was stopped again with the
+                // radio and started with the next try, for ever: admissions
+                // and relay connections churned (review 3 #20).
             }
             Err(e) => {
                 eprintln!("[aokie-plugin] live radio unavailable: {e}");
@@ -989,12 +1017,26 @@ impl Plugin {
         let why = radio
             .last_error()
             .unwrap_or_else(|| "the radio thread ended".to_string());
+        // It had opened its dongle, so calls and texts may have been on it.
+        let ran = radio
+            .status
+            .dongle_ready_epoch
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0;
         eprintln!("[aokie-plugin] the radio has stopped ({why}); it will be started again");
         if let Some(gateway) = self.companion_gateway.take() {
             gateway.stop();
         }
         self.radio = None;
         self.radio_start_error = Some(why);
+        // Review 3 #5 / #7: a radio thread that died (a panic, say) said
+        // nothing of the call it had up, or of the texts it still held: the
+        // call's record stayed open, and the texts "queued", for the life of
+        // the process. They are closed now, before the next radio starts.
+        if ran {
+            self.close_calls_left_open("radio_restarted");
+            self.fail_texts_left_open("radio_restarted");
+        }
     }
 
     /// Start the radio again when it is not running for a reason that may
@@ -1003,10 +1045,18 @@ impl Plugin {
     /// on every host request (the desktop's health poll comes every few
     /// seconds); a start is tried at most once per gap, the gap doubling from
     /// 5 s to 2 min while the radio does not come up, and back to the start
-    /// once it does. Not while consent holds the radio back, a stop is
-    /// unconfirmed or a shutdown has begun, before `plugin.init`, or in dev
-    /// mode (no hardware).
+    /// once it has stayed up `RADIO_STEADY_UPTIME`. Not while consent holds
+    /// the radio back, a stop is unconfirmed or a shutdown has begun, a driver
+    /// step runs (it may be rebinding the very dongle, review 3 #20), before
+    /// `plugin.init`, or in dev mode (no hardware). A radio that is up, and
+    /// has opened its dongle, starts the Companion gateway the host approved.
     pub fn revive_radio(&mut self) {
+        let driver_step = aokie_dongle::driver_job::current().is_some_and(|job| job.is_running());
+        self.revive_radio_unless(driver_step);
+    }
+
+    /// [`Plugin::revive_radio`], told whether a driver step is running.
+    fn revive_radio_unless(&mut self, driver_step_running: bool) {
         if self.dev_mode || !self.initialized || self.stopping || self.consent_blocked.is_some() {
             return;
         }
@@ -1020,8 +1070,12 @@ impl Plugin {
                 .load(std::sync::atomic::Ordering::Acquire);
             if !finished {
                 if radio.is_initialized() {
-                    self.radio_restarts = 0;
-                    self.radio_restart_at = None;
+                    let up_since = *self.radio_up_since.get_or_insert_with(std::time::Instant::now);
+                    if up_since.elapsed() >= RADIO_STEADY_UPTIME {
+                        self.radio_restarts = 0;
+                        self.radio_restart_at = None;
+                    }
+                    self.try_start_configured_companion_gateway();
                 }
                 return;
             }
@@ -1029,10 +1083,14 @@ impl Plugin {
             // Never asked to start (or deliberately stopped): nothing to revive.
             return;
         }
+        if driver_step_running {
+            return;
+        }
         let now = std::time::Instant::now();
         if self.radio_restart_at.is_some_and(|at| now < at) {
             return;
         }
+        self.radio_up_since = None;
         self.radio_restarts = self.radio_restarts.saturating_add(1);
         self.radio_restart_at = Some(now + radio_restart_gap(self.radio_restarts));
         eprintln!(
@@ -1059,14 +1117,29 @@ impl Plugin {
     /// without the number a manager's call could not be told from a
     /// customer's. Run once, at the first `plugin.init`, before this
     /// process's radio can start a call of its own.
-    fn close_calls_left_open(&self) {
-        let open = match calls_left_open(&self.data_dir.join(OUTBOX_FILE)) {
+    ///
+    /// Nothing is written while the sealing key is not to be had: not even a
+    /// quarantine row, which would hide the call from the next start's look.
+    /// The calls then stay open in the outbox, and a later start closes them.
+    /// Where a seal may wait on the Keychain's prompt (a Mac, Linux), longer
+    /// than the host waits for this handshake, the rows are written from a
+    /// thread of their own, on its own connection; which calls they close is
+    /// read here, before this process's radio starts.
+    /// `reason` is `plugin_restarted` at the first `plugin.init`, and
+    /// `radio_restarted` when this process's radio thread died (review 3 #5).
+    fn close_calls_left_open(&self, reason: &'static str) {
+        let path = self.data_dir.join(OUTBOX_FILE);
+        let open = match calls_left_open(&path) {
             Ok(open) => open,
             Err(e) => {
                 eprintln!("[aokie-plugin] could not look for calls a previous run left open: {e}");
                 return;
             }
         };
+        if open.is_empty() {
+            return;
+        }
+        let mut closes = Vec::with_capacity(open.len());
         for call in open {
             let outcome = if call.answered { "completed" } else { "missed" };
             let event = aokie_event(
@@ -1074,7 +1147,7 @@ impl Plugin {
                 &call.id,
                 json!({
                     "at": now_iso8601(),
-                    "reason": "plugin_restarted",
+                    "reason": reason,
                     "callId": call.id,
                     "from": "",
                     "callerPhone": "",
@@ -1086,16 +1159,64 @@ impl Plugin {
                     "configVersion": self.store.config.config_version,
                 }),
             );
-            match self.outbox.insert_pending(&event, outbox::TARGET_DESKTOP) {
-                Ok(_) => eprintln!(
-                    "[aokie-plugin] call {} was left open by a previous run: closed ({outcome}, plugin_restarted)",
-                    call.id
-                ),
+            closes.push((call.id, outcome, event));
+        }
+        if !self.outbox.seal_may_wait() {
+            write_calls_left_open(&self.outbox, closes);
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("aokie-close-calls-left-open".into())
+            .spawn(move || match Outbox::open(&path) {
+                Ok(outbox) => write_calls_left_open(&outbox, closes),
                 Err(e) => eprintln!(
-                    "[aokie-plugin] call {} was left open by a previous run, and its call.ended could not be written: {e}",
-                    call.id
+                    "[aokie-plugin] the calls a previous run left open are closed at a later start: the outbox did not open ({e})"
                 ),
+            });
+        if let Err(e) = spawned {
+            eprintln!("[aokie-plugin] the calls a previous run left open are closed at a later start: {e}");
+        }
+    }
+
+    /// Answer the texts a run handed to the radio that never got their
+    /// outcome (review 3 #7): the process was killed or the radio thread
+    /// died with them in it, and they stayed "queued" for good. The command
+    /// journal says which texts went to the radio (`sms.send`, answered
+    /// `queued` `via` the radio); the outbox says which have their sent or
+    /// failed. Each other one gets `aokie.sms.failed` with `reason` (and
+    /// `outcomeUnknown`: the phone may have sent it), under the key the
+    /// radio's own would have had, so the host takes one outcome a text.
+    /// Written, as the calls are, only while the sealing key is to be had.
+    fn fail_texts_left_open(&self, reason: &'static str) {
+        let sends = match self
+            .command_journal
+            .completed_results("sms.send", (outbox::SENT_RETENTION_DAYS - 1) as u32)
+        {
+            Ok(sends) => sends,
+            Err(e) => {
+                eprintln!("[aokie-plugin] could not look for texts left without an outcome: {e}");
+                return;
             }
+        };
+        let fails = texts_left_open(&sends, |id| self.text_outcome(id).is_some(), reason);
+        if fails.is_empty() {
+            return;
+        }
+        let path = self.data_dir.join(OUTBOX_FILE);
+        if !self.outbox.seal_may_wait() {
+            write_texts_left_open(&self.outbox, fails);
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("aokie-fail-texts-left-open".into())
+            .spawn(move || match Outbox::open(&path) {
+                Ok(outbox) => write_texts_left_open(&outbox, fails),
+                Err(e) => eprintln!(
+                    "[aokie-plugin] the texts left without an outcome are answered at a later start: the outbox did not open ({e})"
+                ),
+            });
+        if let Err(e) = spawned {
+            eprintln!("[aokie-plugin] the texts left without an outcome are answered at a later start: {e}");
         }
     }
 
@@ -1218,15 +1339,24 @@ impl Plugin {
         let Some(radio) = self.radio.as_ref() else {
             return false;
         };
+        let enforced = self.consent_mode() == crate::consent::ConsentMode::Enforce
+            || realtime_voice_selected(&self.store.config.settings);
+        let grant = if enforced { self.consent_loaded().grant } else { None };
+        // Review 3 #6: the radio is told the expiry too, and takes no new
+        // call past it, whether or not anything asks the plugin anything.
+        let expires_at = grant
+            .as_ref()
+            .and_then(|grant| grant.expires_at.as_deref())
+            .and_then(crate::consent::parse_instant)
+            .map_or(0, |at| at.timestamp());
+        radio
+            .status
+            .consent_expires_at
+            .store(expires_at, std::sync::atomic::Ordering::Relaxed);
         if radio.current_call_id().is_some() || radio.is_call_active() {
             return false;
         }
-        let enforced = self.consent_mode() == crate::consent::ConsentMode::Enforce
-            || realtime_voice_selected(&self.store.config.settings);
-        if !enforced {
-            return false;
-        }
-        let Some(grant) = self.consent_loaded().grant else {
+        let Some(grant) = grant else {
             return false;
         };
         if !crate::consent::expired(&grant, &aokie_core::events::now_iso8601()) {
@@ -1450,13 +1580,35 @@ impl Plugin {
         // AOK-CONSENT-001: sending SMS (MAP) needs the `sms` scope.
         self.check_consent("sms.send", crate::consent::Scope::Sms)?;
         if let Some(radio) = self.radio.as_ref() {
+            // Review 3 #8: a text this messageId already has an outcome for
+            // (a host's retry after its 30 s timeout, under a new requestId)
+            // is not sent again: it is answered with that outcome, which the
+            // host has, or will have, as its sent or failed event.
+            if let Some(outcome) = self.text_outcome(&message_id) {
+                eprintln!(
+                    "[aokie-plugin] sms.send {message_id} was already {outcome} — answered with that, not sent twice"
+                );
+                return Ok(json!({
+                    "messageId": message_id,
+                    "to": to,
+                    "status": outcome,
+                    "duplicate": true,
+                    "via": "radio",
+                }));
+            }
             // No phone, no text: the radio would only hold it until its
-            // time ran out. Refused now, so the sender hears it at once.
-            if !radio
+            // time ran out. Refused now, so the sender hears it at once. On
+            // Windows' own stack the phone is the bonded one, known also
+            // while its idle hands-free line is down (review 3 #10).
+            let phone_known = radio
                 .status
                 .connected
                 .load(std::sync::atomic::Ordering::Relaxed)
-            {
+                || radio
+                    .status
+                    .texts_phone_known
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            if !phone_known {
                 return Err(CmdError::failed(
                     "sms.send refused: no phone is connected — the text was not sent; reconnect the phone and send it again",
                 )
@@ -1538,6 +1690,26 @@ impl Plugin {
             at,
         });
         Ok(json!({"messageId": message_id, "status": "queued", "simulated": true}))
+    }
+
+    /// The outcome a text already has, by its messageId: `"sent"` or
+    /// `"failed"` when the outbox holds the radio's `aokie.sms.sent` or
+    /// `aokie.sms.failed` for it (review 3 #8). A refusal is not one: it is
+    /// keyed per refusal, and a refused text may be sent again under its id.
+    fn text_outcome(&self, message_id: &str) -> Option<&'static str> {
+        [
+            (crate::contract::events::SMS_SENT, "sent"),
+            (crate::contract::events::SMS_FAILED, "failed"),
+        ]
+        .into_iter()
+        .find(|(name, _)| {
+            let key = aokie_core::events::aokie_idempotency_key(
+                message_id,
+                aokie_core::events::step_for_event_name(name),
+            );
+            matches!(self.outbox.status_of(&key), Ok(Some(_)))
+        })
+        .map(|(_, outcome)| outcome)
     }
 
     /// The acknowledgement of a REFUSED `sms.send`: `aokie.sms.failed` with
@@ -1892,6 +2064,10 @@ impl Plugin {
         match msg.method.as_str() {
             "plugin.init" => Some(self.handle_init(&id, &msg.params)),
             "plugin.health" => {
+                // Review 3 #6: OAIY's health poll is what comes when no
+                // screen is open: an expired consent grant stops the radio
+                // here too (between calls), as on every command.
+                self.stop_radio_if_consent_expired();
                 self.revive_radio();
                 Some(rpc::success_line(&id, self.build_health()))
             }
@@ -2032,7 +2208,10 @@ impl Plugin {
         // Calls the last process left open (it was killed, or crashed, with a
         // call up) are closed now, before this process's radio can start one.
         if first_init && self.radio.is_none() {
-            self.close_calls_left_open();
+            self.close_calls_left_open("plugin_restarted");
+            // And the texts it handed to the radio that never got their sent
+            // or failed (review 3 #7).
+            self.fail_texts_left_open("plugin_restarted");
         }
         // Arm the live radio at handshake time (real mode) so a call ringing
         // before any command still reaches the flow. Non-blocking: init
@@ -2569,6 +2748,8 @@ impl Plugin {
                 // What the user needs to open a dongle on a no-driver system: on Linux the udev rule
                 // dongle.installDriver puts in place (each connected dongle's `access` says whether it is needed).
                 let access_model = if cfg!(target_os = "linux") { "udev" } else { "none" };
+                self.adopt_running_driver_helper();
+                let driver_job = aokie_dongle::driver_job::current();
                 let note = if cfg!(target_os = "windows") {
                     "connected[] are live USB devices; driverBound=true means the WinUSB driver is attached and the dongle is ready to pair."
                 } else {
@@ -2585,7 +2766,8 @@ impl Plugin {
                     "driverSigning": driver_signing(),
                     // The driver step running or last run (dongle.installDriver, restoreDriver, removeCerts answer
                     // `accepted` and run it off the command loop): the screen polls this until it is done or failed.
-                    "driverJob": aokie_dongle::driver_job::current(),
+                    // A helper an earlier run started is reported as running too.
+                    "driverJob": driver_job,
                     // A Realtek dongle's firmware at the radio's last start: `missing` or `failed` leaves it on its
                     // ROM, which phones do not see.
                     "firmware": realtek_firmware(),
@@ -3750,18 +3932,29 @@ impl Plugin {
                 // A Desktop that signs consent grants is where consent is
                 // decided: a plain settings write cannot turn its enforcement
                 // down to warn or off (that would set every signed grant
-                // aside). Dev mode never enforces, and a host that does not
-                // sign keeps the explicit override.
+                // aside). On a host that does not sign (OAIY), the same holds
+                // once consent has been recorded on this computer (a grant on
+                // record, or one revoked since): warn or off would set the
+                // operator's recorded choices aside just the same. Before any
+                // was recorded, warn is the explicit pre-consent override.
+                // Dev mode never enforces.
                 if let Some(mode) = obj.get("consentMode").and_then(Value::as_str) {
                     let lowered = crate::consent::ConsentMode::from_setting(Some(mode));
-                    if lowered != crate::consent::ConsentMode::Enforce
-                        && !self.dev_mode
-                        && self.consent_verify_key().is_some()
-                    {
-                        return Err(CmdError::failed(format!(
-                            "settings.set refused: consentMode {:?} — this Desktop signs consent grants, so enforcement stays on (revoke consent to stop sensitive processing)",
-                            mode
-                        )));
+                    if lowered != crate::consent::ConsentMode::Enforce && !self.dev_mode {
+                        if self.consent_verify_key().is_some() {
+                            return Err(CmdError::failed(format!(
+                                "settings.set refused: consentMode {:?} — this Desktop signs consent grants, so enforcement stays on (revoke consent to stop sensitive processing)",
+                                mode
+                            )));
+                        }
+                        if crate::consent::load(&self.data_dir).is_some()
+                            || crate::consent::floor(&self.data_dir).is_some()
+                        {
+                            return Err(CmdError::failed(format!(
+                                "settings.set refused: consentMode {:?} — consent has been recorded on this computer, so enforcement stays on (revoke consent to stop sensitive processing, or record it again to change what it allows)",
+                                mode
+                            )));
+                        }
                     }
                 }
                 // The two reserved Desktop adapters are deliberately narrow:
@@ -4536,6 +4729,7 @@ impl Plugin {
         };
         aokie_dongle::installer::check_target(vid, pid)
             .map_err(|e| CmdError::failed(format!("WinUSB driver install failed: {e}")))?;
+        self.adopt_running_driver_helper();
         let work_dir = self.data_dir.join("winusb-install");
         let job = aokie_dongle::driver_job::start("install", vid, pid, move || {
             aokie_dongle::installer::install_winusb(vid, pid, &work_dir, local_signing)
@@ -4620,8 +4814,17 @@ impl Plugin {
     /// `accepted` at once, and `dongle.list`'s `driverJob` is `done` only once
     /// the dongle is read back on a driver other than WinUSB (its `result`
     /// names it), `failed` otherwise.
+    ///
+    /// The target is checked by the restore's own gate (on WinUSB from
+    /// Aokie's package), not the install's catalog: Aokie 0.0.2 bound adapters
+    /// the catalog no longer names (a laptop's Realtek 0bda:c822), and those
+    /// must still be given back (review 3 #19). The radio is stopped first: it
+    /// holds the dongle open through WinUSB, and Windows cannot restart an open
+    /// device to have it choose its driver again. Never in the middle of a
+    /// call, which that would end. It is started again once the step is over
+    /// (`revive_radio` waits while a driver step runs).
     #[cfg(target_os = "windows")]
-    fn restore_driver(&self, payload: &Value) -> Result<Value, CmdError> {
+    fn restore_driver(&mut self, payload: &Value) -> Result<Value, CmdError> {
         let obj = payload.as_object().cloned().unwrap_or_default();
         let (vid, pid) = if obj.contains_key("vid") || obj.contains_key("pid") {
             (require_u16(&obj, "vid")?, require_u16(&obj, "pid")?)
@@ -4632,8 +4835,38 @@ impl Plugin {
                 "dongle.restoreDriver needs vid + pid (or set a preferred dongle via dongle.setPreferred first)",
             ));
         };
-        aokie_dongle::installer::check_target(vid, pid)
+        aokie_dongle::installer::check_restore_target(vid, pid)
             .map_err(|e| CmdError::failed(format!("restore original driver failed: {e}")))?;
+        self.adopt_running_driver_helper();
+        if let Some(running) = aokie_dongle::driver_job::current().filter(|job| job.is_running()) {
+            return Err(CmdError::failed(format!(
+                "restore original driver failed: a driver step ({}) is still running, started {}: wait for it to finish",
+                running.kind, running.started_at
+            )));
+        }
+        let on_dongle = crate::backend::TransportMode::from_setting(
+            self.store.config.settings.get("transportMode"),
+        ) != crate::backend::TransportMode::Native;
+        if on_dongle {
+            if let Some(radio) = self.radio.as_ref() {
+                if radio.current_call_id().is_some() || radio.is_call_active() {
+                    return Err(CmdError::failed(
+                        "restore original driver failed: a call is on the line, and the restore takes the dongle from Aokie's radio, which ends the call: try again once it is over",
+                    ));
+                }
+            }
+            if let Some(gateway) = self.companion_gateway.take() {
+                gateway.stop();
+            }
+            if let Some(radio) = self.radio.take() {
+                eprintln!("[aokie-plugin] the radio is stopped for the dongle's driver restore");
+                self.retire_radio(radio, "driver-restore shutdown");
+            }
+            // Started again once the restore is over (`revive_radio` waits while a driver step runs): back on the
+            // dongle where the restore failed, and saying why it cannot open it where the dongle is Windows' now.
+            self.radio_start_error =
+                Some("stopped for the dongle's driver restore; started again once it is over".to_string());
+        }
         let work_dir = self.data_dir.join("winusb-install");
         let job = aokie_dongle::driver_job::start("restore", vid, pid, move || {
             aokie_dongle::installer::restore_original_driver(vid, pid, &work_dir)
@@ -4645,7 +4878,7 @@ impl Plugin {
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn restore_driver(&self, _payload: &Value) -> Result<Value, CmdError> {
+    fn restore_driver(&mut self, _payload: &Value) -> Result<Value, CmdError> {
         Err(CmdError::failed(
             "dongle.restoreDriver is a Windows step (WinUSB): this system installed no driver, so there is none to restore",
         ))
@@ -4658,6 +4891,7 @@ impl Plugin {
     #[cfg(target_os = "windows")]
     fn remove_certs(&self, payload: &Value) -> Result<Value, CmdError> {
         expect_fields(payload, &[])?;
+        self.adopt_running_driver_helper();
         let work_dir = self.data_dir.join("winusb-install");
         let job = aokie_dongle::driver_job::start("removeCerts", 0, 0, move || {
             aokie_dongle::installer::remove_aokie_certs(&work_dir)
@@ -4667,6 +4901,19 @@ impl Plugin {
         .map_err(CmdError::failed)?;
         Ok(json!({"accepted": true, "removed": false, "job": job}))
     }
+
+    /// A driver helper an earlier run of this plugin started and did not see
+    /// to its end (OAIY started Aokie again while it ran) is reported, and
+    /// waited for, as the step running (review 3 #18;
+    /// `aokie_dongle::installer::adopt_running_helper`): the screen keeps
+    /// Install off, and another step is refused meanwhile.
+    #[cfg(target_os = "windows")]
+    fn adopt_running_driver_helper(&self) {
+        aokie_dongle::installer::adopt_running_helper(&self.data_dir.join("winusb-install"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn adopt_running_driver_helper(&self) {}
 
     #[cfg(not(target_os = "windows"))]
     fn remove_certs(&self, _payload: &Value) -> Result<Value, CmdError> {
@@ -4877,6 +5124,11 @@ const DONGLE_RESET_WAIT: std::time::Duration = std::time::Duration::from_secs(15
 pub const HOST_GRACE_RADIO_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 pub const HOST_GRACE_THREAD_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// How long a radio has to stay up before its restart count starts over
+/// ([`Plugin::revive_radio`]): one that crashes after it initialised is
+/// started again at the growing gaps, not every 5 s.
+const RADIO_STEADY_UPTIME: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// The gap before the radio's next start while it does not come up
 /// ([`Plugin::revive_radio`]): 5 s after the first try, doubling, at most
 /// 2 min.
@@ -4962,6 +5214,97 @@ struct CallLeftOpen {
     /// It has a `call.incoming` row: the phone rang. (An outbound call's first
     /// row in the outbox is its `call.answered`.)
     inbound: bool,
+}
+
+/// Write the `call.ended` rows [`Plugin::close_calls_left_open`] made, once
+/// `store` can seal: when it cannot, none (see there).
+fn write_calls_left_open(
+    store: &Outbox,
+    closes: Vec<(String, &'static str, aokie_core::events::DesktopEvent)>,
+) {
+    if !store.can_seal() {
+        eprintln!(
+            "[aokie-plugin] {} call(s) a previous run left open are closed at a later start: the sealing key is not to be had now",
+            closes.len()
+        );
+        return;
+    }
+    for (id, outcome, event) in closes {
+        match store.insert_pending(&event, outbox::TARGET_DESKTOP) {
+            Ok(outbox::InsertOutcome::QuarantinedProtectFailed) => eprintln!(
+                "[aokie-plugin] call {id} was left open by a previous run: its call.ended waits for the sealing key"
+            ),
+            Ok(_) => eprintln!(
+                "[aokie-plugin] call {id} was left open: closed ({outcome}, {})",
+                event.data.get("reason").and_then(Value::as_str).unwrap_or("plugin_restarted")
+            ),
+            Err(e) => eprintln!(
+                "[aokie-plugin] call {id} was left open by a previous run, and its call.ended could not be written: {e}"
+            ),
+        }
+    }
+}
+
+/// The `aokie.sms.failed` events owed to the texts in `sends` (completed
+/// `sms.send` results) that went to the radio and have no outcome
+/// (`answered`) (review 3 #7, [`Plugin::fail_texts_left_open`]).
+fn texts_left_open(
+    sends: &[Value],
+    answered: impl Fn(&str) -> bool,
+    reason: &'static str,
+) -> Vec<aokie_core::events::DesktopEvent> {
+    let mut fails: Vec<aokie_core::events::DesktopEvent> = Vec::new();
+    for send in sends {
+        if send.get("via").and_then(Value::as_str) != Some("radio")
+            || send.get("status").and_then(Value::as_str) != Some("queued")
+        {
+            continue;
+        }
+        let Some(id) = send.get("messageId").and_then(Value::as_str) else {
+            continue;
+        };
+        if answered(id) || fails.iter().any(|event| event.correlation_id == id) {
+            continue;
+        }
+        fails.push(aokie_event(
+            crate::contract::events::SMS_FAILED,
+            id,
+            json!({
+                "messageId": id,
+                "to": send.get("to").and_then(Value::as_str).unwrap_or(""),
+                "reason": reason,
+                "outcomeUnknown": true,
+                "at": now_iso8601(),
+            }),
+        ));
+    }
+    fails
+}
+
+/// Write the `aokie.sms.failed` rows [`Plugin::fail_texts_left_open`] made,
+/// once `store` can seal: when it cannot, none (a quarantined row would read
+/// as the text's outcome at the next look, and never reach the host).
+fn write_texts_left_open(store: &Outbox, fails: Vec<aokie_core::events::DesktopEvent>) {
+    if !store.can_seal() {
+        eprintln!(
+            "[aokie-plugin] {} text(s) left without an outcome are answered at a later start: the sealing key is not to be had now",
+            fails.len()
+        );
+        return;
+    }
+    for event in fails {
+        match store.insert_pending(&event, outbox::TARGET_DESKTOP) {
+            Ok(_) => eprintln!(
+                "[aokie-plugin] text {} had no outcome: reported failed ({})",
+                event.correlation_id,
+                event.data.get("reason").and_then(Value::as_str).unwrap_or("")
+            ),
+            Err(e) => eprintln!(
+                "[aokie-plugin] text {} had no outcome, and its sms.failed could not be written: {e}",
+                event.correlation_id
+            ),
+        }
+    }
 }
 
 /// The calls in the outbox at `path` that have a `call.incoming` or
@@ -5663,13 +6006,14 @@ fn validate_realtime_voice_settings(settings: &Map<String, Value>) -> Result<(),
             "realtimeVoiceMode=desktop_realtime requires aiReceptionist=true",
         ));
     }
-    let transport_mode = settings
-        .get("transportMode")
-        .and_then(Value::as_str)
-        .unwrap_or("dongle");
-    if transport_mode != "dongle" {
+    // `auto` is the dongle whenever one is plugged in (the radio starts it so,
+    // since only the dongle carries call audio), as the screens and the setup
+    // wizard read it; only `native` has no call audio at all.
+    if crate::backend::TransportMode::from_setting(settings.get("transportMode"))
+        == crate::backend::TransportMode::Native
+    {
         return Err(CmdError::failed(
-            "realtimeVoiceMode=desktop_realtime requires transportMode=dongle because Realtime still needs the Aokie SCO phone-audio link",
+            "realtimeVoiceMode=desktop_realtime requires the USB dongle (transportMode dongle, or auto with the dongle plugged in) because Realtime still needs the Aokie SCO phone-audio link",
         ));
     }
     let endpoint = settings
@@ -5947,7 +6291,22 @@ fn file_has_plaintext_manager_pin(path: &std::path::Path) -> bool {
 
 /// The variables a radio start sets from a setting only while the setting
 /// asks for something (a forced codec, agent hang-up).
-const SETTING_OVERRIDE_ENV: [&str; 2] = ["AOKIE_HFP_CODEC", "AOKIE_AGENT_HANGUP"];
+/// Review 3 #35: and every variable a setting writes only when it is set
+/// (a speech rate, the model, the persona, the agent itself): a setting taken
+/// away left the last value for the next radio start in this process.
+const SETTING_OVERRIDE_ENV: [&str; 11] = [
+    "AOKIE_HFP_CODEC",
+    "AOKIE_AGENT_HANGUP",
+    "AOKIE_STT_ENDPOINT_MS",
+    "AOKIE_MAX_SILENCE_SECS",
+    "AOKIE_SPEECH_RATE_PCT",
+    "AOKIE_DETAIL_RATE_PCT",
+    "AOKIE_PROTECTED_MAX_MS",
+    "AOKIE_AI_RECEPTIONIST",
+    "AOKIE_AI_MODEL",
+    "AOKIE_AI_PERSONA",
+    "AOKIE_BARGE_RMS",
+];
 
 /// What OAIY started the process with for one of [`SETTING_OVERRIDE_ENV`]:
 /// read once, before a setting first writes over it.
@@ -6634,7 +6993,9 @@ mod tests {
         plugin.radio_restart_at = Some(std::time::Instant::now());
         plugin.revive_radio();
         assert_eq!(plugin.radio_restarts, 2);
-        // A radio that comes up starts the count over.
+        // A radio that comes up starts the count over once it has stayed up
+        // a while (review 3 #20: one that crashed right after it initialised
+        // was started again every 5 s).
         let (radio, _controls) = crate::radio::RadioHandle::test_handle();
         radio
             .status
@@ -6642,9 +7003,48 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         plugin.radio = Some(radio);
         plugin.revive_radio();
+        assert_eq!(plugin.radio_restarts, 2, "not just for coming up");
+        assert!(plugin.radio.is_some());
+        plugin.radio_up_since = std::time::Instant::now().checked_sub(RADIO_STEADY_UPTIME);
+        plugin.revive_radio();
         assert_eq!(plugin.radio_restarts, 0);
         assert!(plugin.radio_restart_at.is_none());
         assert!(plugin.radio.is_some());
+    }
+
+    /// Review 3 #20: no radio start while a driver step runs (it may be
+    /// rebinding the very dongle), and no Companion gateway for a radio that
+    /// has not opened its dongle: started with every try, a held or absent
+    /// dongle churned admissions and relay connections for ever.
+    #[test]
+    fn a_radio_is_not_revived_during_a_driver_step_and_its_gateway_waits_for_the_dongle() {
+        let mut plugin = Plugin::ephemeral(false);
+        plugin
+            .store
+            .config
+            .settings
+            .insert("consentMode".into(), json!("warn"));
+        plugin.initialized = true;
+        plugin.radio_start_error = Some("no dongle found".into());
+        plugin.revive_radio_unless(true);
+        assert_eq!(plugin.radio_restarts, 0, "held back while the driver step runs");
+        plugin.revive_radio_unless(false);
+        assert_eq!(plugin.radio_restarts, 1);
+
+        plugin.companion_bootstrap = Some(Plugin::identity_only_companion_bootstrap(
+            crate::companion_gateway::CompanionBootstrap::parse(&valid_companion_bootstrap()).unwrap(),
+        ));
+        let (radio, _controls) = crate::radio::RadioHandle::test_handle();
+        let status = radio.status.clone();
+        plugin.radio = Some(radio);
+        plugin.revive_radio_unless(false);
+        assert!(plugin.companion_gateway.is_none(), "the dongle is not open yet");
+        status.initialized.store(true, std::sync::atomic::Ordering::Relaxed);
+        plugin.revive_radio_unless(false);
+        assert!(plugin.companion_gateway.is_some(), "it starts once the radio is up");
+        if let Some(gateway) = plugin.companion_gateway.take() {
+            gateway.stop();
+        }
     }
 
     #[test]
@@ -6669,6 +7069,94 @@ mod tests {
             [secs(1), secs(2), secs(3), secs(4), secs(5), secs(6), secs(40)],
             [5, 10, 20, 40, 80, 120, 120]
         );
+    }
+
+    /// Review 3 #7: a text a previous run handed to the radio and never got
+    /// an outcome for (the process was killed with it queued) is answered at
+    /// the first init: `aokie.sms.failed`, `plugin_restarted`, under the key
+    /// the radio's own would have had. A text with its outcome, and one the
+    /// dev simulator sent, are left alone.
+    #[test]
+    fn texts_a_previous_run_left_without_an_outcome_are_failed_at_the_first_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = VecSink::default();
+        {
+            let mut previous = Plugin::new(false, dir.path().to_path_buf()).unwrap();
+            for (rid, id, result) in [
+                ("req-open", "msg-open", json!({"messageId": "msg-open", "to": "+61432123456", "status": "queued", "via": "radio"})),
+                ("req-sent", "msg-sent", json!({"messageId": "msg-sent", "to": "+61432123456", "status": "queued", "via": "radio"})),
+                ("req-sim", "msg-sim", json!({"messageId": "msg-sim", "status": "queued", "simulated": true})),
+            ] {
+                let payload = json!({"to": "+61432123456", "body": "hi", "messageId": id});
+                previous.command_journal.prepare(rid, "sms.send", &payload).unwrap();
+                previous.command_journal.complete(rid, &result).unwrap();
+            }
+            previous
+                .outbox
+                .insert_pending(
+                    &aokie_event(crate::contract::events::SMS_SENT, "msg-sent", json!({"messageId": "msg-sent"})),
+                    outbox::TARGET_DESKTOP,
+                )
+                .unwrap();
+        }
+        let mut plugin = Plugin::new(false, dir.path().to_path_buf()).unwrap();
+        plugin
+            .handle_rpc(request(1, "plugin.init", json!({"pluginApiVersion": 1})), &mut sink)
+            .unwrap();
+        let failed_key = |id: &str| aokie_core::events::aokie_idempotency_key(id, "sms.failed");
+        assert!(plugin.outbox.status_of(&failed_key("msg-open")).unwrap().is_some(), "the open text is answered");
+        assert!(plugin.outbox.status_of(&failed_key("msg-sent")).unwrap().is_none(), "the sent one keeps its outcome");
+        assert!(plugin.outbox.status_of(&failed_key("msg-sim")).unwrap().is_none(), "the simulator's is not the radio's");
+        let sends = vec![json!({"messageId": "msg-open", "to": "+61432123456", "status": "queued", "via": "radio"})];
+        let fails = texts_left_open(&sends, |_| false, "radio_restarted");
+        assert_eq!(fails.len(), 1);
+        assert_eq!(fails[0].data["reason"], json!("radio_restarted"));
+        assert_eq!(fails[0].data["outcomeUnknown"], json!(true));
+        assert_eq!(fails[0].idempotency_key, failed_key("msg-open"));
+    }
+
+    /// Review 3 #5 / #7: a radio thread that dies mid-call said nothing of
+    /// its call or of the texts it held. Before it is started again, the call
+    /// is closed (`radio_restarted`) and the text answered.
+    #[test]
+    fn a_radio_that_died_with_a_call_and_a_text_has_them_closed_before_it_is_started_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plugin = Plugin::new(false, dir.path().to_path_buf()).unwrap();
+        plugin.store.config.settings.insert("consentMode".into(), json!("warn"));
+        plugin.initialized = true;
+        let (radio, _controls) = crate::radio::RadioHandle::test_handle();
+        radio.status.dongle_ready_epoch.store(1, std::sync::atomic::Ordering::Relaxed);
+        radio.status.thread_finished.store(true, std::sync::atomic::Ordering::Release);
+        plugin.radio = Some(radio);
+        plugin
+            .outbox
+            .insert_pending(
+                &aokie_event(crate::contract::events::CALL_ANSWERED, "call_live", json!({"callId": "call_live"})),
+                outbox::TARGET_DESKTOP,
+            )
+            .unwrap();
+        let payload = json!({"to": "+61432123456", "body": "hi", "messageId": "msg-held"});
+        plugin.command_journal.prepare("req-held", "sms.send", &payload).unwrap();
+        plugin
+            .command_journal
+            .complete("req-held", &json!({"messageId": "msg-held", "to": "+61432123456", "status": "queued", "via": "radio"}))
+            .unwrap();
+        plugin.revive_radio();
+        assert!(plugin.radio.is_none());
+        let ended = plugin
+            .outbox
+            .retryable(64)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.correlation_id == "call_live" && row.event_name == crate::contract::events::CALL_ENDED)
+            .expect("the call is closed");
+        let event: Value = serde_json::from_str(&ended.payload_json).unwrap();
+        assert_eq!(event["data"]["reason"], json!("radio_restarted"));
+        assert!(plugin
+            .outbox
+            .status_of(&aokie_core::events::aokie_idempotency_key("msg-held", "sms.failed"))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -9544,15 +10032,16 @@ mod tests {
             .contains("requires aiReceptionist=true"));
 
         settings.insert("aiReceptionist".into(), json!(true));
-        for unsupported in ["native", "auto"] {
-            settings.insert("transportMode".into(), json!(unsupported));
-            assert!(validate_realtime_voice_settings(&settings)
-                .unwrap_err()
-                .message
-                .contains("requires transportMode=dongle"));
+        settings.insert("transportMode".into(), json!("native"));
+        assert!(validate_realtime_voice_settings(&settings)
+            .unwrap_err()
+            .message
+            .contains("requires the USB dongle"));
+        // `auto` is the dongle whenever one is plugged in, as the screens read it (review 3 #27).
+        for dongle in ["dongle", "auto"] {
+            settings.insert("transportMode".into(), json!(dongle));
+            assert!(validate_realtime_voice_settings(&settings).is_ok(), "{dongle}");
         }
-        settings.insert("transportMode".into(), json!("dongle"));
-        assert!(validate_realtime_voice_settings(&settings).is_ok());
     }
 
     #[test]
@@ -10422,6 +10911,84 @@ mod tests {
         assert_eq!(ev["data"]["reason"], json!(err.message));
     }
 
+    /// Review 3 #8: a text whose messageId already has an outcome (a host's
+    /// retry after its 30 s timeout, under a new requestId) is answered with
+    /// that outcome and never handed to the radio again, and it does not
+    /// count against the day's cap.
+    #[test]
+    fn sms_send_under_a_message_id_that_has_an_outcome_is_not_sent_twice() {
+        let _env = consent_env_lock();
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+        let (radio, controls) = crate::radio::RadioHandle::test_handle();
+        radio.status.connected.store(true, std::sync::atomic::Ordering::Relaxed);
+        plugin.radio = Some(radio);
+        for (name, id) in [
+            (crate::contract::events::SMS_SENT, "msg-dup-sent"),
+            (crate::contract::events::SMS_FAILED, "msg-dup-failed"),
+        ] {
+            let ev = aokie_event(name, id, json!({"messageId": id, "to": "+61432123456", "at": now_iso8601()}));
+            plugin.outbox.insert_pending(&ev, outbox::TARGET_DESKTOP).unwrap();
+        }
+        let send = |plugin: &mut Plugin, sink: &mut VecSink, id: &str| {
+            plugin
+                .dispatch_command(
+                    "sms.send",
+                    &json!({"to": "+61432123456", "body": "hi", "messageId": id}),
+                    sink,
+                )
+                .unwrap()
+        };
+        let used = |plugin: &Plugin| plugin.store.config.sms_ledger.as_ref().map_or(0, |l| l.count);
+        let before = used(&plugin);
+        let data = send(&mut plugin, &mut sink, "msg-dup-sent");
+        assert_eq!((data["status"].clone(), data["duplicate"].clone()), (json!("sent"), json!(true)));
+        let data = send(&mut plugin, &mut sink, "msg-dup-failed");
+        assert_eq!(data["status"], json!("failed"));
+        assert_eq!(used(&plugin), before, "a retry is not counted again");
+        assert!(
+            !controls.try_iter().any(|c| matches!(c, crate::radio::RadioControl::SendSms { .. })),
+            "nothing reached the radio"
+        );
+        // A new id goes to the radio as before.
+        assert_eq!(send(&mut plugin, &mut sink, "msg-new")["status"], json!("queued"));
+    }
+
+    /// Review 3 #10: on Windows' own stack the idle hands-free line drops
+    /// between calls and `connected` with it, while a text pages the bonded
+    /// phone on its own: sms.send is refused only when no phone is known.
+    #[test]
+    fn sms_send_goes_to_a_known_phone_whose_idle_line_is_down() {
+        let _env = consent_env_lock();
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.ack_mode = true;
+        let mut sink = VecSink::default();
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+        let (radio, controls) = crate::radio::RadioHandle::test_handle();
+        let status = radio.status.clone();
+        plugin.radio = Some(radio);
+        let send = |plugin: &mut Plugin, sink: &mut VecSink, id: &str| {
+            plugin.dispatch_command(
+                "sms.send",
+                &json!({"to": "+61432123456", "body": "hi", "messageId": id}),
+                sink,
+            )
+        };
+        let err = send(&mut plugin, &mut sink, "msg-nobody").unwrap_err();
+        assert!(err.message.contains("no phone is connected"), "{}", err.message);
+        status.texts_phone_known.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(send(&mut plugin, &mut sink, "msg-bonded").unwrap()["status"], json!("queued"));
+        assert!(controls
+            .try_iter()
+            .any(|c| matches!(c, crate::radio::RadioControl::SendSms { ref message_id, .. } if message_id == "msg-bonded")));
+    }
+
     #[test]
     fn sms_send_accepted_by_the_radio_leaves_the_outcome_to_the_radio() {
         // (settings.set refuses consentMode warn while a signing Desktop's key is in the
@@ -10540,6 +11107,46 @@ mod tests {
         std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
         plugin
             .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+    }
+
+    /// A host that does not sign grants (OAIY): warn or off is the pre-consent
+    /// override only. Once consent is recorded here, or revoked since, a plain
+    /// settings write cannot set it aside (review 3 #26).
+    #[test]
+    fn settings_set_cannot_turn_recorded_consent_down_where_grants_are_not_signed() {
+        let _env = consent_env_lock();
+        std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
+        let mut plugin = Plugin::ephemeral(false);
+        let mut sink = VecSink::default();
+        // Nothing recorded yet: the explicit override stands.
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
+            .unwrap();
+        plugin
+            .dispatch_command("consent.set", &json!({"scopes": {"bluetooth": true}}), &mut sink)
+            .unwrap();
+        plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "enforce"}), &mut sink)
+            .unwrap();
+        for mode in ["warn", "off", "Off"] {
+            let err = plugin
+                .dispatch_command("settings.set", &json!({"consentMode": mode}), &mut sink)
+                .unwrap_err();
+            assert!(err.message.contains("consent has been recorded"), "{}", err.message);
+        }
+        // Revoked: still recorded once, so still refused.
+        plugin.dispatch_command("consent.revoke", &json!({}), &mut sink).unwrap();
+        let err = plugin
+            .dispatch_command("settings.set", &json!({"consentMode": "off"}), &mut sink)
+            .unwrap_err();
+        assert!(err.message.contains("enforcement stays on"), "{}", err.message);
+        assert_eq!(plugin.store.config.settings["consentMode"], json!("enforce"));
+        // Dev mode never enforces in the first place.
+        let mut dev = Plugin::ephemeral(true);
+        dev.dispatch_command("consent.set", &json!({"scopes": {"bluetooth": true}}), &mut sink)
+            .unwrap();
+        dev.dispatch_command("settings.set", &json!({"consentMode": "warn"}), &mut sink)
             .unwrap();
     }
 
@@ -10677,9 +11284,52 @@ mod tests {
         .unwrap();
         *plugin.radio.as_ref().unwrap().status.current_call_id.lock().unwrap() = Some("call_live".into());
         assert!(!plugin.stop_radio_if_consent_expired(), "not under a live call");
+        // Review 3 #6: the radio is told, and takes no new call past it.
+        let status = plugin.radio.as_ref().unwrap().status.clone();
+        assert!(status.consent_expired(), "the radio knows the grant has expired");
         *plugin.radio.as_ref().unwrap().status.current_call_id.lock().unwrap() = None;
         assert!(plugin.stop_radio_if_consent_expired());
         assert!(plugin.radio.is_none());
+        assert!(plugin.consent_blocked.as_deref().is_some_and(|r| r.contains("expired")));
+    }
+
+    /// Review 3 #6: with no screen open, OAIY's health poll is all that comes:
+    /// it stops a radio whose grant has expired too (between calls), and a
+    /// grant with no expiry tells the radio none.
+    #[test]
+    fn the_health_poll_stops_a_radio_whose_consent_expired() {
+        let _env = consent_env_lock();
+        std::env::remove_var("FORMLOGIC_CONSENT_VERIFY_KEY");
+        let mut plugin = Plugin::ephemeral(false);
+        plugin.radio_shutdown_wait = std::time::Duration::from_millis(10);
+        plugin.store.config.settings.insert("consentMode".into(), json!("enforce"));
+        let grant = crate::consent::save(
+            &plugin.data_dir,
+            crate::consent::ConsentGrant {
+                version: crate::consent::CURRENT_CONSENT_VERSION,
+                scopes: crate::consent::ConsentScopes {
+                    bluetooth: true,
+                    ..Default::default()
+                },
+                accepted_at: String::new(),
+                accepted_by: None,
+                expires_at: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        let (radio, _controls) = crate::radio::RadioHandle::test_handle();
+        let status = radio.status.clone();
+        plugin.radio = Some(radio);
+        let mut sink = VecSink::default();
+        plugin.handle_rpc(request(1, "plugin.health", json!({})), &mut sink).unwrap();
+        assert!(plugin.radio.is_some());
+        assert!(!status.consent_expired());
+        let mut expired = grant;
+        expired.expires_at = Some("2020-01-01T00:00:00+00:00".into());
+        std::fs::write(plugin.data_dir.join("consent.json"), serde_json::to_vec(&expired).unwrap()).unwrap();
+        plugin.handle_rpc(request(2, "plugin.health", json!({})), &mut sink).unwrap();
+        assert!(plugin.radio.is_none(), "stopped by the health poll");
         assert!(plugin.consent_blocked.as_deref().is_some_and(|r| r.contains("expired")));
     }
 

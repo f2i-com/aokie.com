@@ -421,6 +421,43 @@ pub fn evaluate_present_target(
     }
 }
 
+/// The restore's gate, shared by the unelevated dispatcher and the elevated
+/// helper (review 3 #19). A restore undoes what Aokie did, so it asks what
+/// Aokie did, not what the catalog names today: the device is plugged in, its
+/// class is never a non-dongle's, and it is on WinUSB from Aokie's package
+/// ([`winusb::winusb_is_aokies`]). Aokie 0.0.2
+/// bound adapters the catalog no longer lists, a laptop's Realtek 0bda:c822
+/// among them, and those must still be given back to Windows. Returns the live
+/// device, whose instance id the job pins.
+pub fn evaluate_restore_target(vid: u16, pid: u16) -> Result<UsbDevice, String> {
+    let device = find_device(vid, pid)?.ok_or_else(|| {
+        format!("no {vid:04x}:{pid:04x} device is plugged in: plug the dongle in and try again")
+    })?;
+    if aokie_core::dongle_catalog::class_is_denied(&device.class) {
+        aokie_core::redact::audit(
+            "winusb_restore_refused",
+            format!("vid={vid:04x} pid={pid:04x}: class {:?}", device.class),
+        );
+        return Err(format!(
+            "that device reports class {:?}, which is never a Bluetooth dongle: Aokie leaves its driver alone",
+            device.class.trim()
+        ));
+    }
+    if !device.driver.eq_ignore_ascii_case("WinUSB") {
+        return Err(format!(
+            "the {vid:04x}:{pid:04x} device is on {}, not WinUSB: there is no Aokie driver on it to take off",
+            if device.driver.is_empty() { "no driver" } else { device.driver.as_str() }
+        ));
+    }
+    if !winusb::winusb_is_aokies(&device.instance_id)? {
+        return Err(format!(
+            "the {vid:04x}:{pid:04x} device is on WinUSB from a driver package that is not Aokie's: another \
+             program's driver, which Aokie leaves alone"
+        ));
+    }
+    Ok(device)
+}
+
 /// SHA-256 the file at `path`, lowercase hex. Streams in 64 KiB chunks.
 /// Shared by the unelevated dispatcher (to sign the rendered INF into
 /// the job) and the elevated helper (to verify the INF bytes on disk

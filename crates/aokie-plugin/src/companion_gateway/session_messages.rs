@@ -99,8 +99,46 @@ impl GatewaySession {
                 frame.validate_routed_mobile().map_err(|_| {
                     WorkerError::refused("Companion RTC signal failed contract validation")
                 })?;
-                self.handle_rtc_signal(frame, media, radio)?;
-                Ok(Vec::new())
+                // Read before the offer is handled: a refusal may already have
+                // dropped the lease from the local book.
+                let offer_lease = matches!(frame.signal, RtcSignal::Offer { .. })
+                    .then(|| self.socket_offer_lease(&frame))
+                    .flatten();
+                match self.handle_rtc_signal(frame.clone(), media, radio) {
+                    Ok(()) => Ok(Vec::new()),
+                    Err(error) if error.is_refusal() => {
+                        let Some(lease) = offer_lease else {
+                            return Err(error);
+                        };
+                        if self
+                            .peers
+                            .get(&frame.rtc_session_id)
+                            .is_some_and(|route| route.lease_jti == frame.lease_jti)
+                        {
+                            // A repeated offer for a peer that is already up:
+                            // that peer and its lease carry on.
+                            return Err(error);
+                        }
+                        // A refused offer leaves its lease with no media path.
+                        // Dropping it silently let the phone's heartbeats keep
+                        // the lease, and the claim slot, alive for minutes
+                        // while the takeover showed "connecting". End exactly
+                        // that lease, as a failed peer does.
+                        eprintln!(
+                            "[aokie-plugin][takeover] stage=offer_refused device={} call={} fence={} rtc={} detail={}",
+                            sanitize_gateway_code(&frame.device_id),
+                            frame.call_id,
+                            frame.fence,
+                            frame.rtc_session_id,
+                            sanitize_status_message(&error.message)
+                        );
+                        Ok(self
+                            .fail_refused_offer(&frame, lease, &error.message, media, radio)
+                            .into_iter()
+                            .collect())
+                    }
+                    Err(error) => Err(error),
+                }
             }
             "assistance_answer" => {
                 let frame: PluginAssistanceAnswerFrame = parse_gateway_frame(encoded)?;
@@ -1490,5 +1528,8 @@ pub(super) fn gateway_error_is_per_request(code: &str) -> bool {
             | "invalid_lease"
             | "consent_required"
             | "assistance_pending"
+            // An older gateway that does not know a frame kind this build
+            // sends refuses just it and keeps the socket (`refuse_unknown_kind`).
+            | "unsupported_kind"
     )
 }

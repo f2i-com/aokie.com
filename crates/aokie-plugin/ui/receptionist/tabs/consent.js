@@ -312,7 +312,9 @@
   }
 
   // The operator was told a call on the line would end, and pressed Accept
-  // again to go ahead.
+  // again to go ahead. For that press only: cleared whenever the form opens,
+  // closes or its choices change, and when the tab is left, so a warning given
+  // for one call and one choice never waves a later Accept through.
   var callWarned = false;
 
   /** Accept: a grant without Bluetooth or transcription takes the phone line
@@ -615,7 +617,12 @@
       '</div>' +
       '<div class="rcp-card__body">' +
       '<p class="rcp-hint" style="margin-top: 0;">Version ' + esc((status && status.requiredVersion) || 1) +
-      " · grants expire after 12 months · signed by this computer, so it can't be copied to another install. " +
+      ' · grants expire after 12 months · ' +
+      // Signed only where the host signs grants (consent.get signatureRequired); OAIY does not, and there the
+      // grant is Aokie's own record on this computer, which a settings write cannot set aside once it is made.
+      (status && status.signatureRequired === true
+        ? "signed by this computer, so it can't be copied to another install. "
+        : 'kept by Aokie on this computer; once recorded, no settings change can turn its enforcement off. ') +
       'Privacy &amp; data-handling disclosure: <code>formlogic.com/privacy</code></p>' +
       '<div style="margin-top: 8px;">' + scopeRows.join('') + '</div>' +
       '<div style="margin-top: 12px;">' +
@@ -671,9 +678,11 @@
       if (act === 'cns-toggle') {
         wizardOpen = !wizardOpen;
         error = null;
+        callWarned = false;
         render();
       } else if (act === 'cns-close') {
         wizardOpen = false;
+        callWarned = false;
         render();
       } else if (act === 'cns-accept') accept();
     });
@@ -683,6 +692,7 @@
       var scope = t.getAttribute('data-scope');
       if (scope != null) {
         scopes[scope] = !!t.checked;
+        callWarned = false;
         return;
       }
       if (t.getAttribute('data-codex-destination') != null) {
@@ -705,6 +715,7 @@
     },
     unmount: function () {
       root = null;
+      callWarned = false;
     },
   });
 })();

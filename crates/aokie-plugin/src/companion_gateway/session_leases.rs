@@ -285,6 +285,17 @@ impl GatewaySession {
                 "Companion RTC offer is stale against physical call truth",
             ));
         }
+        // Everything that can refuse the offer short of native media itself
+        // runs before a prepared peer is closed for the active rebind.
+        let binding = binding_for_claims(&claims);
+        let ttl = lease_ttl_ms(&claims).map_err(|error| WorkerError::refused(error.message))?;
+        let offer = SdpSignal {
+            kind: SdpSignalType::Offer,
+            sdp,
+        };
+        offer
+            .validate()
+            .map_err(|_| WorkerError::refused("Companion SDP offer is invalid"))?;
         if let Some(existing) = self.peers.get(&frame.rtc_session_id) {
             let replacing_prepared = matches!(
                 (existing.binding.mode, claims.mode, claims.phase),
@@ -306,15 +317,6 @@ impl GatewaySession {
             let _ = media.close_peer(&frame.rtc_session_id, "active_rebind");
             self.peers.remove(&frame.rtc_session_id);
         }
-        let binding = binding_for_claims(&claims);
-        let ttl = lease_ttl_ms(&claims).map_err(|error| WorkerError::refused(error.message))?;
-        let offer = SdpSignal {
-            kind: SdpSignalType::Offer,
-            sdp,
-        };
-        offer
-            .validate()
-            .map_err(|_| WorkerError::refused("Companion SDP offer is invalid"))?;
         media
             .open_peer(OpenPeerRequest {
                 binding: binding.clone(),
@@ -517,18 +519,18 @@ impl GatewaySession {
                 RemoteMediaEventKind::TakeoverPrepared {
                     confirmed_owner_epoch,
                 } => {
-                    if let Some(encoded) =
-                        self.complete_preparation(&event, confirmed_owner_epoch, media, radio)?
-                    {
+                    let decision =
+                        self.complete_preparation(&event, confirmed_owner_epoch, media, radio);
+                    if let Some(encoded) = self.contain_media_race(&event, decision, media)? {
                         outbound.push(encoded);
                     }
                 }
                 RemoteMediaEventKind::ConsultPrepared {
                     confirmed_owner_epoch,
                 } => {
-                    if let Some(encoded) =
-                        self.complete_preparation(&event, confirmed_owner_epoch, media, radio)?
-                    {
+                    let decision =
+                        self.complete_preparation(&event, confirmed_owner_epoch, media, radio);
+                    if let Some(encoded) = self.contain_media_race(&event, decision, media)? {
                         outbound.push(encoded);
                     }
                 }
@@ -539,8 +541,12 @@ impl GatewaySession {
                         ));
                     }
                     if let Some(route) = self.route_for_event(&event) {
-                        outbound
-                            .push(self.encode_rtc(route, OutboundRtcSignal::Answer(answer.sdp))?);
+                        let encoded = self
+                            .encode_rtc(route, OutboundRtcSignal::Answer(answer.sdp))
+                            .map(Some);
+                        if let Some(encoded) = self.contain_media_race(&event, encoded, media)? {
+                            outbound.push(encoded);
+                        }
                     }
                 }
                 RemoteMediaEventKind::LocalIce { candidate } => {
@@ -548,19 +554,27 @@ impl GatewaySession {
                         let index = u16::try_from(candidate.sdp_mline_index).map_err(|_| {
                             WorkerError::reconnect("Native ICE candidate index is invalid")
                         })?;
-                        outbound.push(self.encode_rtc(
-                            route,
-                            OutboundRtcSignal::Ice {
-                                candidate: candidate.candidate,
-                                sdp_mid: candidate.sdp_mid,
-                                sdp_m_line_index: index,
-                            },
-                        )?);
+                        let encoded = self
+                            .encode_rtc(
+                                route,
+                                OutboundRtcSignal::Ice {
+                                    candidate: candidate.candidate,
+                                    sdp_mid: candidate.sdp_mid,
+                                    sdp_m_line_index: index,
+                                },
+                            )
+                            .map(Some);
+                        if let Some(encoded) = self.contain_media_race(&event, encoded, media)? {
+                            outbound.push(encoded);
+                        }
                     }
                 }
                 RemoteMediaEventKind::IceComplete => {
                     if let Some(route) = self.route_for_event(&event) {
-                        outbound.push(self.encode_rtc(route, OutboundRtcSignal::IceComplete)?);
+                        let encoded = self.encode_rtc(route, OutboundRtcSignal::IceComplete).map(Some);
+                        if let Some(encoded) = self.contain_media_race(&event, encoded, media)? {
+                            outbound.push(encoded);
+                        }
                     }
                 }
                 RemoteMediaEventKind::ConnectionState { state } => {
@@ -575,14 +589,24 @@ impl GatewaySession {
                             outbound.push(encoded);
                         }
                     } else {
-                        self.maybe_request_transition(&event.rtc_session_id, media)?;
+                        let requested = self
+                            .maybe_request_transition(&event.rtc_session_id, media)
+                            .map(|()| None);
+                        if let Some(encoded) = self.contain_media_race(&event, requested, media)? {
+                            outbound.push(encoded);
+                        }
                     }
                 }
                 RemoteMediaEventKind::RemoteAudioReady => {
                     if let Some(route) = self.route_for_event_mut(&event) {
                         route.remote_audio_ready = true;
                     }
-                    self.maybe_request_transition(&event.rtc_session_id, media)?;
+                    let requested = self
+                        .maybe_request_transition(&event.rtc_session_id, media)
+                        .map(|()| None);
+                    if let Some(encoded) = self.contain_media_race(&event, requested, media)? {
+                        outbound.push(encoded);
+                    }
                 }
                 RemoteMediaEventKind::RemoteMicrophoneReady => {
                     if let Some(route) = self.route_for_event_mut(&event) {
@@ -591,7 +615,12 @@ impl GatewaySession {
                         // quarantined until the radio opens the route.
                         route.remote_microphone_ready = true;
                     }
-                    self.maybe_request_transition(&event.rtc_session_id, media)?;
+                    let requested = self
+                        .maybe_request_transition(&event.rtc_session_id, media)
+                        .map(|()| None);
+                    if let Some(encoded) = self.contain_media_race(&event, requested, media)? {
+                        outbound.push(encoded);
+                    }
                 }
                 RemoteMediaEventKind::ProtocolViolation { .. }
                 | RemoteMediaEventKind::Error { .. } => {
@@ -621,6 +650,57 @@ impl GatewaySession {
             }
         }
         Ok(outbound)
+    }
+
+    /// Contain one claim's media race to that claim.
+    ///
+    /// The owner epoch moving under a soft hold, consent withdrawn or a
+    /// physical switch in flight when a transition is asked for, or a lease
+    /// that lapsed as its answer was signed, are ordinary races of one device's
+    /// claim. Ending the whole session for them dropped every device's peers
+    /// and an active takeover elsewhere. The claim fails back as a failed peer
+    /// does instead. A violation of local identity still ends the session.
+    pub(super) fn contain_media_race(
+        &mut self,
+        event: &RemoteMediaEvent,
+        result: Result<Option<String>, WorkerError>,
+        media: &RemoteMediaHandle,
+    ) -> Result<Option<String>, WorkerError> {
+        let error = match result {
+            Ok(encoded) => return Ok(encoded),
+            Err(error) if error.kind == WorkerErrorKind::Rebootstrap => return Err(error),
+            Err(error) => error,
+        };
+        eprintln!(
+            "[aokie-plugin][takeover] stage=media_race call={} owner_epoch={} rtc={} event={} detail={}",
+            event.call_id,
+            event.owner_epoch,
+            event.rtc_session_id,
+            remote_media_event_kind(&event.kind),
+            sanitize_status_message(&error.message)
+        );
+        if self.peers.contains_key(&event.rtc_session_id) {
+            return self.fail_peer(&event.rtc_session_id, "media_race", media);
+        }
+        // No route left: the prepared claim whose receive-only peer has
+        // already closed. Return the caller and drop it locally; the
+        // authoritative snapshot carries the change to every device.
+        if let Some(lease_id) = self
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.provisional.rtc_session_id == event.rtc_session_id
+                    && prepared.provisional.call_id == event.call_id
+                    && prepared.provisional.call_epoch == event.call_epoch
+            })
+            .map(|prepared| prepared.provisional.lease_id.clone())
+        {
+            self.revoke_relay_lease_by_id(&lease_id, "media_race", media);
+            self.last_snapshot_fingerprint = None;
+            self.last_snapshot_sent = None;
+            self.next_snapshot_poll = Instant::now();
+        }
+        Ok(None)
     }
 
     pub(super) fn fail_route_if_current(
@@ -826,6 +906,19 @@ impl GatewaySession {
         };
         prepared.confirmed_owner_epoch = Some(confirmed_owner_epoch);
         prepared.decision_sent = true;
+        if relay_status.is_none() {
+            // The gateway activates the claim on this decision and the phone's
+            // heartbeats then keep that lease alive, whether or not its
+            // microphone-bearing offer ever arrives. Bound the wait for that
+            // offer as the relay carrier does once its ACTIVE status is
+            // delivered, so a phone that never re-offers cannot hold the
+            // caller in soft hold and the claim slot for the lease's life.
+            prepared.active_rebind_deadline = match prepared.provisional.mode {
+                LeaseMode::Consult => Some(Instant::now() + RELAY_CONSULT_ACTIVE_REBIND_TIMEOUT),
+                LeaseMode::Takeover => Some(Instant::now() + RELAY_TAKEOVER_ACTIVE_REBIND_TIMEOUT),
+                LeaseMode::Monitor => None,
+            };
+        }
         eprintln!(
             "[aokie-plugin][takeover] stage=preparation_complete app={} device={} call={} mode={:?} owner_epoch={} fence={} rtc={}",
             self.app_id,
@@ -1127,4 +1220,125 @@ impl GatewaySession {
             .map(Some)
             .map_err(|_| WorkerError::reconnect("Media revocation could not be encoded"))
     }
+
+    /// The lease a gateway-routed offer names, as this session knows it.
+    ///
+    /// The gateway has already checked the frame's device, lease JTI, call
+    /// and fence against its own signed lease, so a revoke built from them
+    /// matches exactly the lease the gateway holds.
+    pub(super) fn socket_offer_lease(&self, frame: &PluginRtcSignalFrame) -> Option<OfferLease> {
+        let names_frame = |claims: &LeaseClaims| {
+            claims.device_id == frame.device_id
+                && claims.rtc_session_id == frame.rtc_session_id
+                && claims.call_id == frame.call_id
+                && claims.call_epoch == frame.call_epoch
+                && claims.fence == frame.fence
+        };
+        if let Some(prepared) = self
+            .prepared
+            .as_ref()
+            .filter(|prepared| names_frame(&prepared.provisional))
+        {
+            if !prepared.decision_sent && prepared.provisional.jti == frame.lease_jti {
+                return Some(OfferLease::Undecided {
+                    lease_id: prepared.provisional.lease_id.clone(),
+                    request_id: prepared.request_id.clone(),
+                    owner_epoch: prepared.provisional.owner_epoch,
+                });
+            }
+            if prepared.decision_sent {
+                // The gateway rotated the JTI when it activated the claim;
+                // the stable lease id is the prepared one.
+                return Some(OfferLease::Decided {
+                    lease_id: prepared.provisional.lease_id.clone(),
+                });
+            }
+        }
+        self.leases
+            .get(&frame.lease_jti)
+            .filter(|claims| names_frame(claims))
+            .map(|claims| OfferLease::Decided {
+                lease_id: claims.lease_id.clone(),
+            })
+    }
+
+    /// End the one lease whose offer was refused, and tell the gateway.
+    ///
+    /// A claim not yet decided is rejected, so the gateway frees the claim
+    /// slot and the phone hears `claim_rejected` with the reason. A decided
+    /// or granted lease is revoked, as [`Self::fail_peer`] does for a peer
+    /// that failed. Either way the local book, routes and any soft hold go at
+    /// once, and every other device's peers and leases stay up.
+    pub(super) fn fail_refused_offer(
+        &mut self,
+        frame: &PluginRtcSignalFrame,
+        lease: OfferLease,
+        detail: &str,
+        media: &RemoteMediaHandle,
+        radio: &RadioHandle,
+    ) -> Option<String> {
+        match lease {
+            OfferLease::Undecided {
+                lease_id,
+                request_id,
+                owner_epoch,
+            } => {
+                self.revoke_relay_lease_by_id(&lease_id, "offer_refused", media);
+                let decision = PluginClaimDecisionFrame {
+                    kind: "claim_decision".into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: self.app_id.clone(),
+                    request_id,
+                    device_id: frame.device_id.clone(),
+                    call_id: frame.call_id.clone(),
+                    call_epoch: frame.call_epoch,
+                    fence: frame.fence,
+                    accepted: false,
+                    media_ready: false,
+                    confirmed_owner_epoch: owner_epoch,
+                    switchboard_revision: radio.switchboard_revision(),
+                    remote_revision: media.snapshot().remote_revision,
+                    reason: Some(aokie_protocol::text::sanitize_line(
+                        &format!("Aokie Desktop refused the media offer: {detail}"),
+                        200,
+                    )),
+                };
+                decision.validate().ok()?;
+                serde_json::to_string(&decision).ok()
+            }
+            OfferLease::Decided { lease_id } => {
+                self.revoke_relay_lease_by_id(&lease_id, "offer_refused", media);
+                self.last_snapshot_fingerprint = None;
+                self.last_snapshot_sent = None;
+                self.next_snapshot_poll = Instant::now();
+                let revoke = PluginLeaseRevokeFrame {
+                    kind: "plugin_lease_revoke".into(),
+                    schema_version: SCHEMA_VERSION,
+                    app_id: self.app_id.clone(),
+                    device_id: frame.device_id.clone(),
+                    lease_id,
+                    lease_jti: frame.lease_jti.clone(),
+                    call_id: frame.call_id.clone(),
+                    call_epoch: frame.call_epoch,
+                    fence: frame.fence,
+                    reason: "offer_refused".into(),
+                };
+                revoke.validate().ok()?;
+                serde_json::to_string(&revoke).ok()
+            }
+        }
+    }
+}
+
+/// What [`GatewaySession::socket_offer_lease`] found for a refused offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OfferLease {
+    /// A prepared claim this plugin has not answered yet.
+    Undecided {
+        lease_id: String,
+        request_id: String,
+        owner_epoch: u64,
+    },
+    /// A claim this plugin accepted, or a granted monitor lease.
+    Decided { lease_id: String },
 }

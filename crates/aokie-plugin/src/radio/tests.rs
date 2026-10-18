@@ -1261,6 +1261,46 @@ fn no_sco_watchdog_leaves_the_owners_own_calls_alone() {
     assert_eq!(dead_air_watch_call(tracker.current()).as_deref(), Some("call_agent"));
 }
 
+/// Review 3 #1: the owner moves the receptionist's live call to the handset
+/// (its audio closes with reason 0x13, the call goes on). The no-audio
+/// watchdog leaves it alone, as an owner's call: no AT+BCC pulling the
+/// audio back, no hang-up at 8 s as `device_lost`. When the audio comes back
+/// to the dongle the call is the receptionist's again. Audio that drops for
+/// another reason keeps the watchdog.
+#[test]
+fn audio_moved_to_the_handset_is_left_there() {
+    use aokie_dongle::bluetooth::BluetoothEvent as E;
+    let status = std::sync::Arc::new(RadioStatus::default());
+    let mut tracker = crate::call_session::SessionTracker::new();
+    let mut sink = crate::event_bridge::VecSink::default();
+    let audio_up = || E::AudioConnected { codec: "mSBC".into(), sample_rate: 16_000, armed: true };
+    handle_event(E::DeviceConnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
+    handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+    handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
+    handle_event(audio_up(), &mut tracker, None, &mut sink, &status);
+    let id = tracker.call_id().unwrap().to_string();
+    assert_eq!(dead_air_watch_call(tracker.current()).as_deref(), Some(id.as_str()));
+
+    // Another reason: the watchdog still watches.
+    handle_event(E::AudioDisconnected, &mut tracker, None, &mut sink, &status);
+    assert_eq!(dead_air_watch_call(tracker.current()).as_deref(), Some(id.as_str()));
+    // The phone moved it to the handset.
+    handle_event(E::AudioOnHandset, &mut tracker, None, &mut sink, &status);
+    assert!(tracker.current().unwrap().audio_on_handset());
+    assert_eq!(dead_air_watch_call(tracker.current()), None, "the owner has it on the handset");
+    assert!(tracker.current().unwrap().receptionist_owns(), "the call is still hers to take back");
+    // The audio comes back: hers again, watched again.
+    handle_event(audio_up(), &mut tracker, None, &mut sink, &status);
+    assert!(!tracker.current().unwrap().audio_on_handset());
+    assert_eq!(dead_air_watch_call(tracker.current()).as_deref(), Some(id.as_str()));
+
+    // Our own call switch bounces the audio: not the handset.
+    *status.switch_in_flight.lock().unwrap() = Some((id.clone(), std::time::Instant::now()));
+    handle_event(E::AudioDisconnected, &mut tracker, None, &mut sink, &status);
+    handle_event(E::AudioOnHandset, &mut tracker, None, &mut sink, &status);
+    assert!(!tracker.current().unwrap().audio_on_handset());
+}
+
 #[cfg(feature = "voice")]
 #[test]
 fn no_sco_watchdog_times_the_continuous_outage_not_total_call_age() {
@@ -3850,4 +3890,265 @@ fn observed_outgoing_dial_publishes_direction_for_current_call() {
         status.outbound_call_id.lock().unwrap().as_deref(),
         tracker.call_id()
     );
+}
+
+/// A phone link with a queue of events, that says, as it is stopped, what a
+/// stopping radio says: each text it still held, failed.
+#[cfg(aokie_radio)]
+struct StoppingBackend {
+    events: std::collections::VecDeque<aokie_dongle::bluetooth::BluetoothEvent>,
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(aokie_radio)]
+impl crate::backend::RadioBackend for StoppingBackend {
+    fn try_recv_event(&mut self) -> Option<aokie_dongle::bluetooth::BluetoothEvent> {
+        self.events.pop_front()
+    }
+    fn try_recv_audio(&mut self) -> Option<aokie_dongle::bluetooth::AudioData> {
+        None
+    }
+    fn send_audio(&self, _samples: &[i16]) -> bool {
+        true
+    }
+    fn flush_tx_audio(&self) {}
+    fn send_sms(&self, _id: String, _to: String, _body: String, _kind: Option<String>) -> Result<(), String> {
+        Ok(())
+    }
+    fn answer_call(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn reject_call(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn hangup(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn dial(&self, _number: String) -> Result<(), String> {
+        Ok(())
+    }
+    fn hold_swap(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn query_calls(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn stop_within(&mut self, _within: std::time::Duration) -> bool {
+        self.stopped.store(true, Ordering::Relaxed);
+        self.events.push_back(aokie_dongle::bluetooth::BluetoothEvent::SmsSendFailed {
+            message_id: "sms_open".into(),
+            recipient_phone: "0400111222".into(),
+            reason: "the Bluetooth radio stopped before the phone took the text".into(),
+        });
+        true
+    }
+    fn open_pairing_window(&self, _seconds: u64) {}
+    fn close_pairing_window(&self) {}
+    fn pairing_window(&self) -> aokie_dongle::bluetooth::PairingWindow {
+        aokie_dongle::bluetooth::PairingWindow::default()
+    }
+    fn pairing_confirm_slot(&self) -> aokie_dongle::bluetooth::PairingConfirmSlot {
+        aokie_dongle::bluetooth::PairingConfirmSlot::default()
+    }
+    fn bonded_devices(&self) -> Vec<(String, Option<String>)> {
+        Vec::new()
+    }
+    fn connected_name(&self) -> Option<String> {
+        None
+    }
+    fn remove_paired(&self, _address: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn disconnect(&self, _address: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn connect(&self, _address: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn confirm_pairing(&self, _address: &str, _accept: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        true
+    }
+    fn get_sample_rate(&self) -> u16 {
+        0
+    }
+    fn realtime_call_audio_supported(&self) -> bool {
+        true
+    }
+    fn sco_dead_air_watchdog(&self) -> bool {
+        false
+    }
+    fn backend_name(&self) -> &'static str {
+        "test backend"
+    }
+}
+
+/// Review 3 #7: a text the phone link still holds when the plugin stops gets
+/// its outcome before the stop is acknowledged: the link is stopped, and the
+/// failure it reports as it ends is read and emitted (before, it went into a
+/// channel nobody read, and the text stayed "queued" for good).
+#[cfg(aokie_radio)]
+#[test]
+fn a_stop_answers_the_texts_the_phone_link_still_held_before_it_is_acknowledged() {
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut bt = StoppingBackend {
+        events: std::collections::VecDeque::new(),
+        stopped: stopped.clone(),
+    };
+    let (control_tx, control_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    control_tx
+        .send(RadioControl::Shutdown { completion: Some(done_tx) })
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut sink = crate::event_bridge::VecSink::default();
+    run_loop(
+        &mut bt,
+        None,
+        &mut sink,
+        control_rx,
+        std::sync::Arc::new(RadioStatus::default()),
+        false,
+        false,
+        None,
+        crate::host_rpc::HostRpc::new(),
+        dir.path(),
+        crate::remote_media::RemoteMediaHandle::spawn().unwrap(),
+    );
+    assert!(done_rx.try_recv().is_ok(), "the stop was acknowledged");
+    assert!(stopped.load(Ordering::Relaxed), "the phone link was stopped first");
+    let failed = sink
+        .lines
+        .iter()
+        .find(|line| line.contains(crate::contract::events::SMS_FAILED))
+        .expect("the text the link held got its outcome");
+    assert!(failed.contains("sms_open"), "{failed}");
+}
+
+/// Review 3 #21: refusing a screened caller while the phone rings is the
+/// screening's, whether or not auto-answer is on. With it off a screened
+/// caller who has a message to hear is refused at ring too (nobody answers to
+/// say it), once the number is known; the reject only ever goes while the
+/// phone has no other call up, waiting or on hold.
+#[test]
+fn screened_callers_are_refused_at_ring_whether_or_not_auto_answer_is_on() {
+    use crate::screen::RingAction;
+    assert_eq!(ring_action_for(RingAction::Answer, true, true, Some("blocked")), RingAction::Answer);
+    assert_eq!(ring_action_for(RingAction::Answer, false, true, Some("blocked")), RingAction::Refuse("blocked"));
+    assert_eq!(
+        ring_action_for(RingAction::Answer, false, false, Some("private")),
+        RingAction::Answer,
+        "a number that is only late is not refused"
+    );
+    assert_eq!(ring_action_for(RingAction::Refuse("blocked"), false, true, Some("blocked")), RingAction::Refuse("blocked"));
+    assert_eq!(ring_action_for(RingAction::Answer, false, true, None), RingAction::Answer);
+    assert_eq!(ring_action_for(RingAction::Leave, false, true, None), RingAction::Leave);
+    assert!(ring_refusal_safe(false, false, false));
+    assert!(!ring_refusal_safe(true, false, false), "a live call");
+    assert!(!ring_refusal_safe(false, true, false), "a caller waiting");
+    assert!(!ring_refusal_safe(false, false, true), "a caller on hold");
+
+    // The loop's shape: the refusal is decided before, and outside, the
+    // auto-answer block, and with auto-answer off a phone that does not act
+    // on the rejects leaves the call ringing rather than answering it.
+    let source = include_str!("run_loop.rs").replace("\r\n", "\n");
+    let refused_at = source.find("refuse_at_ring = Some((reason, 1));").expect("the first reject");
+    let again_at = source.find("refuse_at_ring = Some((r.reason, r.tries));").expect("the next reject");
+    let auto_answer_at = source.find("\n        if auto_answer {\n").expect("the auto-answer block");
+    assert!(refused_at < auto_answer_at && again_at < auto_answer_at);
+    assert!(source.contains("crate::screen::RingStep::AnswerInstead if auto_answer => {"));
+    assert!(source.contains("crate::screen::RingStep::RejectAgain if refusal_safe => {"));
+}
+
+/// Review 3 #22: on a manager call only a turn that offers the PIN has its
+/// digits judged as one; a time or a phone number said in passing is no
+/// attempt (it counted as a wrong PIN, and five of them locked the line for
+/// up to a day). A lockout that begins tells the owner.
+#[cfg(feature = "voice")]
+#[test]
+fn only_a_turn_that_offers_the_pin_is_judged_as_one_and_a_lockout_is_told() {
+    assert!(turn_offers_pin("my manager pin is 7 3 1 9 0 5, cancel Friday"));
+    assert!(turn_offers_pin("PIN: 731905"));
+    assert!(turn_offers_pin("the pass code is 731905"));
+    assert!(turn_offers_pin("my passcode, 731905"));
+    assert!(!turn_offers_pin("move the 12:30 booking to 4:15 on the 18th"));
+    assert!(!turn_offers_pin("call me back on 0491 570 157"));
+    assert!(!turn_offers_pin("the spinning class at 6"), "a word with pin in it is not the PIN");
+    let payload = pin_lockout_payload("call_mgr", 15 * 60);
+    assert_eq!(payload["code"], "manager_pin_locked");
+    assert_eq!(payload["retryAfterSecs"], 900);
+    assert!(payload["message"].as_str().unwrap().contains("15 minutes"));
+
+    // The throttle says which attempt began the lockout, once.
+    let dir = tempfile::tempdir().unwrap();
+    let mut began = 0;
+    for _ in 0..7 {
+        if let crate::manager_auth::Decision::Locked { began: true, .. } =
+            crate::manager_auth::verify(dir.path(), "731905", "000000")
+        {
+            began += 1;
+        }
+    }
+    assert_eq!(began, 1, "only the attempt that locks it begins the lockout");
+}
+
+/// Review 3 #35: the receptionist's call the phone link went down under is
+/// closed then (`device_lost`: a live record never outlives its link), and
+/// the call that takes it up after the reconnect names it and keeps its
+/// caller's number, so the two records of one phone call read as one.
+#[test]
+fn a_call_taken_up_after_a_lost_link_names_the_call_it_resumes() {
+    use aokie_dongle::bluetooth::BluetoothEvent as E;
+    let status = std::sync::Arc::new(RadioStatus::default());
+    let mut tracker = crate::call_session::SessionTracker::new();
+    let mut sink = crate::event_bridge::VecSink::default();
+    handle_event(E::DeviceConnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
+    handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+    handle_event(E::CallerId("0491570157".into()), &mut tracker, None, &mut sink, &status);
+    handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
+    let lost = tracker.call_id().unwrap().to_string();
+    handle_event(E::DeviceDisconnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
+    handle_event(E::DeviceConnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
+    sink.lines.clear();
+    handle_event(E::CallActiveAtConnect, &mut tracker, None, &mut sink, &status);
+    let s = tracker.current().expect("taken up again");
+    assert_ne!(s.id, lost);
+    assert_eq!(s.resumes.as_deref(), Some(lost.as_str()));
+    assert_eq!(s.caller_id.as_deref(), Some("0491570157"), "the caller's number is kept");
+    let incoming: serde_json::Value = sink
+        .lines
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|v| v["params"]["event"]["name"] == json!(crate::contract::events::CALL_INCOMING))
+        .expect("the resumed call's record starts");
+    assert_eq!(incoming["params"]["event"]["data"]["resumesCall"], json!(lost));
+    assert_eq!(incoming["params"]["event"]["data"]["from"], json!("0491570157"));
+    assert!(status.lost_call.lock().unwrap().is_none(), "taken once");
+}
+
+/// Review 3 #35: a setting taken away no longer leaves its last value for
+/// the next radio start in this process: every variable a setting writes
+/// only when it is set goes back to what OAIY started the process with.
+#[test]
+fn every_env_a_setting_writes_only_when_set_is_put_back() {
+    let source = include_str!("../connector.rs").replace("\r\n", "\n");
+    for var in [
+        "AOKIE_STT_ENDPOINT_MS",
+        "AOKIE_MAX_SILENCE_SECS",
+        "AOKIE_AI_RECEPTIONIST",
+        "AOKIE_AI_MODEL",
+        "AOKIE_AI_PERSONA",
+        "AOKIE_BARGE_RMS",
+        "AOKIE_HFP_CODEC",
+        "AOKIE_AGENT_HANGUP",
+    ] {
+        assert!(source.contains(&format!("    \"{var}\",\n")), "{var} is not kept as launched");
+        assert!(source.contains(&format!("restore_launch_env(\"{var}\")")), "{var} is never put back");
+    }
+    for var in ["AOKIE_SPEECH_RATE_PCT", "AOKIE_DETAIL_RATE_PCT", "AOKIE_PROTECTED_MAX_MS"] {
+        assert!(source.contains(&format!("    \"{var}\",\n")), "{var} is not kept as launched");
+    }
+    assert!(source.contains("restore_launch_env(var);"), "the speech pacing ones are put back");
 }

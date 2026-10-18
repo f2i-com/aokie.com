@@ -425,6 +425,14 @@ impl RelayChannel {
         if !status.is_success() {
             return Err(connect_status_error("challenge", status));
         }
+        // The relay server's clock, from the response that carries this
+        // session's endpoint challenge (see realtime_v2::observe_server_date).
+        crate::realtime_v2::observe_server_date(
+            response
+                .headers()
+                .get(reqwest::header::DATE)
+                .and_then(|value| value.to_str().ok()),
+        );
         let body = response
             .text()
             .await

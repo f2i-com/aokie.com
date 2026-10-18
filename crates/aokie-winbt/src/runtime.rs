@@ -316,6 +316,14 @@ impl NativeBtRuntime {
         self.shared.connected.load(Ordering::Acquire)
     }
 
+    /// Whether the bonded phone texts go to is known (review 3 #10). Windows
+    /// drops the idle hands-free line between calls, which clears
+    /// `connected`, while every text pages the phone on its own: a text is
+    /// refused only when no phone has been seen at all.
+    pub fn phone_known(&self) -> bool {
+        self.shared.phone_address.read().map(|p| *p != 0).unwrap_or(false)
+    }
+
     pub fn get_sample_rate(&self) -> u16 {
         self.shared.sample_rate.load(Ordering::Acquire)
     }

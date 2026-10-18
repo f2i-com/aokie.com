@@ -527,6 +527,20 @@ const radioDown = { radio: { initialized: false, connected: false, localAddress:
   assert.deepEqual(doneCalls(setup), [['done', 'Built-in Bluetooth: no dongle needed']]);
 }
 
+{
+  // `auto` is the dongle whenever one is plugged in, as the plugin starts it (review 3 #27): the dongle's step, and
+  // the setup wizard's manifest step is not skipped for it.
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: { 'settings.get': { settings: { transportMode: 'auto' } }, 'dongle.diagnostics': radioUp, 'dongle.list': { connected: [boundDongle] } },
+  });
+  assert.doesNotMatch(page.el('tab-dongle').innerHTML, /No dongle needed/);
+  assert.deepEqual(doneCalls(setup), [['done', 'Dongle ready (00:1A:7D:DA:71:13)']]);
+  const dongleStep = manifest.setup.steps.find((s) => s.id === 'dongle');
+  assert.deepEqual(dongleStep.when.notIn, ['native']);
+}
+
 // ---- setup mode: a view this screen does not have -------------------------------
 
 {
@@ -942,6 +956,80 @@ const runningInstall = { kind: 'install', vid: unboundDongle.vid, pid: unboundDo
   assert.deepEqual(installs(page), []);
 }
 
+/** The normal screen (tab bar), for the tab left and come back to. */
+const normalPayloads = (listedFn, extra = {}) => ({
+  'phone.status': { connected: false, paired: false },
+  'phone.listPaired': { devices: [] },
+  'dongle.diagnostics': radioDown,
+  'call.current': { call: null },
+  'call.switchboard': { waiting: null, parked: null },
+  'settings.get': { settings: {} },
+  'dongle.list': listedFn,
+  ...extra,
+});
+
+{
+  // An install that ends while the tab is away (review 3 #18): on its return the tab shows how it went, as the wait
+  // would have (here: verified on WinUSB), and does not come back on Install as if nothing had run.
+  let listed = { connected: [unboundDongle], driverModel: 'winusb', driverJob: null };
+  const page = await openScreen({
+    payloads: normalPayloads(() => listed, {
+      'dongle.installDriver': () => {
+        listed = { ...listed, driverJob: runningInstall };
+        return { accepted: true, installed: false, job: runningInstall };
+      },
+    }),
+  });
+  const html = () => page.el('tab-dongle').innerHTML;
+  await page.clickDocument({ 'data-tab': 'dongle' });
+  await pickDongle(page, unboundDongle);
+  await page.click('dongle', 'dg-continue');
+  await page.click('dongle', 'dg-install');
+  assert.match(html(), /data-act="dg-install" disabled/);
+  await page.clickDocument({ 'data-tab': 'overview' });
+  listed = {
+    connected: [boundDongle],
+    driverModel: 'winusb',
+    driverJob: { ...runningInstall, state: 'done', finishedAt: '2026-10-18T10:01:00Z', result: { installed: true } },
+  };
+  await page.clickDocument({ 'data-tab': 'dongle' });
+  assert.match(html(), /is bound to WinUSB and ready/);
+  assert.equal(installs(page).length, 1);
+  // Shown once: the next return is the tab as it is.
+  await page.clickDocument({ 'data-tab': 'overview' });
+  await page.clickDocument({ 'data-tab': 'dongle' });
+  assert.equal(page.log.filter((l) => l[0] === 'toast' && /bound to WinUSB and ready/.test(l[2])).length, 1);
+}
+
+{
+  // A failed one says why on the return; one that vanished (Aokie started again meanwhile) is checked as after any
+  // install instead of reading as nothing having run.
+  let listed = { connected: [unboundDongle], driverModel: 'winusb', driverJob: null };
+  const page = await openScreen({
+    payloads: normalPayloads(() => listed, {
+      'dongle.installDriver': () => {
+        listed = { ...listed, driverJob: runningInstall };
+        return { accepted: true, installed: false, job: runningInstall };
+      },
+    }),
+  });
+  const html = () => page.el('tab-dongle').innerHTML;
+  await page.clickDocument({ 'data-tab': 'dongle' });
+  await pickDongle(page, unboundDongle);
+  await page.click('dongle', 'dg-continue');
+  await page.click('dongle', 'dg-install');
+  await page.clickDocument({ 'data-tab': 'overview' });
+  listed = { ...listed, driverJob: { ...runningInstall, state: 'failed', finishedAt: '2026-10-18T10:01:00Z', error: 'the elevation prompt was declined' } };
+  await page.clickDocument({ 'data-tab': 'dongle' });
+  assert.match(html(), /the elevation prompt was declined/);
+
+  await page.click('dongle', 'dg-install');
+  await page.clickDocument({ 'data-tab': 'overview' });
+  listed = { connected: [boundDongle], driverModel: 'winusb', driverJob: null };
+  await page.clickDocument({ 'data-tab': 'dongle' });
+  assert.match(html(), /is bound to WinUSB and ready/);
+}
+
 {
   // Restore: done only once the plugin reads the dongle back on another driver, which the toast names.
   const runningRestore = { kind: 'restore', vid: boundDongle.vid, pid: boundDongle.pid, state: 'running', startedAt: '2026-10-18T10:00:00Z' };
@@ -990,6 +1078,79 @@ const runningInstall = { kind: 'install', vid: unboundDongle.vid, pid: unboundDo
   });
   assert.match(page.el('tab-dongle').innerHTML, /could not load the RTL8761BU firmware when it last started: its firmware files are not there/);
   assert.match(page.el('tab-dongle').innerHTML, /phones do not see it when pairing/);
+}
+
+// ---- small guards: the restart button, the consent form's call warning ----------------
+
+/** Run a tab's click listeners for `act` now, without waiting between (two presses in one go). */
+function pressNow(page, panel, act) {
+  for (const fn of page.el('tab-' + panel).listeners.click || []) fn({ target: clickTarget({ 'data-act': act }), preventDefault() {} });
+}
+
+{
+  // "Restart receptionist now" (review 3 #31): a plugin that cannot say whether a call is on the line is not
+  // restarted (that could be the call it drops), and a second press while the first is under way does nothing.
+  let restarts = 0;
+  let current = new Error('the plugin did not answer');
+  const page = await openScreen({
+    payloads: normalPayloads({ connected: [] }, {
+      'call.current': () => current,
+      'settings.set': { configVersion: 2, settings: { persona: 'Front desk' }, appliesAtReconnect: ['persona'] },
+    }),
+    restartPlugin: async () => {
+      restarts += 1;
+      return true;
+    },
+  });
+  await page.clickDocument({ 'data-tab': 'settings' });
+  for (const fn of page.el('tab-settings').listeners.input || []) {
+    fn({ type: 'input', target: { getAttribute: (n) => (n === 'data-key' ? 'persona' : null), value: 'Front desk' } });
+  }
+  await page.click('settings', 'set-save');
+  assert.match(page.el('tab-settings').innerHTML, /data-act="set-apply-restart"/);
+  await page.click('settings', 'set-apply-restart');
+  assert.equal(restarts, 0, 'not restarted while it cannot tell');
+  assert.ok(page.log.some((l) => l[0] === 'toast' && l[1] === 'error' && /could not say whether a call is on the line/.test(l[2])));
+  assert.doesNotMatch(page.el('tab-settings').innerHTML, /data-act="set-apply-restart" disabled/, 'the button is back for a later try');
+
+  current = { call: null };
+  const asked = page.commands().filter((c) => c === 'call.current').length;
+  pressNow(page, 'settings', 'set-apply-restart');
+  pressNow(page, 'settings', 'set-apply-restart');
+  await settle();
+  assert.equal(page.commands().filter((c) => c === 'call.current').length - asked, 1, 'one check for two presses');
+  assert.equal(restarts, 1, 'one restart for two presses');
+}
+
+{
+  // The consent form's "a call is on the line" warning holds for the press after it only: reopening the form asks
+  // again rather than letting the next Accept end the call unwarned (review 3 #31).
+  const setup = setupStub({ mode: 'setup', step: 'consent', view: 'consent' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'consent.get': consentNone,
+      'settings.get': { settings: {} },
+      'call.current': { call: { callId: 'call_live', state: 'active' } },
+      'consent.set': { recorded: true },
+      'settings.set': { configVersion: 2, settings: { consentMode: 'enforce' } },
+    },
+  });
+  // OAIY does not sign grants (no signatureRequired): the form does not say it does (review 3 #26).
+  assert.match(page.el('tab-consent').innerHTML, /kept by Aokie on this computer/);
+  assert.doesNotMatch(page.el('tab-consent').innerHTML, /signed by this computer/);
+  const untick = { getAttribute: (n) => (n === 'data-scope' ? 'bluetooth' : null), checked: false };
+  for (const fn of page.el('tab-consent').listeners.change || []) fn({ target: untick });
+  await page.click('consent', 'cns-accept');
+  assert.match(page.el('tab-consent').innerHTML, /A call is on the line/);
+  await page.click('consent', 'cns-toggle');
+  await page.click('consent', 'cns-toggle');
+  await page.click('consent', 'cns-accept');
+  assert.ok(!page.commands().includes('consent.set'), 'warned again, nothing recorded');
+  assert.match(page.el('tab-consent').innerHTML, /A call is on the line/);
+  // The press right after the warning goes ahead, as before.
+  await page.click('consent', 'cns-accept');
+  assert.ok(page.commands().includes('consent.set'));
 }
 
 console.log('Receptionist setup-mode checks passed (isolated host; no live commands).');

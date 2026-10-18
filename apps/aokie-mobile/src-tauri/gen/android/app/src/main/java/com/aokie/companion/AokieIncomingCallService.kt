@@ -42,6 +42,26 @@ internal fun aokieOfferExpiryApplies(
   currentStatus in setOf(AokieVoiceOffer.STATUS_RINGING, AokieVoiceOffer.STATUS_ANSWER_REQUESTED) &&
   currentDeadlineAt == actionDeadlineAt && nowSeconds >= actionDeadlineAt
 
+/** How long a decline waits for the signed offer behind a push-only offer. */
+internal const val AOKIE_AUTHORITATIVE_OFFER_WAIT_MS = 5_000L
+
+/**
+ * How long to wait for the signed offer behind a push-only offer.
+ *
+ * An Answer waits until the offer's own answer deadline: the claim window is 45 s, and a cold start over
+ * cellular could take longer than the five seconds this once was, so the call was cancelled while it was
+ * still claimable. Both times are this phone's clock (the deadline is set here when Answer is pressed).
+ * A decline, which sets no deadline, keeps the short wait.
+ */
+internal fun aokieAuthoritativeOfferWaitMs(offer: AokieVoiceOffer?, nowMs: Long): Long {
+  val deadlineAt = offer
+    ?.takeIf { it.status == AokieVoiceOffer.STATUS_ANSWER_REQUESTED }
+    ?.answerDeadlineAt
+    ?: return AOKIE_AUTHORITATIVE_OFFER_WAIT_MS
+  return (deadlineAt * 1_000 - nowMs)
+    .coerceIn(0L, AokieVoiceOffer.ANSWER_SETUP_TIMEOUT_SECONDS * 1_000)
+}
+
 internal enum class AokieSystemEndRoute { DECLINE_RINGING, HANG_UP_CALLER, RETURN_TO_AOKIE }
 internal enum class AokieSystemHangupResultRoute { CALLER_ENDED, RETURN_COMPANION_LEASE }
 
@@ -395,8 +415,9 @@ class AokieIncomingCallService : Service() {
   }
 
   private suspend fun onSystemAnswer(offer: AokieVoiceOffer, fence: AokieCallFence) {
-    // Throwing refuses the system surface's answer.
-    if (!claimAnswer(offer, fence)) {
+    // Throwing refuses the system surface's answer. Telecom gives this callback only a few seconds, so
+    // it keeps the short wait for the signed offer.
+    if (!claimAnswer(offer, fence, waitForDeadline = false)) {
       throw IllegalStateException("Aokie authoritative answer was not admitted")
     }
   }
@@ -407,7 +428,11 @@ class AokieIncomingCallService : Service() {
    * to Rust's v2 client and wait until the lease request is admitted. False when any step fails; a
    * refused admission also cancels the offer.
    */
-  private suspend fun claimAnswer(offer: AokieVoiceOffer, fence: AokieCallFence): Boolean {
+  private suspend fun claimAnswer(
+    offer: AokieVoiceOffer,
+    fence: AokieCallFence,
+    waitForDeadline: Boolean = true,
+  ): Boolean {
     if (!aokieCallActionApplies(fence, activeFence)) {
       AokieOfferStore.recordDiagnostic(this, "answer_offer_replaced")
       return false
@@ -419,7 +444,7 @@ class AokieIncomingCallService : Service() {
     }
     scheduleOfferExpiry(answerRequested, fence)
     launchCompanion()
-    val pending = awaitAuthoritativeOffer(offer)
+    val pending = awaitAuthoritativeOffer(offer, waitForDeadline)
     if (pending == null) {
       AokieOfferStore.recordDiagnostic(this, "answer_offer_not_authenticated")
       return false
@@ -542,8 +567,20 @@ class AokieIncomingCallService : Service() {
     return true
   }
 
-  private suspend fun awaitAuthoritativeOffer(offer: AokieVoiceOffer): AokieVoiceOffer? {
-    val deadline = android.os.SystemClock.elapsedRealtime() + 5_000L
+  private suspend fun awaitAuthoritativeOffer(
+    offer: AokieVoiceOffer,
+    waitForDeadline: Boolean = false,
+  ): AokieVoiceOffer? {
+    val wait = if (waitForDeadline) {
+      aokieAuthoritativeOfferWaitMs(
+        AokieOfferStore.current(this, clearExpired = true)?.takeIf { it.offerId == offer.offerId },
+        System.currentTimeMillis(),
+      )
+    } else {
+      AOKIE_AUTHORITATIVE_OFFER_WAIT_MS
+    }
+    // Counted on the monotonic clock; the offer store still drops the offer once its deadline passes.
+    val deadline = android.os.SystemClock.elapsedRealtime() + wait
     while (android.os.SystemClock.elapsedRealtime() < deadline) {
       val current = AokieOfferStore.current(this, clearExpired = true)
       if (current?.offerId != offer.offerId) return null

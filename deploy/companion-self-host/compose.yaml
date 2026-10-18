@@ -75,9 +75,9 @@ services:
       - "${PUBLIC_IPV4:-0.0.0.0}:3478:3478/udp"
       - "[${PUBLIC_IPV6:-::}]:3478:3478/tcp"
       - "[${PUBLIC_IPV6:-::}]:3478:3478/udp"
-      - "${PUBLIC_IPV4:-0.0.0.0}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/tcp"
+      # The relay range is UDP only: coturn runs with no-tcp-relay, so a TCP
+      # mapping of it would only expose ports that carry nothing.
       - "${PUBLIC_IPV4:-0.0.0.0}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp"
-      - "[${PUBLIC_IPV6:-::}]:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/tcp"
       - "[${PUBLIC_IPV6:-::}]:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp"
     expose:
       - 3479

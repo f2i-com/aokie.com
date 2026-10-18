@@ -83,7 +83,16 @@ pub(crate) struct V2Gateway {
 struct ReplayCache {
     by_app: HashMap<String, HashMap<String, u64>>,
     total: usize,
+    /// When expired ids were last swept from every app. Without a periodic
+    /// sweep an app that went quiet kept its map of dead ids, and an app whose
+    /// ids had all expired kept an empty map, until the relay-wide ceiling was
+    /// reached.
+    pruned_at: u64,
 }
+
+/// Longest an expired id, or an app with none left, stays in a
+/// [`ReplayCache`].
+const REPLAY_CACHE_SWEEP_SECONDS: u64 = 60;
 
 #[derive(Debug, PartialEq, Eq)]
 enum ReplayClaim {
@@ -103,14 +112,18 @@ impl ReplayCache {
         per_app: usize,
         total: usize,
     ) -> ReplayClaim {
+        if now >= self.pruned_at.saturating_add(REPLAY_CACHE_SWEEP_SECONDS) {
+            self.prune(now);
+        }
         if let Some(entries) = self.by_app.get_mut(app_id) {
             let before = entries.len();
             entries.retain(|_, expiry| *expiry > now);
             self.total -= before - entries.len();
-            if entries.contains_key(id) {
+            if entries.is_empty() {
+                self.by_app.remove(app_id);
+            } else if entries.contains_key(id) {
                 return ReplayClaim::Replay;
-            }
-            if entries.len() >= per_app {
+            } else if entries.len() >= per_app {
                 // Only this app is refused; an id is never forgotten before
                 // it expires, so replay protection stays whole.
                 return ReplayClaim::AppFull;
@@ -136,6 +149,7 @@ impl ReplayCache {
             !entries.is_empty()
         });
         self.total = self.by_app.values().map(HashMap::len).sum();
+        self.pruned_at = now;
     }
 }
 
@@ -7533,6 +7547,39 @@ mod tests {
             }
         }
         assert!(refused_for_rate);
+    }
+
+    #[test]
+    fn the_replay_cache_sweeps_dead_ids_and_apps_that_went_quiet() {
+        let mut cache = ReplayCache::default();
+        let now = 1_000_000;
+        for app in ["app_a", "app_b", "app_c"] {
+            assert_eq!(
+                cache.claim(app, "jti_1", now + 30, now, 8, 64),
+                ReplayClaim::Fresh
+            );
+        }
+        // app_a comes back after its id expired: its map is rebuilt from
+        // nothing, never left behind empty.
+        let later = now + 31;
+        assert_eq!(
+            cache.claim("app_a", "jti_2", later + 30, later, 8, 64),
+            ReplayClaim::Fresh
+        );
+        assert_eq!(cache.by_app["app_a"].len(), 1);
+        // A minute on, any claim sweeps the apps that went quiet.
+        let much_later = later + REPLAY_CACHE_SWEEP_SECONDS + 31;
+        assert_eq!(
+            cache.claim("app_d", "jti_1", much_later + 30, much_later, 8, 64),
+            ReplayClaim::Fresh
+        );
+        assert_eq!(cache.by_app.keys().collect::<Vec<_>>(), vec!["app_d"]);
+        assert_eq!(cache.total, 1);
+        // An unexpired id is still a replay after the sweep.
+        assert_eq!(
+            cache.claim("app_d", "jti_1", much_later + 30, much_later + 1, 8, 64),
+            ReplayClaim::Replay
+        );
     }
 
     #[test]

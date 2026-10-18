@@ -301,6 +301,10 @@ pub struct HfpHandsFreeState {
     /// ringing call and sent a second CHUP, then an ATA, into a call that was
     /// gone).
     setup_refused: bool,
+    /// A refused ATA on this ringing call was sent once more (review 3 #28).
+    answer_retried: bool,
+    /// A refused AT+CHUP on this live call was sent once more.
+    hangup_retried: bool,
     /// The dongle can carry wide-band speech, so mSBC is offered in AT+BAC.
     /// A +BCS naming a codec we never offered is answered with our list
     /// again, never confirmed (HFP §4.11.3).
@@ -334,6 +338,8 @@ impl Default for HfpHandsFreeState {
             terminate_pending: false,
             second_setup_unverified: false,
             setup_refused: false,
+            answer_retried: false,
+            hangup_retried: false,
             wbs_supported: false,
             selected_codec: None,
         }
@@ -665,6 +671,35 @@ impl HfpHandsFreeState {
         self.call_active
     }
 
+    /// The phone refused one call-control command once the link was up
+    /// (review 3 #28): what follows. A refused AT+CHUP did not refuse the
+    /// setup, so its `callsetup,0` is read as any other again (were the owner
+    /// to answer on the handset then, the call was read as a screened end
+    /// and a recovered receptionist session). A refused ATA on a call still
+    /// ringing, and a refused AT+CHUP on a live call, are sent once more: a
+    /// refusal is often the phone racing its own state, and left alone the
+    /// call rings out, or the line stays open after the agent hung up.
+    /// Returns the command to send again, if any.
+    pub fn after_refusal(&mut self, command: &str) -> Option<HfpAtCommand> {
+        match command {
+            "AT+CHUP" => {
+                self.setup_refused = false;
+                if self.call_active && !self.hangup_retried {
+                    self.hangup_retried = true;
+                    return Some(HfpAtCommand::RejectOrHangup);
+                }
+            }
+            "ATA" => {
+                if self.incoming_call && !self.call_active && !self.setup_refused && !self.answer_retried {
+                    self.answer_retried = true;
+                    return Some(HfpAtCommand::Answer);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// The phone's indicators show a call: up, ringing, being dialed, or
     /// ending with its verdict still held. While this is true the audio
     /// channel closing is not the call ending (review 1 #4).
@@ -975,6 +1010,7 @@ impl HfpHandsFreeState {
                 self.incoming_call = true;
                 self.outgoing_setup = false;
                 self.setup_refused = false;
+                self.answer_retried = false;
                 events.push(HfpEvent::IncomingCall);
                 events
             }
@@ -1011,6 +1047,11 @@ impl HfpHandsFreeState {
 
     fn update_call_state(&mut self, active: bool) -> Vec<HfpEvent> {
         self.setup_refused = false;
+        if active != self.call_active {
+            // A call that comes up or ends is a new one for the retries.
+            self.answer_retried = false;
+            self.hangup_retried = false;
+        }
         if active {
             // Resolves a held callsetup-drop: it was the ANSWER transition
             // (the AG just sent `callsetup,0` before `call,1`).
@@ -1744,6 +1785,11 @@ mod tests {
         );
         assert!(state.call_active());
         assert!(!state.incoming_call());
+        // Review 3 #29: a waiting caller the indicators confirmed is not one
+        // the phone agreed to switch to: three-way calling was never
+        // negotiated, and the runtime says so to the plugin, whose hold
+        // juggle stays off.
+        assert!(!state.three_way_negotiated());
         // The newcomer gives up: the live call is untouched.
         assert_eq!(
             state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),

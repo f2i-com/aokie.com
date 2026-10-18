@@ -2,6 +2,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { MAX_V2_ASSISTANCE_ANSWER_BYTES, parseCallSnapshot, parseCommandAck, sanitizeLine } from "../protocol/codec";
 import { MAX_JSON_SAFE_INTEGER, type CommandEnvelope } from "../protocol/types";
+import { setProtocolClockOffsetSeconds } from "../protocolClock";
 import type {
   BridgeEvent,
   CompanionAvailability,
@@ -1757,6 +1758,13 @@ export class TauriCompanionBridge implements CompanionBridge {
         } catch (error) {
           this.emit({ type: "media_levels", value: null });
           this.emit({ type: "error", message: error instanceof Error ? error.message : "Invalid native media levels" });
+        }
+      }),
+      listen<unknown>("aokie-companion://v2-server-clock", ({ payload }) => {
+        // The offset native code checks protocol times with; see protocolClock.ts.
+        if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+          const event = payload as Record<string, unknown>;
+          if (Object.keys(event).length === 1) setProtocolClockOffsetSeconds(event.offsetSeconds);
         }
       }),
       listen<unknown>("aokie-companion://v2-snapshot", ({ payload }) => {

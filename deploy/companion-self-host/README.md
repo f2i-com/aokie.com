@@ -37,8 +37,8 @@ Prerequisites:
 - inbound TCP 80, 443, 3478 and 5349;
 - inbound UDP 3478;
 - inbound UDP for the configured relay range (49160-49200 by default), with
-  one-to-one port mapping (TCP relay allocations are disabled, so the TCP
-  mappings of that range carry nothing);
+  one-to-one port mapping (TCP relay allocations are disabled, so the range is
+  published over UDP only);
 - working Docker IPv6 plus routed/firewalled IPv6 before setting
   `TURN_EXTERNAL_IPV6` or publishing an AAAA record.
 

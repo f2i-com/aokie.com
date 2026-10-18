@@ -142,9 +142,16 @@
         known = true;
         render();
       }
-    ).then(function () {
-      refreshing = null;
-    });
+    ).then(
+      function () {
+        refreshing = null;
+      },
+      // (as a finally: a render that threw above must not leave every later refresh waiting on this one)
+      function (e) {
+        refreshing = null;
+        throw e;
+      }
+    );
     return refreshing;
   }
 

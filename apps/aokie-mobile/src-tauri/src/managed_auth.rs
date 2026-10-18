@@ -37,6 +37,13 @@ const MAX_CALLBACK_BYTES: usize = 16 * 1024;
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_ADMISSION_RESPONSE_BYTES: usize = 64 * 1024;
 const REFRESH_EARLY_SECONDS: u64 = 45;
+/// The access-token lifetime assumed when a token response leaves out
+/// `expires_in` (RFC 6749 §5.1 only recommends it) or sends one this build
+/// cannot read. Short, so a token that really lives less is refreshed soon.
+const DEFAULT_ACCESS_TOKEN_TTL_SECONDS: u64 = 300;
+/// The longest access-token lifetime this build relies on. A longer one is
+/// used for this long and then refreshed, never refused.
+const MAX_ACCESS_TOKEN_TTL_SECONDS: u64 = 3_600;
 // The longest admission the server issues, and how far its clock may lead
 // this phone's when it stamps the absolute expiry.
 const MAX_ADMISSION_TTL_SECONDS: u64 = 300;
@@ -228,7 +235,10 @@ pub(crate) struct ManagedForgetOutcome {
 struct TokenResponse {
     access_token: String,
     token_type: String,
-    expires_in: u64,
+    /// Read leniently (see [`lenient_expires_in`]): a missing or odd value is
+    /// defaulted later, never a reason to refuse the response.
+    #[serde(default, deserialize_with = "lenient_expires_in")]
+    expires_in: Option<u64>,
     #[serde(default)]
     refresh_token: Option<String>,
     #[serde(default)]
@@ -244,6 +254,36 @@ impl TokenResponse {
             None => requested.to_vec(),
         }
     }
+}
+
+/// `expires_in` as a whole number of seconds: an integer, a float or a
+/// numeric string. Anything else reads as absent rather than failing the
+/// whole token response.
+fn lenient_expires_in<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Number(number)) => number.as_u64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                .map(|seconds| seconds as u64)
+        }),
+        Some(serde_json::Value::String(text)) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    })
+}
+
+/// What this build takes from a token response it has checked.
+#[derive(Debug, PartialEq, Eq)]
+struct AcceptedToken {
+    access_token: String,
+    /// Seconds, defaulted and clamped (see [`accept_token_response`]).
+    expires_in: u64,
+    /// The granted scopes this build asked for; any others are dropped.
+    scopes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -804,14 +844,14 @@ pub(crate) async fn managed_authorize_profile(
         &requested_scopes,
     )
     .await?;
-    validate_token_response(&token, &requested_scopes)?;
     // `offline_access` was requested, so the first exchange must issue one.
     let issued_refresh = token
         .refresh_token
-        .as_deref()
+        .clone()
         .ok_or("OAuth sign-in did not issue a refresh credential")?;
+    let token = accept_token_response(token, &requested_scopes)?;
     let refresh_account = refresh_account(&discovery, &device_id)?;
-    store_refresh(app, &refresh_account, issued_refresh).await?;
+    store_refresh(app, &refresh_account, &issued_refresh).await?;
     let now = unix_now()?;
     let session = ManagedSession {
         profile_id: profile_id.clone(),
@@ -831,7 +871,7 @@ pub(crate) async fn managed_authorize_profile(
         app_id: selected_app_id.clone(),
         device_id: device_id.clone(),
         oauth_device_id: None,
-        scopes: token.granted_scopes(&requested_scopes),
+        scopes: token.scopes,
         access_token: token.access_token,
         access_expires_at: now.saturating_add(token.expires_in),
         discovery_relay_only: discovery.relay_only,
@@ -1286,12 +1326,16 @@ async fn refresh_access_token(
                 message
             }
         })?;
-    validate_token_response(&token, &session.scopes)?;
-    // Public-client refresh rotation retires the old token server-side. The
-    // new token must reach Credential Manager before it becomes authoritative
-    // in memory; a storage failure is surfaced immediately. A server that did
+    // Public-client refresh rotation retires the old token server-side the
+    // moment it answers, so the rotated one is stored FIRST, before anything
+    // else in the response is checked: refusing the response with the new
+    // token unstored left only a revoked one, and the next refresh signed the
+    // person out. A storage failure is surfaced immediately. A server that did
     // not rotate leaves out `refresh_token`, and the one we hold stays valid.
     if let Some(rotated) = token.refresh_token.as_deref() {
+        if !refresh_token_is_storable(rotated) {
+            return Err("OAuth token response contains invalid credentials".into());
+        }
         if store_refresh(app, &session.refresh_account, rotated)
             .await
             .is_err()
@@ -1300,7 +1344,8 @@ async fn refresh_access_token(
             return Err("managed refresh rotation could not be persisted; sign in again".into());
         }
     }
-    session.scopes = token.granted_scopes(&session.scopes);
+    let token = accept_token_response(token, &session.scopes)?;
+    session.scopes = token.scopes;
     session.access_token = token.access_token;
     session.access_expires_at = unix_now()?.saturating_add(token.expires_in);
     Ok(session)
@@ -1402,33 +1447,56 @@ async fn token_request(url: &str, form: &[(&str, &str)]) -> Result<TokenResponse
     serde_json::from_slice(&bytes).map_err(|_| "OAuth token response is invalid".into())
 }
 
-fn validate_token_response(token: &TokenResponse, allowed_scopes: &[String]) -> Result<(), String> {
-    let refresh_valid = token.refresh_token.as_ref().is_none_or(|refresh| {
-        refresh.len() >= 16
-            && refresh.len() <= MAX_TOKEN_BYTES
-            && !refresh.chars().any(char::is_control)
-    });
+/// Whether a refresh token is safe to keep in native secure storage.
+fn refresh_token_is_storable(refresh: &str) -> bool {
+    refresh.len() >= 16 && refresh.len() <= MAX_TOKEN_BYTES && !refresh.chars().any(char::is_control)
+}
+
+/// Check a token response and take what this build needs from it.
+///
+/// Only what cannot be used is refused: a bad access token or token type, a
+/// refresh token unsafe to store, or a grant without `aokie:state`. The rest
+/// is read leniently, because on a refresh the server has already rotated the
+/// refresh family by the time this runs, and refusing then signed the person
+/// out: a missing or unreadable `expires_in` becomes
+/// [`DEFAULT_ACCESS_TOKEN_TTL_SECONDS`], a longer one than
+/// [`MAX_ACCESS_TOKEN_TTL_SECONDS`] is cut to it, and scopes this build did
+/// not ask for are dropped (they grant this session nothing).
+fn accept_token_response(
+    token: TokenResponse,
+    allowed_scopes: &[String],
+) -> Result<AcceptedToken, String> {
+    let refresh_valid = token
+        .refresh_token
+        .as_deref()
+        .is_none_or(refresh_token_is_storable);
     // The token type is case-insensitive (RFC 6749 §5.1).
     if !token.token_type.eq_ignore_ascii_case("Bearer")
         || token.access_token.len() < 16
         || token.access_token.len() > MAX_TOKEN_BYTES
         || token.access_token.chars().any(char::is_control)
         || !refresh_valid
-        || token.expires_in == 0
-        || token.expires_in > 3_600
     {
-        return Err("OAuth token response contains invalid credentials or expiry".into());
+        return Err("OAuth token response contains invalid credentials".into());
     }
-    let scopes = token.granted_scopes(allowed_scopes);
-    if scopes.is_empty()
-        || scopes
-            .iter()
-            .any(|scope| !allowed_scopes.iter().any(|allowed| allowed == scope))
-        || !scopes.iter().any(|scope| scope == "aokie:state")
-    {
-        return Err("OAuth token response contains unexpected scopes".into());
+    let expires_in = match token.expires_in {
+        None | Some(0) => DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
+        Some(seconds) => seconds.min(MAX_ACCESS_TOKEN_TTL_SECONDS),
+    };
+    let mut scopes = Vec::new();
+    for scope in token.granted_scopes(allowed_scopes) {
+        if allowed_scopes.contains(&scope) && !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
     }
-    Ok(())
+    if !scopes.iter().any(|scope| scope == "aokie:state") {
+        return Err("OAuth token response does not grant aokie:state".into());
+    }
+    Ok(AcceptedToken {
+        access_token: token.access_token,
+        expires_in,
+        scopes,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2245,15 +2313,28 @@ mod tests {
     }
 
     #[test]
-    fn token_response_rejects_scope_escalation() {
+    fn token_response_drops_scopes_it_did_not_ask_for_instead_of_signing_out() {
         let token = TokenResponse {
             access_token: "a".repeat(32),
             token_type: "Bearer".into(),
-            expires_in: 600,
+            expires_in: Some(600),
             refresh_token: Some("r".repeat(32)),
-            scope: Some("aokie:state aokie:takeover".into()),
+            scope: Some("aokie:state aokie:takeover aokie:state".into()),
         };
-        assert!(validate_token_response(&token, &["aokie:state".into()]).is_err());
+        // The extra scope grants this session nothing; it is dropped, never
+        // escalated into, and never a reason to refuse a rotated response.
+        let accepted = accept_token_response(token, &["aokie:state".into()]).unwrap();
+        assert_eq!(accepted.scopes, vec!["aokie:state".to_owned()]);
+        assert_eq!(accepted.expires_in, 600);
+        // A grant without aokie:state is still unusable.
+        let token = TokenResponse {
+            access_token: "a".repeat(32),
+            token_type: "Bearer".into(),
+            expires_in: Some(600),
+            refresh_token: None,
+            scope: Some("aokie:takeover".into()),
+        };
+        assert!(accept_token_response(token, &["aokie:state".into()]).is_err());
     }
 
     #[test]
@@ -2261,11 +2342,40 @@ mod tests {
         let token = TokenResponse {
             access_token: format!("{}\n", "a".repeat(31)),
             token_type: "Bearer".into(),
-            expires_in: 600,
+            expires_in: Some(600),
             refresh_token: Some("r".repeat(32)),
             scope: Some("aokie:state".into()),
         };
-        assert!(validate_token_response(&token, &["aokie:state".into()]).is_err());
+        assert!(accept_token_response(token, &["aokie:state".into()]).is_err());
+        assert!(!refresh_token_is_storable(&format!("{}\u{7}", "r".repeat(31))));
+        assert!(!refresh_token_is_storable("short"));
+        assert!(refresh_token_is_storable(&"r".repeat(32)));
+    }
+
+    #[test]
+    fn token_response_expiry_is_defaulted_or_clamped_never_refused() {
+        let requested: Vec<String> = vec!["aokie:state".into()];
+        let parse = |expires_in: serde_json::Value| -> AcceptedToken {
+            let mut body = serde_json::json!({
+                "access_token": "a".repeat(32),
+                "token_type": "Bearer",
+                "scope": "aokie:state"
+            });
+            if !expires_in.is_null() {
+                body["expires_in"] = expires_in;
+            }
+            let token: TokenResponse = serde_json::from_value(body).unwrap();
+            accept_token_response(token, &requested).unwrap()
+        };
+        assert_eq!(parse(serde_json::Value::Null).expires_in, DEFAULT_ACCESS_TOKEN_TTL_SECONDS);
+        assert_eq!(parse(serde_json::json!(0)).expires_in, DEFAULT_ACCESS_TOKEN_TTL_SECONDS);
+        assert_eq!(parse(serde_json::json!(86_400)).expires_in, MAX_ACCESS_TOKEN_TTL_SECONDS);
+        assert_eq!(parse(serde_json::json!(900)).expires_in, 900);
+        assert_eq!(parse(serde_json::json!(900.0)).expires_in, 900);
+        assert_eq!(parse(serde_json::json!("900")).expires_in, 900);
+        assert_eq!(parse(serde_json::json!(-5)).expires_in, DEFAULT_ACCESS_TOKEN_TTL_SECONDS);
+        assert_eq!(parse(serde_json::json!("soon")).expires_in, DEFAULT_ACCESS_TOKEN_TTL_SECONDS);
+        assert_eq!(parse(serde_json::json!({"s": 1})).expires_in, DEFAULT_ACCESS_TOKEN_TTL_SECONDS);
     }
 
     #[test]
@@ -2281,9 +2391,8 @@ mod tests {
             "refresh_expires_in": 86_400
         }))
         .unwrap();
-        validate_token_response(&token, &requested).unwrap();
         assert_eq!(token.refresh_token, None);
-        assert_eq!(token.granted_scopes(&requested), requested);
+        assert_eq!(accept_token_response(token, &requested).unwrap().scopes, requested);
 
         // A present but unsafe refresh token is still refused.
         let token: TokenResponse = serde_json::from_value(serde_json::json!({
@@ -2294,9 +2403,9 @@ mod tests {
             "scope": "aokie:state"
         }))
         .unwrap();
-        assert!(validate_token_response(&token, &requested).is_err());
+        assert!(accept_token_response(token, &requested).is_err());
 
-        // A granted scope still narrows the session, and must be a subset.
+        // A granted scope still narrows the session.
         let token: TokenResponse = serde_json::from_value(serde_json::json!({
             "access_token": "a".repeat(32),
             "token_type": "Bearer",
@@ -2305,9 +2414,8 @@ mod tests {
             "scope": "aokie:state"
         }))
         .unwrap();
-        validate_token_response(&token, &requested).unwrap();
         assert_eq!(
-            token.granted_scopes(&requested),
+            accept_token_response(token, &requested).unwrap().scopes,
             vec!["aokie:state".to_owned()]
         );
     }

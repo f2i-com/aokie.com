@@ -6,7 +6,8 @@ name: Self-host smoke
 # Automatic CI is temporarily paused while checks are run manually.
 # Manual dispatch remains available from the Actions tab.
 #
-# Scope: template rendering acceptance, compose config validation (both
+# Scope: the container lock fitting its crates (scripts/check-container-lock.sh),
+# template rendering acceptance, compose config validation (both
 # profiles), image build with --pull, local-profile boot to HEALTHY (the
 # coturn healthcheck performs a real STUN transaction), gateway /version,
 # container-lock cargo audit, teardown. The full WebSocket handshake +
@@ -27,6 +28,14 @@ jobs:
         working-directory: deploy/companion-self-host
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # As every other checkout here (ci.yml): the token is not left in .git, where a build step could read it.
+          persist-credentials: false
+
+      - name: Container lockfile fits its crates (cargo metadata --locked)
+        # The image builds the two-member container workspace with --locked: a lock that no longer fits its
+        # crates fails here in seconds, with the image's own Rust, before the image build (review 3 #3).
+        run: docker run --rm -v "$PWD/../..:/repo:ro" -w /repo rust:1.92.0-slim sh scripts/check-container-lock.sh
 
       - name: Render acceptance (AK-14 email escaping)
         run: sh render-test.sh

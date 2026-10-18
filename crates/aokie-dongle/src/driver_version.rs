@@ -10,15 +10,15 @@
 //!
 //! The dispatcher picks the value once, renders the INF with it and hands it to the elevated helper in the job;
 //! the helper renders its own copy with the same value instead of reading the clock again, so a UAC prompt
-//! answered after midnight (or a minute later) still matches the INF that was approved. Pure, so it is tested on
-//! every system; only Windows installs a driver.
+//! answered after midnight (or a minute later) still matches the INF that was approved. The clock is UTC's, which
+//! never goes back an hour. Pure, so it is tested on every system; only Windows installs a driver.
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 
 /// The major version every Aokie WinUSB package has carried.
 const MAJOR: u16 = 2;
 
-/// The `DriverVer` of a package rendered at `at` (local time).
+/// The `DriverVer` of a package rendered at `at` (UTC: see [`driver_ver_now`]).
 pub fn driver_ver_at(at: NaiveDateTime) -> String {
     let (minor, build, revision) = version_fields(at.date(), at.hour(), at.minute());
     format!(
@@ -29,9 +29,18 @@ pub fn driver_ver_at(at: NaiveDateTime) -> String {
     )
 }
 
-/// The `DriverVer` of a package rendered now.
+/// The `DriverVer` of a package rendered now, in UTC (review 3 #33): local
+/// time goes back an hour when summer time ends, and a package rendered in
+/// that hour would read as older than the one rendered just before it, which
+/// Windows then keeps.
 pub fn driver_ver_now() -> String {
-    driver_ver_at(chrono::Local::now().naive_local())
+    driver_ver_at(chrono::Utc::now().naive_utc())
+}
+
+/// Today as [`driver_ver_now`] dates it (UTC), for the helper's check of a job's value
+/// ([`check_job_driver_ver`]).
+pub fn driver_ver_today() -> NaiveDate {
+    chrono::Utc::now().date_naive()
 }
 
 /// YY, MMDD and HHMM (a clock before 2000 counts as 2000: the field cannot go below 0).
@@ -152,6 +161,14 @@ mod tests {
         assert!(check_job_driver_ver("10/18/2026,2.26.1019.1200", today).is_err());
         assert!(check_job_driver_ver("10/18/2026,2.26.1018.2460", today).is_err());
         assert!(check_job_driver_ver("10/18/2026,2.26.1018.2400", today).is_err());
+    }
+
+    /// The dispatcher's value and the helper's today are read off one clock, UTC's (review 3 #33).
+    #[test]
+    fn the_value_rendered_now_is_dated_today_on_the_same_clock() {
+        check_job_driver_ver(&driver_ver_now(), driver_ver_today()).unwrap();
+        let (date, _) = parse_driver_ver(&driver_ver_now()).unwrap();
+        assert!((date - chrono::Utc::now().date_naive()).num_days().abs() <= 1);
     }
 
     /// The static package submitted for Microsoft signing: Windows reads its DriverVer, and it covers exactly the

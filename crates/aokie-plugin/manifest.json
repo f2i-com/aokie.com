@@ -221,8 +221,20 @@
         "label": "Aokie radio data (phone pairing keys, call database, logs, and any speech models an older Aokie downloaded)"
       },
       {
+        "path": "~/Library/Application Support/com.aokie.app",
+        "label": "On a Mac: Aokie radio data (phone pairing keys, sealed, in aokie_radio/pairing_store.json, and any speech models an older Aokie downloaded)"
+      },
+      {
+        "path": "$XDG_DATA_HOME/com.aokie.app",
+        "label": "On Linux (~/.local/share/com.aokie.app when XDG_DATA_HOME is unset): Aokie radio data (phone pairing keys, sealed, in aokie_radio/pairing_store.json)"
+      },
+      {
         "credential": "Aokie/*",
         "label": "Sealed keys in Windows Credential Manager (endpoint identity, manager PIN)"
+      },
+      {
+        "credential": "com.aokie.sealed-values/data-key-v1",
+        "label": "On a Mac (login Keychain) or Linux (Secret Service): the key Aokie seals the pairing keys, manager PIN and outbox with"
       },
       {
         "path": "%ProgramData%/Aokie/driver-transactions.jsonl",
@@ -288,8 +300,7 @@
           "command": "settings.get",
           "path": "settings.transportMode",
           "notIn": [
-            "native",
-            "auto"
+            "native"
           ]
         },
         "done": {

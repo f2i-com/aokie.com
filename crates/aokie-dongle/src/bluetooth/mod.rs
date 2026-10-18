@@ -43,6 +43,10 @@ pub enum BluetoothEvent {
         armed: bool,
     },
     AudioDisconnected,
+    /// The phone closed the call's audio itself with the call still active:
+    /// the audio moved to the handset (the owner took the call on the
+    /// phone). The next `AudioConnected` brings it back.
+    AudioOnHandset,
     CallerId(String),
     /// Phase 4: a SECOND caller is knocking while a call is active
     /// (call-waiting-negotiated connections only). One per waiting episode
@@ -376,6 +380,19 @@ impl BluetoothManager {
         self.runtime.is_call_active()
     }
 
+    /// Whether the phone negotiated three-way calling, so a waiting caller
+    /// can be switched to (AT+CHLD=2).
+    pub fn three_way_calling(&self) -> bool {
+        self.runtime.three_way_calling()
+    }
+
+    /// Stop the radio and wait up to `within` for it to end, so what it says
+    /// as it ends (a text still open, reported failed) can still be read
+    /// with `try_recv_event`. True when it ended in time.
+    pub fn stop_within(&mut self, within: std::time::Duration) -> bool {
+        self.runtime.stop_within(within)
+    }
+
     /// Current SCO sample rate (8000 for CVSD, 16000 for mSBC).
     pub fn get_sample_rate(&self) -> u16 {
         self.runtime.sample_rate()
@@ -452,6 +469,7 @@ fn bluetooth_event_from_runtime(
             armed,
         },
         RuntimeEvent::AudioDisconnected => BluetoothEvent::AudioDisconnected,
+        RuntimeEvent::AudioOnHandset => BluetoothEvent::AudioOnHandset,
         RuntimeEvent::CallerId(num) => BluetoothEvent::CallerId(num),
         RuntimeEvent::CallWaiting { number } => BluetoothEvent::CallWaiting { number },
         RuntimeEvent::CallWaitingEnded => BluetoothEvent::CallWaitingEnded,

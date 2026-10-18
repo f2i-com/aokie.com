@@ -1236,6 +1236,11 @@ struct ClientState {
     // clock. Renewal timing uses it so a phone wall clock that trails or
     // leads the gateway's cannot let the gateway expire a live lease.
     lease_received_at: Option<(String, Instant)>,
+    // When the current lease's exact jti expires, by the same monotonic
+    // clock: its remaining life measured on the server clock when it arrived
+    // (see lease_local_deadline). Local expiry and the socket handoff use it,
+    // so a wall-clock jump mid-call can neither end nor stretch the lease.
+    lease_deadline: Option<(String, Instant)>,
     // Lease requests this phone gave up on after LEASE_REQUEST_TIMEOUT, kept
     // for LOCAL_EXPIRY_TOMBSTONE_TTL. A grant that still arrives for one is
     // returned with its exact token instead of failing the session.
@@ -1839,6 +1844,110 @@ fn contain_late_timed_out_grant(
     Ok(true)
 }
 
+/// How many lease lineages one endpoint session hands to the next. Small, so
+/// a flapping connection cannot fill the fence that refuses new grants while
+/// [`MAX_LOCAL_EXPIRY_TOMBSTONES`] are held.
+const MAX_CARRIED_SESSION_TOMBSTONES: usize = 4;
+
+/// The fences an ended endpoint session hands to the next one.
+///
+/// A lease cannot outlive its session: it is bound to the session nonce, and
+/// the gateway (on disconnect) and the Desktop's relay authority (on the new
+/// hello) revoke everything the old session held, so keeping the lease
+/// across a reconnect would need a protocol change. What can outlive it is
+/// relay mail: a grant, renewal, answer or revocation for that lease posted
+/// before the reconnect and delivered after it. Wiping every fence at session
+/// end made each of those fatal to the new session. The lease (and a return
+/// in flight) is therefore tombstoned without its token, a lease request in
+/// flight is remembered as given up, and both are carried for
+/// [`LOCAL_EXPIRY_TOMBSTONE_TTL`]; [`contain_previous_session_lease_status`]
+/// and [`contain_locally_closed_rtc`] then absorb the late traffic.
+fn take_session_fences(
+    client: &mut ClientState,
+) -> (VecDeque<LocalExpiryTombstone>, VecDeque<(String, Instant)>) {
+    let now = Instant::now();
+    let retain_until = now + LOCAL_EXPIRY_TOMBSTONE_TTL;
+    if let Some(lease) = client.lease.take() {
+        let _ = push_local_expiry_tombstone(client, lease, retain_until, false);
+    }
+    if let Some(pending) = client.pending_revoke.take() {
+        let _ = push_local_expiry_tombstone(client, pending.lease, retain_until, false);
+    }
+    if let Some(pending) = client.pending.take() {
+        remember_timed_out_lease_request(client, &pending.request_id, now);
+    }
+    purge_local_expiry_tombstones(client, now);
+    client
+        .timed_out_lease_requests
+        .retain(|(_, retain_until)| *retain_until > now);
+    let mut tombstones = std::mem::take(&mut client.local_expiry_tombstones);
+    // The old session's tokens are never sent again: whatever it still owed
+    // is already in the urgent queue as exact bytes.
+    for tombstone in &mut tombstones {
+        tombstone.lease.token.clear();
+        tombstone.returnable = false;
+    }
+    while tombstones.len() > MAX_CARRIED_SESSION_TOMBSTONES {
+        let oldest = tombstones
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, tombstone)| tombstone.retain_until)
+            .map(|(index, _)| index)
+            .expect("a non-empty queue has an oldest entry");
+        tombstones.remove(oldest);
+    }
+    (
+        tombstones,
+        std::mem::take(&mut client.timed_out_lease_requests),
+    )
+}
+
+/// A lease status for authority an earlier endpoint session of this phone
+/// held or asked for (see [`take_session_fences`]). That authority was
+/// revoked with its session and is bound to the old session nonce, so the
+/// frame can neither renew nor grant anything; it is digested and dropped
+/// instead of failing the new session. Status for a lineage this phone never
+/// knew still goes through the full checks.
+fn contain_previous_session_lease_status(
+    client: &mut ClientState,
+    frame: &LeaseStatusFrame,
+    replay_key: &str,
+    encoded: &str,
+) -> Result<bool, String> {
+    if client
+        .session_nonce
+        .as_deref()
+        .is_none_or(|current| current == frame.lease.session_nonce)
+    {
+        return Ok(false);
+    }
+    let now = Instant::now();
+    purge_local_expiry_tombstones(client, now);
+    client
+        .timed_out_lease_requests
+        .retain(|(_, retain_until)| *retain_until > now);
+    let held_before = client.local_expiry_tombstones.iter().any(|tombstone| {
+        let old = &tombstone.lease.claims;
+        old.session_nonce == frame.lease.session_nonce
+            && old.lease_id == frame.lease.lease_id
+            && old.app_id == frame.lease.app_id
+            && old.device_id == frame.lease.device_id
+    });
+    let asked_for_before = matches!(frame.kind.as_str(), "lease_granted" | "claim_provisional")
+        && client
+            .timed_out_lease_requests
+            .iter()
+            .any(|(request_id, _)| *request_id == frame.request_id);
+    if !held_before && !asked_for_before {
+        return Ok(false);
+    }
+    remember_applied_relay_frame(client, replay_key.to_owned(), encoded)?;
+    eprintln!(
+        "[AokieCompanion][realtime] ignored a lease status for authority an earlier session held"
+    );
+    Ok(true)
+}
+
 fn queue_exact_lease_revocation(
     state: &V2State,
     client: &mut ClientState,
@@ -2325,12 +2434,15 @@ fn clear_stale_end_caller(client: &mut ClientState, now: Instant, now_unix: u64)
     Some(request_id)
 }
 
-/// True when no caller-ending operation is waiting for its result, so a
-/// result now is a late reply to one this phone already stopped waiting for.
-fn end_caller_result_is_late(client: &ClientState) -> bool {
+/// True when this result is not for the caller-ending operation waiting now:
+/// nothing waits for a result (this phone already stopped waiting for it), or
+/// a later attempt does and this is the reply to an earlier one. Either way it
+/// is late, authenticated traffic, and failing on it ended the session. A
+/// result for the waiting operation itself still has to match every fence.
+fn end_caller_result_is_late(client: &ClientState, operation_id: &str) -> bool {
     !matches!(
-        client.pending_end_caller,
-        Some(PendingEndCaller::AwaitingResult { .. })
+        &client.pending_end_caller,
+        Some(PendingEndCaller::AwaitingResult { operation_id: waiting, .. }) if waiting == operation_id
     )
 }
 
@@ -2398,6 +2510,7 @@ impl V2State {
         let urgent_control_frames = std::mem::take(&mut state.urgent_control_frames);
         let spent_mobile_offers = std::mem::take(&mut state.spent_mobile_offers);
         let terminal_offer_acceptances = std::mem::take(&mut state.terminal_offer_acceptances);
+        let (local_expiry_tombstones, timed_out_lease_requests) = take_session_fences(&mut state);
         *state = ClientState {
             answered_assistance_requests,
             applied_relay_frames,
@@ -2405,6 +2518,8 @@ impl V2State {
             urgent_control_frames,
             spent_mobile_offers,
             terminal_offer_acceptances,
+            local_expiry_tombstones,
+            timed_out_lease_requests,
             ..ClientState::default()
         };
     }
@@ -2431,6 +2546,11 @@ impl V2State {
         let mut terminal_offer_acceptances = std::mem::take(&mut state.terminal_offer_acceptances);
         terminal_offer_acceptances
             .retain(|terminal| terminal.app_id == app_id && terminal.device_id == device_id);
+        let (mut local_expiry_tombstones, timed_out_lease_requests) =
+            take_session_fences(&mut state);
+        local_expiry_tombstones.retain(|tombstone| {
+            tombstone.lease.claims.app_id == app_id && tombstone.lease.claims.device_id == device_id
+        });
         *state = ClientState {
             app_id: Some(app_id.to_owned()),
             device_id: Some(device_id.to_owned()),
@@ -2446,6 +2566,8 @@ impl V2State {
             urgent_control_frames,
             spent_mobile_offers,
             terminal_offer_acceptances,
+            local_expiry_tombstones,
+            timed_out_lease_requests,
             ..ClientState::default()
         };
     }
@@ -2610,6 +2732,8 @@ impl V2State {
             let urgent_control_frames = std::mem::take(&mut state.urgent_control_frames);
             let spent_mobile_offers = std::mem::take(&mut state.spent_mobile_offers);
             let terminal_offer_acceptances = std::mem::take(&mut state.terminal_offer_acceptances);
+            let (local_expiry_tombstones, timed_out_lease_requests) =
+                take_session_fences(&mut state);
             *state = ClientState {
                 answered_assistance_requests,
                 applied_relay_frames,
@@ -2617,6 +2741,8 @@ impl V2State {
                 urgent_control_frames,
                 spent_mobile_offers,
                 terminal_offer_acceptances,
+                local_expiry_tombstones,
+                timed_out_lease_requests,
                 ..ClientState::default()
             };
         }
@@ -3005,7 +3131,8 @@ async fn prepare_offer_answer_for_transfer(
         )?;
         let mode = selected.offer.offered_mode;
         if let Some(action) = native_action {
-            validate_native_action(action, unix_now()?)?;
+            // Android stamped the action with this phone's own clock.
+            validate_native_action(action, local_unix_now()?)?;
             if action.kind != NativeCallActionKind::Answer {
                 return Err("native Answer does not match authoritative call state".into());
             }
@@ -3291,7 +3418,8 @@ fn authoritative_android_offer(
         call_id: offer.call_id.clone(),
         call_epoch: offer.call_epoch,
         owner_epoch: offer.owner_epoch,
-        expires_at: offer.expires_at,
+        // Android checks this against its own clock.
+        expires_at: server_to_local_unix(offer.expires_at),
         accepted_transfer_request_id: offer.accepted_transfer_request_id.clone(),
     }))
 }
@@ -4220,7 +4348,8 @@ async fn prepare_assistance_answer(
             .clone()
             .ok_or("v2 device identity is unavailable")?;
         let selected_native_offer = if let Some(action) = native_action {
-            validate_native_action(action, now)?;
+            // Android stamped the action with this phone's own clock.
+            validate_native_action(action, local_unix_now()?)?;
             let transfer_request_id = action
                 .accepted_transfer_request_id
                 .as_deref()
@@ -4448,7 +4577,8 @@ async fn poll_native_call_actions(
     }
     let action: NativeCallAction = serde_json::from_str(&encoded)
         .map_err(|_| "Android native-call action was malformed".to_string())?;
-    if let Err(message) = validate_native_action(&action, unix_now()?) {
+    // Android stamped the action with this phone's own clock.
+    if let Err(message) = validate_native_action(&action, local_unix_now()?) {
         let _ = crate::android_runtime::complete_native_call_action(
             app,
             &action.action_id,
@@ -5413,7 +5543,12 @@ async fn open_overlapping_managed_transport(
     )
     .await
     {
-        Ok(Ok((socket, _))) => socket,
+        Ok(Ok((socket, response))) => {
+            // The upgrade response carries the endpoint challenge's socket:
+            // its `Date` is the gateway's clock.
+            observe_server_date(response_date(&response));
+            socket
+        }
         Ok(Err(error)) => {
             let message = if matches!(
                 &error,
@@ -5629,7 +5764,12 @@ pub(crate) fn spawn(
                 )
                 .await
                 {
-                    Ok(Ok((socket, _))) => Ok(V2Transport::websocket(socket)),
+                    Ok(Ok((socket, response))) => {
+                        // The gateway's clock, from the response that
+                        // carries the endpoint challenge's socket.
+                        observe_server_date(response_date(&response));
+                        Ok(V2Transport::websocket(socket))
+                    }
                     Ok(Err(error)) => Err(
                         if matches!(
                             &error,
@@ -6397,7 +6537,8 @@ fn managed_ws_handoff_lease_ready(client: &ClientState, now: u64) -> Result<(), 
     if matches!(lease.claims.phase, LeasePhase::Prepared) {
         return Err("managed socket handoff is waiting for provisional media to settle".into());
     }
-    if lease.claims.expires_at.saturating_sub(now) <= MANAGED_HANDOFF_MIN_LEASE_REMAINING.as_secs()
+    if current_lease_remaining(client, now)
+        .is_some_and(|remaining| remaining.as_secs() <= MANAGED_HANDOFF_MIN_LEASE_REMAINING.as_secs())
     {
         return Err("managed socket handoff is waiting for the active media lease to renew".into());
     }
@@ -6971,6 +7112,14 @@ async fn handle_gateway_frame(
             if let Err(message) = publish_current_android_offer(app, state).await {
                 emit_error(app, &message);
             }
+            // The renderer gates its own controls on these server-clock
+            // times, so it gets the offset with every snapshot.
+            let _ = app.emit(
+                "aokie-companion://v2-server-clock",
+                ServerClockEvent {
+                    offset_seconds: SERVER_CLOCK.offset(),
+                },
+            );
             app.emit("aokie-companion://v2-snapshot", frame)
                 .map_err(|_| "could not deliver protocol-v2 snapshot".to_string())?;
             if assistance_cleared {
@@ -7255,12 +7404,13 @@ async fn handle_gateway_frame(
                 {
                     return Ok(());
                 }
-                if end_caller_result_is_late(&client) {
-                    // The local wait (NATIVE_HANGUP_TIMEOUT) already gave up.
-                    // The Desktop's own snapshot and lease revocation carry
-                    // the outcome; failing here ended the session instead.
+                if end_caller_result_is_late(&client, &frame.operation_id) {
+                    // The local wait (NATIVE_HANGUP_TIMEOUT) already gave up,
+                    // or this answers an earlier attempt. The Desktop's own
+                    // snapshot and lease revocation carry the outcome; failing
+                    // here ended the session instead.
                     eprintln!(
-                        "[AokieCompanion][realtime] ignored a caller-ending result that arrived after its local wait ended"
+                        "[AokieCompanion][realtime] ignored a caller-ending result for an operation this phone is no longer waiting on"
                     );
                     if client.relay_transport {
                         remember_applied_relay_frame(&mut client, replay_key, encoded)?;
@@ -7795,6 +7945,8 @@ struct LeaseStatusPlan {
     ice_servers: Vec<IceServerConfig>,
     relay_only: bool,
     received_at: Instant,
+    /// Protocol time when the status arrived, for [`lease_local_deadline`].
+    received_unix: u64,
 }
 
 impl LeaseStatusPlan {
@@ -7855,7 +8007,17 @@ where
     if let Some((expired, queue_error)) = expired_before_status {
         let containment = {
             let mut client = state.inner.lock().await;
-            contain_late_local_expiry_renewal(state, &mut client, &frame, &replay_key, encoded, now)
+            match contain_previous_session_lease_status(&mut client, &frame, &replay_key, encoded) {
+                Ok(false) => contain_late_local_expiry_renewal(
+                    state,
+                    &mut client,
+                    &frame,
+                    &replay_key,
+                    encoded,
+                    now,
+                ),
+                other => other,
+            }
         };
         cleanup(vec![expired.session]).await;
         if let Some(message) = queue_error {
@@ -7872,6 +8034,10 @@ where
     {
         let mut client = state.inner.lock().await;
         if applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
+            return Ok(None);
+        }
+        if contain_previous_session_lease_status(&mut client, &frame, &replay_key, encoded)? {
+            // Relay mail for authority the previous endpoint session held.
             return Ok(None);
         }
         if contain_late_local_expiry_renewal(state, &mut client, &frame, &replay_key, encoded, now)?
@@ -8091,6 +8257,7 @@ where
             ice_servers: client.ice_servers.clone(),
             relay_only: client.relay_only,
             received_at,
+            received_unix: now,
         }
     };
 
@@ -8157,6 +8324,14 @@ async fn commit_lease_status(
     }
     client.lease = Some(plan.proposed.clone());
     client.lease_received_at = Some((plan.proposed.claims.jti.clone(), plan.received_at));
+    client.lease_deadline = Some((
+        plan.proposed.claims.jti.clone(),
+        lease_local_deadline(
+            plan.received_at,
+            plan.received_unix,
+            plan.proposed.claims.expires_at,
+        ),
+    ));
     client.applying_lease_status = None;
     Ok(AppliedLeaseStatus {
         lease_event: plan.lease_event.clone(),
@@ -9149,15 +9324,40 @@ async fn take_expired_lease(state: &V2State) -> Option<(ClientLease, Option<Stri
     take_expired_lease_locked(state, &mut client, now)
 }
 
+/// The longest a lease is trusted to live from its arrival. Every authority
+/// mints far shorter leases; this only bounds a bad clock reading.
+const MAX_LOCAL_LEASE_LIFETIME: Duration = Duration::from_secs(300);
+
+/// When a lease that arrived at `received_at` (protocol time `received_unix`)
+/// expires on this phone's monotonic clock.
+fn lease_local_deadline(received_at: Instant, received_unix: u64, expires_at: u64) -> Instant {
+    received_at
+        + Duration::from_secs(expires_at.saturating_sub(received_unix))
+            .min(MAX_LOCAL_LEASE_LIFETIME)
+}
+
+/// How long the current lease has left: by its arrival deadline when this
+/// exact jti has one, else by protocol time (a lease set up before its
+/// deadline was recorded, as in tests).
+fn current_lease_remaining(client: &ClientState, now: u64) -> Option<Duration> {
+    let lease = client.lease.as_ref()?;
+    let deadline = client
+        .lease_deadline
+        .as_ref()
+        .filter(|(jti, _)| *jti == lease.claims.jti)
+        .map(|(_, deadline)| *deadline);
+    Some(match deadline {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+        None => Duration::from_secs(lease.claims.expires_at.saturating_sub(now)),
+    })
+}
+
 fn take_expired_lease_locked(
     state: &V2State,
     client: &mut ClientState,
     now: u64,
 ) -> Option<(ClientLease, Option<String>)> {
-    let expired = client
-        .lease
-        .as_ref()
-        .is_some_and(|lease| lease.claims.expires_at <= now);
+    let expired = current_lease_remaining(client, now).is_some_and(|remaining| remaining.is_zero());
     if !expired {
         return None;
     }
@@ -9783,16 +9983,77 @@ fn validate_text(value: &str, maximum: usize, label: &str) -> Result<(), String>
     }
 }
 
+/// A lease expiry (server clock) as the moment native media must stop, on
+/// this phone's own clock, which is what native media compares it with.
 fn expiry_datetime(expires_at: u64) -> Result<DateTime<Utc>, String> {
-    let seconds = i64::try_from(expires_at).map_err(|_| "lease expiry is invalid")?;
+    let local = server_to_local_unix(expires_at);
+    let seconds = i64::try_from(local).map_err(|_| "lease expiry is invalid")?;
     DateTime::from_timestamp(seconds, 0).ok_or_else(|| "lease expiry is invalid".into())
 }
 
+/// The one server clock this phone dates and checks protocol times on.
+///
+/// The phone and the Desktop check each other's proofs, offers and leases
+/// with only a few seconds of slack, so a phone clock more than about five
+/// seconds out could not take over and its leases lapsed. The offset is read
+/// from the `Date` of each response that carries an endpoint challenge (the
+/// gateway's WebSocket upgrade, the relay's challenge document); a clock
+/// within two seconds is left exactly as it is, so nothing changes for a
+/// phone already in step or a server that sends no `Date`. See
+/// `aokie_protocol::clock`.
+static SERVER_CLOCK: aokie_protocol::clock::ServerClock =
+    aokie_protocol::clock::ServerClock::new();
+
+/// The offset the renderer's own gates use (`protocolClock.ts`).
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerClockEvent {
+    offset_seconds: i64,
+}
+
+/// Take the server's clock from the `Date` header of a response that carries
+/// an endpoint challenge.
+pub(crate) fn observe_server_date(date: Option<&str>) {
+    let Ok(local) = local_unix_now() else {
+        return;
+    };
+    let before = SERVER_CLOCK.offset();
+    let after = SERVER_CLOCK.observe_http_date(date, local);
+    if after != before {
+        eprintln!("[AokieCompanion][realtime] stage=server_clock offset_seconds={after}");
+    }
+}
+
+/// The `Date` header of a WebSocket upgrade response.
+fn response_date(
+    response: &tokio_tungstenite::tungstenite::handshake::client::Response,
+) -> Option<&str> {
+    response
+        .headers()
+        .get("date")
+        .and_then(|value| value.to_str().ok())
+}
+
+/// Protocol time: this phone's clock moved onto the server's. Every time the
+/// phone signs into a proof or checks against a lease, offer, consent or
+/// assistance expiry uses this.
 fn unix_now() -> Result<u64, String> {
+    local_unix_now().map(|local| SERVER_CLOCK.now(local))
+}
+
+/// This phone's own clock, for values it stamped itself with it: Android's
+/// native call actions, and the managed admission's local expiry.
+fn local_unix_now() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| "system clock is before the Unix epoch".into())
+}
+
+/// A server-clock time on this phone's own clock, for Android, which checks
+/// what Rust hands it against `System.currentTimeMillis`.
+fn server_to_local_unix(server: u64) -> u64 {
+    aokie_protocol::clock::corrected_now(server, SERVER_CLOCK.offset().saturating_neg())
 }
 
 fn managed_gateway_url(value: &str) -> Result<Url, String> {
@@ -9836,7 +10097,8 @@ fn fresh_session_nonce(state: &V2State, configured: Option<&str>, device_id: &st
 }
 
 fn managed_admission_refresh_deadline(expires_at: u64) -> Instant {
-    let remaining = expires_at.saturating_sub(unix_now().unwrap_or(expires_at));
+    // managed_auth keeps the admission's expiry on this phone's own clock.
+    let remaining = expires_at.saturating_sub(local_unix_now().unwrap_or(expires_at));
     Instant::now() + Duration::from_secs(remaining).saturating_sub(ADMISSION_REFRESH_MARGIN)
 }
 
@@ -16009,7 +16271,33 @@ mod tests {
         );
         assert!(client.pending_end_caller.is_none());
         // Once nothing waits for a result, a result is a late reply.
-        assert!(end_caller_result_is_late(&client));
+        assert!(end_caller_result_is_late(&client, "caller_end_operation_a"));
+        // A result for an earlier attempt, while a later one waits, is late
+        // too; only the waiting operation's own result is applied.
+        client.pending_end_caller = Some(PendingEndCaller::AwaitingResult {
+            request_id: "end_confirm_b".into(),
+            challenge: EndCallerChallengeFrame {
+                kind: "end_caller_challenge".into(),
+                schema_version: SCHEMA_VERSION,
+                app_id: "app_a".into(),
+                request_id: "end_prepare_b".into(),
+                confirmation_id: "confirmation_b".into(),
+                nonce: "nonce_b".into(),
+                device_id: "device_a".into(),
+                call_id: "call_a".into(),
+                call_epoch: 1,
+                owner_epoch: 1,
+                switchboard_revision: 1,
+                remote_revision: 1,
+                lease_id: "lease_b".into(),
+                fence: 1,
+                expires_at: 2_000,
+            },
+            operation_id: "caller_end_operation_b".into(),
+        });
+        assert!(end_caller_result_is_late(&client, "caller_end_operation_a"));
+        assert!(!end_caller_result_is_late(&client, "caller_end_operation_b"));
+        client.pending_end_caller = None;
         // A native hang-up keeps its own deadline.
         client.pending_end_caller = Some(PendingEndCaller::AwaitingChallenge {
             request_id: "end_prepare_b".into(),
@@ -16120,5 +16408,157 @@ mod tests {
         client.lease = None;
         client.snapshot.as_mut().unwrap().snapshot.call_epoch += 1;
         assert_eq!(monitor_rejoin_ready(&client, &rejoin, now), Some(false));
+    }
+
+    // ---- review 3: session fences, arrival-measured leases, server clock ----
+
+    #[tokio::test]
+    async fn a_session_end_keeps_its_fences_so_late_relay_mail_is_absorbed() {
+        let state = V2State::default();
+        let mut client = end_caller_client();
+        let old_lease = client.lease.clone().unwrap();
+        client.pending = Some(pending_lease_for(&old_lease.claims));
+        *state.inner.lock().await = client;
+
+        // The transport dropped: the session ends and its state is reset.
+        state.reset_generation(1).await;
+        {
+            let client = state.inner.lock().await;
+            assert!(client.lease.is_none() && client.pending.is_none());
+            let tombstone = client
+                .local_expiry_tombstones
+                .iter()
+                .find(|tombstone| tombstone.lease.claims.jti == old_lease.claims.jti)
+                .expect("the dropped lease is tombstoned for the next session");
+            // Its token is never sent again; the authority revoked it already.
+            assert!(!tombstone.returnable && tombstone.lease.token.is_empty());
+            assert!(client
+                .timed_out_lease_requests
+                .iter()
+                .any(|(request_id, _)| request_id == "request_a"));
+        }
+        state.reset().await;
+
+        // The next session, same app and device, with a new session nonce.
+        let identity = crate::endpoint_identity::EndpointIdentity::from_secret([7; 32]).unwrap();
+        state
+            .begin("app_a", "device_a", "session_b", &identity, &[], false, true, None)
+            .await;
+        let mut client = state.inner.lock().await;
+        assert_eq!(client.local_expiry_tombstones.len(), 1);
+
+        // A renewal of the old lease, delivered late by relay mail: absorbed.
+        let mut renewed = old_lease.claims.clone();
+        renewed.jti = "lease_a_renewed".into();
+        renewed.expires_at += 10;
+        let frame = lease_status_frame("lease_renewed", "v2.old.renewal", renewed);
+        assert!(contain_previous_session_lease_status(
+            &mut client,
+            &frame,
+            "status:late_renewal",
+            "{}"
+        )
+        .unwrap());
+        // A grant answering the old session's lease request: absorbed too.
+        let mut granted = old_lease.claims.clone();
+        granted.lease_id = "media_other".into();
+        let grant = lease_status_frame("lease_granted", "v2.old.grant", granted.clone());
+        assert!(
+            contain_previous_session_lease_status(&mut client, &grant, "status:late_grant", "{}")
+                .unwrap()
+        );
+        // An old-session status for a lineage this phone never knew still
+        // goes through every check, as does anything for the new session.
+        let mut unknown = lease_status_frame("lease_renewed", "v2.unknown", granted);
+        unknown.request_id = "request_unknown".into();
+        assert!(
+            !contain_previous_session_lease_status(&mut client, &unknown, "status:unknown", "{}")
+                .unwrap()
+        );
+        let mut current = old_lease.claims.clone();
+        current.session_nonce = "session_b".into();
+        let current = lease_status_frame("lease_granted", "v2.current", current);
+        assert!(
+            !contain_previous_session_lease_status(&mut client, &current, "status:current", "{}")
+                .unwrap()
+        );
+        drop(client);
+
+        // Another device's fences do not cross over.
+        state
+            .begin("app_a", "device_other", "session_c", &identity, &[], false, true, None)
+            .await;
+        assert!(state.inner.lock().await.local_expiry_tombstones.is_empty());
+    }
+
+    #[test]
+    fn a_flapping_connection_cannot_fill_the_grant_fence_with_carried_tombstones() {
+        let mut client = ClientState::default();
+        for index in 0..10 {
+            let mut lease = end_caller_client().lease.unwrap();
+            lease.claims.jti = format!("lease_{index}");
+            client.lease = Some(lease);
+            let (tombstones, requests) = take_session_fences(&mut client);
+            client.local_expiry_tombstones = tombstones;
+            client.timed_out_lease_requests = requests;
+        }
+        assert_eq!(client.local_expiry_tombstones.len(), MAX_CARRIED_SESSION_TOMBSTONES);
+        assert!(MAX_CARRIED_SESSION_TOMBSTONES < MAX_LOCAL_EXPIRY_TOMBSTONES - 1);
+    }
+
+    #[test]
+    fn lease_expiry_is_measured_from_arrival_not_from_a_jumping_wall_clock() {
+        let state = V2State::default();
+        let now = unix_now().unwrap();
+        let mut client = end_caller_client();
+        let jti = client.lease.as_ref().unwrap().claims.jti.clone();
+        client.lease.as_mut().unwrap().claims.expires_at = now + 20;
+        client.lease_deadline = Some((jti.clone(), Instant::now() + Duration::from_secs(20)));
+        // The phone's clock jumps a minute forward mid-call: the lease still
+        // has its 20 s, measured from when it arrived.
+        assert!(take_expired_lease_locked(&state, &mut client, now + 60).is_none());
+        assert!(managed_ws_handoff_lease_ready(&client, now + 60).is_ok());
+        // And a clock that jumps back cannot stretch it.
+        client.lease_deadline = Some((jti.clone(), Instant::now()));
+        assert!(take_expired_lease_locked(&state, &mut client, now - 60).is_some());
+
+        // Without a recorded arrival (or for another jti) protocol time decides.
+        let mut client = end_caller_client();
+        client.lease.as_mut().unwrap().claims.expires_at = now + 20;
+        client.lease_deadline = Some(("an_older_jti".into(), Instant::now()));
+        assert!(take_expired_lease_locked(&state, &mut client, now).is_none());
+        assert!(take_expired_lease_locked(&state, &mut client, now + 20).is_some());
+
+        // The arrival deadline is the lease's remaining life, bounded.
+        let arrived = Instant::now();
+        assert_eq!(
+            lease_local_deadline(arrived, now, now + 20),
+            arrived + Duration::from_secs(20)
+        );
+        assert_eq!(lease_local_deadline(arrived, now, now - 5), arrived);
+        assert_eq!(
+            lease_local_deadline(arrived, now, now + 86_400),
+            arrived + MAX_LOCAL_LEASE_LIFETIME
+        );
+    }
+
+    #[test]
+    fn the_server_clock_reads_the_upgrade_responses_date_and_is_idle_without_one() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .header("date", "Sun, 18 Oct 2026 08:00:00 GMT")
+            .body(None)
+            .unwrap();
+        assert_eq!(response_date(&response), Some("Sun, 18 Oct 2026 08:00:00 GMT"));
+        let bare = tokio_tungstenite::tungstenite::http::Response::builder()
+            .body(None)
+            .unwrap();
+        assert_eq!(response_date(&bare), None);
+        // With no offset learned, protocol time and this phone's clock agree,
+        // and handing a server time to Android changes nothing.
+        if SERVER_CLOCK.offset() == 0 {
+            let local = local_unix_now().unwrap();
+            assert!(unix_now().unwrap().abs_diff(local) <= 1);
+            assert_eq!(server_to_local_unix(1_800_000_000), 1_800_000_000);
+        }
     }
 }

@@ -165,7 +165,8 @@ jobs:
   # The Mac's and Linux's own builds, tested and linted before either bundle is released (the jobs above run on
   # Windows, whose radio, driver and sealing are Windows' own): the shipping library crates and the plugin with call
   # audio. Values are sealed under a throwaway key (AOKIE_SEAL_EPHEMERAL=1): a runner has no login Keychain or
-  # Secret Service to answer, and the manager PIN's tests, which reach a Mac's Keychain, are skipped there.
+  # Secret Service to answer. That covers the manager PIN's tests too (they seal through the same key, which a test
+  # build with AOKIE_SEAL_EPHEMERAL never asks the Keychain for), so nothing is skipped on either system.
   unix-tests:
     name: tests + clippy (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
@@ -176,10 +177,8 @@ jobs:
         include:
           - os: macos-15
             label: macos-arm64
-            skip: --skip manager_pin
           - os: ubuntu-22.04
             label: linux-x86_64
-            skip: ''
     env:
       AOKIE_SEAL_EPHEMERAL: '1'
       CMAKE_POLICY_VERSION_MINIMUM: '3.5'
@@ -220,13 +219,19 @@ jobs:
           echo "::error::no libclang.dylib on this Mac"; exit 1
 
       - name: Tests (library crates)
-        run: cargo test --locked -p aokie-core -p aokie-bluetooth -p aokie-dongle -p aokie-protocol -p package-signer -- ${{ matrix.skip }}
+        run: cargo test --locked -p aokie-core -p aokie-bluetooth -p aokie-dongle -p aokie-protocol -p package-signer
 
       - name: Tests (plugin, voice)
-        run: cargo test --locked -p aokie-plugin --features voice -- --test-threads=2 ${{ matrix.skip }}
+        run: cargo test --locked -p aokie-plugin --features voice -- --test-threads=2
 
       - name: Clippy (plugin, voice, deny-level lints)
         run: cargo clippy --locked -p aokie-plugin --all-targets --features voice
+
+      # The self-host image builds its own two-crate workspace with --locked: its Cargo.lock must still fit those
+      # crates (review 3 #3). Seconds, on one leg.
+      - name: Self-host container lock (cargo metadata --locked)
+        if: runner.os == 'Linux'
+        run: sh scripts/check-container-lock.sh
 
   # Supply-chain gate (audit AOK-CI-001): RustSec advisories fail CI — accept
   # an unavoidable one explicitly via audit.toml with a documented reason.

@@ -1103,11 +1103,54 @@ mod tests {
         // Rust reads `null` as "nothing stored": returning it for a Keystore or decrypt error made the
         // caller mint a new identity, sign the user out, or rewrite the profile index.
         assert!(KOTLIN_SECURE_STORE.contains("fun read(context: Context, logicalKey: String): Result<String?>"));
-        assert!(KOTLIN_SECURE_STORE.contains("if (!target.exists()) return@runCatching null"));
+        assert!(KOTLIN_SECURE_STORE.contains("if (!storedFileExists(target)) return@runCatching null"));
+        // Before API 30 a write killed midway leaves only AtomicFile's backup;
+        // it is still a stored value, never absence.
+        assert!(KOTLIN_SECURE_STORE.contains("target.exists() || java.io.File(target.path + \".bak\").exists()"));
         assert!(KOTLIN_DIR_MAIN_ACTIVITY.contains("AokieSecureStore.read(this, key).getOrElse {"));
         assert!(KOTLIN_DIR_MAIN_ACTIVITY.contains("throw IllegalStateException(\"Aokie secure value could not be read\")"));
         assert!(include_str!("android_runtime.rs")
             .contains("\"Android secure-store value could not be read ({})\""));
+    }
+
+    #[test]
+    fn a_lost_keystore_key_resets_the_store_instead_of_failing_forever() {
+        // Only definite loss resets: a missing key (its values can never be
+        // read again), an unrecoverable key, or a permanently invalidated one.
+        let key = KOTLIN_SECURE_STORE
+            .split("private fun key(context: Context): SecretKey {")
+            .nth(1)
+            .and_then(|rest| rest.split("val generator").next())
+            .expect("the store derives its key");
+        assert!(key.contains("catch (error: UnrecoverableKeyException)"));
+        assert!(key.contains("resetUnreadableValues(context)"));
+        assert!(!key.contains("catch (error: Exception)") && !key.contains("catch (error: Throwable)"));
+        assert_eq!(
+            KOTLIN_SECURE_STORE
+                .matches("catch (error: KeyPermanentlyInvalidatedException)")
+                .count(),
+            2
+        );
+        // A read asks for the key first, so values a lost key sealed read as
+        // absent rather than as a decrypt error on every launch.
+        let read = KOTLIN_SECURE_STORE
+            .split("fun read(context: Context, logicalKey: String)")
+            .nth(1)
+            .expect("the store reads");
+        assert!(
+            read.find("val secret = key(context)").expect("read asks for the key")
+                < read.find("storedFileExists(target)").expect("read checks for the value")
+        );
+    }
+
+    #[test]
+    fn a_push_only_answer_waits_for_its_signed_offer_until_the_answer_deadline() {
+        // The app's own Answer waits the whole claim window, not five seconds;
+        // a system surface keeps the short wait Telecom's callback allows.
+        assert!(KOTLIN_CALL_SERVICE.contains("waitForDeadline: Boolean = true"));
+        assert!(KOTLIN_CALL_SERVICE.contains("aokieAuthoritativeOfferWaitMs("));
+        assert!(KOTLIN_CALL_SERVICE.contains(".coerceIn(0L, AokieVoiceOffer.ANSWER_SETUP_TIMEOUT_SECONDS * 1_000)"));
+        assert!(!KOTLIN_CALL_SERVICE.contains("elapsedRealtime() + 5_000L"));
     }
 
     #[test]
@@ -1130,7 +1173,8 @@ mod tests {
             .find("answer(CallAttributesCompat.CALL_TYPE_AUDIO_CALL)")
             .expect("local Answer answers");
         assert!(claim < answer);
-        assert!(KOTLIN_CALL_SERVICE.contains("if (!claimAnswer(offer, fence)) {\n      throw"));
+        assert!(KOTLIN_CALL_SERVICE
+            .contains("if (!claimAnswer(offer, fence, waitForDeadline = false)) {\n      throw"));
     }
 
     #[test]

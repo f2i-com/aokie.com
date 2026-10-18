@@ -1017,17 +1017,24 @@ impl GatewaySession {
             }
         }
         if self.relay_carrier
-            && delivery == TransportDelivery::Dropped
             && serde_json::from_str::<Envelope>(encoded)
                 .is_ok_and(|frame| frame.kind == "plugin_snapshot")
         {
-            // A snapshot is authoritative state, and immediately after revoke
-            // it is also the Companion's completion receipt. A terminal 429 or
-            // missing target must make it owed again, but at normal poll cadence
-            // so a relay outage cannot turn the radio process into a hot loop.
-            self.last_snapshot_fingerprint = None;
-            self.last_snapshot_sent = None;
-            self.next_snapshot_poll = Instant::now() + SNAPSHOT_POLL;
+            if delivery == TransportDelivery::Dropped {
+                // A snapshot is authoritative state, and immediately after
+                // revoke it is also the Companion's completion receipt. A
+                // terminal 429, a refusal or a missing target must make it
+                // owed again, but spaced out while the relay keeps dropping
+                // it: re-posting four times a second only repeated the
+                // refusal (and its log line) for the rest of the call.
+                self.relay_snapshot_drops = self.relay_snapshot_drops.saturating_add(1);
+                self.last_snapshot_fingerprint = None;
+                self.last_snapshot_sent = None;
+                self.next_snapshot_poll =
+                    Instant::now() + relay_snapshot_retry_delay(self.relay_snapshot_drops);
+            } else {
+                self.relay_snapshot_drops = 0;
+            }
         }
         if self
             .deferred_prepare

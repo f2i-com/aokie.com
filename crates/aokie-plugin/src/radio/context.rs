@@ -79,6 +79,12 @@ pub(super) struct CallVoiceContext {
     pub(super) transfer: crate::transfer::call::TransferCall,
     #[cfg(feature = "voice")]
     pub(super) queued_appointments: Vec<String>,
+    /// What the fresh session for this call is told of it after OAIY's
+    /// stream dropped under it (review 3 #13): what was said, what was
+    /// already requested, and whether the call was being finished. The
+    /// session that took over had no memory of the call.
+    #[cfg(feature = "voice")]
+    pub(super) reconnect_note: Option<String>,
     /// The caller was assigned the Desktop Realtime responder. This travels
     /// with a parked caller even though its WebSocket never does: a restore
     /// therefore creates a fresh, call-fenced session instead of silently
@@ -137,6 +143,8 @@ impl CallVoiceContext {
             transfer: crate::transfer::call::TransferCall::default(),
             #[cfg(feature = "voice")]
             queued_appointments: Vec::new(),
+            #[cfg(feature = "voice")]
+            reconnect_note: None,
             #[cfg(feature = "voice")]
             desktop_realtime_responder: false,
         }

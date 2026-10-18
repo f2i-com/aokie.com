@@ -1133,6 +1133,11 @@ fn the_hold_juggle_lays_a_call_aside_only_through_the_withdrawing_helper() {
     let announced_at = source.find("HOLD_PRIMARY_ASK_LINE").unwrap();
     assert!(withdrawn_at < stopped_at, "the request is withdrawn before the session is stopped");
     assert!(withdrawn_at < announced_at, "and before the first hold announcement");
+    // Review 3 #29: no juggle on a phone that did not negotiate three-way
+    // calling: decided before anything is withdrawn, said or switched.
+    let gated_at = source.find("} else if !bt.can_switch_calls() {").expect("the three-way gate");
+    assert!(gated_at < withdrawn_at, "the three-way gate comes before the juggle starts");
+    assert!(gated_at < source.find("bt.hold_swap()").unwrap_or(usize::MAX), "and before any switch");
 }
 
 /// Second review F1. A call's voice context is laid aside in more places than

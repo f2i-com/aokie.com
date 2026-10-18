@@ -142,6 +142,15 @@ pub(super) fn run_auto_hold_juggle(
                         "[aokie-plugin] AUTO-HOLD: no voice for the hold announcements on the OAIY route (OAIY's speak mode unavailable, Aokie's own TTS absent) — {} keeps hearing call waiting; if they give up it is a missed call for OAIY to ring back",
                         w.call_id
                     );
+                } else if !bt.can_switch_calls() {
+                    // Review 3 #29: the phone never negotiated three-way
+                    // calling (its indicators said a caller was waiting all
+                    // the same). The first caller would be told to hold, and
+                    // then the phone would refuse the switch.
+                    eprintln!(
+                        "[aokie-plugin] AUTO-HOLD: the phone did not agree to three-way calling on this link — {} keeps hearing the network's call waiting",
+                        w.call_id
+                    );
                 } else if sr == 0 {
                     eprintln!(
                         "[aokie-plugin] AUTO-HOLD: no audio path (sr=0) — leaving {} in observe state",

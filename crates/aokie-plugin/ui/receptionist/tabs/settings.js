@@ -203,6 +203,9 @@
   // appliesAtReconnect) — e.g. where calls go. Non-null renders the
   // "Restart receptionist now" apply banner.
   var pendingRestart = null;
+  // "Restart receptionist now" is under way (the call check, then the
+  // restart): a second press does nothing meanwhile.
+  var restarting = false;
   var settings = withAokieDefaults(null);
   var baseline = withAokieDefaults(null);
   // The host's AI sources, read for OAIY Voice's running state only.
@@ -552,12 +555,7 @@
         check('textsAllowedOnly', 'Text only these numbers') +
         hint('No text goes to any other number: not a reply, a follow-up or a missed-call text back. Texts from other numbers still arrive and are kept.') +
         check('rejectPrivate', 'Do not answer hidden or private numbers') +
-        hint('Rejected while the phone rings when it says the number is hidden; a phone that only shows the number once a call is answered has it hung up straight away instead.') +
-        // The refusals above are made when Aokie picks a call up: with
-        // auto-answer off a call rings through to the phone untouched.
-        (settings.autoAnswer
-          ? ''
-          : hint('Auto-answer is off, so calls ring through to your phone and none of this is applied to them: callers are refused (or left ringing) only while Aokie answers calls.', true))
+        hint('Rejected while the phone rings when it says the number is hidden; a phone that only shows the number once a call is answered has it hung up straight away instead.')
     );
   }
 
@@ -750,7 +748,7 @@
       (pendingRestart
         ? '<p class="rcp-notice rcp-notice--warn">Saved — the change applies when the receptionist restarts. The phone reconnects automatically (about 15 seconds of downtime).</p>' +
           '<div class="rcp-actions">' +
-          '<button type="button" class="rcp-button is-primary" data-act="set-apply-restart"' + (saving || loading ? ' disabled' : '') + '>Restart receptionist now</button>' +
+          '<button type="button" class="rcp-button is-primary" data-act="set-apply-restart"' + (saving || loading || restarting ? ' disabled' : '') + '>Restart receptionist now</button>' +
           '</div>'
         : '') +
       '<div class="rcp-actions">' +
@@ -895,6 +893,7 @@
    *  reconnect underneath it. Older Desktops without the bridge verb get an
    *  honest pointer at the manual path. */
   function applyRestart() {
+    if (restarting) return;
     if (typeof HOST.restartPlugin !== 'function') {
       HOST.toast(
         'info',
@@ -904,10 +903,16 @@
     }
     // A restart drops the phone link, and with it a call on the line
     // (review 1 #31): ask first, and keep the restart for when it is over.
+    // A plugin that cannot say whether a call is on (it did not answer) is
+    // not restarted either: that could be the call it drops (review 3 #31).
+    restarting = true;
+    render();
     HOST.command('call.current').then(
       function (data) {
         var call = data && data.call;
         if (call && call.state !== 'ended') {
+          restarting = false;
+          render();
           HOST.toast(
             'info',
             'A call is on the line — press "Restart receptionist now" again once it has ended.'
@@ -916,18 +921,25 @@
         }
         restartNow();
       },
-      function () {
-        restartNow();
+      function (e) {
+        restarting = false;
+        render();
+        HOST.toast(
+          'error',
+          'Aokie could not say whether a call is on the line (' + errMsg(e) + '), so it was not restarted. Try again in a moment.'
+        );
       }
     );
   }
 
   function restartNow() {
     pendingRestart = null;
+    restarting = true;
     render();
     HOST.toast('info', 'Restarting the receptionist — the phone reconnects automatically.');
     HOST.restartPlugin().then(
       function () {
+        restarting = false;
         HOST.toast('success', 'Receptionist restarted — the saved settings are live.');
         // Give the plugin a beat to finish booting before re-reading
         // settings (an immediate settings.get can race the connector start).
@@ -936,6 +948,7 @@
         }, 3000);
       },
       function (e) {
+        restarting = false;
         HOST.toast('error', 'Restart failed: ' + errMsg(e));
         pendingRestart = ['restart'];
         render();

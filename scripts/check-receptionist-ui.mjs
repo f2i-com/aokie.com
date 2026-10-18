@@ -263,12 +263,12 @@ for (const [greeting, name, said] of [
   }
   // Review 2026-10 wording: the texts switch says what it does (no text at
   // all to another number), the allowed list asks for area codes and names
-  // entries too short to match, and with auto-answer off the screen says
-  // the refusals do not apply (calls ring through untouched).
+  // entries too short to match. Screening refuses callers while they ring
+  // with auto-answer off too (review 3 #21), so no caveat says otherwise.
   assert.match(toOaiy, /Text only these numbers/);
   assert.doesNotMatch(toOaiy, /Reply to texts only/);
   assert.match(toOaiy, /with its area code/);
-  assert.match(toOaiy, /Auto-answer is off/);
+  assert.doesNotMatch(toOaiy, /Auto-answer is off/);
   assert.doesNotMatch(settings.formFor({ ...oaiyBag, autoAnswer: true }), /Auto-answer is off/);
   const shortList = settings.formFor({ ...oaiyBag, allowedNumbers: '0400 111 222\n123\n9876 5432' });
   assert.match(shortList, /These match nobody: 123\./);

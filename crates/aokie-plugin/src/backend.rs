@@ -20,7 +20,9 @@ pub enum TransportMode {
     Dongle,
     /// Built-in Windows Bluetooth stack — no driver install.
     Native,
-    /// Prefer native when a Windows Bluetooth adapter is present, else dongle.
+    /// The dongle whenever one bound to WinUSB is plugged in (only it carries
+    /// call audio), else native when Windows has an adapter
+    /// (`radio::spawn`'s `picks_native_backend`).
     Auto,
 }
 
@@ -69,6 +71,20 @@ pub trait RadioBackend: Send {
     fn dial(&self, number: String) -> Result<(), String>;
     fn hold_swap(&self) -> Result<(), String>;
     fn query_calls(&self) -> Result<(), String>;
+    /// Whether the phone negotiated three-way calling, so a waiting caller
+    /// can be switched to (review 3 #29: the juggle told the first caller to
+    /// hold, then the phone refused the switch). Backends that cannot tell
+    /// keep the default.
+    fn can_switch_calls(&self) -> bool {
+        true
+    }
+    /// Stop the phone link and wait up to `within` for it to end, so what it
+    /// says as it ends (a text it still held, reported failed) can still be
+    /// read with `try_recv_event` before the plugin lets go (review 3 #7).
+    /// True when it ended in time; backends with nothing to wait for say so.
+    fn stop_within(&mut self, _within: std::time::Duration) -> bool {
+        true
+    }
     /// `AT+BCC` audio self-heal for an active call with no SCO. Backends
     /// where the OS owns call audio (native Windows stack) keep the default
     /// refusal — their dead-air watchdog is disabled anyway.
@@ -95,6 +111,13 @@ pub trait RadioBackend: Send {
     fn connect(&self, address: &str) -> Result<bool, String>;
     fn confirm_pairing(&self, address: &str, accept: bool) -> Result<(), String>;
     fn is_connected(&self) -> bool;
+    /// Whether a text has a phone to go to. The dongle sends texts over the
+    /// connected phone's link; Windows' own stack pages the bonded phone for
+    /// each one, so there it is that phone being known, also while Windows
+    /// has dropped its idle hands-free line (review 3 #10).
+    fn texts_phone_known(&self) -> bool {
+        self.is_connected()
+    }
     fn get_sample_rate(&self) -> u16;
     /// Whether this backend can expose bidirectional phone-call PCM to the
     /// plugin. Desktop Realtime replaces the responder, not this physical
@@ -170,6 +193,12 @@ impl RadioBackend for UsbRadioBackend {
     }
     fn query_calls(&self) -> Result<(), String> {
         self.inner.query_calls()
+    }
+    fn can_switch_calls(&self) -> bool {
+        self.inner.three_way_calling()
+    }
+    fn stop_within(&mut self, within: std::time::Duration) -> bool {
+        self.inner.stop_within(within)
     }
     fn open_pairing_window(&self, seconds: u64) {
         self.inner.open_pairing_window(seconds);
@@ -317,6 +346,9 @@ impl RadioBackend for NativeRadioBackend {
     }
     fn is_connected(&self) -> bool {
         self.inner.is_connected()
+    }
+    fn texts_phone_known(&self) -> bool {
+        self.inner.phone_known()
     }
     fn get_sample_rate(&self) -> u16 {
         self.inner.get_sample_rate()

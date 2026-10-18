@@ -171,19 +171,21 @@ pub(super) fn flush_incoming_if_pending(
     if !tracker.current().is_some_and(|s| s.incoming_pending()) {
         return;
     }
-    let (corr, from) = {
+    let (corr, from, resumes) = {
         let s = tracker.current_mut().unwrap();
         s.mark_incoming_emitted();
-        (s.id.clone(), s.caller_id.clone().unwrap_or_default())
+        (s.id.clone(), s.caller_id.clone().unwrap_or_default(), s.resumes.clone())
     };
+    let mut data = json!({"callId": corr, "from": from, "at": aokie_core::events::now_iso8601()});
+    // A call taken up again after the phone link came back names the call
+    // the lost link closed (review 3 #35): one phone call, read as one.
+    if let Some(resumes) = resumes {
+        data["resumesCall"] = json!(resumes);
+    }
     emit(
         outbox,
         sink,
-        aokie_core::events::aokie_event(
-            crate::contract::events::CALL_INCOMING,
-            &corr,
-            json!({"callId": corr, "from": from, "at": aokie_core::events::now_iso8601()}),
-        ),
+        aokie_core::events::aokie_event(crate::contract::events::CALL_INCOMING, &corr, data),
     );
 }
 

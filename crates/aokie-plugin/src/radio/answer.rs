@@ -30,6 +30,33 @@ pub(super) fn hold_auto_answer(
     elapsed < ANSWER_OVERLAY_WAIT
 }
 
+/// What the screening does with a call to us while it rings (review 3 #21).
+/// With auto-answer on, a screened caller with a message to hear is answered
+/// and told it at the greeting, as before; with it off nobody answers to say
+/// it, so once the number is known (or the phone said it is hidden) that
+/// caller is refused while it rings. A number that is only late is not.
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
+pub(super) fn ring_action_for(
+    action: crate::screen::RingAction,
+    auto_answer: bool,
+    identity_known: bool,
+    verdict: Option<&'static str>,
+) -> crate::screen::RingAction {
+    match (action, verdict) {
+        (crate::screen::RingAction::Answer, Some(reason)) if !auto_answer && identity_known => {
+            crate::screen::RingAction::Refuse(reason)
+        }
+        (action, _) => action,
+    }
+}
+
+/// Whether a reject (AT+CHUP) may go to the call that rings: only while the
+/// phone shows no live call and no other caller waits or is on hold, where
+/// it would end that call instead (review 3 #21, review 1 #1).
+pub(super) fn ring_refusal_safe(call_live: bool, caller_waiting: bool, caller_held: bool) -> bool {
+    !call_live && !caller_waiting && !caller_held
+}
+
 /// Connect the in-plugin agent's LLM client (llama.cpp :8080 / ollama :11434
 /// / the configured aiEndpoint) and keep the health slot truthful. Shared by
 /// the lazy first-reply path and the ring-time pre-warm.

@@ -20,6 +20,11 @@ pub struct RadioStatus {
     /// back rather than never left.
     pub dongle_ready_epoch: AtomicU64,
     pub connected: AtomicBool,
+    /// A text has a phone to go to (`RadioBackend::texts_phone_known`): the
+    /// connected phone on the dongle; on Windows' own stack the bonded phone,
+    /// whose idle hands-free line Windows drops between calls (review 3 #10:
+    /// sms.send was refused then). Refreshed every pass of the radio loop.
+    pub texts_phone_known: AtomicBool,
     pub call_active: AtomicBool,
     pub local_address: Mutex<Option<String>>,
     pub connected_address: Mutex<Option<String>>,
@@ -94,6 +99,11 @@ pub struct RadioStatus {
     /// ring policy exists) and at least one Companion device is approved. Set
     /// by the connector; read per call, together with the call's consent.
     pub transfer_ready: AtomicBool,
+    /// When the consent grant the radio runs on expires, as Unix seconds (0:
+    /// none, or its expiry does not decide). Set by the connector; the radio
+    /// takes no new call past it (review 3 #6), whether or not anything asks
+    /// the plugin, whose next command stops it between calls.
+    pub consent_expires_at: std::sync::atomic::AtomicI64,
     /// VOICE-001: the measured TTS→STT loopback self-test outcome. `None` =
     /// still running (auto-answer stays blocked until it lands — never arm on
     /// unproven engines); populated with ok/failed + duration once done.
@@ -216,6 +226,19 @@ pub struct RadioStatus {
     /// only when it was hers and recent; any other call found up is the
     /// owner's, observed and never greeted into.
     pub lost_with_link: Mutex<Option<(bool, std::time::Instant)>>,
+    /// The receptionist's call the phone link took down with it: its id and
+    /// caller's number, for the call that takes it up again after the
+    /// reconnect (`CallSession::resumes`, review 3 #35).
+    pub lost_call: Mutex<Option<(String, Option<String>)>>,
+}
+
+impl RadioStatus {
+    /// Whether the consent grant the radio runs on has expired
+    /// (`consent_expires_at`).
+    pub fn consent_expired(&self) -> bool {
+        let expires = self.consent_expires_at.load(Ordering::Relaxed);
+        expires != 0 && chrono::Utc::now().timestamp() >= expires
+    }
 }
 
 /// One non-foreground switchboard leg (waiting or parked) — see

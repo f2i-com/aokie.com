@@ -156,6 +156,33 @@ impl CommandJournal {
         }
     }
 
+    /// The results of `command` completed in the last `days` days, oldest
+    /// first: what a run said it did (review 3 #7: the texts it handed to the
+    /// radio, each of which is owed a sent or failed event).
+    pub fn completed_results(&self, command: &str, days: u32) -> Result<Vec<Value>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT result_json FROM command_journal
+                  WHERE command = ?1
+                    AND result_json IS NOT NULL
+                    AND completed_at >= datetime('now', ?2)
+                  ORDER BY completed_at",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![command, format!("-{days} days")], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        for row in rows {
+            let text = row.map_err(|e| e.to_string())?;
+            if let Ok(value) = serde_json::from_str(&text) {
+                results.push(value);
+            }
+        }
+        Ok(results)
+    }
+
     /// Validation/refusal errors occur before an action is accepted. Remove
     /// that reservation so a corrected retry can use the same request id.
     pub fn abandon(&mut self, request_id: &str) -> Result<(), String> {

@@ -1218,10 +1218,14 @@ where
                 outlet.flush()?;
                 if !ready && Instant::now() >= ready_by {
                     note_unanswered(true);
-                    return Err(transport_error(format!(
+                    // Not the stream failing (review 3 #13): OAIY took the
+                    // connection and never said ready. A reconnect would
+                    // only wait as long again; OAIY is told the call is over.
+                    return Err(format!(
                         "Desktop realtime did not say ready within {} ms",
                         ready_within.as_millis()
-                    )));
+                    )
+                    .into());
                 }
                 // Stop/cancel always preempt queued audio.
                 loop {
@@ -1400,9 +1404,13 @@ where
                         .map_err(|e| transport_error(format!("Desktop realtime pong failed: {e}")))?,
                     Message::Pong(_) | Message::Frame(_) => {}
                     Message::Close(frame) => {
-                        return Err(transport_error(frame
+                        // OAIY closed the call's stream itself (review 3
+                        // #13): its decision, not a broken socket, and the
+                        // call is not reconnected for it.
+                        return Err(frame
                             .map(|frame| format!("Desktop realtime closed: {}", frame.reason))
-                            .unwrap_or_else(|| "Desktop realtime closed".to_string())));
+                            .unwrap_or_else(|| "Desktop realtime closed".to_string())
+                            .into());
                     }
                 }
             }
@@ -3242,30 +3250,36 @@ mod tests {
         text(serde_json::json!({"type": "formlogic.realtime.ready", "callId": "call_1", "generation": 7, "destinationOrigin": "https://oaiy.localhost"}))
     }
 
+    /// Review 3 #13: no ready in time is OAIY not answering, not the stream
+    /// failing: the call is not reconnected for it, and OAIY is told the
+    /// call is over.
     #[test]
-    fn no_ready_in_time_ends_the_stream_as_the_stream_failing() {
+    fn no_ready_in_time_ends_the_stream_but_is_not_the_stream_failing() {
         let started = Instant::now();
         let (result, sent, _) = run_against(Vec::new(), true, Duration::from_millis(60), Vec::new(), |_| {});
         let error = result.unwrap_err();
-        assert!(error.transport, "{error:?}");
+        assert!(!error.transport, "{error:?}");
         assert!(error.reason.contains("did not say ready"), "{error:?}");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(4));
         assert_eq!(sent[0]["type"], "formlogic.realtime.start");
+        assert_eq!(sent.last().unwrap()["type"], "formlogic.realtime.stop");
     }
 
+    /// The stream ending, or a receive error, is the stream failing (the
+    /// call reconnects once); OAIY closing it itself is not (review 3 #13).
     #[test]
-    fn the_stream_ending_or_closing_is_the_stream_failing_not_a_clean_stop() {
-        for last in [None, Some(Ok(Message::Close(None)))] {
-            let mut frames = vec![ready_frame()];
-            frames.extend(last);
-            let (result, _, events) = run_against(frames, false, READY_TIMEOUT, Vec::new(), |_| {});
-            let error = result.unwrap_err();
-            assert!(error.transport, "{error:?}");
-            assert!(matches!(events[0], RealtimeEventKind::Ready { .. }));
-        }
-        // A receive error is too.
+    fn the_stream_ending_is_the_stream_failing_and_oaiy_closing_it_is_not() {
+        let (result, _, events) = run_against(vec![ready_frame()], false, READY_TIMEOUT, Vec::new(), |_| {});
+        let error = result.unwrap_err();
+        assert!(error.transport, "{error:?}");
+        assert!(matches!(events[0], RealtimeEventKind::Ready { .. }));
         let (result, _, _) = run_against(vec![ready_frame(), Err("reset".into())], false, READY_TIMEOUT, Vec::new(), |_| {});
         assert!(result.unwrap_err().transport);
+        let (result, _, _) =
+            run_against(vec![ready_frame(), Ok(Message::Close(None))], false, READY_TIMEOUT, Vec::new(), |_| {});
+        let error = result.unwrap_err();
+        assert!(!error.transport, "{error:?}");
+        assert!(error.reason.contains("closed"), "{error:?}");
     }
 
     #[test]

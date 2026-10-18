@@ -12,7 +12,6 @@ members = [
     # MAP/PBAP) — the no-driver-install transport. Kept out of
     # default-members (like aokie-plugin): built explicitly.
     "crates/aokie-winbt",
-    "crates/aokie-audio",
     "crates/aokie-plugin",
     # First-party Ed25519 bundle signing (TRUST-001): writes package-manifest.json
     # pinning every release-bundle file's digest; FormLogic Desktop pins the public
@@ -23,13 +22,14 @@ members = [
 # `aokie-plugin` (the FormLogic Desktop JSON-RPC process) is a member
 # but is intentionally kept out of `default-members`: a later task
 # wires its runtime up against these crates. `default-members` keeps a
-# bare `cargo build` scoped to the four native library crates that are
+# bare `cargo build` scoped to the three native library crates that are
 # known-green so the not-yet-wired plugin can't break the default build.
+# (aokie-audio was the fourth: nothing linked it, and the plugin's echo
+# canceller is its own (aec-rs, in `voice`), so it was removed, review 3 #33.)
 default-members = [
     "crates/aokie-core",
     "crates/aokie-bluetooth",
     "crates/aokie-dongle",
-    "crates/aokie-audio",
 ]
 
 [workspace.package]

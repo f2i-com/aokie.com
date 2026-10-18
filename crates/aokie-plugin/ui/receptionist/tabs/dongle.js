@@ -72,6 +72,10 @@
   var jobTarget = null;
   var jobTimer = null;
   var jobWait = 0; // which wait a poll belongs to: a poll of one the tab has since dropped stops
+  // The step the tab was waiting for when it was left ({kind, d}): on its return, its outcome is shown even when
+  // it ended meanwhile. And the last step whose end this page has shown (kind@startedAt), so it is shown once.
+  var leftJob = null;
+  var seenJob = null;
   // The device a verify poll is checking. Kept OUTSIDE the live list because
   // the target legitimately disappears from `connected` mid-verify (the
   // rebind re-enumerates it) — "Check again" and a remount mid-verify must
@@ -95,9 +99,10 @@
     return !!(TABS.setup && TABS.setup.active());
   }
 
-  /** The built-in Windows Bluetooth transport: no dongle is involved. */
+  /** The built-in Windows Bluetooth transport: no dongle is involved. (`auto` is the dongle whenever one is
+   *  plugged in, as the plugin starts it, so its step is the dongle's.) */
   function builtInTransport() {
-    return setupTransportKnown && !!TABS.transport && TABS.transport.mode() !== 'dongle';
+    return setupTransportKnown && !!TABS.transport && TABS.transport.mode() === 'native';
   }
 
   function radioUp() {
@@ -245,6 +250,53 @@
     return !!(job && job.kind === kind && (!d || (Number(job.vid) === Number(d.vid) && Number(job.pid) === Number(d.pid))));
   }
 
+  function jobId(job) {
+    return job ? job.kind + '@' + job.startedAt : null;
+  }
+
+  /** The step's device as the list has it now, else its ids (a rebind takes it off the list a while). */
+  function jobDevice(job) {
+    var conn = connectedDevices();
+    for (var i = 0; i < conn.length; i++) {
+      if (Number(conn[i].vid) === Number(job.vid) && Number(conn[i].pid) === Number(job.pid)) return conn[i];
+    }
+    return { vid: job.vid, pid: job.pid };
+  }
+
+  /** What follows a `kind` step for `d` that is done, as a wait for it does. */
+  function onDoneFor(kind, d) {
+    if (kind === 'install' && !noDriver()) {
+      return function () {
+        verifySelected(d);
+      };
+    }
+    if (kind === 'install') {
+      return function () {
+        HOST.toast('success', 'Aokie may use ' + dongleLabel(d) + ' (USB ' + idLabel(d) + ') now. Start Aokie again to open it.');
+        render();
+      };
+    }
+    if (kind === 'restore') return restored;
+    return function () {
+      render();
+    };
+  }
+
+  /** The step being waited for is gone from the plugin: Aokie was started again while it ran (the plugin finds a
+   *  helper still running and reports it, so this is one that ended meanwhile). An install is checked as after any
+   *  install (is the dongle on WinUSB now?); for the rest the screen says so, and Install is not offered as though
+   *  nothing had run. */
+  function jobVanished(kind, d) {
+    if (kind === 'install' && !noDriver() && d) {
+      step = 'install';
+      selectedKey = key(d);
+      verifySelected(d);
+      return;
+    }
+    error = 'Aokie was started again while the driver step ran, so it cannot say how it went. Rescan to see the dongle as it is now.';
+    render();
+  }
+
   /** Wait for the plugin's `kind` step for `d` to end (however long the person takes over its prompt), polling
    *  dongle.list every 2 s: then `onDone(job)`, or its error on the screen. */
   function waitForJob(kind, d, onDone) {
@@ -268,11 +320,16 @@
         busy = false;
         jobKind = null;
         jobTarget = null;
+        if (job) seenJob = jobId(job);
         if (jobIsFor(job, kind, d) && job.state === 'done') {
           onDone(job);
           return;
         }
-        error = (job && job.error) || 'The driver step ended without saying how it went. Rescan, then try again.';
+        if (!job) {
+          jobVanished(kind, d);
+          return;
+        }
+        error = job.error || 'The driver step ended without saying how it went. Rescan, then try again.';
         if (kind === 'install' && !noDriver()) step = 'install';
         render();
       });
@@ -301,31 +358,50 @@
   function resumeRunningJob() {
     var job = driverJob();
     if (!job || job.state !== 'running' || jobKind) return false;
-    var d = null;
-    var conn = connectedDevices();
-    for (var i = 0; i < conn.length; i++) {
-      if (Number(conn[i].vid) === Number(job.vid) && Number(conn[i].pid) === Number(job.pid)) d = conn[i];
-    }
-    d = d || { vid: job.vid, pid: job.pid };
+    leftJob = null;
+    var d = jobDevice(job);
     if (job.kind === 'install' && !noDriver()) {
       step = 'install';
       selectedKey = key(d);
-      waitForJob('install', d, function () {
-        verifySelected(d);
-      });
-    } else if (job.kind === 'install') {
-      waitForJob('install', d, function () {
-        HOST.toast('success', 'Aokie may use ' + dongleLabel(d) + ' (USB ' + idLabel(d) + ') now. Start Aokie again to open it.');
-        render();
-      });
-    } else if (job.kind === 'restore') {
-      waitForJob('restore', d, restored);
+      waitForJob('install', d, onDoneFor('install', d));
+    } else if (job.kind === 'install' || job.kind === 'restore') {
+      waitForJob(job.kind, d, onDoneFor(job.kind, d));
     } else {
       // Another step (the certificates' removal): its buttons off until it ends.
-      waitForJob(job.kind, null, function () {
-        render();
-      });
+      waitForJob(job.kind, null, onDoneFor(job.kind, null));
     }
+    return true;
+  }
+
+  /** On mount, where no step runs: one that ended while the tab was away is shown as a wait would have shown it
+   *  (verified, or its error), once. That is the step the tab was waiting for when it was left, or one that ended
+   *  in the last ten minutes that this page has not shown (begun by another screen, or before the screen was
+   *  opened again). Without this the tab came back on Install, as if nothing had run. */
+  function showFinishedJob() {
+    var left = leftJob;
+    leftJob = null;
+    var job = driverJob();
+    if (jobKind) return false;
+    if (!job) {
+      if (left) jobVanished(left.kind, left.d);
+      return !!left;
+    }
+    if (job.state === 'running' || jobId(job) === seenJob) return false;
+    seenJob = jobId(job);
+    var finished = Date.parse(job.finishedAt || '');
+    var recent = !isNaN(finished) && Date.now() - finished < 10 * 60 * 1000;
+    if (!(left && jobIsFor(job, left.kind, left.kind === 'removeCerts' ? null : left.d)) && !recent) return false;
+    var d = job.kind === 'install' || job.kind === 'restore' ? jobDevice(job) : null;
+    if (job.state === 'done') {
+      onDoneFor(job.kind, d)(job);
+      return true;
+    }
+    error = job.error || 'The driver step ended without saying how it went. Rescan, then try again.';
+    if (job.kind === 'install' && !noDriver() && d) {
+      step = 'install';
+      selectedKey = key(d);
+    }
+    render();
     return true;
   }
 
@@ -1213,10 +1289,11 @@
         return;
       }
       render();
-      refresh().then(function () {
+      refresh().then(function (data) {
         if (!root) return;
-        // A driver step still running in the plugin: wait for it again, its buttons off.
-        resumeRunningJob();
+        // A driver step still running in the plugin: wait for it again, its buttons off. One that ended while the
+        // tab was away: its outcome. (No answer from the plugin: the step the tab left is looked for next time.)
+        if (!resumeRunningJob() && data) showFinishedJob();
         // Where there is no driver step, the radio's state is the tab's news.
         if (noDriver() && !setupActive()) checkRadio();
       });
@@ -1236,7 +1313,9 @@
         jobTimer = null;
       }
       if (jobKind) {
-        // The step goes on in the plugin; mount finds it again (a poll still in flight stops).
+        // The step goes on in the plugin; mount finds it again, or its outcome if it ended meanwhile (a poll still
+        // in flight stops).
+        leftJob = { kind: jobKind, d: jobTarget };
         jobWait += 1;
         jobKind = null;
         jobTarget = null;

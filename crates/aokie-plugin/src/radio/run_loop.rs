@@ -565,6 +565,12 @@ pub(super) fn run_loop(
     loop {
         let mut idle = true;
         status.loop_beat.fetch_add(1, Ordering::Relaxed);
+        // Whether a text has a phone to go to (review 3 #10), for sms.send's
+        // gate: on Windows' own stack that is the bonded phone, also while
+        // its idle hands-free line is down between calls.
+        status
+            .texts_phone_known
+            .store(bt.texts_phone_known(), Ordering::Relaxed);
         status
             .loop_phase
             .store(loop_phase::EVENTS, Ordering::Relaxed);
@@ -1395,46 +1401,74 @@ pub(super) fn run_loop(
         // caller's number, or leaves the call ringing for the owner: it is
         // not answered on this pass.
         let mut not_answering = false;
-        if auto_answer {
-            if let Some(s) = tracker.current_mut() {
-                // A screened caller known to be one while the phone still
-                // rings, with nothing to be said to them, is refused there: not
-                // picked up at all. Decided before anything about the voice
-                // pipeline, the realtime route's preparing or the
-                // personalization window: none of them is needed to refuse a
-                // call. With a message to say the call is answered and
-                // screened at the greeting, as before; with no number yet, as
-                // before too, unless the allowed list needs one first.
-                if !s.is_active() && !s.outbound {
-                    let refusing = ring_refusal.as_ref().is_some_and(|r| r.call_id == s.id);
-                    if !refusing {
-                        #[cfg(feature = "voice")]
-                        let action = {
-                            // A number that did not come with the RING is
-                            // asked for, once: the phone lists the call to us
-                            // with its number, or with none when it is hidden.
-                            if screen_policy.needs_ring_id()
-                                && !s.ring_id_asked
-                                && !s.caller_withheld
-                                && s.caller_id.as_deref().unwrap_or("").trim().is_empty()
-                            {
-                                s.ring_id_asked = true;
-                                if let Err(e) = bt.query_calls() {
-                                    eprintln!("[aokie-plugin] AT+CLCC for a ringing call's number could not be sent: {e}");
-                                }
+        // Review 3 #21: refusing a screened caller while the phone rings is
+        // the screening's, not auto-answer's: blocked numbers, rejectPrivate
+        // and otherCallers "reject" are refused with auto-answer off too (the
+        // settings screen always said so). Only ever for a call to us that is
+        // still ringing, and only while the phone shows no live call and no
+        // other caller waits or is held: an AT+CHUP then would end the live
+        // call instead (review 1 #1).
+        let refusal_safe = ring_refusal_safe(
+            status.call_active.load(Ordering::Relaxed),
+            status.waiting_call.lock().unwrap().is_some(),
+            status.parked_call.lock().unwrap().is_some(),
+        );
+        // Review 3 #6: past the consent grant's expiry no new call is taken:
+        // it is left ringing for the owner, however long since anyone asked
+        // the plugin anything.
+        let consent_lapsed = status.consent_expired();
+        if let Some(s) = tracker.current_mut() {
+            // A screened caller known to be one while the phone still
+            // rings, with nothing to be said to them, is refused there: not
+            // picked up at all. Decided before anything about the voice
+            // pipeline, the realtime route's preparing or the
+            // personalization window: none of them is needed to refuse a
+            // call. With a message to say the call is answered and
+            // screened at the greeting, as before; with no number yet, as
+            // before too, unless the allowed list needs one first.
+            if !s.is_active() && !s.outbound {
+                let refusing = ring_refusal.as_ref().is_some_and(|r| r.call_id == s.id);
+                if !refusing {
+                    #[cfg(feature = "voice")]
+                    let action = {
+                        // A number that did not come with the RING is
+                        // asked for, once: the phone lists the call to us
+                        // with its number, or with none when it is hidden.
+                        if screen_policy.needs_ring_id()
+                            && !s.ring_id_asked
+                            && !s.caller_withheld
+                            && s.caller_id.as_deref().unwrap_or("").trim().is_empty()
+                        {
+                            s.ring_id_asked = true;
+                            if let Err(e) = bt.query_calls() {
+                                eprintln!("[aokie-plugin] AT+CLCC for a ringing call's number could not be sent: {e}");
                             }
-                            screen_policy.ring_action(
-                                s.caller_id.as_deref(),
-                                s.caller_withheld,
-                                std::time::Duration::from_millis(s.ringing_for_ms() as u64),
-                            )
-                        };
-                        #[cfg(not(feature = "voice"))]
-                        let action = crate::screen::RingAction::Answer;
-                        match action {
-                            crate::screen::RingAction::Refuse(reason) if !s.auto_answered => {
-                                // Not answered while the phone has its time to act.
-                                s.auto_answered = true;
+                        }
+                        let action = screen_policy.ring_action(
+                            s.caller_id.as_deref(),
+                            s.caller_withheld,
+                            std::time::Duration::from_millis(s.ringing_for_ms() as u64),
+                        );
+                        // With auto-answer off nobody answers a screened
+                        // caller to say the message: refused while it rings.
+                        // Once the number is known (or the phone said it is
+                        // hidden): a number that is only late is not refused.
+                        let identity_known = s.caller_withheld
+                            || !s.caller_id.as_deref().unwrap_or("").trim().is_empty();
+                        ring_action_for(
+                            action,
+                            auto_answer,
+                            identity_known,
+                            screen_policy.verdict(s.caller_id.as_deref()),
+                        )
+                    };
+                    #[cfg(not(feature = "voice"))]
+                    let action = crate::screen::RingAction::Answer;
+                    match action {
+                        crate::screen::RingAction::Refuse(reason) if !s.auto_answered => {
+                            // Not answered while the phone has its time to act.
+                            s.auto_answered = true;
+                            if refusal_safe {
                                 ring_refusal = Some(crate::screen::RingRefusal {
                                     call_id: s.id.clone(),
                                     reason,
@@ -1443,60 +1477,88 @@ pub(super) fn run_loop(
                                     gave_up: false,
                                 });
                                 refuse_at_ring = Some((reason, 1));
-                                idle = false;
-                            }
-                            crate::screen::RingAction::Wait => {
-                                not_answering = true;
-                                idle = false;
-                            }
-                            crate::screen::RingAction::Leave => {
-                                not_answering = true;
-                                if !s.left_ringing && !s.handed_over {
-                                    s.left_ringing = true;
-                                    *status.left_to_owner.lock().unwrap() = Some((s.id.clone(), false));
-                                    eprintln!(
-                                        "[aokie-plugin] call from {} is not on the allowed list — left ringing for the owner (Answer hands it to the receptionist)",
-                                        s.caller_id
-                                            .as_deref()
-                                            .filter(|n| !n.trim().is_empty())
-                                            .map(|n| aokie_core::redact::Phone(n).to_string())
-                                            .unwrap_or_else(|| "a hidden number".to_string())
-                                    );
-                                }
-                            }
-                            crate::screen::RingAction::Answer if s.left_ringing => {
-                                // (its number came, and it is allowed after all)
-                                s.left_ringing = false;
-                                *status.left_to_owner.lock().unwrap() = None;
-                            }
-                            crate::screen::RingAction::Answer => {}
-                            crate::screen::RingAction::Refuse(_) => {}
-                        }
-                    } else if let Some(r) = ring_refusal.as_mut().filter(|r| !r.gave_up) {
-                        // The call is still here: a reject is only a request.
-                        match crate::screen::ring_refusal_step(r.tries, r.sent.elapsed()) {
-                            crate::screen::RingStep::Wait => {}
-                            crate::screen::RingStep::RejectAgain => {
-                                r.tries += 1;
-                                r.sent = Instant::now();
-                                refuse_at_ring = Some((r.reason, r.tries));
-                                idle = false;
-                            }
-                            crate::screen::RingStep::AnswerInstead => {
-                                // The phone did not act. The call is answered
-                                // after all and refused at the greeting, as
-                                // every screened call was before: a screened
-                                // caller is never left ringing through.
-                                r.gave_up = true;
-                                s.auto_answered = false;
+                            } else {
                                 eprintln!(
-                                    "[aokie-plugin] call screened while ringing ({}) — the phone still rings after {} rejects; answering it to refuse it at the greeting",
-                                    r.reason, r.tries
+                                    "[aokie-plugin] call screened while ringing ({reason}) — not refused: the phone has another call up or waiting, which a reject would end; it is not answered"
+                                );
+                            }
+                            idle = false;
+                        }
+                        crate::screen::RingAction::Wait => {
+                            not_answering = true;
+                            idle = false;
+                        }
+                        crate::screen::RingAction::Leave if auto_answer => {
+                            not_answering = true;
+                            if !s.left_ringing && !s.handed_over {
+                                s.left_ringing = true;
+                                *status.left_to_owner.lock().unwrap() = Some((s.id.clone(), false));
+                                eprintln!(
+                                    "[aokie-plugin] call from {} is not on the allowed list — left ringing for the owner (Answer hands it to the receptionist)",
+                                    s.caller_id
+                                        .as_deref()
+                                        .filter(|n| !n.trim().is_empty())
+                                        .map(|n| aokie_core::redact::Phone(n).to_string())
+                                        .unwrap_or_else(|| "a hidden number".to_string())
                                 );
                             }
                         }
+                        crate::screen::RingAction::Answer if auto_answer && consent_lapsed && !s.handed_over => {
+                            not_answering = true;
+                            if !s.left_ringing {
+                                s.left_ringing = true;
+                                *status.left_to_owner.lock().unwrap() = Some((s.id.clone(), false));
+                                eprintln!(
+                                    "[aokie-plugin] consent has expired — call {} is left ringing for the owner, not answered (re-consent in the Consent tab)",
+                                    s.id
+                                );
+                            }
+                        }
+                        crate::screen::RingAction::Answer if auto_answer && s.left_ringing => {
+                            // (its number came, and it is allowed after all)
+                            s.left_ringing = false;
+                            *status.left_to_owner.lock().unwrap() = None;
+                        }
+                        _ => {}
+                    }
+                } else if let Some(r) = ring_refusal.as_mut().filter(|r| !r.gave_up) {
+                    // The call is still here: a reject is only a request.
+                    match crate::screen::ring_refusal_step(r.tries, r.sent.elapsed()) {
+                        crate::screen::RingStep::Wait => {}
+                        crate::screen::RingStep::RejectAgain if refusal_safe => {
+                            r.tries += 1;
+                            r.sent = Instant::now();
+                            refuse_at_ring = Some((r.reason, r.tries));
+                            idle = false;
+                        }
+                        crate::screen::RingStep::RejectAgain => {}
+                        crate::screen::RingStep::AnswerInstead if auto_answer => {
+                            // The phone did not act. The call is answered
+                            // after all and refused at the greeting, as
+                            // every screened call was before: a screened
+                            // caller is never left ringing through.
+                            r.gave_up = true;
+                            s.auto_answered = false;
+                            eprintln!(
+                                "[aokie-plugin] call screened while ringing ({}) — the phone still rings after {} rejects; answering it to refuse it at the greeting",
+                                r.reason, r.tries
+                            );
+                        }
+                        crate::screen::RingStep::AnswerInstead => {
+                            // With auto-answer off nobody answers it: it
+                            // rings on, for the owner to let ring out.
+                            r.gave_up = true;
+                            eprintln!(
+                                "[aokie-plugin] call screened while ringing ({}) — the phone still rings after {} rejects; auto-answer is off, so it is left ringing",
+                                r.reason, r.tries
+                            );
+                        }
                     }
                 }
+            }
+        }
+        if auto_answer {
+            if let Some(s) = tracker.current_mut() {
                 if !not_answering && !s.auto_answered && !s.is_active() && !s.outbound {
                     // AOK-VOICE-001: never answer into silence. A KNOWN voice
                     // failure (asset preflight or a live engine/synthesis

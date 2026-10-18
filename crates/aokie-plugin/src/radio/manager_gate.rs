@@ -50,6 +50,67 @@ pub(super) const MANAGER_GREET_LINE: &str =
 #[cfg(feature = "voice")]
 pub(super) const MANAGER_ACTION_FILLER: &str = "One moment.";
 
+/// Whether a manager-number caller's turn offers the PIN in passing ("my
+/// pin is 7 3 1 9 0 5, cancel Friday"): it says so (pin, passcode,
+/// password). Review 3 #22: the manager saying a time or a phone number had
+/// its digits judged as a wrong PIN, and the lockout (up to a day) followed.
+/// A digit run with no such word is no attempt at all; one with it is an
+/// attempt like any other, so the inline path gives no guesses for free.
+#[cfg(feature = "voice")]
+pub(super) fn turn_offers_pin(text: &str) -> bool {
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    words
+        .iter()
+        .any(|word| matches!(word.as_str(), "pin" | "passcode" | "password"))
+        || words.windows(2).any(|pair| pair[0] == "pass" && pair[1] == "code")
+}
+
+/// Tell the owner the manager PIN has just locked (review 3 #22): wrong PINs
+/// on the manager's number, which may not be the manager. Said where OAIY
+/// and the flows hear the plugin's incidents (`aokie.hardware.error`, its own
+/// code and occurrence); the lockout itself lasts up to a day.
+#[cfg(feature = "voice")]
+pub(super) fn notify_pin_lockout(
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+    call_id: &str,
+    retry_after_secs: u64,
+) {
+    eprintln!(
+        "[aokie-plugin] manager PIN locked for {} min — the owner is told",
+        retry_after_secs / 60
+    );
+    emit(
+        outbox,
+        sink,
+        aokie_core::events::aokie_event_occurrence(
+            crate::contract::events::HARDWARE_ERROR,
+            call_id,
+            &aokie_core::events::occurrence_id(),
+            pin_lockout_payload(call_id, retry_after_secs),
+        ),
+    );
+}
+
+/// The lockout notice's data (`notify_pin_lockout`).
+#[cfg(feature = "voice")]
+pub(super) fn pin_lockout_payload(call_id: &str, retry_after_secs: u64) -> serde_json::Value {
+    json!({
+        "code": "manager_pin_locked",
+        "callId": call_id,
+        "retryAfterSecs": retry_after_secs,
+        "message": format!(
+            "The manager PIN is locked for {} minutes after repeated wrong PINs from the manager's number. If that was not the manager, someone may be trying to guess it: change the PIN in the receptionist settings.",
+            retry_after_secs.div_ceil(60)
+        ),
+        "at": aokie_core::events::now_iso8601(),
+    })
+}
+
 /// Phase 3 PIN gate: per-call state. `awaiting_pin` swallows the NEXT caller
 /// turn (redacted everywhere) as the PIN attempt; `verified` unlocks further
 /// changes without re-asking; `pending` is the stashed [[MANAGER:]] request.

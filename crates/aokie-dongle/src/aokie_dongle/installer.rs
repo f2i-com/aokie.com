@@ -5,9 +5,29 @@ use std::ptr::null;
 
 use serde::Serialize;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, HANDLE, WAIT_ABANDONED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenMutexW, ReleaseMutex, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE,
+};
+
+/// The named mutex every aokie-driver-helper holds for its whole run (review 3
+/// #18), so that one runs at a time whoever started it. The dispatcher's own
+/// lock ([`InstallLock`]) is its process's: a plugin restarted while its helper
+/// ran (OAIY stopped it, or it crashed) took a fresh one and could start a
+/// second elevated helper beside the first, whose certificate clean-up then
+/// deleted the certificate the first had just added. The dispatcher looks for
+/// this one ([`helper_running`]) before it raises UAC, and a helper that finds
+/// it held exits at once with [`HELPER_BUSY_EXIT_CODE`], touching nothing.
+pub const HELPER_MUTEX_NAME: &str = "AokieDriverHelperRunning";
+
+/// The helper's exit code when another helper holds [`HELPER_MUTEX_NAME`].
+pub const HELPER_BUSY_EXIT_CODE: i32 = 75;
+
+const HELPER_BUSY: &str = "another Aokie driver step is still running (its helper was started earlier, perhaps by \
+     an Aokie that has since been started again, and its Windows prompt may still be open): wait for it to finish, \
+     then try again";
 
 /// Bumped whenever the on-disk job format changes in a way the helper
 /// must understand. The helper rejects unknown versions, so a stale
@@ -325,6 +345,20 @@ pub fn check_target(vid: u16, pid: u16) -> Result<(), String> {
     })
 }
 
+/// [`check_target`] for a restore: the dongle must be plugged in and on
+/// WinUSB with Aokie's package in the driver store
+/// ([`super::evaluate_restore_target`]), not one the catalog names. A restore
+/// undoes what Aokie did, and Aokie 0.0.2 bound adapters the catalog no longer
+/// lists (a laptop's Realtek 0bda:c822): those must still be given back.
+pub fn check_restore_target(vid: u16, pid: u16) -> Result<(), String> {
+    super::evaluate_restore_target(vid, pid)?;
+    helper_path().map(|_| ()).ok_or_else(|| {
+        "could not locate aokie-driver-helper.exe — set AOKIE_WINUSB_HELPER \
+         to override, otherwise it must be present next to the running app exe"
+            .to_string()
+    })
+}
+
 /// AOK-DRIVER-001 restore path: revert a dongle Aokie previously bound to
 /// WinUSB back to its in-box driver (e.g. BTHUSB), so the operator can
 /// undo the rebind without hunting through Device Manager. Elevated
@@ -370,8 +404,10 @@ fn wait_for_inbox_driver(vid: u16, pid: u16) -> Result<String, String> {
 fn restore_and_check(vid: u16, pid: u16, work_dir: &Path) -> Result<(), String> {
     let _lock = InstallLock::acquire()?;
     // DRIVER-001: run the unelevated policy gate and pin the exact live
-    // instance into the restore job — the helper re-verifies both.
-    let device = super::evaluate_present_target(vid, pid, super::allow_unknown_dongle())?;
+    // instance into the restore job — the helper re-verifies both. The
+    // restore's own gate (on WinUSB, Aokie's package there), not the
+    // install's catalog: see `check_restore_target`.
+    let device = super::evaluate_restore_target(vid, pid)?;
     let helper_path = helper_path().ok_or_else(|| {
         "could not locate aokie-driver-helper.exe — set AOKIE_WINUSB_HELPER \
          to override, otherwise it must be present next to the running app exe"
@@ -412,13 +448,25 @@ impl InstallLock {
         // worst-case; if we lose this wait the user is hitting Install
         // while another install is genuinely in flight.
         let wait = unsafe { WaitForSingleObject(handle, 2_000) };
-        // WAIT_ABANDONED means we own the mutex but the previous holder
-        // crashed without releasing it. There's no shared state behind
-        // the lock for the prior process to have left half-written —
-        // the only thing we coordinate is "I am about to launch a
-        // helper" — so it's safe to proceed.
-        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
-            Ok(Self { handle })
+        if wait == WAIT_OBJECT_0 {
+            let lock = Self { handle };
+            // The lock is this process's; a helper an earlier Aokie started
+            // (one stopped or restarted while its helper ran) outlives it.
+            if helper_running() {
+                return Err(HELPER_BUSY.to_string());
+            }
+            Ok(lock)
+        } else if wait == WAIT_ABANDONED {
+            // The Aokie that held the lock ended without letting it go: it
+            // was stopped in the middle of a driver step, whose elevated
+            // helper may still be running. Not taken as acquired (review 3
+            // #18): let go again, and refused; the next try finds the
+            // helper's own mutex, or nothing.
+            unsafe {
+                ReleaseMutex(handle);
+                CloseHandle(handle);
+            }
+            Err(HELPER_BUSY.to_string())
         } else if wait == WAIT_TIMEOUT {
             unsafe { CloseHandle(handle) };
             Err(
@@ -442,6 +490,95 @@ impl Drop for InstallLock {
             CloseHandle(self.handle);
         }
     }
+}
+
+/// Whether an aokie-driver-helper is running now, whichever Aokie started it:
+/// the helper holds [`HELPER_MUTEX_NAME`] for its whole run. The mutex is the
+/// elevated helper's, and this unelevated process may be refused access to it,
+/// which says as much that it is there.
+pub fn helper_running() -> bool {
+    let name_w: Vec<u16> = HELPER_MUTEX_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name_w.as_ptr()) };
+    if !handle.is_null() {
+        unsafe { CloseHandle(handle) };
+        return true;
+    }
+    match unsafe { GetLastError() } {
+        ERROR_FILE_NOT_FOUND => false,
+        ERROR_ACCESS_DENIED => true,
+        other => {
+            eprintln!(
+                "[installer] could not tell whether a driver helper is running (OpenMutexW: Win32 error {other}); taken as none"
+            );
+            false
+        }
+    }
+}
+
+/// A helper an earlier Aokie started and did not see to its end (Aokie was
+/// started again while it ran, review 3 #18): reported as the driver step
+/// running (`crate::driver_job`), so the screen keeps Install off and another
+/// step is refused, rather than the step reading as vanished. What it does
+/// comes from the job file that Aokie wrote beside it (`aokie_driver_job.json`,
+/// removed once a helper it waited for ends). The step ends when the helper
+/// exits, as the plugin would have ended it: an install is done once the
+/// dongle is on WinUSB, a restore once it is on another driver. Called before
+/// the step is reported and before another starts.
+pub fn adopt_running_helper(work_dir: &Path) {
+    if crate::driver_job::current().is_some_and(|job| job.is_running()) || !helper_running() {
+        return;
+    }
+    let job_path = work_dir.join("aokie_driver_job.json");
+    let left: serde_json::Value = std::fs::read(&job_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let id = |field: &str| left.get(field).and_then(|v| v.as_u64()).and_then(|v| u16::try_from(v).ok()).unwrap_or(0);
+    let (vid, pid) = (id("vid"), id("pid"));
+    let kind: &'static str = match left.get("mode").and_then(|v| v.as_str()) {
+        Some("install") => "install",
+        Some("restore-driver") => "restore",
+        Some("remove-certs") => "removeCerts",
+        _ => "driverStep",
+    };
+    let started = crate::driver_job::start(kind, vid, pid, move || {
+        while helper_running() {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let _ = std::fs::remove_file(&job_path);
+        match kind {
+            "install" => match super::find_device(vid, pid) {
+                Ok(Some(device)) if device.driver.eq_ignore_ascii_case("WinUSB") => {
+                    Ok(serde_json::json!({"installed": true, "backend": "aokie-helper", "afterRestart": true}))
+                }
+                _ => Err(append_helper_log(
+                    "the driver install that was running when Aokie started again has ended, and the dongle is not on WinUSB"
+                        .to_string(),
+                )),
+            },
+            "restore" => wait_for_inbox_driver(vid, pid)
+                .map(|driver| serde_json::json!({"restored": true, "driver": driver, "afterRestart": true})),
+            _ => Ok(serde_json::json!({"afterRestart": true})),
+        }
+    });
+    match started {
+        Ok(_) => eprintln!(
+            "[installer] a driver helper started before Aokie started again is still running ({kind} {vid:04x}:{pid:04x}): reported as the driver step until it exits"
+        ),
+        Err(e) => eprintln!("[installer] the running driver helper was not reported: {e}"),
+    }
+}
+
+/// What the helper's exit code says, where it is not success.
+fn helper_exit_error(what: &str, code: i32) -> String {
+    if code == HELPER_BUSY_EXIT_CODE {
+        // (the log is the running helper's, not this one's)
+        return HELPER_BUSY.to_string();
+    }
+    append_helper_log(format!("{what} exited with code {code}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -510,10 +647,7 @@ fn run_helper_install(
         Ok(0) => Ok(InstallOutcome {
             backend: InstallBackend::AokieHelper,
         }),
-        Ok(code) => Err(append_helper_log(format!(
-            "aokie-driver-helper exited with code {}",
-            code
-        ))),
+        Ok(code) => Err(helper_exit_error("aokie-driver-helper", code)),
         Err(e) => Err(append_helper_log(e)),
     }
 }
@@ -559,10 +693,7 @@ fn run_helper_remove_certs(work_dir: &Path, helper_path: &Path) -> Result<(), St
     let _ = std::fs::remove_file(&job_path);
     match outcome {
         Ok(0) => Ok(()),
-        Ok(code) => Err(append_helper_log(format!(
-            "aokie-driver-helper (remove-certs) exited with code {}",
-            code
-        ))),
+        Ok(code) => Err(helper_exit_error("aokie-driver-helper (remove-certs)", code)),
         Err(e) => Err(append_helper_log(e)),
     }
 }
@@ -616,10 +747,7 @@ fn run_helper_restore(
     let _ = std::fs::remove_file(&job_path);
     match outcome {
         Ok(0) => Ok(()),
-        Ok(code) => Err(append_helper_log(format!(
-            "aokie-driver-helper (restore-driver) exited with code {}",
-            code
-        ))),
+        Ok(code) => Err(helper_exit_error("aokie-driver-helper (restore-driver)", code)),
         Err(e) => Err(append_helper_log(e)),
     }
 }

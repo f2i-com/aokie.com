@@ -18,7 +18,12 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, HANDLE, WAIT_FAILED,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::System::Registry::REG_MULTI_SZ;
+use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+    SetupDiGetDeviceInstanceIdW, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL, DIREG_DRV,
+};
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegQueryValueExW, HKEY, KEY_READ, REG_MULTI_SZ, REG_SZ,
+};
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
 use windows_sys::Win32::UI::Shell::{
     SHGetFolderPathW, ShellExecuteExW, CSIDL_WINDOWS, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
@@ -791,8 +796,15 @@ pub fn restore_inbox_driver(vid: u16, pid: u16) -> Result<Vec<String>, String> {
         ));
     }
     let removed = uninstall_aokie_driver_packages()?;
-    // Best-effort re-search; a not-present device is a no-op.
-    let _ = reenumerate_device(&hwid);
+    // Re-enumerating the device alone does not have PnP choose its driver
+    // again (review 3 #19: the restore then ended "still on WinUSB, unplug
+    // it"): it is restarted (removed and found again, as a replug), which the
+    // dispatcher may do only once its radio has let go of the dongle. A
+    // re-enumeration is the fallback where the restart is refused.
+    if let Err(e) = restart_device(&hwid) {
+        eprintln!("[winusb] restore: the dongle was not restarted ({e}); re-enumerating it instead");
+        let _ = reenumerate_device(&hwid);
+    }
     Ok(removed)
 }
 
@@ -801,23 +813,9 @@ pub fn restore_inbox_driver(vid: u16, pid: u16) -> Result<Vec<String>, String> {
 /// naming it, with those removed before it: a restore that leaves one there
 /// leaves PnP able to pick it again.
 fn uninstall_aokie_driver_packages() -> Result<Vec<String>, String> {
-    let inf_dir = windows_dir()?.join("INF");
-    let entries = std::fs::read_dir(&inf_dir)
-        .map_err(|e| format!("could not list the driver store's INFs in {:?}: {}", inf_dir, e))?;
     let mut removed = Vec::new();
     let mut failed = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let lower = name.to_ascii_lowercase();
-        if !(lower.starts_with("oem") && lower.ends_with(".inf")) {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(entry.path()) else {
-            continue;
-        };
-        if !is_aokie_package(&bytes) {
-            continue;
-        }
+    for name in aokie_packages_in_store()? {
         // The published name only: the function finds it in the INF directory.
         let name_w = wide_null(&name);
         if unsafe { SetupUninstallOEMInfW(name_w.as_ptr(), SUOI_FORCEDELETE, null()) } != 0 {
@@ -835,6 +833,100 @@ fn uninstall_aokie_driver_packages() -> Result<Vec<String>, String> {
         ));
     }
     Ok(removed)
+}
+
+/// The published names (`oem12.inf`) of Aokie's WinUSB packages in the
+/// driver store ([`is_aokie_package`]).
+pub fn aokie_packages_in_store() -> Result<Vec<String>, String> {
+    let inf_dir = windows_dir()?.join("INF");
+    let entries = std::fs::read_dir(&inf_dir)
+        .map_err(|e| format!("could not list the driver store's INFs in {:?}: {}", inf_dir, e))?;
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let lower = name.to_ascii_lowercase();
+        if !(lower.starts_with("oem") && lower.ends_with(".inf")) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        if is_aokie_package(&bytes) {
+            found.push(name);
+        }
+    }
+    Ok(found)
+}
+
+/// The INF the present device `instance_id`'s driver was installed from, as
+/// its driver key records it (`InfPath`: `oem12.inf` for a package from the
+/// driver store). None where it has no driver key or it cannot be read.
+pub fn bound_inf(instance_id: &str) -> Option<String> {
+    let enumerator = wide_null("USB");
+    let info_set = unsafe {
+        SetupDiGetClassDevsW(null(), enumerator.as_ptr(), null_mut(), DIGCF_ALLCLASSES | DIGCF_PRESENT)
+    };
+    if info_set == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE as HDEVINFO {
+        return None;
+    }
+    let _info_set_guard = DeviceInfoSetGuard(info_set);
+    let mut index: u32 = 0;
+    loop {
+        let mut info: SP_DEVINFO_DATA = unsafe { zeroed() };
+        info.cbSize = size_of::<SP_DEVINFO_DATA>() as u32;
+        if unsafe { SetupDiEnumDeviceInfo(info_set, index, &mut info) } == 0 {
+            return None;
+        }
+        index += 1;
+        let mut id = [0u16; 512];
+        let mut needed: u32 = 0;
+        if unsafe { SetupDiGetDeviceInstanceIdW(info_set, &info, id.as_mut_ptr(), id.len() as u32, &mut needed) } == 0 {
+            continue;
+        }
+        let len = id.iter().position(|unit| *unit == 0).unwrap_or(id.len());
+        if !String::from_utf16_lossy(&id[..len]).eq_ignore_ascii_case(instance_id) {
+            continue;
+        }
+        let key = unsafe { SetupDiOpenDevRegKey(info_set, &info, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_READ) };
+        if key.is_null() || std::ptr::eq(key, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE as HKEY) {
+            return None;
+        }
+        let value = wide_null("InfPath");
+        let mut kind: u32 = 0;
+        let mut data = [0u16; 260];
+        let mut size = (data.len() * 2) as u32;
+        let read = unsafe {
+            RegQueryValueExW(key, value.as_ptr(), null(), &mut kind, data.as_mut_ptr() as *mut u8, &mut size)
+        };
+        unsafe { RegCloseKey(key) };
+        if read != 0 || kind != REG_SZ {
+            return None;
+        }
+        let units = (size as usize / 2).min(data.len());
+        let len = data[..units].iter().position(|unit| *unit == 0).unwrap_or(units);
+        let inf = String::from_utf16_lossy(&data[..len]).trim().to_string();
+        return (!inf.is_empty()).then_some(inf);
+    }
+}
+
+/// Whether the WinUSB driver on the present device `instance_id` is Aokie's
+/// (review 3 #19, the restore's gate): the INF it was installed from is one of
+/// Aokie's packages, or a driver-store package no longer there (an earlier
+/// restore took Aokie's out, and Windows has not chosen the dongle's driver
+/// again yet). Where its driver key cannot be read: whether one of Aokie's
+/// packages is in the store.
+pub fn winusb_is_aokies(instance_id: &str) -> Result<bool, String> {
+    let packages = aokie_packages_in_store()?;
+    match bound_inf(instance_id) {
+        Some(inf) => {
+            if packages.iter().any(|p| p.eq_ignore_ascii_case(&inf)) {
+                return Ok(true);
+            }
+            let lower = inf.to_ascii_lowercase();
+            Ok(lower.starts_with("oem") && lower.ends_with(".inf") && !windows_dir()?.join("INF").join(&inf).exists())
+        }
+        None => Ok(!packages.is_empty()),
+    }
 }
 
 /// Whether an INF in the driver store is one of Aokie's WinUSB packages:
@@ -1303,7 +1395,7 @@ mod tests {
             .lines()
             .find_map(|line| line.strip_prefix("DriverVer="))
             .expect("the INF has a DriverVer");
-        let today = chrono::Local::now().naive_local().date();
+        let today = crate::driver_version::driver_ver_today();
         crate::driver_version::check_job_driver_ver(driver_ver, today).unwrap();
     }
 }

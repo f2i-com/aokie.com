@@ -1235,22 +1235,29 @@ pub(super) fn run_reply_rounds(
                 // volunteered it mid-sentence); only gate-prompted
                 // turns are redacted. A failed inline match falls
                 // through to the normal PIN prompt.
-                if is_mgr && pin_set && !ctx.manager_gate.verified {
+                // Review 3 #22: only a turn that offers the PIN
+                // ("my pin is ...") is judged; a time or a phone number
+                // said in passing is no attempt and counts nothing.
+                if is_mgr && pin_set && !ctx.manager_gate.verified && turn_offers_pin(&text) {
                     let expected = crate::speech_plan::spoken_digits(
                         &std::env::var("AOKIE_MANAGER_PIN")
                             .unwrap_or_default(),
                     );
                     let inline = crate::speech_plan::spoken_digits(&text);
-                    if !expected.is_empty()
-                        && inline.len() == expected.len()
-                        && crate::manager_auth::verify(
-                            data_dir, &expected, &inline,
-                        ) == crate::manager_auth::Decision::Verified
-                    {
-                        ctx.manager_gate.verified = true;
-                        eprintln!(
-                            "[aokie-plugin] manager PIN verified (inline with the request)"
-                        );
+                    if !expected.is_empty() && inline.len() == expected.len() {
+                        match crate::manager_auth::verify(data_dir, &expected, &inline) {
+                            crate::manager_auth::Decision::Verified => {
+                                ctx.manager_gate.verified = true;
+                                eprintln!(
+                                    "[aokie-plugin] manager PIN verified (inline with the request)"
+                                );
+                            }
+                            crate::manager_auth::Decision::Locked {
+                                retry_after_secs,
+                                began: true,
+                            } => notify_pin_lockout(outbox, sink, &corr, retry_after_secs),
+                            _ => {}
+                        }
                     }
                 }
                 if !is_mgr {

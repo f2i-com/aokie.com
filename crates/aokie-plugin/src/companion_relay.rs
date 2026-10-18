@@ -342,6 +342,9 @@ pub(crate) struct RelayChannel {
     reopen_not_before: Instant,
     stream_failures: u32,
     undeliverable: Option<(Instant, u64)>,
+    /// When frames the relay refused or shed were last reported, and how many
+    /// such POSTs were held back since (see [`Self::note_shed`]).
+    shed_log: std::sync::Mutex<Option<(Instant, u32)>>,
 }
 
 /// Clone-only input for one asynchronous per-party greeting refresh.
@@ -391,6 +394,14 @@ impl RelayGreetingRequest {
         if !status.is_success() {
             return Err(relay_status_error("challenge", status));
         }
+        // The relay's clock, as the challenge left it: the challenge and every
+        // protocol time after it are checked on that clock.
+        crate::companion_gateway::observe_server_date(
+            response
+                .headers()
+                .get(reqwest::header::DATE)
+                .and_then(|value| value.to_str().ok()),
+        );
         let body = response
             .text()
             .await
@@ -466,12 +477,27 @@ impl RelayChannel {
         approved_thumbprints: Vec<String>,
         prime_tail: bool,
     ) -> Result<(Self, EndpointChallengeFrame), WorkerError> {
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             // The relay is a fixed, admission-named endpoint: a proxy from the
             // environment would see every bearer token and frame.
             .no_proxy()
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(10));
+        // A managed-beta build may reach the FormLogic API host over plain
+        // http. That host is the install on this computer, so it is pinned to
+        // loopback: resolving the `.local` name would let whoever answers
+        // mDNS on the LAN collect the bearer and every frame.
+        if crate::companion_gateway::relay_client_pins_api_host([
+            endpoints.challenge_url.as_str(),
+            endpoints.frames_url.as_str(),
+            endpoints.stream_url.as_str(),
+        ]) {
+            builder = builder.resolve_to_addrs(
+                crate::companion_gateway::MANAGED_BETA_API_HOST,
+                &crate::companion_gateway::managed_beta_api_host_loopback(),
+            );
+        }
+        let client = builder
             .build()
             .map_err(|_| {
                 WorkerError::rebootstrap("Companion relay HTTP client could not be created")
@@ -503,6 +529,7 @@ impl RelayChannel {
             reopen_not_before: Instant::now(),
             stream_failures: 0,
             undeliverable: None,
+            shed_log: std::sync::Mutex::new(None),
         };
         let challenge = channel.fetch_challenge().await?;
         if prime_tail {
@@ -1002,6 +1029,29 @@ impl RelayChannel {
         }
     }
 
+    /// Report frames the relay refused or shed, at most once an
+    /// [`UNDELIVERABLE_LOG_INTERVAL`], with a count of the POSTs held back.
+    /// The session retries a dropped snapshot for as long as the relay keeps
+    /// dropping it, so one line per POST would fill the log ring.
+    fn note_shed(&self, stage: &str, frames: usize, status: StatusCode, detail: &str) {
+        let Ok(mut window) = self.shed_log.lock() else {
+            return;
+        };
+        let held_back = match *window {
+            Some((since, held)) if since.elapsed() < UNDELIVERABLE_LOG_INTERVAL => {
+                *window = Some((since, held.saturating_add(1)));
+                return;
+            }
+            Some((_, held)) => held,
+            None => 0,
+        };
+        *window = Some((Instant::now(), 0));
+        eprintln!(
+            "[aokie-plugin][companion] stage={stage} frames={frames} status={} held_back={held_back} detail={detail}",
+            status.as_u16()
+        );
+    }
+
     fn restart_stream(&mut self, delay: Duration) {
         self.stream = None;
         self.parser = SseParser::default();
@@ -1070,10 +1120,11 @@ impl RelayChannel {
                         // them again cannot change that, and failing the
                         // session for it resent the same frame on reconnect,
                         // in a loop that dropped every remote media route.
-                        eprintln!(
-                            "[aokie-plugin][companion] stage=relay_frames_refused frames={} status={} detail=The relay refused the frames and they were dropped",
+                        self.note_shed(
+                            "relay_frames_refused",
                             frames.len(),
-                            status.as_u16()
+                            status,
+                            "The relay refused the frames and they were dropped",
                         );
                         return Ok(TransportDelivery::Dropped);
                     }
@@ -1083,9 +1134,11 @@ impl RelayChannel {
                         // frame is recoverable — the session republishes state
                         // — whereas failing the session would fail-closed a
                         // live call over a server-side queue depth.
-                        eprintln!(
-                            "[aokie-plugin][companion] stage=relay_backpressure frames={} detail=The relay mailbox is full and the frames were dropped",
-                            frames.len()
+                        self.note_shed(
+                            "relay_backpressure",
+                            frames.len(),
+                            status,
+                            "The relay mailbox is full and the frames were dropped",
                         );
                         return Ok(TransportDelivery::Dropped);
                     }
@@ -2155,6 +2208,7 @@ mod tests {
             reopen_not_before: Instant::now(),
             stream_failures: 0,
             undeliverable: None,
+            shed_log: std::sync::Mutex::new(None),
         }
     }
 }

@@ -18,7 +18,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use aokie_media::{
     DesktopPeer, IceCandidateSignal, IceServerConfig, MediaMode, OwnedAudioFrame, PeerEvent,
@@ -1373,10 +1373,10 @@ impl RemoteMediaHandle {
         {
             return Err("accepted transfer is no longer current before takeover setup".into());
         }
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "system clock is before the Unix epoch".to_string())?
-            .as_secs();
+        // The setup expiry was dated on the server's clock by the assistance
+        // broker, so it is read on that clock too.
+        let now_unix = crate::companion_gateway::server_unix_now()
+            .ok_or_else(|| "system clock is before the Unix epoch".to_string())?;
         let deadline = bounded_transfer_deadline(setup_expires_at, now_unix, Instant::now())?;
         let guard = TransferActivationGuard {
             request_id,
@@ -1900,6 +1900,13 @@ impl RemoteMediaHandle {
             dropped: self.inner.dropped_events.clone(),
         }
         .emit(&binding, kind);
+    }
+
+    /// Queue one media event as native media would, for a test that drives
+    /// the gateway session's reaction to it.
+    #[cfg(test)]
+    pub(crate) fn emit_test_event(&self, binding: SessionBinding, kind: RemoteMediaEventKind) {
+        self.emit(binding, kind);
     }
 }
 

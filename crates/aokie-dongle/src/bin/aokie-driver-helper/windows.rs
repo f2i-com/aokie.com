@@ -175,7 +175,61 @@ macro_rules! log_err {
     }};
 }
 
+/// [`aokie_dongle::installer::HELPER_MUTEX_NAME`], held until this helper
+/// exits (the system lets it go then, however it ends).
+struct HelperRunning(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for HelperRunning {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// Take the helpers' mutex, or say why not: one helper at a time, whichever
+/// Aokie started it (review 3 #18). One that ended without letting it go (it
+/// crashed, or was ended) is not running, so the mutex it left is taken:
+/// only helpers take this one; the dispatcher only looks.
+fn hold_helper_mutex() -> Result<HelperRunning, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+    let name: Vec<u16> = aokie_dongle::installer::HELPER_MUTEX_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(format!(
+            "could not open the helpers' mutex: Win32 error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(HelperRunning(handle)),
+        WAIT_TIMEOUT => {
+            unsafe { CloseHandle(handle) };
+            Err("another aokie-driver-helper is running: this one does nothing".to_string())
+        }
+        other => {
+            unsafe { CloseHandle(handle) };
+            Err(format!("waiting for the helpers' mutex returned 0x{other:08x}"))
+        }
+    }
+}
+
 pub fn main() {
+    // First of all, before the log is opened: the log is one file for every
+    // helper, and a helper that is not to run must not replace the running
+    // one's (the dispatcher reads it back on a failure).
+    let _running = match hold_helper_mutex() {
+        Ok(running) => running,
+        Err(e) => {
+            eprintln!("[aokie-driver-helper] {e}");
+            std::process::exit(aokie_dongle::installer::HELPER_BUSY_EXIT_CODE);
+        }
+    };
     let now = chrono::Local::now();
     log_line!(
         "[aokie-driver-helper] starting at {} (pid={})",
@@ -184,6 +238,7 @@ pub fn main() {
     );
     if let Err(e) = run() {
         log_err!("[aokie-driver-helper] {}", e);
+        // (exit skips the guard's drop: the system lets the mutex go as the process ends)
         std::process::exit(1);
     }
     log_line!("[aokie-driver-helper] done");
@@ -445,7 +500,7 @@ fn validate_install_job_fields(job: &DriverJob) -> Result<(), String> {
     if self_sign {
         aokie_dongle::driver_version::check_job_driver_ver(
             &job.driver_ver,
-            chrono::Local::now().date_naive(),
+            aokie_dongle::driver_version::driver_ver_today(),
         )
         .map_err(|e| format!("install job's driver_ver refused: {}", e))?;
     }
@@ -900,9 +955,11 @@ fn run_remove_certs() -> Result<(), String> {
 }
 
 /// AOK-DRIVER-001 restore path: revert the device to its in-box driver.
-/// Re-validates the target against the live catalog policy first (so a
-/// tampered restore job can't be aimed at an arbitrary device), then
-/// hands off to the winusb restore routine.
+/// Re-validates the target first (so a tampered restore job can't be aimed
+/// at an arbitrary device): the restore's own gate, on WinUSB from Aokie's
+/// package (`aokie_dongle::evaluate_restore_target`), not the install's
+/// catalog, which no longer names adapters Aokie 0.0.2 bound (review 3 #19).
+/// Then hands off to the winusb restore routine.
 fn run_restore(job: &DriverJob) -> Result<(), String> {
     log_line!(
         "[aokie-driver-helper] restore-driver job: vid=0x{:04x} pid=0x{:04x}",
@@ -918,14 +975,10 @@ fn run_restore(job: &DriverJob) -> Result<(), String> {
                 .to_string(),
         );
     }
-    // Only ever restore a device that is itself a legitimate Aokie
-    // target — never touch an arbitrary device's driver binding.
-    let device = aokie_dongle::evaluate_present_target(
-        job.vid,
-        job.pid,
-        aokie_dongle::allow_unknown_dongle(),
-    )
-    .map_err(|e| format!("device policy refused this restore target: {}", e))?;
+    // Only ever restore a device Aokie bound — never touch an arbitrary
+    // device's driver binding.
+    let device = aokie_dongle::evaluate_restore_target(job.vid, job.pid)
+        .map_err(|e| format!("device policy refused this restore target: {}", e))?;
     if !instance_matches(&job.instance_id, &device.instance_id) {
         return Err(format!(
             "device instance changed since approval: restore job approved {:?} but the \

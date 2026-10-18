@@ -2,14 +2,17 @@ package com.aokie.companion
 
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import android.util.AtomicFile
+import android.util.Log
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.security.KeyStore
 import java.security.MessageDigest
+import java.security.UnrecoverableKeyException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -28,6 +31,7 @@ object AokieSecureStore {
   private const val STORE_DIRECTORY = "aokie-native-store-v1"
   private const val MAX_KEY_BYTES = 512
   private const val MAX_VALUE_BYTES = 64 * 1024
+  private const val TAG = "AokieSecureStore"
   private val magic = byteArrayOf(0x41, 0x4f, 0x4b, 0x31) // AOK1
   private val lock = Any()
 
@@ -45,7 +49,13 @@ object AokieSecureStore {
       require(valueBytes.size <= MAX_VALUE_BYTES) { "secure value is too large" }
 
       val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-      cipher.init(Cipher.ENCRYPT_MODE, key(context))
+      try {
+        cipher.init(Cipher.ENCRYPT_MODE, key(context))
+      } catch (error: KeyPermanentlyInvalidatedException) {
+        // A definite loss: reset the store, and this write goes under a fresh key.
+        resetLostKey(context)
+        cipher.init(Cipher.ENCRYPT_MODE, key(context))
+      }
       cipher.updateAAD(keyBytes)
       val ciphertext = cipher.doFinal(valueBytes)
       val encoded = ByteArrayOutputStream().use { bytes ->
@@ -88,7 +98,9 @@ object AokieSecureStore {
     runCatching {
       val keyBytes = checkedKey(logicalKey)
       val target = file(context, logicalKey)
-      if (!target.exists()) return@runCatching null
+      // The key first: if it was lost, key() clears every value it sealed, and this one reads as absent.
+      val secret = key(context)
+      if (!storedFileExists(target)) return@runCatching null
       val encoded = AtomicFile(target).readFully()
       require(encoded.size <= MAX_VALUE_BYTES + 128) { "secure value is too large" }
 
@@ -109,7 +121,13 @@ object AokieSecureStore {
       }
 
       val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-      cipher.init(Cipher.DECRYPT_MODE, key(context), GCMParameterSpec(128, iv))
+      try {
+        cipher.init(Cipher.DECRYPT_MODE, secret, GCMParameterSpec(128, iv))
+      } catch (error: KeyPermanentlyInvalidatedException) {
+        // The value can never be read again; after the reset it is truly absent.
+        resetLostKey(context)
+        return@runCatching null
+      }
       cipher.updateAAD(keyBytes)
       val plaintext = cipher.doFinal(ciphertext)
       require(plaintext.size <= MAX_VALUE_BYTES) { "secure value is too large" }
@@ -128,13 +146,37 @@ object AokieSecureStore {
   fun contains(context: Context, logicalKey: String): Boolean = synchronized(lock) {
     runCatching {
       checkedKey(logicalKey)
-      file(context, logicalKey).exists()
+      storedFileExists(file(context, logicalKey))
     }.getOrDefault(false)
   }
 
-  private fun key(@Suppress("UNUSED_PARAMETER") context: Context): SecretKey {
+  /**
+   * Whether a value is stored in [target], counting the backup AtomicFile keeps mid-write.
+   *
+   * Before API 30, AtomicFile writes by renaming the old file to `<name>.bak` and restores it on the next
+   * read. A process killed mid-write therefore left only the backup, and a plain `exists()` check read the
+   * value as absent: Rust would then mint a new identity or treat the person as signed out.
+   */
+  private fun storedFileExists(target: java.io.File): Boolean =
+    target.exists() || java.io.File(target.path + ".bak").exists()
+
+  private fun key(context: Context): SecretKey {
     val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-    (store.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+    val existing = try {
+      store.getKey(KEY_ALIAS, null) as? SecretKey
+    } catch (error: UnrecoverableKeyException) {
+      // The key's material is gone for good (some devices lose it across an OS update or a lock-screen
+      // change). Other Keystore errors stay errors: they can be transient, and treating one as loss would
+      // throw away a readable identity.
+      Log.w(TAG, "the native store key is unrecoverable; resetting the store")
+      runCatching { store.deleteEntry(KEY_ALIAS) }
+      null
+    }
+    existing?.let { return it }
+    // No key: every value in the store was sealed by a key that no longer exists and can never be read
+    // again. Clear them, so they read as absent (a fresh identity, a new sign-in) instead of failing on
+    // every launch with no way out. On a first launch there is nothing to clear.
+    resetUnreadableValues(context)
     val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
     generator.init(
       KeyGenParameterSpec.Builder(
@@ -148,6 +190,23 @@ object AokieSecureStore {
         .build(),
     )
     return generator.generateKey()
+  }
+
+  /** Forget a key Android reports permanently invalid, and every value it sealed. */
+  private fun resetLostKey(context: Context) {
+    Log.w(TAG, "the native store key was permanently invalidated; resetting the store")
+    runCatching {
+      KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(KEY_ALIAS)
+    }
+    resetUnreadableValues(context)
+  }
+
+  private fun resetUnreadableValues(context: Context) {
+    val directory = java.io.File(context.noBackupFilesDir, STORE_DIRECTORY)
+    val stale = directory.listFiles().orEmpty()
+    if (stale.isEmpty()) return
+    Log.w(TAG, "clearing ${stale.size} values sealed by a lost key")
+    stale.forEach { runCatching { it.delete() } }
   }
 
   private fun checkedKey(logicalKey: String): ByteArray {

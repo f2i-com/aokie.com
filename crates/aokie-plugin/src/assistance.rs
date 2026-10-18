@@ -5,7 +5,6 @@
 //! signalling and remain in memory for the live receptionist to consume.
 
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use aokie_protocol::v2::{
     AssistanceResponseAction, PluginAssistanceAnswerFrame, PluginAssistanceRequestFrame,
@@ -872,11 +871,11 @@ fn validate_text(value: &str, maximum: usize, name: &str) -> Result<(), String> 
     }
 }
 
+/// Now on the server's clock, like every other Companion protocol time: a
+/// request's expiry reaches the phone, which checks it on that clock.
 fn unix_now() -> Result<u64, String> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .map_err(|_| "system clock is before the Unix epoch".into())
+    crate::companion_gateway::server_unix_now()
+        .ok_or_else(|| "system clock is before the Unix epoch".into())
 }
 
 pub fn global() -> &'static AssistanceBroker {

@@ -193,7 +193,10 @@ pub(super) fn process_flushed_turn(
                     }
                 } else {
                     ctx.manager_gate.attempts += 1;
-                    if matches!(auth, crate::manager_auth::Decision::Locked { .. }) {
+                    if let crate::manager_auth::Decision::Locked { retry_after_secs, began } = auth {
+                        if began {
+                            notify_pin_lockout(outbox, sink, &corr, retry_after_secs);
+                        }
                         ctx.manager_gate.pending = None;
                         speak_manager_line(
                             bt,

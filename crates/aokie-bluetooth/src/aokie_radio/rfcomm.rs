@@ -893,6 +893,14 @@ impl RfcommState {
                         .or_else(|| self.hfp_outstanding.answered())
                         .unwrap_or("unsolicited");
                     self.hfp_in_flight_command_sent_at = None;
+                    // Review 3 #28: a refused ATA on a ringing call, or a
+                    // refused AT+CHUP on a live one, is sent once more
+                    // before it is reported.
+                    if let Some(again) = self.hfp_state.after_refusal(command) {
+                        eprintln!("[AokieRadio] AG refused {command} — sending it once more");
+                        responses.push(self.build_hfp_command_frame(again));
+                        continue;
+                    }
                     eprintln!("[AokieRadio] AG refused {command} — the connection stays up");
                     self.hfp_events.push(hfp::HfpEvent::CommandRejected {
                         command,
@@ -2675,6 +2683,66 @@ mod tests {
             .unwrap();
         assert_eq!(parse_frame(&responses[0]).unwrap().payload, b"AT+BAC=1,2\r");
         assert!(state.take_hfp_events().is_empty());
+    }
+
+    /// Review 3 #28: a refused ATA on a ringing call and a refused AT+CHUP on
+    /// a live one are sent once more (the second refusal is reported), and
+    /// a refused AT+CHUP on a ringing call no longer counts as our refusing
+    /// it: the owner answering on the handset then is an answered call.
+    #[test]
+    fn a_refused_answer_or_hangup_is_sent_once_more() {
+        let mut state = open_hfp_state();
+        for reply in [
+            "\r\n+BRSF: 871\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\n+CIND: (\"call\",(0,1)),(\"callsetup\",(0-3))\r\nOK\r\n",
+            "\r\n+CIND: 0,0\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+        ] {
+            state
+                .handle_packet(&build_uih(aokie_hfp_dlci(), false, None, reply.as_bytes()))
+                .unwrap();
+        }
+        assert!(state.hfp_state().service_level_ready());
+        let error = || build_uih(aokie_hfp_dlci(), false, None, b"\r\nERROR\r\n");
+        let ciev = |text: &str| build_uih(aokie_hfp_dlci(), false, None, text.as_bytes());
+
+        // A ring; our ATA is refused: sent once more, then reported.
+        state.handle_packet(&ciev("\r\n+CIEV: 2,1\r\n")).unwrap();
+        state.take_hfp_events();
+        state.build_call_control_command(hfp::HfpAtCommand::Answer).unwrap();
+        let again = state.handle_packet(&error()).unwrap();
+        assert_eq!(parse_frame(&again[0]).unwrap().payload, b"ATA\r");
+        assert!(state.take_hfp_events().is_empty(), "not reported while it is tried again");
+        assert!(state.handle_packet(&error()).unwrap().is_empty(), "once only");
+        assert_eq!(
+            state.take_hfp_events(),
+            vec![hfp::HfpEvent::CommandRejected { command: "ATA", timed_out: false }]
+        );
+
+        // Our CHUP on the ringing call is refused: it is not ours to end any
+        // more, so the setup ending is the ambiguous edge again, and the
+        // owner answering on the handset is an answer.
+        state.build_call_control_command(hfp::HfpAtCommand::RejectOrHangup).unwrap();
+        assert!(state.handle_packet(&error()).unwrap().is_empty(), "a ringing call's CHUP is not retried here");
+        state.take_hfp_events();
+        state.handle_packet(&ciev("\r\n+CIEV: 2,0\r\n")).unwrap();
+        assert!(state.take_hfp_events().is_empty(), "held for the call indicator, not ended");
+        state.handle_packet(&ciev("\r\n+CIEV: 1,1\r\n")).unwrap();
+        assert!(state.take_hfp_events().contains(&hfp::HfpEvent::CallAnswered));
+
+        // A CHUP refused on the live call: sent once more, then reported.
+        state.build_call_control_command(hfp::HfpAtCommand::RejectOrHangup).unwrap();
+        let again = state.handle_packet(&error()).unwrap();
+        assert_eq!(parse_frame(&again[0]).unwrap().payload, b"AT+CHUP\r");
+        assert!(state.handle_packet(&error()).unwrap().is_empty());
+        assert_eq!(
+            state.take_hfp_events(),
+            vec![hfp::HfpEvent::CommandRejected { command: "AT+CHUP", timed_out: false }]
+        );
     }
 
     #[test]

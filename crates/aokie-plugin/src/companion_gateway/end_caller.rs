@@ -62,8 +62,16 @@ pub(super) fn sanitize_gateway_code(code: &str) -> String {
     }
 }
 
+/// What is left of a lease as it arrives, for native media's own monotonic
+/// deadline. The expiry was dated on the server's clock, so it is read on
+/// that clock ([`unix_now`]), not this computer's: a Desktop a few seconds
+/// ahead of the gateway used to cut every lease short by that much.
 pub(super) fn lease_ttl_ms(claims: &LeaseClaims) -> Result<u64, WorkerError> {
-    let remaining = claims.expires_at.saturating_sub(unix_now()?);
+    lease_ttl_ms_at(claims, unix_now()?)
+}
+
+pub(super) fn lease_ttl_ms_at(claims: &LeaseClaims, server_now: u64) -> Result<u64, WorkerError> {
+    let remaining = claims.expires_at.saturating_sub(server_now);
     if remaining == 0 || remaining > 300 {
         return Err(WorkerError::expired("Companion media lease is expired"));
     }

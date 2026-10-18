@@ -77,8 +77,10 @@ pub(super) fn handle_event(
             // is gone. A late real CallTerminated lands on an idle tracker
             // and is a no-op (no duplicate terminal event).
             if let Some(s) = tracker.current() {
-                *status.lost_with_link.lock().unwrap() =
-                    Some((s.is_active() && s.receptionist_owns(), std::time::Instant::now()));
+                let hers = s.is_active() && s.receptionist_owns();
+                *status.lost_with_link.lock().unwrap() = Some((hers, std::time::Instant::now()));
+                *status.lost_call.lock().unwrap() =
+                    hers.then(|| (s.id.clone(), s.caller_id.clone()));
                 flush_incoming_if_pending(tracker, outbox, sink);
                 status.call_active.store(false, Ordering::Relaxed);
                 tracker.note_intent(crate::call_session::TerminationIntent::DeviceLost);
@@ -556,6 +558,23 @@ pub(super) fn handle_event(
                 .is_some_and(|(hers, at)| hers && at.elapsed() < std::time::Duration::from_secs(120));
             if hers {
                 eprintln!("[aokie-plugin] the receptionist's call is still up after the reconnect — resuming it");
+                // Review 3 #35: the call that takes it up names the call
+                // whose record the lost link closed, and keeps its caller's
+                // number (the reconnect gives none).
+                let lost = status.lost_call.lock().unwrap().take();
+                let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                if let Some(s) = tracker.ring(id, now_iso8601()) {
+                    *status.current_caller.lock().unwrap() = None;
+                    *status.current_call_id.lock().unwrap() = Some(s.id.clone());
+                    *status.call_started_at.lock().unwrap() = Some(s.started_at_iso.clone());
+                }
+                if let (Some(s), Some((lost_id, number))) = (tracker.current_mut(), lost) {
+                    s.resumes = Some(lost_id);
+                    if let Some(number) = number.filter(|n| !n.trim().is_empty()) {
+                        *status.current_caller.lock().unwrap() = Some(number.clone());
+                        s.caller_id = Some(number);
+                    }
+                }
                 handle_event(E::CallAnswered, tracker, outbox, sink, status);
                 return;
             }
@@ -581,6 +600,17 @@ pub(super) fn handle_event(
             armed,
         } => {
             flush_incoming_if_pending(tracker, outbox, sink);
+            // Review 3 #1: the audio is back on the dongle (the owner gave
+            // the call back, or the phone rebuilt the link): the receptionist
+            // takes it up again.
+            if let Some(s) = tracker.current_mut() {
+                if s.audio_on_handset_since.take().is_some() {
+                    eprintln!(
+                        "[aokie-plugin] call {} audio is back on the dongle — the receptionist takes it up again",
+                        s.id
+                    );
+                }
+            }
             // SCO can drop and re-arm repeatedly within ONE call, so even with
             // a call correlation these are per-incident occurrences.
             let corr = tracker.call_id().unwrap_or("radio").to_string();
@@ -611,6 +641,32 @@ pub(super) fn handle_event(
                         }),
                     ),
                 );
+            }
+        }
+        E::AudioOnHandset => {
+            // Review 3 #1: the phone moved the live call's audio to the
+            // handset (the owner took it there). Marked, the receptionist
+            // steps aside: the no-audio watchdog does not pull the audio back
+            // with AT+BCC and hang up at 8 s as `device_lost`, and the OAIY
+            // stream pauses until the audio comes back. Our own call switches
+            // bounce the audio and are not this.
+            let switching = status
+                .switch_in_flight
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() < std::time::Duration::from_secs(10));
+            if switching {
+                return;
+            }
+            if let Some(s) = tracker.current_mut().filter(|s| s.is_active()) {
+                if s.audio_on_handset_since.is_none() {
+                    s.audio_on_handset_since = Some(std::time::Instant::now());
+                    eprintln!(
+                        "[aokie-plugin] call {} audio moved to the handset — the receptionist steps aside until it comes back",
+                        s.id
+                    );
+                }
             }
         }
         E::AudioDisconnected => {

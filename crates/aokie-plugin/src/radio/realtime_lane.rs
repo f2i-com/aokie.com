@@ -404,6 +404,60 @@ pub(super) fn realtime_instructions(
     }
 }
 
+/// What a fresh session for a call is told of it after OAIY's stream dropped
+/// under it (review 3 #13): the new session had no memory of the call, so it
+/// greeted as if new, could ask again what the caller had answered, and an
+/// appointment request it never knew of could be made twice. The turns said
+/// so far (the latest, each cut short, all within a bound), how many requests
+/// were already recorded, and whether the call was being finished.
+#[cfg(feature = "voice")]
+pub(super) fn realtime_reconnect_note(
+    history: &[serde_json::Value],
+    appointments_requested: usize,
+    finishing: bool,
+) -> String {
+    const TURNS: usize = 12;
+    const TURN_CHARS: usize = 300;
+    let turns: Vec<String> = history
+        .iter()
+        .filter_map(|entry| {
+            let who = match entry.get("role").and_then(serde_json::Value::as_str)? {
+                "user" => "Caller",
+                "assistant" => "You",
+                _ => return None,
+            };
+            let text: String = entry
+                .get("content")
+                .and_then(serde_json::Value::as_str)?
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace("[[", "(")
+                .replace("]]", ")")
+                .chars()
+                .take(TURN_CHARS)
+                .collect();
+            (!text.is_empty()).then(|| format!("{who}: {text}"))
+        })
+        .collect();
+    let mut note = String::from(
+        "This call was already under way: the connection dropped and has just come back. Do not greet the caller again or ask what they have already told you.",
+    );
+    if !turns.is_empty() {
+        note.push_str("\nWhat was said so far, the latest last:\n");
+        note.push_str(&turns[turns.len().saturating_sub(TURNS)..].join("\n"));
+    }
+    if appointments_requested > 0 {
+        note.push_str(&format!(
+            "\n{appointments_requested} appointment request(s) were already recorded on this call: do not request them again."
+        ));
+    }
+    if finishing {
+        note.push_str("\nYou were ending the call when the connection dropped: say a short goodbye and finish the call.");
+    }
+    note
+}
+
 /// The persona as business notes: `[[`/`]]` neutralised (no legacy action
 /// marker survives) and at most 8,000 characters.
 #[cfg(feature = "voice")]

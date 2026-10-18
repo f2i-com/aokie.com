@@ -14,7 +14,8 @@
 # Hardware-dependent suites (live radio, dongle-attached) stay out of scope
 # here by design - they are labelled and run supervised on the dev machine.
 # The self-host container smoke is the selfhost-smoke.yml manual workflow
-# (needs Linux + Docker); render-test.sh runs anywhere with sh.
+# (needs Linux + Docker); render-test.sh and the container lock check run
+# anywhere with sh.
 
 param(
     [switch]$Companion,
@@ -102,6 +103,16 @@ Invoke-Gate 'contracts: cross-repo digest (FL-34, transfer_v1 against OAIY when 
 # -- Self-host template rendering (audit AK-14) - cheap, always on --
 Invoke-Gate 'self-host: render acceptance (AK-14)' $repo {
     sh deploy/companion-self-host/render-test.sh
+}
+
+# -- Self-host container lock (review 3 #3) - cheap, always on: the gateway image
+# builds its own two-crate workspace with --locked, from
+# deploy/companion-self-host/container-workspace/Cargo.lock; a lock that no longer
+# fits aokie-protocol and aokie-realtime stops `docker compose build`. The script
+# lays that workspace out in a temporary folder and runs cargo metadata --locked
+# there (AOKIE_CONTAINER_LOCK_UPDATE=1 makes the lock again). --
+Invoke-Gate 'self-host: container Cargo.lock fits its crates (cargo metadata --locked)' $repo {
+    sh scripts/check-container-lock.sh
 }
 
 # -- Hygiene gates (audit AK-19) - opt-in, each fails loudly when its

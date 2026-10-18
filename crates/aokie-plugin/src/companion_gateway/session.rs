@@ -24,6 +24,9 @@ pub(super) struct GatewaySession {
     pub(super) last_assistance_request_sent: Option<String>,
     pub(super) relay_snapshot_event_id: Option<String>,
     pub(super) relay_snapshot_delivered_devices: HashSet<String>,
+    /// Snapshots the relay dropped in a row, which spaces out the next try
+    /// (`relay_snapshot_retry_delay`).
+    pub(super) relay_snapshot_drops: u32,
     pub(super) pending_end_caller: HashMap<String, PendingEndCaller>,
     pub(super) accepted_transfers: HashMap<String, AcceptedTransferLease>,
     pub(super) relay_end_caller_challenges: HashMap<String, RelayEndCallerChallenge>,
@@ -172,6 +175,7 @@ impl GatewaySession {
             last_assistance_request_sent: None,
             relay_snapshot_event_id: None,
             relay_snapshot_delivered_devices: HashSet::new(),
+            relay_snapshot_drops: 0,
             pending_end_caller: HashMap::new(),
             accepted_transfers: HashMap::new(),
             relay_end_caller_challenges: HashMap::new(),

@@ -887,6 +887,88 @@ fn oaiys_stream_dropping_mid_call_reconnects_once_and_a_second_drop_takes_the_fa
     assert_eq!(l.midcall.as_ref().map(|failure| failure.0.as_str()), Some(CALL));
 }
 
+/// Review 3 #1: the owner moved the call's audio to the handset. A link the
+/// phone only rebuilds is back within the settle and keeps its session; past
+/// it, OAIY's stream pauses as for a takeover (no apology, no hang-up), nothing
+/// starts while the audio is on the handset, and a fresh session takes the
+/// caller up once it is back on the dongle.
+#[test]
+fn audio_on_the_handset_pauses_oaiys_stream_until_it_comes_back() {
+    let mut l = begun();
+    l.tracker.current_mut().unwrap().audio_on_handset_since = Some(Instant::now());
+    l.pass();
+    assert!(l.lane.is_some(), "a link being rebuilt keeps its session");
+    l.tracker.current_mut().unwrap().audio_on_handset_since =
+        Instant::now().checked_sub(AUDIO_ON_HANDSET_SETTLE + std::time::Duration::from_millis(100));
+    l.pass();
+    assert!(l.lane.is_none(), "paused");
+    assert_eq!(stop_reasons(&l.sent()).len(), 1, "OAIY is told");
+    assert_eq!(l.resume.as_deref(), Some(CALL), "the call waits for its audio");
+    assert!(l.midcall.is_none() && l.terminal.is_none(), "no apology and no hang-up");
+    l.pass();
+    assert_eq!(l.sessions(), 1, "nothing starts while the audio is on the handset");
+    l.tracker.current_mut().unwrap().audio_on_handset_since = None;
+    l.pass();
+    assert_eq!(l.sessions(), 2, "back on the dongle: a fresh session takes the caller up");
+    assert_eq!(l.start(1).call_id, CALL);
+    assert!(l.lane.as_ref().unwrap().resumed, "the caller is not greeted a second time");
+}
+
+/// Review 3 #13: the fresh session after OAIY's stream dropped is told what
+/// it missed (the turns so far, the requests already recorded), and the
+/// requests the dropped session recorded stay recorded: a repeat of one is
+/// the duplicate it is.
+#[test]
+fn a_reconnected_session_is_told_what_was_said_and_keeps_the_requests_made() {
+    let mut l = begun();
+    l.caller_says("I'd like to book a table for Friday at seven");
+    l.ctx.history.push(json!({"role": "assistant", "content": "Friday at seven for how many?"}));
+    l.lane.as_mut().unwrap().completed_appointment_requests.push("appt_1".into());
+    l.oaiy(RealtimeEventKind::Closed {
+        reason: "Desktop realtime receive failed: connection reset".into(),
+        transport: true,
+    });
+    l.pass();
+    assert_eq!(l.resume.as_deref(), Some(CALL));
+    l.pass();
+    assert_eq!(l.sessions(), 2);
+    let instructions = l.start(1).instructions;
+    assert!(instructions.contains("already under way"), "{instructions}");
+    assert!(instructions.contains("Caller: I'd like to book a table for Friday at seven"), "{instructions}");
+    assert!(instructions.contains("You: Friday at seven for how many?"), "{instructions}");
+    assert!(instructions.contains("1 appointment request(s) were already recorded"), "{instructions}");
+    assert!(!instructions.contains("ending the call"), "{instructions}");
+    assert_eq!(l.lane.as_ref().unwrap().completed_appointment_requests, vec!["appt_1".to_string()]);
+    assert!(l.ctx.reconnect_note.is_none(), "said once, to the session that resumed");
+}
+
+/// Review 3 #13: OAIY's stream dropping after the agent said goodbye on a
+/// finish_call ends the call as it asked: no reconnect greeting the caller
+/// again, no apology.
+#[test]
+fn a_finish_call_whose_goodbye_was_said_still_ends_the_call_when_oaiys_stream_drops() {
+    let mut l = begun();
+    l.agent_hangup = true;
+    l.lane.as_mut().unwrap().pending_hangup = Some(PendingRealtimeHangup {
+        tool_call_id: "finish_1".into(),
+        response_id: "resp_1".into(),
+        item_id: "item_bye".into(),
+        requested_at: Instant::now(),
+        ready_at: Some(Instant::now() + std::time::Duration::from_secs(60)),
+        attempts: 0,
+    });
+    l.oaiy(RealtimeEventKind::Closed {
+        reason: "Desktop realtime stream ended".into(),
+        transport: true,
+    });
+    l.pass();
+    assert!(l.resume.is_none(), "not reconnected");
+    assert!(l.midcall.is_none(), "no apology");
+    assert_eq!(l.terminal.as_ref().map(|(id, _, attempts)| (id.as_str(), *attempts)), Some((CALL, 1)));
+    assert!(l.ctx.agent_hung_up);
+    assert_eq!(l.sessions(), 1);
+}
+
 /// Only the stream failing is reconnected: a session that ended for what OAIY
 /// sent (a protocol violation) takes the fail-safe at once, as before.
 #[test]

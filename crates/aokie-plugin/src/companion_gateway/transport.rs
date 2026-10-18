@@ -63,6 +63,11 @@ pub(super) struct WebSocketTransport {
     pub(super) socket: GatewaySocket,
     pub(super) next_ping: Instant,
     pub(super) awaiting_pong: Option<Instant>,
+    /// When the authority loop last came round to the heartbeat. A loop held
+    /// up by one slow step (a native peer can take 22 s to open) read nothing
+    /// meanwhile, so a pong that arrived then is unread in the socket, not
+    /// lost.
+    pub(super) last_heartbeat_tick: Instant,
     /// Replacement sockets finish their endpoint challenge in the background
     /// but do not send this hello until the authority loop is ready to swap.
     /// Sending it earlier lets the gateway fence the predecessor before the
@@ -464,6 +469,7 @@ impl GatewayTransport {
                 socket,
                 next_ping: Instant::now() + PING_INTERVAL,
                 awaiting_pong: None,
+                last_heartbeat_tick: Instant::now(),
                 pending_hello,
             }),
             session_nonce,
@@ -698,8 +704,17 @@ impl WebSocketTransport {
     }
 
     pub(super) async fn tick_heartbeat(&mut self) -> Result<(), WorkerError> {
+        let now = Instant::now();
+        let stalled = heartbeat_loop_stalled(self.last_heartbeat_tick, now);
+        self.last_heartbeat_tick = now;
         if let Some(sent_at) = self.awaiting_pong {
-            if sent_at.elapsed() >= PONG_TIMEOUT {
+            if stalled {
+                // The loop was held up and could not read, so the pong may be
+                // waiting in the socket. Give it a fresh window of reading
+                // before calling the gateway gone: a timeout here ends the
+                // session and drops every device's peers.
+                self.awaiting_pong = Some(now);
+            } else if sent_at.elapsed() >= PONG_TIMEOUT {
                 return Err(WorkerError::reconnect(
                     "Companion gateway heartbeat timed out",
                 ));
@@ -712,6 +727,13 @@ impl WebSocketTransport {
         }
         Ok(())
     }
+}
+
+/// Whether the authority loop went this long without coming round to the
+/// heartbeat. It normally comes round every [`READ_TICK`] or so; a gap of
+/// [`HEARTBEAT_STALL`] means one step blocked it and nothing was read.
+pub(super) fn heartbeat_loop_stalled(last_tick: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_tick) >= HEARTBEAT_STALL
 }
 
 pub(super) async fn open_gateway_socket(
@@ -745,11 +767,20 @@ pub(super) async fn open_gateway_socket(
 
     // Bounded like every later write: a black-holed TCP or TLS handshake must
     // become a retry, not a worker that never reaches its backoff.
-    let (mut socket, _) =
+    let (mut socket, upgrade) =
         tokio::time::timeout(GATEWAY_CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
             .await
             .map_err(|_| WorkerError::reconnect("Companion gateway connection timed out"))?
             .map_err(safe_ws_error)?;
+    // The upgrade's `Date` is the gateway's clock a moment ago: read it before
+    // the challenge, so the challenge and every time after it are checked on
+    // the gateway's clock rather than this computer's.
+    observe_server_date(
+        upgrade
+            .headers()
+            .get("date")
+            .and_then(|value| value.to_str().ok()),
+    );
     let challenge_encoded = tokio::time::timeout(Duration::from_secs(10), socket.next())
         .await
         .map_err(|_| WorkerError::reconnect("Companion endpoint challenge timed out"))?

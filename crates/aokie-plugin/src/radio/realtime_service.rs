@@ -399,6 +399,9 @@ pub(super) fn adopt_resumed_session(
     let mut lane = RealtimeCallLane::new(session);
     lane.allow_transfer_sent = allow_transfer;
     lane.resumed = true;
+    // The requests this call already made stay made (review 3 #13): the
+    // fresh session's repeat of one is the duplicate it is.
+    lane.completed_appointment_requests = ctx.queued_appointments.clone();
     ctx.transfer.finish_resume();
     // The AI has the caller back (after a takeover, or after a hold): whatever
     // the caller asked before that is spent. What they say to the fresh session
@@ -580,6 +583,12 @@ pub(super) fn carry_call_context(
     std::mem::replace(ctx, replacement)
 }
 
+/// How long a call's audio stays on the handset before OAIY's stream pauses
+/// for it (review 3 #1): a phone that only rebuilds the audio link has it
+/// back within this, and the conversation carries on in the same session.
+#[cfg(all(aokie_radio, feature = "voice"))]
+pub(super) const AUDIO_ON_HANDSET_SETTLE: std::time::Duration = std::time::Duration::from_millis(2_000);
+
 #[cfg(all(aokie_radio, feature = "voice"))]
 thread_local! {
     /// The call that has had its one reconnect after OAIY's stream dropped
@@ -670,7 +679,10 @@ pub(super) fn service_realtime_lane(
         if realtime_lane.is_none() {
             if let Some(resume_id) = realtime_resume_call.clone() {
                 let resumable = tracker.current().is_some_and(|call| {
-                    call.is_active() && call.id == resume_id && call.receptionist_owns()
+                    call.is_active()
+                        && call.id == resume_id
+                        && call.receptionist_owns()
+                        && !call.audio_on_handset()
                 }) && !remote_media.radio_reserved()
                     && bt.get_sample_rate() > 0;
                 if resumable {
@@ -707,17 +719,21 @@ pub(super) fn service_realtime_lane(
                             status.transfer_ready.load(Ordering::Relaxed),
                             &remote_media.snapshot().consent,
                         );
+                        // After OAIY's stream dropped, the fresh session is
+                        // told what it missed (review 3 #13).
+                        let mut instructions =
+                            realtime_instructions(oaiy_route, persona, agent_hangup);
+                        if let Some(note) = ctx.reconnect_note.as_deref() {
+                            instructions.push_str("\n\n");
+                            instructions.push_str(note);
+                        }
                         match spawn_session(
                             crate::realtime_voice::SessionConfig {
                                 endpoint: config.endpoint.clone(),
                                 call_id: resume_id.clone(),
                                 generation: voice_call_gen,
                                 expected_destination: config.destination.clone(),
-                                instructions: realtime_instructions(
-                                    oaiy_route,
-                                    persona,
-                                    agent_hangup,
-                                ),
+                                instructions,
                                 greeting: resume_greeting,
                                 voice: Some(config.voice.clone()),
                                 model: None,
@@ -736,6 +752,7 @@ pub(super) fn service_realtime_lane(
                                 // The handoff is over only once the fresh
                                 // session exists; a start that failed keeps
                                 // its record.
+                                ctx.reconnect_note = None;
                                 *realtime_lane =
                                     Some(adopt_resumed_session(ctx, session, allow_transfer));
                                 *realtime_resume_call = None;
@@ -796,14 +813,17 @@ pub(super) fn service_realtime_lane(
                     // answer. One the owner answers in Aokie is prepared then.
                     let left_to_owner = !call.is_active()
                         && !call.outbound
-                        && matches!(
+                        && (matches!(
                             screen_policy.ring_action(
                                 call.caller_id.as_deref(),
                                 call.caller_withheld,
                                 std::time::Duration::from_millis(call.ringing_for_ms() as u64),
                             ),
                             crate::screen::RingAction::Wait | crate::screen::RingAction::Leave
-                        );
+                        )
+                            // Review 3 #6: past the consent grant's expiry
+                            // the call is left ringing for the owner.
+                            || (status.consent_expired() && !call.handed_over));
                     let wait_for_identity = left_to_owner
                         || (!call.is_active()
                             && hold_auto_answer(
@@ -1687,10 +1707,26 @@ pub(super) fn service_realtime_lane(
 
         if realtime_failure.is_none() {
             if let Some(lane) = realtime_lane.as_mut() {
+                // Review 3 #1: the owner moved the call's audio to the
+                // handset, and it stayed there past a link rebuild: the owner
+                // has the caller by hand. The OAIY stream pauses as for a
+                // takeover, and a fresh session takes the caller up when the
+                // audio comes back to the dongle.
+                let audio_on_handset = lane.begun
+                    && tracker.current().is_some_and(|call| {
+                        call.id == lane.call_id && call.audio_on_handset_for(AUDIO_ON_HANDSET_SETTLE)
+                    });
                 let ownership_changed = remote_media.radio_reserved()
+                    || audio_on_handset
                     || (lane.begun
                         && !reply_owner_is_current(&remote_media, lane.owner.as_ref()));
                 if ownership_changed {
+                    if audio_on_handset {
+                        eprintln!(
+                            "[aokie-plugin] call {} audio is on the handset — OAIY's stream paused until it comes back",
+                            lane.call_id
+                        );
+                    }
                     // A Companion claim/return changes the exact owner
                     // fence. Close Realtime immediately and prepare a fresh
                     // provider session only after human media is released;
@@ -2186,6 +2222,9 @@ pub(super) fn service_realtime_lane(
                                         if recorded && !duplicate {
                                             lane.completed_appointment_requests
                                                 .push(request.request_id.clone());
+                                            if !ctx.queued_appointments.contains(&request.request_id) {
+                                                ctx.queued_appointments.push(request.request_id.clone());
+                                            }
                                         }
                                         completion = Some((
                                             tool_call_id,
@@ -2441,7 +2480,17 @@ pub(super) fn service_realtime_lane(
         }
 
         if let Some((call_id, _begun, owner, reason)) = realtime_failure {
+            // Review 3 #13: what the dropped session leaves its call: a
+            // finish_call it had armed (and whether its goodbye was said),
+            // and the appointment requests it recorded.
+            let mut carried_hangup: Option<Option<Instant>> = None;
             if let Some(lane) = realtime_lane.take() {
+                carried_hangup = lane.pending_hangup.as_ref().map(|pending| pending.ready_at);
+                for request_id in &lane.completed_appointment_requests {
+                    if !ctx.queued_appointments.contains(request_id) {
+                        ctx.queued_appointments.push(request_id.clone());
+                    }
+                }
                 // OAIY is told why, so its call record says what happened.
                 if oaiy_route {
                     lane.session.stop(&format!("realtime voice failed: {reason}"));
@@ -2465,6 +2514,36 @@ pub(super) fn service_realtime_lane(
                 .is_some_and(|expected| reply_owner_is_current(&remote_media, Some(expected)));
             let exact_owner =
                 current_owner.or_else(|| passed_owner_is_current.then_some(owner).flatten());
+            // The agent had finished the call and its goodbye was said: the
+            // call ends as it asked, whatever became of OAIY's stream, rather
+            // than a reconnect greeting the caller again, or an apology.
+            // (The hang-up is tried again as the fail-safe's is.)
+            if matches!(carried_hangup, Some(Some(_)))
+                && exact_call_active
+                && !remote_media.radio_reserved()
+            {
+                if let Some(expected) = exact_owner.clone() {
+                    eprintln!(
+                        "[aokie-plugin] OAIY's stream ended ({reason}) after the agent said goodbye on call {call_id}: ending the call as it asked"
+                    );
+                    match remote_media.with_aokie_owner(&expected, || {
+                        tracker.note_intent(crate::call_session::TerminationIntent::AgentHangup);
+                        bt.hangup()
+                    }) {
+                        Ok(result) => {
+                            if let Err(error) = result {
+                                eprintln!("[aokie-plugin] realtime finish_call hangup failed: {error}");
+                            }
+                            ctx.agent_hung_up = true;
+                            *realtime_terminal_call = Some((call_id, Instant::now(), 1));
+                            return;
+                        }
+                        Err(lost) => eprintln!(
+                            "[aokie-plugin] realtime finish_call lost ownership after OAIY's stream ended: {lost}"
+                        ),
+                    }
+                }
+            }
             // OAIY's stream dropped under a live call the receptionist has
             // (OAIY restarted, the socket broke): a fresh session for the
             // same call, once, rather than an apology and a hang-up. Should
@@ -2481,6 +2560,11 @@ pub(super) fn service_realtime_lane(
                 eprintln!(
                     "[aokie-plugin] OAIY's stream dropped mid-call ({reason}); reconnecting once for call {call_id}"
                 );
+                ctx.reconnect_note = Some(realtime_reconnect_note(
+                    &ctx.history,
+                    ctx.queued_appointments.len(),
+                    carried_hangup.is_some(),
+                ));
                 *realtime_resume_call = Some(call_id);
                 return;
             }

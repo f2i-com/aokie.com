@@ -327,11 +327,14 @@
   };
 
   // ---- transport mode (dongle vs built-in Windows Bluetooth) --------------
-  // `dongle` = the original WinUSB-driver radio; `native`/`auto` = the
-  // built-in Windows Bluetooth transport, where no WinUSB dongle is involved
-  // at all. Native/auto therefore hides every dongle-only surface — the
-  // Dongle tab here; the Settings tab gates its own dongle-only Advanced
-  // fields, and the Phone tab adjusts its pairing instructions. The mode
+  // `dongle` = the original WinUSB-driver radio; `native` = the built-in
+  // Windows Bluetooth transport, where no WinUSB dongle is involved at all;
+  // `auto` = the dongle whenever one is plugged in (the plugin starts it so,
+  // since only the dongle carries call audio), else native. Native therefore
+  // hides every dongle-only surface, and auto shows them as dongle does — the
+  // Dongle tab here (and the manifest's setup step); the Settings tab gates
+  // its own dongle-only Advanced fields, and the Phone tab adjusts its
+  // pairing instructions. The mode
   // ALWAYS comes from the loaded plugin settings; a missing or unknown value
   // means the dongle view (the pre-transportMode behavior — the safe default
   // while the first settings.get is still in flight).

@@ -80,11 +80,13 @@ pub(super) fn normalize_gateway_url(raw: &str) -> Result<Url, String> {
 /// ⚠️ The `http` exception exists because the current deployment serves
 /// `http://formlogic.local` with its API on `http://api.formlogic.local`:
 /// neither presents a certificate, so requiring `https` would make the hosted
-/// relay unreachable on the very install it was built for. It means the
-/// admission bearer rides plaintext over the LAN, which is why the exception
-/// is confined to managed-beta builds and to numeric loopback, `localhost`
-/// and that one exact API host. Any other `.local` name is refused: whoever
-/// answers mDNS for it on the LAN would otherwise collect the bearer.
+/// relay unreachable on the very install it was built for. The exception is
+/// confined to managed-beta builds and to numeric loopback, `localhost` and
+/// that one exact API host, and the relay client pins that host to this
+/// computer's loopback ([`relay_client_pins_api_host`]): it is the FormLogic
+/// install on this computer, and resolving a `.local` name would let whoever
+/// answers mDNS for it on the LAN collect the bearer over plaintext. Any
+/// other `.local` name is refused.
 pub(super) fn normalize_relay_url(raw: &str, label: &str) -> Result<Url, WorkerError> {
     let invalid =
         |detail: &str| WorkerError::rebootstrap(format!("Companion relay {label} {detail}"));
@@ -108,7 +110,7 @@ pub(super) fn normalize_relay_url(raw: &str, label: &str) -> Result<Url, WorkerE
 }
 
 /// The exact API host of the managed-beta FormLogic install.
-pub(super) const MANAGED_BETA_API_HOST: &str = "api.formlogic.local";
+pub(crate) const MANAGED_BETA_API_HOST: &str = "api.formlogic.local";
 
 /// The hosts a managed-beta build may reach over plain http: numeric
 /// loopback, `localhost`, and the one exact API host the desktop install
@@ -118,6 +120,32 @@ pub(super) fn is_managed_beta_plaintext_host(host: &str) -> bool {
         || host == "[::1]"
         || host.eq_ignore_ascii_case("localhost")
         || host.eq_ignore_ascii_case(MANAGED_BETA_API_HOST)
+}
+
+/// Whether a relay client must pin [`MANAGED_BETA_API_HOST`] to loopback:
+/// any of its URLs reaches that host over plain http. The pin never asks DNS
+/// or mDNS, so the plaintext bearer can only go to the FormLogic install on
+/// this computer; if nothing listens there the relay fails closed.
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
+pub(crate) fn relay_client_pins_api_host<'a>(urls: impl IntoIterator<Item = &'a str>) -> bool {
+    urls.into_iter().any(|raw| {
+        Url::parse(raw).is_ok_and(|url| {
+            url.scheme() == "http"
+                && url
+                    .host_str()
+                    .is_some_and(|host| host.eq_ignore_ascii_case(MANAGED_BETA_API_HOST))
+        })
+    })
+}
+
+/// The loopback addresses [`MANAGED_BETA_API_HOST`] is pinned to. The port is
+/// ignored by the resolver override; the URL's own port applies.
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
+pub(crate) fn managed_beta_api_host_loopback() -> [std::net::SocketAddr; 2] {
+    [
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+    ]
 }
 
 pub(super) fn is_numeric_loopback_host(host: &str) -> bool {
@@ -156,11 +184,47 @@ pub(super) fn sanitize_status_message(message: &str) -> String {
     }
 }
 
-pub(super) fn unix_now() -> Result<u64, WorkerError> {
+/// The Desktop's one view of the server clock (see [`aokie_protocol::clock`]).
+///
+/// Taken from the `Date` of the response that carries each endpoint
+/// challenge, and shared by everything that dates or checks a Companion
+/// protocol time: this session, the assistance broker and remote media. A
+/// Desktop clock a few seconds out no longer refuses the phone's proofs or
+/// cuts the gateway's leases short.
+pub(crate) static SERVER_CLOCK: aokie_protocol::clock::ServerClock =
+    aokie_protocol::clock::ServerClock::new();
+
+/// This computer's own clock, uncorrected, in Unix seconds.
+pub(crate) fn local_unix_now() -> Option<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
+        .ok()
         .map(|duration| duration.as_secs())
-        .map_err(|_| WorkerError::rebootstrap("System clock is before the Unix epoch"))
+}
+
+/// Now on the server's clock, in Unix seconds.
+pub(crate) fn server_unix_now() -> Option<u64> {
+    local_unix_now().map(|local| SERVER_CLOCK.now(local))
+}
+
+/// Take the server's clock from the `Date` header of a response carrying an
+/// endpoint challenge, as it arrives.
+pub(crate) fn observe_server_date(date: Option<&str>) {
+    let Some(local) = local_unix_now() else {
+        return;
+    };
+    let before = SERVER_CLOCK.offset();
+    let after = SERVER_CLOCK.observe_http_date(date, local);
+    if after != before {
+        eprintln!(
+            "[aokie-plugin][companion] stage=server_clock offset_seconds={after} previous={before}"
+        );
+    }
+}
+
+pub(super) fn unix_now() -> Result<u64, WorkerError> {
+    server_unix_now()
+        .ok_or_else(|| WorkerError::rebootstrap("System clock is before the Unix epoch"))
 }
 
 /// The relay's party identifier for a Companion endpoint key.

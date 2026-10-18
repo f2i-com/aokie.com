@@ -7257,3 +7257,430 @@ fn status_and_refusal_text_is_one_clean_line_within_its_byte_limit() {
     rejection.validate().unwrap();
     aokie_protocol::text::check_line(&rejection.message, 240).unwrap();
 }
+
+// ---- third review: refused offers, media races, the heartbeat, the clock ----
+
+/// A gateway-routed mobile offer whose endpoint binding verifies. The SDP
+/// carries a valid DTLS fingerprint but not the `v=0` start native media
+/// requires, so the offer is refused at the very last step, after every
+/// lease and fence check has passed.
+fn signed_mobile_offer_refused_by_media(
+    lease: &LeaseClaims,
+    signal_id: &str,
+    endpoint_jti: &str,
+    sdp_revision: u64,
+    transport_generation: u64,
+) -> String {
+    let signing_key = approved_mobile_signing_key();
+    let endpoint_key =
+        EndpointPublicKey::from_ed25519_bytes(&signing_key.verifying_key().to_bytes());
+    let now = unix_now().unwrap();
+    let fingerprint = vec!["AB"; 32].join(":");
+    let sdp = format!("s=refused by native media\r\na=fingerprint:sha-256 {fingerprint}\r\n");
+    let claims = EndpointBindingClaims {
+        app_id: lease.app_id.clone(),
+        plugin_id: lease.plugin_id.clone(),
+        device_id: lease.device_id.clone(),
+        rtc_session_id: lease.rtc_session_id.clone(),
+        endpoint_session_nonce: lease.session_nonce.clone(),
+        lease_jti: lease.jti.clone(),
+        endpoint_role: AdmissionRole::Mobile,
+        holder_key_thumbprint: lease.mobile_key_thumbprint.clone(),
+        peer_key_thumbprint: lease.plugin_key_thumbprint.clone(),
+        call_id: lease.call_id.clone(),
+        call_epoch: lease.call_epoch,
+        owner_epoch: lease.owner_epoch,
+        fence: lease.fence,
+        sdp_revision,
+        transport_generation,
+        dtls_fingerprint: sdp_dtls_fingerprint(&sdp).unwrap(),
+        sdp_sha256: sdp_sha256(&sdp),
+        nonce: format!("offer_nonce_{endpoint_jti}"),
+        jti: endpoint_jti.into(),
+        issued_at: now,
+        expires_at: now + 30,
+    };
+    let signature = URL_SAFE_NO_PAD.encode(
+        signing_key
+            .sign(&claims.signing_bytes().expect("offer claims canonicalize"))
+            .to_bytes(),
+    );
+    routed_to_plugin(
+        &serde_json::to_string(&MobileRtcSignalFrame {
+            kind: "rtc_signal".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: lease.app_id.clone(),
+            signal_id: signal_id.into(),
+            plugin_id: lease.plugin_id.clone(),
+            device_id: lease.device_id.clone(),
+            lease_token: "lease-token".into(),
+            lease_jti: lease.jti.clone(),
+            rtc_session_id: lease.rtc_session_id.clone(),
+            sdp_revision,
+            transport_generation,
+            call_id: lease.call_id.clone(),
+            call_epoch: lease.call_epoch,
+            owner_epoch: lease.owner_epoch,
+            fence: lease.fence,
+            signal: RtcSignal::Offer {
+                sdp,
+                binding: SignedEndpointBinding {
+                    endpoint_key,
+                    claims,
+                    signature,
+                },
+            },
+        })
+        .expect("signed mobile offer encodes"),
+    )
+}
+
+/// A socket session holding one prepared takeover claim from the gateway,
+/// with the provisional lease it was proposed with.
+fn socket_harness_with_proposed_takeover() -> (RelayHarness, LeaseClaims) {
+    let mut harness = RelayHarness::new();
+    harness.session.relay_carrier = false;
+    let remote = harness.media.snapshot();
+    let mut lease = takeover_claims(&harness.session, LeasePhase::Prepared);
+    lease.call_epoch = remote.call_epoch;
+    lease.owner_epoch = remote.owner_epoch;
+    let proposal = json!({
+        "kind": "claim_proposal",
+        "schemaVersion": SCHEMA_VERSION,
+        "appId": harness.session.app_id,
+        "requestId": "claim_a",
+        "deviceId": "device_a",
+        "leaseToken": "lease-token",
+        "lease": lease,
+    })
+    .to_string();
+    assert!(socket_inbound(&mut harness, &proposal).unwrap().is_empty());
+    assert!(harness.session.prepared.is_some());
+    (harness, lease)
+}
+
+#[test]
+fn a_refused_prepared_offer_on_the_socket_rejects_that_claim_to_the_gateway() {
+    let (mut harness, lease) = socket_harness_with_proposed_takeover();
+    let offer = signed_mobile_offer_refused_by_media(&lease, "signal_prepared", "offer_jti_1", 1, 1);
+    let frames = socket_inbound(&mut harness, &offer)
+        .expect("a refused offer costs the session nothing");
+    // Before, the refusal was dropped silently: the claim slot stayed taken
+    // and the phone showed "connecting" until the lease lapsed.
+    assert_eq!(frames.len(), 1, "the gateway hears the refusal at once");
+    let decision: PluginClaimDecisionFrame = serde_json::from_str(&frames[0]).unwrap();
+    decision.validate().unwrap();
+    assert!(!decision.accepted);
+    assert!(!decision.media_ready);
+    assert_eq!(decision.request_id, "claim_a");
+    assert_eq!(decision.device_id, "device_a");
+    assert_eq!(decision.fence, lease.fence);
+    assert!(decision.reason.as_deref().unwrap().contains("media offer"));
+    assert!(harness.session.prepared.is_none());
+    assert!(harness.session.leases.is_empty());
+    assert!(harness.session.peers.is_empty());
+}
+
+#[test]
+fn a_refused_active_offer_on_the_socket_revokes_that_lease_and_returns_the_caller() {
+    let (mut harness, provisional) = socket_harness_with_proposed_takeover();
+    let binding = binding_for_claims(&provisional);
+    harness
+        .media
+        .install_test_prepared_peer(binding.clone(), 10_000)
+        .unwrap();
+    harness.media.ack_prepare_human(&binding).unwrap();
+    let decided = harness
+        .session
+        .drain_media_events(&harness.media, &harness.radio)
+        .unwrap();
+    let decision = decided
+        .iter()
+        .find_map(|encoded| serde_json::from_str::<PluginClaimDecisionFrame>(encoded).ok())
+        .expect("the plugin accepts the prepared claim");
+    assert!(decision.accepted);
+    // The wait for the microphone-bearing offer is bounded on the socket
+    // too, not only on the relay.
+    assert!(harness
+        .session
+        .prepared
+        .as_ref()
+        .is_some_and(|prepared| prepared.active_rebind_deadline.is_some()));
+
+    // The gateway activated the claim under a new JTI; the phone's offer for
+    // it is refused by native media.
+    let mut active = provisional.clone();
+    active.owner_epoch = decision.confirmed_owner_epoch;
+    active.phase = LeasePhase::Active;
+    active.tracks = tracks_for(LeaseMode::Takeover, LeasePhase::Active);
+    active.jti = "gateway_active_jti".into();
+    let offer = signed_mobile_offer_refused_by_media(&active, "signal_active", "offer_jti_2", 1, 1);
+    let frames = socket_inbound(&mut harness, &offer).expect("refused alone");
+    assert_eq!(frames.len(), 1);
+    let revoke: PluginLeaseRevokeFrame = serde_json::from_str(&frames[0]).unwrap();
+    revoke.validate().unwrap();
+    // Exactly the gateway's lease: its JTI, the stable id and every fence.
+    assert_eq!(revoke.lease_jti, "gateway_active_jti");
+    assert_eq!(revoke.lease_id, provisional.lease_id);
+    assert_eq!(revoke.device_id, "device_a");
+    assert_eq!(revoke.call_id, provisional.call_id);
+    assert_eq!(revoke.call_epoch, provisional.call_epoch);
+    assert_eq!(revoke.fence, provisional.fence);
+    assert_eq!(revoke.reason, "offer_refused");
+    assert!(harness.session.prepared.is_none());
+    assert!(harness.session.leases.is_empty());
+    assert_eq!(
+        harness.media.snapshot().service_mode,
+        LocalServiceMode::AokieActive,
+        "the caller is back with Aokie, not left in soft hold"
+    );
+}
+
+#[test]
+fn a_repeated_offer_for_a_live_peer_is_refused_without_ending_its_lease() {
+    let mut harness = socket_harness_with_live_takeover();
+    let active = takeover_claims(&harness.session, LeasePhase::Active);
+    let offer = signed_mobile_offer_refused_by_media(&active, "signal_repeat", "offer_jti_3", 3, 3);
+    let error = socket_inbound(&mut harness, &offer).expect_err("the repeat is refused");
+    assert!(error.is_refusal(), "{}", error.message);
+    assert_device_a_takeover_intact(&harness.session);
+}
+
+#[test]
+fn the_socket_wait_for_the_active_offer_expires_and_returns_the_caller() {
+    let (mut harness, provisional) = socket_harness_with_proposed_takeover();
+    let binding = binding_for_claims(&provisional);
+    harness
+        .media
+        .install_test_prepared_peer(binding.clone(), 10_000)
+        .unwrap();
+    harness.media.ack_prepare_human(&binding).unwrap();
+    harness
+        .session
+        .drain_media_events(&harness.media, &harness.radio)
+        .unwrap();
+    let deadline = harness
+        .session
+        .prepared
+        .as_ref()
+        .and_then(|prepared| prepared.active_rebind_deadline)
+        .expect("the socket bounds the wait");
+    assert!(deadline <= Instant::now() + RELAY_TAKEOVER_ACTIVE_REBIND_TIMEOUT);
+    assert!(!harness
+        .session
+        .expire_unbound_active_rebind(Instant::now(), &harness.media));
+    // The phone never sends its microphone-bearing offer.
+    assert!(harness
+        .session
+        .expire_unbound_active_rebind(deadline, &harness.media));
+    assert!(harness.session.prepared.is_none());
+    assert!(harness.session.leases.is_empty());
+    assert_eq!(
+        harness.media.snapshot().service_mode,
+        LocalServiceMode::AokieActive
+    );
+}
+
+#[test]
+fn a_media_race_on_one_claim_fails_that_claim_and_keeps_every_other_device() {
+    let mut harness = RelayHarness::new();
+    harness.session.relay_carrier = false;
+    install_takeover_route(&mut harness.session, LeasePhase::Prepared);
+    // Device B is listening.
+    let mut monitor = takeover_claims(&harness.session, LeasePhase::Active);
+    monitor.mode = LeaseMode::Monitor;
+    monitor.tracks = tracks_for(LeaseMode::Monitor, LeasePhase::Active);
+    monitor.device_id = "device_b".into();
+    monitor.rtc_session_id = "rtc_b".into();
+    monitor.jti = "monitor_b_jti".into();
+    monitor.lease_id = "monitor_b".into();
+    harness
+        .session
+        .leases
+        .insert(monitor.jti.clone(), monitor.clone());
+    harness.session.peers.insert(
+        "rtc_b".into(),
+        PeerRoute {
+            binding: binding_for_claims(&monitor),
+            lease_jti: monitor.jti.clone(),
+            device_id: monitor.device_id.clone(),
+            sdp_revision: 1,
+            transport_generation: 1,
+            lease_ttl_ms: 20_000,
+            connected: true,
+            remote_audio_ready: true,
+            remote_microphone_ready: false,
+            transition_requested: false,
+        },
+    );
+    // Soft hold is reported, but the owner epoch did not move: another switch
+    // won the race. This used to end the whole session.
+    let provisional = takeover_claims(&harness.session, LeasePhase::Prepared);
+    harness.media.emit_test_event(
+        binding_for_claims(&provisional),
+        RemoteMediaEventKind::TakeoverPrepared {
+            confirmed_owner_epoch: provisional.owner_epoch,
+        },
+    );
+    let frames = harness
+        .session
+        .drain_media_events(&harness.media, &harness.radio)
+        .expect("one claim's race is contained");
+    let revokes = frames
+        .iter()
+        .filter_map(|encoded| serde_json::from_str::<PluginLeaseRevokeFrame>(encoded).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(revokes.len(), 1);
+    assert_eq!(revokes[0].lease_id, provisional.lease_id);
+    assert_eq!(revokes[0].device_id, "device_a");
+    assert!(harness.session.prepared.is_none());
+    assert!(!harness.session.peers.contains_key("rtc_a"));
+    assert!(harness.session.peers.contains_key("rtc_b"), "device B keeps listening");
+    assert!(harness.session.leases.contains_key("monitor_b_jti"));
+}
+
+#[test]
+fn a_loop_held_up_by_one_slow_step_is_not_a_dead_gateway() {
+    let start = Instant::now();
+    assert!(!heartbeat_loop_stalled(start, start + READ_TICK));
+    assert!(!heartbeat_loop_stalled(start, start + Duration::from_millis(1_500)));
+    // A native peer taking 22 s to open held the loop: the pong is unread in
+    // the socket, so the heartbeat restarts its wait instead of failing.
+    assert!(heartbeat_loop_stalled(start, start + Duration::from_secs(22)));
+    assert!(HEARTBEAT_STALL < PONG_TIMEOUT);
+}
+
+#[test]
+fn a_snapshot_the_relay_keeps_dropping_is_retried_ever_less_often() {
+    let mut harness = RelayHarness::new();
+    let mut previous_gap = Duration::ZERO;
+    for drop in 1..=8 {
+        harness.session.last_snapshot_fingerprint = None;
+        harness.session.last_snapshot_sent = None;
+        let encoded = harness
+            .session
+            .snapshot_frame(&harness.radio)
+            .expect("snapshot builds")
+            .expect("live call publishes a snapshot");
+        let settled_at = Instant::now();
+        harness.session.finish_relay_delivery(
+            &encoded,
+            TransportDelivery::Dropped,
+            &harness.media,
+            &harness.radio,
+        );
+        let gap = harness.session.next_snapshot_poll - settled_at;
+        assert!(gap + Duration::from_millis(20) >= previous_gap, "drop {drop}");
+        assert!(gap <= RELAY_SNAPSHOT_RETRY_MAX + Duration::from_millis(20), "drop {drop}");
+        assert!(harness.session.last_snapshot_fingerprint.is_none(), "still owed");
+        previous_gap = gap;
+    }
+    assert!(previous_gap >= RELAY_SNAPSHOT_RETRY_MAX - Duration::from_millis(20));
+    assert_eq!(relay_snapshot_retry_delay(1), SNAPSHOT_POLL);
+    assert_eq!(relay_snapshot_retry_delay(2), SNAPSHOT_POLL * 2);
+    assert_eq!(relay_snapshot_retry_delay(40), RELAY_SNAPSHOT_RETRY_MAX);
+
+    // One delivery puts the pace back to normal.
+    harness.session.last_snapshot_fingerprint = None;
+    harness.session.last_snapshot_sent = None;
+    let encoded = harness
+        .session
+        .snapshot_frame(&harness.radio)
+        .unwrap()
+        .unwrap();
+    harness.session.finish_relay_delivery(
+        &encoded,
+        TransportDelivery::Delivered,
+        &harness.media,
+        &harness.radio,
+    );
+    assert_eq!(harness.session.relay_snapshot_drops, 0);
+}
+
+#[test]
+fn an_older_gateway_refusing_a_newer_frame_kind_does_not_reconnect() {
+    let mut harness = socket_harness_with_live_takeover();
+    let refusal = json!({
+        "kind": "error",
+        "schemaVersion": SCHEMA_VERSION,
+        "code": "unsupported_kind",
+        "message": "this gateway does not support that frame kind",
+    })
+    .to_string();
+    assert!(socket_inbound(&mut harness, &refusal).unwrap().is_empty());
+    assert_device_a_takeover_intact(&harness.session);
+}
+
+#[test]
+fn the_plaintext_formlogic_api_host_is_pinned_to_this_computer() {
+    assert!(relay_client_pins_api_host([
+        "http://api.formlogic.local/api/aokie-companion/relay/challenge",
+    ]));
+    assert!(relay_client_pins_api_host([
+        "https://relay.example.test/challenge",
+        "http://API.FormLogic.local:8080/frames",
+    ]));
+    // TLS authenticates the host itself, and no other name gets the pin.
+    assert!(!relay_client_pins_api_host([
+        "https://api.formlogic.local/challenge",
+        "https://relay.example.test/frames",
+        "http://127.0.0.1:8080/stream",
+    ]));
+    for address in managed_beta_api_host_loopback() {
+        assert!(address.ip().is_loopback());
+    }
+}
+
+/// An HTTP `Date` for a Unix time, as a server writes it.
+fn http_date(unix: u64) -> String {
+    chrono::DateTime::from_timestamp(unix as i64, 0)
+        .unwrap()
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
+}
+
+#[test]
+fn a_desktop_clock_minutes_off_connects_and_keeps_the_gateways_full_lease() {
+    let authority = test_authority();
+    let credentials = admission("app_a", "aokie", &authority)
+        .into_credentials(None, "aokie", authority.clone())
+        .unwrap();
+    let gateway_now = local_unix_now().unwrap();
+    let challenge = EndpointChallengeFrame {
+        kind: "endpoint_challenge".into(),
+        schema_version: SCHEMA_VERSION,
+        app_id: "app_a".into(),
+        subject_id: "aokie".into(),
+        role: AdmissionRole::Plugin,
+        connection_id: "connection_clock".into(),
+        challenge_nonce: "challenge_clock".into(),
+        admission_jti: "admission_clock".into(),
+        holder_key_thumbprint: authority.endpoint_key.thumbprint.clone(),
+        expected_peer_key_thumbprint: None,
+        approved_peer_key_thumbprints: authority.approved_thumbprints(),
+        peer_roster_revision: Some(authority.roster_revision),
+        peer_roster_hash: Some(authority.roster_hash.clone()),
+        expires_at: gateway_now + aokie_protocol::v2::ENDPOINT_CHALLENGE_LIFETIME,
+    };
+    let session = test_gateway_session();
+    let mut claims = takeover_claims(&session, LeasePhase::Active);
+    claims.expires_at = gateway_now + 20;
+    for skew in [-180_i64, -40, 40, 180] {
+        let local_now = (gateway_now as i64 + skew) as u64;
+        // On its own clock the Desktop could not even take the challenge.
+        assert!(endpoint_hello(&challenge, &credentials, local_now).is_err(), "skew {skew}");
+        // Read the gateway's clock off the upgrade response, as the socket does.
+        let clock = aokie_protocol::clock::ServerClock::new();
+        clock.observe_http_date(Some(&http_date(gateway_now)), local_now);
+        let server_now = clock.now(local_now);
+        let (hello, _) = endpoint_hello(&challenge, &credentials, server_now)
+            .unwrap_or_else(|error| panic!("skew {skew}: {}", error.message));
+        hello
+            .endpoint_proof
+            .verify(gateway_now + 1)
+            .unwrap_or_else(|error| panic!("skew {skew}: {error}"));
+        // And the gateway's 20 s lease is 20 s here too, not 20 s minus
+        // however far ahead this clock runs.
+        assert_eq!(lease_ttl_ms_at(&claims, server_now).unwrap(), 20_000, "skew {skew}");
+    }
+}

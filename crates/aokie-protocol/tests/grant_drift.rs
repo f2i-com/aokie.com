@@ -55,6 +55,32 @@ fn quoted_between(source: &str, start: &str, end: &str, what: &str) -> BTreeSet<
     names
 }
 
+/// `Grant::ALL` is kept by hand, so a grant added to the enum but not to the
+/// list would be unknown to every drift test below and to `from_wire`. The
+/// serde derive is the enum's own list of variants: an unknown name's error
+/// names every one, in declaration order.
+#[test]
+fn grant_all_lists_every_grant_the_enum_declares() {
+    let error = serde_json::from_str::<Grant>("\"no_such_grant\"")
+        .unwrap_err()
+        .to_string();
+    let expected = error
+        .split("expected one of ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("serde's unknown-variant message changed: {error}"));
+    let declared: Vec<&str> = expected.split('`').skip(1).step_by(2).collect();
+    let listed: Vec<&str> = Grant::ALL.iter().map(|grant| grant.as_str()).collect();
+    assert_eq!(listed, declared, "Grant::ALL drifted from the Grant enum");
+    for grant in Grant::ALL {
+        assert_eq!(
+            serde_json::to_value(grant).unwrap(),
+            serde_json::Value::String(grant.as_str().to_owned()),
+            "Grant::as_str drifted from the wire name"
+        );
+        assert_eq!(Grant::from_wire(grant.as_str()), Some(grant));
+    }
+}
+
 #[test]
 fn the_v2_json_schema_grant_enum_matches_the_protocol() {
     let schema: serde_json::Value = serde_json::from_str(&read(

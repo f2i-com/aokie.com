@@ -108,6 +108,16 @@ fn display_line(value: &mut String, maximum: usize) {
     *value = aokie_protocol::text::sanitize_line(value, maximum);
 }
 
+/// A required display field that is empty once cleaned (the server sent only
+/// spaces or control characters) reads as `fallback`, so one blank label
+/// cannot fail the whole response it is in.
+fn required_display_line(value: &mut String, maximum: usize, fallback: &str) {
+    display_line(value, maximum);
+    if value.is_empty() {
+        *value = fallback.to_owned();
+    }
+}
+
 fn optional_display_line(value: &mut RequiredNullable<String>, maximum: usize) {
     if let Some(text) = value.0.as_mut() {
         display_line(text, maximum);
@@ -823,13 +833,20 @@ impl ValidateResponse for CompanionCallRecords {
 impl ValidateResponse for CompanionCallRecordDetail {
     fn sanitize(&mut self) {
         self.record.sanitize();
+        // A turn or follow-up with nothing to read is left out; a blank label
+        // reads as "unknown". Either used to fail the whole call detail.
         for turn in &mut self.transcript {
-            display_line(&mut turn.speaker, 64);
+            required_display_line(&mut turn.speaker, 64, "Unknown");
             display_line(&mut turn.text, 10_000);
         }
+        self.transcript.retain(|turn| !turn.text.is_empty());
         for follow_up in &mut self.follow_ups {
             display_line(&mut follow_up.summary, 2_000);
+            required_display_line(&mut follow_up.status, 64, "unknown");
+            required_display_line(&mut follow_up.priority, 64, "unknown");
         }
+        self.follow_ups
+            .retain(|follow_up| !follow_up.summary.is_empty());
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -940,6 +957,8 @@ impl StaffMember {
 impl CallRecord {
     fn sanitize(&mut self) {
         optional_display_line(&mut self.caller_name, 200);
+        optional_display_line(&mut self.masked_number, 40);
+        required_display_line(&mut self.status, 64, "unknown");
         optional_display_line(&mut self.summary, 5_000);
     }
 
@@ -1437,6 +1456,34 @@ mod tests {
         assert!(cut.len() <= 5_000 && long_cjk.starts_with(cut));
         // A summary of nothing but line breaks reads as no summary.
         assert_eq!(parsed.records[2].summary.0, None);
+    }
+
+    #[test]
+    fn blank_call_detail_fields_read_as_absent_instead_of_failing_the_detail() {
+        let mut detail: serde_json::Value = serde_json::from_str(call_detail_json()).unwrap();
+        detail["record"]["status"] = "   ".into();
+        detail["record"]["maskedNumber"] = " \t ".into();
+        detail["transcript"] = serde_json::json!([
+            {"id":"turn_1","speaker":"  ","text":"Hello","occurredAt":"2026-07-16T03:00:01Z"},
+            {"id":"turn_2","speaker":"caller","text":" \n ","occurredAt":"2026-07-16T03:00:02Z"}
+        ]);
+        detail["followUps"] = serde_json::json!([
+            {"id":"task_1","summary":"Call back","status":" ","priority":"\t","submittedAt":"2026-07-16 03:01:00"},
+            {"id":"task_2","summary":"  ","status":"open","priority":"high","submittedAt":"2026-07-16 03:01:00"}
+        ]);
+        let parsed = parse_response::<CompanionCallRecordDetail>(
+            serde_json::to_string(&detail).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(parsed.record.status, "unknown");
+        assert_eq!(parsed.record.masked_number.0, None);
+        // The turn with words keeps them under a neutral speaker; the empty
+        // turn and the follow-up with no summary are left out.
+        assert_eq!(parsed.transcript.len(), 1);
+        assert_eq!(parsed.transcript[0].speaker, "Unknown");
+        assert_eq!(parsed.follow_ups.len(), 1);
+        assert_eq!(parsed.follow_ups[0].status, "unknown");
+        assert_eq!(parsed.follow_ups[0].priority, "unknown");
     }
 
     #[test]

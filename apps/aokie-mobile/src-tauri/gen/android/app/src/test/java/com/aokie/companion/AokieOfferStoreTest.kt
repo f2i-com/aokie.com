@@ -1,5 +1,6 @@
 package com.aokie.companion
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -66,5 +67,21 @@ class AokieOfferStoreTest {
 
     // The same offer is never a replacement of itself.
     assertFalse(aokiePushMayReplace(ringing, ringing, liveOfferId = null))
+  }
+
+  @Test
+  fun anAnswerWaitsForTheSignedOfferUntilItsOwnAnswerDeadlineNotAFixedFiveSeconds() {
+    val answering = offer("offer_a", expiresAt = 2_000).answerRequested(nowSeconds = 900)
+    // Pressed just now: the whole 45 s claim window.
+    assertEquals(45_000L, aokieAuthoritativeOfferWaitMs(answering, nowMs = 900_000))
+    // Twelve seconds of a slow cold start already gone: the rest of the window.
+    assertEquals(33_000L, aokieAuthoritativeOfferWaitMs(answering, nowMs = 912_000))
+    // Past the deadline: no wait at all, and never negative.
+    assertEquals(0L, aokieAuthoritativeOfferWaitMs(answering, nowMs = 950_000))
+    // A clock set back mid-call never stretches it past the window.
+    assertEquals(45_000L, aokieAuthoritativeOfferWaitMs(answering, nowMs = 100_000))
+    // A decline on a ringing offer, or no offer, keeps the short wait.
+    assertEquals(AOKIE_AUTHORITATIVE_OFFER_WAIT_MS, aokieAuthoritativeOfferWaitMs(offer("offer_b"), nowMs = 900_000))
+    assertEquals(AOKIE_AUTHORITATIVE_OFFER_WAIT_MS, aokieAuthoritativeOfferWaitMs(null, nowMs = 900_000))
   }
 }

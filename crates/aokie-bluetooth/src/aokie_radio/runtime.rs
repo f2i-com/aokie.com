@@ -88,6 +88,11 @@ pub enum RuntimeEvent {
         armed: bool,
     },
     AudioDisconnected,
+    /// The phone closed the call's audio channel itself (reason 0x13) with
+    /// the call still active: it moved the audio to the handset, as it does
+    /// when the owner takes the call on the phone (review 3 #1). Follows the
+    /// `AudioDisconnected`; the next `AudioConnected` brings it back.
+    AudioOnHandset,
     CallerId(String),
     /// Phase 4: a SECOND caller is knocking while a call is active (+CCWA /
     /// callsetup-while-active on a call-waiting-negotiated SLC, or one the
@@ -376,6 +381,21 @@ fn now_epoch_secs() -> u64 {
 /// slot. We run them sequentially because each ops pulls and tears
 /// down its own RFCOMM/SDP channels — running two in parallel would
 /// race the L2CAP CID allocator and confuse the AG.
+/// What the phone's sent folder held before a text's first PUT (review 3
+/// #9): an earlier text to the same person, starting the same way, is not
+/// taken for a lost one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SentSnapshot {
+    /// Not listed yet (the text has not been tried).
+    NotTaken,
+    /// The handles listed: an entry with one of them is an earlier text.
+    Taken(Vec<String>),
+    /// It could not be listed (the listing failed, or a PUT had just gone
+    /// out, when Pixel goes silent on a SETPATH): the text is known again
+    /// by its recipient, its whole subject and its date only.
+    Unavailable,
+}
+
 #[derive(Debug, Clone)]
 enum PendingMapOp {
     /// Subscribe to MNS notifications. Sent once per ACL connection
@@ -417,7 +437,14 @@ enum PendingMapOp {
         not_before: Option<Instant>,
         /// The start of the text, to know it again in the phone's folders.
         body_head: String,
+        /// The newest handles in the phone's sent folder before the text's
+        /// first PUT: when it is looked for there, only a new one is it.
+        sent_before: SentSnapshot,
     },
+    /// Before a text's first PUT: list the newest of the phone's sent
+    /// folder (`SentSnapshot`), then send it. A failed listing never holds
+    /// the text back: it is sent with no snapshot.
+    SnapshotSent { send: Box<PendingMapOp> },
     /// A text whose PUT may have reached the phone before its session
     /// failed (only the phone's answer was lost): `send` is looked for in
     /// `folder` (sent, then outbox) before it is sent again, so a lost ack
@@ -469,6 +496,9 @@ impl PendingMapOp {
             PendingMapOp::VerifySent { send, folder, .. } => {
                 format!("VerifySent({:?}, {})", folder, send.log_summary())
             }
+            PendingMapOp::SnapshotSent { send } => {
+                format!("SnapshotSent({})", send.log_summary())
+            }
         }
     }
 
@@ -485,7 +515,9 @@ impl PendingMapOp {
     fn text_id(&self) -> Option<&str> {
         match self {
             PendingMapOp::SendReply { message_id, .. } => Some(message_id),
-            PendingMapOp::VerifySent { send, .. } => send.text_id(),
+            PendingMapOp::VerifySent { send, .. } | PendingMapOp::SnapshotSent { send } => {
+                send.text_id()
+            }
             _ => None,
         }
     }
@@ -525,6 +557,10 @@ pub struct RuntimeStatus {
     /// PAIR-001: the held SSP numeric comparison awaiting the operator, if any.
     /// Written by the runtime loop, read by `phone.status` via the slot clone.
     pairing_confirm: PairingConfirmSlot,
+    /// Three-way calling (AT+CHLD 1 and 2, call waiting) was negotiated on
+    /// the hands-free link: a waiting caller can be switched to (review 3
+    /// #29). Refreshed with every hands-free event.
+    three_way_calling: AtomicBool,
 }
 
 /// Bounded audio channel depth. Each `AudioFrame` carries one SCO
@@ -776,6 +812,30 @@ impl AokieRuntime {
         let _ = self.control_tx.send(ControlCommand::Shutdown);
     }
 
+    /// Stop the runtime and wait up to `within` for its thread to end. What
+    /// the runtime says as it ends (a text still open is reported failed,
+    /// review 3 #7) is then waiting in the event channel for the caller to
+    /// read before it lets go. True when the thread ended in time; one that
+    /// did not is left to `Drop`, as before.
+    pub fn stop_within(&mut self, within: Duration) -> bool {
+        self.shutdown();
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+        let deadline = Instant::now() + within;
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !handle.is_finished() {
+            self.handle = Some(handle);
+            return false;
+        }
+        if handle.join().is_err() {
+            eprintln!("[AokieRadio] runtime thread ended with a panic");
+        }
+        true
+    }
+
     /// AOK-BT-001: open a bounded pairing window for `seconds`. The window is
     /// shared state, so this takes effect immediately; the runtime loop makes
     /// the radio discoverable on its next tick and closes it on expiry.
@@ -912,6 +972,13 @@ impl AokieRuntime {
 
     pub fn is_call_active(&self) -> bool {
         self.status.call_active.load(Ordering::Relaxed)
+    }
+
+    /// Whether the phone negotiated three-way calling on the hands-free link,
+    /// so a waiting caller can be switched to (AT+CHLD=2). A phone that
+    /// reports a waiting caller without it refuses the switch.
+    pub fn three_way_calling(&self) -> bool {
+        self.status.three_way_calling.load(Ordering::Relaxed)
     }
 
     pub fn sample_rate(&self) -> u16 {
@@ -1507,6 +1574,14 @@ fn wait_for_reopen(
             }
         }
     }
+}
+
+/// Whether an audio channel that closed for `reason` with the call still
+/// active (`call_up`) was the phone moving the audio to the handset (review
+/// 3 #1): the phone closed it itself (0x13, remote user terminated). Our own
+/// close (0x16), a lost link (0x08, 0x15, 0x22) or a refused one is not.
+fn audio_moved_to_handset(reason: u8, call_up: bool) -> bool {
+    call_up && reason == 0x13
 }
 
 /// Before `run_runtime` returns for a reopen: tell the phone the link is
@@ -2343,6 +2418,10 @@ fn run_runtime(
                         pbap_pending_since = Some(Instant::now());
                     }
                 }
+                status.three_way_calling.store(
+                    l2cap_state.hfp_state().is_some_and(|hfp| hfp.three_way_negotiated()),
+                    Ordering::Relaxed,
+                );
                 forward_hfp_event(hfp_event, &event_tx, &status, &interface.path);
             }
 
@@ -2788,7 +2867,15 @@ fn run_runtime(
         //     the next read timeout.
         loop {
             match control_rx.try_recv() {
-                Ok(ControlCommand::Shutdown) => return Ok(RuntimeExit::Shutdown),
+                Ok(ControlCommand::Shutdown) => {
+                    // Review 3 #4: the phone is told the link is going. Left
+                    // up, the controller can keep the link and the call's
+                    // audio with nobody reading them, and the caller hears
+                    // silence; told, the phone takes the call back to its
+                    // own earpiece at once.
+                    close_link_for_reopen(&mut transport, active_acl_handle);
+                    return Ok(RuntimeExit::Shutdown);
+                }
                 Ok(ControlCommand::ResetTransport) => {
                     let delay = recovery.force_reopen(Instant::now());
                     eprintln!(
@@ -2970,7 +3057,21 @@ fn run_runtime(
                     } else {
                         bmessage::build_sms_push(&recipient_phone, &body)
                     };
-                    texts.open(&message_id, &recipient_phone);
+                    match texts.take_in(&message_id, &recipient_phone) {
+                        TextIntake::New => {}
+                        TextIntake::AlreadyOpen => {
+                            eprintln!(
+                                "[AokieRadio] text {message_id} is already on its way — handed over again, not sent twice"
+                            );
+                            continue;
+                        }
+                        TextIntake::AnsweredAgain => {
+                            eprintln!(
+                                "[AokieRadio] text {message_id} was already answered — given that answer again, not sent twice"
+                            );
+                            continue;
+                        }
+                    }
                     // The PUT goes out as one ACL packet (no fragmenting): one
                     // larger than the dongle takes never reaches the phone,
                     // and the send stalled until its time ran out. Refused
@@ -2995,6 +3096,7 @@ fn run_runtime(
                         tried_at: None,
                         attempts: 0,
                         not_before: None,
+                        sent_before: SentSnapshot::NotTaken,
                     });
                     eprintln!(
                         "[AokieRadio] SendSms enqueued ({} pending MAP ops, type={})",
@@ -3160,7 +3262,10 @@ fn run_runtime(
                     let _ = reply.send(result);
                 }
                 Err(stdmpsc::TryRecvError::Empty) => break,
-                Err(stdmpsc::TryRecvError::Disconnected) => return Ok(RuntimeExit::Shutdown),
+                Err(stdmpsc::TryRecvError::Disconnected) => {
+                    close_link_for_reopen(&mut transport, active_acl_handle);
+                    return Ok(RuntimeExit::Shutdown);
+                }
             }
         }
 
@@ -4068,6 +4173,18 @@ fn run_runtime(
                                     "[AokieRadio] SCO closed (reason 0x{:02x}) while the phone still shows the call — the call goes on (audio on the handset, or the link being rebuilt)",
                                     reason
                                 );
+                                // Review 3 #1: the phone itself closed the
+                                // audio of a call that is up: the audio is
+                                // on the handset. The consumer steps aside
+                                // (no AT+BCC pulling it back, no dead-air
+                                // hang-up) until it comes back. Any other
+                                // reason keeps the no-audio watchdog.
+                                let call_up = l2cap_state
+                                    .hfp_state()
+                                    .is_some_and(|hfp| hfp.call_active());
+                                if audio_moved_to_handset(*reason, call_up) {
+                                    let _ = event_tx.send(RuntimeEvent::AudioOnHandset);
+                                }
                             } else if !matches!(*reason, 0x08 | 0x15) {
                                 let _ = event_tx.send(RuntimeEvent::CallTerminated);
                             }
@@ -4386,6 +4503,10 @@ fn run_runtime(
                         }
                     }
                 }
+                status.three_way_calling.store(
+                    l2cap_state.hfp_state().is_some_and(|hfp| hfp.three_way_negotiated()),
+                    Ordering::Relaxed,
+                );
                 forward_hfp_event(hfp_event, &event_tx, &status, &interface.path);
             }
         }
@@ -5359,7 +5480,9 @@ fn drive_map_runtime(
             // PBAP is mid-stream — Pixel queues MAS responses behind PBAP body chunks and stalls.
             if fresh_work_allowed && !pbap_busy && !pending_map_ops.is_empty() {
                 // (a retried text waiting out its pause lets the ops behind it go first)
-                if let Some(next_op) = take_ready_op(pending_map_ops).map(mark_tried) {
+                if let Some(next_op) =
+                    take_ready_op(pending_map_ops).map(|op| mark_tried(op, *last_send_reply_at))
+                {
                     feed_pooled_next_op(
                         runtime,
                         next_op,
@@ -5434,7 +5557,9 @@ fn drive_map_runtime(
         && !pbap_busy
         && fresh_work_allowed
     {
-        if let Some(op) = take_ready_op(pending_map_ops).map(mark_tried) {
+        if let Some(op) =
+            take_ready_op(pending_map_ops).map(|op| mark_tried(op, *last_send_reply_at))
+        {
             if let Err((op, why)) = start_map_operation(
                 op,
                 active_acl_handle,
@@ -5451,8 +5576,24 @@ fn drive_map_runtime(
 }
 
 /// A text's first try starts its retain time (see `SendReply::tried_at`).
-fn mark_tried(mut op: PendingMapOp) -> PendingMapOp {
-    if let PendingMapOp::SendReply { tried_at, .. } = &mut op {
+/// Before that first try the newest of the phone's sent folder is listed
+/// (`SnapshotSent`, review 3 #9), unless a PUT went out under
+/// `POLL_SKIP_AFTER_REPLY` ago (Pixel goes silent on a SETPATH then): the
+/// text is then sent with no snapshot.
+fn mark_tried(mut op: PendingMapOp, last_send_reply_at: Option<Instant>) -> PendingMapOp {
+    if let PendingMapOp::SendReply {
+        sent_before,
+        tried_at,
+        ..
+    } = &mut op
+    {
+        if *sent_before == SentSnapshot::NotTaken {
+            let put_just_went = last_send_reply_at.is_some_and(|at| at.elapsed() < POLL_SKIP_AFTER_REPLY);
+            if !put_just_went {
+                return PendingMapOp::SnapshotSent { send: Box::new(op) };
+            }
+            *sent_before = SentSnapshot::Unavailable;
+        }
         tried_at.get_or_insert_with(Instant::now);
     }
     op
@@ -5541,6 +5682,12 @@ fn pending_op_to_mas_operation(op: &PendingMapOp) -> MasOperation {
             max_list_count: INBOX_POLL_MAX_LIST,
             filter_message_type: MSG_TYPE_KEEP_BOTH_SMS_VARIANTS,
         },
+        // The newest few of the sent folder, before a text's first PUT.
+        PendingMapOp::SnapshotSent { .. } => MasOperation::ListMessages {
+            folder: MasFolder::Sent,
+            max_list_count: INBOX_POLL_MAX_LIST,
+            filter_message_type: MSG_TYPE_KEEP_SMS_AND_MMS,
+        },
         // The newest few of the folder, texts and MMS (a reply to an MMS goes
         // out as one).
         PendingMapOp::VerifySent { folder, .. } => MasOperation::ListMessages {
@@ -5574,8 +5721,10 @@ const FETCH_ATTEMPTS: u8 = 3;
 
 /// How long after a send whose PUT may have reached the phone its folders
 /// are looked in: the phone may still be filing it, and Pixel goes silent
-/// on a SETPATH just after a PUT (see `POLL_SKIP_AFTER_REPLY`).
-const VERIFY_SENT_PAUSE: Duration = Duration::from_secs(10);
+/// on a SETPATH under `POLL_SKIP_AFTER_REPLY` after a PUT (review 3 #9: it
+/// was 10 s, inside that window). Counted from when the send was found to
+/// have stopped short, which is after its PUT.
+const VERIFY_SENT_PAUSE: Duration = POLL_SKIP_AFTER_REPLY;
 
 /// The pause before a text is tried again after `attempts` failed tries.
 fn send_retry_pause(attempts: u32) -> Duration {
@@ -5597,13 +5746,15 @@ fn push_wire_len(bmessage_len: usize) -> usize {
 }
 
 /// The start of a text, whitespace folded: what the phone's message
-/// listing shows of it as its subject.
+/// listing shows of it as its subject: as much as a phone puts in one
+/// (MAP's subject is at most 255 characters), so the whole subject can be
+/// compared.
 fn text_head(body: &str) -> String {
     body.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
-        .take(32)
+        .take(256)
         .collect()
 }
 
@@ -5616,13 +5767,34 @@ fn text_head(body: &str) -> String {
 struct TextLedger {
     /// (message id, recipient), in the order handed over.
     open: Vec<(String, String)>,
+    /// The last texts answered in this run, with the answer each was given
+    /// (newest last, at most `TEXT_ANSWERS_KEPT`): a text handed over again
+    /// under its id is given that answer again, never sent twice.
+    answered: VecDeque<(String, RuntimeEvent)>,
     event_tx: UnboundedSender<RuntimeEvent>,
+}
+
+/// How many answered texts a run remembers (review 3 #8). A host retries a
+/// text within a minute or two; a few dozen covers every text of that time.
+const TEXT_ANSWERS_KEPT: usize = 64;
+
+/// What becomes of a text handed to the radio (`TextLedger::take_in`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextIntake {
+    /// A new text: it is opened and goes to the phone.
+    New,
+    /// Its id is already open (a host retry while the first is on its way):
+    /// the first one's answer answers both, and nothing more is sent.
+    AlreadyOpen,
+    /// Its id was answered in this run: that answer was given again.
+    AnsweredAgain,
 }
 
 impl TextLedger {
     fn new(event_tx: UnboundedSender<RuntimeEvent>) -> Self {
         Self {
             open: Vec::new(),
+            answered: VecDeque::new(),
             event_tx,
         }
     }
@@ -5632,6 +5804,30 @@ impl TextLedger {
             self.open
                 .push((message_id.to_string(), recipient_phone.to_string()));
         }
+    }
+
+    /// Take in a text handed to the radio (review 3 #8: a host that retried
+    /// a text after its 30 s timeout, under the same message id, had it sent
+    /// twice). A new id is opened; an id already open or already answered is
+    /// not sent again, and an answered one is given its answer again (the
+    /// same event, which the plugin's outbox takes as the one it has).
+    fn take_in(&mut self, message_id: &str, recipient_phone: &str) -> TextIntake {
+        if self.is_open(message_id) {
+            return TextIntake::AlreadyOpen;
+        }
+        if let Some((_, answer)) = self.answered.iter().find(|(id, _)| id == message_id) {
+            let _ = self.event_tx.send(answer.clone());
+            return TextIntake::AnsweredAgain;
+        }
+        self.open(message_id, recipient_phone);
+        TextIntake::New
+    }
+
+    fn remember_answer(&mut self, message_id: &str, answer: RuntimeEvent) {
+        if self.answered.len() >= TEXT_ANSWERS_KEPT {
+            self.answered.pop_front();
+        }
+        self.answered.push_back((message_id.to_string(), answer));
     }
 
     fn is_open(&self, message_id: &str) -> bool {
@@ -5646,10 +5842,12 @@ impl TextLedger {
     fn sent(&mut self, message_id: &str) {
         match self.close(message_id) {
             Some(recipient_phone) => {
-                let _ = self.event_tx.send(RuntimeEvent::SmsSent {
+                let answer = RuntimeEvent::SmsSent {
                     message_id: message_id.to_string(),
                     recipient_phone,
-                });
+                };
+                let _ = self.event_tx.send(answer.clone());
+                self.remember_answer(message_id, answer);
             }
             None => eprintln!("[AokieRadio] text {message_id} was already answered — not reported again"),
         }
@@ -5659,11 +5857,13 @@ impl TextLedger {
         match self.close(message_id) {
             Some(recipient_phone) => {
                 eprintln!("[AokieRadio] text {message_id} failed: {reason}");
-                let _ = self.event_tx.send(RuntimeEvent::SmsSendFailed {
+                let answer = RuntimeEvent::SmsSendFailed {
                     message_id: message_id.to_string(),
                     recipient_phone,
                     reason,
-                });
+                };
+                let _ = self.event_tx.send(answer.clone());
+                self.remember_answer(message_id, answer);
             }
             None => eprintln!("[AokieRadio] text {message_id} was already answered — not reported again"),
         }
@@ -5753,6 +5953,7 @@ fn requeue_or_report(
             attempts,
             not_before,
             body_head,
+            sent_before,
         } => {
             if !texts.is_open(&message_id) {
                 return; // already answered
@@ -5790,6 +5991,7 @@ fn requeue_or_report(
                     not_before
                 },
                 body_head,
+                sent_before,
             };
             if in_doubt {
                 eprintln!(
@@ -5859,6 +6061,17 @@ fn requeue_or_report(
                     attempts,
                 });
             }
+        }
+        PendingMapOp::SnapshotSent { send } => {
+            // The listing before the PUT stopped short: the text goes on
+            // with no snapshot once it was tried, as it was before one.
+            let mut send = *send;
+            if stop.tried() {
+                if let PendingMapOp::SendReply { sent_before, .. } = &mut send {
+                    *sent_before = SentSnapshot::Unavailable;
+                }
+            }
+            requeue_or_report(send, MapStop::NotStarted, reason, pending, seen_handles, texts);
         }
         PendingMapOp::Subscribe | PendingMapOp::PollInbox | PendingMapOp::CheckSent { .. } => {}
     }
@@ -5955,8 +6168,10 @@ fn listing_holds_text(entry: &[(String, String)], recipient: &str, head: &str, s
         return false;
     }
     if let Some(subject) = get("subject").map(text_head).filter(|s| !s.is_empty()) {
+        // The whole subject the phone gives (it may cut the text short, with
+        // "..."), not only its start (review 3 #9).
         let subject = subject.trim_end_matches("...").trim_end_matches('…').trim_end();
-        let n = subject.chars().count().min(head.chars().count()).min(24);
+        let n = subject.chars().count().min(head.chars().count());
         if n == 0
             || subject.chars().take(n).collect::<String>() != head.chars().take(n).collect::<String>()
         {
@@ -5967,6 +6182,23 @@ fn listing_holds_text(entry: &[(String, String)], recipient: &str, head: &str, s
         Some(at) => at >= since,
         None => true,
     }
+}
+
+/// Whether a sent-folder entry is new since the text's snapshot (review 3
+/// #9): with a snapshot, an entry it lists is an earlier text. The outbox is
+/// not in the snapshot (only the sent folder is listed before a PUT), and
+/// neither is any folder when there is no snapshot.
+fn entry_is_new_since(entry: &[(String, String)], before: &SentSnapshot, folder: MasFolder) -> bool {
+    let SentSnapshot::Taken(handles) = before else {
+        return true;
+    };
+    if folder != MasFolder::Sent {
+        return true;
+    }
+    entry
+        .iter()
+        .find(|(k, _)| k == "handle")
+        .is_none_or(|(_, handle)| !handles.iter().any(|h| h.eq_ignore_ascii_case(handle)))
 }
 
 /// How long after queueing the MAP Subscribe we keep waiting for the
@@ -6052,6 +6284,24 @@ fn handle_map_runtime_event(
 ) {
     match event {
         MapRuntimeEvent::OperationCompleted(output) => match (active_map_op.as_ref(), output) {
+            (Some(PendingMapOp::SnapshotSent { send }), output) => {
+                let snapshot = match output {
+                    crate::aokie_radio::map_mas::OperationOutput::Listing(bytes) => SentSnapshot::Taken(
+                        msg_attribute_pairs(&bytes)
+                            .iter()
+                            .filter_map(|entry| entry.iter().find(|(k, _)| k == "handle").map(|(_, v)| v.clone()))
+                            .collect(),
+                    ),
+                    _ => SentSnapshot::Unavailable,
+                };
+                let mut send = send.as_ref().clone();
+                if let PendingMapOp::SendReply { sent_before, .. } = &mut send {
+                    *sent_before = snapshot;
+                }
+                if send.text_id().is_some_and(|id| texts.is_open(id)) {
+                    pending_map_ops.push_front(send);
+                }
+            }
             (Some(PendingMapOp::Subscribe), _) => {
                 eprintln!("[AokieRadio] MAP NotificationRegistration acked");
                 let _ = event_tx.send(RuntimeEvent::MapNotificationsSubscribed);
@@ -6095,6 +6345,7 @@ fn handle_map_runtime_event(
                     queued_at,
                     tried_at,
                     body_head,
+                    sent_before,
                     ..
                 } = send.as_ref()
                 else {
@@ -6109,9 +6360,10 @@ fn handle_map_runtime_event(
                         .unwrap_or_else(|_| chrono::Duration::minutes(10)))
                 .format("%Y%m%dT%H%M%S")
                 .to_string();
-                let found = msg_attribute_pairs(&bytes)
-                    .iter()
-                    .any(|entry| listing_holds_text(entry, recipient_phone, body_head, &since));
+                let found = msg_attribute_pairs(&bytes).iter().any(|entry| {
+                    listing_holds_text(entry, recipient_phone, body_head, &since)
+                        && entry_is_new_since(entry, sent_before, *folder)
+                });
                 if found {
                     eprintln!(
                         "[AokieRadio] {} is in the phone's {:?} folder: the phone has it, so it is not sent again",
@@ -7026,6 +7278,41 @@ fn build_msbc_sco_packet(
 mod tests {
     use super::*;
 
+    /// Review 3 #4: every way the run loop ends for a shutdown tells the
+    /// phone the link is going first (HCI_Disconnect), so a call up when
+    /// OAIY quits goes back to the phone's earpiece instead of silence.
+    #[test]
+    fn a_shutdown_tells_the_phone_the_link_is_going_first() {
+        let source = include_str!("runtime.rs");
+        let start = source.find("\nfn run_runtime(").expect("run_runtime");
+        let body = &source[start + 1..];
+        let body = &body[..body[1..].find("\nfn ").expect("the next function") + 1];
+        let exits: Vec<usize> = body
+            .match_indices("return Ok(RuntimeExit::Shutdown)")
+            .map(|(at, _)| at)
+            .collect();
+        assert!(exits.len() >= 2, "the shutdown exits were not found");
+        for at in exits {
+            let before = body[..at].trim_end();
+            let last_statement = before.rsplit('\n').next().unwrap_or_default();
+            assert!(
+                last_statement.contains("close_link_for_reopen(&mut transport, active_acl_handle);"),
+                "a shutdown exit returns without closing the phone link: {last_statement:?}"
+            );
+        }
+    }
+
+    /// Review 3 #1: only the phone closing the audio of an active call is
+    /// the audio moving to the handset.
+    #[test]
+    fn only_the_phone_closing_an_active_calls_audio_is_the_handset() {
+        assert!(audio_moved_to_handset(0x13, true));
+        assert!(!audio_moved_to_handset(0x13, false), "a ring's in-band audio closing is not");
+        for other in [0x08, 0x15, 0x16, 0x22, 0x3b] {
+            assert!(!audio_moved_to_handset(other, true), "reason 0x{other:02x}");
+        }
+    }
+
     /// Review 1 #6: one phone at a time. A second phone waits while another
     /// holds the link; the same phone back on a new handle is let through.
     #[test]
@@ -7368,6 +7655,7 @@ mod tests {
             attempts,
             not_before: None,
             body_head: text_head("Your  booking is\nconfirmed for Friday at 10"),
+            sent_before: SentSnapshot::Unavailable,
         }
     }
 
@@ -7402,6 +7690,42 @@ mod tests {
             assert_eq!(outcomes(&mut rx), vec!["sent m1", "failed m2"]);
         } // the run ends with m3 still open
         assert_eq!(outcomes(&mut rx), vec!["failed m3"]);
+    }
+
+    /// Review 3 #8: a host that retries a text under the same message id
+    /// (after its 30 s timeout) never has it sent twice: while the first is
+    /// on its way the retry is not taken in, and once it is answered the
+    /// retry is given that answer again.
+    #[test]
+    fn a_text_handed_over_again_is_never_sent_twice() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut texts = TextLedger::new(tx);
+        assert_eq!(texts.take_in("m1", "0400111222"), TextIntake::New);
+        assert_eq!(texts.take_in("m1", "0400111222"), TextIntake::AlreadyOpen);
+        assert!(outcomes(&mut rx).is_empty(), "nothing is answered yet");
+        texts.sent("m1");
+        assert_eq!(outcomes(&mut rx), vec!["sent m1"]);
+        assert_eq!(texts.take_in("m1", "0400111222"), TextIntake::AnsweredAgain);
+        assert_eq!(outcomes(&mut rx), vec!["sent m1"], "the same answer again");
+        assert!(!texts.is_open("m1"), "and it is not opened to be sent again");
+        // A failure is given again the same way, with its reason.
+        assert_eq!(texts.take_in("m2", "0400111222"), TextIntake::New);
+        texts.failed("m2", "the phone refused it".into());
+        let _ = outcomes(&mut rx);
+        assert_eq!(texts.take_in("m2", "0400111222"), TextIntake::AnsweredAgain);
+        match rx.try_recv() {
+            Ok(RuntimeEvent::SmsSendFailed { message_id, reason, .. }) => {
+                assert_eq!((message_id.as_str(), reason.as_str()), ("m2", "the phone refused it"));
+            }
+            other => panic!("expected the failure again, got {other:?}"),
+        }
+        // Only the last few dozen answers are kept.
+        for i in 0..TEXT_ANSWERS_KEPT {
+            let id = format!("x{i}");
+            texts.take_in(&id, "0400111222");
+            texts.sent(&id);
+        }
+        assert_eq!(texts.take_in("m1", "0400111222"), TextIntake::New);
     }
 
     #[test]
@@ -7547,6 +7871,77 @@ mod tests {
         run_event(MapRuntimeEvent::OperationCompleted(OperationOutput::Listing(other)), next, &mut pending, &mut seen, &mut texts, &tx);
         assert!(matches!(pending.front(), Some(PendingMapOp::SendReply { not_before: None, .. })));
         assert!(outcomes(&mut rx).is_empty(), "no answer yet: it is being sent again");
+    }
+
+    /// Review 3 #9: the sent folder is listed before a text's first PUT, and
+    /// a text in doubt is known again there only by an entry that is new
+    /// since: an earlier text to the same person, starting the same way, no
+    /// longer marks a lost one sent.
+    #[test]
+    fn a_text_in_doubt_is_known_only_by_an_entry_new_since_its_put() {
+        use crate::aokie_radio::map_mas::OperationOutput;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut texts = TextLedger::new(tx.clone());
+        let mut seen = HashSet::new();
+        let mut pending = VecDeque::new();
+        let mut fresh = send_op("m1", 0);
+        if let PendingMapOp::SendReply { sent_before, tried_at, .. } = &mut fresh {
+            *sent_before = SentSnapshot::NotTaken;
+            *tried_at = None;
+        }
+        // Its first try is the listing; a PUT that just went out skips it.
+        let first = mark_tried(fresh.clone(), None);
+        assert!(matches!(first, PendingMapOp::SnapshotSent { .. }));
+        assert!(matches!(
+            mark_tried(fresh.clone(), Some(Instant::now())),
+            PendingMapOp::SendReply { sent_before: SentSnapshot::Unavailable, tried_at: Some(_), .. }
+        ));
+        let now = chrono::Local::now().format("%Y%m%dT%H%M%S").to_string();
+        let listing = |handles: &[&str]| -> Vec<u8> {
+            let mut s = String::from("<MAP-msg-listing version=\"1.0\">");
+            for handle in handles {
+                s.push_str(&format!(
+                    "<msg handle=\"{handle}\" subject=\"Your booking is confirmed for Friday at 10\" datetime=\"{now}\" recipient_addressing=\"0400111222\" type=\"SMS_GSM\" />"
+                ));
+            }
+            s.push_str("</MAP-msg-listing>");
+            s.into_bytes()
+        };
+        // The same text sent earlier is already there: listed, then the PUT.
+        texts.open("m1", "0400111222");
+        run_event(MapRuntimeEvent::OperationCompleted(OperationOutput::Listing(listing(&["A1"]))), Some(first), &mut pending, &mut seen, &mut texts, &tx);
+        let send = pending.pop_front().expect("the text goes on after its listing");
+        assert!(matches!(&send, PendingMapOp::SendReply { sent_before: SentSnapshot::Taken(h), .. } if h == &vec!["A1".to_string()]));
+        let verify = |send: &PendingMapOp| PendingMapOp::VerifySent { send: Box::new(send.clone()), folder: MasFolder::Sent, not_before: None };
+        // Its PUT was lost: only the earlier one is in sent, so it is not it.
+        run_event(MapRuntimeEvent::OperationCompleted(OperationOutput::Listing(listing(&["A1"]))), Some(verify(&send)), &mut pending, &mut seen, &mut texts, &tx);
+        assert!(outcomes(&mut rx).is_empty(), "the earlier text is not taken for this one");
+        assert!(matches!(pending.pop_front(), Some(PendingMapOp::VerifySent { folder: MasFolder::Outbox, .. })));
+        // A new entry is.
+        run_event(MapRuntimeEvent::OperationCompleted(OperationOutput::Listing(listing(&["A2", "A1"]))), Some(verify(&send)), &mut pending, &mut seen, &mut texts, &tx);
+        assert_eq!(outcomes(&mut rx), vec!["sent m1"]);
+        // A listing that fails never holds the text back: it goes on with
+        // no snapshot.
+        texts.open("m2", "0400111222");
+        let mut second = send_op("m2", 0);
+        if let PendingMapOp::SendReply { sent_before, .. } = &mut second {
+            *sent_before = SentSnapshot::NotTaken;
+        }
+        let snapshot = PendingMapOp::SnapshotSent { send: Box::new(second) };
+        requeue_or_report(snapshot, MapStop::InFlight, "RFCOMM closed mid-MAP session", &mut pending, &mut seen, &mut texts);
+        assert!(matches!(
+            pending.pop_front(),
+            Some(PendingMapOp::SendReply { sent_before: SentSnapshot::Unavailable, attempts: 0, not_before: None, .. })
+        ));
+        assert!(outcomes(&mut rx).is_empty());
+        // The whole subject is compared, not its first 24 characters.
+        let head = text_head("Your booking is confirmed for Friday at 10");
+        let entry = |subject: &str| vec![
+            ("recipient_addressing".to_string(), "0400111222".to_string()),
+            ("subject".to_string(), subject.to_string()),
+        ];
+        assert!(!listing_holds_text(&entry("Your booking is confirmed for Monday at 9"), "0400111222", &head, "20000101T000000"));
+        assert!(listing_holds_text(&entry("Your booking is confirmed for Fri..."), "0400111222", &head, "20000101T000000"));
     }
 
     /// Review 1 #22/#23: a body is seen once fetched (not when queued), and

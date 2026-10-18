@@ -94,6 +94,19 @@ pub struct CallSession {
     /// theirs, as a call they dial on the handset is. The receptionist
     /// neither greets nor listens.
     pub owner_took: bool,
+    /// The phone moved this call's audio to the handset (review 3 #1): its
+    /// audio channel closed (reason 0x13) with the call still up, as it does
+    /// when the owner takes the call on the phone. Until the audio comes back
+    /// to the dongle the receptionist steps aside: the no-audio watchdog
+    /// neither pulls the audio back (AT+BCC) nor hangs up, and the OAIY
+    /// stream is paused. When it moved.
+    pub audio_on_handset_since: Option<Instant>,
+    /// The call this one takes up again (review 3 #35): the receptionist's
+    /// call the phone link went down under, found still up on the phone
+    /// when it came back. Its record was closed as `device_lost` then, as a
+    /// live record must not outlive its link (AOK-LIF-003); this one names
+    /// it, so the two records of one phone call can be read as one.
+    pub resumes: Option<String>,
     intent: Option<TerminationIntent>,
     /// `aokie.call.incoming` is delayed briefly for caller-id collection;
     /// this holds "not yet emitted" plus when the wait started.
@@ -136,6 +149,19 @@ impl CallSession {
 
     pub fn is_active(&self) -> bool {
         self.phase == Phase::Active
+    }
+
+    /// Whether the call's audio is on the handset (`audio_on_handset_since`).
+    pub fn audio_on_handset(&self) -> bool {
+        self.audio_on_handset_since.is_some()
+    }
+
+    /// Whether the call's audio has been on the handset for at least
+    /// `settle`: an audio link the phone only rebuilds is back within it, and
+    /// the OAIY stream is not paused for that.
+    pub fn audio_on_handset_for(&self, settle: std::time::Duration) -> bool {
+        self.audio_on_handset_since
+            .is_some_and(|since| since.elapsed() >= settle)
     }
 
     /// Whether the receptionist runs this call's conversation: a call to us
@@ -258,6 +284,8 @@ impl SessionTracker {
             left_ringing: false,
             handed_over: false,
             owner_took: false,
+            audio_on_handset_since: None,
+            resumes: None,
             intent: None,
             pending_incoming_since: Some(Instant::now()),
             greeted: false,
@@ -303,6 +331,8 @@ impl SessionTracker {
             left_ringing: false,
             handed_over: false,
             owner_took: false,
+            audio_on_handset_since: None,
+            resumes: None,
             intent: None,
             pending_incoming_since: None,
             greeted: false,
@@ -399,6 +429,8 @@ impl SessionTracker {
         }
         self.last_generation += 1;
         session.generation = self.last_generation;
+        // Restored by our own switch: the phone gives its audio to us.
+        session.audio_on_handset_since = None;
         self.session = Some(session);
         Ok(self.last_generation)
     }

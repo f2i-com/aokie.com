@@ -64,7 +64,6 @@ services:
     ports:
       - 127.0.0.1:3478:3478/tcp
       - 127.0.0.1:3478:3478/udp
-      - "127.0.0.1:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/tcp"
       - "127.0.0.1:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp"
     networks: [local]
     read_only: true

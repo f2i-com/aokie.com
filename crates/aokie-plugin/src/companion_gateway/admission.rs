@@ -234,7 +234,11 @@ impl AdmissionResponse {
         validate_identity(&self.app_id, "appId").map_err(WorkerError::rebootstrap)?;
         validate_identity(&self.subject_id, "subjectId").map_err(WorkerError::rebootstrap)?;
         validate_bearer(&self.access_token).map_err(WorkerError::rebootstrap)?;
-        let now = unix_now()?;
+        // The Desktop broker's lifetimes are read on this computer's own
+        // clock, as they always were: the admission comes before any server
+        // clock has been seen, and the broker may date it locally.
+        let now = local_unix_now()
+            .ok_or_else(|| WorkerError::rebootstrap("System clock is before the Unix epoch"))?;
         let wall_remaining = self.expires_at.saturating_sub(now);
         if self.expires_in <= ADMISSION_SAFETY_MARGIN_SECONDS
             || self.expires_in > 300

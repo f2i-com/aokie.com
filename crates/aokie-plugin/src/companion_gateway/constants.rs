@@ -6,8 +6,23 @@ use super::*;
 pub(super) const READ_TICK: Duration = Duration::from_millis(100);
 pub(super) const SNAPSHOT_POLL: Duration = Duration::from_millis(250);
 pub(super) const SNAPSHOT_REFRESH: Duration = Duration::from_secs(10);
+/// Longest wait before re-posting a snapshot the relay keeps dropping.
+pub(super) const RELAY_SNAPSHOT_RETRY_MAX: Duration = Duration::from_secs(4);
+
+/// When to try again after `drops` snapshots in a row were dropped: the
+/// normal poll after one, doubling to [`RELAY_SNAPSHOT_RETRY_MAX`]. A new
+/// hello or a lease change still publishes at once.
+pub(super) fn relay_snapshot_retry_delay(drops: u32) -> Duration {
+    let doublings = drops.saturating_sub(1).min(8);
+    SNAPSHOT_POLL
+        .saturating_mul(1_u32 << doublings)
+        .min(RELAY_SNAPSHOT_RETRY_MAX)
+}
 pub(super) const PING_INTERVAL: Duration = Duration::from_secs(15);
 pub(super) const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+/// A gap this long between two heartbeat ticks means the authority loop was
+/// blocked (see `heartbeat_loop_stalled`), not that the gateway went quiet.
+pub(super) const HEARTBEAT_STALL: Duration = Duration::from_secs(2);
 /// Longest one write to the gateway socket may take before the socket is
 /// treated as gone (see `bounded_ws_send`).
 pub(super) const GATEWAY_SEND_TIMEOUT: Duration = Duration::from_secs(5);

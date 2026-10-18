@@ -376,7 +376,6 @@ the connected app.
 | `crates/aokie-dongle` | Dongle discovery, the guarded WinUSB driver install and restore with its elevated helper, and the radio's event bridge. |
 | `crates/aokie-winbt` | The native Windows Bluetooth backend (WinRT Calls, WASAPI, RFCOMM); built only when asked for. |
 | `crates/aokie-core` | The Tauri-free foundation the other crates share: policy, the dongle catalog, contracts and security. |
-| `crates/aokie-audio` | Echo cancellation, recording and audio buffers. |
 | `crates/aokie-protocol` | Companion snapshot and command models, revision fences and shared fixtures. |
 | `crates/aokie-realtime` | The self-hostable Companion signalling gateway. |
 | `crates/aokie-media` | The native WebRTC media bridge shared by the desktop and Companion. |

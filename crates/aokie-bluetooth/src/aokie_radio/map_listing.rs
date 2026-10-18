@@ -89,9 +89,12 @@ pub fn parse_listing(input: &[u8]) -> Vec<MessageEntry> {
     entries
 }
 
-/// Every `<msg>` element's attributes as (name, value) pairs, in order.
+/// Every `<msg>` element's attributes as (name, value) pairs, in order,
+/// with the values' XML entities decoded (`&amp;`, `&lt;`, `&#39;` ...).
 /// For looking at what a folder holds (a sent text's state, say)
-/// beyond the fields `MessageEntry` keeps.
+/// beyond the fields `MessageEntry` keeps. A `>` inside a quoted value
+/// does not end the element (review 3 #9: a text with `&` or `<` early in
+/// it was never recognised in the sent folder, and was sent again).
 pub fn msg_attribute_pairs(input: &[u8]) -> Vec<Vec<(String, String)>> {
     let text = String::from_utf8_lossy(input);
     let mut out = Vec::new();
@@ -100,10 +103,15 @@ pub fn msg_attribute_pairs(input: &[u8]) -> Vec<Vec<(String, String)>> {
         if !piece.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/') {
             continue;
         }
-        let section = &piece[..piece.find('>').unwrap_or(piece.len())];
         let mut pairs = Vec::new();
-        let mut rest = section;
-        while let Some(eq) = rest.find('=') {
+        let mut rest = piece;
+        loop {
+            // The element ends at a `>` outside any value.
+            let eq = rest.find('=');
+            let gt = rest.find('>');
+            let Some(eq) = eq.filter(|eq| gt.is_none_or(|gt| *eq < gt)) else {
+                break;
+            };
             let name = rest[..eq].trim().rsplit(char::is_whitespace).next().unwrap_or("").to_string();
             let after = rest[eq + 1..].trim_start();
             let Some(quote) = after.chars().next().filter(|c| *c == '"' || *c == '\'') else {
@@ -113,11 +121,56 @@ pub fn msg_attribute_pairs(input: &[u8]) -> Vec<Vec<(String, String)>> {
             let Some(close) = body.find(quote) else {
                 break;
             };
-            pairs.push((name, body[..close].to_string()));
+            pairs.push((name, unescape_xml(&body[..close])));
             rest = &body[close + 1..];
         }
         out.push(pairs);
     }
+    out
+}
+
+/// An XML attribute value with its entities decoded: the five named ones
+/// and numeric character references. An entity it does not know is left
+/// as it is.
+pub fn unescape_xml(value: &str) -> String {
+    if !value.contains('&') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let decoded = tail.find(';').filter(|end| *end <= 12).and_then(|end| {
+            let name = &tail[1..end];
+            let ch = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => name
+                    .strip_prefix("#x")
+                    .or_else(|| name.strip_prefix("#X"))
+                    .map(|hex| u32::from_str_radix(hex, 16))
+                    .or_else(|| name.strip_prefix('#').map(|dec| dec.parse::<u32>()))
+                    .and_then(Result::ok)
+                    .and_then(char::from_u32),
+            }?;
+            Some((ch, end + 1))
+        });
+        match decoded {
+            Some((ch, len)) => {
+                out.push(ch);
+                rest = &tail[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
     out
 }
 
@@ -246,6 +299,21 @@ mod tests {
         assert!(all[0].contains(&("sent".to_string(), "no".to_string())));
         assert!(all[0].contains(&("read".to_string(), "yes".to_string())));
         assert_eq!(all[1], vec![("handle".to_string(), "04000000000031".to_string()), ("sent".to_string(), "yes".to_string())]);
+    }
+
+    /// Review 3 #9: values come back as the text said them. A text with `&`
+    /// or `<` in it (listed as `&amp;` / `&lt;`), or a `>` in a value, was
+    /// never recognised in the sent folder and was sent again.
+    #[test]
+    fn attribute_values_are_unescaped_and_a_quoted_gt_does_not_end_the_element() {
+        let xml = br#"<MAP-msg-listing><msg handle="01" subject="Tom &amp; Jo &lt;3 &#39;ok&#x27; a > b" sent="yes"/><msg handle="02" subject="&bogus; &amp"/></MAP-msg-listing>"#;
+        let all = msg_attribute_pairs(xml);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0][1], ("subject".to_string(), "Tom & Jo <3 'ok' a > b".to_string()));
+        assert_eq!(all[0][2], ("sent".to_string(), "yes".to_string()));
+        assert_eq!(all[1][1], ("subject".to_string(), "&bogus; &amp".to_string()), "unknown entities stay");
+        assert_eq!(unescape_xml("plain"), "plain");
+        assert_eq!(unescape_xml("&quot;hi&quot; &apos;"), "\"hi\" '");
     }
 
     const SAMPLE: &str = r#"<?xml version="1.0"?>

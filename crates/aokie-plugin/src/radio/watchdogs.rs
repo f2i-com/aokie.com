@@ -143,8 +143,13 @@ impl DialCancelFollowUp {
 pub(super) fn dead_air_watch_call(
     session: Option<&crate::call_session::CallSession>,
 ) -> Option<String> {
+    // Review 3 #1: nor a call whose audio the phone moved to the handset
+    // (the owner took it there): pulled back, and hung up at 8 s, the owner
+    // lost the call.
     session
-        .filter(|session| session.is_active() && session.receptionist_owns())
+        .filter(|session| {
+            session.is_active() && session.receptionist_owns() && !session.audio_on_handset()
+        })
         .map(|session| session.id.clone())
 }
 

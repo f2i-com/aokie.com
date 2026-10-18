@@ -3,6 +3,13 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// How long a stopping plugin waits for the phone link to end and say what
+/// it still held (review 3 #7): it ends within a few of its 50 ms reads, and
+/// telling the phone the link is going takes at most 0.8 s. Inside the 3 s
+/// the host's grace leaves the radio.
+#[cfg(aokie_radio)]
+pub(super) const RADIO_STOP_WAIT: std::time::Duration = std::time::Duration::from_millis(1_500);
+
 #[cfg(aokie_radio)]
 #[allow(clippy::too_many_arguments)]
 // `greeting` and friends are only mutated by the voice build's Configure arm.
@@ -102,6 +109,20 @@ pub(super) fn service_controls(
             None => control_rx.try_recv(),
         };
         match next {
+            Ok(RadioControl::Answer { op })
+                if status.consent_expired() && tracker.current().is_some_and(|s| !s.is_active()) =>
+            {
+                // Review 3 #6: past the consent grant's expiry the
+                // receptionist takes no call. The call rings on the phone.
+                emit_control_failed(
+                    outbox,
+                    sink,
+                    &tracker,
+                    "call.answer",
+                    op.as_deref(),
+                    "consent has expired — re-consent in the Consent tab before the receptionist takes calls; the call keeps ringing on the phone",
+                );
+            }
             Ok(RadioControl::Answer { op }) => {
                 // A call left ringing for the owner is the receptionist's
                 // once they answer it here.
@@ -995,6 +1016,20 @@ pub(super) fn service_controls(
                     );
                     *status.parked_call.lock().unwrap() = None;
                 }
+                // Review 3 #7: a text the phone link still holds is answered
+                // before the stop is acknowledged. The link is stopped here
+                // (it tells the phone it is going, review 3 #4), and what it
+                // says as it ends, each text it held reported failed, is
+                // read now, while the outbox and stdout still take it.
+                // Before, those failures went into a channel nobody read.
+                if !bt.stop_within(RADIO_STOP_WAIT) {
+                    eprintln!(
+                        "[aokie-plugin] the phone link did not stop within {RADIO_STOP_WAIT:?}; a text it still held is answered at the next start"
+                    );
+                }
+                while let Some(event) = bt.try_recv_event() {
+                    handle_event(event, &mut *tracker, outbox, sink, status);
+                }
                 // `call.ended` may already be visible while one of its
                 // detached transcript corrections is still pending. A
                 // graceful stop must not strand the one-shot barrier that
@@ -1018,8 +1053,13 @@ pub(super) fn service_controls(
             Err(TryRecvError::Disconnected) => {
                 // All handles disappeared (host/process teardown without
                 // an explicit shutdown request). Best-effort synchronous
-                // drain while stdout/outbox are still alive.
+                // drain while stdout/outbox are still alive: the texts the
+                // phone link still held are answered too (review 3 #7).
                 if emit_forced_transcript_settlements(outbox, sink) {
+                    bt.stop_within(RADIO_STOP_WAIT);
+                    while let Some(event) = bt.try_recv_event() {
+                        handle_event(event, &mut *tracker, outbox, sink, status);
+                    }
                     return false;
                 }
                 break;

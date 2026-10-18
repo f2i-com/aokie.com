@@ -605,7 +605,12 @@ pub(crate) async fn create_offer(
         playout_device_guid: audio_selection.output_id,
         ..PeerOptions::default()
     };
-    crate::android_runtime::begin_communication_audio(app).await?;
+    // A replaced peer left communication audio (and its foreground service)
+    // running for this one, so a failure here must still end it.
+    if let Err(error) = crate::android_runtime::begin_communication_audio(app).await {
+        let _ = crate::android_runtime::end_communication_audio(app).await;
+        return Err(error);
+    }
     let (peer, offer) = match CompanionPeer::offer(request.session.binding.clone(), options).await {
         Ok(opened) => opened,
         Err(error) => {
@@ -626,7 +631,10 @@ pub(crate) async fn create_offer(
         let mut slot = state.inner.slot.lock().await;
         if slot.transport.as_ref() != Some(&transport) {
             drop(slot);
-            close_peer(None, active, "closed", "authenticated transport changed").await;
+            // With the app, so communication audio this open began (the
+            // foreground service, the proximity wake lock and
+            // MODE_IN_COMMUNICATION) ends with the peer.
+            close_peer(Some(app), active, "closed", "authenticated transport changed").await;
             return Err("authenticated transport changed while media was opening".into());
         }
         slot.active = Some(active.clone());
@@ -1355,6 +1363,17 @@ async fn watch_peer(state: NativeMediaState, app: AppHandle, active: ActiveMedia
     }
 }
 
+/// Whether closing a peer in this phase ends communication audio.
+///
+/// A "replaced" peer is closed only because its successor opens next, and
+/// that successor begins communication audio again at once. Ending it in
+/// between stopped the microphone foreground service, and Android refuses the
+/// plain `startService` that would restart it while the screen is off, so the
+/// microphone stayed silent for the rest of the takeover.
+fn ends_communication_audio(phase: &str) -> bool {
+    phase != "replaced"
+}
+
 async fn close_peer(
     app: Option<&AppHandle>,
     active: ActiveMedia,
@@ -1387,7 +1406,7 @@ async fn close_peer(
         .auto_arm_microphone
         .store(false, Ordering::Release);
     active.peer.lock().await.close();
-    if let Some(app) = app {
+    if let Some(app) = app.filter(|_| ends_communication_audio(phase)) {
         let _ = crate::android_runtime::end_communication_audio(app).await;
     }
     active
@@ -1797,6 +1816,16 @@ async fn android_permission_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_replaced_peer_keeps_communication_audio_for_its_successor() {
+        // create_offer closes the old peer as "replaced" and begins
+        // communication audio again at once; every other close ends it.
+        assert!(!ends_communication_audio("replaced"));
+        for phase in ["closed", "revoked", "transport_rebound", "failed", "expired"] {
+            assert!(ends_communication_audio(phase), "{phase}");
+        }
+    }
 
     fn session(mode: MediaMode, owner_epoch: u64, fence: u64) -> MediaSession {
         MediaSession {
