@@ -260,6 +260,11 @@ What only a Mac can answer is listed at the end.
   same: nothing is ever stored unsealed, and a Keychain that will not give the
   key stops the write. macOS ties "Always Allow" to a program's signature, so
   a plugin you have rebuilt is a new program to the Keychain, which asks again.
+  A release's plugin signed with Aokie's Developer ID keeps one signature from
+  version to version (below, "A release's Mac bundle"): the Keychain asks the
+  first time and not after an update. To keep it from asking after each build
+  of your own, sign the bundle with an identity of your own
+  (`AOKIE_CODESIGN_IDENTITY`, `scripts/bundle-unix.sh`).
 * **`transportMode`** is `dongle`. `native` is Windows' own Bluetooth stack and
   is refused with a message that says so.
 
@@ -360,19 +365,53 @@ test program. Release builds ignore it. No test covers the Keychain itself, or
 the outbox sealed with it: a test's outbox is not sealed off Windows.
 
 **A release's Mac bundle.** Each release (production and managed beta) carries
-`aokie-plugin-macos-arm64-<tag>.zip`, made by the `plugin-release-macos` job of
-`.github/workflows/ci.yml` on GitHub's Mac: `bundle-unix.sh`, every program and
-library signed ad hoc, the bundle started from its folder (`plugin_check.py
---no-dongle`), then `release-manifest.json`, `SHA256SUMS.txt` and a
+`aokie-plugin-macos-arm64-<tag>.zip`, made on GitHub's Mac by three jobs of
+`.github/workflows/ci.yml`. `plugin-release-macos` runs `bundle-unix.sh` and
+signs every program and library ad hoc. `sign-macos` signs them again with
+Aokie's Apple Developer ID and has Apple notarise them, when the repository has
+one set up (below). It is the only job given Apple's secrets, and it has no
+checkout: it runs Apple's tools and nothing of the project's. `package-macos`
+starts the bundle from its folder (`plugin_check.py --no-dongle`), then writes
+`release-manifest.json` (which says how the programs are signed: `codeSigning`
+`developer-id` or `adhoc`, and `notarised`), `SHA256SUMS.txt` and a
 `package-manifest.json` signed with Aokie's package key, as the Windows bundle
-is, so OAIY verifies it as Aokie's and needs no "Trust this plugin". The zip is
-unpacked again and checked before `publish-macos` attaches it to the release.
-libusb is LGPL-2.1: Aokie loads it as the library beside the plugin, which may
-be replaced with one's own build (`third-party/libusb-1.0.27/README.md` says
-how, and that OAIY then asks to trust the changed plugin). The programs carry
-no Apple Developer ID and are not notarised: OAIY's install unpacks them itself,
-so macOS does not mark them as downloaded, but the login Keychain treats each new build
-as a new program and asks again before Aokie uses its key.
+is, so OAIY verifies it as Aokie's and needs no "Trust this plugin". The package
+signature comes last, so it covers the programs as Apple's tools signed them.
+The zip is unpacked again and checked before `publish-macos` attaches it to the
+release. libusb is LGPL-2.1: Aokie loads it as the library beside the plugin,
+which may be replaced with one's own build (`third-party/libusb-1.0.27/README.md`
+says how, and that OAIY then asks to trust the changed plugin).
+
+With the Developer ID, the plugin is `com.aokie.plugin` and libusb
+`com.aokie.plugin.libusb`, signed with the hardened runtime by the same team (the
+runtime loads a library only from the program's own team). The login Keychain's
+"Always Allow" goes by the identifier and the team, which every version keeps:
+once Aokie is allowed its key (or has made it, on a Mac that had no Aokie
+before), an update does not make the Keychain ask again. The first Developer ID
+version on a Mac that ran an ad hoc one asks once more, as a program the
+Keychain has not seen. A bare
+program cannot have its notarisation stapled to it: macOS asks Apple when it
+needs to know, and OAIY's install unpacks the zip itself, so macOS does not mark
+the files as downloaded and does not ask. Without the Developer ID the programs
+are signed ad hoc and not notarised, and the Keychain treats each new build as a
+new program and asks again.
+
+To set up the Developer ID for Aokie's releases (the same certificate and notary
+key OAIY's Mac build uses), on GitHub, in the repository's Settings:
+
+1. Environments: an environment named `mac-signing`. Its deployment branches and
+   tags must allow the tags releases are made from (`v*`), and `main` for a run
+   that attaches a bundle to an earlier release (`attach_macos_to`). A required
+   reviewer makes every signing run wait for that person's approval.
+2. In that environment, six secrets: `APPLE_CERTIFICATE` (the Developer ID
+   Application certificate and its key, as a .p12, in base64),
+   `APPLE_CERTIFICATE_PASSWORD` (the .p12's password), `APPLE_SIGNING_IDENTITY`
+   (the identity's name as `security find-identity -v -p codesigning` lists it),
+   and the notary's App Store Connect API key: `APPLE_API_KEY_P8` (the .p8's
+   text), `APPLE_API_KEY_ID` and `APPLE_API_ISSUER`. Without the last three the
+   programs are signed but not notarised, which the job warns of.
+3. Variables (Actions): `MAC_SIGNING` set to `on`. Until then `sign-macos` is
+   skipped and the bundle is signed ad hoc, as before.
 
 ### What only a Mac can answer
 

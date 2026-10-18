@@ -312,8 +312,10 @@ still pre-authorises a machine.
 Both kinds of release also carry a Mac bundle, `aokie-plugin-macos-arm64-<tag>.zip`, made by
 `plugin-release-macos` on GitHub's Mac with `scripts/bundle-unix.sh`: the same plugin without
 the driver helper or the driver, libusb as a library beside it (LGPL-2.1: its licence and
-source in `third-party/`), its programs signed ad hoc (no Apple Developer ID), and its
-`package-manifest.json` signed with the same key. `publish-macos` attaches it to the release
+source in `third-party/`), its programs signed with Aokie's Apple Developer ID and notarised
+by `sign-macos` where the repository has one set up (ad hoc until then: `docs/HARDWARE.md`,
+"A release's Mac bundle", says what to add), and its `package-manifest.json` signed with the
+same key by `package-macos`. `publish-macos` attaches it to the release
 once the Windows job has made it, with a paragraph in its notes that names the oldest macOS
 the bundle's programs ask for; a manual run with `attach_macos_to: <tag>` attaches one to a
 release made before. The Mac and Linux bundles are built with `AOKIE_BUNDLE_STRICT=1`

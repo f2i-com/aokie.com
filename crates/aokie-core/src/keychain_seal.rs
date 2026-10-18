@@ -290,8 +290,12 @@ pub fn prefetch_data_key() {
 ///
 /// macOS ties "always allow" to the program's code signature. A program
 /// rebuilt without a stable signature is a new program to the Keychain,
-/// which then asks again. (The Secret Service gives an unlocked
-/// collection's items to the user's programs without asking.)
+/// which then asks again. A release's plugin is signed with Aokie's
+/// Developer ID as `com.aokie.plugin` (ci.yml, sign-macos), which every
+/// version keeps, so it is asked once; a local build keeps one signature
+/// when bundle-unix.sh is given an identity (AOKIE_CODESIGN_IDENTITY).
+/// (The Secret Service gives an unlocked collection's items to the user's
+/// programs without asking.)
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn fetch_data_key() -> Result<[u8; KEY_LEN], String> {
     // A test run must neither put a key into the developer's Keychain nor

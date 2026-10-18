@@ -17,8 +17,10 @@
 # to anyone else may load it but not have it built in. The bundle is refused if the plugin still has it built in.
 # Linux links the system's libusb, also as a library of its own.
 #
-# Nothing is installed and nothing is signed: the last lines say where OAIY Desktop looks for a plugin and that it
-# will ask you to trust this one, as it asks for any plugin that is not signed.
+# Nothing is installed and nothing is signed with a publisher's key: the last lines say where OAIY Desktop looks for
+# a plugin and that it will ask you to trust this one, as it asks for any plugin that is not signed. On a Mac the
+# programs are signed ad hoc, unless AOKIE_CODESIGN_IDENTITY names an identity of one's own (below, where the
+# bundle is checked), which keeps the login Keychain from asking again after each rebuild.
 #
 # AOKIE_BUNDLE_STRICT=1 (the release jobs and unix-bundle.yml set it): a bundle for others. Cargo builds --locked
 # (Cargo.lock as committed, nothing resolved anew), and anything the bundle should carry and does not (Realtek's
@@ -249,6 +251,39 @@ for file in $required; do
   [ -s "$out/$file" ] || { echo "MISSING from the bundle (or empty): $file"; missing=$((missing + 1)); }
 done
 [ "$missing" = 0 ] || exit 1
+
+# On a Mac, AOKIE_CODESIGN_IDENTITY signs the bundle's programs with an identity of one's own (a name or SHA-1 that
+# `security find-identity -v -p codesigning` lists; AOKIE_CODESIGN_KEYCHAIN names its keychain when that is not in the
+# search list), where they are otherwise left signed ad hoc. The same identity and the same identifiers every build
+# (com.aokie.plugin, com.aokie.plugin.libusb: the release's Developer ID signature has them too) keep the plugin's
+# designated requirement the same, and the login Keychain's "Always Allow" goes by that, so a plugin rebuilt this way
+# is not a new program to it and it does not ask again. AOKIE_CODESIGN_RUNTIME=1 adds the hardened runtime and a
+# timestamp, for a Developer ID only: the runtime loads a library only from the program's own team, and a self-signed
+# identity has no team, so libusb would be refused and the plugin would not start. Unset, or `-`: ad hoc, as before.
+codesign_identity=${AOKIE_CODESIGN_IDENTITY:--}
+if [ "$(uname -s)" = Darwin ] && [ "$codesign_identity" != "-" ]; then
+  runtime=""
+  [ "${AOKIE_CODESIGN_RUNTIME:-0}" = 1 ] && runtime="--options runtime --timestamp"
+  # Every program and library, by name: one with no identifier here stops the bundle rather than go out ad hoc.
+  find "$out" -type f -print | while IFS= read -r file; do
+    if [ -x "$file" ] || file -b "$file" | grep -q '^Mach-O'; then
+      case "${file#"$out"/}" in
+        aokie-plugin|libusb-1.0.0.dylib) ;;
+        *) echo "${file#"$out"/} is a program or library with no identifier to sign it under"; exit 1 ;;
+      esac
+    fi
+  done
+  # Inside out: the library the plugin loads, then the plugin.
+  for entry in libusb-1.0.0.dylib=com.aokie.plugin.libusb aokie-plugin=com.aokie.plugin; do
+    file="$out/${entry%%=*}"
+    [ -f "$file" ] || continue
+    # shellcheck disable=SC2086
+    codesign --force $runtime --identifier "${entry#*=}" --sign "$codesign_identity" \
+      ${AOKIE_CODESIGN_KEYCHAIN:+--keychain "$AOKIE_CODESIGN_KEYCHAIN"} "$file"
+    codesign --verify --strict "$file"
+    echo "signed ${entry%%=*}: $(codesign -d -r- "$file" 2>&1 | sed -n 's/^designated => //p')"
+  done
+fi
 
 # On a Mac: the oldest macOS every program and library in the bundle starts on (each one's LC_BUILD_VERSION minos;
 # the release notes say this one).

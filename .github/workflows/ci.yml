@@ -740,12 +740,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "release publish failed" }
 
   # The Mac's bundle (Apple silicon), beside the Windows one, for both kinds of release: on a Mac there is no driver
-  # and no flavour, Aokie opens the dongle itself through libusb. scripts/bundle-unix.sh builds it, with libusb as a
-  # library beside the plugin (LGPL-2.1: its licence and source go in third-party/), every program and library is
-  # signed ad hoc (what an Apple-silicon Mac runs; no Developer ID, so the login Keychain asks again for each new
-  # build), the bundle is started from its folder and asked what OAIY asks a plugin first, and it is signed with
-  # Aokie's package key as the Windows bundle is, so OAIY verifies it as Aokie's. The zip is the run's artifact;
-  # publish-macos attaches it to the release.
+  # and no flavour, Aokie opens the dongle itself through libusb. Three jobs, so that Apple's secrets never meet the
+  # project's code:
+  #
+  # - plugin-release-macos builds it with scripts/bundle-unix.sh, libusb as a library beside the plugin (LGPL-2.1:
+  #   its licence and source go in third-party/), and signs every program and library ad hoc (what an Apple-silicon
+  #   Mac runs). No secret.
+  # - sign-macos, only when the repository says it has a Developer ID (the variable MAC_SIGNING is `on`), signs them
+  #   again with it and has Apple notarise them, in the environment mac-signing, which holds the certificate and the
+  #   notary's key. It has no checkout and runs Apple's tools and nothing of the project's. The same Developer ID and
+  #   the same identifiers every version keep the plugin's designated requirement the same, and the login Keychain's
+  #   "Always Allow" goes by that, so it stops asking after each new version. Without it the signature is ad hoc, a
+  #   new program to the Keychain each build, which asks again.
+  # - package-macos starts the bundle from its folder and asks it what OAIY asks a plugin first, then signs it with
+  #   Aokie's package key as the Windows bundle is, so OAIY verifies it as Aokie's. The package signature is the last
+  #   change to the bundle: it covers the programs as they were signed. The zip is the run's artifact; publish-macos
+  #   attaches it to the release.
   plugin-release-macos:
     name: aokie-plugin macOS bundle (Apple silicon)
     runs-on: macos-15
@@ -772,10 +782,6 @@ jobs:
           AOKIE_BUNDLE_STRICT: '1'
         run: sh scripts/bundle-unix.sh "$PWD/bundle"
 
-      # Built here, without the package key, so the signing step runs it and builds nothing.
-      - name: Build package-signer (no secrets)
-        run: cargo build --locked -p package-signer --release
-
       # Before anything is checked or signed: what is checked is what ships.
       - name: Sign ad hoc
         run: |
@@ -796,6 +802,181 @@ jobs:
           echo "$min" > macos-minimum.txt
           echo "macOS $min or later"
 
+      # As an archive: an artifact keeps no file's mode, and the plugin must stay a program.
+      - name: Hand the bundle on
+        run: tar -cf aokie-plugin-macos-arm64-built.tar bundle macos-minimum.txt
+
+      - name: Upload the built bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aokie-plugin-macos-arm64-built
+          path: aokie-plugin-macos-arm64-built.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  # The Developer ID, and Apple's notary. Every Mach-O in the bundle gets an identifier of its own, the same every
+  # version (com.aokie.plugin, and com.aokie.plugin.libusb for libusb), and the hardened runtime, which notarising
+  # asks for: the plugin and libusb are then signed by the same team, which is what the runtime lets a program load.
+  # A program or library this job has no identifier for stops it, rather than going out signed ad hoc. A bare program
+  # cannot have its notarisation stapled to it (only an app, an image or an installer package can): macOS asks
+  # Apple's servers when it needs to know, and OAIY's install, which unpacks the zip itself, does not mark the files
+  # as downloaded, so it does not ask at all.
+  sign-macos:
+    name: sign the macOS bundle with the Developer ID and notarise it
+    needs: plugin-release-macos
+    if: vars.MAC_SIGNING == 'on'
+    runs-on: macos-15
+    environment: mac-signing
+    timeout-minutes: 60
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: aokie-plugin-macos-arm64-built
+
+      - name: Sign with the Developer ID
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          tar -xf aokie-plugin-macos-arm64-built.tar
+          [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_SIGNING_IDENTITY" ] || { echo "::error::MAC_SIGNING is on, and the environment mac-signing has no certificate"; exit 1; }
+          # A keychain of this job's own, for the certificate and its key; gone with the runner.
+          keychain="$RUNNER_TEMP/aokie-signing.keychain-db"
+          key="$(openssl rand -base64 24)"
+          security create-keychain -p "$key" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$key" "$keychain"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign > /dev/null
+          : > "$RUNNER_TEMP/developer-id.p12"
+          # Apple's intermediate for Developer ID certificates of the G2 kind, in case the runner has not got it.
+          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer && security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain" > /dev/null 2>&1 || true
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$key" "$keychain" > /dev/null
+          # (the runner's keychains after the job's own, each a word of its own)
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          echo "identities for signing code in the job's keychain: $(security find-identity -v -p codesigning "$keychain" | grep -c 'Developer ID Application')"
+
+          sign() { codesign --force --timestamp --options runtime --identifier "$2" --sign "$APPLE_SIGNING_IDENTITY" --keychain "$keychain" "bundle/$1"; }
+          # Every program and library, by name: what the job has no identifier for stops it.
+          find bundle -type f -print | while IFS= read -r file; do
+            if [ -x "$file" ] || file -b "$file" | grep -q '^Mach-O'; then
+              case "${file#bundle/}" in
+                aokie-plugin|libusb-1.0.0.dylib) ;;
+                *) echo "::error::${file#bundle/} is a program or library this job has no identifier for"; exit 1 ;;
+              esac
+            fi
+          done
+          # Inside out: the library the plugin loads, then the plugin.
+          sign libusb-1.0.0.dylib com.aokie.plugin.libusb
+          sign aokie-plugin com.aokie.plugin
+          for f in libusb-1.0.0.dylib aokie-plugin; do
+            codesign --verify --strict --verbose=2 "bundle/$f"
+            codesign -dv --verbose=2 "bundle/$f" 2>&1 | grep -E "^(Identifier|TeamIdentifier|Timestamp|Runtime|CodeDirectory)" || true
+            # What the Keychain's "Always Allow" goes by: the identifier and the team, never this build's own hash.
+            dr="$(codesign -d -r- "bundle/$f" 2>&1 | sed -n 's/^designated => //p')"
+            echo "$f: $dr"
+            case "$dr" in *cdhash*|'') echo "::error::$f's designated requirement names this build only"; exit 1 ;; esac
+          done
+          team="$(codesign -dv bundle/aokie-plugin 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+          [ -n "$team" ] && [ "$team" != "not set" ] || { echo "::error::the plugin's signature names no team: not a Developer ID"; exit 1; }
+          [ "$(codesign -dv bundle/libusb-1.0.0.dylib 2>&1 | sed -n 's/^TeamIdentifier=//p')" = "$team" ] || { echo "::error::libusb is not signed by the plugin's team, which the hardened runtime refuses to load"; exit 1; }
+
+      - name: Have Apple notarise the programs
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_API_KEY_P8" ] || [ -z "$APPLE_API_KEY_ID" ] || [ -z "$APPLE_API_ISSUER" ]; then
+            echo "::warning::the environment mac-signing has no notary key: the bundle is signed with the Developer ID and NOT notarised (OAIY's install does not need it; the Keychain goes by the signature)."
+            printf 'AOKIE_CODE_SIGNING=developer-id\nAOKIE_NOTARISED=no\n' > signing.env
+            exit 0
+          fi
+          printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k --keepParent bundle "$RUNNER_TEMP/aokie-plugin-notarise.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/aokie-plugin-notarise.zip" --key "$RUNNER_TEMP/notary.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait --timeout 45m --output-format json > "$RUNNER_TEMP/notary.json" || true
+          status="$(python3 -c 'import json, sys
+          try: print(json.load(open(sys.argv[1])).get("status") or "no answer")
+          except Exception: print("no answer")' "$RUNNER_TEMP/notary.json")"
+          id="$(python3 -c 'import json, sys
+          try: print(json.load(open(sys.argv[1])).get("id") or "")
+          except Exception: print("")' "$RUNNER_TEMP/notary.json")"
+          echo "Apple's notary says: $status"
+          if [ "$status" != "Accepted" ]; then
+            # Why not, in Apple's words (which file, which rule).
+            [ -n "$id" ] && xcrun notarytool log "$id" --key "$RUNNER_TEMP/notary.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" | head -80 || true
+            : > "$RUNNER_TEMP/notary.p8"
+            echo "::error::Apple did not notarise the bundle ($status)"
+            exit 1
+          fi
+          : > "$RUNNER_TEMP/notary.p8"
+          printf 'AOKIE_CODE_SIGNING=developer-id\nAOKIE_NOTARISED=yes\n' > signing.env
+
+      - name: Hand the signed bundle on
+        run: tar -cf aokie-plugin-macos-arm64-signed.tar bundle macos-minimum.txt signing.env
+
+      - name: Upload the signed bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aokie-plugin-macos-arm64-signed
+          path: aokie-plugin-macos-arm64-signed.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  # The bundle as it ships: signed by the Developer ID where sign-macos ran, ad hoc where the repository has none
+  # (MAC_SIGNING not `on`: sign-macos is skipped, and this takes plugin-release-macos's bundle as it is). A run where
+  # MAC_SIGNING is on and sign-macos did not succeed makes no bundle.
+  package-macos:
+    name: aokie-plugin macOS bundle, checked and package-signed
+    needs: [plugin-release-macos, sign-macos]
+    if: >-
+      !cancelled() && needs.plugin-release-macos.result == 'success' && (
+        needs.sign-macos.result == 'success' || (needs.sign-macos.result == 'skipped' && vars.MAC_SIGNING != 'on'))
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
+
+      # Built here, without the package key, so the signing step runs it and builds nothing.
+      - name: Build package-signer (no secrets)
+        run: cargo build --locked -p package-signer --release
+
+      - name: Download the signed bundle
+        if: needs.sign-macos.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: aokie-plugin-macos-arm64-signed
+
+      - name: Download the bundle signed ad hoc
+        if: needs.sign-macos.result != 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: aokie-plugin-macos-arm64-built
+
+      # How its programs are signed, for the release manifest and the notes: the signing job's word, or ad hoc.
+      - name: Unpack the bundle
+        run: |
+          set -euo pipefail
+          if [ -f aokie-plugin-macos-arm64-signed.tar ]; then
+            tar -xf aokie-plugin-macos-arm64-signed.tar
+            grep -qx 'AOKIE_CODE_SIGNING=developer-id' signing.env || { echo "::error::the signing job left no word of how it signed"; exit 1; }
+          else
+            tar -xf aokie-plugin-macos-arm64-built.tar
+            printf 'AOKIE_CODE_SIGNING=adhoc\nAOKIE_NOTARISED=no\n' > signing.env
+          fi
+          grep -E '^AOKIE_(CODE_SIGNING|NOTARISED)=[a-z-]+$' signing.env >> "$GITHUB_ENV"
+          cat signing.env
+          rm -f aokie-plugin-macos-arm64-*.tar
+
       - name: The bundled plugin starts from its folder and answers
         run: python3 scripts/virtual-dongle/plugin_check.py --no-dongle "$PWD/bundle/aokie-plugin"
 
@@ -806,13 +987,16 @@ jobs:
           import datetime, hashlib, json, os, pathlib
           root = pathlib.Path("bundle")
           contract = json.loads(pathlib.Path("docs/contracts/aokie-connector-contract.v1.json").read_text())["contractVersion"]
+          code_signing = os.environ["AOKIE_CODE_SIGNING"]
           manifest = {
               "builtAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "ref": os.environ["GITHUB_SHA"],
               "contractVersion": contract,
               "flavour": "macos-arm64",
-              # (no Developer ID: the programs are signed ad hoc)
-              "signed": False,
+              # Signed with an Apple Developer ID (developer-id), or ad hoc (adhoc: no identity behind it).
+              "signed": code_signing == "developer-id",
+              "codeSigning": code_signing,
+              "notarised": os.environ["AOKIE_NOTARISED"] == "yes",
               "files": [{"name": p.relative_to(root).as_posix(), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
                         for p in sorted(root.rglob("*")) if p.is_file()],
           }
@@ -863,7 +1047,17 @@ jobs:
           elif [ "$GITHUB_REF_TYPE" = tag ] || [ -n "${ATTACH_TO:-}" ]; then
             echo "::error::a bundle for a release has no package manifest"; exit 1
           fi
+          # The programs' own signatures, as unpacked: whole, and for a Developer ID the identifiers the Keychain goes by.
+          for f in aokie-plugin libusb-1.0.0.dylib; do
+            codesign --verify --strict "verify-extracted/$f"
+            codesign -d -r- "verify-extracted/$f" 2>&1 | sed -n 's/^designated => /'"$f"': /p'
+          done
+          if [ "$AOKIE_CODE_SIGNING" = developer-id ]; then
+            codesign -d -r- verify-extracted/aokie-plugin 2>&1 | grep -q 'identifier "com.aokie.plugin" and anchor apple generic' \
+              || { echo "::error::the unpacked plugin is not signed as com.aokie.plugin with a Developer ID"; exit 1; }
+          fi
           python3 scripts/virtual-dongle/plugin_check.py --no-dongle "$PWD/verify-extracted/aokie-plugin"
+          echo "$AOKIE_CODE_SIGNING $AOKIE_NOTARISED" > macos-signing.txt
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -873,6 +1067,7 @@ jobs:
             aokie-plugin-macos-arm64-*.zip
             aokie-plugin-macos-arm64-*.zip.sha256
             macos-minimum.txt
+            macos-signing.txt
           if-no-files-found: error
           retention-days: 30
 
@@ -882,9 +1077,9 @@ jobs:
   publish-macos:
     name: attach the macOS bundle to the release
     runs-on: ubuntu-latest
-    needs: [plugin-release-macos, plugin-release, plugin-release-managed-beta]
+    needs: [package-macos, plugin-release, plugin-release-managed-beta]
     if: >-
-      always() && needs.plugin-release-macos.result == 'success' && (
+      always() && needs.package-macos.result == 'success' && (
         (github.ref_type == 'tag' && (needs.plugin-release.result == 'success' || needs.plugin-release-managed-beta.result == 'success'))
         || (github.event_name == 'workflow_dispatch' && inputs.attach_macos_to != ''))
     permissions:
@@ -904,12 +1099,19 @@ jobs:
           [ -f "$zip" ] && [ -f "$zip.sha256" ] || { echo "::error::$zip is not in the artifact"; ls -la; exit 1; }
           macos_min=$(tr -d '[:space:]' < macos-minimum.txt)
           [ -n "$macos_min" ] || { echo "::error::the artifact does not say which macOS the bundle needs"; exit 1; }
+          read -r code_signing notarised < macos-signing.txt || true
+          case "$code_signing $notarised" in
+            "developer-id yes") signed_words="Its programs are signed with Aokie's Apple Developer ID and notarised by Apple, the same signature every version, so once the login Keychain has allowed Aokie its key, an update does not make it ask again." ;;
+            "developer-id no") signed_words="Its programs are signed with Aokie's Apple Developer ID, the same signature every version, so once the login Keychain has allowed Aokie its key, an update does not make it ask again." ;;
+            "adhoc no") signed_words="Its programs are signed ad hoc, not with an Apple Developer ID, so the login Keychain asks before Aokie uses its key after each new version." ;;
+            *) echo "::error::the artifact does not say how the bundle's programs are signed"; exit 1 ;;
+          esac
           gh release upload "$TAG" "$zip" "$zip.sha256" --repo "$GITHUB_REPOSITORY"
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
           if ! grep -q 'aokie-plugin-macos-arm64' notes.md; then
             cat >> notes.md <<EOF
 
-          **On a Mac (Apple silicon, macOS $macos_min or later):** $zip is the plugin for macOS, signed with the same package key (fl-aokie-2026a), so OAIY verifies it as Aokie's; $zip.sha256 is its checksum. Install it the same way: in OAIY Desktop, Connections, Plugins, Install a plugin. On a Mac, Aokie opens the USB Bluetooth dongle itself through libusb: no driver is installed, and there is no fallback to the computer's own Bluetooth (docs/HARDWARE.md, macOS). Its programs are signed ad hoc, not with an Apple Developer ID, so the login Keychain asks before Aokie uses its key after each new version. libusb is LGPL-2.1 and comes as a library beside the plugin, with its licence and source in third-party/. Aokie has no speech of its own: calls go to OAIY, whose OAIY Voice hears and speaks, and nothing is downloaded. Built from $GITHUB_SHA.
+          **On a Mac (Apple silicon, macOS $macos_min or later):** $zip is the plugin for macOS, signed with the same package key (fl-aokie-2026a), so OAIY verifies it as Aokie's; $zip.sha256 is its checksum. Install it the same way: in OAIY Desktop, Connections, Plugins, Install a plugin. On a Mac, Aokie opens the USB Bluetooth dongle itself through libusb: no driver is installed, and there is no fallback to the computer's own Bluetooth (docs/HARDWARE.md, macOS). $signed_words libusb is LGPL-2.1 and comes as a library beside the plugin, with its licence and source in third-party/. Aokie has no speech of its own: calls go to OAIY, whose OAIY Voice hears and speaks, and nothing is downloaded. Built from $GITHUB_SHA.
           EOF
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
           fi

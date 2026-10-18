@@ -9,7 +9,9 @@
 #
 # The Mac's leg is how a Mac build is made without a Mac at hand, and with nothing to install on the Mac that uses
 # it: the plugin links macOS's own frameworks, so only a Mac can build it. Its programs are signed ad hoc there (a
-# signature an Apple-silicon Mac will run, with no identity behind it).
+# signature an Apple-silicon Mac will run, with no identity behind it, which the login Keychain takes as a new program
+# each build); a release's Mac bundle is signed with Aokie's Developer ID where the repository has one (ci.yml,
+# sign-macos).
 #
 # Before it is uploaded, each bundle is started from its folder alone and asked what OAIY Desktop asks a plugin
 # first (scripts/virtual-dongle/plugin_check.py --no-dongle): a build machine has no dongle, so the radio is not
