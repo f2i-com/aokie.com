@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 chrono.workspace = true
 ed25519-dalek = { version = "2", features = ["signature"] }
 serde.workspace = true
