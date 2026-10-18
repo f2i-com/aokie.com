@@ -179,6 +179,11 @@ pub enum RealtimeEventKind {
     },
     OutputItemDone {
         item_id: String,
+        /// OAIY cut the item short itself (`"cancelled": true`: the caller
+        /// said Hush, a transfer was declined): what is still queued of it
+        /// is never played. Absent (an older OAIY, an item said in full):
+        /// false, and the item plays out as it always did.
+        cancelled: bool,
     },
     ToolCall {
         tool_call_id: String,
@@ -1670,7 +1675,10 @@ fn parse_server_text(
         "formlogic.realtime.output_item_done" | "output_item_done" => {
             let item_id = item_id()?;
             output_state.finish(&item_id)?;
-            Ok(Some(RealtimeEventKind::OutputItemDone { item_id }))
+            // Only an explicit `true` cuts the item: anything else (absent,
+            // false, not a bool) is an item said in full, as before.
+            let cancelled = value.get("cancelled").and_then(Value::as_bool) == Some(true);
+            Ok(Some(RealtimeEventKind::OutputItemDone { item_id, cancelled }))
         }
         "formlogic.realtime.tool_call" => {
             // The id and the name are the two things a result must repeat
@@ -2272,7 +2280,8 @@ mod tests {
             .unwrap()
             .unwrap(),
             RealtimeEventKind::OutputItemDone {
-                item_id: "item_1".into()
+                item_id: "item_1".into(),
+                cancelled: false,
             }
         );
         assert_eq!(state, OutputParseState::default());
@@ -2285,6 +2294,36 @@ mod tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    /// OAIY marks an item it cut itself (Hush, a declined transfer) with
+    /// `"cancelled": true` on its item_done. Only that cuts it; an item_done
+    /// without it (an older OAIY) or with anything else is an item said in
+    /// full. The parser finishes the item either way.
+    #[test]
+    fn an_item_oaiy_cut_says_so_on_its_item_done() {
+        let done = |extra: &str| {
+            let mut state = OutputParseState::default();
+            state.start("item_1").unwrap();
+            let text = format!(
+                r#"{{"type":"formlogic.realtime.output_item_done","callId":"call_1","generation":7,"itemId":"item_1"{extra}}}"#
+            );
+            let kind = parse_server_text(&text, "call_1", 7, "https://api.openai.com", &mut state)
+                .unwrap()
+                .unwrap();
+            assert_eq!(state, OutputParseState::default(), "finished: {extra}");
+            match kind {
+                RealtimeEventKind::OutputItemDone { item_id, cancelled } => {
+                    assert_eq!(item_id, "item_1");
+                    cancelled
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(done(r#","cancelled":true"#));
+        assert!(!done(""), "absent: said in full");
+        assert!(!done(r#","cancelled":false"#));
+        assert!(!done(r#","cancelled":"true""#), "only a bool");
     }
 
     #[test]
@@ -3130,6 +3169,7 @@ mod tests {
         outlet
             .push(RealtimeEventKind::OutputItemDone {
                 item_id: "item_1".into(),
+                cancelled: false,
             })
             .unwrap();
         outlet.push(pcm("item_2", 480)).unwrap();

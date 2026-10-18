@@ -317,7 +317,7 @@ pub(super) fn run_auto_hold_juggle(
                                         ),
                                     );
                                 }
-                                tracker.answered();
+                                tracker.answered_here();
                                 emit(
                                     outbox,
                                     sink,
@@ -831,7 +831,7 @@ pub(super) fn run_auto_hold_juggle(
                                                 ),
                                             );
                                         }
-                                        tracker.answered();
+                                        tracker.answered_here();
                                         emit(
                                             outbox,
                                             sink,
@@ -953,7 +953,7 @@ pub(super) fn run_auto_hold_juggle(
                                             ),
                                         );
                                     }
-                                    tracker.answered();
+                                    tracker.answered_here();
                                     emit(
                                         outbox,
                                         sink,

@@ -577,7 +577,7 @@ fn laid_aside_with_a_ringing_request() -> Laid {
     // The radio holds the call as active, as it does while the request rings.
     let mut tracker = crate::call_session::SessionTracker::new();
     tracker.ring("call_a".into(), aokie_core::events::now_iso8601());
-    tracker.answered();
+    tracker.answered_here();
     Laid {
         rig,
         ctx,
@@ -687,7 +687,7 @@ fn a_call_with_no_open_request() -> Laid {
     let mut tracker = crate::call_session::SessionTracker::new();
     tracker.ring("call_a".into(), aokie_core::events::now_iso8601());
     tracker.caller_id("0491 570 006".into());
-    tracker.answered();
+    tracker.answered_here();
     // The host announced ringPlan and a Companion device is approved.
     let status = RadioStatus::default();
     status

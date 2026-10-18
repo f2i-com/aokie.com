@@ -392,6 +392,57 @@ pub(super) fn resume_start(
     (resume, greeting)
 }
 
+/// What the caller heard of `item_id`, the output item playing, as it is cut
+/// short: its transcript's audible prefix is recorded as an interrupted bot
+/// turn, so the call's record and its conversation say only what was said
+/// (as the caller talking over it does: SpeechStarted). Takes the item's
+/// transcript; one for another item is dropped.
+#[cfg(all(aokie_radio, feature = "voice"))]
+fn record_cut_output(
+    lane: &mut RealtimeCallLane,
+    ctx: &mut CallVoiceContext,
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+    item_id: &str,
+) {
+    let heard_ms = lane.output_pacer.audible_played_ms(Instant::now());
+    let total_ms = lane.output_total_samples.saturating_mul(1_000) / lane.sco_rate.max(1) as u64;
+    let transcript = lane
+        .completed_transcript
+        .take()
+        .or_else(|| lane.output_transcript.take())
+        .filter(|(transcript_item, _)| transcript_item == item_id);
+    let Some((_, text)) = transcript else {
+        return;
+    };
+    let (audible, _) = estimate_audible_prefix(
+        text.trim(),
+        1.0,
+        &CutEstimate {
+            audible_ms: heard_ms,
+            queued_ms: heard_ms.saturating_add(crate::realtime_voice::OUTPUT_LEAD_MS),
+            synthesized_ms: (total_ms > 0).then_some(total_ms),
+        },
+    );
+    if !audible.is_empty() {
+        emit_turn_with_delivery(
+            outbox,
+            sink,
+            &lane.call_id,
+            ctx.turn_index,
+            "bot",
+            &audible,
+            Some("interrupted"),
+            None,
+        );
+        ctx.history.push(serde_json::json!({
+            "role": "assistant",
+            "content": audible,
+        }));
+        ctx.turn_index += 1;
+    }
+}
+
 /// The fresh session exists: it becomes the call's lane, and only now is the
 /// handoff over (`finish_resume`), so a start that failed keeps its record.
 #[cfg(all(aokie_radio, feature = "voice"))]
@@ -590,6 +641,27 @@ pub(super) fn carry_call_context(
     std::mem::replace(ctx, replacement)
 }
 
+/// The tracker's generation changed (the call ended, or another took its
+/// place): the old call's session is stopped, whatever it was doing, and what
+/// it was saying is cut. One opened while the phone rang and never begun goes
+/// the same way, before the realtime block runs: OAIY made a greeting and
+/// nothing else.
+#[cfg(all(aokie_radio, feature = "voice"))]
+pub(super) fn stop_session_for_new_generation(
+    realtime_lane: &mut Option<RealtimeCallLane>,
+    bt: &dyn crate::backend::RadioBackend,
+) {
+    if let Some(old) = realtime_lane.take() {
+        if let Some(item_id) = old.output_pacer.active_item() {
+            let _ = old
+                .session
+                .cancel_output(item_id, old.output_pacer.audible_played_ms(Instant::now()));
+        }
+        old.session.stop("call generation changed");
+        bt.flush_tx_audio();
+    }
+}
+
 /// How long a call's audio stays on the handset before OAIY's stream pauses
 /// for it (review 3 #1): a phone that only rebuilds the audio link has it
 /// back within this, and the conversation carries on in the same session.
@@ -598,8 +670,11 @@ pub(super) const AUDIO_ON_HANDSET_SETTLE: std::time::Duration = std::time::Durat
 
 /// Who takes `call`, a call to us that still rings ([`ring_responder`]), read
 /// from the same screening, allowed list, consent grant and auto-answer the
-/// radio loop answers it by. `hold_elapsed` is the answer's hold so far
-/// (`answer_hold_started`), which also bounds the wait for a number.
+/// radio loop answers it by, and the same phone link: on one that cannot give
+/// OAIY the call's audio (`call_audio_supported` false) the radio loop's
+/// auto-answer is blocked (`realtime_backend_error`) and answers nothing.
+/// `hold_elapsed` is the answer's hold so far (`answer_hold_started`), which
+/// also bounds the wait for a number.
 #[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn ringing_call_responder(
@@ -608,6 +683,7 @@ pub(super) fn ringing_call_responder(
     status: &RadioStatus,
     oaiy_route: bool,
     auto_answer: bool,
+    call_audio_supported: bool,
     overlay_ready: bool,
     hold_elapsed: Duration,
 ) -> RingResponder {
@@ -627,9 +703,9 @@ pub(super) fn ringing_call_responder(
         || manager_line_is_local(oaiy_route, screen_policy.is_manager(call.caller_id.as_deref()));
     ring_responder(
         action,
-        auto_answer,
+        auto_answer && call_audio_supported,
         status.consent_expired(),
-        call.handed_over,
+        call.handed_over || call.answered_by_aokie,
         screened,
         identity_known,
         !hold_auto_answer(caller_id_known, overlay_ready, hold_elapsed),
@@ -643,13 +719,20 @@ thread_local! {
     /// reused, so this is per call (and per test, each on its own thread).
     static TRANSPORT_RECONNECTED: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// The call that has had its one fresh start after OAIY's stream dropped
+    /// under a session that never began (opened while it rang, or not yet
+    /// begun at the answer). Per call, as above.
+    static STARTED_AFRESH: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Whether `call_id` may still reconnect after its stream dropped, spending
-/// the one reconnect it has when it may.
+/// Spend `slot`'s one use for `call_id`: whether it was still there.
 #[cfg(all(aokie_radio, feature = "voice"))]
-pub(super) fn claim_transport_reconnect(call_id: &str) -> bool {
-    TRANSPORT_RECONNECTED.with(|spent| {
+fn claim_once_per_call(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<String>>>,
+    call_id: &str,
+) -> bool {
+    slot.with(|spent| {
         let mut spent = spent.borrow_mut();
         if spent.as_deref() == Some(call_id) {
             return false;
@@ -657,6 +740,22 @@ pub(super) fn claim_transport_reconnect(call_id: &str) -> bool {
         *spent = Some(call_id.to_string());
         true
     })
+}
+
+/// Whether `call_id` may still reconnect after its stream dropped, spending
+/// the one reconnect it has when it may.
+#[cfg(all(aokie_radio, feature = "voice"))]
+pub(super) fn claim_transport_reconnect(call_id: &str) -> bool {
+    claim_once_per_call(&TRANSPORT_RECONNECTED, call_id)
+}
+
+/// Whether `call_id` may still be started afresh after its stream dropped
+/// under a session that never began, spending the one fresh start it has
+/// when it may. Apart from its reconnect: a call that lost a session while
+/// it rang still has that for once it is live.
+#[cfg(all(aokie_radio, feature = "voice"))]
+pub(super) fn claim_fresh_start(call_id: &str) -> bool {
+    claim_once_per_call(&STARTED_AFRESH, call_id)
 }
 
 #[cfg(all(aokie_radio, feature = "voice"))]
@@ -818,54 +917,58 @@ pub(super) fn service_realtime_lane(
             }
         }
 
+        // Whether the phone link carries a call's audio to OAIY at all: on one
+        // that cannot, auto-answer answers nothing (realtime_backend_error),
+        // so no call that rings is OAIY's (ring_responder).
+        let call_audio_supported = bt.realtime_call_audio_supported();
+
         // A session opened while the phone rang waits, not begun, for the
         // receptionist's answer. It is closed, never begun, once she will
-        // not take the call after all: the call ended; while it still
-        // rings, the screening, the allowed list or the consent grant now
-        // say otherwise; answered, the owner took it on the phone, or its
-        // audio stayed on the handset past a link rebuild (the caller is
-        // taken up when it comes back, as on a begun call). OAIY made a
-        // greeting and nothing else: no call began there. The call is then
-        // decided again below, as one that never had a session.
+        // not take the call after all: while it still rings, the screening,
+        // the allowed list or the consent grant now say otherwise; answered,
+        // the owner took it on the phone, or its audio stayed on the handset
+        // past a link rebuild. OAIY made a greeting and nothing else: no call
+        // began there, and no caller was greeted, so nothing is resumed. The
+        // call is then decided again below, as one that never had a session:
+        // one whose audio comes back to the dongle gets a fresh session with
+        // its own (personalized) greeting, not a resume's "Thanks for
+        // waiting". (A call that ends, or that another replaces, changes the
+        // tracker's generation, and the radio loop has stopped its session
+        // before this runs: stop_session_for_new_generation.)
         let early_close = realtime_lane
             .as_ref()
             .filter(|lane| lane.while_ringing && !lane.begun)
             .and_then(|lane| {
-                let call = tracker.current().filter(|call| call.id == lane.call_id);
-                let why = match call {
-                    None => "the call ended before it was answered",
-                    Some(call) if !call.is_active() => {
-                        let overlay_ready = ctx
-                            .call_agent_overlay
-                            .as_ref()
-                            .is_some_and(|overlay| overlay.call_id == call.id);
-                        let responder = ringing_call_responder(
-                            call,
-                            screen_policy,
-                            status,
-                            oaiy_route,
-                            auto_answer,
-                            overlay_ready,
-                            answer_hold_started.map_or(Duration::ZERO, |started| started.elapsed()),
-                        );
-                        match responder {
-                            RingResponder::Owner => "the call is left to the owner",
-                            RingResponder::Screened => "the call is screened",
-                            RingResponder::Undecided | RingResponder::Receptionist => return None,
-                        }
+                let call = tracker.current().filter(|call| call.id == lane.call_id)?;
+                if !call.is_active() {
+                    let overlay_ready = ctx
+                        .call_agent_overlay
+                        .as_ref()
+                        .is_some_and(|overlay| overlay.call_id == call.id);
+                    let responder = ringing_call_responder(
+                        call,
+                        screen_policy,
+                        status,
+                        oaiy_route,
+                        auto_answer,
+                        call_audio_supported,
+                        overlay_ready,
+                        answer_hold_started.map_or(Duration::ZERO, |started| started.elapsed()),
+                    );
+                    match responder {
+                        RingResponder::Owner => Some("the call is left to the owner"),
+                        RingResponder::Screened => Some("the call is screened"),
+                        RingResponder::Undecided | RingResponder::Receptionist => None,
                     }
-                    Some(call) if !call.receptionist_owns() => {
-                        "the owner answered the call on the phone"
-                    }
-                    Some(call) if call.audio_on_handset_for(AUDIO_ON_HANDSET_SETTLE) => {
-                        "the call's audio is on the handset"
-                    }
-                    Some(_) => return None,
-                };
-                let take_up_later = call.is_some_and(|call| call.is_active() && call.receptionist_owns());
-                Some((why, take_up_later))
+                } else if !call.receptionist_owns() {
+                    Some("the owner answered the call on the phone")
+                } else if call.audio_on_handset_for(AUDIO_ON_HANDSET_SETTLE) {
+                    Some("the call's audio is on the handset")
+                } else {
+                    None
+                }
             });
-        if let Some((why, take_up_later)) = early_close {
+        if let Some(why) = early_close {
             if let Some(lane) = realtime_lane.take() {
                 eprintln!(
                     "[aokie-plugin] OAIY's session for call {} closed before it began: {why}",
@@ -873,11 +976,7 @@ pub(super) fn service_realtime_lane(
                 );
                 lane.session.stop(why);
                 status.realtime_ready.store(false, Ordering::Relaxed);
-                if take_up_later {
-                    *realtime_resume_call = Some(lane.call_id.clone());
-                } else {
-                    ctx.desktop_realtime_responder = false;
-                }
+                ctx.desktop_realtime_responder = false;
             }
         }
 
@@ -923,18 +1022,23 @@ pub(super) fn service_realtime_lane(
                     let started = *answer_hold_started.get_or_insert_with(Instant::now);
                     // A call already answered (only the OAIY route gets
                     // here with one) has no ring left to prepare in:
-                    // screening still gates `begin` on the settled identity.
+                    // screening still gates `begin` on the settled identity,
+                    // and nothing is started while its audio is on the
+                    // handset (the owner has the caller there; the session
+                    // opened while it rang was closed for that, and the
+                    // caller is greeted afresh when the audio comes back).
                     // An agent's dial is started at once (its opening line
                     // is set at the dial), as before. A call to us that
                     // rings waits until its responder is known: nothing is
                     // started for a call the allowed list is still deciding
                     // about, leaves ringing for the owner, or that only the
-                    // owner can answer (auto-answer off), nor past the
-                    // consent grant's expiry (review 3 #6): OAIY would be
-                    // told of a call the receptionist may never answer. One
-                    // the owner answers in Aokie is prepared then.
+                    // owner can answer (auto-answer off, or unable to give
+                    // OAIY the call's audio), nor past the consent grant's
+                    // expiry (review 3 #6): OAIY would be told of a call the
+                    // receptionist may never answer. One the owner answers
+                    // in Aokie is prepared then.
                     let wait_for_identity = if call.is_active() {
-                        false
+                        call.audio_on_handset()
                     } else if call.outbound {
                         hold_auto_answer(
                             call.caller_id.as_deref().is_some_and(|id| !id.is_empty()),
@@ -949,6 +1053,7 @@ pub(super) fn service_realtime_lane(
                                 status,
                                 oaiy_route,
                                 auto_answer,
+                                call_audio_supported,
                                 overlay_ready,
                                 started.elapsed(),
                             ),
@@ -1219,6 +1324,23 @@ pub(super) fn service_realtime_lane(
         // (manual answer or a late answer acknowledgement), it is no
         // longer a before-answer failure: apply the same owner-fenced
         // fail-safe/Companion-resume policy as an established session.
+        // Unless the owner picked it up on the phone, as a call that rings
+        // through is for them to: theirs (CallSession::owner_took), and
+        // never the fail-safe's, which would apologise over them and hang
+        // up their call. It is observed, as any call the owner has.
+        if let Some((failed_call_id, _)) = realtime_failed_call.as_ref() {
+            let owners_call = tracker.current().is_some_and(|call| {
+                call.is_active() && call.id == *failed_call_id && !call.receptionist_owns()
+            });
+            if owners_call {
+                eprintln!(
+                    "[aokie-plugin] the owner answered call {failed_call_id} on the phone after OAIY's voice failed — theirs: no apology, no hang-up"
+                );
+                *realtime_legacy_call = Some(failed_call_id.clone());
+                *realtime_failed_call = None;
+                ctx.desktop_realtime_responder = false;
+            }
+        }
         if let Some((failed_call_id, reason)) = realtime_failed_call.clone() {
             let exact_call_active = tracker
                 .current()
@@ -1672,7 +1794,10 @@ pub(super) fn service_realtime_lane(
                             lane.output_transcript = Some((item_id, text));
                         }
                     }
-                    crate::realtime_voice::RealtimeEventKind::OutputItemDone { item_id } => {
+                    crate::realtime_voice::RealtimeEventKind::OutputItemDone {
+                        item_id,
+                        cancelled,
+                    } => {
                         if realtime_output_is_cancelled(
                             lane.cancelled_item.as_deref(),
                             &item_id,
@@ -1681,6 +1806,41 @@ pub(super) fn service_realtime_lane(
                             lane.output_transcript = None;
                             lane.completed_transcript = None;
                             lane.output_total_samples = 0;
+                            continue;
+                        }
+                        // OAIY cut the item itself (the caller said Hush, a
+                        // transfer was declined): what is still queued of it
+                        // (the pacer holds up to 30 s) is never played. What
+                        // the caller heard of it is recorded as an
+                        // interrupted turn, as when they talk over it, and
+                        // nothing goes back to OAIY, which made the cut. An
+                        // item no longer playing has nothing to flush, and a
+                        // cut is never a reason to end the call.
+                        if cancelled {
+                            if lane.output_pacer.active_item() == Some(item_id.as_str()) {
+                                record_cut_output(lane, ctx, outbox, sink, &item_id);
+                                bt.flush_tx_audio();
+                                lane.output_pacer.clear();
+                                lane.output_resampler =
+                                    crate::realtime_voice::StreamingResampler::new(
+                                        crate::realtime_voice::WIRE_SAMPLE_RATE,
+                                        lane.sco_rate,
+                                    );
+                                lane.output_total_samples = 0;
+                                if let Some(cut_aec) = aec.as_mut() {
+                                    cut_aec.reset();
+                                }
+                                eprintln!(
+                                    "[aokie-plugin] OAIY cut output item {item_id}; its unplayed audio was dropped"
+                                );
+                            }
+                            if lane
+                                .output_transcript
+                                .as_ref()
+                                .is_some_and(|(transcript_item, _)| transcript_item == &item_id)
+                            {
+                                lane.output_transcript = None;
+                            }
                             continue;
                         }
                         if let Err(error) = lane.output_pacer.finish_item(&item_id) {
@@ -2624,8 +2784,11 @@ pub(super) fn service_realtime_lane(
             // finish_call it had armed (and whether its goodbye was said),
             // and the appointment requests it recorded.
             let mut carried_hangup: Option<Option<Instant>> = None;
+            // The session never began: nobody was greeted on it.
+            let mut never_begun = false;
             if let Some(lane) = realtime_lane.take() {
                 carried_hangup = lane.pending_hangup.as_ref().map(|pending| pending.ready_at);
+                never_begun = !lane.begun;
                 for request_id in &lane.completed_appointment_requests {
                     if !ctx.queued_appointments.contains(request_id) {
                         ctx.queued_appointments.push(request_id.clone());
@@ -2683,6 +2846,31 @@ pub(super) fn service_realtime_lane(
                         ),
                     }
                 }
+            }
+            // OAIY's stream dropped (OAIY restarted, the socket broke) under
+            // a session that never began: opened while the phone rang, or
+            // answered and not begun yet. Nobody was greeted. While the
+            // receptionist still has the call (it rings for her, or she has
+            // the line with no person holding the radio) it is started
+            // afresh, once, as a call that never had a session: its own
+            // greeting, personalized, rather than rung through with nobody
+            // to answer it, or resumed with "Thanks for waiting" to a caller
+            // who never heard a word. A second drop, or any other failure,
+            // goes as before; the call keeps its one reconnect for once it
+            // is live.
+            let start_afresh = transport_failure
+                && never_begun
+                && tracker
+                    .current()
+                    .is_some_and(|call| call.id == call_id && call.receptionist_owns())
+                && (!exact_call_active
+                    || (exact_owner.is_some() && !remote_media.radio_reserved()))
+                && claim_fresh_start(&call_id);
+            if start_afresh {
+                eprintln!(
+                    "[aokie-plugin] OAIY's stream dropped before call {call_id} began ({reason}); starting it afresh once"
+                );
+                return;
             }
             // OAIY's stream dropped under a live call the receptionist has
             // (OAIY restarted, the socket broke): a fresh session for the
@@ -2757,7 +2945,18 @@ pub(super) fn service_realtime_failures(
         let exact_call = tracker
             .current()
             .is_some_and(|call| call.is_active() && call.id == failed_call_id);
-        if !exact_call {
+        // The fail-safe ends only a call the receptionist answered: one the
+        // owner picked up on the phone is theirs (CallSession::owner_took),
+        // and is never apologised over or hung up.
+        let owners_call = tracker
+            .current()
+            .is_some_and(|call| call.id == failed_call_id && !call.receptionist_owns());
+        if !exact_call || owners_call {
+            if exact_call {
+                eprintln!(
+                    "[aokie-plugin] realtime fail-safe dropped: the owner has call {failed_call_id} ({cause})"
+                );
+            }
             *realtime_midcall_failure = None;
         } else if !reply_owner_is_current(&remote_media, Some(&failed_owner)) {
             // Human ownership always wins. Never speak or end the cellular

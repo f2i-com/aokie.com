@@ -907,15 +907,7 @@ pub(super) fn run_loop(
                 outbox,
                 sink,
             );
-            if let Some(old) = realtime_lane.take() {
-                if let Some(item_id) = old.output_pacer.active_item() {
-                    let _ = old
-                        .session
-                        .cancel_output(item_id, old.output_pacer.audible_played_ms(Instant::now()));
-                }
-                old.session.stop("call generation changed");
-                bt.flush_tx_audio();
-            }
+            stop_session_for_new_generation(&mut realtime_lane, &*bt);
             realtime_legacy_call = None;
             realtime_failed_call = None;
             realtime_resume_call = None;
@@ -1427,8 +1419,14 @@ pub(super) fn run_loop(
             // personalization window: none of them is needed to refuse a
             // call. With a message to say the call is answered and
             // screened at the greeting, as before; with no number yet, as
-            // before too, unless the allowed list needs one first.
-            if !s.is_active() && !s.outbound {
+            // before too, unless the allowed list needs one first. Once
+            // Aokie's answer has gone out nothing here is decided again
+            // while the phone confirms it: a consent grant expiring, or a
+            // late number not on the allowed list, would leave the call
+            // ringing "for the owner" just as the phone picks the caller up
+            // into dead air (send_auto_answer). Consent is the grant's at the
+            // answer, as a live call's is.
+            if !s.is_active() && !s.outbound && !s.answered_by_aokie {
                 let refusing = ring_refusal.as_ref().is_some_and(|r| r.call_id == s.id);
                 if !refusing {
                     #[cfg(feature = "voice")]
@@ -1688,7 +1686,7 @@ pub(super) fn run_loop(
                         if hold {
                             idle = false;
                         } else {
-                            match bt.answer_call() {
+                            match send_auto_answer(s, || bt.answer_call()) {
                                 Ok(()) => {
                                     #[cfg(feature = "voice")]
                                     eprintln!(
@@ -1712,7 +1710,6 @@ pub(super) fn run_loop(
                                 }
                                 Err(e) => eprintln!("[aokie-plugin] auto-answer failed: {e}"),
                             }
-                            s.auto_answered = true;
                             idle = false;
                         }
                     }

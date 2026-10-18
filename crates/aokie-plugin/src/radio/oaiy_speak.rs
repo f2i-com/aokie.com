@@ -248,7 +248,7 @@ pub(super) fn say_in_oaiy_voice(
                         break 'say Err(error.to_string());
                     }
                 }
-                K::OutputItemDone { item_id } => {
+                K::OutputItemDone { item_id, .. } => {
                     if item.as_deref() == Some(item_id.as_str()) {
                         if let Err(error) = pacer.finish_item(&item_id) {
                             break 'say Err(error);

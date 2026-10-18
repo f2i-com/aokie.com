@@ -440,6 +440,11 @@ pub(super) fn handle_event(
                     *status.current_call_id.lock().unwrap() = Some(s.id.clone());
                     *status.call_started_at.lock().unwrap() = Some(s.started_at_iso.clone());
                 }
+                // Rebuilt as the receptionist's call it was taken to be, not
+                // one picked up on the phone (CallSession::owner_took).
+                if let Some(s) = tracker.current_mut() {
+                    s.answered_by_aokie = true;
+                }
             }
             // Lifecycle order (audit AOK-LIF-001): incoming ALWAYS precedes
             // answered — even when the caller-ID hold hasn't elapsed yet.
@@ -580,6 +585,11 @@ pub(super) fn handle_event(
                     *status.current_caller.lock().unwrap() = None;
                     *status.current_call_id.lock().unwrap() = Some(s.id.clone());
                     *status.call_started_at.lock().unwrap() = Some(s.started_at_iso.clone());
+                }
+                // Hers, as before the link dropped: not a call picked up on
+                // the phone (CallSession::owner_took).
+                if let Some(s) = tracker.current_mut() {
+                    s.answered_by_aokie = true;
                 }
                 if let (Some(s), Some((lost_id, number))) = (tracker.current_mut(), lost) {
                     s.resumes = Some(lost_id);

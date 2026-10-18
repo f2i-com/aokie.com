@@ -24,6 +24,11 @@ const CALL: &str = "call_a";
 /// A phone link that answers everything and carries no audio.
 struct FakeBackend {
     rate: u16,
+    /// Whether the link can give OAIY the call's audio (Windows' native
+    /// backend cannot: `realtime_call_audio_supported`).
+    call_audio: bool,
+    /// The hang-ups sent.
+    hangups: std::cell::Cell<u32>,
 }
 
 impl crate::backend::RadioBackend for FakeBackend {
@@ -47,6 +52,7 @@ impl crate::backend::RadioBackend for FakeBackend {
         Ok(())
     }
     fn hangup(&self) -> Result<(), String> {
+        self.hangups.set(self.hangups.get() + 1);
         Ok(())
     }
     fn dial(&self, _number: String) -> Result<(), String> {
@@ -91,7 +97,7 @@ impl crate::backend::RadioBackend for FakeBackend {
         self.rate
     }
     fn realtime_call_audio_supported(&self) -> bool {
-        true
+        self.call_audio
     }
     fn sco_dead_air_watchdog(&self) -> bool {
         false
@@ -138,12 +144,13 @@ impl Loop {
         let mut tracker = crate::call_session::SessionTracker::new();
         tracker.ring(CALL.into(), aokie_core::events::now_iso8601());
         tracker.caller_id("0491 570 006".into());
+        send_auto_answer(tracker.current_mut().unwrap(), || Ok(())).unwrap();
         tracker.answered();
         let status = Arc::new(RadioStatus::default());
         status.transfer_ready.store(true, std::sync::atomic::Ordering::Relaxed);
         Self {
             rig,
-            bt: FakeBackend { rate: 8_000 },
+            bt: FakeBackend { rate: 8_000, call_audio: true, hangups: std::cell::Cell::new(0) },
             sink: crate::event_bridge::VecSink::default(),
             status,
             screen: crate::screen::ScreenPolicy::permissive(),
@@ -1176,6 +1183,41 @@ impl Loop {
     fn phone(&mut self, event: BluetoothEvent) {
         handle_event(event, &mut self.tracker, None, &mut self.sink, &self.status);
     }
+
+    /// Auto-answer's answer goes out as the radio loop sends it
+    /// (`send_auto_answer`), and the phone says the call is answered.
+    fn aokie_answers(&mut self) {
+        send_auto_answer(self.tracker.current_mut().expect("a call rings"), || Ok(())).unwrap();
+        self.phone(BluetoothEvent::CallAnswered);
+    }
+
+    /// The radio loop's own fail-safe turn (`service_realtime_failures`), with
+    /// no voice to apologise in: what it does is the hang-up, or not.
+    fn failures_pass(&mut self) {
+        *self.status.tts_error.lock().unwrap() = Some("no voice in this test".into());
+        let (_controls, control_rx) = std::sync::mpsc::channel();
+        let mut pending = std::collections::VecDeque::new();
+        let synth = crate::synth::SynthHandle::inert();
+        service_realtime_failures(
+            &mut self.bt,
+            None,
+            &mut self.sink,
+            &control_rx,
+            &self.status,
+            true,
+            &None,
+            &self.rig.media,
+            &synth,
+            &mut pending,
+            &mut self.tracker,
+            &mut self.resume,
+            &mut self.answered_at,
+            &mut self.midcall,
+            &mut self.terminal,
+            &mut self.deferred,
+            &mut self.ctx,
+        );
+    }
 }
 
 #[test]
@@ -1210,7 +1252,7 @@ fn oaiys_session_starts_as_the_number_is_known_and_begins_once_the_call_is_answe
     assert!(!l.sent().contains(&SentControl::Begin));
 
     // Answered: begun at once, and the begin carries the personalization.
-    l.phone(BluetoothEvent::CallAnswered);
+    l.aokie_answers();
     l.pass();
     assert!(l.sent().contains(&SentControl::Begin));
     assert!(l.lane.as_ref().unwrap().begun);
@@ -1247,18 +1289,25 @@ fn a_number_still_to_come_is_waited_for_and_a_hidden_one_starts_at_once() {
     assert_eq!(late.sessions(), 1);
 }
 
+/// The caller hangs up while it rings: the call's end changes the tracker's
+/// generation, and the radio loop stops the session for that before its
+/// realtime block runs (run_loop: stop_session_for_new_generation), as it
+/// does for every call that ends. Closed, never begun.
 #[test]
 fn a_caller_who_hangs_up_while_it_rings_has_the_session_closed_never_begun() {
     let mut l = Loop::ringing_and_ready();
     l.sent();
+    let generation = l.tracker.generation();
     l.phone(BluetoothEvent::CallTerminated);
+    assert_ne!(l.tracker.generation(), generation, "the call's end is a new generation");
+    stop_session_for_new_generation(&mut l.lane, &l.bt);
     l.pass();
     assert!(l.lane.is_none(), "closed");
     let sent = l.sent();
     assert!(!sent.contains(&SentControl::Begin), "{sent:?}");
-    assert_eq!(stop_reasons(&sent), vec!["the call ended before it was answered".to_string()]);
-    assert!(!l.status.realtime_ready.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(stop_reasons(&sent), vec!["call generation changed".to_string()]);
     assert!(l.failed.is_none() && l.resume.is_none() && l.midcall.is_none(), "no failure, nothing to resume");
+    assert_eq!(l.bt.hangups.get(), 0);
     // The call's record is the missed call it was: the session changes nothing of it.
     let ended: Value = l
         .sink
@@ -1272,20 +1321,27 @@ fn a_caller_who_hangs_up_while_it_rings_has_the_session_closed_never_begun() {
     assert_eq!(l.sessions(), 1, "nothing more is started");
 }
 
-/// The owner answered on the phone: its audio on the handset (review 3 #1).
+/// Aokie answered, and the call's audio went to the handset (review 3 #1).
 /// Not begun while it is there; past a link rebuild's settle the session is
-/// closed, and the caller is taken up when the audio comes back.
+/// closed, never begun, and nothing is resumed: nobody was greeted. When the
+/// audio comes back to the dongle the caller gets a fresh session and their
+/// own greeting, personalized, never "Thanks for waiting".
 #[test]
-fn the_owner_answering_on_the_handset_closes_the_session_never_begun() {
+fn audio_kept_on_the_handset_closes_the_session_never_begun_and_greets_afresh() {
     let mut l = Loop::ringing_and_ready();
+    l.ctx.call_agent_overlay = Some(CallAgentOverlay {
+        call_id: CALL.into(),
+        persona: Some("Greet Sam by name.".into()),
+        greeting: Some("Hi Sam!".into()),
+    });
     l.sent();
-    l.phone(BluetoothEvent::CallAnswered);
+    l.aokie_answers();
     l.phone(BluetoothEvent::AudioOnHandset);
     l.pass();
     assert!(!l.sent().contains(&SentControl::Begin), "not while its audio is on the handset");
     assert!(l.lane.is_some(), "a link being rebuilt keeps its session");
 
-    // The audio stays there: closed, and the call waits for it to come back.
+    // The audio stays there: closed, nothing to resume, nothing started.
     l.tracker.current_mut().unwrap().audio_on_handset_since =
         Instant::now().checked_sub(AUDIO_ON_HANDSET_SETTLE + std::time::Duration::from_millis(100));
     l.pass();
@@ -1293,16 +1349,92 @@ fn the_owner_answering_on_the_handset_closes_the_session_never_begun() {
     let sent = l.sent();
     assert!(!sent.contains(&SentControl::Begin), "{sent:?}");
     assert_eq!(stop_reasons(&sent), vec!["the call's audio is on the handset".to_string()]);
-    assert_eq!(l.resume.as_deref(), Some(CALL));
-    assert!(l.midcall.is_none() && l.terminal.is_none(), "no apology, no hang-up");
+    assert!(l.resume.is_none(), "nobody was greeted: nothing to resume");
+    assert!(l.failed.is_none() && l.midcall.is_none() && l.terminal.is_none(), "no apology, no hang-up");
+    assert!(l.legacy.is_none(), "still the receptionist's");
+    l.pass();
     l.pass();
     assert_eq!(l.sessions(), 1, "nothing starts while the audio is on the handset");
 
-    // Back on the dongle: a fresh session takes the caller up.
+    // Back on the dongle: a fresh session, greeting the caller for the first
+    // time, with their own greeting.
     l.phone(BluetoothEvent::AudioConnected { codec: "CVSD".into(), sample_rate: 8_000, armed: true });
     l.pass();
     assert_eq!(l.sessions(), 2);
-    assert!(l.lane.as_ref().unwrap().resumed);
+    let lane = l.lane.as_ref().unwrap();
+    assert!(!lane.resumed && !lane.while_ringing);
+    let start = l.start(1);
+    assert_eq!(start.greeting, "Hi Sam!");
+    assert!(start.resume.is_none());
+    l.ready(&[]);
+    l.pass();
+    assert!(l.sent().contains(&SentControl::Begin));
+    let (_, greeting) = l.started.borrow()[1].1.begun_with().expect("begun");
+    assert_eq!(greeting.as_deref(), Some("Hi Sam!"), "the begin keeps it");
+}
+
+/// Auto-answer off: nothing is opened while it rings, and the owner picking
+/// up on the phone makes the call theirs (CallSession::owner_took). OAIY
+/// never hears of it; the call is observed.
+#[test]
+fn a_call_the_owner_picks_up_with_auto_answer_off_never_reaches_oaiy() {
+    let mut l = Loop::ringing_from(Some("0491 570 156"));
+    l.auto_answer = false;
+    l.pass();
+    l.pass();
+    assert_eq!(l.sessions(), 0);
+    l.phone(BluetoothEvent::CallAnswered);
+    assert!(l.tracker.current().unwrap().owner_took, "nobody in Aokie answered it");
+    l.phone(BluetoothEvent::AudioConnected { codec: "CVSD".into(), sample_rate: 8_000, armed: true });
+    for _ in 0..3 {
+        l.pass();
+    }
+    assert_eq!(l.sessions(), 0, "the caller's number never reaches OAIY");
+    assert_eq!(l.legacy.as_deref(), Some(CALL), "the owner's call: observed");
+    assert!(!l.ctx.desktop_realtime_responder);
+    assert!(l.failed.is_none() && l.midcall.is_none() && l.resume.is_none());
+}
+
+/// Auto-answer on, its answer still holding for the personalization, and the
+/// owner picks up on the phone first: theirs. The session opened while it
+/// rang is closed, never begun, even with the call's audio on the dongle.
+#[test]
+fn the_owner_picking_up_during_the_answers_hold_closes_the_session_never_begun() {
+    let mut l = Loop::ringing_and_ready();
+    l.sent();
+    l.phone(BluetoothEvent::CallAnswered);
+    l.phone(BluetoothEvent::AudioConnected { codec: "CVSD".into(), sample_rate: 8_000, armed: true });
+    assert!(l.tracker.current().unwrap().owner_took);
+    l.pass();
+    assert!(l.lane.is_none());
+    let sent = l.sent();
+    assert!(!sent.contains(&SentControl::Begin), "{sent:?}");
+    assert_eq!(stop_reasons(&sent), vec!["the owner answered the call on the phone".to_string()]);
+    assert_eq!(l.legacy.as_deref(), Some(CALL), "observed");
+    l.pass();
+    l.pass();
+    assert_eq!(l.sessions(), 1, "nothing more is started");
+}
+
+/// Review: the consent grant expires after Aokie's answer went out and before
+/// the phone confirms it. The answer stands (consent is the grant's at the
+/// decision): the session is not closed for the owner, and the caller is
+/// greeted when the answer lands, not picked up into dead air.
+#[test]
+fn an_answer_aokie_sent_stays_the_receptionists_when_consent_expires_before_it_lands() {
+    let mut l = Loop::ringing_and_ready();
+    l.sent();
+    send_auto_answer(l.tracker.current_mut().unwrap(), || Ok(())).unwrap();
+    l.status.consent_expires_at.store(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(l.status.consent_expired());
+    l.pass();
+    assert!(l.lane.is_some(), "not closed for the owner");
+    assert!(stop_reasons(&l.sent()).is_empty());
+    l.phone(BluetoothEvent::CallAnswered);
+    assert!(l.tracker.current().unwrap().receptionist_owns(), "Aokie's answer");
+    l.pass();
+    assert!(l.sent().contains(&SentControl::Begin), "greeted, not dead air");
+    assert_eq!(l.sessions(), 1);
 }
 
 /// A call the run loop left ringing for the owner after the start (here the
@@ -1446,19 +1578,187 @@ fn an_agent_dial_is_started_as_before() {
     assert!(l.sent().contains(&SentControl::Begin));
 }
 
-/// OAIY's stream dropping before the call is answered rings the call through,
-/// as a session that failed before the answer always did, and does not spend
-/// the one reconnect the call has once it is live.
-#[test]
-fn a_session_lost_while_it_rings_rings_through_and_keeps_the_calls_reconnect() {
-    let mut l = Loop::ringing_and_ready();
-    l.oaiy(RealtimeEventKind::Closed {
+fn dropped() -> RealtimeEventKind {
+    RealtimeEventKind::Closed {
         reason: "Desktop realtime receive failed: connection reset".into(),
         transport: true,
-    });
+    }
+}
+
+/// OAIY's stream dropping (OAIY restarted) under the session opened while the
+/// phone rings: the call still rings for the receptionist, so it is started
+/// afresh, once, with its own greeting. A second drop rings it through, as a
+/// session that failed before the answer always did. Neither spends the one
+/// reconnect the call has once it is live.
+#[test]
+fn a_session_lost_while_it_rings_is_started_afresh_once_then_rings_through() {
+    let mut l = Loop::ringing_and_ready();
+    l.oaiy(dropped());
+    l.pass();
+    assert!(l.lane.is_none());
+    assert!(l.failed.is_none() && l.resume.is_none(), "not rung through, nothing to resume");
+    l.pass();
+    assert_eq!(l.sessions(), 2, "started afresh while it rings");
+    let lane = l.lane.as_ref().unwrap();
+    assert!(lane.while_ringing && !lane.resumed);
+    let start = l.start(1);
+    assert_eq!(start.greeting, DEFAULT_GREETING, "its own greeting, not a resume's");
+    assert!(start.resume.is_none());
+
+    // The second drop: rung through, and nothing more is started.
+    l.ready(&[]);
+    l.pass();
+    l.oaiy(dropped());
     l.pass();
     assert!(l.lane.is_none());
     assert_eq!(l.failed.as_ref().map(|(id, _)| id.as_str()), Some(CALL), "rings through");
-    assert!(l.resume.is_none());
+    l.pass();
+    l.pass();
+    assert_eq!(l.sessions(), 2, "one fresh start a call");
     assert!(claim_transport_reconnect(CALL), "the call's one reconnect is still there");
+}
+
+/// A session that failed while it rings for what OAIY said (not its stream
+/// dropping) rings through at once: a fresh one would fail the same way.
+#[test]
+fn a_session_refused_while_it_rings_rings_through_at_once() {
+    let mut l = Loop::ringing_and_ready();
+    l.oaiy(RealtimeEventKind::Error {
+        code: Some("bad_start".into()),
+        message: "the start was refused".into(),
+        fatal: true,
+        abandoned_item_id: None,
+    });
+    l.pass();
+    assert_eq!(l.failed.as_ref().map(|(id, _)| id.as_str()), Some(CALL));
+    l.pass();
+    assert_eq!(l.sessions(), 1);
+}
+
+/// OAIY's stream drops after the answer, before the session began (the
+/// call's audio not up yet): nobody was greeted, so the call is started
+/// afresh with its own greeting, not resumed with "Thanks for waiting".
+#[test]
+fn a_session_lost_after_the_answer_before_it_began_is_started_afresh_not_resumed() {
+    let mut l = Loop::ringing_and_ready();
+    l.bt.rate = 0;
+    l.aokie_answers();
+    l.pass();
+    assert!(!l.lane.as_ref().unwrap().begun, "no call audio yet");
+    l.oaiy(dropped());
+    l.pass();
+    assert!(l.lane.is_none());
+    assert!(l.resume.is_none() && l.failed.is_none() && l.midcall.is_none());
+    l.pass();
+    assert_eq!(l.sessions(), 2);
+    let start = l.start(1);
+    assert_eq!(start.greeting, DEFAULT_GREETING);
+    assert!(start.resume.is_none());
+    l.bt.rate = 8_000;
+    l.ready(&[]);
+    l.pass();
+    let lane = l.lane.as_ref().unwrap();
+    assert!(lane.begun && !lane.resumed);
+}
+
+/// A call that rang through after OAIY's voice failed, picked up by the owner
+/// on the phone: theirs. Never the fail-safe's: no apology over them, and
+/// their call is not hung up (it was, before). Observed, nothing started.
+#[test]
+fn a_call_that_rang_through_and_the_owner_picks_up_is_never_hung_up() {
+    let mut l = Loop::ringing_and_ready();
+    assert!(claim_fresh_start(CALL), "spent: the drop rings it through");
+    l.oaiy(dropped());
+    l.pass();
+    assert_eq!(l.failed.as_ref().map(|(id, _)| id.as_str()), Some(CALL));
+    l.phone(BluetoothEvent::CallAnswered);
+    assert!(l.tracker.current().unwrap().owner_took);
+    l.pass();
+    assert!(l.failed.is_none() && l.midcall.is_none() && l.terminal.is_none(), "no fail-safe");
+    assert_eq!(l.legacy.as_deref(), Some(CALL), "observed");
+    l.failures_pass();
+    l.pass();
+    assert_eq!(l.bt.hangups.get(), 0, "the owner's call is not hung up");
+    assert_eq!(l.sessions(), 1);
+
+    // Nor does a fail-safe that reaches the owner's call by any other way
+    // hang it up; the receptionist's call still takes it.
+    let owner = aokie_owner_for_call(&l.rig.media, CALL).expect("Aokie's fence");
+    let long_ago = Instant::now().checked_sub(std::time::Duration::from_secs(2)).unwrap();
+    l.midcall = Some((CALL.into(), owner, "OAIY's voice failed".into()));
+    l.answered_at = Some((CALL.into(), long_ago));
+    l.failures_pass();
+    assert!(l.midcall.is_none() && l.terminal.is_none());
+    assert_eq!(l.bt.hangups.get(), 0);
+
+    let mut hers = Loop::new();
+    let owner = aokie_owner_for_call(&hers.rig.media, CALL).expect("Aokie's fence");
+    hers.midcall = Some((CALL.into(), owner, "OAIY's voice failed".into()));
+    hers.answered_at = Some((CALL.into(), long_ago));
+    hers.failures_pass();
+    assert_eq!(hers.bt.hangups.get(), 1, "the receptionist's call: the fail-safe hangs up");
+}
+
+/// A phone link that cannot give OAIY the call's audio (Windows' native
+/// backend): auto-answer answers nothing there, so nothing is opened while
+/// it rings and the caller's number never reaches OAIY. Handed over in
+/// Aokie, the owner's own answer, it is as with auto-answer off.
+#[test]
+fn nothing_is_opened_while_it_rings_on_a_link_that_cannot_carry_the_calls_audio() {
+    let mut l = Loop::ringing_from(Some("0491 570 157"));
+    l.bt.call_audio = false;
+    for _ in 0..3 {
+        l.pass();
+    }
+    assert_eq!(l.sessions(), 0);
+    assert!(l.legacy.is_none() && l.failed.is_none(), "it rings for the owner");
+    l.tracker.hand_to_receptionist();
+    l.pass();
+    assert_eq!(l.sessions(), 1, "answered in Aokie: the receptionist's");
+
+    // A session opened before the link said so is closed for the owner.
+    let mut l = Loop::ringing_and_ready();
+    l.sent();
+    l.bt.call_audio = false;
+    l.pass();
+    assert!(l.lane.is_none());
+    assert_eq!(stop_reasons(&l.sent()), vec!["the call is left to the owner".to_string()]);
+}
+
+/// OAIY cut an item itself (`"cancelled": true` on its item_done: the caller
+/// said Hush, a transfer was declined): what was queued of it (up to 30 s)
+/// is dropped, never played, and it is not recorded as said in full. The
+/// session goes on. Without the flag the item plays out as before.
+#[test]
+fn an_item_oaiy_cut_is_not_played_out() {
+    let text = "Let me see whether the owner can take your call, Sam; one moment while I ring them.";
+    let say = |l: &mut Loop, cancelled: bool| {
+        l.oaiy(RealtimeEventKind::OutputItemStarted { item_id: "item_1".into() });
+        l.oaiy(RealtimeEventKind::OutputTranscript { item_id: "item_1".into(), text: text.into() });
+        for _ in 0..5 {
+            // A second of OAIY's voice each.
+            l.oaiy(RealtimeEventKind::OutputPcm { item_id: "item_1".into(), samples: vec![1_000; 24_000] });
+        }
+        l.pass();
+        assert_eq!(l.lane.as_ref().unwrap().output_pacer.active_item(), Some("item_1"), "playing");
+        l.oaiy(RealtimeEventKind::OutputItemDone { item_id: "item_1".into(), cancelled });
+        l.pass();
+    };
+
+    let mut l = begun();
+    say(&mut l, true);
+    let lane = l.lane.as_ref().unwrap();
+    assert!(lane.output_pacer.active_item().is_none(), "what was queued is dropped");
+    assert!(lane.completed_transcript.is_none() && lane.output_transcript.is_none());
+    assert!(!l.ctx.history.iter().any(|entry| entry["content"] == text), "not said in full");
+    assert!(l.failed.is_none() && l.midcall.is_none(), "the call goes on");
+    l.oaiy(RealtimeEventKind::OutputItemStarted { item_id: "item_2".into() });
+    l.pass();
+    assert_eq!(l.lane.as_ref().unwrap().output_pacer.active_item(), Some("item_2"), "the next item plays");
+
+    let mut l = begun();
+    say(&mut l, false);
+    let lane = l.lane.as_ref().unwrap();
+    assert_eq!(lane.output_pacer.active_item(), Some("item_1"), "plays out");
+    assert_eq!(lane.completed_transcript.as_ref().map(|(_, said)| said.as_str()), Some(text));
 }

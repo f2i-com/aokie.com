@@ -439,7 +439,7 @@ pub(super) fn service_controls(
                                 ),
                             );
                         }
-                        tracker.answered();
+                        tracker.answered_here();
                         status.call_active.store(true, Ordering::Relaxed);
                         *status.current_call_id.lock().unwrap() = Some(w.call_id.clone());
                         *status.current_caller.lock().unwrap() = if w.from.is_empty() {

@@ -38,7 +38,8 @@ pub(super) enum RingResponder {
     /// Not known yet: its number may still come, and the answer waits for it.
     Undecided,
     /// The owner: left ringing for them (the allowed list, the expired
-    /// consent grant), or auto-answer is off and nobody has answered it.
+    /// consent grant), or auto-answer will not answer it (off, or the phone
+    /// link cannot carry the call's audio to OAIY) and nobody has.
     Owner,
     /// The screening's own way: a screened caller, a manager's line that
     /// needs Aokie's own voice. No OAIY session.
@@ -49,27 +50,31 @@ pub(super) enum RingResponder {
 }
 
 /// Who takes a call to us that still rings, from what the radio loop answers
-/// it by: `action` (`ring_action_for`), auto-answer, the consent grant, and
-/// whether the owner handed it to the receptionist (Answer in Aokie, which
-/// wins over the allowed list and an expiry that came after). `screened` is
-/// a screening verdict or a manager's line kept to Aokie's own voice. Until
+/// it by: `action` (`ring_action_for`), the consent grant, whether auto-answer
+/// would answer it (`auto_answers`: the setting is on and the phone link can
+/// carry the call's audio to OAIY; on one that cannot, auto-answer leaves
+/// every call ringing, `realtime_backend_error`), and whether the call is
+/// the receptionist's already (`taken`: the owner handed it over with Answer
+/// in Aokie, or Aokie's own answer went out; either wins over the allowed
+/// list and an expiry that came after). The one decider of whether OAIY
+/// hears of the call while it rings: nothing is opened, and no caller's
+/// number goes to OAIY, for a call that rings through. `screened` is a
+/// screening verdict or a manager's line kept to Aokie's own voice. Until
 /// the number is known (or the phone said it is hidden) only an answer that
 /// stopped waiting for one (`id_wait_over`, ANSWER_ID_WAIT) decides it, as
 /// before: a number that comes late may still be screened. Pure for tests.
 #[cfg(feature = "voice")]
 pub(super) fn ring_responder(
     action: crate::screen::RingAction,
-    auto_answer: bool,
+    auto_answers: bool,
     consent_expired: bool,
-    handed_over: bool,
+    taken: bool,
     screened: bool,
     identity_known: bool,
     id_wait_over: bool,
 ) -> RingResponder {
     use crate::screen::RingAction;
-    if !handed_over
-        && (matches!(action, RingAction::Wait | RingAction::Leave) || consent_expired)
-    {
+    if !taken && (matches!(action, RingAction::Wait | RingAction::Leave) || consent_expired) {
         return RingResponder::Owner;
     }
     if !identity_known && !id_wait_over {
@@ -78,7 +83,7 @@ pub(super) fn ring_responder(
     if screened {
         return RingResponder::Screened;
     }
-    if handed_over || (auto_answer && action == RingAction::Answer) {
+    if taken || (auto_answers && action == RingAction::Answer) {
         RingResponder::Receptionist
     } else {
         RingResponder::Owner
@@ -103,6 +108,27 @@ pub(super) fn ring_action_for(
         }
         (action, _) => action,
     }
+}
+
+/// Auto-answer's answer to `call`, sent by `answer` (the radio's ATA). The
+/// call is Aokie's answer (`answered_by_aokie`) BEFORE it goes out, so the
+/// phone's confirmation, whenever it comes, finds it the receptionist's, and
+/// nothing decided while that is on its way (a consent grant that expires, a
+/// late number not on the allowed list) leaves the caller picked up into dead
+/// air. An answer that could not be sent is none: a pickup on the phone after
+/// it is the owner's (`CallSession::owner_took`). Once per call either way
+/// (`auto_answered`).
+pub(super) fn send_auto_answer(
+    call: &mut crate::call_session::CallSession,
+    answer: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    call.answered_by_aokie = true;
+    call.auto_answered = true;
+    let sent = answer();
+    if sent.is_err() {
+        call.answered_by_aokie = false;
+    }
+    sent
 }
 
 /// Whether a reject (AT+CHUP) may go to the call that rings: only while the

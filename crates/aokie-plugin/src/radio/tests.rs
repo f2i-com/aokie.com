@@ -1232,10 +1232,16 @@ fn reply_side_effect_fence_rejects_an_actual_call_transition() {
     assert!(!reply_owner_is_current(&remote, None));
 }
 
+/// Auto-answer's answer to the call that rings, as the radio loop sends it
+/// (`send_auto_answer`): what the phone's answer then finds.
+fn aokie_answers(tracker: &mut crate::call_session::SessionTracker) {
+    send_auto_answer(tracker.current_mut().expect("a call rings"), || Ok(())).unwrap();
+}
+
 /// review 1 #2: the no-SCO watchdog acts only on a call the receptionist
 /// runs. The owner's own call (answered on the handset after it was left
-/// ringing, or dialed there) keeps its audio on the earpiece: no AT+BCC, no
-/// dead-air hangup.
+/// ringing, or with nobody in Aokie answering it, or dialed there) keeps its
+/// audio on the earpiece: no AT+BCC, no dead-air hangup.
 #[test]
 fn no_sco_watchdog_leaves_the_owners_own_calls_alone() {
     let mut tracker = crate::call_session::SessionTracker::new();
@@ -1246,12 +1252,18 @@ fn no_sco_watchdog_leaves_the_owners_own_calls_alone() {
     assert_eq!(dead_air_watch_call(tracker.current()), None, "the owner answered on the handset");
     tracker.terminate();
 
-    tracker.dial("call_handset".into(), Some("0400111222".into()), "2026-10-18T01:01:00Z".into(), false);
+    tracker.ring("call_picked_up".into(), "2026-10-18T01:00:30Z".into());
+    tracker.answered();
+    assert_eq!(dead_air_watch_call(tracker.current()), None, "picked up on the phone before Aokie answered");
+    tracker.terminate();
+
+    tracker.dial("call_handset".into(), Some("0491 570 156".into()), "2026-10-18T01:01:00Z".into(), false);
     tracker.answered();
     assert_eq!(dead_air_watch_call(tracker.current()), None, "the owner dialed on the handset");
     tracker.terminate();
 
     tracker.ring("call_ours".into(), "2026-10-18T01:02:00Z".into());
+    aokie_answers(&mut tracker);
     tracker.answered();
     assert_eq!(dead_air_watch_call(tracker.current()).as_deref(), Some("call_ours"));
     tracker.terminate();
@@ -1276,6 +1288,7 @@ fn audio_moved_to_the_handset_is_left_there() {
     let audio_up = || E::AudioConnected { codec: "mSBC".into(), sample_rate: 16_000, armed: true };
     handle_event(E::DeviceConnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
     handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+    aokie_answers(&mut tracker);
     handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
     handle_event(audio_up(), &mut tracker, None, &mut sink, &status);
     let id = tracker.call_id().unwrap().to_string();
@@ -2442,16 +2455,18 @@ fn auto_answer_waits_one_ring_for_personalization() {
 }
 
 /// Who takes a call to us that still rings, for OAIY's session: the
-/// receptionist only when she will answer it (auto-answer on, the screening
-/// and the allowed list say answer, the consent grant current), or the owner
-/// handed it to her in Aokie. Decided once the number is known or the answer
-/// stopped waiting for one; the owner's ring and the expiry come first.
+/// receptionist only when she will answer it (auto-answer on, on a link that
+/// can give OAIY the call's audio, the screening and the allowed list say
+/// answer, the consent grant current), or she has it already (the owner
+/// handed it to her in Aokie, or Aokie's answer went out). Decided once the
+/// number is known or the answer stopped waiting for one; the owner's ring
+/// and the expiry come first.
 #[cfg(feature = "voice")]
 #[test]
 fn a_ringing_call_is_the_receptionists_only_when_she_will_answer_it() {
     use crate::screen::RingAction::{Answer, Leave, Refuse, Wait};
     use RingResponder::{Owner, Receptionist, Screened, Undecided};
-    // (action, auto_answer, consent_expired, handed_over, screened, identity_known, id_wait_over)
+    // (action, auto_answers, consent_expired, taken, screened, identity_known, id_wait_over)
     let r = ring_responder;
     assert_eq!(r(Answer, true, false, false, false, true, false), Receptionist, "the number is known: at once");
     assert_eq!(r(Answer, true, false, false, false, false, false), Undecided, "a number may still come");
@@ -2467,6 +2482,43 @@ fn a_ringing_call_is_the_receptionists_only_when_she_will_answer_it() {
     assert_eq!(r(Answer, true, false, false, true, true, false), Screened, "answered and refused at the greeting");
     assert_eq!(r(Refuse("blocked"), false, false, false, true, true, false), Screened, "with auto-answer off too");
     assert_eq!(r(Answer, true, true, false, true, true, false), Owner, "the expiry first: it rings for the owner");
+    // Auto-answer on, on a link that cannot give OAIY the call's audio
+    // (realtime_backend_error): it answers nothing, as if off.
+    assert_eq!(r(Answer, false, false, false, false, true, true), Owner, "it rings through: nothing for OAIY");
+    // Aokie's answer went out, then the expiry or a late number not on the
+    // allowed list: the answer stands.
+    assert_eq!(r(Answer, true, true, true, false, true, false), Receptionist, "answered before it expired");
+    assert_eq!(r(Leave, true, false, true, false, true, false), Receptionist, "answered before the number came");
+}
+
+/// Auto-answer's answer marks the call Aokie's before it goes out (the
+/// phone's confirmation finds it so, whatever is decided meanwhile), and an
+/// answer that could not be sent marks nothing: a pickup on the phone after
+/// it is the owner's. Either way it is not sent again.
+#[test]
+fn auto_answer_marks_its_answer_before_sending_it_and_only_if_it_went() {
+    let mut tracker = crate::call_session::SessionTracker::new();
+    tracker.ring("call_a".into(), "2026-10-19T01:00:00Z".into());
+    tracker.caller_id("0491 570 156".into());
+    let sent = send_auto_answer(tracker.current_mut().unwrap(), || Ok(()));
+    assert!(sent.is_ok());
+    let s = tracker.current().unwrap();
+    assert!(s.answered_by_aokie && s.auto_answered);
+    // Left ringing after it went (a late decision): the answer stands.
+    tracker.current_mut().unwrap().left_ringing = true;
+    tracker.answered();
+    assert!(tracker.current().unwrap().receptionist_owns());
+    tracker.terminate();
+
+    // Not sent: not Aokie's answer, and the owner's pickup is theirs.
+    tracker.ring("call_c".into(), "2026-10-19T01:02:00Z".into());
+    tracker.caller_id("0491 570 157".into());
+    let sent = send_auto_answer(tracker.current_mut().unwrap(), || Err("no phone link".into()));
+    assert!(sent.is_err());
+    let s = tracker.current().unwrap();
+    assert!(!s.answered_by_aokie && s.auto_answered, "not sent again");
+    tracker.answered();
+    assert!(tracker.current().unwrap().owner_took);
 }
 
 /// §9.3: the greeting hold waits for the overlay only while the caller
@@ -3300,6 +3352,7 @@ fn a_lost_link_clears_the_held_and_waiting_state() {
         since_iso: "2026-10-18T01:00:00Z".into(),
     });
     tracker.ring("call_a".into(), "2026-10-18T01:00:00Z".into());
+    aokie_answers(&mut tracker);
     tracker.answered();
     handle_event(
         aokie_dongle::bluetooth::BluetoothEvent::DeviceDisconnected("AA:BB:CC:00:00:01".into()),
@@ -3418,6 +3471,7 @@ fn a_call_found_at_connect_is_the_receptionists_only_if_it_was() {
 
     // The receptionist's call drops with the link, and is up after it.
     handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+    aokie_answers(&mut tracker);
     handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
     handle_event(E::DeviceDisconnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
     assert!(tracker.current().is_none());
@@ -4136,6 +4190,7 @@ fn a_call_taken_up_after_a_lost_link_names_the_call_it_resumes() {
     handle_event(E::DeviceConnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
     handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
     handle_event(E::CallerId("0491570157".into()), &mut tracker, None, &mut sink, &status);
+    aokie_answers(&mut tracker);
     handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
     let lost = tracker.call_id().unwrap().to_string();
     handle_event(E::DeviceDisconnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
@@ -4210,6 +4265,7 @@ fn a_call_the_owner_took_to_the_handset_stays_theirs_after_a_lost_link() {
         let mut sink = crate::event_bridge::VecSink::default();
         handle_event(E::DeviceConnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
         handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+        aokie_answers(&mut tracker);
         handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
         handle_event(E::AudioOnHandset, &mut tracker, None, &mut sink, &status);
         tracker.current_mut().unwrap().audio_on_handset_since = Instant::now().checked_sub(on_handset_for);

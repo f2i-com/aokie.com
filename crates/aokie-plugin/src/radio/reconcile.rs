@@ -244,7 +244,7 @@ pub(super) fn reconcile_switchboard(
                                     ),
                                 );
                             }
-                            tracker.answered();
+                            tracker.answered_here();
                             emit(
                                 outbox,
                                 sink,
@@ -667,7 +667,7 @@ pub(super) fn reconcile_switchboard(
                                             ),
                                         );
                                     }
-                                    tracker.answered();
+                                    tracker.answered_here();
                                     emit(
                                         outbox,
                                         sink,

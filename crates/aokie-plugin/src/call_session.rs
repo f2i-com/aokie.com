@@ -90,9 +90,19 @@ pub struct CallSession {
     /// The owner answered, in Aokie, a call left ringing for them: the
     /// receptionist's from then on, never left ringing again.
     pub handed_over: bool,
-    /// The owner answered on the phone a call that was left ringing for them:
-    /// theirs, as a call they dial on the handset is. The receptionist
-    /// neither greets nor listens.
+    /// Aokie answered this call itself: auto-answer's answer went out (set
+    /// before it is sent, so the phone's confirmation finds it, and kept
+    /// whatever is decided while that is on its way), or the switchboard
+    /// took the line (a waiting caller accepted, a call rebuilt after lost
+    /// events or a lost link: [`SessionTracker::answered_here`]). Not set by
+    /// a ring refusal, which answers nothing.
+    pub answered_by_aokie: bool,
+    /// The owner answered the call on the phone: a call to us that went
+    /// active without Aokie answering it (`answered_by_aokie`) or the owner
+    /// handing it over in Aokie (`handed_over`), whether it was left ringing
+    /// for them or rang while auto-answer was off or still holding. Theirs,
+    /// as a call they dial on the handset is: the receptionist neither
+    /// greets nor listens.
     pub owner_took: bool,
     /// The phone moved this call's audio to the handset (review 3 #1): its
     /// audio channel closed (reason 0x13) with the call still up, as it does
@@ -283,6 +293,7 @@ impl SessionTracker {
             ring_id_asked: false,
             left_ringing: false,
             handed_over: false,
+            answered_by_aokie: false,
             owner_took: false,
             audio_on_handset_since: None,
             resumes: None,
@@ -330,6 +341,7 @@ impl SessionTracker {
             ring_id_asked: false,
             left_ringing: false,
             handed_over: false,
+            answered_by_aokie: false,
             owner_took: false,
             audio_on_handset_since: None,
             resumes: None,
@@ -375,15 +387,29 @@ impl SessionTracker {
 
     /// The call went active. Idempotent; ignored when idle (a stray
     /// answered indicator with no call must not fabricate a session). A call
-    /// still left ringing for the owner was answered on the phone: theirs.
+    /// to us that Aokie did not answer (`answered_by_aokie`) and the owner did
+    /// not hand over in Aokie (`handed_over`) was answered on the phone:
+    /// theirs, left ringing for them or not (auto-answer off, or still
+    /// holding for the caller's number when they picked up).
     pub fn answered(&mut self) {
         if let Some(s) = self.session.as_mut() {
             s.phase = Phase::Active;
             if s.answered.is_none() {
                 s.answered = Some(Instant::now());
-                s.owner_took = s.left_ringing && !s.outbound;
+                s.owner_took = !s.outbound && !s.answered_by_aokie && !s.handed_over;
             }
         }
+    }
+
+    /// The call went active because Aokie took the line itself (the
+    /// switchboard accepting a waiting caller, a call rebuilt after lost
+    /// events or a lost link): the receptionist's, as a call auto-answer
+    /// answered.
+    pub fn answered_here(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            s.answered_by_aokie = true;
+        }
+        self.answered();
     }
 
     /// The owner answered, in Aokie, a call left ringing for them: the
@@ -872,14 +898,53 @@ mod tests {
         assert!(s.handed_over && !s.owner_took && s.receptionist_owns(), "answered in Aokie: the receptionist's");
         t.terminate();
 
-        // An ordinary call is the receptionist's, a handset dial the owner's.
+        // A call auto-answer answered is the receptionist's, a handset dial
+        // the owner's.
         ring(&mut t, "call_c");
+        t.current_mut().unwrap().answered_by_aokie = true;
         t.answered();
         assert!(t.current().unwrap().receptionist_owns());
         t.terminate();
-        t.dial("call_d".into(), Some("0400111222".into()), "2026-10-13T05:00:00Z".into(), false);
+        t.dial("call_d".into(), Some("0491 570 156".into()), "2026-10-13T05:00:00Z".into(), false);
         t.answered();
         assert!(!t.current().unwrap().receptionist_owns());
+        t.terminate();
+        // An agent's dial is the receptionist's, nobody having answered it here.
+        t.dial("call_e".into(), Some("0491 570 156".into()), "2026-10-13T05:00:00Z".into(), true);
+        t.answered();
+        assert!(t.current().unwrap().receptionist_owns());
+    }
+
+    /// A call to us that goes active with nobody in Aokie answering it was
+    /// picked up on the phone: auto-answer off, or the owner faster than its
+    /// hold. Theirs, left ringing or not.
+    #[test]
+    fn a_call_picked_up_on_the_phone_is_the_owners_unless_aokie_answered_it() {
+        let mut t = SessionTracker::new();
+        ring(&mut t, "call_a");
+        t.caller_id("0491 570 156".into());
+        t.answered();
+        let s = t.current().unwrap();
+        assert!(s.owner_took && !s.receptionist_owns(), "nobody here answered it");
+        t.terminate();
+
+        // Aokie's answer stands, whatever was decided while the phone
+        // confirmed it (left ringing after the answer went out).
+        ring(&mut t, "call_b");
+        t.current_mut().unwrap().answered_by_aokie = true;
+        t.current_mut().unwrap().left_ringing = true;
+        t.answered();
+        assert!(t.current().unwrap().receptionist_owns(), "Aokie answered it");
+        t.terminate();
+
+        // The switchboard took the line itself.
+        ring(&mut t, "call_c");
+        t.answered_here();
+        let s = t.current().unwrap();
+        assert!(s.answered_by_aokie && s.receptionist_owns());
+        // A second answer indication changes nothing.
+        t.answered();
+        assert!(t.current().unwrap().receptionist_owns());
     }
 
     /// The phone saying the ringing caller hides their number is kept only
