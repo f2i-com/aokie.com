@@ -247,7 +247,7 @@ pub(super) fn run_reply_rounds(
         // `spoken` holds the conservative audible estimate
         // (transcript / history / nudge).
         let mut sent_spans: Vec<String> = Vec::new();
-        eprintln!("[aokie-plugin] agent replying (streaming)â€¦");
+        eprintln!("[aokie-plugin] agent replying (streaming)…");
         // AOK-CTRL-001: the LLM stream runs on a DETACHED
         // worker; this thread pumps sentences + controls, so
         // a hangup/reject acts within ~25 ms even against a
@@ -1072,7 +1072,7 @@ pub(super) fn run_reply_rounds(
                     *stt_silence = Duration::ZERO;
                 } else if barged {
                     eprintln!(
-                    "[aokie-plugin] caller barged in â€” reply cut short"
+                    "[aokie-plugin] caller barged in — reply cut short"
                 );
                 }
             }

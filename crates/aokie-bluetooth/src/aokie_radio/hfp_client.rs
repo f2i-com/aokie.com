@@ -37,6 +37,9 @@ pub struct HfpClientState {
     in_flight_command: Option<hfp::HfpAtCommand>,
     in_flight_sent_at: Option<Instant>,
     slc_failed: bool,
+    /// Commands sent once the SLC is up, awaiting OK/ERROR (same contract
+    /// as the server path's `hfp_outstanding`).
+    outstanding: hfp::OutstandingCommands,
     events: Vec<hfp::HfpEvent>,
     wbs_supported: bool,
     /// Latched once the peer closes the channel (DISC / DM / mux
@@ -48,6 +51,7 @@ impl HfpClientState {
     pub fn new(server_channel: u8, wbs_supported: bool, call_waiting_enabled: bool) -> Self {
         let mut hfp_state = hfp::HfpHandsFreeState::new();
         hfp_state.set_call_waiting_enabled(call_waiting_enabled);
+        hfp_state.set_wbs_supported(wbs_supported);
         Self {
             client: RfcommClientState::new(server_channel),
             hfp_state,
@@ -56,6 +60,7 @@ impl HfpClientState {
             in_flight_command: None,
             in_flight_sent_at: None,
             slc_failed: false,
+            outstanding: hfp::OutstandingCommands::default(),
             events: Vec::new(),
             wbs_supported,
             closed: false,
@@ -209,6 +214,18 @@ impl HfpClientState {
 
     /// SLC stall watchdog — same contract as `RfcommState::tick_hfp_stall`.
     pub fn tick_hfp_stall(&mut self, now: Instant, timeout: Duration) -> bool {
+        if self.hfp_state.service_level_ready() && self.in_flight_sent_at.is_none() {
+            // Post-SLC: a command lost, not the connection (review 1 #3).
+            let Some(command) = self.outstanding.timed_out(now, timeout) else {
+                return false;
+            };
+            eprintln!("[AokieRadio] AG never answered {command} within {timeout:?} — the connection stays up");
+            self.events.push(hfp::HfpEvent::CommandRejected {
+                command,
+                timed_out: true,
+            });
+            return true;
+        }
         let Some(sent_at) = self.in_flight_sent_at else {
             return false;
         };
@@ -218,7 +235,7 @@ impl HfpClientState {
         let stalled = self
             .in_flight_command
             .take()
-            .map(|c| format!("{:?}", c))
+            .map(|c| hfp::at_command_name(&c).to_string())
             .unwrap_or_else(|| "RFCOMM handshake".to_string());
         self.in_flight_sent_at = None;
         if !self.hfp_state.service_level_ready() {
@@ -238,6 +255,28 @@ impl HfpClientState {
         for result in hfp::parse_ag_results_buffered(&mut self.line_carry, payload)? {
             self.events.extend(self.hfp_state.apply_result(&result));
             match result {
+                hfp::HfpAgResult::Ok
+                    if self.in_flight_command.is_none() && self.hfp_state.service_level_ready() =>
+                {
+                    self.outstanding.answered();
+                }
+                hfp::HfpAgResult::Error if self.hfp_state.service_level_ready() => {
+                    // Post-SLC: the phone refusing one command, never a
+                    // failed connection (review 1 #3; the server path's
+                    // matching arm says why).
+                    let command = self
+                        .in_flight_command
+                        .take()
+                        .map(|c| hfp::at_command_name(&c))
+                        .or_else(|| self.outstanding.answered())
+                        .unwrap_or("unsolicited");
+                    self.in_flight_sent_at = None;
+                    eprintln!("[AokieRadio] AG refused {command} — the connection stays up");
+                    self.events.push(hfp::HfpEvent::CommandRejected {
+                        command,
+                        timed_out: false,
+                    });
+                }
                 hfp::HfpAgResult::Ok => {
                     if matches!(
                         self.in_flight_command,
@@ -272,15 +311,25 @@ impl HfpClientState {
                             self.pending_commands.clear();
                             self.slc_failed = true;
                         }
+                        // The command's name, never its arguments (a
+                        // Debug print of Dial carried the number).
                         let label = failed
-                            .map(|c| format!("{:?}", c))
+                            .map(|c| hfp::at_command_name(&c).to_string())
                             .unwrap_or_else(|| "unsolicited".to_string());
                         self.events
                             .push(hfp::HfpEvent::ServiceLevelConnectionFailed(label));
                     }
                 }
                 hfp::HfpAgResult::SelectedCodec(codec) => {
-                    responses.push(self.build_at_frame(hfp::HfpAtCommand::ConfirmCodec(codec))?);
+                    // Confirm only a codec we offered (review 1 #17).
+                    let reply = if self.hfp_state.codec_offered(codec) {
+                        hfp::HfpAtCommand::ConfirmCodec(codec)
+                    } else {
+                        hfp::HfpAtCommand::AvailableCodecs {
+                            wbs_supported: self.wbs_supported,
+                        }
+                    };
+                    responses.push(self.build_at_frame(reply)?);
                 }
                 _ => {}
             }
@@ -345,6 +394,9 @@ impl HfpClientState {
 
     fn build_at_frame(&mut self, command: hfp::HfpAtCommand) -> Result<Vec<u8>, String> {
         self.hfp_state.mark_command_sent(&command);
+        if self.hfp_state.service_level_ready() {
+            self.outstanding.sent(&command, Instant::now());
+        }
         self.client
             .build_outbound_uih(&hfp::build_at_command(command))
     }

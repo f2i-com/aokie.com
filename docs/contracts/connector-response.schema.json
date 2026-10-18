@@ -30,6 +30,7 @@
                 "connector_unavailable",
                 "command_failed",
                 "stale_call",
+                "stale_turn",
                 "ipc_unavailable",
                 "auth_required"
               ],

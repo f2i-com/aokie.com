@@ -40,6 +40,11 @@ pub(super) struct GatewaySession {
     /// wrap the log ring during a call, but never permanently silent.
     pub(super) relay_hello_rejection_logged_at: Option<Instant>,
     pub(super) relay_hello_rejections_suppressed: u32,
+    /// When an outgoing snapshot that failed its own validation was last
+    /// reported. Such a snapshot is withheld, never a reason to reconnect,
+    /// and the poll retries it four times a second, so the report is
+    /// rate-limited like the hello refusals above.
+    pub(super) snapshot_refusal_logged_at: Option<Instant>,
     /// A relay party that must be greeted again before the next publish,
     /// carried from [`Self::accept_mobile_hello`] out to the carrier that owns
     /// the greeting book and can fetch a fresh challenge. Set only for a hello
@@ -175,6 +180,7 @@ impl GatewaySession {
             dropped_relay_kinds: HashSet::new(),
             relay_hello_rejection_logged_at: None,
             relay_hello_rejections_suppressed: 0,
+            snapshot_refusal_logged_at: None,
             relay_regreet_party: None,
             relay_verified_route: None,
             relay_authority_enabled: relay_lease_authority_enabled(),

@@ -290,7 +290,7 @@ pub fn evaluate(
             "consent version {} was accepted but {} is now required — re-consent needed",
             g.version, required_version
         )),
-        Some(g) if g.expires_at.as_deref().is_some_and(|exp| exp <= now_iso) => Some(format!(
+        Some(g) if g.expires_at.as_deref().is_some_and(|exp| has_passed(exp, now_iso)) => Some(format!(
             "consent expired at {} — re-consent needed",
             g.expires_at.as_deref().unwrap_or("")
         )),
@@ -304,6 +304,107 @@ pub fn evaluate(
         (Some(r), ConsentMode::Enforce) => ConsentDecision::Deny(r),
         (Some(r), _) => ConsentDecision::Warn(r),
     }
+}
+
+/// A grant's timestamp as an instant: RFC 3339 (any offset, any fraction),
+/// or a bare `YYYY-MM-DD`, read as that day's start in UTC.
+pub fn parse_instant(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let value = value.trim();
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(at.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .ok()
+        .and_then(|day| day.and_hms_opt(0, 0, 0))
+        .map(|at| at.and_utc())
+}
+
+/// Whether the instant `at` is at or before `now_iso`. Compared as instants,
+/// not as strings: "2027-01-01T10:00:00+11:00" is before
+/// "2027-01-01T00:00:00Z", and a string comparison says otherwise. An
+/// expiry that is not a timestamp has passed (fail closed); a `now` that
+/// is not one (it is always `now_iso8601()`) falls back to the strings.
+fn has_passed(at: &str, now_iso: &str) -> bool {
+    match (parse_instant(at), parse_instant(now_iso)) {
+        (Some(at), Some(now)) => at <= now,
+        (None, _) => true,
+        (Some(_), None) => at <= now_iso,
+    }
+}
+
+/// Whether `grant` has an expiry and it has passed at `now_iso`.
+pub fn expired(grant: &ConsentGrant, now_iso: &str) -> bool {
+    grant
+        .expires_at
+        .as_deref()
+        .is_some_and(|exp| has_passed(exp, now_iso))
+}
+
+/// How long a grant recorded through the unsigned path lasts: the 12 months
+/// the consent screen promises (a signed grant carries its own expiry).
+pub const UNSIGNED_GRANT_DAYS: i64 = 365;
+
+/// Where the newest moment consent was given or taken back is kept, so that
+/// an older signed grant sent again (a replay) is refused even after a
+/// revoke removed the record it would be compared with.
+const FLOOR_FILENAME: &str = "consent-floor.json";
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConsentFloor {
+    not_before: String,
+}
+
+/// The instant a new signed grant's `acceptedAt` may not be before: the
+/// recorded grant's acceptance, or the last revoke, whichever is later.
+pub fn floor(data_dir: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    std::fs::read(data_dir.join(FLOOR_FILENAME))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ConsentFloor>(&bytes).ok())
+        .and_then(|f| parse_instant(&f.not_before))
+}
+
+/// Raise the floor to `at` (never lower it).
+pub fn raise_floor(data_dir: &Path, at: &str) -> Result<(), String> {
+    let Some(new) = parse_instant(at) else {
+        return Err(format!("consent floor: {at:?} is not a timestamp"));
+    };
+    if floor(data_dir).is_some_and(|old| old >= new) {
+        return Ok(());
+    }
+    let json = serde_json::to_vec(&ConsentFloor {
+        not_before: new.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    })
+    .map_err(|e| format!("serialize consent floor: {e}"))?;
+    aokie_core::paths::atomic_write(&data_dir.join(FLOOR_FILENAME), &json)
+}
+
+/// Why a signed `grant` is refused as a replay: it was accepted before the
+/// grant on record (`stored`) or before the floor. `None` = it may be
+/// recorded.
+pub fn replay_refusal(
+    grant: &ConsentGrant,
+    stored: Option<&ConsentGrant>,
+    floor: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<String> {
+    let Some(accepted) = parse_instant(&grant.accepted_at) else {
+        return Some(format!(
+            "the grant's acceptedAt ({:?}) is not a timestamp",
+            grant.accepted_at
+        ));
+    };
+    let stored_at = stored.and_then(|g| parse_instant(&g.accepted_at));
+    let newest = match (stored_at, floor) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }?;
+    (accepted < newest).then(|| {
+        format!(
+            "the grant was accepted at {}, before the consent already recorded or revoked ({}) — an older grant cannot replace it",
+            grant.accepted_at,
+            newest.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        )
+    })
 }
 
 fn config_path(data_dir: &Path) -> PathBuf {
@@ -419,6 +520,13 @@ pub fn save_signed(data_dir: &Path, envelope: &SignedConsent) -> Result<(), Stri
 /// a caller can't back-date it over the wire.
 pub fn save(data_dir: &Path, mut grant: ConsentGrant) -> Result<ConsentGrant, String> {
     grant.accepted_at = aokie_core::events::now_iso8601();
+    // The wizard says grants expire after 12 months: an unsigned one
+    // without an expiry of its own now does.
+    if grant.expires_at.is_none() {
+        grant.expires_at = Some(aokie_core::events::iso8601_after_secs(
+            UNSIGNED_GRANT_DAYS * 86_400,
+        ));
+    }
     let json =
         serde_json::to_string_pretty(&grant).map_err(|e| format!("serialize consent: {e}"))?;
     aokie_core::paths::atomic_write(&config_path(data_dir), json.as_bytes())?;
@@ -426,8 +534,12 @@ pub fn save(data_dir: &Path, mut grant: ConsentGrant) -> Result<ConsentGrant, St
 }
 
 /// Delete the consent record (revocation). A missing file is not an error —
-/// that is already the "no consent" state.
+/// that is already the "no consent" state. The floor is raised to now first,
+/// so no grant accepted before the revoke can be sent again to undo it.
 pub fn revoke(data_dir: &Path) -> Result<(), String> {
+    if let Err(e) = raise_floor(data_dir, &aokie_core::events::now_iso8601()) {
+        eprintln!("[aokie-plugin] consent revoke: the replay floor was not recorded: {e}");
+    }
     let path = config_path(data_dir);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),

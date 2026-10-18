@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  admissionStateLeavesLiveCall,
   assistanceMatchesV2Call,
   assistanceExpiryDelayMs,
   currentV2InAppOffer,
@@ -189,6 +190,20 @@ describe("desktopPairingOpenAfterAdmission", () => {
 
   it("does not open the sheet for unrelated admission states", () => {
     expect(desktopPairingOpenAfterAdmission(false, "desktop_unavailable")).toBe(false);
+  });
+});
+
+describe("admissionStateLeavesLiveCall", () => {
+  it("keeps the call screen while the connection or a lease is live", () => {
+    expect(admissionStateLeavesLiveCall("connected", false)).toBe(false);
+    expect(admissionStateLeavesLiveCall("connected", true)).toBe(false);
+    expect(admissionStateLeavesLiveCall("reconnecting", true)).toBe(false);
+  });
+
+  it("returns to setup only when nothing is connected or held", () => {
+    for (const transport of ["idle", "connecting", "reconnecting", "offline"] as const) {
+      expect(admissionStateLeavesLiveCall(transport, false)).toBe(true);
+    }
   });
 });
 

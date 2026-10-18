@@ -501,6 +501,10 @@ pub(super) fn realtime_error_is_terminal(fatal: bool) -> bool {
     fatal
 }
 
+/// `tool_activity_revision` / `current_activity_revision`: what the caller
+/// did since the model asked to finish, as a count compared, not raw signal
+/// energy (the radio passes the count of turns that resumed the
+/// conversation: see `finish_call_answer`).
 #[cfg(feature = "voice")]
 pub(super) fn realtime_finish_call_allowed(
     agent_hangup: bool,
@@ -534,10 +538,51 @@ pub(super) fn realtime_caller_turn_resumes_conversation(text: &str) -> bool {
     if normalized.contains('?') {
         return true;
     }
-    let words: Vec<&str> = normalized
+    let all_words: Vec<&str> = normalized
         .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect();
+    // Goodbyes that open with "no" ("no problem, bye", "no worries", "no,
+    // that's all") are not the caller saying no to the goodbye: they are taken
+    // out before the turn is judged ("that's" splits into "that", "s").
+    const GOODBYE_NO: [&[&str]; 22] = [
+        &["no", "problem"],
+        &["no", "problems"],
+        &["no", "worries"],
+        &["no", "worry"],
+        &["no", "thanks"],
+        &["no", "thank", "you"],
+        &["not", "a", "problem"],
+        &["no", "that", "s", "all"],
+        &["no", "that", "s", "it"],
+        &["no", "that", "s", "everything"],
+        &["no", "that", "is", "all"],
+        &["no", "that", "is", "it"],
+        &["no", "thats", "all"],
+        &["no", "thats", "it"],
+        &["no", "i", "m", "good"],
+        &["no", "i", "m", "fine"],
+        &["no", "im", "good"],
+        &["no", "im", "fine"],
+        &["no", "i", "am", "good"],
+        &["no", "i", "am", "fine"],
+        &["no", "all", "good"],
+        &["no", "nothing", "else"],
+    ];
+    let mut words: Vec<&str> = Vec::with_capacity(all_words.len());
+    let mut at = 0;
+    while at < all_words.len() {
+        match GOODBYE_NO
+            .iter()
+            .find(|phrase| all_words[at..].starts_with(phrase))
+        {
+            Some(phrase) => at += phrase.len(),
+            None => {
+                words.push(all_words[at]);
+                at += 1;
+            }
+        }
+    }
     if words.len() > 4 {
         return true;
     }
@@ -701,7 +746,6 @@ pub(super) struct RealtimeCallLane {
     pub(super) cancelled_item: Option<String>,
     pub(super) pending_tool_call: Option<(String, String, serde_json::Value, u64)>,
     pub(super) pending_business_lookup: Option<PendingRealtimeBusinessLookup>,
-    pub(super) deferred_input: DeferredRealtimeInput,
     /// Every tool call this call has asked for (MOB-01): duplicate ids, the
     /// per-call allowance and the busy decision live in the ledger.
     pub(super) tools: ToolLedger,
@@ -725,6 +769,16 @@ pub(super) struct RealtimeCallLane {
     pub(super) latest_caller_turn: Option<(u32, String)>,
     pub(super) authorized_finish_tool: Option<(String, u64)>,
     pub(super) pending_hangup: Option<PendingRealtimeHangup>,
+    /// Completed caller turns that resumed the conversation
+    /// ([`realtime_caller_turn_resumes_conversation`]), counted.
+    pub(super) resuming_caller_turns: u64,
+    /// `resuming_caller_turns` when the pending tool call was taken in: a
+    /// goodbye is refused only for a turn that resumed the conversation
+    /// after the model asked to finish, never for noise.
+    pub(super) tool_intake_resuming_turns: u64,
+    /// This session resumes a call the caller was already greeted on (a
+    /// return from the owner or from hold, a reconnect).
+    pub(super) resumed: bool,
 }
 
 #[cfg(all(aokie_radio, feature = "voice"))]
@@ -732,51 +786,6 @@ pub(super) struct PendingRealtimeBusinessLookup {
     pub(super) tool_call_id: String,
     pub(super) name: String,
     pub(super) lookup: PendingBusinessLookup,
-}
-
-/// Caller PCM withheld only while a provider function result is outstanding.
-/// Realtime VAD has automatic response creation enabled, so forwarding speech
-/// in that interval could start a second response before Desktop has supplied
-/// the first function output. Preserve every sample in order, then release it
-/// in 100 ms commands immediately after the tool result clears that fence.
-#[cfg(all(aokie_radio, feature = "voice"))]
-#[derive(Default)]
-pub(super) struct DeferredRealtimeInput {
-    pub(super) samples: std::collections::VecDeque<i16>,
-}
-
-#[cfg(all(aokie_radio, feature = "voice"))]
-impl DeferredRealtimeInput {
-    pub(super) const MAX_MS: usize = 15_000;
-    pub(super) const FLUSH_MS: usize = 100;
-
-    pub(super) fn push(&mut self, samples: &[i16], sample_rate: u32) {
-        // Overflow drops the OLDEST samples instead of failing the session: a
-        // long tool wait must never become a call-ending error. Losing the
-        // head of withheld caller audio only degrades the replay; server VAD
-        // re-segments whatever is flushed.
-        let max_samples = (sample_rate as usize)
-            .saturating_mul(Self::MAX_MS)
-            .saturating_div(1_000)
-            .max(1);
-        self.samples.extend(samples.iter().copied());
-        if self.samples.len() > max_samples {
-            let excess = self.samples.len() - max_samples;
-            self.samples.drain(..excess);
-        }
-    }
-
-    pub(super) fn take_flush_chunk(&mut self, sample_rate: u32) -> Vec<i16> {
-        let take = self
-            .samples
-            .len()
-            .min((sample_rate as usize * Self::FLUSH_MS / 1_000).max(1));
-        self.samples.drain(..take).collect()
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.samples.is_empty()
-    }
 }
 
 #[cfg(all(aokie_radio, feature = "voice"))]
@@ -816,7 +825,6 @@ impl RealtimeCallLane {
             cancelled_item: None,
             pending_tool_call: None,
             pending_business_lookup: None,
-            deferred_input: DeferredRealtimeInput::default(),
             tools: ToolLedger::default(),
             refused_tools: std::collections::VecDeque::new(),
             queued_answers: std::collections::VecDeque::new(),
@@ -828,6 +836,9 @@ impl RealtimeCallLane {
             latest_caller_turn: None,
             authorized_finish_tool: None,
             pending_hangup: None,
+            resuming_caller_turns: 0,
+            tool_intake_resuming_turns: 0,
+            resumed: false,
         }
     }
 
@@ -907,6 +918,7 @@ impl RealtimeCallLane {
             // drain before beginning the tool. Host lookups are then polled
             // asynchronously.
             ToolAdmission::Run(_) => {
+                self.tool_intake_resuming_turns = self.resuming_caller_turns;
                 self.pending_tool_call = Some((
                     tool_call_id,
                     name,

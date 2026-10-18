@@ -73,11 +73,22 @@ object AokieSecureStore {
     }.getOrDefault(false)
   }
 
-  fun get(context: Context, logicalKey: String): String? = synchronized(lock) {
+  /**
+   * For Kotlin's own short-lived records (offers, call actions, the push token), where an unreadable value is
+   * as good as none. Rust's identity, session and profile records go through [read] instead: there a read
+   * error must never look like absence, or the caller would mint a new identity or sign the user out.
+   */
+  fun get(context: Context, logicalKey: String): String? = read(context, logicalKey).getOrNull()
+
+  /**
+   * The stored value, `null` only when nothing is stored under [logicalKey], or a failure for any key, file,
+   * format, Keystore or decryption error.
+   */
+  fun read(context: Context, logicalKey: String): Result<String?> = synchronized(lock) {
     runCatching {
       val keyBytes = checkedKey(logicalKey)
       val target = file(context, logicalKey)
-      if (!target.exists()) return@synchronized null
+      if (!target.exists()) return@runCatching null
       val encoded = AtomicFile(target).readFully()
       require(encoded.size <= MAX_VALUE_BYTES + 128) { "secure value is too large" }
 
@@ -103,7 +114,7 @@ object AokieSecureStore {
       val plaintext = cipher.doFinal(ciphertext)
       require(plaintext.size <= MAX_VALUE_BYTES) { "secure value is too large" }
       plaintext.toString(Charsets.UTF_8)
-    }.getOrNull()
+    }
   }
 
   fun delete(context: Context, logicalKey: String): Boolean = synchronized(lock) {

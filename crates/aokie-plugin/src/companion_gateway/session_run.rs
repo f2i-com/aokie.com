@@ -112,14 +112,60 @@ impl GatewaySession {
                 device_id: Some(device_id),
                 snapshot,
             };
-            targeted.validate().map_err(|_| {
-                WorkerError::reconnect("Projected relay snapshot failed local validation")
-            })?;
+            if targeted.validate().is_err() {
+                // One device's projection is withheld; the others still get
+                // theirs, and nobody's session is reconnected over it.
+                self.report_withheld_snapshot("a projected relay snapshot failed validation");
+                continue;
+            }
             projected.push(serde_json::to_string(&targeted).map_err(|_| {
                 WorkerError::reconnect("Projected relay snapshot could not be encoded")
             })?);
         }
         Ok(projected)
+    }
+
+    /// A snapshot that passes the receivers' own validation, or `None`.
+    ///
+    /// A snapshot that fails is never a reason to reconnect: that would tear
+    /// down every device's media and, since the same state is rebuilt on the
+    /// next connection, loop for the rest of the call. Captions are the one
+    /// part made of free text, so the snapshot is retried without them, then
+    /// without offers; if it still fails it is withheld (and reported) while
+    /// the Companions keep the last state they had.
+    pub(super) fn publishable_snapshot(
+        &mut self,
+        mut snapshot: AuthoritativeCallSnapshot,
+    ) -> Option<AuthoritativeCallSnapshot> {
+        if snapshot.validate().is_ok() {
+            return Some(snapshot);
+        }
+        if !snapshot.captions.is_empty() {
+            snapshot.captions.clear();
+            if snapshot.validate().is_ok() {
+                self.report_withheld_snapshot("captions failed validation and were left out");
+                return Some(snapshot);
+            }
+        }
+        if !snapshot.pending_mobile_offers.is_empty() {
+            snapshot.pending_mobile_offers.clear();
+            if snapshot.validate().is_ok() {
+                self.report_withheld_snapshot("offers failed validation and were left out");
+                return Some(snapshot);
+            }
+        }
+        self.report_withheld_snapshot("the call snapshot failed validation and was withheld");
+        None
+    }
+
+    pub(super) fn report_withheld_snapshot(&mut self, detail: &str) {
+        let due = self
+            .snapshot_refusal_logged_at
+            .is_none_or(|at| at.elapsed() >= RELAY_HELLO_REJECTION_LOG_INTERVAL);
+        if due {
+            self.snapshot_refusal_logged_at = Some(Instant::now());
+            eprintln!("[aokie-plugin][companion] stage=snapshot_withheld detail={detail}");
+        }
     }
 
     pub(super) fn idle_transition_frame(&mut self) -> Result<Option<String>, WorkerError> {
@@ -223,9 +269,9 @@ impl GatewaySession {
             pending_mobile_offers: Vec::new(),
             occurred_at: aokie_core::events::now_iso8601(),
         };
-        snapshot
-            .validate()
-            .map_err(|_| WorkerError::reconnect("Authoritative call snapshot is invalid"))?;
+        let Some(snapshot) = self.publishable_snapshot(snapshot) else {
+            return Ok(None);
+        };
         let fingerprint = serde_json::to_string(&json!({
             "callId": snapshot.call_id,
             "callEpoch": snapshot.call_epoch,
@@ -271,9 +317,9 @@ impl GatewaySession {
         } else {
             self.attach_pending_offers(snapshot, &remote)?
         };
-        snapshot
-            .validate()
-            .map_err(|_| WorkerError::reconnect("Authoritative call snapshot is invalid"))?;
+        let Some(snapshot) = self.publishable_snapshot(snapshot) else {
+            return Ok(None);
+        };
         let frame = PluginSnapshotFrame {
             kind: "plugin_snapshot".into(),
             schema_version: SCHEMA_VERSION,
@@ -282,9 +328,10 @@ impl GatewaySession {
             device_id: None,
             snapshot,
         };
-        frame
-            .validate()
-            .map_err(|_| WorkerError::reconnect("Plugin snapshot frame is invalid"))?;
+        if frame.validate().is_err() {
+            self.report_withheld_snapshot("the snapshot frame failed validation");
+            return Ok(None);
+        }
         self.last_snapshot_fingerprint = Some(fingerprint);
         self.last_snapshot_sent = Some(Instant::now());
         serde_json::to_string(&frame)

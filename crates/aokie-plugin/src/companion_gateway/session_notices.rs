@@ -191,14 +191,14 @@ impl GatewaySession {
             || expected_switchboard_revision
                 .is_some_and(|revision| revision != radio.switchboard_revision())
         {
-            return Err(WorkerError::reconnect(
+            return Err(WorkerError::refused(
                 "Companion claim proposal crossed a physical switchboard transition",
             ));
         }
         let request_id = notice
             .request_id
             .clone()
-            .ok_or_else(|| WorkerError::reconnect("Companion claim proposal omitted requestId"))?;
+            .ok_or_else(|| WorkerError::refused("Companion claim proposal omitted requestId"))?;
         match notice.lease.mode {
             LeaseMode::Consult if notice.lease.phase == LeasePhase::Prepared => {
                 let remote = radio
@@ -206,7 +206,7 @@ impl GatewaySession {
                     .ok_or_else(|| WorkerError::reconnect("Companion media is unavailable"))?
                     .snapshot();
                 let assistance = self.assistance.pending_frame(&self.app_id).ok_or_else(|| {
-                    WorkerError::reconnect(
+                    WorkerError::refused(
                         "Private consultation requires a current Aokie assistance request",
                     )
                 })?;
@@ -217,20 +217,20 @@ impl GatewaySession {
                     || assistance.switchboard_revision != radio.switchboard_revision()
                     || assistance.remote_revision != remote.remote_revision
                 {
-                    return Err(WorkerError::reconnect(
+                    return Err(WorkerError::refused(
                         "Private consultation does not match the active assistance fence",
                     ));
                 }
             }
             LeaseMode::Takeover if notice.lease.phase == LeasePhase::Prepared => {}
             _ => {
-                return Err(WorkerError::reconnect(
+                return Err(WorkerError::refused(
                     "Companion claim proposal has an invalid lease phase",
                 ))
             }
         }
         if self.prepared.is_some() {
-            return Err(WorkerError::reconnect(
+            return Err(WorkerError::refused(
                 "Companion gateway proposed a second consult/takeover claimant",
             ));
         }
@@ -238,7 +238,7 @@ impl GatewaySession {
             if notice.lease.mode != LeaseMode::Takeover
                 || notice.lease.phase != LeasePhase::Prepared
             {
-                return Err(WorkerError::reconnect(
+                return Err(WorkerError::refused(
                     "A request-bound transfer must use a prepared takeover lease",
                 ));
             }
@@ -250,7 +250,7 @@ impl GatewaySession {
                 .assistance
                 .pending_transfer(&notice.lease.call_id, notice.lease.call_epoch)
                 .ok_or_else(|| {
-                    WorkerError::reconnect("The accepted transfer request is no longer pending")
+                    WorkerError::refused("The accepted transfer request is no longer pending")
                 })?;
             if transfer.request_id != transfer_request_id
                 || transfer.fence.call_id != notice.lease.call_id
@@ -263,7 +263,7 @@ impl GatewaySession {
                     .as_deref()
                     .is_some_and(|accepted| accepted != notice.device_id)
             {
-                return Err(WorkerError::reconnect(
+                return Err(WorkerError::refused(
                     "The accepted transfer crossed its exact assistance fence",
                 ));
             }
@@ -275,14 +275,14 @@ impl GatewaySession {
                 &transfer.request_id,
                 &notice.lease.mobile_key_thumbprint,
             ) {
-                return Err(WorkerError::reconnect(
+                return Err(WorkerError::refused(
                     "The transfer was not offered to this endpoint",
                 ));
             }
             self.assistance
                 .accept_transfer(&transfer.request_id, &transfer.fence, &notice.device_id)
                 .map_err(|_| {
-                    WorkerError::reconnect("Another owner endpoint accepted the transfer first")
+                    WorkerError::refused("Another owner endpoint accepted the transfer first")
                 })?;
             let accepted = self
                 .assistance
@@ -293,7 +293,7 @@ impl GatewaySession {
                         && accepted.accepted_by.as_deref() == Some(notice.device_id.as_str())
                 })
                 .ok_or_else(|| {
-                    WorkerError::reconnect(
+                    WorkerError::refused(
                         "The transfer acceptance did not produce a bounded setup window",
                     )
                 })?;
@@ -342,7 +342,7 @@ impl GatewaySession {
     ) -> Result<(), WorkerError> {
         self.validate_notice(&notice, radio)?;
         if notice.lease.mode != LeaseMode::Monitor || notice.lease.phase != LeasePhase::Active {
-            return Err(WorkerError::reconnect(
+            return Err(WorkerError::refused(
                 "Only active monitor leases may be granted directly",
             ));
         }
@@ -367,10 +367,11 @@ impl GatewaySession {
             .find(|route| route.binding.lease_id.as_deref() == Some(stable_id.as_str()))
         {
             route.lease_jti = notice.lease.jti.clone();
-            route.lease_ttl_ms = lease_ttl_ms(&notice.lease)?;
+            route.lease_ttl_ms = lease_ttl_ms(&notice.lease)
+                .map_err(|error| WorkerError::refused(error.message))?;
             media
                 .renew_lease(route.binding.clone(), route.lease_ttl_ms)
-                .map_err(|_| WorkerError::reconnect("Companion media lease renewal failed"))?;
+                .map_err(|_| WorkerError::refused("Companion media lease renewal failed"))?;
         } else if let Some(prepared) = self
             .prepared
             .as_ref()
@@ -378,9 +379,11 @@ impl GatewaySession {
         {
             let binding = binding_for_claims(&notice.lease);
             let _ = prepared;
+            let ttl = lease_ttl_ms(&notice.lease)
+                .map_err(|error| WorkerError::refused(error.message))?;
             media
-                .renew_lease(binding, lease_ttl_ms(&notice.lease)?)
-                .map_err(|_| WorkerError::reconnect("Prepared media lease renewal failed"))?;
+                .renew_lease(binding, ttl)
+                .map_err(|_| WorkerError::refused("Prepared media lease renewal failed"))?;
         }
         Ok(())
     }
@@ -411,9 +414,9 @@ impl GatewaySession {
         notice
             .lease
             .validate(now)
-            .map_err(|_| WorkerError::reconnect("Companion lease claims are invalid"))?;
+            .map_err(|_| WorkerError::refused("Companion lease claims are invalid"))?;
         if notice.lease.expires_at > now.saturating_add(300) {
-            return Err(WorkerError::reconnect(
+            return Err(WorkerError::refused(
                 "Companion lease lifetime exceeds the local safety limit",
             ));
         }
@@ -425,7 +428,7 @@ impl GatewaySession {
             || remote.call_epoch != notice.lease.call_epoch
             || remote.owner_epoch != notice.lease.owner_epoch
         {
-            return Err(WorkerError::reconnect(
+            return Err(WorkerError::refused(
                 "Companion lease does not match physical call epochs",
             ));
         }

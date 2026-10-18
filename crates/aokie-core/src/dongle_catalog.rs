@@ -12,8 +12,16 @@
 //!
 //! The catalog is curated rather than open: the list intentionally
 //! sticks to chipsets we've smoke-tested (Broadcom BCM2070x, Realtek
-//! RTL8761/RTL8821CE). Adding a new chipset means appending here and
+//! RTL8761, CSR8510). Adding a new chipset means appending here and
 //! verifying the HCI transport works end-to-end on it.
+//!
+//! Only USB dongles, never a computer's own Bluetooth: Linux opens any
+//! catalogued controller without asking (the system's Bluetooth, and a
+//! keyboard on it, with it) and Windows offers each one a WinUSB bind.
+//! A laptop's built-in adapter (Realtek's RTL8821CE, 0bda:c822, which
+//! HP and Lenovo fit inside, or anything of Intel's) is not a dongle,
+//! so it is not here; someone who means to give one to Aokie sets the
+//! unknown-dongle opt-in below.
 
 use serde::Serialize;
 
@@ -65,13 +73,6 @@ pub const DEFAULT_CATALOG: &[DongleId] = &[
     DongleId {
         vid: 0x0bda,
         pid: 0x8771,
-        tier: DongleCompatTier::Beta,
-    },
-    // Realtek RTL8821CE — newer combo cards seen in some HP / Lenovo
-    // laptops also expose a USB Bluetooth interface with these IDs.
-    DongleId {
-        vid: 0x0bda,
-        pid: 0xc822,
         tier: DongleCompatTier::Beta,
     },
     // Cambridge Silicon Radio CSR8510 A10 — ubiquitous BT 4.0 dongle,
@@ -419,6 +420,25 @@ mod tests {
         let approval = evaluate_install_target(&stranger, true).unwrap();
         assert_eq!(approval.tier, None);
         assert!(approval.unknown_opt_in);
+    }
+
+    /// Adapters that are part of a computer, not dongles: Realtek's
+    /// RTL8821CE and RTL8822BE cards, and Intel's (Intel makes no USB
+    /// dongle at all). The catalog is opened or rebound without asking,
+    /// so none of them may be in it.
+    #[test]
+    fn catalog_names_no_computers_own_bluetooth() {
+        const BUILT_IN: &[(u16, u16)] = &[(0x0bda, 0xc822), (0x0bda, 0xb00c)];
+        for d in DEFAULT_CATALOG {
+            assert!(
+                !BUILT_IN.contains(&(d.vid, d.pid)),
+                "{:04x}:{:04x} is a computer's own Bluetooth",
+                d.vid,
+                d.pid
+            );
+            assert_ne!(d.vid, 0x8087, "Intel's Bluetooth is always built in");
+        }
+        assert_eq!(dongle_tier(0x0bda, 0xc822), None);
     }
 
     #[test]

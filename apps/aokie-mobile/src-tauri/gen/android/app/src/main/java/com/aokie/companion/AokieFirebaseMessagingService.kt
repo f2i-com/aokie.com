@@ -68,12 +68,17 @@ class AokieFirebaseMessagingService : FirebaseMessagingService() {
       AokieOfferStore.recordDiagnostic(this, "voice_offer_cancel_invalid")
       return
     }
-    val cancelled = AokieOfferStore.cancel(this, cancellation.offerId, cancellation.reason) ?: return
-    startService(
-      Intent(this, AokieIncomingCallService::class.java)
-        .setAction(AokieIncomingCallService.ACTION_CANCEL)
-        .putExtra(AokieIncomingCallService.EXTRA_OFFER_ID, cancelled.offerId),
-    )
+    val cancelled = AokieOfferStore.cancelFromPush(this, cancellation.offerId, cancellation.reason) ?: return
+    runCatching {
+      startService(
+        Intent(this, AokieIncomingCallService::class.java)
+          .setAction(AokieIncomingCallService.ACTION_CANCEL)
+          .putExtra(AokieIncomingCallService.EXTRA_OFFER_ID, cancelled.offerId),
+      )
+    }.onFailure {
+      // The record and its notification are already gone; with no service running there is no surface left.
+      AokieOfferStore.recordDiagnostic(this, "voice_offer_cancel_service_start_failed")
+    }
   }
 
   private fun receiveInformational(data: Map<String, String>) {

@@ -175,3 +175,91 @@ fn mock_lifecycle_events_validate_against_desktop_event_schema() {
     // phone.pairing_started.
     assert_eq!(seen, 11);
 }
+
+/// Every typed error code the plugin returns (the shared connector contract
+/// fixture) must be one the response schema admits: `stale_turn` was missing,
+/// so a schema-validating host would reject the plugin's benign "reply
+/// skipped" answer as a malformed response.
+#[test]
+fn connector_response_schema_admits_every_typed_error_code() {
+    let fixture = load_json(&contracts_dir().join("aokie-connector-contract.v1.json"));
+    let schema = load_json(&contracts_dir().join("connector-response.schema.json"));
+    let validator = validator_for("connector-response.schema.json");
+    let enumerated: Vec<&str> = schema["oneOf"]
+        .as_array()
+        .or_else(|| schema["anyOf"].as_array())
+        .expect("connector-response is a union of the ok and error shapes")
+        .iter()
+        .filter_map(|branch| branch["properties"]["error"]["properties"]["code"]["enum"].as_array())
+        .flatten()
+        .map(|code| code.as_str().unwrap())
+        .collect();
+    assert!(!enumerated.is_empty(), "the error branch enumerates its codes");
+    for code in fixture["errors"].as_array().unwrap() {
+        let code = code.as_str().unwrap();
+        assert!(
+            enumerated.contains(&code),
+            "connector-response.schema.json does not admit the plugin's error code {code}"
+        );
+        assert_valid(
+            &validator,
+            &json!({"ok": false, "error": {"code": code, "message": "probe"}}),
+            &format!("error response {code}"),
+        );
+    }
+}
+
+/// The phone service definition and the dispatcher agree on every action's
+/// input: each schema is closed (a flow cannot send a field the plugin would
+/// refuse as unknown), and each field it declares is one the dispatcher
+/// accepts. The probe gives every field a value of the wrong type, so a
+/// handler that knows the field refuses it on its type (or a missing required
+/// field), never as unknown, and no handler gets far enough to act.
+#[test]
+fn phone_definition_inputs_are_closed_and_known_to_the_dispatcher() {
+    let _guard = plugin_test_lock().lock().expect("plugin test lock");
+    let definition =
+        load_json(&Path::new(env!("CARGO_MANIFEST_DIR")).join("definitions/phone.json"));
+    let mut plugin = Plugin::ephemeral(true);
+    let mut sink = VecSink::default();
+    let actions = definition["actions"].as_array().expect("actions array");
+    assert!(!actions.is_empty());
+    for action in actions {
+        let id = action["id"].as_str().unwrap();
+        let command = action["transport"]["command"].as_str().unwrap();
+        let input = &action["inputSchema"];
+        assert_eq!(input["type"], json!("object"), "{id} input is an object");
+        assert_eq!(
+            input["additionalProperties"],
+            json!(false),
+            "{id} input schema must be closed (additionalProperties: false)"
+        );
+        let properties = input["properties"].as_object().cloned().unwrap_or_default();
+        for required in input["required"].as_array().into_iter().flatten() {
+            assert!(
+                properties.contains_key(required.as_str().unwrap()),
+                "{id} requires an undeclared field {required}"
+            );
+        }
+        for field in properties.keys() {
+            let payload = json!({ field: {"__contractProbe": true} });
+            if let Err(e) = plugin.dispatch_command(command, &payload, &mut sink) {
+                assert!(
+                    !e.message.contains("unknown payload field"),
+                    "{id} declares {field}, but {command} refuses it as unknown: {}",
+                    e.message
+                );
+            }
+        }
+        // And the dispatcher still refuses a field the definition does not
+        // declare, which is what the closed schema mirrors.
+        let refused = plugin
+            .dispatch_command(command, &json!({"__contractProbe": true}), &mut sink)
+            .expect_err("an undeclared field is refused");
+        assert!(
+            refused.message.contains("unknown payload field"),
+            "{command} refused an undeclared field for another reason: {}",
+            refused.message
+        );
+    }
+}

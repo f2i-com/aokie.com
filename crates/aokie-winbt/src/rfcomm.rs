@@ -8,16 +8,18 @@
 //! Windows resolves the service's RFCOMM channel from its own SDP cache,
 //! so none of the dongle's SDP-client work is needed here.
 //!
-//! BLOCKING BY DESIGN: every method ends in an `IAsync*.get()` wait with
-//! no app-level timeout (WinRT offers no read deadline on `DataReader`).
-//! That is acceptable for v1 because `MapLoop`/`PbapFetch` run on the
-//! crate's dedicated worker thread (see `worker.rs`) — a stuck OBEX
-//! exchange stalls only the SMS/phonebook lane, never the voice pipeline.
-//! The wedge containment that IS implemented: session drivers bound every
-//! op to [`MAX_OBEX_ROUND_TRIPS`] packets, and a dropped phone makes the
-//! OS surface an error on the pending read rather than hanging forever.
-//! Revisit with a watchdog-thread channel if a real phone proves it can
-//! black-hole a read indefinitely.
+//! BLOCKING, BUT BOUNDED: every method waits on a WinRT async step, and
+//! WinRT gives a `DataReader` no read deadline of its own, so each wait is
+//! capped here (`bounded!`: [`CONNECT_LIMIT`] for finding and connecting
+//! the phone's service, [`IO_LIMIT`] for each write and read). A phone that
+//! stops answering mid-exchange then fails the op, which the session
+//! drivers already handle (the channel is dropped and the next op opens a
+//! fresh one), instead of holding the messaging thread for good. Session
+//! drivers also bound every op to [`MAX_OBEX_ROUND_TRIPS`] packets. The
+//! messaging lane runs on a thread of its own (`worker.rs`), so even a slow
+//! op never holds up call control.
+
+use std::time::{Duration, Instant};
 
 use aokie_bluetooth::aokie_radio::obex::{FixedPayload, Packet};
 use windows::Devices::Bluetooth::Rfcomm::RfcommServiceId;
@@ -40,6 +42,45 @@ pub(crate) const MAX_OBEX_PACKET_BYTES: usize = 0x1_0000;
 /// an error instead of looping the worker thread forever.
 pub(crate) const MAX_OBEX_ROUND_TRIPS: u32 = 256;
 
+/// The longest one step of finding and connecting a phone's service may
+/// take: Windows pages an idle phone up for it (a few seconds) and may ask it
+/// for its services over the air.
+const CONNECT_LIMIT: Duration = Duration::from_secs(20);
+
+/// The longest one write or read on an open channel may take. An OBEX
+/// response is normally back in well under a second; the dongle gives a
+/// whole MAP op 30 s (`MAP_OP_DEADLINE`).
+const IO_LIMIT: Duration = Duration::from_secs(15);
+
+/// How often a bounded wait looks at the step's status.
+const WAIT_POLL: Duration = Duration::from_millis(5);
+
+/// Wait at most `$limit` for a WinRT async step (an `IAsyncOperation` or an
+/// `IAsyncAction`) and take its result, the error naming `$what`. Past the
+/// limit the step is cancelled and the wait ends in an error. A macro, not a
+/// function: the async interfaces share these methods but no trait this
+/// crate can name.
+macro_rules! bounded {
+    ($op:expr, $limit:expr, $what:expr) => {{
+        let op = $op;
+        let limit: Duration = $limit;
+        let deadline = Instant::now() + limit;
+        loop {
+            // AsyncStatus::Started is 0; anything else is over, and `get`
+            // returns its result (or its error) at once.
+            match op.Status() {
+                Ok(status) if status.0 == 0 => {}
+                _ => break op.get().map_err(|e| format!("{}: {}", $what, hr(&e))),
+            }
+            if Instant::now() >= deadline {
+                let _ = op.Cancel();
+                break Err(format!("{}: no answer in {} s", $what, limit.as_secs()));
+            }
+            std::thread::sleep(WAIT_POLL);
+        }
+    }};
+}
+
 /// One blocking RFCOMM byte channel to a service on the phone.
 pub(crate) struct BtChannel {
     /// Never read directly — kept alive because the streams die with the
@@ -56,15 +97,12 @@ impl BtChannel {
     /// (plan §4 "Pairing UX").
     pub(crate) fn connect(phone_address: u64, short_uuid: u16) -> Result<Self, String> {
         ensure_ro_initialized()?;
-        let device = BluetoothDevice::FromBluetoothAddressAsync(phone_address)
-            .map_err(|e| format!("BluetoothDevice::FromBluetoothAddressAsync: {}", hr(&e)))?
-            .get()
-            .map_err(|e| {
-                format!(
-                    "no Bluetooth device at address {phone_address:012X}: {}",
-                    hr(&e)
-                )
-            })?;
+        let device = bounded!(
+            BluetoothDevice::FromBluetoothAddressAsync(phone_address)
+                .map_err(|e| format!("BluetoothDevice::FromBluetoothAddressAsync: {}", hr(&e)))?,
+            CONNECT_LIMIT,
+            format!("no Bluetooth device at address {phone_address:012X}")
+        )?;
         let service_id = RfcommServiceId::FromShortId(short_uuid as u32).map_err(|e| {
             format!(
                 "RfcommServiceId::FromShortId(0x{short_uuid:04X}): {}",
@@ -73,11 +111,13 @@ impl BtChannel {
         })?;
         // NOTE: in windows-rs 0.61.3 this takes ONE argument — there is
         // no cache-mode overload in the projection.
-        let result = device
-            .GetRfcommServicesForIdAsync(&service_id)
-            .map_err(|e| format!("GetRfcommServicesForIdAsync: {}", hr(&e)))?
-            .get()
-            .map_err(|e| format!("GetRfcommServicesForIdAsync wait: {}", hr(&e)))?;
+        let result = bounded!(
+            device
+                .GetRfcommServicesForIdAsync(&service_id)
+                .map_err(|e| format!("GetRfcommServicesForIdAsync: {}", hr(&e)))?,
+            CONNECT_LIMIT,
+            "GetRfcommServicesForIdAsync wait"
+        )?;
         let status = result
             .Error()
             .map_err(|e| format!("RfcommDeviceServicesResult::Error: {}", hr(&e)))?;
@@ -107,16 +147,13 @@ impl BtChannel {
             .ConnectionServiceName()
             .map_err(|e| format!("RfcommDeviceService::ConnectionServiceName: {}", hr(&e)))?;
         let socket = StreamSocket::new().map_err(|e| format!("StreamSocket::new: {}", hr(&e)))?;
-        socket
-            .ConnectAsync(&host, &port)
-            .map_err(|e| format!("StreamSocket::ConnectAsync: {}", hr(&e)))?
-            .get()
-            .map_err(|e| {
-                format!(
-                    "RFCOMM connect to {phone_address:012X} svc 0x{short_uuid:04X}: {}",
-                    hr(&e)
-                )
-            })?;
+        bounded!(
+            socket
+                .ConnectAsync(&host, &port)
+                .map_err(|e| format!("StreamSocket::ConnectAsync: {}", hr(&e)))?,
+            CONNECT_LIMIT,
+            format!("RFCOMM connect to {phone_address:012X} svc 0x{short_uuid:04X}")
+        )?;
         let writer = DataWriter::CreateDataWriter(
             &socket
                 .OutputStream()
@@ -140,12 +177,13 @@ impl BtChannel {
         self.writer
             .WriteBytes(bytes)
             .map_err(|e| format!("RFCOMM write: {}", hr(&e)))?;
-        let stored = self
-            .writer
-            .StoreAsync()
-            .map_err(|e| format!("RFCOMM flush: {}", hr(&e)))?
-            .get()
-            .map_err(|e| format!("RFCOMM flush wait: {}", hr(&e)))?;
+        let stored = bounded!(
+            self.writer
+                .StoreAsync()
+                .map_err(|e| format!("RFCOMM flush: {}", hr(&e)))?,
+            IO_LIMIT,
+            "RFCOMM flush wait"
+        )?;
         if stored as usize != bytes.len() {
             return Err(format!(
                 "RFCOMM short write: {stored} of {} bytes stored",
@@ -198,12 +236,13 @@ impl BtChannel {
     }
 
     fn load(&self, want: u32) -> Result<usize, String> {
-        let loaded = self
-            .reader
-            .LoadAsync(want)
-            .map_err(|e| format!("RFCOMM load: {}", hr(&e)))?
-            .get()
-            .map_err(|e| format!("RFCOMM load wait: {}", hr(&e)))?;
+        let loaded = bounded!(
+            self.reader
+                .LoadAsync(want)
+                .map_err(|e| format!("RFCOMM load: {}", hr(&e)))?,
+            IO_LIMIT,
+            "RFCOMM load wait"
+        )?;
         Ok(loaded as usize)
     }
 }

@@ -449,7 +449,15 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(hex)
 }
 
-pub fn write_winusb_package(vid: u16, pid: u16, work_dir: &Path) -> Result<PathBuf, String> {
+/// Stage the driver package for `vid`/`pid` in `work_dir`: the static signed pair where it ships, else (a
+/// development or managed-beta build) an INF rendered with `driver_ver`, the value the dispatcher also puts in the
+/// helper's job (`crate::driver_version`).
+pub fn write_winusb_package(
+    vid: u16,
+    pid: u16,
+    work_dir: &Path,
+    driver_ver: &str,
+) -> Result<PathBuf, String> {
     std::fs::create_dir_all(work_dir)
         .map_err(|e| format!("could not create WinUSB package dir {:?}: {}", work_dir, e))?;
 
@@ -508,7 +516,7 @@ pub fn write_winusb_package(vid: u16, pid: u16, work_dir: &Path) -> Result<PathB
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("Aokie Bluetooth Dongle");
 
-    let package = winusb::WinusbPackage::new(vid, pid, description);
+    let package = winusb::WinusbPackage::new(vid, pid, description).with_driver_ver(driver_ver);
     let inf_path = work_dir.join(winusb::INF_NAME);
     // A reused work directory must not accidentally pair the freshly rendered
     // managed-beta INF with a stale catalog from an earlier production stage.

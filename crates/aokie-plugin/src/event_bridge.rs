@@ -147,11 +147,29 @@ pub fn emit_event(
     force_outbox: bool,
     mode: EmitMode,
 ) -> Result<(), String> {
-    let outboxed = force_outbox || is_essential(&event.name);
+    let mut outboxed = force_outbox || is_essential(&event.name);
     if outboxed {
-        let outcome = outbox
-            .insert_pending(event, TARGET_DESKTOP)
-            .map_err(|e| format!("outbox write failed for {}: {e}", event.idempotency_key))?;
+        // When the outbox cannot hold the event (disk full, its lock held past
+        // the busy timeout, or the Keychain will not seal it) the event still
+        // goes to the host now, once, without durability: a live call or text
+        // event the host never hears of is worse than one it hears of without
+        // a replay behind it. (The radio's own emit says the same.)
+        let outcome = match outbox.insert_pending(event, TARGET_DESKTOP) {
+            Ok(outcome) => outcome,
+            Err(e) if mode != EmitMode::RequireAck => {
+                eprintln!(
+                    "[aokie-plugin] OUTBOX WRITE FAILED for {} ({e}) — emitting it live, not durable",
+                    event.idempotency_key
+                );
+                return emit_live(sink, event);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "outbox write failed for {}: {e} (and the host does not support eventAck, so it is not emitted)",
+                    event.idempotency_key
+                ))
+            }
+        };
         match outcome {
             crate::outbox::InsertOutcome::PayloadCollision => {
                 // A DIFFERENT occurrence collided on this key (key-derivation
@@ -165,13 +183,23 @@ pub fn emit_event(
             }
             crate::outbox::InsertOutcome::QuarantinedProtectFailed => {
                 // AOK-DUR-001: the sensitive payload could not be protected at
-                // rest, so it was quarantined (typed dead row, no payload).
-                // Emitting anyway would report success for an event whose
-                // durability just failed — refuse instead.
-                return Err(format!(
-                    "event.emit refused for {}: payload protection failed — event quarantined in the outbox",
-                    event.name
-                ));
+                // rest, so it was quarantined (typed dead row, no payload, no
+                // plaintext on disk). The event itself still goes to the host,
+                // live and once: it is the copy at rest that failed, and
+                // nothing is replayed for it. Under RequireAck it stays held
+                // with the rest (there is nothing durable to hold, but a host
+                // that cannot acknowledge gets no business events).
+                if mode == EmitMode::RequireAck {
+                    return Err(format!(
+                        "event.emit held for {}: payload protection failed — event quarantined in the outbox, and the host does not support eventAck",
+                        event.name
+                    ));
+                }
+                eprintln!(
+                    "[aokie-plugin] {} could not be sealed at rest — emitting it live, not durable",
+                    event.idempotency_key
+                );
+                outboxed = false;
             }
             crate::outbox::InsertOutcome::Inserted | crate::outbox::InsertOutcome::Duplicate => {}
         }
@@ -216,6 +244,14 @@ pub fn emit_event(
             Err(format!("event.emit failed for {}: {e}", event.name))
         }
     }
+}
+
+/// Write one event to the host with no outbox row behind it (the outbox
+/// could not take it): delivered now or not at all.
+fn emit_live(sink: &mut dyn Sink, event: &DesktopEvent) -> Result<(), String> {
+    let line = rpc::notification_line("event.emit", json!({ "event": event }));
+    sink.send_line(&line)
+        .map_err(|e| format!("event.emit failed for {} (not durable: the outbox could not take it): {e}", event.name))
 }
 
 /// One replay pass (ack mode): re-emit every DUE unacknowledged row —
@@ -589,10 +625,12 @@ mod tests {
         assert_eq!(sink.lines.len(), 1);
     }
 
-    /// Item 1: a quarantined insert (protect failure) refuses emission — the
-    /// host never receives an event whose local durability failed.
+    /// A quarantined insert (protect failure) still reaches the host, live
+    /// and once (review 2026-10: the event was dropped outright): only its
+    /// copy at rest failed. No plaintext is written, and nothing replays it.
+    /// A host that cannot acknowledge still gets nothing.
     #[test]
-    fn quarantined_event_is_not_emitted() {
+    fn quarantined_event_is_emitted_live_and_not_replayed() {
         let outbox = crate::outbox::Outbox::open_in_memory_with_protection(
             crate::outbox::PayloadProtection::Unavailable,
         )
@@ -603,9 +641,34 @@ mod tests {
             "call_qq",
             json!({"text": "secret"}),
         );
-        let err = emit_event(&mut sink, &outbox, &ev, false, EmitMode::AckExpected).unwrap_err();
+        emit_event(&mut sink, &outbox, &ev, false, EmitMode::AckExpected).unwrap();
+        assert_eq!(sink.lines.len(), 1, "the live event reaches the host");
+        assert_eq!(
+            outbox.status_of(&ev.idempotency_key).unwrap(),
+            Some(OutboxStatus::Dead),
+            "the quarantine row stays dead (no payload behind it)"
+        );
+        assert_eq!(replay_once(&mut sink, &outbox, 16), 0, "nothing is replayed");
+        let held = aokie_event(crate::contract::events::CALL_TURN_FINAL, "call_qr", json!({"text": "x"}));
+        let mut quiet = VecSink::default();
+        let err = emit_event(&mut quiet, &outbox, &held, false, EmitMode::RequireAck).unwrap_err();
         assert!(err.contains("quarantined"), "typed: {err}");
-        assert!(sink.lines.is_empty(), "no emission after a protect failure");
+        assert!(quiet.lines.is_empty());
+    }
+
+    /// The outbox's database refusing the row (here: its table gone, as a
+    /// full disk or a long-held lock refuses it) does not swallow the event.
+    #[test]
+    fn an_outbox_write_failure_still_emits_the_event_live() {
+        let outbox = Outbox::open_in_memory().unwrap();
+        outbox.break_for_tests();
+        let mut sink = VecSink::default();
+        let ev = aokie_event(crate::contract::events::SMS_RECEIVED, "sms_x", json!({"body": "hi"}));
+        emit_event(&mut sink, &outbox, &ev, false, EmitMode::AckExpected).unwrap();
+        assert_eq!(sink.lines.len(), 1);
+        let mut quiet = VecSink::default();
+        assert!(emit_event(&mut quiet, &outbox, &ev, false, EmitMode::RequireAck).is_err());
+        assert!(quiet.lines.is_empty());
     }
 
     #[test]

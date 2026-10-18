@@ -54,8 +54,12 @@ pub const TYPE_NOTIFICATION_REGISTRATION: &str = "x-bt/MAP-NotificationRegistrat
 pub const APP_PARAM_MAX_LIST_COUNT: u8 = 0x01; // 2 bytes BE
 pub const APP_PARAM_LIST_START_OFFSET: u8 = 0x02; // 2 bytes BE
 pub const APP_PARAM_FILTER_MESSAGE_TYPE: u8 = 0x03; // 1 byte bitmask
-pub const APP_PARAM_TRANSPARENT: u8 = 0x0a; // 1 byte
-pub const APP_PARAM_RETRY: u8 = 0x0b; // 1 byte
+// Attachment, Transparent and Retry are 0x0A, 0x0B and 0x0C (MAP 1.4.2 Table
+// 6.5). They were once sent one tag low: the phone read "Transparent" as
+// Attachment and "Retry" as Transparent=1, and kept no copy of a sent text.
+pub const APP_PARAM_ATTACHMENT: u8 = 0x0a; // 1 byte (0=off, 1=on)
+pub const APP_PARAM_TRANSPARENT: u8 = 0x0b; // 1 byte (0=keep a copy in sent)
+pub const APP_PARAM_RETRY: u8 = 0x0c; // 1 byte (1=the phone retries a failed send)
 pub const APP_PARAM_CHARSET: u8 = 0x14; // 1 byte (0=Native, 1=UTF-8)
 pub const APP_PARAM_NOTIFICATION_STATUS: u8 = 0x0e; // 1 byte (0=off, 1=on)
 
@@ -67,6 +71,7 @@ pub const APP_PARAM_NOTIFICATION_STATUS: u8 = 0x0e; // 1 byte (0=off, 1=on)
 pub const MSG_TYPE_EXCLUDE_ALL_BUT_SMS_GSM: u8 = 0xfe; // keep bit 0
 pub const MSG_TYPE_EXCLUDE_ALL_BUT_SMS_CDMA: u8 = 0xfd; // keep bit 1
 pub const MSG_TYPE_KEEP_BOTH_SMS_VARIANTS: u8 = 0xfc; // keep bits 0+1
+pub const MSG_TYPE_KEEP_SMS_AND_MMS: u8 = 0xf4; // keep bits 0+1+3 (3 = MMS)
 
 /// Charset values (MAP §6.3.5).
 pub const CHARSET_NATIVE: u8 = 0x00;
@@ -543,7 +548,11 @@ impl MasMceSession {
             Operation::GetMessage {
                 handle, charset, ..
             } => {
-                let mut app_params = Vec::with_capacity(3);
+                // Attachment and Charset are both mandatory for GetMessage
+                // (MAP §5.6.4). Attachment=0 asks for the text alone: an MMS
+                // then comes without its pictures.
+                let mut app_params = Vec::with_capacity(6);
+                push_app_param_u8(&mut app_params, APP_PARAM_ATTACHMENT, 0);
                 push_app_param_u8(&mut app_params, APP_PARAM_CHARSET, charset);
                 let extras = vec![
                     Header::name(handle),
@@ -563,20 +572,8 @@ impl MasMceSession {
             Operation::PushMessage {
                 bmessage, charset, ..
             } => {
-                let mut app_params = Vec::with_capacity(6);
-                push_app_param_u8(&mut app_params, APP_PARAM_CHARSET, charset);
-                push_app_param_u8(&mut app_params, APP_PARAM_TRANSPARENT, 0);
-                push_app_param_u8(&mut app_params, APP_PARAM_RETRY, 1);
-                let extras = vec![
-                    // Empty Name selects the current folder (outbox)
-                    // per MAP §5.4.7. Some phones reject an absent
-                    // Name header so we always include it.
-                    Header::name(""),
-                    Header::obex_type(TYPE_MESSAGE),
-                    Header::app_parameters(app_params),
-                ];
                 self.state = MasState::AwaitingPut;
-                Ok(Some(build_put_request(conn, extras, bmessage)))
+                Ok(Some(build_put_request(conn, push_message_headers(charset), bmessage)))
             }
             Operation::SetNotificationRegistration { enabled } => {
                 // Body is one ASCII byte: "1" or "0" per MAP §6.3.5.
@@ -714,6 +711,44 @@ fn push_app_param_u16(out: &mut Vec<u8>, tag: u8, value: u16) {
     out.push(tag);
     out.push(2);
     out.extend_from_slice(&value.to_be_bytes());
+}
+
+/// The headers of a PushMessage PUT, before its EndOfBody. Transparent=0
+/// has the phone keep a copy in its sent folder (the owner sees what was
+/// sent for them, and the sent check can find it); Retry=1 lets the phone
+/// try again itself when the network refuses the text.
+fn push_message_headers(charset: u8) -> Vec<Header> {
+    let mut app_params = Vec::with_capacity(9);
+    push_app_param_u8(&mut app_params, APP_PARAM_CHARSET, charset);
+    push_app_param_u8(&mut app_params, APP_PARAM_TRANSPARENT, 0);
+    push_app_param_u8(&mut app_params, APP_PARAM_RETRY, 1);
+    vec![
+        // Empty Name selects the current folder (outbox) per MAP §5.4.7.
+        // Some phones reject an absent Name header so we always include it.
+        Header::name(""),
+        Header::obex_type(TYPE_MESSAGE),
+        Header::app_parameters(app_params),
+    ]
+}
+
+/// How many bytes the PushMessage PUT for a `bmessage_len`-byte bMessage
+/// is on the wire: the whole OBEX packet, which goes to the phone in one
+/// RFCOMM frame and one ACL packet. The runtime holds it against the
+/// dongle's ACL buffer before it queues the text.
+pub fn push_message_packet_len(bmessage_len: usize) -> usize {
+    // The Connection-Id's value does not change the length.
+    build_put_request(0, push_message_headers(CHARSET_UTF8), vec![0; bmessage_len]).len()
+}
+
+/// The OBEX response code a phone refused a PushMessage with, when the
+/// failure `reason` is that refusal and sending it again cannot change it:
+/// a 4xx (0xC0-0xCF, bar 0xC8 Request Timeout, which may pass). A 5xx is the
+/// phone's own trouble and may pass too. Reads what `require_response_code`
+/// wrote for the PUT step, so the two stay together here.
+pub fn push_refusal_code(reason: &str) -> Option<u8> {
+    let at = reason.find("MAS PUT: server returned 0x")? + "MAS PUT: server returned 0x".len();
+    let code = u8::from_str_radix(reason.get(at..at + 2)?, 16).ok()?;
+    ((0xc0..=0xcf).contains(&code) && code != 0xc8).then_some(code)
 }
 
 // =============================================================================
@@ -964,6 +999,95 @@ mod tests {
             session.output(),
             OperationOutput::PushAcknowledged
         ));
+    }
+
+    /// The application-parameter bytes of a request, as sent.
+    fn app_params_of(packet: &Packet) -> Vec<u8> {
+        match packet
+            .headers
+            .iter()
+            .find(|h| matches!(h, Header::ByteSeq { id, .. } if *id == HDR_APP_PARAMETERS))
+            .expect("request carries AppParameters")
+        {
+            Header::ByteSeq { value, .. } => value.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Review 2026-10: the tags were one low (Transparent 0x0A, Retry 0x0B),
+    /// so the phone read Attachment=0, Transparent=1 and kept no copy of a
+    /// sent text. Pin the exact bytes: Charset=UTF-8, Transparent=0, Retry=1.
+    #[test]
+    fn push_message_app_params_are_the_spec_tags() {
+        let mut session = MasMceSession::new(
+            Operation::PushMessage {
+                folder: Folder::Outbox,
+                bmessage: b"BEGIN:BMSG\r\nEND:BMSG\r\n".to_vec(),
+                charset: CHARSET_UTF8,
+            },
+            0,
+        );
+        let _ = session.next_request();
+        let _ = session.handle_response(&ok_connect_response(7));
+        let _ = session.handle_response(&ok_response(7, vec![]));
+        let _ = session.handle_response(&ok_response(7, vec![]));
+        let put = session
+            .handle_response(&ok_response(7, vec![]))
+            .expect("PUT message");
+        let parsed = parse_outbound(&put, FixedPayload::None);
+        assert_eq!(
+            app_params_of(&parsed),
+            vec![0x14, 0x01, 0x01, 0x0b, 0x01, 0x00, 0x0c, 0x01, 0x01]
+        );
+        // What the runtime holds against the dongle's buffer is this packet.
+        assert_eq!(push_message_packet_len(b"BEGIN:BMSG\r\nEND:BMSG\r\n".len()), put.len());
+    }
+
+    /// GetMessage carries both mandatory parameters: Attachment=0 (the text
+    /// of an MMS, not its pictures), then Charset.
+    #[test]
+    fn get_message_app_params_ask_for_no_attachments() {
+        let mut session = MasMceSession::new(
+            Operation::GetMessage {
+                folder: Folder::Inbox,
+                handle: "0400000000000001".into(),
+                charset: CHARSET_UTF8,
+            },
+            0,
+        );
+        let _ = session.next_request();
+        let _ = session.handle_response(&ok_connect_response(7));
+        let _ = session.handle_response(&ok_response(7, vec![]));
+        let _ = session.handle_response(&ok_response(7, vec![]));
+        let get = session
+            .handle_response(&ok_response(7, vec![]))
+            .expect("GET message");
+        let parsed = parse_outbound(&get, FixedPayload::None);
+        assert_eq!(app_params_of(&parsed), vec![0x0a, 0x01, 0x00, 0x14, 0x01, 0x01]);
+    }
+
+    #[test]
+    fn a_4xx_refusal_of_the_put_is_final_and_a_5xx_is_not() {
+        let refused = |code: u8| {
+            let packet = Packet {
+                opcode: code,
+                fixed_payload: vec![],
+                headers: vec![],
+            };
+            require_response_code(&packet, &[RSP_OK], "PUT").unwrap_err()
+        };
+        let reason = format!("MAS session failed: {}", refused(obex::RSP_NOT_ACCEPTABLE));
+        assert_eq!(push_refusal_code(&reason), Some(0xc6));
+        assert_eq!(push_refusal_code(&refused(obex::RSP_BAD_REQUEST)), Some(0xc0));
+        assert_eq!(push_refusal_code(&refused(0xc8)), None); // Request Timeout may pass
+        assert_eq!(push_refusal_code(&refused(obex::RSP_SERVICE_UNAVAILABLE)), None);
+        assert_eq!(push_refusal_code("RFCOMM closed mid-MAP session"), None);
+        // A refused CONNECT or SETPATH is not a refusal of the text.
+        let connect = Packet { opcode: 0xc3, fixed_payload: vec![], headers: vec![] };
+        assert_eq!(
+            push_refusal_code(&require_response_code(&connect, &[RSP_OK], "CONNECT").unwrap_err()),
+            None
+        );
     }
 
     #[test]

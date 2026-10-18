@@ -201,6 +201,10 @@ pub(super) fn withdraw_open_transfer(
 /// refusal is a typed error and a fixed instruction, and it stands only until
 /// the transfer ends (declined, expired, cancelled, failed or taken: a taken
 /// call has stopped the session, so the tool cannot be called at all).
+///
+/// `activity_revision` and `lane_activity_revision` count the caller turns
+/// that resumed the conversation, when the model asked and now: a goodbye is
+/// refused when they differ (the caller took the conversation up again).
 #[cfg(feature = "voice")]
 pub(super) fn finish_call_answer(
     agent_hangup: bool,
@@ -394,6 +398,7 @@ pub(super) fn adopt_resumed_session(
 ) -> RealtimeCallLane {
     let mut lane = RealtimeCallLane::new(session);
     lane.allow_transfer_sent = allow_transfer;
+    lane.resumed = true;
     ctx.transfer.finish_resume();
     // The AI has the caller back (after a takeover, or after a hold): whatever
     // the caller asked before that is spent. What they say to the fresh session
@@ -573,6 +578,29 @@ pub(super) fn carry_call_context(
     replacement: CallVoiceContext,
 ) -> CallVoiceContext {
     std::mem::replace(ctx, replacement)
+}
+
+#[cfg(all(aokie_radio, feature = "voice"))]
+thread_local! {
+    /// The call that has had its one reconnect after OAIY's stream dropped
+    /// under it. The radio loop runs on one thread, and call ids are never
+    /// reused, so this is per call (and per test, each on its own thread).
+    static TRANSPORT_RECONNECTED: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether `call_id` may still reconnect after its stream dropped, spending
+/// the one reconnect it has when it may.
+#[cfg(all(aokie_radio, feature = "voice"))]
+pub(super) fn claim_transport_reconnect(call_id: &str) -> bool {
+    TRANSPORT_RECONNECTED.with(|spent| {
+        let mut spent = spent.borrow_mut();
+        if spent.as_deref() == Some(call_id) {
+            return false;
+        }
+        *spent = Some(call_id.to_string());
+        true
+    })
 }
 
 #[cfg(all(aokie_radio, feature = "voice"))]
@@ -1131,6 +1159,9 @@ pub(super) fn service_realtime_lane(
             Option<crate::remote_media::AokieOwnerFence>,
             String,
         )> = None;
+        // The failure was the stream to OAIY itself (it dropped, or OAIY
+        // closed it), not something OAIY said: such a call reconnects once.
+        let mut transport_failure = false;
         if let Some(lane) = realtime_lane.as_mut() {
             for _ in 0..64 {
                 let event = match lane.session.try_recv() {
@@ -1280,6 +1311,11 @@ pub(super) fn service_realtime_lane(
                                 .store(ctx.turn_index, Ordering::Relaxed);
                             lane.latest_caller_turn =
                                 Some((ctx.turn_index, text.trim().to_string()));
+                            let resumes = realtime_caller_turn_resumes_conversation(text.trim());
+                            if resumes {
+                                lane.resuming_caller_turns =
+                                    lane.resuming_caller_turns.saturating_add(1);
+                            }
                             // Content-aware finish cancellation: a real
                             // resumed turn cancels the armed hangup; a
                             // courtesy "bye"/"thanks"/"hi" over the
@@ -1288,7 +1324,7 @@ pub(super) fn service_realtime_lane(
                             if lane.authorized_finish_tool.is_some()
                                 || lane.pending_hangup.is_some()
                             {
-                                if realtime_caller_turn_resumes_conversation(text.trim()) {
+                                if resumes {
                                     lane.authorized_finish_tool = None;
                                     lane.pending_hangup = None;
                                     eprintln!(
@@ -1635,7 +1671,8 @@ pub(super) fn service_realtime_lane(
                             }
                         }
                     }
-                    crate::realtime_voice::RealtimeEventKind::Closed { reason } => {
+                    crate::realtime_voice::RealtimeEventKind::Closed { reason, transport } => {
+                        transport_failure = transport;
                         realtime_failure = Some((
                             lane.call_id.clone(),
                             lane.begun,
@@ -1749,9 +1786,14 @@ pub(super) fn service_realtime_lane(
                                 .map(|persona| {
                                     realtime_instructions(oaiy_route, persona, agent_hangup)
                                 });
+                            // A session that resumes a call the caller was
+                            // already greeted on keeps its start's resume
+                            // line ("Thanks for waiting", the return line):
+                            // the opening greeting is not said twice.
                             let begin_greeting = ctx
                                 .call_agent_overlay
                                 .as_ref()
+                                .filter(|_| !lane.resumed)
                                 .filter(|overlay| overlay.call_id == lane.call_id)
                                 .and_then(|overlay| overlay.greeting.as_deref())
                                 .map(str::trim)
@@ -2189,11 +2231,24 @@ pub(super) fn service_realtime_lane(
                     } else if name == "finish_call" {
                         let valid_arguments =
                             arguments.as_object().is_some_and(serde_json::Map::is_empty);
+                        // A goodbye is refused for a caller who took the
+                        // conversation up again since the model asked to
+                        // finish: a completed turn that resumes it, while the
+                        // caller was heard after the ask (so a late
+                        // transcript of the turn the goodbye answers does not
+                        // count). Raw signal energy alone (a breath, echo, a
+                        // courtesy "bye") is not a reason: comparing it
+                        // refused goodbyes on any noise.
+                        let heard_since = activity_revision != lane.caller_activity_revision;
                         let (accepted, output) = finish_call_answer(
                             agent_hangup,
                             valid_arguments,
-                            activity_revision,
-                            lane.caller_activity_revision,
+                            lane.tool_intake_resuming_turns,
+                            if heard_since {
+                                lane.resuming_caller_turns
+                            } else {
+                                lane.tool_intake_resuming_turns
+                            },
                             &ctx.transfer,
                         );
                         if accepted {
@@ -2410,6 +2465,25 @@ pub(super) fn service_realtime_lane(
                 .is_some_and(|expected| reply_owner_is_current(&remote_media, Some(expected)));
             let exact_owner =
                 current_owner.or_else(|| passed_owner_is_current.then_some(owner).flatten());
+            // OAIY's stream dropped under a live call the receptionist has
+            // (OAIY restarted, the socket broke): a fresh session for the
+            // same call, once, rather than an apology and a hang-up. Should
+            // that one fail too, the call takes the fail-safe below.
+            let reconnect_once = transport_failure
+                && exact_call_active
+                && exact_owner.is_some()
+                && !remote_media.radio_reserved()
+                && tracker
+                    .current()
+                    .is_some_and(|call| call.id == call_id && call.receptionist_owns())
+                && claim_transport_reconnect(&call_id);
+            if reconnect_once {
+                eprintln!(
+                    "[aokie-plugin] OAIY's stream dropped mid-call ({reason}); reconnecting once for call {call_id}"
+                );
+                *realtime_resume_call = Some(call_id);
+                return;
+            }
             match realtime_failure_disposition(
                 exact_call_active,
                 exact_owner.is_some(),

@@ -9,6 +9,12 @@ pub(crate) enum WorkerErrorKind {
     Expired,
     AdmissionRefresh,
     Rebootstrap,
+    /// One inbound frame is refused and dropped; the session, and every other
+    /// device's peers and leases, stay up. Used for the ordinary races a
+    /// multi-device call produces (a stale peer, an old ICE generation, a
+    /// claim that lost to another owner, a late or replayed proof). Identity
+    /// and signature violations never use it: they still end the session.
+    Refused,
 }
 
 /// Whether a carrier actually accepted a frame for delivery.
@@ -30,6 +36,7 @@ impl WorkerErrorKind {
             Self::Expired => "expired",
             Self::AdmissionRefresh => "admission_refresh",
             Self::Rebootstrap => "rebootstrap",
+            Self::Refused => "refused",
         }
     }
 }
@@ -60,6 +67,19 @@ impl WorkerError {
             kind: WorkerErrorKind::Rebootstrap,
             message: message.into(),
         }
+    }
+
+    /// Refuse this one frame without ending the session (see
+    /// [`WorkerErrorKind::Refused`]).
+    pub(crate) fn refused(message: impl Into<String>) -> Self {
+        Self {
+            kind: WorkerErrorKind::Refused,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn is_refusal(&self) -> bool {
+        self.kind == WorkerErrorKind::Refused
     }
 }
 
@@ -99,6 +119,9 @@ pub(super) fn retry_schedule(
             WorkerErrorKind::Expired => GatewayConnectionPhase::Expired,
             WorkerErrorKind::AdmissionRefresh => GatewayConnectionPhase::AdmissionRefresh,
             WorkerErrorKind::Rebootstrap => GatewayConnectionPhase::RebootstrapRequired,
+            // The run loop never ends a session on a refusal; if one ever
+            // reaches here it is an ordinary reconnect.
+            WorkerErrorKind::Refused => GatewayConnectionPhase::Reconnecting,
         },
         attempt,
         delay: Duration::from_secs(1_u64 << exponent).min(MAX_BACKOFF),

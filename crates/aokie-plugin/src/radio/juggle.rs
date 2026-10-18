@@ -496,6 +496,10 @@ pub(super) fn run_auto_hold_juggle(
                                         );
                                     }
                                 }
+                                let verdict = swap_back_verdict_for_tracker(
+                                    verdict,
+                                    tracker.current().is_some(),
+                                );
                                 eprintln!(
                                     "[aokie-plugin] AUTO-HOLD: swap-back verdict {verdict:?}"
                                 );
@@ -503,8 +507,9 @@ pub(super) fn run_auto_hold_juggle(
                                     SwapBackVerdict::Swapped => {
                                         // Newcomer parked; the primary resumes
                                         // with their whole conversation intact.
-                                        let sess_b =
-                                            tracker.park().expect("newcomer was active");
+                                        let Some(sess_b) = tracker.park() else {
+                                            unreachable!("swap_back_verdict_for_tracker: Swapped has a newcomer");
+                                        };
                                         let ctx_b = stow_ctx!(ctx_a);
                                         match tracker.restore(sess_a) {
                                             Ok(_gen) => {}
@@ -749,19 +754,23 @@ pub(super) fn run_auto_hold_juggle(
                                             sink,
                                         );
                                         drop(ctx_a);
-                                        let sess_b2 =
-                                            tracker.park().expect("newcomer was tracked");
-                                        let b2_id = sess_b2.id.clone();
-                                        let b2_from =
-                                            sess_b2.caller_id.clone().unwrap_or_default();
-                                        let ctx_b2 = stow_ctx!(CallVoiceContext::fresh(None));
-                                        *parked = Some((sess_b2, ctx_b2));
-                                        *status.parked_call.lock().unwrap() =
-                                            Some(SwitchboardLeg {
-                                                call_id: b2_id,
-                                                from: b2_from,
-                                                since_iso: aokie_core::events::now_iso8601(),
-                                            });
+                                        // The newcomer's session may have
+                                        // ended during the settle (review 1
+                                        // #7): then only the stranger is left.
+                                        if let Some(sess_b2) = tracker.park() {
+                                            let b2_id = sess_b2.id.clone();
+                                            let b2_from =
+                                                sess_b2.caller_id.clone().unwrap_or_default();
+                                            let ctx_b2 =
+                                                stow_ctx!(CallVoiceContext::fresh(None));
+                                            *parked = Some((sess_b2, ctx_b2));
+                                            *status.parked_call.lock().unwrap() =
+                                                Some(SwitchboardLeg {
+                                                    call_id: b2_id,
+                                                    from: b2_from,
+                                                    since_iso: aokie_core::events::now_iso8601(),
+                                                });
+                                        }
                                         // The stranger's identity: the live
                                         // knock leg, or the just-ended episode
                                         // stash (our CHLD consumed the knock).

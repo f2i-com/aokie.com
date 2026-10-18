@@ -31,8 +31,7 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::core::{GUID, PCSTR, PSTR, PWSTR};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, NTE_BAD_KEYSET,
-    NTE_KEYSET_ENTRY_BAD, TRUE,
+    CloseHandle, GetLastError, FALSE, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, NTE_EXISTS, TRUE,
 };
 use windows_sys::Win32::Security::Cryptography::Catalog::{
     CryptCATAdminCalcHashFromFileHandle, CryptCATClose, CryptCATOpen, CryptCATPersistStore,
@@ -40,7 +39,7 @@ use windows_sys::Win32::Security::Cryptography::Catalog::{
     CRYPTCAT_OPEN_CREATENEW,
 };
 use windows_sys::Win32::Security::Cryptography::{
-    CertAddCertificateContextToStore, CertCloseStore, CertCreateSelfSignCertificate,
+    BCryptGenRandom, CertAddCertificateContextToStore, CertCloseStore, CertCreateSelfSignCertificate,
     CertDeleteCertificateFromStore, CertDuplicateCertificateContext, CertEnumCertificatesInStore,
     CertFindCertificateInStore, CertFreeCertificateContext, CertGetCertificateContextProperty,
     CertGetNameStringA, CertOpenStore, CertSetCertificateContextProperty, CertStrToNameA,
@@ -53,7 +52,8 @@ use windows_sys::Win32::Security::Cryptography::{
     CRYPT_KEY_PROV_INFO, CRYPT_MACHINE_KEYSET, CRYPT_NEWKEYSET, CRYPT_SILENT, CRYPT_VERIFYCONTEXT,
     PROV_RSA_FULL, SIGNER_CERT, SIGNER_CERT_0, SIGNER_CERT_STORE_INFO, SIGNER_FILE_INFO,
     SIGNER_SIGNATURE_INFO, SIGNER_SIGNATURE_INFO_0, SIGNER_SUBJECT_INFO, SIGNER_SUBJECT_INFO_0,
-    X509_ASN_ENCODING, X509_ENHANCED_KEY_USAGE,
+    BCRYPT_USE_SYSTEM_PREFERRED_RNG, CERT_BASIC_CONSTRAINTS2_INFO, X509_ASN_ENCODING,
+    X509_BASIC_CONSTRAINTS2, X509_ENHANCED_KEY_USAGE,
 };
 
 // CERT_NAME_BLOB and CRYPT_DATA_BLOB are typedefs of CRYPT_INTEGER_BLOB
@@ -91,6 +91,9 @@ const SZ_OID_ENHANCED_KEY_USAGE: &str = "2.5.29.37";
 /// Code-signing EKU OID — the only thing we want this cert to be
 /// usable for.
 const SZ_OID_PKIX_KP_CODE_SIGNING: &str = "1.3.6.1.5.5.7.3.3";
+/// `szOID_BASIC_CONSTRAINTS2`: the extension that says the cert is no CA
+/// (it signs the catalog, never another certificate).
+const SZ_OID_BASIC_CONSTRAINTS2: &str = "2.5.29.19";
 
 /// Cat member SIP OIDs. INF members use the CAB-data OID (libwdi/inf2cat
 /// convention) plus the SHA-1 digest OID — the cat-level signature is
@@ -143,10 +146,36 @@ const SIGNER_NO_ATTR: u32 = 0x00;
 /// CALG_SHA_256 — wincrypt.h ALG_ID for SHA-256.
 const CALG_SHA_256: u32 = 0x0000800c;
 
-/// Local machine-keyset key container name. Same key is reused across
-/// installs and destroyed after every successful sign (see
-/// `destroy_signing_keypair`).
-const KEY_CONTAINER_NAME: &str = "aokie WinUSB driver-signing key";
+/// The machine-keyset key container of one install's signing key: a name of
+/// its own, random, created new (`CRYPT_NEWKEYSET` refuses one that exists).
+/// It used to be one fixed name, opened if it was there: a standard user
+/// could create that container first, own its ACL, and so read the private
+/// key of a certificate this helper then trusted in LocalMachine\Root and
+/// TrustedPublisher (or block its deletion). The container is destroyed once
+/// the catalog is signed (`destroy_signing_keypair`).
+fn fresh_key_container_name() -> Result<String, String> {
+    let mut random = [0u8; 16];
+    let status = unsafe {
+        BCryptGenRandom(
+            null_mut(),
+            random.as_mut_ptr(),
+            random.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(format!(
+            "BCryptGenRandom failed: NTSTATUS 0x{:08x}",
+            status as u32
+        ));
+    }
+    let mut hex = String::with_capacity(random.len() * 2);
+    for byte in random {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{:02x}", byte);
+    }
+    Ok(format!("aokie WinUSB driver-signing key {}", hex))
+}
 
 /// Generate a `.cat` next to the given INF and self-sign it. Returns
 /// the cat path on success.
@@ -510,38 +539,69 @@ fn self_sign_file(path: &Path, cert_subject: &str) -> Result<(), String> {
     let _ = remove_cert_from_store(cert_subject, "Root");
     let _ = remove_cert_from_store(cert_subject, "TrustedPublisher");
 
-    let cert = create_self_signed_cert(cert_subject)?;
-    // Destroy the keypair on every exit path. Earlier this code only
-    // called destroy_signing_keypair() on the success branch and the
-    // sign-cat-with-cert failure path — an `add_cert_to_store` failure
-    // would early-return without cleanup, leaving the RSA-2048
-    // private key sitting in LocalMachine\…\KEY_CONTAINER_NAME for an
-    // attacker to discover and re-sign with. The guard fires from
-    // every return below.
-    let _key_cleanup = KeypairCleanupGuard;
+    let container = fresh_key_container_name()?;
+    // Destroy the keypair on every early return: an `add_cert_to_store`
+    // failure used to return without cleanup, leaving the RSA-2048 private
+    // key in the machine keyset for anyone to re-sign with. The success path
+    // below destroys it itself and checks that it went.
+    let mut key_cleanup = KeypairCleanupGuard {
+        container: container.clone(),
+        armed: true,
+    };
+    let cert = create_self_signed_cert(cert_subject, &container)?;
+    // A cert in one store and not the other (or in either once signing
+    // failed) trusts nothing that was signed: take it back out.
+    let untrust = || {
+        let _ = remove_cert_from_store(cert_subject, "Root");
+        let _ = remove_cert_from_store(cert_subject, "TrustedPublisher");
+    };
     if let Err(e) = add_cert_to_store(cert.0, "Root") {
         cert_free(cert.0);
+        untrust();
         return Err(e);
     }
     if let Err(e) = add_cert_to_store(cert.0, "TrustedPublisher") {
         cert_free(cert.0);
+        untrust();
         return Err(e);
     }
 
     let sign_result = sign_cat_with_cert(path, cert.0);
     cert_free(cert.0);
+    // The private key must be gone before Windows is left trusting its
+    // certificate machine-wide. If it will not go, the install is refused
+    // and the certificate leaves the trust stores again (it used to be
+    // logged and the install went on).
+    key_cleanup.armed = false;
+    if let Err(e) = destroy_signing_keypair(&container) {
+        untrust();
+        return Err(format!(
+            "the driver-signing key could not be deleted ({}), so its certificate was taken out of \
+             LocalMachine\\Root and TrustedPublisher again and the install is refused",
+            e
+        ));
+    }
+    if sign_result.is_err() {
+        untrust();
+    }
     sign_result
 }
 
 /// Drop guard that destroys the self-signed driver-signing keypair
-/// from the machine keyset. The cert public key remains in the user's
-/// Trusted Publishers / Root store (Windows needs it there to verify
-/// the .cat at install time), but without the private key on disk, no
-/// one can use that cert to sign anything new.
-struct KeypairCleanupGuard;
+/// from the machine keyset on an early return. The cert public key
+/// remains in the Trusted Publishers / Root store (Windows needs it there
+/// to verify the .cat at install time), but without the private key on
+/// disk, no one can use that cert to sign anything new.
+struct KeypairCleanupGuard {
+    container: String,
+    armed: bool,
+}
 impl Drop for KeypairCleanupGuard {
     fn drop(&mut self) {
-        if let Err(e) = destroy_signing_keypair() {
+        if !self.armed {
+            return;
+        }
+        if let Err(e) = destroy_signing_keypair(&self.container) {
             eprintln!("[pki] destroy_signing_keypair via guard failed: {}", e);
         }
     }
@@ -864,7 +924,7 @@ fn cert_sha1_thumbprint(cert: *mut CERT_CONTEXT) -> Option<String> {
     Some(hex)
 }
 
-fn create_self_signed_cert(cert_subject: &str) -> Result<CertContextOwned, String> {
+fn create_self_signed_cert(cert_subject: &str, container: &str) -> Result<CertContextOwned, String> {
     // EKU = code signing only.
     let code_signing_oid = cstring(SZ_OID_PKIX_KP_CODE_SIGNING);
     let mut eku_array: [PSTR; 1] = [code_signing_oid.as_ptr() as PSTR];
@@ -912,21 +972,78 @@ fn create_self_signed_cert(cert_subject: &str) -> Result<CertContextOwned, Strin
     }
     eku_buf.truncate(size as usize);
 
-    let mut extensions = [CERT_EXTENSION {
-        pszObjId: oid_eku.as_ptr() as PSTR,
-        fCritical: TRUE,
-        Value: CRYPT_DATA_BLOB {
-            cbData: eku_buf.len() as u32,
-            pbData: eku_buf.as_mut_ptr(),
+    // Basic constraints: not a CA. The cert signs one catalog; even with its
+    // key in the wrong hands it could not issue a certificate Windows trusts.
+    let basic = CERT_BASIC_CONSTRAINTS2_INFO {
+        fCA: FALSE,
+        fPathLenConstraint: FALSE,
+        dwPathLenConstraint: 0,
+    };
+    let oid_basic = cstring(SZ_OID_BASIC_CONSTRAINTS2);
+    let mut size: u32 = 0;
+    let ok = unsafe {
+        CryptEncodeObjectEx(
+            X509_ASN_ENCODING,
+            X509_BASIC_CONSTRAINTS2,
+            &basic as *const _ as *const std::ffi::c_void,
+            0,
+            null(),
+            null_mut(),
+            &mut size,
+        )
+    };
+    if ok == 0 || size == 0 {
+        return Err(format!(
+            "CryptEncodeObjectEx(basic constraints, sizing) failed: Win32 error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    let mut basic_buf = vec![0u8; size as usize];
+    let ok = unsafe {
+        CryptEncodeObjectEx(
+            X509_ASN_ENCODING,
+            X509_BASIC_CONSTRAINTS2,
+            &basic as *const _ as *const std::ffi::c_void,
+            0,
+            null(),
+            basic_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut size,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "CryptEncodeObjectEx(basic constraints) failed: Win32 error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    basic_buf.truncate(size as usize);
+
+    let mut extensions = [
+        CERT_EXTENSION {
+            pszObjId: oid_eku.as_ptr() as PSTR,
+            fCritical: TRUE,
+            Value: CRYPT_DATA_BLOB {
+                cbData: eku_buf.len() as u32,
+                pbData: eku_buf.as_mut_ptr(),
+            },
         },
-    }];
+        CERT_EXTENSION {
+            pszObjId: oid_basic.as_ptr() as PSTR,
+            fCritical: FALSE,
+            Value: CRYPT_DATA_BLOB {
+                cbData: basic_buf.len() as u32,
+                pbData: basic_buf.as_mut_ptr(),
+            },
+        },
+    ];
     let cert_extensions = CERT_EXTENSIONS {
         cExtension: extensions.len() as u32,
         rgExtension: extensions.as_mut_ptr(),
     };
 
-    // Acquire (or create) the keypair container in the machine keyset.
-    let key_container_w = wide_null(KEY_CONTAINER_NAME);
+    // Create this install's own keypair container in the machine keyset.
+    // Never open one that exists: whoever made it owns its ACL.
+    let key_container_w = wide_null(container);
     let mut hcsp: usize = 0;
     if unsafe {
         CryptAcquireContextW(
@@ -934,33 +1051,21 @@ fn create_self_signed_cert(cert_subject: &str) -> Result<CertContextOwned, Strin
             key_container_w.as_ptr(),
             null(),
             PROV_RSA_FULL,
-            CRYPT_MACHINE_KEYSET | CRYPT_SILENT,
+            CRYPT_NEWKEYSET | CRYPT_MACHINE_KEYSET | CRYPT_SILENT,
         )
     } == 0
     {
         let err = unsafe { GetLastError() } as i32;
-        if err == NTE_BAD_KEYSET || err == NTE_KEYSET_ENTRY_BAD {
-            if unsafe {
-                CryptAcquireContextW(
-                    &mut hcsp,
-                    key_container_w.as_ptr(),
-                    null(),
-                    PROV_RSA_FULL,
-                    CRYPT_NEWKEYSET | CRYPT_MACHINE_KEYSET | CRYPT_SILENT,
-                )
-            } == 0
-            {
-                return Err(format!(
-                    "CryptAcquireContext(NEWKEYSET) failed: Win32 error {}",
-                    unsafe { GetLastError() }
-                ));
-            }
-        } else {
+        if err == NTE_EXISTS {
             return Err(format!(
-                "CryptAcquireContext(machine keyset) failed: Win32 error {}",
-                err
+                "the key container {:?} exists already: refusing a signing key this install did not create",
+                container
             ));
         }
+        return Err(format!(
+            "CryptAcquireContext(NEWKEYSET, machine keyset) failed: Win32 error {}",
+            err
+        ));
     }
     let _hprov_guard = HCryptProvGuard(hcsp);
 
@@ -1021,7 +1126,7 @@ fn create_self_signed_cert(cert_subject: &str) -> Result<CertContextOwned, Strin
         pbData: subject_buf.as_mut_ptr(),
     };
 
-    let mut key_container_w_mut = wide_null(KEY_CONTAINER_NAME);
+    let mut key_container_w_mut = wide_null(container);
     let key_prov_info = CRYPT_KEY_PROV_INFO {
         pwszContainerName: key_container_w_mut.as_mut_ptr(),
         pwszProvName: null_mut(),
@@ -1238,8 +1343,8 @@ fn sign_cat_with_cert(path: &Path, cert: *mut CERT_CONTEXT) -> Result<(), String
     Ok(())
 }
 
-fn destroy_signing_keypair() -> Result<(), String> {
-    let key_container_w = wide_null(KEY_CONTAINER_NAME);
+fn destroy_signing_keypair(container: &str) -> Result<(), String> {
+    let key_container_w = wide_null(container);
     let mut hcsp: usize = 0;
     if unsafe {
         CryptAcquireContextW(

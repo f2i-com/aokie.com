@@ -84,11 +84,12 @@ pub(crate) async fn require_confirmed_peer(
     let previous = load_pin(app, profile_id).await?;
     if let Some(pin) = &previous {
         validate_pin(pin)?;
-        if pin.profile_id != profile_id || pin.app_id != app_id || pin.device_id != device_id {
-            return Err("saved Desktop peer pin belongs to another profile binding".into());
-        }
-        if pin.peer_fingerprint == peer_fingerprint {
-            return Ok(());
+        match pin_standing(pin, profile_id, app_id, device_id, peer_fingerprint)? {
+            PinStanding::Confirmed => return Ok(()),
+            // Rotation, or a pin a forgotten enrolment of this same profile
+            // left behind (each enrolment mints a new device id): either way
+            // the owner confirms the key below before anything connects.
+            PinStanding::NeedsConfirmation => {}
         }
     }
 
@@ -113,7 +114,11 @@ pub(crate) async fn require_confirmed_peer(
         app_id: app_id.to_owned(),
         device_id: device_id.to_owned(),
         peer_fingerprint: peer_fingerprint.to_owned(),
-        previous_peer_fingerprint: previous.map(|pin| pin.peer_fingerprint),
+        // A leftover pin from an earlier enrolment is not a rotation: the
+        // owner confirms this key as on first use.
+        previous_peer_fingerprint: previous
+            .filter(|pin| pin.device_id == device_id)
+            .map(|pin| pin.peer_fingerprint),
         expires_at: now + CONFIRMATION_TTL_SECONDS,
     };
     state
@@ -136,6 +141,36 @@ pub(crate) async fn require_confirmed_peer(
     )
     .map_err(|_| "could not present Desktop peer trust confirmation".to_string())?;
     Err("Desktop peer trust confirmation is required before connecting".into())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PinStanding {
+    Confirmed,
+    NeedsConfirmation,
+}
+
+fn pin_standing(
+    pin: &PersistedPeerPin,
+    profile_id: &str,
+    app_id: &str,
+    device_id: &str,
+    peer_fingerprint: &str,
+) -> Result<PinStanding, String> {
+    if pin.profile_id != profile_id || pin.app_id != app_id {
+        return Err("saved Desktop peer pin belongs to another profile binding".into());
+    }
+    if pin.device_id == device_id && pin.peer_fingerprint == peer_fingerprint {
+        Ok(PinStanding::Confirmed)
+    } else {
+        Ok(PinStanding::NeedsConfirmation)
+    }
+}
+
+/// Delete the Desktop pin a forgotten server profile left behind, so a
+/// re-enrolment starts from a fresh owner confirmation.
+pub(crate) async fn forget_peer_pin(app: &AppHandle, profile_id: &str) -> Result<(), String> {
+    validate_id(profile_id, "profileId")?;
+    crate::endpoint_identity::native_store_delete(app, &pin_account(profile_id)).await
 }
 
 #[tauri::command]
@@ -298,5 +333,34 @@ mod tests {
             confirmed_at: 1,
         };
         assert!(validate_pin(&pin).is_err());
+    }
+
+    #[test]
+    fn a_pin_left_by_a_forgotten_enrolment_asks_again_instead_of_refusing() {
+        let pin = PersistedPeerPin {
+            schema_version: 1,
+            profile_id: "profile_a".into(),
+            app_id: "app_a".into(),
+            device_id: "mobile_old".into(),
+            peer_fingerprint: "desktop_a".into(),
+            confirmed_at: 1,
+        };
+        assert_eq!(
+            pin_standing(&pin, "profile_a", "app_a", "mobile_old", "desktop_a").unwrap(),
+            PinStanding::Confirmed
+        );
+        // Re-enrolling the same server minted a new device id: the owner is
+        // asked to confirm the Desktop key, never silently trusted.
+        assert_eq!(
+            pin_standing(&pin, "profile_a", "app_a", "mobile_new", "desktop_a").unwrap(),
+            PinStanding::NeedsConfirmation
+        );
+        assert_eq!(
+            pin_standing(&pin, "profile_a", "app_a", "mobile_old", "desktop_b").unwrap(),
+            PinStanding::NeedsConfirmation
+        );
+        // A pin stored under another profile or app is still damage.
+        assert!(pin_standing(&pin, "profile_b", "app_a", "mobile_old", "desktop_a").is_err());
+        assert!(pin_standing(&pin, "profile_a", "app_b", "mobile_old", "desktop_a").is_err());
     }
 }

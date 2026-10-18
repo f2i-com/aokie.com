@@ -275,7 +275,7 @@ impl RelayChannel {
             message,
             admission_rejected: false,
         })?;
-        let client = Client::builder()
+        let client = crate::discovery::endpoint_client_settings(Client::builder())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .build()

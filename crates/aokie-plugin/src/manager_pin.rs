@@ -7,20 +7,23 @@
 //! settings snapshot learned the PIN.
 //!
 //! Now the PIN is:
-//!   * sealed at rest (DPAPI on Windows — unreadable by any other user/machine),
+//!   * sealed at rest (DPAPI on Windows; on macOS and Linux under a key in the
+//!     login Keychain or the Secret Service — unreadable by any other
+//!     user/machine either way),
 //!   * write-only across `settings.get` (redacted to a `managerPinSet` boolean),
 //!   * revealed to plaintext only inside THIS process, at PIN-check time, in the
 //!     `AOKIE_MANAGER_PIN` env the radio already reads (process memory, the same
 //!     trust boundary that already holds the live call audio).
 //!
-//! Non-Windows builds have no DPAPI; they keep the PIN unsealed on disk (dev
-//! only — production dongle deployments are Windows) but STILL redact it from
-//! every read path, which is the surface that actually leaked.
+//! A system that cannot seal (none Aokie ships for: `dpapi::platform_supported`)
+//! keeps the PIN unsealed on disk but STILL redacts it from every read path,
+//! which is the surface that actually leaked.
 
 use aokie_core::dpapi;
 
-/// Seal a plaintext manager PIN for storage. On Windows the returned token is
-/// DPAPI-sealed (`dpapi:<base64>`) and is never itself the PIN. An empty PIN
+/// Seal a plaintext manager PIN for storage. The returned token is sealed
+/// (`dpapi:<base64>` on Windows, `keychain1:<base64>` on macOS and Linux) and
+/// is never itself the PIN. An empty PIN
 /// clears the lock and stores an empty string (blank = read-only manager line).
 ///
 /// `Err` only on a platform that CAN seal but the seal failed — the caller
@@ -33,8 +36,8 @@ pub fn seal(plain: &str) -> Result<String, String> {
     if dpapi::platform_supported() {
         dpapi::protect(plain.as_bytes())
     } else {
-        // Dev fallback: no DPAPI. Store as-is; the readback redaction (the real
-        // exposure) still applies.
+        // A system that cannot seal: store as-is; the readback redaction (the
+        // real exposure) still applies.
         Ok(plain.to_string())
     }
 }
@@ -87,13 +90,14 @@ mod tests {
 
     #[test]
     fn seal_then_reveal_round_trips() {
-        // On Windows the token is DPAPI-sealed; on dev it is stored as-is. Either
-        // way reveal() must return the original PIN, and is_set() must be true.
+        // Sealed where the system can seal (Windows, macOS, Linux), as-is where
+        // not. Either way reveal() must return the original PIN, and is_set()
+        // must be true.
         let sealed = seal("731905").unwrap();
         assert!(is_set(Some(&sealed)));
         assert_eq!(reveal(&sealed), "731905");
         if dpapi::platform_supported() {
-            assert!(dpapi::is_sealed(&sealed), "windows stores a sealed token");
+            assert!(dpapi::is_sealed(&sealed), "a sealing system stores a sealed token");
             assert_ne!(sealed, "731905", "the PIN is not stored in the clear");
         }
     }

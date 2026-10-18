@@ -222,10 +222,14 @@
   var configVersion = null;
   var appManaged = false;
 
-  /** True once an external writer has been observed bumping configVersion. */
-  function noteConfigVersion(next, ours) {
+  /** True once an external writer has been observed bumping configVersion
+   *  AND changing the greeting or the brief. Every settings write bumps the
+   *  version (the Consent and Dongle tabs, OAIY's own Agent › Phone page),
+   *  so a bump alone said "your FormLogic app re-applied these settings" on
+   *  OAIY, which has no such app, for any change at all. */
+  function noteConfigVersion(next, ours, greetingOrBriefChanged) {
     if (typeof next !== 'number') return;
-    if (configVersion !== null && next !== configVersion && !ours) {
+    if (configVersion !== null && next !== configVersion && !ours && greetingOrBriefChanged) {
       appManaged = true;
     }
     configVersion = next;
@@ -260,6 +264,10 @@
       function (results) {
         var data = results[0] || {};
         var merged = withAokieDefaults(data.settings);
+        // What the form last had saved, against what is saved now: the
+        // greeting or brief changed by someone else is what the notice is for.
+        var changedElsewhere =
+          loaded && (merged.greeting !== baseline.greeting || merged.persona !== baseline.persona);
         // A tab-entry refresh must not eat edits that were already present or
         // were typed while the two reads were in flight. The working settings
         // + their old baseline stay paired until the operator saves or
@@ -279,7 +287,7 @@
         if (TABS.transport && TABS.transport.update) TABS.transport.update(merged);
         // A bump between polls that this tab did not cause = the linked app
         // re-applied its record (see the provenance note above).
-        noteConfigVersion(data.configVersion, false);
+        noteConfigVersion(data.configVersion, false, changedElsewhere);
         loaded = true;
         loading = false;
         render();
@@ -315,7 +323,7 @@
           // The saved mode now drives the Dongle tab's visibility too.
           if (TABS.transport && TABS.transport.update) TABS.transport.update(merged);
           // OUR bump — never mistake a successful save for the linked app.
-          noteConfigVersion((data || {}).configVersion, true);
+          noteConfigVersion((data || {}).configVersion, true, false);
           var blocked = data && typeof data.blocked === 'string' ? data.blocked.trim() : '';
           // Start-only keys (where calls go and friends) are saved but NOT
           // live until the plugin restarts — surface the apply step instead
@@ -524,7 +532,10 @@
         '<textarea rows="4" data-key="allowedNumbers" placeholder="0400 111 222&#10;+61 2 9876 5432">' +
           esc(settings.allowedNumbers) + '</textarea>'
       ) +
-        hint('One number a line (or with commas). A number matches however it is written: its last nine digits.') +
+        hint('One number a line (or with commas), written in full with its area code: a number matches however it is written, by its last nine digits.') +
+        '<p class="rcp-hint is-warn" id="set-allowed-short" aria-live="polite"' +
+        (shortAllowedNumbers(settings.allowedNumbers).length ? '' : ' hidden') + '>' +
+        esc(shortAllowedText(settings.allowedNumbers)) + '</p>' +
         check('callsAllowedOnly', 'Answer calls only from these numbers') +
         field(
           'Calls from other numbers',
@@ -538,10 +549,52 @@
           'Left ringing, the call shows on the Overview with Answer (the receptionist takes it) and Reject; answer it on the phone to take it yourself, and the receptionist stays out of it. ' +
             'While this is on, the receptionist never rings a number that is not on the list (a call back of a missed call, say).'
         ) +
-        check('textsAllowedOnly', 'Reply to texts only from these numbers') +
-        hint('Texts from other numbers still arrive and are kept; nothing is sent back to them.') +
+        check('textsAllowedOnly', 'Text only these numbers') +
+        hint('No text goes to any other number: not a reply, a follow-up or a missed-call text back. Texts from other numbers still arrive and are kept.') +
         check('rejectPrivate', 'Do not answer hidden or private numbers') +
-        hint('Rejected while the phone rings when it says the number is hidden; a phone that only shows the number once a call is answered has it hung up straight away instead.')
+        hint('Rejected while the phone rings when it says the number is hidden; a phone that only shows the number once a call is answered has it hung up straight away instead.') +
+        // The refusals above are made when Aokie picks a call up: with
+        // auto-answer off a call rings through to the phone untouched.
+        (settings.autoAnswer
+          ? ''
+          : hint('Auto-answer is off, so calls ring through to your phone and none of this is applied to them: callers are refused (or left ringing) only while Aokie answers calls.', true))
+    );
+  }
+
+  /** The allowed-list entries with fewer than nine digits. The plugin
+   *  compares numbers by their last nine digits (screen.rs): an entry of
+   *  under six matches nobody, and one of six to eight only a caller id of
+   *  exactly that many digits, which a number without its area code seldom
+   *  is. Split as the plugin splits the list. */
+  function shortAllowedNumbers(list) {
+    return String(list || '')
+      .split(/[\n,;]+/)
+      .map(function (entry) {
+        return entry.trim();
+      })
+      .filter(function (entry) {
+        return entry && entry.replace(/\D/g, '').length < 9;
+      });
+  }
+
+  function shortAllowedText(list) {
+    var short = shortAllowedNumbers(list);
+    if (!short.length) return '';
+    var none = short.filter(function (entry) {
+      return entry.replace(/\D/g, '').length < 6;
+    });
+    return (
+      (none.length ? 'These match nobody: ' + none.join(', ') + '. ' : '') +
+      (short.length > none.length
+        ? 'These may miss the caller: ' +
+          short
+            .filter(function (entry) {
+              return none.indexOf(entry) === -1;
+            })
+            .join(', ') +
+          '. '
+        : '') +
+      'Write each number in full, with its area code.'
     );
   }
 
@@ -650,7 +703,7 @@
         // Dongle-only hardware knobs — meaningless on the native Windows
         // Bluetooth transport, so they hide (in place, order preserved)
         // unless the mode is dongle.
-        '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
+        '<div class="set-dongle-only"' + (settings.transportMode !== 'native' ? '' : ' hidden') + '>' +
         field('Bluetooth audio codec', '<select data-key="hfpCodec">' + codecOpts.join('') + '</select>') +
         hint('Dongle mode only. Some dongles only work reliably with CVSD; mSBC gives better speech-recognition accuracy where supported.') +
         field(
@@ -666,7 +719,7 @@
           ? ''
           : check('answerTone', 'Play a test tone on answer') +
             hint('Diagnostic: verifies the outbound audio path reaches the caller. Leave off for normal use.')) +
-        '<div class="set-dongle-only"' + (settings.transportMode === 'dongle' ? '' : ' hidden') + '>' +
+        '<div class="set-dongle-only"' + (settings.transportMode !== 'native' ? '' : ' hidden') + '>' +
         check('legacyPairingPin', 'Allow legacy PIN pairing (compatibility)') +
         hint(
           "⚠️ Uses the fixed PIN 0000 for very old devices that can't do modern code-confirmation pairing — it provides no protection against a nearby impostor. Enable only while pairing such a device, then turn it back off.",
@@ -736,21 +789,22 @@
   /**
    * The honest answer to "I changed the greeting and it did not take".
    *
-   * A linked FormLogic app re-applies its Receptionist Settings record on
-   * every incoming call, so a greeting or brief edited here is saved and then
-   * replaced. Shown ONCE an external configVersion bump has actually been
-   * observed, so a receptionist with no linked app, where this form IS the
-   * source of truth, never sees it.
+   * Something other than this form can write the greeting and the brief (a
+   * linked app re-applying its record, a flow calling settings.set). Shown
+   * once the saved greeting or brief has actually been seen to change under
+   * the form, by a write it did not make: any other settings write (another
+   * tab, OAIY's Agent › Phone page) bumps the version too and is no sign of
+   * that. Said without naming who, since this form cannot know.
    */
   function appManagedNoticeHtml() {
     if (!loaded || !appManaged) return '';
     return (
       '<p class="rcp-notice rcp-notice--warn rcp-wide" role="status">' +
-      '<strong>Your FormLogic app just re-applied these settings' +
+      '<strong>The greeting or the brief was just changed outside this form' +
       (typeof configVersion === 'number' ? ' (config v' + configVersion + ')' : '') +
       '.</strong> ' +
-      'It does that on every incoming call, so a greeting or brief edited here is replaced by the ' +
-      'app&rsquo;s Receptionist Settings record. Edit them in the app to make them stick.' +
+      'The form shows what is saved now. If something keeps writing them (a linked app or a flow that ' +
+      'sets the receptionist&rsquo;s settings on each call), change them there to make an edit stick.' +
       '</p>'
     );
   }
@@ -768,6 +822,14 @@
       if (key === 'greeting' && root) {
         var said = root.querySelector('#set-greeting-said');
         if (said) said.innerHTML = greetingSaidHtml(greetingRoute);
+      }
+      // (the allowed list says which of its numbers are too short, as typed)
+      if (key === 'allowedNumbers' && root) {
+        var short = root.querySelector('#set-allowed-short');
+        if (short) {
+          short.textContent = shortAllowedText(t.value);
+          short.hidden = !short.textContent;
+        }
       }
       return;
     }
@@ -840,6 +902,27 @@
       );
       return;
     }
+    // A restart drops the phone link, and with it a call on the line
+    // (review 1 #31): ask first, and keep the restart for when it is over.
+    HOST.command('call.current').then(
+      function (data) {
+        var call = data && data.call;
+        if (call && call.state !== 'ended') {
+          HOST.toast(
+            'info',
+            'A call is on the line — press "Restart receptionist now" again once it has ended.'
+          );
+          return;
+        }
+        restartNow();
+      },
+      function () {
+        restartNow();
+      }
+    );
+  }
+
+  function restartNow() {
     pendingRestart = null;
     render();
     HOST.toast('info', 'Restarting the receptionist — the phone reconnects automatically.');

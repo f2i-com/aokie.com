@@ -509,11 +509,24 @@ pub fn accept_connection_request_command(address: &str, role: u8) -> Result<[u8;
 /// 0x0F = "Connection Rejected due to Unacceptable BD_ADDR", the standard
 /// "we don't want this peer" refusal.
 pub fn reject_connection_request_command(address: &str) -> Result<[u8; 10], String> {
+    // Connection Rejected due to Unacceptable BD_ADDR
+    reject_connection_request_command_with_reason(address, 0x0F)
+}
+
+/// HCI error 0x0D, "Connection Rejected due to Limited Resources": the
+/// reason given a second phone while one is connected (Aokie serves one at
+/// a time). Unlike 0x0F it says nothing about the phone itself.
+pub const REJECT_LIMITED_RESOURCES: u8 = 0x0D;
+
+pub fn reject_connection_request_command_with_reason(
+    address: &str,
+    reason: u8,
+) -> Result<[u8; 10], String> {
     let mut out = [0u8; 10];
     out[0..2].copy_from_slice(&OPCODE_REJECT_CONNECTION_REQUEST.to_le_bytes());
     out[2] = 7;
     out[3..9].copy_from_slice(&parse_bd_addr(address)?);
-    out[9] = 0x0F; // Connection Rejected due to Unacceptable BD_ADDR
+    out[9] = reason;
     Ok(out)
 }
 

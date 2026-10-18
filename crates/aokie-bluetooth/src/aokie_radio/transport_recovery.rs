@@ -215,6 +215,56 @@ fn describe_attempts(flushes: usize, reopens: usize) -> String {
     )
 }
 
+/// Review 1 #19: during a call, one USB error is a hiccup, not a dead dongle.
+/// A single write that timed out or a pipe error used to end the runtime
+/// run, and the supervisor's reopen dropped the phone and the call with it.
+/// During a call an error is now logged and ridden out, unless the dongle is
+/// gone or errors keep coming (`LIMIT` within `WINDOW`): then the run ends
+/// as before and the supervisor reopens. Outside a call nothing changes.
+#[derive(Debug, Default)]
+pub(crate) struct UsbHiccups {
+    recent: VecDeque<Instant>,
+}
+
+impl UsbHiccups {
+    pub(crate) const WINDOW: Duration = Duration::from_secs(10);
+    pub(crate) const LIMIT: usize = 5;
+
+    /// True: log it and carry on. False: end the run (the supervisor
+    /// reopens the dongle).
+    pub(crate) fn ride_out(&mut self, error: &str, call_up: bool, now: Instant) -> bool {
+        if !call_up || dongle_gone(error) {
+            return false;
+        }
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= Self::WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(now);
+        self.recent.len() < Self::LIMIT
+    }
+}
+
+/// The error says the dongle is no longer there (pulled out, powered off,
+/// reset away): nothing to ride out. libusb's "No such device", the libusb
+/// transport's own "the dongle is gone", and Windows' device-not-connected,
+/// bad-command and no-such-device errors (1167, 22, 433), which WinUSB
+/// returns for a device that has gone.
+pub(crate) fn dongle_gone(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    let win32_code = lower.split("win32 error ").nth(1).and_then(|rest| {
+        rest.split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse::<u32>().ok())
+    });
+    lower.contains("no such device")
+        || lower.contains("dongle is gone")
+        || matches!(win32_code, Some(1167 | 22 | 433))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +408,33 @@ mod tests {
             RecoveryAction::FlushAclPipe
         );
         assert!(r.take_give_up_report());
+    }
+
+    #[test]
+    fn a_usb_hiccup_during_a_call_is_ridden_out_not_a_reopen() {
+        let t0 = Instant::now();
+        let mut hiccups = UsbHiccups::default();
+        let timeout = "libusb write_bulk (HCI ACL out): the dongle did not take it within 1000 ms";
+        // Outside a call nothing changes: the run ends and the supervisor reopens.
+        assert!(!hiccups.ride_out(timeout, false, t0));
+        // During a call a few are ridden out ...
+        for i in 0..(UsbHiccups::LIMIT as u64 - 1) {
+            assert!(hiccups.ride_out(timeout, true, t0 + Duration::from_millis(i * 100)));
+        }
+        // ... until they keep coming.
+        assert!(!hiccups.ride_out(timeout, true, t0 + Duration::from_millis(500)));
+        // Old ones are forgotten.
+        let later = t0 + UsbHiccups::WINDOW + Duration::from_secs(1);
+        assert!(hiccups.ride_out(timeout, true, later));
+        // A dongle that has gone is never ridden out.
+        assert!(!hiccups.ride_out("Pipe error: No such device (it may have been disconnected)", true, later));
+        assert!(!hiccups.ride_out("WinUsb_WritePipe(2) failed: Win32 error 1167", true, later));
+        assert!(!hiccups.ride_out(
+            "libusb set_alternate_setting(1, 0): the dongle is gone",
+            true,
+            later
+        ));
+        assert!(!dongle_gone("WinUsb_ReadPipe(1) failed: Win32 error 225"));
+        assert!(dongle_gone("WinUsb_ReadPipe(1) failed: Win32 error 22"));
     }
 }

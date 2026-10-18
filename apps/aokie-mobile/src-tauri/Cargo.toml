@@ -60,6 +60,14 @@ libwebrtc = "=0.3.50"
 # libwebrtc use 0.21: the two coexist under different crate names.
 rustls-platform-verifier = "0.7"
 jni22 = { package = "jni", version = "0.22" }
+# The Companion's WebSockets verify with the same platform verifier and the same aws-lc-rs provider
+# as reqwest (see `ws_tls.rs`); both are already in the graph through reqwest.
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+# Host tests build `ws_tls.rs`'s Android configuration too, so its API use is checked off a device.
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
+rustls-platform-verifier = "0.7"

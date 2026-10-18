@@ -56,6 +56,14 @@ const STREAM_REOPEN_DELAY: Duration = Duration::from_secs(1);
 const MAX_ABSORBED_STREAM_FAILURES: u32 = 3;
 /// `AokieCompanionRelayService::MAX_FRAMES_PER_POST`.
 const MAX_FRAMES_PER_POST: usize = 64;
+/// The relay's per-frame ceiling, as the phone's relay reader also has it.
+const MAX_RELAY_FRAME_BYTES: usize = 32 * 1024;
+/// What one authoritative snapshot may use of that ceiling, with margin for
+/// any re-encoding the relay does. A snapshot carries up to 200 captions, so a
+/// long call grew past the ceiling, every publication was refused, and the
+/// refusal tore the session down to resend the same frame: the Companion
+/// stopped updating for the rest of the call. Oldest captions are shed first.
+const RELAY_SNAPSHOT_BUDGET_BYTES: usize = MAX_RELAY_FRAME_BYTES - 4 * 1024;
 /// Attempts for one frame batch before it is dropped (429) or reported.
 const POST_ATTEMPTS: u32 = 3;
 const POST_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -121,9 +129,36 @@ pub(crate) enum RelayStreamEvent {
 #[derive(Default)]
 pub(crate) struct SseParser {
     buffer: String,
+    /// The start of a character whose remaining bytes are in the next chunk.
+    pending_bytes: Vec<u8>,
 }
 
 impl SseParser {
+    /// Decode raw stream bytes, carrying a character split across two reads.
+    ///
+    /// NOT `from_utf8_lossy` per chunk: `Response::chunk()` hands back
+    /// whatever the transport produced, and a boundary lands wherever TCP put
+    /// it, including the middle of a multi-byte character. Decoding each chunk
+    /// on its own turned both halves into U+FFFD, and because the damage sits
+    /// inside a JSON string the frame still parsed: caller names and captions
+    /// reached the session silently mangled. (The phone's relay reader does
+    /// the same thing for the same reason.)
+    pub(crate) fn push_bytes(&mut self, bytes: &[u8]) -> Vec<RelayStreamEvent> {
+        self.pending_bytes.extend_from_slice(bytes);
+        let split = match std::str::from_utf8(&self.pending_bytes) {
+            Ok(_) => self.pending_bytes.len(),
+            // `error_len() == None` means the tail is INCOMPLETE rather than
+            // invalid: the rest of the character is still in flight.
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            // Genuinely invalid bytes can never be completed by anything that
+            // follows, so they are consumed here; carrying them would wedge the
+            // decoder on every later read.
+            Err(_) => self.pending_bytes.len(),
+        };
+        let head: Vec<u8> = self.pending_bytes.drain(..split).collect();
+        self.push(&String::from_utf8_lossy(&head))
+    }
+
     pub(crate) fn push(&mut self, chunk: &str) -> Vec<RelayStreamEvent> {
         // Normalising line endings up front lets one separator search cover
         // both CRLF and LF streams.
@@ -206,8 +241,9 @@ fn parse_sse_block(block: &str) -> Option<RelayStreamEvent> {
 ///
 /// The frame itself is still queued when metadata is malformed, but it carries
 /// an EMPTY authority set. That lets the session tolerate peer traffic without
-/// letting missing, unknown, duplicate, or oversized metadata become ambient
-/// permission.
+/// letting missing, non-string, duplicate, or oversized metadata become
+/// ambient permission. A well-formed name this build does not know is only
+/// dropped: it grants nothing, and the known names beside it stand.
 fn parse_authenticated_grants(payload: &Value) -> HashSet<Grant> {
     let Some(values) = payload.get("grants").and_then(Value::as_array) else {
         return HashSet::new();
@@ -216,12 +252,19 @@ fn parse_authenticated_grants(payload: &Value) -> HashSet<Grant> {
         return HashSet::new();
     }
     let mut grants = HashSet::with_capacity(values.len());
+    let mut names = HashSet::with_capacity(values.len());
     for value in values {
-        let Ok(grant) = serde_json::from_value::<Grant>(value.clone()) else {
+        let Some(name) = value.as_str() else {
             return HashSet::new();
         };
-        if !grants.insert(grant) {
+        if !names.insert(name) {
             return HashSet::new();
+        }
+        // A grant this build does not know is dropped, not fatal: a newer
+        // FormLogic that adds one must not strip every older Desktop of all
+        // the grants it does know. An unknown name grants nothing either way.
+        if let Some(grant) = Grant::from_wire(name) {
+            grants.insert(grant);
         }
     }
     grants
@@ -425,6 +468,9 @@ impl RelayChannel {
     ) -> Result<(Self, EndpointChallengeFrame), WorkerError> {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            // The relay is a fixed, admission-named endpoint: a proxy from the
+            // environment would see every bearer token and frame.
+            .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|_| {
@@ -626,6 +672,8 @@ impl RelayChannel {
         &mut self,
         encoded: &str,
     ) -> Result<TransportDelivery, WorkerError> {
+        let fitted = fit_relay_snapshot(encoded, RELAY_SNAPSHOT_BUDGET_BYTES);
+        let encoded = fitted.as_deref().unwrap_or(encoded);
         let targets = self.route_targets(encoded);
         if targets.is_empty() {
             self.note_undeliverable();
@@ -694,8 +742,7 @@ impl RelayChannel {
             }
             Ok(Ok(Some(bytes))) => {
                 self.last_stream_read = Instant::now();
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                let events = self.parser.push(&text);
+                let events = self.parser.push_bytes(&bytes);
                 self.note_stream_progress(!events.is_empty());
                 self.absorb(events);
                 Ok(self.take_inbound())
@@ -774,6 +821,15 @@ impl RelayChannel {
                     if !self.approved_parties.contains(&from) {
                         eprintln!(
                             "[aokie-plugin][companion] stage=relay_frame_ignored detail=A frame arrived from a party outside the approved roster"
+                        );
+                        continue;
+                    }
+                    if let Some(kind) = aokie_protocol::v2::unknown_frame_kind(&frame) {
+                        // A newer Companion's frame. Ignoring it grants
+                        // nothing; handing it on would fail the whole session
+                        // and every other device's media with it.
+                        eprintln!(
+                            "[aokie-plugin][companion] stage=relay_frame_ignored kind={kind} detail=A frame of a kind this Desktop does not know was ignored"
                         );
                         continue;
                     }
@@ -1006,6 +1062,21 @@ impl RelayChannel {
                         tokio::time::sleep(POST_RETRY_DELAY).await;
                         continue;
                     }
+                    if matches!(
+                        status,
+                        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY
+                    ) {
+                        // The relay refused these frames' content. Sending
+                        // them again cannot change that, and failing the
+                        // session for it resent the same frame on reconnect,
+                        // in a loop that dropped every remote media route.
+                        eprintln!(
+                            "[aokie-plugin][companion] stage=relay_frames_refused frames={} status={} detail=The relay refused the frames and they were dropped",
+                            frames.len(),
+                            status.as_u16()
+                        );
+                        return Ok(TransportDelivery::Dropped);
+                    }
                     if status == StatusCode::TOO_MANY_REQUESTS {
                         // Systemic backpressure: the app mailbox is full
                         // because nothing is draining it. Losing a signalling
@@ -1054,6 +1125,44 @@ impl RelayChannel {
                     WorkerError::rebootstrap("Companion plugin identity is invalid")
                 })?,
             ))
+    }
+}
+
+/// A copy of an authoritative snapshot frame shed of its oldest captions until
+/// it fits `budget` bytes, or `None` when `encoded` is not a snapshot or
+/// already fits.
+///
+/// Re-encoded through the typed frame, so member order is exactly what the
+/// session produced. A snapshot that still does not fit with no captions at
+/// all is returned without them and left to the relay to refuse: nothing else
+/// in it (offers, consent, participants) is safe to drop here.
+fn fit_relay_snapshot(encoded: &str, budget: usize) -> Option<String> {
+    if encoded.len() <= budget {
+        return None;
+    }
+    let mut frame: aokie_protocol::v2::PluginSnapshotFrame = serde_json::from_str(encoded).ok()?;
+    if frame.kind != "plugin_snapshot" || frame.snapshot.captions.is_empty() {
+        return None;
+    }
+    let total = frame.snapshot.captions.len();
+    // Estimate how many to shed from each caption's encoded size (plus its
+    // separating comma), then confirm against the real encoding.
+    let mut excess = encoded.len() - budget;
+    let mut shed = 0;
+    while shed < total && excess > 0 {
+        let size = serde_json::to_string(&frame.snapshot.captions[shed])
+            .map_or(0, |caption| caption.len() + 1);
+        excess = excess.saturating_sub(size);
+        shed += 1;
+    }
+    frame.snapshot.captions.drain(..shed);
+    loop {
+        let fitted = serde_json::to_string(&frame).ok()?;
+        if fitted.len() <= budget || frame.snapshot.captions.is_empty() {
+            frame.validate().ok()?;
+            return Some(fitted);
+        }
+        frame.snapshot.captions.remove(0);
     }
 }
 
@@ -1164,7 +1273,7 @@ mod tests {
         let malformed = [
             None,
             Some(serde_json::json!("state_read")),
-            Some(serde_json::json!(["state_read", "unknown_scope"])),
+            Some(serde_json::json!(["state_read", 7])),
             Some(serde_json::json!(["state_read", "state_read"])),
             Some(Value::Array(
                 (0..=MAX_AUTHENTICATED_GRANTS)
@@ -1805,6 +1914,215 @@ mod tests {
 
         assert!(channel.approved_parties.contains(&party));
         assert_eq!(party, "mobile:abc");
+    }
+
+    #[test]
+    fn an_unknown_grant_name_is_dropped_and_the_known_ones_stand() {
+        let payload = serde_json::json!({
+            "seq": 1,
+            "from": "mobile:abc",
+            "grants": ["state_read", "notes_read", "monitor"],
+            "frame": {"kind": "mobile_hello"}
+        });
+        let encoded = format!("id: 1\nevent: frame\ndata: {payload}\n\n");
+        let events = SseParser::default().push(&encoded);
+        let [RelayStreamEvent::Frame { grants, .. }] = events.as_slice() else {
+            panic!("one frame");
+        };
+        assert_eq!(grants, &HashSet::from([Grant::StateRead, Grant::Monitor]));
+    }
+
+    #[test]
+    fn a_character_split_between_two_reads_arrives_whole() {
+        let encoded = frame_event(
+            9,
+            "mobile:abc",
+            "{\"kind\":\"lease_granted\",\"deviceId\":\"device_a\",\"note\":\"日本語 😀\"}",
+        );
+        let bytes = encoded.as_bytes();
+        // Cut inside the three-byte "本" and again inside the four-byte emoji.
+        let first_cut = encoded.find('本').unwrap() + 1;
+        let second_cut = encoded.find('😀').unwrap() + 2;
+        let mut parser = SseParser::default();
+        assert!(parser.push_bytes(&bytes[..first_cut]).is_empty());
+        assert!(parser.push_bytes(&bytes[first_cut..second_cut]).is_empty());
+        let events = parser.push_bytes(&bytes[second_cut..]);
+        let [RelayStreamEvent::Frame { frame, .. }] = events.as_slice() else {
+            panic!("one frame, got {events:?}");
+        };
+        let frame: Value = serde_json::from_str(frame).unwrap();
+        assert_eq!(frame["note"], "日本語 😀");
+
+        // A byte that can never start a character is consumed, not carried
+        // forward to wedge every later read.
+        let mut parser = SseParser::default();
+        assert!(parser.push_bytes(&[0xff]).is_empty());
+        let events = parser
+            .push_bytes(frame_event(10, "mobile:abc", "{\"kind\":\"lease_granted\"}").as_bytes());
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn a_frame_of_a_kind_this_desktop_does_not_know_is_ignored_not_handed_on() {
+        let mut channel = test_channel();
+        let mut parser = SseParser::default();
+        let events = parser.push(&format!(
+            "{}{}",
+            frame_event(
+                1,
+                "mobile:abc",
+                "{\"kind\":\"call_notes\",\"deviceId\":\"device_a\"}"
+            ),
+            frame_event(
+                2,
+                "mobile:abc",
+                "{\"kind\":\"lease_heartbeat\",\"deviceId\":\"device_a\"}"
+            ),
+        ));
+        channel.absorb(events);
+        // The cursor still moves past the ignored frame.
+        assert_eq!(channel.last_seq, 2);
+        let frame = channel.take_inbound().expect("the known frame is queued");
+        assert!(frame.contains("lease_heartbeat"));
+        assert!(channel.take_inbound().is_none());
+    }
+
+    fn snapshot_frame_with_captions(count: usize, text: &str) -> String {
+        let captions: Vec<Value> = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "captionId": format!("caption_7_{index}"),
+                    "speaker": "Caller",
+                    "text": text,
+                    "occurredAt": "2026-07-16T00:00:00Z",
+                    "finalText": true
+                })
+            })
+            .collect();
+        let frame = serde_json::json!({
+            "kind": "plugin_snapshot",
+            "schemaVersion": 2,
+            "appId": "app_a",
+            "eventId": "event_call_42_1",
+            "deviceId": "device_a",
+            "snapshot": {
+                "callId": "call_42",
+                "callEpoch": 7,
+                "ownerEpoch": 3,
+                "switchboardRevision": 11,
+                "remoteRevision": 13,
+                "telephonyState": "active",
+                "serviceMode": "aokie_active",
+                "mediaState": "ready",
+                "remoteCapabilities": {
+                    "softwareHold": true,
+                    "carrierHoldEvidence": "unknown",
+                    "secondaryCallObservation": "unknown",
+                    "voiceConsult": true,
+                    "takeover": true
+                },
+                "secondaryCallPolicy": "normal",
+                "remoteConsent": {
+                    "policyId": "aokie_remote_access",
+                    "policyVersion": 3,
+                    "enabled": true,
+                    "acknowledged": true,
+                    "acknowledgedAt": "2026-07-15T23:00:00Z",
+                    "captionsEnabled": true,
+                    "assistanceEnabled": true,
+                    "monitorEnabled": true,
+                    "consultEnabled": true,
+                    "takeoverEnabled": true
+                },
+                "caller": { "label": "Private caller", "maskedNumber": "***123" },
+                "captions": captions,
+                "occurredAt": "2026-07-16T00:00:00Z"
+            }
+        });
+        // Encode through the typed frame, as the session does.
+        let typed: aokie_protocol::v2::PluginSnapshotFrame =
+            serde_json::from_value(frame).expect("fixture is a valid snapshot frame");
+        typed.validate().expect("fixture validates");
+        serde_json::to_string(&typed).unwrap()
+    }
+
+    #[test]
+    fn a_long_calls_snapshot_sheds_its_oldest_captions_to_fit_the_relay() {
+        // 200 turns of ~670 CJK characters: about 400 KB, far past the relay.
+        let encoded = snapshot_frame_with_captions(200, &"語".repeat(666));
+        assert!(encoded.len() > MAX_RELAY_FRAME_BYTES);
+        let fitted = fit_relay_snapshot(&encoded, RELAY_SNAPSHOT_BUDGET_BYTES)
+            .expect("an oversized snapshot is fitted");
+        assert!(
+            fitted.len() <= RELAY_SNAPSHOT_BUDGET_BYTES,
+            "{}",
+            fitted.len()
+        );
+        let frame: aokie_protocol::v2::PluginSnapshotFrame = serde_json::from_str(&fitted).unwrap();
+        frame.validate().unwrap();
+        let captions = &frame.snapshot.captions;
+        assert!(!captions.is_empty());
+        // The newest turn is kept, and the kept turns are one unbroken run.
+        assert_eq!(captions.last().unwrap().caption_id, "caption_7_199");
+        let first_kept: usize = captions[0].caption_id["caption_7_".len()..]
+            .parse()
+            .unwrap();
+        for (offset, caption) in captions.iter().enumerate() {
+            assert_eq!(
+                caption.caption_id,
+                format!("caption_7_{}", first_kept + offset)
+            );
+        }
+        // Nothing else in the frame changed: same addressing, same event.
+        assert_eq!(frame.device_id.as_deref(), Some("device_a"));
+        assert_eq!(frame.event_id, "event_call_42_1");
+
+        // A 15-minute call of ordinary turns is under budget and goes as is.
+        let ordinary = snapshot_frame_with_captions(60, &"word ".repeat(60));
+        assert!(ordinary.len() > 16 * 1024);
+        assert_eq!(
+            fit_relay_snapshot(&ordinary, RELAY_SNAPSHOT_BUDGET_BYTES),
+            None
+        );
+        // Frames that are not snapshots are never rewritten.
+        let other = format!(
+            "{{\"kind\":\"rtc_signal\",\"pad\":\"{}\"}}",
+            "x".repeat(40_000)
+        );
+        assert_eq!(
+            fit_relay_snapshot(&other, RELAY_SNAPSHOT_BUDGET_BYTES),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_the_relay_refuses_as_too_large_is_dropped_not_fatal() {
+        for status in [
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            let router = axum::Router::new().route(
+                "/frames",
+                axum::routing::post(move || async move { status }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral listener");
+            let address = listener.local_addr().expect("listener address");
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+
+            let mut channel = test_channel();
+            channel.endpoints.frames_url = format!("http://{address}/frames");
+            channel.authorize_route("device_a", "mobile:abc", &test_grants());
+            let delivery = channel
+                .send_text("{\"kind\":\"plugin_lease_status\",\"deviceId\":\"device_a\"}")
+                .await
+                .expect("a refused frame must not fail the live session");
+            assert_eq!(delivery, TransportDelivery::Dropped, "{status}");
+            server.abort();
+        }
     }
 
     fn test_channel() -> RelayChannel {

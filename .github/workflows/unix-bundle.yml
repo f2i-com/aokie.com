@@ -76,7 +76,11 @@ jobs:
             if [ -d "$dir" ]; then echo "$dir: $(ls "$dir" | grep -c -i 'libclang') libclang file(s) $(ls "$dir" | grep -i 'libclang' | head -3 | tr '\n' ' ')"; else echo "$dir: not there"; fi
           done
 
+      # Strict: cargo builds --locked, and a bundle missing anything it should carry (Realtek's firmware) stops here.
       - name: Build and lay out the plugin
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+          AOKIE_BUNDLE_STRICT: '1'
         run: sh scripts/bundle-unix.sh "$PWD/aokie"
 
       # On a Mac every program and library is signed ad hoc, so that macOS runs it on Apple silicon. Before the

@@ -20,8 +20,9 @@ pub(crate) fn format_address(address: u64) -> String {
 }
 
 /// Parse an `XX:XX:..` (or contiguous-hex) address back to u64. Accepts the
-/// dongle backend's canonical form; returns None on anything else.
-pub(crate) fn parse_address(text: &str) -> Option<u64> {
+/// dongle backend's canonical form; returns None on anything else. (Public for
+/// the dev tools in `src/bin`, which take the phone's address as an argument.)
+pub fn parse_address(text: &str) -> Option<u64> {
     let hex: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex.len() != 12 {
         return None;

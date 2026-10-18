@@ -267,7 +267,37 @@ pub(super) fn resolve_swap_back_by_indicator(snap: &SwapSnapshot) -> SwapBackVer
         (2, _) => SwapBackVerdict::ActiveDied,
         (0, true) => SwapBackVerdict::NewcomerAlone,
         (0, false) => SwapBackVerdict::AllGone,
+        // The tracked call is gone yet the indicator still reads held+active:
+        // the indicator is stale (the phone dropped mid-settle and nothing
+        // reset it). Nobody is left to swap to (review 1 #7: this read as
+        // Swapped and the "newcomer was active" expect panicked the radio).
+        (_, false) => SwapBackVerdict::AllGone,
         _ => SwapBackVerdict::Swapped,
+    }
+}
+
+/// Review 1 #7: a swap-back verdict acted on with the tracker as it is. A
+/// verdict that works on the newcomer's session (park it, keep talking to
+/// it) when that session is gone — its terminal edge, or the phone link's
+/// end, arrived during the settle — becomes the verdict for the same
+/// topology without the newcomer, so no arm ever needs a session that is
+/// not there.
+#[cfg(all(aokie_radio, feature = "voice"))]
+pub(super) fn swap_back_verdict_for_tracker(
+    verdict: SwapBackVerdict,
+    newcomer_tracked: bool,
+) -> SwapBackVerdict {
+    if newcomer_tracked {
+        return verdict;
+    }
+    match verdict {
+        // The primary has the line again and the newcomer is gone.
+        SwapBackVerdict::Swapped => SwapBackVerdict::SwappedNewcomerGone,
+        // The primary is still held and nobody is active: retrieve them.
+        SwapBackVerdict::StayedOnNewcomer => SwapBackVerdict::ActiveDied,
+        // The primary's leg is gone and the newcomer is too.
+        SwapBackVerdict::NewcomerAlone => SwapBackVerdict::AllGone,
+        other => other,
     }
 }
 

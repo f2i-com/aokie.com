@@ -57,6 +57,8 @@ pub struct PluginConfig {
     pub config_version: u64,
     /// Phase 2: the outbound daily-dial ledger (None = never dialed).
     pub dial_ledger: Option<DialLedger>,
+    /// sms.send's daily ledger, the same shape (None = never texted).
+    pub sms_ledger: Option<DialLedger>,
 }
 
 /// Load/save wrapper bound to one data dir.

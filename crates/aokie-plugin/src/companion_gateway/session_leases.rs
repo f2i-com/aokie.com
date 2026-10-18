@@ -19,14 +19,21 @@ impl GatewaySession {
         let authentication = frame
             .signal
             .verify_endpoint_authentication(now)
-            .map_err(|_| WorkerError::reconnect("Companion RTC endpoint signature is invalid"))?;
+            .map_err(|error| match error {
+                // A proof that aged out in transit, or a phone clock a little
+                // off, is one late frame, not a forgery: refuse just it.
+                V2ProtocolError::Expired => {
+                    WorkerError::refused("Companion RTC endpoint proof is outside its time window")
+                }
+                _ => WorkerError::reconnect("Companion RTC endpoint signature is invalid"),
+            })?;
         if let Some(authentication) = authentication {
             let expected = self
                 .leases
                 .get(&frame.lease_jti)
                 .or_else(|| self.prepared.as_ref().map(|prepared| &prepared.provisional))
                 .ok_or_else(|| {
-                    WorkerError::reconnect("Companion RTC signature has no exact lease context")
+                    WorkerError::refused("Companion RTC signature has no exact lease context")
                 })?;
             let supplied_key = match &frame.signal {
                 RtcSignal::Offer { binding, .. } | RtcSignal::Answer { binding, .. } => {
@@ -59,12 +66,12 @@ impl GatewaySession {
             self.used_endpoint_jtis
                 .retain(|_, expires_at| *expires_at > now);
             if self.used_endpoint_jtis.contains_key(authentication.jti()) {
-                return Err(WorkerError::reconnect(
+                return Err(WorkerError::refused(
                     "Companion RTC endpoint signature was replayed",
                 ));
             }
             if self.used_endpoint_jtis.len() >= MAX_USED_ENDPOINT_JTIS {
-                return Err(WorkerError::reconnect(
+                return Err(WorkerError::refused(
                     "Companion RTC endpoint replay cache is exhausted",
                 ));
             }
@@ -83,14 +90,14 @@ impl GatewaySession {
                 if route.sdp_revision != frame.sdp_revision
                     || route.transport_generation != frame.transport_generation
                 {
-                    return Err(WorkerError::reconnect(
+                    return Err(WorkerError::refused(
                         "Companion ICE signal has a stale SDP generation",
                     ));
                 }
                 let sdp_mid = sdp_mid
-                    .ok_or_else(|| WorkerError::reconnect("Companion ICE signal omitted sdpMid"))?;
+                    .ok_or_else(|| WorkerError::refused("Companion ICE signal omitted sdpMid"))?;
                 let index = sdp_m_line_index.ok_or_else(|| {
-                    WorkerError::reconnect("Companion ICE signal omitted sdpMLineIndex")
+                    WorkerError::refused("Companion ICE signal omitted sdpMLineIndex")
                 })?;
                 media
                     .add_remote_ice(
@@ -110,7 +117,7 @@ impl GatewaySession {
                             frame.rtc_session_id,
                             sanitize_status_message(&error)
                         );
-                        WorkerError::reconnect(format!(
+                        WorkerError::refused(format!(
                             "Remote ICE candidate was rejected: {}",
                             sanitize_status_message(&error)
                         ))
@@ -125,7 +132,7 @@ impl GatewaySession {
                 let lease_id = route
                     .lease_id
                     .clone()
-                    .ok_or_else(|| WorkerError::reconnect("Companion RTC route omitted leaseId"))?;
+                    .ok_or_else(|| WorkerError::refused("Companion RTC route omitted leaseId"))?;
                 if matches!(
                     route.mode,
                     MediaMode::PreparedConsult
@@ -156,7 +163,7 @@ impl GatewaySession {
                 self.next_snapshot_poll = Instant::now();
                 Ok(())
             }
-            RtcSignal::Answer { .. } => Err(WorkerError::reconnect(
+            RtcSignal::Answer { .. } => Err(WorkerError::refused(
                 "Companion endpoint sent an answer in the offer direction",
             )),
         }
@@ -174,10 +181,10 @@ impl GatewaySession {
         // open, its dedicated epoch changes and the queued peer fails closed.
         // Capturing after admission would bless the already-started switch.
         let admitted_switch_epoch = media.capture_aokie_switch_epoch().map_err(|_| {
-            WorkerError::reconnect("Companion media switchboard proof is unavailable")
+            WorkerError::refused("Companion media switchboard proof is unavailable")
         })?;
         if radio.switch_in_flight() {
-            return Err(WorkerError::reconnect(
+            return Err(WorkerError::refused(
                 "Companion media offer arrived while the physical switchboard was moving",
             ));
         }
@@ -188,7 +195,7 @@ impl GatewaySession {
         }) {
             if radio.switchboard_revision() != expected_revision {
                 self.revoke_relay_lease_by_id(&lease_id, "switchboard_changed_before_media", media);
-                return Err(WorkerError::reconnect(
+                return Err(WorkerError::refused(
                     "Companion media offer crossed a physical switchboard transition",
                 ));
             }
@@ -200,7 +207,7 @@ impl GatewaySession {
                 .map(|_| prepared.provisional.lease_id.clone())
         }) {
             self.revoke_relay_lease_by_id(&lease_id, "active_peer_not_opened", media);
-            return Err(WorkerError::reconnect(
+            return Err(WorkerError::refused(
                 "Active Companion media offer arrived after its bounded handoff window",
             ));
         }
@@ -209,10 +216,10 @@ impl GatewaySession {
             claims
         } else {
             let prepared = self.prepared.as_ref().ok_or_else(|| {
-                WorkerError::reconnect("Active consult/takeover offer has no prepared claim")
+                WorkerError::refused("Active consult/takeover offer has no prepared claim")
             })?;
             let confirmed = prepared.confirmed_owner_epoch.ok_or_else(|| {
-                WorkerError::reconnect("Active offer arrived before physical preparation")
+                WorkerError::refused("Active offer arrived before physical preparation")
             })?;
             let old = &prepared.provisional;
             if frame.device_id != old.device_id
@@ -224,7 +231,7 @@ impl GatewaySession {
                 || frame.sdp_revision <= prepared.provisional_sdp_revision
                 || frame.transport_generation <= prepared.provisional_transport_generation
             {
-                return Err(WorkerError::reconnect(
+                return Err(WorkerError::refused(
                     "Active offer does not advance the prepared binding",
                 ));
             }
@@ -240,13 +247,13 @@ impl GatewaySession {
             && claims.phase == LeasePhase::Active
         {
             let prepared = self.prepared.as_ref().ok_or_else(|| {
-                WorkerError::reconnect("Active consult/takeover offer has no prepared claim")
+                WorkerError::refused("Active consult/takeover offer has no prepared claim")
             })?;
             if prepared.confirmed_owner_epoch != Some(claims.owner_epoch)
                 || frame.sdp_revision <= prepared.provisional_sdp_revision
                 || frame.transport_generation <= prepared.provisional_transport_generation
             {
-                return Err(WorkerError::reconnect(
+                return Err(WorkerError::refused(
                     "Active offer did not advance SDP and transport generations",
                 ));
             }
@@ -259,13 +266,13 @@ impl GatewaySession {
             || claims.owner_epoch != frame.owner_epoch
             || claims.fence != frame.fence
         {
-            return Err(WorkerError::reconnect(
+            return Err(WorkerError::refused(
                 "Companion RTC offer does not match its lease binding",
             ));
         }
         claims
             .validate(now)
-            .map_err(|_| WorkerError::reconnect("Companion RTC lease is invalid"))?;
+            .map_err(|_| WorkerError::refused("Companion RTC lease is invalid"))?;
         let remote = radio
             .remote_media()
             .ok_or_else(|| WorkerError::reconnect("Companion media is unavailable"))?
@@ -274,7 +281,7 @@ impl GatewaySession {
             || remote.call_epoch != claims.call_epoch
             || remote.owner_epoch != claims.owner_epoch
         {
-            return Err(WorkerError::reconnect(
+            return Err(WorkerError::refused(
                 "Companion RTC offer is stale against physical call truth",
             ));
         }
@@ -292,7 +299,7 @@ impl GatewaySession {
                 )
             );
             if !replacing_prepared {
-                return Err(WorkerError::reconnect(
+                return Err(WorkerError::refused(
                     "Companion RTC session already has a native peer",
                 ));
             }
@@ -300,14 +307,14 @@ impl GatewaySession {
             self.peers.remove(&frame.rtc_session_id);
         }
         let binding = binding_for_claims(&claims);
-        let ttl = lease_ttl_ms(&claims)?;
+        let ttl = lease_ttl_ms(&claims).map_err(|error| WorkerError::refused(error.message))?;
         let offer = SdpSignal {
             kind: SdpSignalType::Offer,
             sdp,
         };
         offer
             .validate()
-            .map_err(|_| WorkerError::reconnect("Companion SDP offer is invalid"))?;
+            .map_err(|_| WorkerError::refused("Companion SDP offer is invalid"))?;
         media
             .open_peer(OpenPeerRequest {
                 binding: binding.clone(),
@@ -328,7 +335,7 @@ impl GatewaySession {
                     binding.rtc_session_id,
                     sanitize_status_message(&error)
                 );
-                WorkerError::reconnect(format!(
+                WorkerError::refused(format!(
                     "Native Companion peer could not open: {}",
                     sanitize_status_message(&error)
                 ))
@@ -359,10 +366,12 @@ impl GatewaySession {
             binding.mode,
             MediaMode::PreparedTalk | MediaMode::PreparedConsult
         ) {
-            let prepared = self
-                .prepared
-                .as_mut()
-                .ok_or_else(|| WorkerError::reconnect("Prepared takeover context disappeared"))?;
+            let Some(prepared) = self.prepared.as_mut() else {
+                // The peer just opened has no route to live in; close it
+                // rather than leave an orphan that blocks the next claim.
+                let _ = media.close_peer(&binding.rtc_session_id, "prepared_context_lost");
+                return Err(WorkerError::refused("Prepared takeover context disappeared"));
+            };
             prepared.provisional_sdp_revision = frame.sdp_revision;
             prepared.provisional_transport_generation = frame.transport_generation;
         }
@@ -387,7 +396,7 @@ impl GatewaySession {
 
     pub(super) fn route_for_frame(&self, frame: &PluginRtcSignalFrame) -> Result<&PeerRoute, WorkerError> {
         let route = self.peers.get(&frame.rtc_session_id).ok_or_else(|| {
-            WorkerError::reconnect("Companion RTC signal names an unknown native peer")
+            WorkerError::refused("Companion RTC signal names an unknown native peer")
         })?;
         if route.lease_jti != frame.lease_jti
             || route.device_id != frame.device_id
@@ -396,7 +405,7 @@ impl GatewaySession {
             || route.binding.owner_epoch != frame.owner_epoch
             || route.binding.fence != frame.fence
         {
-            return Err(WorkerError::reconnect(
+            return Err(WorkerError::refused(
                 "Companion RTC signal does not match the immutable peer binding",
             ));
         }

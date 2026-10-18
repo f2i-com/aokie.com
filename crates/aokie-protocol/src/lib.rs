@@ -8,6 +8,7 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod text;
 pub mod v2;
 
 pub const SCHEMA_VERSION: u16 = 1;

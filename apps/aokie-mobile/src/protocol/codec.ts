@@ -16,6 +16,61 @@ import {
 const SAFE_ID = /^[A-Za-z0-9._:-]{1,200}$/;
 const IDEMPOTENCY_DEVICE_LIMIT = 152;
 export const MAX_ASSISTANCE_ANSWER_CHARACTERS = 2_000;
+/**
+ * Protocol v2 counts its limits in UTF-8 bytes (`MAX_ASSISTANCE_ANSWER_BYTES`
+ * in aokie-protocol), not characters: 2,000 characters of CJK text is 6,000
+ * bytes, and an answer counted in UTF-16 units was refused after the owner had
+ * typed it.
+ */
+export const MAX_V2_ASSISTANCE_ANSWER_BYTES = 2_000;
+
+const utf8 = new TextEncoder();
+
+export function utf8ByteLength(value: string): number {
+  return utf8.encode(value).length;
+}
+
+/** The longest prefix of `value` within `maxBytes` UTF-8 bytes, never splitting a character. */
+export function truncateToUtf8Bytes(value: string, maxBytes: number): string {
+  if (value.length <= maxBytes / 3 || utf8ByteLength(value) <= maxBytes) return value;
+  let bytes = 0;
+  let end = 0;
+  for (const character of value) {
+    const size = utf8ByteLength(character);
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    end += character.length;
+  }
+  return value.slice(0, end);
+}
+
+function forbiddenInLine(character: string): boolean {
+  const code = character.codePointAt(0) ?? 0;
+  return code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029;
+}
+
+/**
+ * The phone's copy of aokie-protocol's `text::sanitize_line`: each run of
+ * control characters (newline and tab included) becomes one space, the ends
+ * are trimmed, and the result is cut on a character boundary within
+ * `maxBytes` UTF-8 bytes. May return "".
+ */
+export function sanitizeLine(value: string, maxBytes: number): string {
+  let line = "";
+  let pendingSpace = false;
+  for (const character of value) {
+    if (forbiddenInLine(character)) {
+      pendingSpace = true;
+      continue;
+    }
+    if (!line && /\s/u.test(character)) continue;
+    if (pendingSpace && line) line += " ";
+    pendingSpace = false;
+    line += character;
+    if (line.length > maxBytes + 4) break;
+  }
+  return truncateToUtf8Bytes(line.trimEnd(), maxBytes).trimEnd();
+}
 const SERVICE_MODES = new Set<ServiceMode>([
   "aokie_active",
   "soft_hold",

@@ -544,6 +544,20 @@ impl L2capState {
         id
     }
 
+    /// The live HFP connection's state (service-level connection up), from
+    /// whichever RFCOMM channel carries it: the phone's (server) or ours
+    /// (client, phone.connect). None while no SLC is up.
+    pub fn hfp_state(&self) -> Option<&hfp::HfpHandsFreeState> {
+        self.channels.values().find_map(|channel| {
+            let state = if let Some(rfcomm_state) = channel.rfcomm_state.as_ref() {
+                rfcomm_state.hfp_state()
+            } else {
+                channel.hfp_client.as_ref()?.hfp_state()
+            };
+            state.service_level_ready().then_some(state)
+        })
+    }
+
     pub fn take_hfp_events(&mut self) -> Vec<hfp::HfpEvent> {
         let mut events = std::mem::take(&mut self.orphan_hfp_events);
         for channel in self.channels.values_mut() {

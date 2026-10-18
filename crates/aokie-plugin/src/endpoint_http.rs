@@ -14,8 +14,9 @@
 //!      (`ClientBuilder::resolve`) so the connection can only go where we checked.
 //!
 //! IP-literal and `localhost` endpoints skip resolution/pinning — the operator typed the
-//! address, the settings classifier already vetted its class, and loopback/LAN use is a
-//! deliberate, warned-about deployment mode.
+//! address and the settings classifier already vetted its class. Only loopback and public
+//! addresses get this far: `settings.set` refuses a private-network (LAN), link-local or
+//! metadata endpoint, and an IP literal of those classes is refused here as well.
 //!
 //! Clients are cached per (endpoint origin, timeouts): reqwest clients are cheap to clone
 //! (Arc inside), and caching keeps the pinned resolution stable for a call instead of

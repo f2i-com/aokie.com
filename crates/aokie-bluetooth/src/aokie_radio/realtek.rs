@@ -227,12 +227,59 @@ fn read_files(chip: &RtlChip) -> Option<(PathBuf, Vec<u8>, Vec<u8>)> {
     })
 }
 
+/// What became of a Realtek controller's firmware at the radio's last start, for the dongle screen
+/// (`dongle.list`'s `firmware`): a dongle left on its ROM is seen by no phone, and the log alone said why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FirmwareStatus {
+    /// The chip, as [`CHIPS`] names it.
+    pub chip: &'static str,
+    /// `loaded`; `missing` (its files are not where they are looked for); `failed` (the controller refused it).
+    /// Either of the last two leaves the controller on its ROM.
+    pub state: &'static str,
+    /// What was looked for where, or the controller's refusal.
+    pub detail: String,
+}
+
+static LAST_STATUS: std::sync::Mutex<Option<FirmwareStatus>> = std::sync::Mutex::new(None);
+
+/// The firmware's state at the radio's last start: None when the controller was no Realtek ROM of [`CHIPS`]
+/// (another chip, or one whose firmware was loaded already).
+pub fn firmware_status() -> Option<FirmwareStatus> {
+    LAST_STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn set_status(status: Option<FirmwareStatus>) {
+    *LAST_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = status;
+}
+
 /// Load the firmware into a controller running the ROM of a chip of [`CHIPS`]: its version as the firmware reports
 /// it, after a reset (which keeps the firmware, and clears the event mask: set it again). None where there is nothing
 /// to load (another controller, one whose firmware is loaded, or no files, which the log says). An error where the
-/// controller refused a step: the caller goes on with the ROM.
+/// controller refused a step: the caller goes on with the ROM. Either way [`firmware_status`] says what happened.
 pub fn load_firmware(transport: &AokieHciTransport, version: &LocalVersion) -> Result<Option<LocalVersion>, String> {
-    let Some(chip) = rom_chip(version) else { return Ok(None) };
+    let Some(chip) = rom_chip(version) else {
+        set_status(None);
+        return Ok(None);
+    };
+    let result = load_chip_firmware(transport, chip);
+    set_status(Some(match &result {
+        Ok(Some(_)) => FirmwareStatus { chip: chip.name, state: "loaded", detail: String::new() },
+        Ok(None) => FirmwareStatus {
+            chip: chip.name,
+            state: "missing",
+            detail: format!(
+                "{} and {} were looked for in {} and are not there",
+                chip.firmware,
+                chip.config,
+                firmware_dirs().iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+            ),
+        },
+        Err(e) => FirmwareStatus { chip: chip.name, state: "failed", detail: e.clone() },
+    }));
+    result
+}
+
+fn load_chip_firmware(transport: &AokieHciTransport, chip: &'static RtlChip) -> Result<Option<LocalVersion>, String> {
     let Some((dir, fw, config)) = read_files(chip) else {
         let looked: Vec<String> = firmware_dirs().iter().map(|d| d.display().to_string()).collect();
         eprintln!(

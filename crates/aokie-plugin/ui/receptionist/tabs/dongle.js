@@ -9,6 +9,15 @@
  * (`dongle.list` / `dongle.installDriver` / `dongle.restoreDriver`); this
  * tab only sequences it and narrates what to expect.
  *
+ * A driver step (the install, the restore, Linux's access rule) waits on a
+ * person at a Windows or desktop prompt, so the plugin runs it off its command
+ * loop: the command answers `accepted`, and `dongle.list`'s `driverJob` says
+ * when it is done or why it failed. The tab polls that, keeps every button
+ * that would start another step off while one runs, and finds a running step
+ * again after the host gave up waiting (20 s) or the tab was left. It used to
+ * wait on the command itself, which the host timed out while the elevated
+ * helper still ran, and offered Install again: a second elevated install.
+ *
  * A second card, "Reset the dongle", runs `dongle.reset`: the plugin's
  * software recovery (reopen the USB connection, reset the controller, page
  * the phone back), refused by the plugin while a call is up.
@@ -57,6 +66,12 @@
   var acceptSigning = false;
   var verifyTimer = null;
   var verifyAttempts = 0;
+  // A driver step running in the plugin that this tab waits for: its kind
+  // ('install' | 'restore'), the device it is for, and the poll timer.
+  var jobKind = null;
+  var jobTarget = null;
+  var jobTimer = null;
+  var jobWait = 0; // which wait a poll belongs to: a poll of one the tab has since dropped stops
   // The device a verify poll is checking. Kept OUTSIDE the live list because
   // the target legitimately disappears from `connected` mid-verify (the
   // rebind re-enumerates it) — "Check again" and a remount mid-verify must
@@ -125,7 +140,6 @@
     '0a5c:21e8': 'Broadcom BCM20702',
     '0a5c:21ec': 'Broadcom BCM20702',
     '0bda:8771': 'Realtek RTL8761B',
-    '0bda:c822': 'Realtek RTL8821C',
     '0a12:0001': 'CSR8510 A10',
   };
 
@@ -196,23 +210,149 @@
 
   /** Linux: put the rule in place that lets this user open `d` (the desktop asks for the password). */
   function allow(d) {
+    if (busy) return;
     busy = true;
     error = null;
     render();
-    HOST.command('dongle.installDriver', { vid: d.vid, pid: d.pid })
-      .then(
-        function () {
-          HOST.toast('success', 'Aokie may use ' + dongleLabel(d) + ' (USB ' + idLabel(d) + ') now. Start Aokie again to open it.');
-          return refresh();
-        },
-        function (e) {
-          error = errMsg(e);
+    var allowed = function () {
+      HOST.toast('success', 'Aokie may use ' + dongleLabel(d) + ' (USB ' + idLabel(d) + ') now. Start Aokie again to open it.');
+      return refresh();
+    };
+    HOST.command('dongle.installDriver', { vid: d.vid, pid: d.pid }).then(
+      function (data) {
+        if (data && data.accepted) {
+          waitForJob('install', d, allowed);
+          return;
         }
-      )
-      .then(function () {
+        // (an older plugin answered once the rule was in place)
         busy = false;
+        allowed().then(render);
+      },
+      function (e) {
+        findRunningJob('install', d, e, allowed);
+      }
+    );
+  }
+
+  // ---- driver steps running in the plugin ---------------------------------
+
+  /** dongle.list's driverJob: the driver step running or last run in the plugin. */
+  function driverJob() {
+    return (list && list.driverJob) || null;
+  }
+
+  function jobIsFor(job, kind, d) {
+    return !!(job && job.kind === kind && (!d || (Number(job.vid) === Number(d.vid) && Number(job.pid) === Number(d.pid))));
+  }
+
+  /** Wait for the plugin's `kind` step for `d` to end (however long the person takes over its prompt), polling
+   *  dongle.list every 2 s: then `onDone(job)`, or its error on the screen. */
+  function waitForJob(kind, d, onDone) {
+    busy = true;
+    error = null;
+    jobKind = kind;
+    jobTarget = d;
+    var wait = ++jobWait;
+    render();
+    var poll = function () {
+      jobTimer = null;
+      if (!root || wait !== jobWait) return; // tab left: mount finds the running step again
+      refresh().then(function (data) {
+        if (!root || wait !== jobWait) return;
+        var job = data && data.driverJob;
+        // (no answer this time, or the step is still on: ask again)
+        if (data === null || (jobIsFor(job, kind, d) && job.state === 'running')) {
+          jobTimer = window.setTimeout(poll, 2000);
+          return;
+        }
+        busy = false;
+        jobKind = null;
+        jobTarget = null;
+        if (jobIsFor(job, kind, d) && job.state === 'done') {
+          onDone(job);
+          return;
+        }
+        error = (job && job.error) || 'The driver step ended without saying how it went. Rescan, then try again.';
+        if (kind === 'install' && !noDriver()) step = 'install';
         render();
       });
+    };
+    jobTimer = window.setTimeout(poll, 1000);
+  }
+
+  /** A driver command came back with an error: the host's "did not respond" after 20 s while the step still runs
+   *  in the plugin, or the plugin's refusal. Ask dongle.list which, and wait for a step that is running. */
+  function findRunningJob(kind, d, e, onDone) {
+    refresh().then(function (data) {
+      var job = data && data.driverJob;
+      if (jobIsFor(job, kind, d) && job.state === 'running') {
+        waitForJob(kind, d, onDone);
+        return;
+      }
+      busy = false;
+      error = errMsg(e);
+      if (kind === 'install' && !noDriver()) step = 'install';
+      render();
+    });
+  }
+
+  /** On mount: a step the plugin is still running (started before the tab was left, or by another screen) is
+   *  waited for again, its buttons off until it ends. */
+  function resumeRunningJob() {
+    var job = driverJob();
+    if (!job || job.state !== 'running' || jobKind) return false;
+    var d = null;
+    var conn = connectedDevices();
+    for (var i = 0; i < conn.length; i++) {
+      if (Number(conn[i].vid) === Number(job.vid) && Number(conn[i].pid) === Number(job.pid)) d = conn[i];
+    }
+    d = d || { vid: job.vid, pid: job.pid };
+    if (job.kind === 'install' && !noDriver()) {
+      step = 'install';
+      selectedKey = key(d);
+      waitForJob('install', d, function () {
+        verifySelected(d);
+      });
+    } else if (job.kind === 'install') {
+      waitForJob('install', d, function () {
+        HOST.toast('success', 'Aokie may use ' + dongleLabel(d) + ' (USB ' + idLabel(d) + ') now. Start Aokie again to open it.');
+        render();
+      });
+    } else if (job.kind === 'restore') {
+      waitForJob('restore', d, restored);
+    } else {
+      // Another step (the certificates' removal): its buttons off until it ends.
+      waitForJob(job.kind, null, function () {
+        render();
+      });
+    }
+    return true;
+  }
+
+  /** A restore the plugin read back on another driver. */
+  function restored(job) {
+    var driver = (job && job.result && job.result.driver) || 'the standard Windows Bluetooth driver';
+    HOST.toast('success', 'Windows driver restored — the dongle is on ' + driver + ' again.');
+    return refresh();
+  }
+
+  /** A Realtek dongle whose firmware Aokie could not load at its last start runs its ROM, which phones do not see. */
+  function firmwareHtml() {
+    var fw = list && list.firmware;
+    if (!fw || (fw.state !== 'missing' && fw.state !== 'failed')) return '';
+    var why =
+      fw.state === 'missing'
+        ? 'its firmware files are not there' + (fw.detail ? ' (' + esc(fw.detail) + ')' : '')
+        : 'the dongle refused it' + (fw.detail ? ' (' + esc(fw.detail) + ')' : '');
+    return (
+      '<div class="rcp-callout is-warn" role="status">' + ICONS.alert +
+      '<span>Aokie could not load the ' + esc(fw.chip || 'Realtek') + ' firmware when it last started: ' + why +
+      '. The dongle runs its ROM instead, and phones do not see it when pairing. ' +
+      (fw.state === 'missing'
+        ? 'Reinstall Aokie (its bundle carries the firmware), then start it again.'
+        : 'Unplug the dongle, plug it back in, then start Aokie again.') +
+      '</span></div>'
+    );
   }
 
   /** The dongle chosen for Aokie (dongle.setPreferred), as dongle.list reports it. */
@@ -263,9 +403,10 @@
     return HOST.command('dongle.list').then(
       function (data) {
         list = data || {};
-        error = null;
+        // (a step being waited for keeps its error slot, and its device: a rebind takes it off the list a while)
+        if (!jobKind) error = null;
         // Keep the selection pinned to the same physical id across refreshes.
-        if (selectedKey && !selectedDevice()) selectedKey = null;
+        if (selectedKey && !selectedDevice() && !jobKind) selectedKey = null;
         // Nothing picked yet: the dongle chosen for Aokie, else the only one there is to pick.
         if (!selectedKey) {
           var offered = candidates();
@@ -331,7 +472,8 @@
 
   function install() {
     var sel = selectedDevice();
-    if (!sel) return;
+    // (one driver step at a time: the plugin refuses a second, and its button is off)
+    if (!sel || busy) return;
     busy = true;
     error = null;
     render();
@@ -346,41 +488,46 @@
     }
     // One acceptance, one install: the next one asks again.
     acceptSigning = false;
-    HOST.command('dongle.installDriver', request)
-      .then(
-        function () {
-          busy = false;
-          verifySelected(sel);
-        },
-        function (e) {
-          // The declined-UAC case comes back as a typed, human error from the host.
-          busy = false;
-          error = errMsg(e);
-          step = 'install';
-          render();
+    var installed = function () {
+      verifySelected(sel);
+    };
+    HOST.command('dongle.installDriver', request).then(
+      function (data) {
+        if (data && data.accepted) {
+          // The plugin runs it: wait for the step (a declined UAC prompt fails it, with a human error).
+          waitForJob('install', sel, installed);
+          return;
         }
-      );
+        // (an older plugin answered once the install was over)
+        busy = false;
+        installed();
+      },
+      function (e) {
+        findRunningJob('install', sel, e, installed);
+      }
+    );
   }
 
   function restore(d) {
+    if (busy) return;
     busy = true;
     error = null;
     restoreArm = null;
     render();
-    HOST.command('dongle.restoreDriver', { vid: d.vid, pid: d.pid })
-      .then(
-        function () {
-          HOST.toast('success', 'Windows driver restored — the dongle is back on the standard Windows Bluetooth driver.');
-          return refresh();
-        },
-        function (e) {
-          error = errMsg(e);
+    HOST.command('dongle.restoreDriver', { vid: d.vid, pid: d.pid }).then(
+      function (data) {
+        if (data && data.accepted) {
+          // Done only once the plugin reads the dongle back on a driver other than WinUSB.
+          waitForJob('restore', d, restored);
+          return;
         }
-      )
-      .then(function () {
         busy = false;
-        render();
-      });
+        restored(data).then(render);
+      },
+      function (e) {
+        findRunningJob('restore', d, e, restored);
+      }
+    );
   }
 
   /** Reset the dongle in software (dongle.reset): the plugin closes and
@@ -724,7 +871,7 @@
           (loading
             ? 'Scanning USB devices…'
             : 'No supported dongle detected. Plug the USB Bluetooth dongle in, then rescan. ' +
-              'Supported chipsets: Broadcom BCM20702 (certified), Realtek RTL8761/RTL8821CE and CSR8510 (beta).') +
+              'Supported chipsets: Broadcom BCM20702 (certified), Realtek RTL8761 and CSR8510 (beta).') +
           '</p>'
       );
     } else {
@@ -805,7 +952,8 @@
   }
 
   function installStepHtml() {
-    var sel = selectedDevice();
+    // (while its install runs the device may drop off the list: the rebind re-enumerates it)
+    var sel = selectedDevice() || (jobKind === 'install' ? jobTarget : null);
     if (!sel) {
       return (
         '<p class="rcp-error">The selected dongle disappeared — rescan and pick it again.</p>' +
@@ -825,6 +973,10 @@
       '<p class="rcp-step-meta">Windows will show a <strong>User Account Control</strong> prompt — choose <strong>Yes</strong>. ' +
       'Only this exact device is rebound (the installer pins its hardware identity), and you can restore the standard ' +
       'Windows driver at any time.</p>' +
+      (jobKind === 'install'
+        ? '<p class="rcp-step-meta" role="status">Installing: answer the Windows prompt if one is open (it may be behind ' +
+          'this window). The install can take a minute or two; this waits for it to finish.</p>'
+        : '') +
       signingHtml() +
       errorHtml() +
       barHtml(
@@ -928,6 +1080,7 @@
           : '<p class="rcp-inline-note">Guided setup for the USB Bluetooth dongle: pick the device, install the WinUSB ' +
             "driver (one Windows prompt), and verify it's ready.</p>") +
       setupStatusHtml() +
+      firmwareHtml() +
       stepperHtml() +
       body +
       '</div>' +
@@ -1061,8 +1214,11 @@
       }
       render();
       refresh().then(function () {
+        if (!root) return;
+        // A driver step still running in the plugin: wait for it again, its buttons off.
+        resumeRunningJob();
         // Where there is no driver step, the radio's state is the tab's news.
-        if (root && noDriver() && !setupActive()) checkRadio();
+        if (noDriver() && !setupActive()) checkRadio();
       });
     },
     unmount: function () {
@@ -1074,6 +1230,17 @@
       if (radioStartTimer != null) {
         window.clearTimeout(radioStartTimer);
         radioStartTimer = null;
+      }
+      if (jobTimer != null) {
+        window.clearTimeout(jobTimer);
+        jobTimer = null;
+      }
+      if (jobKind) {
+        // The step goes on in the plugin; mount finds it again (a poll still in flight stops).
+        jobWait += 1;
+        jobKind = null;
+        jobTarget = null;
+        busy = false;
       }
     },
     onEvent: function (evt) {

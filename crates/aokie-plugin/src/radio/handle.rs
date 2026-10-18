@@ -298,6 +298,43 @@ pub(super) fn return_companion_end_caller_to_aokie(
 /// barrier flushed) before it is unconfirmed.
 pub const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Said by every radio round trip that was handed to the radio and not
+/// answered in time. The radio thread still holds the request and may carry
+/// it out later (it was busy, not gone), so its outcome is unknown: the
+/// command journal keeps such a request id reserved instead of freeing it,
+/// and a retry under it is refused rather than paging or resetting twice.
+pub const RADIO_OUTCOME_UNKNOWN: &str = "it may still carry it out, so the outcome is unknown";
+
+/// The error of a round trip the radio did not answer within its wait (or
+/// whose thread ended with the request in hand: whether it ran is as unknown).
+fn unanswered(request: &str, error: std::sync::mpsc::RecvTimeoutError) -> String {
+    match error {
+        std::sync::mpsc::RecvTimeoutError::Timeout => format!(
+            "the radio did not answer the {request} request in time; {RADIO_OUTCOME_UNKNOWN}"
+        ),
+        std::sync::mpsc::RecvTimeoutError::Disconnected => format!(
+            "the radio stopped before it answered the {request} request; {RADIO_OUTCOME_UNKNOWN}"
+        ),
+    }
+}
+
+/// Whether a command's error says the radio was handed the request and did
+/// not answer it in time ([`RADIO_OUTCOME_UNKNOWN`]).
+pub fn outcome_unknown(message: &str) -> bool {
+    message.contains(RADIO_OUTCOME_UNKNOWN)
+}
+
+/// The name `phone.status` shows for a connected phone whose own name has not
+/// come yet (the radio's Remote Name Request lands about a second after the
+/// link). The radio puts it on a device it sees connect.
+pub const UNNAMED_PHONE: &str = "Paired phone";
+
+/// How long `phone.status` waits on the radio thread for the connected
+/// phone's name, the times it is not known yet. Short: the command loop must
+/// not stall behind a radio that is busy with a call, and the name is kept
+/// once it has been answered.
+const CONNECTED_NAME_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
 impl RadioHandle {
     /// Test-only: a handle wired to a bare channel (no radio thread) so
     /// connector tests can exercise the radio-backed command paths —
@@ -609,7 +646,7 @@ impl RadioHandle {
         let (tx, rx) = std::sync::mpsc::channel();
         self.send(RadioControl::RemovePaired { address, reply: tx })?;
         rx.recv_timeout(std::time::Duration::from_secs(5))
-            .map_err(|_| "the radio did not answer the removePaired request".to_string())?
+            .map_err(|e| unanswered("removePaired", e))?
     }
 
     /// Bonded (revocable) devices with their captured friendly names
@@ -622,8 +659,17 @@ impl RadioHandle {
     }
 
     /// The connected phone's captured friendly name/model, if known yet.
-    /// Round-trips the radio thread (the name lives in the radio runtime).
+    /// The name lives in the radio runtime, so the radio thread is asked for
+    /// it, but only until it has answered one: from then on it is kept with
+    /// the device in `status.paired` (the devices seen this radio session)
+    /// and read from there, so `phone.status` does not wait on a radio busy
+    /// with a call. An ask that is not answered waits only
+    /// [`CONNECTED_NAME_WAIT`].
     pub fn connected_name(&self) -> Option<String> {
+        let address = self.connected_address()?;
+        if let Some(name) = self.known_name(&address) {
+            return Some(name);
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         if self
             .send(RadioControl::ConnectedName { reply: tx })
@@ -631,9 +677,32 @@ impl RadioHandle {
         {
             return None;
         }
-        rx.recv_timeout(std::time::Duration::from_secs(3))
-            .ok()
-            .flatten()
+        let name = rx.recv_timeout(CONNECTED_NAME_WAIT).ok().flatten()?;
+        // Kept for this phone only if it is still the one connected: the
+        // answer is the name of whatever link the radio has now.
+        if self.connected_address().as_deref() == Some(address.as_str()) {
+            let mut paired = self.status.paired.lock().unwrap();
+            match paired.iter_mut().find(|d| d.address == address) {
+                Some(device) => device.name = name.clone(),
+                None => paired.push(PairedDevice {
+                    address,
+                    name: name.clone(),
+                }),
+            }
+        }
+        Some(name)
+    }
+
+    /// The name kept for `address` (see [`Self::connected_name`]), not the
+    /// stand-in a device is listed under until its own name comes.
+    fn known_name(&self, address: &str) -> Option<String> {
+        self.status
+            .paired
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|d| d.address == address && d.name != UNNAMED_PHONE)
+            .map(|d| d.name.clone())
     }
 
     /// Disconnect the connected phone but KEEP the bond (remote reconnect/
@@ -642,7 +711,7 @@ impl RadioHandle {
         let (tx, rx) = std::sync::mpsc::channel();
         self.send(RadioControl::Disconnect { address, reply: tx })?;
         rx.recv_timeout(std::time::Duration::from_secs(5))
-            .map_err(|_| "the radio did not answer the disconnect request".to_string())?
+            .map_err(|e| unanswered("disconnect", e))?
     }
 
     /// HARD-001: reconnect a bonded phone from OUR side (page + outbound HFP
@@ -651,7 +720,7 @@ impl RadioHandle {
         let (tx, rx) = std::sync::mpsc::channel();
         self.send(RadioControl::Connect { address, reply: tx })?;
         rx.recv_timeout(std::time::Duration::from_secs(10))
-            .map_err(|_| "the radio did not answer the connect request".to_string())?
+            .map_err(|e| unanswered("connect", e))?
     }
 
     /// `dongle.reset`: ask the radio thread to reset the dongle in software.
@@ -661,7 +730,7 @@ impl RadioHandle {
         let (tx, rx) = std::sync::mpsc::channel();
         self.send(RadioControl::ResetDongle { reply: tx })?;
         rx.recv_timeout(std::time::Duration::from_secs(3))
-            .map_err(|_| "the radio did not answer the reset request".to_string())?
+            .map_err(|e| unanswered("reset", e))?
     }
 
     /// The controller-ready count `dongle.reset` waits to see move.
@@ -720,6 +789,64 @@ impl RadioHandle {
             reply: tx,
         })?;
         rx.recv_timeout(std::time::Duration::from_secs(5))
-            .map_err(|_| "the radio did not answer the confirmPairing request".to_string())?
+            .map_err(|e| unanswered("confirmPairing", e))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connected(handle: &RadioHandle, address: &str, listed_as: &str) {
+        *handle.status.connected_address.lock().unwrap() = Some(address.to_string());
+        handle.status.paired.lock().unwrap().push(PairedDevice {
+            address: address.to_string(),
+            name: listed_as.to_string(),
+        });
+    }
+
+    #[test]
+    fn a_known_phone_name_is_read_without_asking_the_radio() {
+        let (handle, controls) = RadioHandle::test_handle();
+        connected(&handle, "AA:BB:CC:DD:EE:01", "Pixel 9");
+        assert_eq!(handle.connected_name().as_deref(), Some("Pixel 9"));
+        assert!(controls.try_recv().is_err(), "the radio thread was asked");
+    }
+
+    #[test]
+    fn a_name_the_radio_answers_is_kept_for_the_next_status() {
+        let (handle, controls) = RadioHandle::test_handle();
+        connected(&handle, "AA:BB:CC:DD:EE:02", UNNAMED_PHONE);
+        let radio = std::thread::spawn(move || {
+            if let Ok(RadioControl::ConnectedName { reply }) = controls.recv() {
+                let _ = reply.send(Some("Galaxy S25".to_string()));
+            }
+            controls
+        });
+        assert_eq!(handle.connected_name().as_deref(), Some("Galaxy S25"));
+        let controls = radio.join().unwrap();
+        assert_eq!(handle.connected_name().as_deref(), Some("Galaxy S25"));
+        assert!(controls.try_recv().is_err(), "asked again for a name it had");
+    }
+
+    #[test]
+    fn a_busy_radio_holds_phone_status_only_briefly() {
+        // The radio takes the request and does not answer (it is in a call).
+        let (handle, _controls) = RadioHandle::test_handle();
+        connected(&handle, "AA:BB:CC:DD:EE:03", UNNAMED_PHONE);
+        let started = std::time::Instant::now();
+        assert_eq!(handle.connected_name(), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_round_trip_the_radio_does_not_answer_says_its_outcome_is_unknown() {
+        let (handle, _controls) = RadioHandle::test_handle();
+        let error = handle.reset_dongle().unwrap_err();
+        assert!(outcome_unknown(&error), "{error}");
+        // A radio that is not running at all was never handed the request.
+        let (handle, controls) = RadioHandle::test_handle();
+        drop(controls);
+        assert!(!outcome_unknown(&handle.reset_dongle().unwrap_err()));
     }
 }

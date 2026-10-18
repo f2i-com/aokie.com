@@ -278,6 +278,8 @@ pub(super) fn run_loop(
     // already cancelled — the CHUP is sent exactly once per attempt (ids are
     // never reused, so no reset is needed).
     let mut dial_cancel_sent: Option<String> = None;
+    // The cancelled attempt still waiting to end (review 1 #9).
+    let mut dial_cancel_follow_up: Option<DialCancelFollowUp> = None;
     // Dead-air watchdog: one continuously timed SCO outage. A Companion-owned
     // caller must return to Aokie before this path may ever send CHUP.
     let mut no_sco_watchdog = NoScoWatchdog::default();
@@ -1148,9 +1150,65 @@ pub(super) fn run_loop(
                     s.id
                 );
                 dial_cancel_sent = Some(s.id.clone());
+                dial_cancel_follow_up = Some(DialCancelFollowUp {
+                    call_id: s.id.clone(),
+                    cancel_sent: Instant::now(),
+                    calls_asked: None,
+                });
                 tracker.note_intent(crate::call_session::TerminationIntent::AgentHangup);
                 if let Err(e) = bt.hangup() {
                     eprintln!("[aokie-plugin] outbound cancel failed: {e}");
+                }
+            }
+        }
+        // Review 1 #9: the cancel must end the attempt. When the phone's own
+        // edges have not within the grace, its call list decides: no call
+        // on it, and the session ends here (failed/no_answer, "cancelled").
+        if let Some(follow_up) = dial_cancel_follow_up.as_mut() {
+            let still_stuck = tracker
+                .current()
+                .is_some_and(|s| s.id == follow_up.call_id && !s.is_active());
+            if !still_stuck {
+                dial_cancel_follow_up = None;
+            } else {
+                let listed_since_ask = follow_up.calls_asked.is_some_and(|asked| {
+                    status
+                        .clcc_calls
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|(started, _)| *started >= asked)
+                });
+                match follow_up.step(listed_since_ask, Instant::now()) {
+                    DialCancelStep::Wait => {}
+                    DialCancelStep::AskCalls => {
+                        follow_up.calls_asked = Some(Instant::now());
+                        if let Err(e) = bt.query_calls() {
+                            eprintln!("[aokie-plugin] AT+CLCC after the dial cancel could not be sent: {e}");
+                        }
+                    }
+                    DialCancelStep::EndHere => {
+                        dial_cancel_follow_up = None;
+                        flush_incoming_if_pending(&mut tracker, outbox, sink);
+                        if let Some(ended) = tracker.terminate() {
+                            eprintln!(
+                                "[aokie-plugin] cancelled outbound attempt {} has no call on the phone — ended here ({})",
+                                ended.id, ended.outcome
+                            );
+                            emit_call_ended(
+                                &ended,
+                                status.config_version.load(Ordering::Relaxed),
+                                outbox,
+                                sink,
+                            );
+                        }
+                        *status.pending_dial.lock().unwrap() = None;
+                        *status.outbound_call_id.lock().unwrap() = None;
+                        status.call_active.store(false, Ordering::Relaxed);
+                        *status.current_caller.lock().unwrap() = None;
+                        *status.current_call_id.lock().unwrap() = None;
+                        *status.call_started_at.lock().unwrap() = None;
+                    }
                 }
             }
         }
@@ -1168,10 +1226,7 @@ pub(super) fn run_loop(
                 .unwrap()
                 .as_ref()
                 .is_some_and(|(_, at)| at.elapsed() < std::time::Duration::from_secs(10));
-            let active_call_id = tracker
-                .current()
-                .filter(|session| session.is_active())
-                .map(|session| session.id.clone());
+            let active_call_id = dead_air_watch_call(tracker.current());
             let aokie_owner = remote_media.aokie_owner_fence();
             // The mutex-backed owner proof wins over the cached atomic if a
             // refresh is crossing this exact tick.

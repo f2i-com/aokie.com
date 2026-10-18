@@ -102,11 +102,19 @@ mod tests {
     struct TestDir(PathBuf);
     impl TestDir {
         fn new() -> Self {
+            // (a clock alone collided: tests run side by side, and a Mac's clock moves in microseconds)
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0);
-            let dir = std::env::temp_dir().join(format!("aokie-preferred-dongle-test-{}", nanos));
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "aokie-preferred-dongle-test-{}-{}-{}",
+                std::process::id(),
+                nanos,
+                n
+            ));
             fs::create_dir_all(&dir).unwrap();
             TestDir(dir)
         }

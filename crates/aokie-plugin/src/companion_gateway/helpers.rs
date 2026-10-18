@@ -82,7 +82,9 @@ pub(super) fn normalize_gateway_url(raw: &str) -> Result<Url, String> {
 /// neither presents a certificate, so requiring `https` would make the hosted
 /// relay unreachable on the very install it was built for. It means the
 /// admission bearer rides plaintext over the LAN, which is why the exception
-/// is confined to loopback / `.local` hosts on managed-beta builds.
+/// is confined to managed-beta builds and to numeric loopback, `localhost`
+/// and that one exact API host. Any other `.local` name is refused: whoever
+/// answers mDNS for it on the LAN would otherwise collect the bearer.
 pub(super) fn normalize_relay_url(raw: &str, label: &str) -> Result<Url, WorkerError> {
     let invalid =
         |detail: &str| WorkerError::rebootstrap(format!("Companion relay {label} {detail}"));
@@ -96,18 +98,26 @@ pub(super) fn normalize_relay_url(raw: &str, label: &str) -> Result<Url, WorkerE
     let secure = url.scheme() == "https";
     let local_plaintext = cfg!(feature = "managed-beta-driver")
         && url.scheme() == "http"
-        && url.host_str().is_some_and(is_local_network_host);
+        && url.host_str().is_some_and(is_managed_beta_plaintext_host);
     if !secure && !local_plaintext {
         return Err(invalid(
-            "must use https (managed-beta builds may use http on a loopback or .local host)",
+            "must use https (managed-beta builds may use http on loopback or the exact api.formlogic.local host)",
         ));
     }
     Ok(url)
 }
 
-/// Loopback plus the mDNS `.local` names the desktop install actually serves.
-pub(super) fn is_local_network_host(host: &str) -> bool {
-    is_loopback_host(host) || host.to_ascii_lowercase().ends_with(".local")
+/// The exact API host of the managed-beta FormLogic install.
+pub(super) const MANAGED_BETA_API_HOST: &str = "api.formlogic.local";
+
+/// The hosts a managed-beta build may reach over plain http: numeric
+/// loopback, `localhost`, and the one exact API host the desktop install
+/// serves. Never a wildcard `.local` name.
+pub(super) fn is_managed_beta_plaintext_host(host: &str) -> bool {
+    is_numeric_loopback_host(host)
+        || host == "[::1]"
+        || host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case(MANAGED_BETA_API_HOST)
 }
 
 pub(super) fn is_numeric_loopback_host(host: &str) -> bool {
@@ -132,9 +142,18 @@ pub(super) fn redacted_url(raw: &str) -> String {
         .unwrap_or_else(|| "[invalid URL]".into())
 }
 
+/// One line of status or refusal text, at most 240 UTF-8 bytes and free of
+/// control characters. It reaches the settings screen and, in a relay claim
+/// refusal, a phone that validates the message in bytes and refuses control
+/// characters; a cut by characters could pass 900 bytes of CJK text.
 pub(super) fn sanitize_status_message(message: &str) -> String {
-    let without_lines = message.lines().next().unwrap_or("Companion gateway error");
-    without_lines.chars().take(240).collect()
+    let first_line = message.lines().next().unwrap_or_default();
+    let line = aokie_protocol::text::sanitize_line(first_line, 240);
+    if line.is_empty() {
+        "Companion gateway error".into()
+    } else {
+        line
+    }
 }
 
 pub(super) fn unix_now() -> Result<u64, WorkerError> {

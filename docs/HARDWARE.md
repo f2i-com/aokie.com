@@ -34,11 +34,17 @@ the HFP/SCO/MAP path has been exercised on real silicon.
 | Broadcom BCM20702 | `0a5c:21e8` | Certified | Common 2.4 GHz combo dongle |
 | Broadcom BCM20702 | `0a5c:21ec` | Certified | Variant of the above |
 | Realtek RTL8761 | `0bda:8771` | Beta | Chipset in many ASUS / TP-Link dongles; Aokie loads Realtek's firmware into it at each start (below) |
-| Realtek RTL8821CE | `0bda:c822` | Beta | Combo cards in some HP / Lenovo laptops |
 | CSR CSR8510 A10 | `0a12:0001` | Beta | Ubiquitous BT 4.0 dongle; no vendor firmware load |
 
 **Certified** = the full answer/hear/speak/SMS path has been run end to end.
 **Beta** = enumerates and pairs; the SCO audio path may vary by firmware.
+
+The catalog names USB dongles only. Realtek's RTL8821CE (`0bda:c822`) was in it, but that
+is a Wi-Fi and Bluetooth card built into some HP and Lenovo laptops: on Linux, where the
+radio opens a catalogued controller without asking, Aokie took the laptop's own Bluetooth
+(and the keyboard, mouse or headset on it), and Windows offered it a WinUSB bind. It is
+out of the catalog and of the static driver package; Intel's adapters (always built in)
+never were in. A test in `dongle_catalog.rs` keeps them out.
 
 ### Realtek: the firmware Aokie loads
 

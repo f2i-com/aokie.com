@@ -31,7 +31,13 @@ entryPoints:
     address: ":443"
     transport:
       respondingTimeouts:
-        readTimeout: 0s
+        # Bounds how long a client may take to send its request (the
+        # WebSocket upgrade has no body), so a slow or stalled client cannot
+        # hold a connection open forever. It does not cut a live WebSocket:
+        # Go's HTTP server clears the connection's deadlines when the proxy
+        # takes over an upgraded connection, which is how Traefik's own 60 s
+        # default coexists with long-lived WebSockets.
+        readTimeout: 30s
         writeTimeout: 0s
         idleTimeout: 180s
   turns:

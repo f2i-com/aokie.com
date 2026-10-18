@@ -22,7 +22,11 @@ is_uint() {
 : "${TURN_BPS_CAPACITY:=100000000}"
 : "${TURN_ALLOW_PRIVATE_PEERS:=0}"
 
-[ -r "$TURN_SECRET_FILE" ] || fail "REST secret is not readable at $TURN_SECRET_FILE"
+# Docker mounts a Compose file secret with its host owner and mode, and this
+# container runs as the image's nobody user: on Linux the file must belong to
+# uid 65534 (see the README), or this read fails.
+[ -r "$TURN_SECRET_FILE" ] \
+  || fail "REST secret is not readable at $TURN_SECRET_FILE by uid $(id -u); chown it to $(id -u) with mode 0400 (see the README)"
 turn_secret="$(cat "$TURN_SECRET_FILE")"
 [ "${#turn_secret}" -ge 32 ] && [ "${#turn_secret}" -le 4096 ] \
   || fail "REST secret must contain 32..4096 bytes"

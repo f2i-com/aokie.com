@@ -36,6 +36,8 @@ pub mod probe;
 pub(crate) mod rfcomm;
 #[cfg(target_os = "windows")]
 pub mod runtime;
+// Plain logic (endpoint, call and caller-id choices): built everywhere so its tests run on any system.
+pub(crate) mod select;
 #[cfg(target_os = "windows")]
 pub mod sms_tool;
 #[cfg(target_os = "windows")]

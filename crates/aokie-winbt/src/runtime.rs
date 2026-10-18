@@ -26,12 +26,13 @@ pub(crate) enum NativeControl {
     Dial(String),
     HoldSwap,
     QueryCalls,
+    /// Queued, as the dongle runtime queues it: SmsSent / SmsSendFailed say
+    /// how it went.
     SendSms {
         message_id: String,
         recipient: String,
         body: String,
         msg_type: Option<String>,
-        reply: Sender<Result<(), String>>,
     },
     Connect(String, Sender<Result<bool, String>>),
     Disconnect(String, Sender<Result<bool, String>>),
@@ -200,19 +201,19 @@ impl NativeBtRuntime {
         body: String,
         msg_type: Option<String>,
     ) -> Result<(), String> {
-        let (reply_tx, reply_rx) = channel();
+        // Not waited for: the send pages the phone and runs a MAP exchange
+        // (seconds), and the plugin's radio thread, which calls this, also
+        // answers and hangs up calls. The outcome comes back as SmsSent /
+        // SmsSendFailed, as on the dongle, whose send_sms fails only when its
+        // runtime is gone.
         self.control_tx
             .send(NativeControl::SendSms {
                 message_id,
                 recipient: recipient_phone,
                 body,
                 msg_type,
-                reply: reply_tx,
             })
-            .map_err(|_| "native engine worker is gone".to_string())?;
-        reply_rx
-            .recv()
-            .map_err(|_| "native engine worker dropped the SMS request".to_string())?
+            .map_err(|_| "native engine worker is gone".to_string())
     }
 
     pub fn answer_call(&self) -> Result<(), String> {

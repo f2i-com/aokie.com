@@ -47,6 +47,12 @@
             android:exported="false"
             android:foregroundServiceType="phoneCall"
             android:stopWithTask="false" />
+        <!-- Runs while Companion media has communication audio open (in-app Talk, Consult or listening),
+             so the microphone and the process keep working with the screen off. -->
+        <service
+            android:name=".AokieCommunicationService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|phoneCall" />
 
         <meta-data
             android:name="com.google.firebase.messaging.default_notification_channel_id"

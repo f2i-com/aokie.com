@@ -15,6 +15,7 @@
       "transport": { "kind": "plugin-command", "command": "call.dial" },
       "inputSchema": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "number": {
             "type": "string",
@@ -47,6 +48,7 @@
       "transport": { "kind": "plugin-command", "command": "call.operatorSpeak" },
       "inputSchema": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "text": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "What to say. Spoken verbatim." },
           "callId": { "type": "string", "maxLength": 64, "description": "Which call. Defaults to the active one." }
@@ -64,6 +66,7 @@
       "transport": { "kind": "plugin-command", "command": "call.hangup" },
       "inputSchema": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "callId": { "type": "string", "maxLength": 64, "description": "Which call. Defaults to the active one." }
         }
@@ -77,21 +80,22 @@
       "sideEffects": "none",
       "timeoutMs": 10000,
       "transport": { "kind": "plugin-command", "command": "call.current" },
-      "inputSchema": { "type": "object" },
+      "inputSchema": { "type": "object", "additionalProperties": false },
       "outputSchema": { "type": "object" }
     },
     {
       "id": "sms.send",
       "title": "Send an SMS",
-      "description": "Send a text message from the paired phone.",
+      "description": "Send a text message from the paired phone. Refused while no phone is connected, and once the day's cap is reached (the maxDailyTexts setting, 200 when unset). Accepted means queued: aokie.sms.sent or aokie.sms.failed follows.",
       "sideEffects": "external-write",
       "timeoutMs": 30000,
       "transport": { "kind": "plugin-command", "command": "sms.send" },
       "inputSchema": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "to": { "type": "string", "minLength": 3, "maxLength": 32, "description": "The recipient number." },
-          "body": { "type": "string", "minLength": 1, "maxLength": 1600, "description": "The message text." },
+          "body": { "type": "string", "minLength": 1, "maxLength": 600, "description": "The message text: at most 600 bytes, which is 600 letters of English but about 200 of Chinese, Japanese or emoji (one text goes to the phone in one Bluetooth packet). Longer is refused: send it in parts." },
           "messageId": {
             "type": "string",
             "maxLength": 64,
@@ -105,22 +109,23 @@
     {
       "id": "sms.threads",
       "title": "List SMS conversations",
-      "description": "Every conversation on the paired phone, most recent first.",
+      "description": "Every conversation on the paired phone, most recent first. Dev mode only for now: a real phone's thread history is not available yet, so this fails on the radio.",
       "sideEffects": "none",
       "timeoutMs": 20000,
       "transport": { "kind": "plugin-command", "command": "sms.threads" },
-      "inputSchema": { "type": "object" },
+      "inputSchema": { "type": "object", "additionalProperties": false },
       "outputSchema": { "type": "object" }
     },
     {
       "id": "sms.thread",
       "title": "Read one SMS conversation",
-      "description": "The messages in a single conversation.",
+      "description": "The messages in a single conversation. Dev mode only for now: a real phone's thread history is not available yet, so this fails on the radio.",
       "sideEffects": "none",
       "timeoutMs": 20000,
       "transport": { "kind": "plugin-command", "command": "sms.thread" },
       "inputSchema": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "threadId": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Which conversation, from sms.threads." }
         },
@@ -135,7 +140,7 @@
       "sideEffects": "none",
       "timeoutMs": 10000,
       "transport": { "kind": "plugin-command", "command": "phone.status" },
-      "inputSchema": { "type": "object" },
+      "inputSchema": { "type": "object", "additionalProperties": false },
       "outputSchema": { "type": "object" }
     }
   ]

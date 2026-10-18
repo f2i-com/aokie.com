@@ -472,12 +472,11 @@ impl GatewayTransport {
 
     pub(super) async fn send_text(&mut self, encoded: &str) -> Result<TransportDelivery, WorkerError> {
         match self {
-            Self::WebSocket(transport) => transport
-                .socket
-                .send(Message::Text(encoded.into()))
-                .await
-                .map(|_| TransportDelivery::Delivered)
-                .map_err(safe_ws_error),
+            Self::WebSocket(transport) => {
+                bounded_ws_send(&mut transport.socket, Message::Text(encoded.into()))
+                    .await
+                    .map(|_| TransportDelivery::Delivered)
+            }
             #[cfg(feature = "voice")]
             Self::Relay(channel) => channel.send_text(encoded).await,
         }
@@ -638,11 +637,8 @@ impl GatewayTransport {
                 let Some(encoded) = transport.pending_hello.as_ref() else {
                     return Ok(());
                 };
-                transport
-                    .socket
-                    .send(Message::Text(encoded.clone().into()))
-                    .await
-                    .map_err(safe_ws_error)?;
+                bounded_ws_send(&mut transport.socket, Message::Text(encoded.clone().into()))
+                    .await?;
                 transport.pending_hello = None;
                 Ok(())
             }
@@ -670,7 +666,7 @@ impl GatewayTransport {
     pub(super) async fn close(self) {
         match self {
             Self::WebSocket(mut transport) => {
-                let _ = transport.socket.send(Message::Close(None)).await;
+                let _ = bounded_ws_send(&mut transport.socket, Message::Close(None)).await;
             }
             #[cfg(feature = "voice")]
             Self::Relay(channel) => channel.close().await,
@@ -684,10 +680,7 @@ impl WebSocketTransport {
             Err(_) => Ok(None),
             Ok(Some(Ok(Message::Text(encoded)))) => Ok(Some(encoded.as_str().to_string())),
             Ok(Some(Ok(Message::Ping(payload)))) => {
-                self.socket
-                    .send(Message::Pong(payload))
-                    .await
-                    .map_err(safe_ws_error)?;
+                bounded_ws_send(&mut self.socket, Message::Pong(payload)).await?;
                 Ok(None)
             }
             Ok(Some(Ok(Message::Pong(_)))) => {
@@ -713,10 +706,7 @@ impl WebSocketTransport {
             }
         }
         if Instant::now() >= self.next_ping {
-            self.socket
-                .send(Message::Ping(Default::default()))
-                .await
-                .map_err(safe_ws_error)?;
+            bounded_ws_send(&mut self.socket, Message::Ping(Default::default())).await?;
             self.awaiting_pong = Some(Instant::now());
             self.next_ping = Instant::now() + PING_INTERVAL;
         }
@@ -753,9 +743,13 @@ pub(super) async fn open_gateway_socket(
         .headers_mut()
         .insert("x-aokie-plugin-id", plugin_header);
 
-    let (mut socket, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(safe_ws_error)?;
+    // Bounded like every later write: a black-holed TCP or TLS handshake must
+    // become a retry, not a worker that never reaches its backoff.
+    let (mut socket, _) =
+        tokio::time::timeout(GATEWAY_CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+            .await
+            .map_err(|_| WorkerError::reconnect("Companion gateway connection timed out"))?
+            .map_err(safe_ws_error)?;
     let challenge_encoded = tokio::time::timeout(Duration::from_secs(10), socket.next())
         .await
         .map_err(|_| WorkerError::reconnect("Companion endpoint challenge timed out"))?
@@ -826,6 +820,10 @@ pub(super) fn endpoint_hello_for_session(
             "Companion endpoint challenge does not match the local identity and approved roster",
         ));
     }
+    // Dated from the gateway's clock as the challenge reveals it, so a Desktop
+    // clock a few seconds ahead of the gateway is not refused as "from the
+    // future", and capped by the challenge's own expiry.
+    let (issued_at, expires_at) = challenge.hello_proof_window(now);
     let proof_claims = HelloProofClaims {
         app_id: credentials.app_id.clone(),
         subject_id: credentials.plugin_id.clone(),
@@ -841,11 +839,14 @@ pub(super) fn endpoint_hello_for_session(
         peer_roster_hash: Some(authority.roster_hash.clone()),
         nonce: format!("proof_nonce_{}", uuid::Uuid::new_v4().simple()),
         jti: format!("proof_jti_{}", uuid::Uuid::new_v4().simple()),
-        issued_at: now,
-        expires_at: challenge.expires_at.min(now.saturating_add(30)),
+        issued_at,
+        expires_at,
     };
+    // Shape check at the issue time: the window may sit a little behind this
+    // Desktop's clock on purpose, so a check against `now` would refuse the
+    // very proof that lets a fast clock connect.
     proof_claims
-        .validate(now)
+        .validate(issued_at)
         .map_err(|_| WorkerError::rebootstrap("Companion endpoint proof claims are invalid"))?;
     let proof = SignedHelloProof {
         endpoint_key: authority.endpoint_key.clone(),
@@ -1132,25 +1133,36 @@ pub(super) async fn run_socket(
         let inbound_kind = serde_json::from_str::<Envelope>(&encoded)
             .map(|frame| frame.kind)
             .unwrap_or_else(|_| "malformed".into());
-        let outbound = session
-            .handle_inbound(
-                &encoded,
-                media,
-                radio,
-                from_relay_peer,
-                inbound_party.as_deref(),
-                inbound_subject.as_deref(),
-                inbound_grants.as_ref(),
-            )
-            .map_err(|error| {
+        let outbound = match session.handle_inbound(
+            &encoded,
+            media,
+            radio,
+            from_relay_peer,
+            inbound_party.as_deref(),
+            inbound_subject.as_deref(),
+            inbound_grants.as_ref(),
+        ) {
+            Ok(outbound) => outbound,
+            Err(error) if error.is_refusal() => {
+                // One device's stale or racing frame. Drop it and keep every
+                // other device's peers, leases and an active takeover.
+                eprintln!(
+                    "[aokie-plugin][companion] stage=inbound_refused frame={} detail={}",
+                    inbound_kind,
+                    sanitize_status_message(&error.message)
+                );
+                continue;
+            }
+            Err(error) => {
                 eprintln!(
                     "[aokie-plugin][companion] stage=inbound_rejected frame={} kind={} detail={}",
                     inbound_kind,
                     error.kind.label(),
                     sanitize_status_message(&error.message)
                 );
-                error
-            })?;
+                return Err(error);
+            }
+        };
         // Relay admission can narrow on any later authenticated frame. Keep
         // transport-level privacy projections in the same fail-closed state
         // before sending outbound assistance/caller context. Ordinary frames
@@ -1204,10 +1216,24 @@ pub(super) async fn run_socket(
 pub(super) async fn send_json<T: Serialize>(socket: &mut GatewaySocket, value: &T) -> Result<(), WorkerError> {
     let encoded = serde_json::to_string(value)
         .map_err(|_| WorkerError::reconnect("Companion frame could not be encoded"))?;
-    socket
-        .send(Message::Text(encoded.into()))
-        .await
-        .map_err(safe_ws_error)
+    bounded_ws_send(socket, Message::Text(encoded.into())).await
+}
+
+/// Every write to the gateway socket is bounded. A peer that stops reading
+/// (a dead NAT mapping, a stalled proxy) fills the TCP send buffer and an
+/// unbounded `send` would then park the call-authority loop for good; past
+/// [`GATEWAY_SEND_TIMEOUT`] the socket is treated as gone and the session
+/// reconnects instead.
+pub(super) async fn bounded_ws_send(
+    socket: &mut GatewaySocket,
+    message: Message,
+) -> Result<(), WorkerError> {
+    match tokio::time::timeout(GATEWAY_SEND_TIMEOUT, socket.send(message)).await {
+        Ok(result) => result.map_err(safe_ws_error),
+        Err(_) => Err(WorkerError::reconnect(
+            "Companion gateway stopped accepting frames",
+        )),
+    }
 }
 
 pub(super) fn safe_ws_error(error: tungstenite::Error) -> WorkerError {

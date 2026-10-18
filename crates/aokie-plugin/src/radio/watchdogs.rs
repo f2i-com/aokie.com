@@ -94,6 +94,60 @@ pub(super) struct NoScoWatchdog {
     pub(super) outage: Option<NoScoOutage>,
 }
 
+/// Review 1 #9: what to do about a stuck outbound attempt after its cancel
+/// (AT+CHUP) went out. A phone that never placed the call has nothing to
+/// cancel and sends no edge to end it, so the session sat "dialing" for good:
+/// every later call.dial refused, and the next call to us without a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DialCancelStep {
+    Wait,
+    /// Ask the phone for its call list (AT+CLCC).
+    AskCalls,
+    /// The phone listed no call (or did not answer): end the session here.
+    EndHere,
+}
+
+pub(super) struct DialCancelFollowUp {
+    pub(super) call_id: String,
+    pub(super) cancel_sent: std::time::Instant,
+    pub(super) calls_asked: Option<std::time::Instant>,
+}
+
+impl DialCancelFollowUp {
+    /// How long the cancel gets to end the attempt through the phone's own
+    /// edges, then how long the call list gets to answer.
+    pub(super) const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+    pub(super) const LIST_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// `listed_since_ask`: a CLCC line arrived after the list was asked for
+    /// (the phone has a call, and its edges will end it).
+    pub(super) fn step(&self, listed_since_ask: bool, now: std::time::Instant) -> DialCancelStep {
+        match self.calls_asked {
+            None if now.saturating_duration_since(self.cancel_sent) >= Self::CANCEL_GRACE => {
+                DialCancelStep::AskCalls
+            }
+            Some(asked)
+                if !listed_since_ask && now.saturating_duration_since(asked) >= Self::LIST_GRACE =>
+            {
+                DialCancelStep::EndHere
+            }
+            _ => DialCancelStep::Wait,
+        }
+    }
+}
+
+/// The call the no-SCO watchdog may act on: an answered call the receptionist
+/// runs. A call the owner answered on the handset, or dialed there, keeps its
+/// audio on the earpiece by the owner's choice: AT+BCC would pull it to the
+/// dongle and the dead-air hangup would end the owner's own call.
+pub(super) fn dead_air_watch_call(
+    session: Option<&crate::call_session::CallSession>,
+) -> Option<String> {
+    session
+        .filter(|session| session.is_active() && session.receptionist_owns())
+        .map(|session| session.id.clone())
+}
+
 impl NoScoWatchdog {
     pub(super) const GRACE: std::time::Duration = std::time::Duration::from_secs(8);
     /// How long an active Aokie-owned call may sit without audio before the

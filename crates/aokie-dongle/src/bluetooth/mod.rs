@@ -52,6 +52,17 @@ pub enum BluetoothEvent {
     },
     /// The waiting episode ended with the active call untouched.
     CallWaitingEnded,
+    /// The phone refused (or never answered) a command once the hands-free
+    /// link was up — the answer to that one command, never a broken link or
+    /// a hardware fault. `command` is its name ("ATD", "ATA", "AT+CHUP",
+    /// ...), never its arguments.
+    CommandRejected {
+        command: String,
+        timed_out: bool,
+    },
+    /// The hands-free link came up with a call already in progress on the
+    /// phone: a reconnect in the middle of a call.
+    CallActiveAtConnect,
     /// `callheld` indicator transition (0 none / 1 held+active / 2 held only).
     CallHeld {
         state: i32,
@@ -444,6 +455,11 @@ fn bluetooth_event_from_runtime(
         RuntimeEvent::CallerId(num) => BluetoothEvent::CallerId(num),
         RuntimeEvent::CallWaiting { number } => BluetoothEvent::CallWaiting { number },
         RuntimeEvent::CallWaitingEnded => BluetoothEvent::CallWaitingEnded,
+        RuntimeEvent::CommandRejected { command, timed_out } => BluetoothEvent::CommandRejected {
+            command: command.to_string(),
+            timed_out,
+        },
+        RuntimeEvent::CallActiveAtConnect => BluetoothEvent::CallActiveAtConnect,
         RuntimeEvent::CallHeld { state } => BluetoothEvent::CallHeld { state },
         RuntimeEvent::CallListEntry {
             index,
@@ -538,6 +554,16 @@ pub fn bluetooth_event_from_aokie_hfp(
         }
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallWaitingEnded => {
             Some(BluetoothEvent::CallWaitingEnded)
+        }
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CommandRejected { command, timed_out } => {
+            Some(BluetoothEvent::CommandRejected {
+                command: command.to_string(),
+                timed_out,
+            })
+        }
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallStateCheck => None,
+        aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallActiveAtConnect => {
+            Some(BluetoothEvent::CallActiveAtConnect)
         }
         aokie_bluetooth::aokie_radio::hfp::HfpEvent::CallHeld(state) => {
             Some(BluetoothEvent::CallHeld { state })

@@ -48,6 +48,11 @@ pub enum TerminationIntent {
     /// the rule the person set, not by anyone pressing Reject, and the record
     /// says which.
     Screened,
+    /// The plugin is stopping (OAIY quitting or restarting it) with the call
+    /// still up: its record closes now, with its real number and outcome,
+    /// rather than at the next start as `plugin_restarted`. The call itself
+    /// goes on on the phone.
+    PluginStopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +439,7 @@ impl SessionTracker {
             );
             let (outcome, reason) = match (s.alerted, s.intent) {
                 (_, Some(TerminationIntent::DeviceLost)) => ("failed", "device_lost"),
+                (_, Some(TerminationIntent::PluginStopped)) => ("failed", "plugin_stopped"),
                 (true, _) if cancelled => ("no_answer", "cancelled"),
                 (true, _) => ("no_answer", "remote_or_network"),
                 (false, _) if cancelled => ("failed", "cancelled"),
@@ -475,6 +481,8 @@ impl SessionTracker {
             // the greeting, or someone took it on the handset): it was answered,
             // and why it was to end is still said.
             (true, Some(TerminationIntent::Screened)) => ("completed", "screened"),
+            (true, Some(TerminationIntent::PluginStopped)) => ("completed", "plugin_stopped"),
+            (false, Some(TerminationIntent::PluginStopped)) => ("missed", "plugin_stopped"),
             (true, _) => ("completed", "remote_or_operator"),
             (false, Some(TerminationIntent::OperatorReject)) => ("rejected", "operator_reject"),
             (false, Some(TerminationIntent::Screened)) => ("rejected", "screened"),

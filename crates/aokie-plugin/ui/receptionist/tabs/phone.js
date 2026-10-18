@@ -40,6 +40,10 @@
    *  max — it auto-closes the moment one phone bonds and there's a live
    *  countdown + Stop button. */
   var PAIRING_WINDOW_SECONDS = 300;
+  /** The dongle takes one phone at a time: the radio turns a second phone
+   *  away while one is connected, pairing included. */
+  var ONE_PHONE_NOTE =
+    'The dongle takes one phone at a time: a new phone cannot pair while another is connected. To pair another, first turn Bluetooth off on the connected phone (one only disconnected here reconnects on its own).';
 
   function formatSeconds(total) {
     var m = Math.floor(total / 60);
@@ -65,6 +69,7 @@
   var forgetArm = null; // address with the inline Forget confirm open
   var baselineBonds = 0;
   var confirmed = false; // operator accepted THIS window's comparison
+  var confirmedAddress = null; // ...for this phone
   var prevWindowOpen = false;
   var idleTimer = null;
   var windowTimer = null;
@@ -102,7 +107,9 @@
           ? d.pairingSecondsRemaining
           : 0;
       radioError = d.error || null;
-      connected = !!d.connected && !radioError && !d.pairingConfirm;
+      // Connected is what the plugin says: an old error kept in `error`
+      // (shown below) does not make a connected phone read "Pair a phone".
+      connected = !!d.connected && !d.pairingConfirm;
       device = d.device || null;
       // PAIR-001: surface (or clear) the numeric-comparison prompt. The
       // plugin reports it only while the radio actually holds the SSP reply.
@@ -118,8 +125,13 @@
     });
   }
 
+  // One refresh at a time: a slow radio answers late, and polls that stack
+  // up behind it queue ahead of the commands that matter (Answer, Hang up).
+  var refreshing = null;
+
   function refreshAll() {
-    return Promise.all([pollStatus(), loadBonded(), loadTransport()]).then(
+    if (refreshing) return refreshing;
+    refreshing = Promise.all([pollStatus(), loadBonded(), loadTransport()]).then(
       function () {
         known = true;
         error = null;
@@ -130,7 +142,10 @@
         known = true;
         render();
       }
-    );
+    ).then(function () {
+      refreshing = null;
+    });
+    return refreshing;
   }
 
   // Best-effort transport fetch: a settings failure keeps the last-known
@@ -141,7 +156,9 @@
       function (data) {
         var bag = (data && data.settings) || {};
         if (TABS.transport && TABS.transport.update) TABS.transport.update(bag);
-        transportMode = TABS.transport && TABS.transport.mode ? TABS.transport.mode() : 'dongle';
+        var mode = TABS.transport && TABS.transport.mode ? TABS.transport.mode() : 'dongle';
+        // (`auto` pairs with the dongle whenever one is plugged in)
+        transportMode = mode === 'native' ? 'native' : 'dongle';
       },
       function () {
         /* keep the last-known mode */
@@ -165,7 +182,11 @@
     render();
   }
 
+  var ticking = false;
+
   function windowTick() {
+    if (ticking) return; // the last tick is still waiting on the radio
+    ticking = true;
     Promise.all([pollStatus(), loadBonded()])
       .then(function () {
         var windowOpen = secondsLeft > 0;
@@ -177,7 +198,9 @@
           baselineBonds = bonded.length;
         }
         prevWindowOpen = windowOpen;
-        var success = bonded.length > baselineBonds || (confirmed && connected);
+        // The phone whose code was accepted, connected: not just any phone
+        // (another bonded phone reconnecting read as this one paired).
+        var success = bonded.length > baselineBonds || (confirmed && confirmedPhoneConnected());
         if (success) {
           baselineBonds = bonded.length; // never re-fire for the same bond
           return HOST.command('phone.stopPairing')
@@ -203,7 +226,22 @@
         // The idle poll recovers, but stale connection or pairing prompts
         // must not stay actionable while the current status is unavailable.
         render();
+      })
+      .then(function () {
+        ticking = false;
       });
+  }
+
+  /** Whether the phone this window's code was accepted for is the one now
+   *  connected (by the status's device address, or the roster's flag). */
+  function confirmedPhoneConnected() {
+    if (!connected || !confirmedAddress) return false;
+    var want = String(confirmedAddress).toLowerCase();
+    if (device && device.address) return String(device.address).toLowerCase() === want;
+    for (var i = 0; i < bonded.length; i++) {
+      if (String(bonded[i].address || '').toLowerCase() === want) return !!bonded[i].connected;
+    }
+    return false;
   }
 
   function ensureTimers() {
@@ -299,7 +337,10 @@
           // Remember the operator accepted THIS window's comparison, so the
           // poller counts the phone reconnecting as success even when its
           // address was already stored (re-pair doesn't grow the bond count).
-          if (accept) confirmed = true;
+          if (accept) {
+            confirmed = true;
+            confirmedAddress = address;
+          }
           confirmPrompt = null;
           if (!accept) {
             HOST.toast('success', 'Pairing refused — the phone was not paired. The window stays open if you want to try again.');
@@ -427,6 +468,9 @@
       return (
         '<div class="rcp-card__body">' +
         '<p class="rcp-step-meta">' + windowCopy + '</p>' +
+        (transportMode === 'dongle' && connected
+          ? '<p class="rcp-hint is-warn">' + esc(ONE_PHONE_NOTE) + '</p>'
+          : '') +
         '<div class="rcp-actions">' +
         '<button type="button" class="rcp-button" data-act="pair-stop"' + (busy ? ' disabled' : '') + '>Stop pairing</button>' +
         '</div>' +
@@ -440,6 +484,7 @@
         '<p class="rcp-status-ok">' + ICONS.check + ' Phone connected' +
         (device && device.address ? ' (' + esc(device.address) + ')' : '') +
         ' — check receptionist readiness before testing calls.</p>' +
+        (transportMode === 'dongle' ? '<p class="rcp-hint">' + esc(ONE_PHONE_NOTE) + '</p>' : '') +
         '<div class="rcp-actions">' +
         '<button type="button" class="rcp-button" data-act="pair-start"' + (busy ? ' disabled' : '') + '>' +
         (busy ? 'Opening…' : 'Pair another phone') + '</button>' +

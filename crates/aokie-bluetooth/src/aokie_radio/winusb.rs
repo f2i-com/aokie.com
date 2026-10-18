@@ -1856,8 +1856,12 @@ impl AokieHciTransport {
         voice_setting: u16,
         connection_count: usize,
     ) -> Result<(), String> {
+        // Review 1 #16: every way out that arms nothing is an Err, so the
+        // link is reported as not armed instead of as ready.
         let Some(requested_alt) = sco_alt_setting_for_voice(voice_setting, connection_count) else {
-            return Ok(());
+            return Err(format!(
+                "no voice alternate setting for voice setting 0x{voice_setting:04x} with {connection_count} link(s)"
+            ));
         };
         // Probe-aware fallback: the spec-correct alt for mSBC is 6
         // (MPS=63), but cheap dongles routinely advertise mSBC over HFP
@@ -1887,7 +1891,10 @@ impl AokieHciTransport {
                         "[AokieRadio] SCO alt {} not exposed and no 16-bit fallback available (probe={:?}); skipping alt-config",
                         requested_alt, self.available_sco_alts,
                     );
-                    return Ok(());
+                    return Err(format!(
+                        "the dongle has no voice setting to carry this link (asked {}, has {:?})",
+                        requested_alt, self.available_sco_alts
+                    ));
                 }
             }
         } else {
@@ -1904,7 +1911,7 @@ impl AokieHciTransport {
         }
 
         let Some(associated) = self.associated.as_ref() else {
-            return Ok(());
+            return Err("the dongle has no voice interface: call audio cannot be carried".to_string());
         };
 
         unsafe { set_current_alternate_setting(associated.0, requested_alt)? };

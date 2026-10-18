@@ -565,23 +565,12 @@ impl Gateway {
             .with_state(self.clone())
     }
 
-    async fn health(&self) -> Health {
-        let apps = self.inner.apps.lock().await;
-        let v2 = self.inner.v2.stats().await;
-        Health {
-            status: "ok",
-            apps: apps.len(),
-            desktops: apps
-                .values()
-                .filter(|session| session.desktop.is_some())
-                .count(),
-            mobiles: apps.values().map(|session| session.mobiles.len()).sum(),
-            media_bridge: false,
-            v2_enabled: self.inner.v2.is_enabled(),
-            v2_apps: v2.apps,
-            v2_plugins: v2.plugins,
-            v2_mobiles: v2.mobiles,
-        }
+    /// The public liveness answer. It carries nothing else: connection
+    /// counts on an unauthenticated path told anyone watching when the
+    /// owner's Desktop and phone were online. Configuration invariants are
+    /// on `/version`.
+    fn health(&self) -> Health {
+        Health { status: "ok" }
     }
 
     async fn register_mobile(
@@ -1167,18 +1156,10 @@ fn rejected_ack(command_id: &str, code: ProtocolErrorCode, message: &str) -> Com
 #[serde(rename_all = "camelCase")]
 struct Health {
     status: &'static str,
-    apps: usize,
-    desktops: usize,
-    mobiles: usize,
-    media_bridge: bool,
-    v2_enabled: bool,
-    v2_apps: usize,
-    v2_plugins: usize,
-    v2_mobiles: usize,
 }
 
 async fn health(State(gateway): State<Gateway>) -> Json<Health> {
-    Json(gateway.health().await)
+    Json(gateway.health())
 }
 
 async fn version(State(gateway): State<Gateway>) -> Json<Value> {
@@ -1459,6 +1440,29 @@ mod tests {
 
     fn mobile_admission() -> Admission {
         mobile_admission_for("device_a")
+    }
+
+    #[tokio::test]
+    async fn public_health_reveals_nothing_but_liveness() {
+        use tower::ServiceExt as _;
+        let response = gateway()
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({ "status": "ok" })
+        );
     }
 
     fn mobile_admission_for(device_id: &str) -> Admission {

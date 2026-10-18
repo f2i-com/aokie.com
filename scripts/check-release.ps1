@@ -45,31 +45,31 @@ function Invoke-Gate {
 }
 
 # -- Feature-combination compile matrix (the repo's standing rule) --
-Invoke-Gate 'check: default features' $repo { cargo check -p aokie-plugin }
-Invoke-Gate 'check: voice' $repo { cargo check -p aokie-plugin --features voice }
+Invoke-Gate 'check: default features' $repo { cargo check --locked -p aokie-plugin }
+Invoke-Gate 'check: voice' $repo { cargo check --locked -p aokie-plugin --features voice }
 Invoke-Gate 'check: voice,managed-beta-driver (shipping combo)' $repo {
-    cargo check -p aokie-plugin --features voice,managed-beta-driver
+    cargo check --locked -p aokie-plugin --features voice,managed-beta-driver
 }
 Invoke-Gate 'check: driver helper (managed-beta-driver)' $repo {
-    cargo check -p aokie-dongle --features managed-beta-driver --bins
+    cargo check --locked -p aokie-dongle --features managed-beta-driver --bins
 }
 
 # -- Tests --
 Invoke-Gate 'test: workspace (default features)' $repo {
-    cargo test --workspace
+    cargo test --locked --workspace
 }
 # --test-threads=2: the synthetic-audio/QuickJS timing tests are a documented
 # flake class under full parallel load.
 Invoke-Gate 'test: plugin (voice)' $repo {
-    cargo test -p aokie-plugin --features voice -- --test-threads=2
+    cargo test --locked -p aokie-plugin --features voice -- --test-threads=2
 }
 
 # -- Lints --
 Invoke-Gate 'clippy: workspace (deny-level lints)' $repo {
-    cargo clippy --workspace --all-targets
+    cargo clippy --locked --workspace --all-targets
 }
 Invoke-Gate 'clippy: plugin (voice)' $repo {
-    cargo clippy -p aokie-plugin --all-targets --features voice
+    cargo clippy --locked -p aokie-plugin --all-targets --features voice
 }
 
 # -- Companion app - opt-in (npm toolchain) --
@@ -115,19 +115,19 @@ if ($Msrv) {
     # rust-version pins live in the shipping crates' Cargo.tomls; compiling
     # WITH that toolchain is what detects an accidental MSRV increase.
     Invoke-Gate 'MSRV: plugin (cargo +1.88.0, shipping combo)' $repo {
-        cargo +1.88.0 check -p aokie-plugin --features voice,managed-beta-driver
+        cargo +1.88.0 check --locked -p aokie-plugin --features voice,managed-beta-driver
     }
     Invoke-Gate 'MSRV: dongle + signer' $repo {
-        cargo +1.88.0 check -p package-signer
+        cargo +1.88.0 check --locked -p package-signer
         if ($LASTEXITCODE -ne 0) { throw 'MSRV check failed' }
-        cargo +1.88.0 check -p aokie-dongle --features managed-beta-driver --bins
+        cargo +1.88.0 check --locked -p aokie-dongle --features managed-beta-driver --bins
     }
 } else {
     Write-Host "(skipped: MSRV compile - pass -Msrv to include; requires 'rustup toolchain install 1.88.0')" -ForegroundColor Yellow
 }
 if ($AndroidTarget) {
     Invoke-Gate 'companion: Android target check' $repo {
-        cargo check -p aokie-mobile --target aarch64-linux-android
+        cargo check --locked -p aokie-mobile --target aarch64-linux-android
     }
 } else {
     Write-Host "(skipped: Android target compile - pass -AndroidTarget to include; requires the NDK + 'rustup target add aarch64-linux-android')" -ForegroundColor Yellow

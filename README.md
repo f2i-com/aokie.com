@@ -92,8 +92,12 @@ enabled operation needs.
 |---|---|---|
 | Broadcom BCM20702 | `0a5c:21e8`, `0a5c:21ec` | Certified: answer, hear, speak and SMS run end to end |
 | Realtek RTL8761 | `0bda:8771` | Beta: Aokie loads Realtek's firmware into it at each start (docs/HARDWARE.md); call audio not yet run end to end |
-| Realtek RTL8821CE | `0bda:c822` | Beta |
 | CSR CSR8510 A10 | `0a12:0001` | Beta |
+
+Only USB dongles are listed: a computer's own Bluetooth (Realtek's RTL8821CE card, `0bda:c822`, in some HP and
+Lenovo laptops, or any Intel adapter) is never offered or opened, on Linux too, where the radio opens a catalogued
+controller without asking. Someone who means to give one to Aokie sets the unknown-dongle opt-in
+(docs/HARDWARE.md).
 
 Read [docs/HARDWARE.md](docs/HARDWARE.md) before changing a driver. It covers the tiers,
 the managed-beta path for dongles not in the catalog, Linux, the native Windows
@@ -286,13 +290,19 @@ The `plugin-release` job in [.github/workflows/ci.yml](.github/workflows/ci.yml)
 signs and packages the bundle: `aokie-plugin.exe` and `aokie-driver-helper.exe`,
 `manifest.json`, `definitions/`, `ui/`, the driver package and the Realtek firmware, then
 `SHA256SUMS.txt`, `release-manifest.json` and a `package-manifest.json` signed by
-`package-signer`. `scripts/verify-bundle-assets.ps1 -Bundle <dir>` checks that every file
-the manifest names is present.
+`package-signer`. `scripts/verify-bundle-assets.ps1 -Bundle <dir> [-DriverPackage]` checks
+that every file the manifest names is present, and the driver helper, the Realtek firmware
+and (`-DriverPackage`, a production bundle) the driver package beside them. Every build in
+the release jobs runs `--locked` and with no secret in its environment; the certificate and
+the package key reach only the steps that sign, which run the programs already built, and
+every bundle's signature is checked against the key OAIY pins.
 
 Until the Microsoft-signed catalog and the Authenticode certificate exist, the
 `plugin-release-managed-beta` job builds the managed-beta flavour instead: run the workflow
-with `bundle: managed-beta`, or on a tag whose name contains `managed-beta` (for example
-`v0.0.1-managed-beta`), which it publishes as a GitHub pre-release labelled managed beta.
+with `bundle: managed-beta` (its default), or on a tag whose name contains `managed-beta`
+(for example `v0.0.1-managed-beta`), which it publishes as a GitHub pre-release labelled
+managed beta. It refuses any other tag: a managed-beta bundle is never published under a
+production tag.
 It ships no driver package, its executables are not Authenticode-signed, and its
 `package-manifest.json` is signed with the same `fl-aokie-2026a` key, so OAIY verifies it as
 Aokie's. Its dongle setup screen asks the operator to accept the driver it signs on that
@@ -304,8 +314,11 @@ Both kinds of release also carry a Mac bundle, `aokie-plugin-macos-arm64-<tag>.z
 the driver helper or the driver, libusb as a library beside it (LGPL-2.1: its licence and
 source in `third-party/`), its programs signed ad hoc (no Apple Developer ID), and its
 `package-manifest.json` signed with the same key. `publish-macos` attaches it to the release
-once the Windows job has made it, with a paragraph in its notes; a manual run with
-`attach_macos_to: <tag>` attaches one to a release made before.
+once the Windows job has made it, with a paragraph in its notes that names the oldest macOS
+the bundle's programs ask for; a manual run with `attach_macos_to: <tag>` attaches one to a
+release made before. The Mac and Linux bundles are built with `AOKIE_BUNDLE_STRICT=1`
+(`--locked`, and a bundle missing its firmware is not laid out), after `unix-tests` has run
+those systems' tests and clippy.
 
 ## Test
 
@@ -364,8 +377,6 @@ the connected app.
 | `crates/aokie-winbt` | The native Windows Bluetooth backend (WinRT Calls, WASAPI, RFCOMM); built only when asked for. |
 | `crates/aokie-core` | The Tauri-free foundation the other crates share: policy, the dongle catalog, contracts and security. |
 | `crates/aokie-audio` | Echo cancellation, recording and audio buffers. |
-| `crates/aokie-db` | The SQLite schema for calls, transcripts, contacts and texts, with search and retention. |
-| `crates/aokie-receptionist` | Appointment calendar and orders logic, prompt building and spoken-date parsing. |
 | `crates/aokie-protocol` | Companion snapshot and command models, revision fences and shared fixtures. |
 | `crates/aokie-realtime` | The self-hostable Companion signalling gateway. |
 | `crates/aokie-media` | The native WebRTC media bridge shared by the desktop and Companion. |

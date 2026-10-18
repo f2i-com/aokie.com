@@ -24,6 +24,7 @@ const V2_PAYLOAD_KEYS: &[&str] = &[
     "realtimeUrl",
     "oauthAuthorizationUrl",
     "oauthTokenUrl",
+    "oauthRevocationUrl",
     "oauthResource",
     "admissionEndpoint",
     "clientId",
@@ -74,6 +75,10 @@ struct V2SignedPayload {
     realtime_url: Option<String>,
     oauth_authorization_url: String,
     oauth_token_url: String,
+    /// RFC 7009 token revocation. Optional: a server that advertises it lets
+    /// a forgotten profile's refresh credential be revoked, not just deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oauth_revocation_url: Option<String>,
     oauth_resource: String,
     admission_endpoint: String,
     client_id: String,
@@ -218,6 +223,8 @@ pub struct DiscoveryDocument {
     pub(crate) oauth_authorization_url: String,
     pub(crate) oauth_token_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) oauth_revocation_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) oauth_resource: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) admission_endpoint: Option<String>,
@@ -255,6 +262,7 @@ pub(crate) fn test_discovery_document_with_relay_policy(relay_only: bool) -> Dis
         realtime_url: Some("wss://formlogic.example/v2/realtime".into()),
         oauth_authorization_url: "https://formlogic.example/oauth/authorize".into(),
         oauth_token_url: "https://formlogic.example/api/oauth/token".into(),
+        oauth_revocation_url: None,
         oauth_resource: Some("https://formlogic.example/api/aokie-companion".into()),
         admission_endpoint: Some("https://formlogic.example/api/aokie-companion/admission".into()),
         client_id: Some("aokie-companion".into()),
@@ -285,6 +293,32 @@ pub(crate) fn test_discovery_document_with_relay_policy(relay_only: bool) -> Dis
         signing_key_fingerprint: Some("fingerprint_1".into()),
         signature_verified: true,
     }
+}
+
+/// Host names the debug and managed-beta-local builds accept over plain HTTP.
+const LOCAL_DEV_HOSTS: &[&str] = &["localhost", "formlogic.local", "api.formlogic.local"];
+
+/// The settings every endpoint HTTP client shares, applied to a fresh client
+/// builder (each caller checks the platform verifier before making one).
+///
+/// No system proxy: OAuth codes, bearer and admission tokens go straight to
+/// the endpoint the signed discovery named. In the debug and managed-beta-local
+/// builds the plain-HTTP development names are also pinned to this device's
+/// loopback addresses, so a token sent over plain HTTP can never reach another
+/// machine on the LAN, whatever mDNS or a hosts entry says those names mean.
+/// Release builds accept none of those names over HTTP and pin nothing.
+pub(crate) fn endpoint_client_settings(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let builder = builder.no_proxy();
+    if !(cfg!(debug_assertions) || cfg!(feature = "managed-beta-local")) {
+        return builder;
+    }
+    let loopback = [
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+    ];
+    LOCAL_DEV_HOSTS.iter().fold(builder, |builder, host| {
+        builder.resolve_to_addrs(host, &loopback)
+    })
 }
 
 fn is_loopback(url: &Url) -> bool {
@@ -448,11 +482,36 @@ fn validate_remote_consent(payload: &V2SignedPayload) -> Result<(), String> {
     Ok(())
 }
 
+/// Which document an ICE list came from. TURN credentials are secrets: the
+/// public discovery document need not (and should not) carry them, because a
+/// relay-only session takes its TURN servers from its own admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IceSource {
+    PublicDiscovery,
+    Admission,
+}
+
 pub(crate) fn validate_managed_ice_configuration(
     servers: &[DiscoveryIceServer],
     relay_only: bool,
     turn_credential_expires_at: Option<u64>,
     now: u64,
+) -> Result<Vec<IceServerConfig>, String> {
+    validate_ice_configuration(
+        servers,
+        relay_only,
+        turn_credential_expires_at,
+        now,
+        IceSource::Admission,
+    )
+}
+
+pub(crate) fn validate_ice_configuration(
+    servers: &[DiscoveryIceServer],
+    relay_only: bool,
+    turn_credential_expires_at: Option<u64>,
+    now: u64,
+    source: IceSource,
 ) -> Result<Vec<IceServerConfig>, String> {
     let runtime_servers: Vec<_> = servers
         .iter()
@@ -489,7 +548,9 @@ pub(crate) fn validate_managed_ice_configuration(
         }
     }
 
-    if relay_only && earliest_turn_expiry.is_none() {
+    // A relay-only admission must carry TURN; a relay-only discovery document
+    // may be STUN-only (or list no servers at all).
+    if relay_only && earliest_turn_expiry.is_none() && source == IceSource::Admission {
         return Err("relayOnly requires at least one TURN server".into());
     }
     if earliest_turn_expiry != turn_credential_expires_at {
@@ -611,11 +672,12 @@ fn validate_v2_payload(
     if payload.media.relay_only != payload.relay_only {
         return Err("top-level and media relayOnly fields disagree".into());
     }
-    validate_managed_ice_configuration(
+    validate_ice_configuration(
         &payload.ice_servers,
         payload.relay_only,
         payload.turn_credential_expires_at.value(),
         unix_now()?,
+        IceSource::PublicDiscovery,
     )?;
     if payload.media.transport != "webrtc"
         || payload.media.gateway_relays_media
@@ -639,6 +701,12 @@ fn validate_v2_payload(
         let parsed = validate_https_url(value, label)?;
         if !same_origin(&issuer, &parsed) {
             return Err(format!("{label} must share the trusted issuer origin"));
+        }
+    }
+    if let Some(revocation) = &payload.oauth_revocation_url {
+        let parsed = validate_https_url(revocation, "oauthRevocationUrl")?;
+        if !same_origin(&issuer, &parsed) {
+            return Err("oauthRevocationUrl must share the trusted issuer origin".into());
         }
     }
     select_v2_gateway(payload)
@@ -782,6 +850,7 @@ fn legacy_document(document: LegacyDiscoveryDocument) -> Result<DiscoveryDocumen
         realtime_url: Some(document.realtime_url),
         oauth_authorization_url: document.oauth_authorization_url,
         oauth_token_url: document.oauth_token_url,
+        oauth_revocation_url: None,
         oauth_resource: None,
         admission_endpoint: None,
         client_id: None,
@@ -822,7 +891,7 @@ pub(crate) async fn fetch_discovery(url: &str) -> Result<DiscoveryDocument, Stri
     }
 
     crate::native_init::ensure_https_ready()?;
-    let client = reqwest::Client::builder()
+    let client = endpoint_client_settings(reqwest::Client::builder())
         .redirect(Policy::none())
         .timeout(Duration::from_secs(8))
         .build()
@@ -868,6 +937,7 @@ pub(crate) async fn fetch_discovery(url: &str) -> Result<DiscoveryDocument, Stri
         realtime_url: gateway_url,
         oauth_authorization_url: payload.oauth_authorization_url,
         oauth_token_url: payload.oauth_token_url,
+        oauth_revocation_url: payload.oauth_revocation_url,
         oauth_resource: Some(payload.oauth_resource),
         admission_endpoint: Some(payload.admission_endpoint),
         client_id: Some(payload.client_id),
@@ -1262,6 +1332,102 @@ mod tests {
         assert!(
             validate_managed_ice_configuration(&stun_with_credentials, false, None, now).is_err()
         );
+    }
+
+    #[test]
+    fn an_advertised_revocation_endpoint_must_share_the_issuer_origin() {
+        let mut payload = schema_v2_payload();
+        payload.insert(
+            "oauthRevocationUrl".into(),
+            json!("https://formlogic.example/api/oauth/revoke"),
+        );
+        assert!(read_v2_document(signed_document(payload.clone())).is_ok());
+        payload.insert(
+            "oauthRevocationUrl".into(),
+            json!("https://elsewhere.example/oauth/revoke"),
+        );
+        assert_eq!(
+            read_v2_document(signed_document(payload)).unwrap_err(),
+            "oauthRevocationUrl must share the trusted issuer origin"
+        );
+        // Leaving it out is the shape every current server sends.
+        assert!(read_v2_document(signed_document(schema_v2_payload())).is_ok());
+    }
+
+    #[test]
+    fn a_relay_only_discovery_document_may_leave_turn_to_the_admission() {
+        let now = 1_800_000_000;
+        let stun_only = vec![DiscoveryIceServer {
+            urls: vec!["stun:stun.example:3478".into()],
+            username: String::new(),
+            credential: String::new(),
+            expires_at: None,
+        }];
+        // The public document need not publish TURN secrets...
+        validate_ice_configuration(&stun_only, true, None, now, IceSource::PublicDiscovery)
+            .unwrap();
+        validate_ice_configuration(&[], true, None, now, IceSource::PublicDiscovery).unwrap();
+        // ...but the admission a relay-only session actually uses must.
+        assert!(validate_managed_ice_configuration(&stun_only, true, None, now).is_err());
+        // A document that still carries TURN is held to the same rules.
+        let turn = vec![DiscoveryIceServer {
+            urls: vec!["turns:turn.example:5349?transport=tcp".into()],
+            username: "short-lived-user".into(),
+            credential: "short-lived-secret".into(),
+            expires_at: Some(now + 300),
+        }];
+        validate_ice_configuration(
+            &turn,
+            true,
+            Some(now + 300),
+            now,
+            IceSource::PublicDiscovery,
+        )
+        .unwrap();
+        assert!(
+            validate_ice_configuration(&turn, true, None, now, IceSource::PublicDiscovery).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_development_names_are_pinned_to_this_devices_loopback() {
+        // Test builds are debug builds, so the pin applies: a request to the
+        // development name reaches a listener on 127.0.0.1 whatever DNS or
+        // mDNS would say the name means.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 2048];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            request
+        });
+        let client = endpoint_client_settings(reqwest::Client::builder())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let body = client
+            .get(format!("http://api.formlogic.local:{port}/probe"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /probe HTTP/1.1"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("host: api.formlogic.local"));
     }
 
     #[cfg(feature = "managed-beta-local")]

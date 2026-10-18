@@ -7,7 +7,9 @@ read_secret() {
   label="$3"
 
   if [ ! -r "$file" ]; then
-    echo "aokie-realtime: $label secret is not readable at $file" >&2
+    # Docker mounts a Compose file secret with its host owner and mode; this
+    # container runs as uid 65532, so on Linux the file must belong to it.
+    echo "aokie-realtime: $label secret is not readable at $file by uid $(id -u); chown it to $(id -u) with mode 0400 (see the README)" >&2
     exit 78
   fi
 

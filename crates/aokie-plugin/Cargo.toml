@@ -51,7 +51,8 @@ regex = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 sha2 = "0.10"
 uuid = { version = "1.0", features = ["v4"] }
-tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "time", "net", "macros"] }
+# `signal`: main.rs hears SIGTERM / Ctrl-C and runs the shutdown steps before it exits.
+tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "time", "net", "macros", "signal"] }
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 url = "2"

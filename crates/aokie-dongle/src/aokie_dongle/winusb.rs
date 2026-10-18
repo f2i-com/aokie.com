@@ -4,16 +4,15 @@ use std::mem::{size_of, zeroed};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 
-use chrono::Datelike;
-
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Status, CM_Get_Parent, CM_Query_And_Remove_SubTreeW, CM_Reenumerate_DevNode,
     SetupCloseInfFile, SetupCopyOEMInfW, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
     SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW, SetupDiSetDeviceRegistryPropertyW,
-    SetupOpenInfFileW, UpdateDriverForPlugAndPlayDevicesW, CM_REENUMERATE_RETRY_INSTALLATION,
-    CM_REMOVE_NO_RESTART, CONFIGFLAG_REINSTALL, CR_NO_SUCH_DEVNODE, CR_SUCCESS, DIGCF_ALLCLASSES,
-    DIGCF_PRESENT, HDEVINFO, INF_STYLE_WIN4, INSTALLFLAG_FORCE, SPDRP_CONFIGFLAGS,
-    SPDRP_HARDWAREID, SPOST_PATH, SP_COPY_NEWER_OR_SAME, SP_DEVINFO_DATA,
+    SetupOpenInfFileW, SetupUninstallOEMInfW, UpdateDriverForPlugAndPlayDevicesW,
+    CM_REENUMERATE_RETRY_INSTALLATION, CM_REMOVE_NO_RESTART, CONFIGFLAG_REINSTALL,
+    CR_NO_SUCH_DEVNODE, CR_SUCCESS, DIGCF_ALLCLASSES, DIGCF_PRESENT, HDEVINFO, INF_STYLE_WIN4,
+    INSTALLFLAG_FORCE, SPDRP_CONFIGFLAGS, SPDRP_HARDWAREID, SPOST_PATH, SP_COPY_NEWER_OR_SAME,
+    SP_DEVINFO_DATA, SUOI_FORCEDELETE,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, HANDLE, WAIT_FAILED,
@@ -21,7 +20,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Registry::REG_MULTI_SZ;
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+use windows_sys::Win32::UI::Shell::{
+    SHGetFolderPathW, ShellExecuteExW, CSIDL_WINDOWS, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 pub const INF_NAME: &str = "aokie_winusb_bluetooth.inf";
@@ -34,11 +35,10 @@ pub struct WinusbPackage {
     vid: u16,
     pid: u16,
     description: String,
-    /// Free-form `MM/DD/YYYY,major.minor.build.rev` string for the
-    /// INF's `DriverVer`. Defaulted to today's date so re-running the
-    /// installer always supersedes whatever's already in the driver
-    /// store — without this, repeat installs were no-ops because
-    /// Windows treats identical DriverVer as "no newer version".
+    /// The INF's `DriverVer` (`crate::driver_version`): the date and
+    /// minute it was rendered, so re-running the installer supersedes
+    /// whatever is already in the driver store — Windows treats an
+    /// identical DriverVer as "no newer version".
     driver_ver: String,
 }
 
@@ -53,13 +53,13 @@ impl WinusbPackage {
             vid,
             pid,
             description: sanitize_inf_string(description),
-            driver_ver: default_driver_ver(),
+            driver_ver: crate::driver_version::driver_ver_now(),
         }
     }
 
-    /// Override `DriverVer` for tests that pin a fixture string. Production
-    /// callers should let the constructor derive it from today's date.
-    #[cfg(test)]
+    /// The package with a given `DriverVer`: the one the dispatcher chose and
+    /// put in the job, which the elevated helper renders its own copy with
+    /// (it does not read the clock again), and a test's fixture.
     pub fn with_driver_ver(mut self, value: &str) -> Self {
         self.driver_ver = value.to_string();
         self
@@ -140,23 +140,6 @@ DeviceName="{device_name}"
             cat_name = CAT_NAME,
         )
     }
-}
-
-/// `DriverVer` derived from the current local date. The build number
-/// goes `YYYY*100 + month*1`-style so each daily build still increments
-/// monotonically — Windows compares `DriverVer` lexically, so a
-/// monotonically increasing fourth field is enough to make repeat
-/// installs replace older copies.
-fn default_driver_ver() -> String {
-    let now = chrono::Local::now().naive_local().date();
-    let revision = (now.year() as u32) * 10_000 + (now.month0() + 1) * 100 + (now.day0() + 1);
-    format!(
-        "{:02}/{:02}/{:04},2.2.0.{}",
-        now.month0() + 1,
-        now.day0() + 1,
-        now.year(),
-        revision,
-    )
 }
 
 pub fn hardware_id(vid: u16, pid: u16) -> String {
@@ -781,15 +764,24 @@ pub fn flag_phantom_devices_for_reinstall(target_hardware_id: &str) -> Result<us
     Ok(flagged)
 }
 
-/// AOK-DRIVER-001 restore: revert a device Aokie bound to WinUSB back to
-/// its in-box driver (e.g. BTHUSB). Mechanism: set `CONFIGFLAG_REINSTALL`
-/// on every present device matching `hwid`, then re-enumerate. Without an
-/// `INSTALLFLAG_FORCE` in that PnP re-search, Windows re-ranks the
-/// candidate INFs by signature trust and picks Microsoft-signed BTHUSB
-/// over our self-signed WinUSB INF — which is exactly the revert we want.
-/// (This is the mirror image of the "install doesn't persist" bug the
-/// `clear_reinstall_flag_on_present_devices` path guards against.)
-pub fn restore_inbox_driver(vid: u16, pid: u16) -> Result<(), String> {
+/// AOK-DRIVER-001 restore: give a dongle Aokie bound to WinUSB back to
+/// Windows' own driver (BTHUSB).
+///
+/// Setting `CONFIGFLAG_REINSTALL` and re-enumerating alone leaves the pick
+/// to PnP while Aokie's packages are still in the driver store. They match
+/// the dongle by its hardware id, where Windows' bth.inf matches only its
+/// Bluetooth class (a compatible id), so a package Windows trusts (the
+/// Microsoft-signed production one, or a managed-beta one whose certificate
+/// is still in TrustedPublisher) outranks bth.inf, PnP binds WinUSB again,
+/// and the old restore said "restored" all the same. So every Aokie package
+/// is taken out of the driver store first (each oem*.inf that is Aokie's,
+/// [`is_aokie_package`], removed with `SetupUninstallOEMInfW`), then the
+/// device is flagged and re-enumerated with only Windows' own drivers left
+/// to choose from. Returns the published names removed. Whether PnP did
+/// rebind the dongle is the dispatcher's check
+/// (`installer::restore_original_driver` reads the bound service back),
+/// not something this assumes.
+pub fn restore_inbox_driver(vid: u16, pid: u16) -> Result<Vec<String>, String> {
     let hwid = hardware_id(vid, pid);
     let flagged = set_reinstall_flag_on_present_devices(&hwid)?;
     if flagged == 0 {
@@ -798,9 +790,92 @@ pub fn restore_inbox_driver(vid: u16, pid: u16) -> Result<(), String> {
             hwid
         ));
     }
+    let removed = uninstall_aokie_driver_packages()?;
     // Best-effort re-search; a not-present device is a no-op.
     let _ = reenumerate_device(&hwid);
-    Ok(())
+    Ok(removed)
+}
+
+/// Remove every Aokie WinUSB package from the driver store (forced: the
+/// dongle may still be using one). A package that will not go is an error
+/// naming it, with those removed before it: a restore that leaves one there
+/// leaves PnP able to pick it again.
+fn uninstall_aokie_driver_packages() -> Result<Vec<String>, String> {
+    let inf_dir = windows_dir()?.join("INF");
+    let entries = std::fs::read_dir(&inf_dir)
+        .map_err(|e| format!("could not list the driver store's INFs in {:?}: {}", inf_dir, e))?;
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let lower = name.to_ascii_lowercase();
+        if !(lower.starts_with("oem") && lower.ends_with(".inf")) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        if !is_aokie_package(&bytes) {
+            continue;
+        }
+        // The published name only: the function finds it in the INF directory.
+        let name_w = wide_null(&name);
+        if unsafe { SetupUninstallOEMInfW(name_w.as_ptr(), SUOI_FORCEDELETE, null()) } != 0 {
+            removed.push(name);
+        } else {
+            let err = unsafe { GetLastError() };
+            failed.push(format!("{} ({})", name, describe_setup_error(err)));
+        }
+    }
+    if !failed.is_empty() {
+        return Err(format!(
+            "could not take Aokie's driver package out of the driver store: {} (removed before it: {})",
+            failed.join(", "),
+            if removed.is_empty() { "none".to_string() } else { removed.join(", ") }
+        ));
+    }
+    Ok(removed)
+}
+
+/// Whether an INF in the driver store is one of Aokie's WinUSB packages:
+/// it names Aokie as its provider and Aokie's own device-interface GUID,
+/// as the static package and every rendered one do. (A published INF keeps
+/// the original's bytes; ours are ASCII, a UTF-16 one is read as such.)
+pub fn is_aokie_package(bytes: &[u8]) -> bool {
+    let text = if bytes.starts_with(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    let compact: String = text
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '\t'))
+        .collect::<String>()
+        .to_ascii_uppercase();
+    compact.contains(&AOKIE_INTERFACE_GUID.to_ascii_uppercase())
+        && compact.contains("PROVIDERNAME=\"AOKIE\"")
+}
+
+/// The Windows folder, from Shell32 (never from an environment variable:
+/// this runs elevated, and the environment came from the unelevated user).
+fn windows_dir() -> Result<std::path::PathBuf, String> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buffer = [0_u16; 260];
+    let hr = unsafe {
+        SHGetFolderPathW(null_mut(), CSIDL_WINDOWS as i32, null_mut(), 0, buffer.as_mut_ptr())
+    };
+    if hr != 0 {
+        return Err(format!("could not resolve the Windows folder: HRESULT 0x{:08x}", hr as u32));
+    }
+    let len = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+    if len == 0 {
+        return Err("the Windows folder resolved empty".to_string());
+    }
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len])))
 }
 
 /// OR `CONFIGFLAG_REINSTALL` into every PRESENT device matching
@@ -1076,10 +1151,21 @@ pub fn run_elevated_helper(helper_path: &Path, job_path: &Path) -> Result<i32, S
             ));
         }
 
+        // Wait for the helper to exit, however long it takes. Giving up after
+        // 120 s (as this did) released the install lock while the elevated
+        // helper was still installing, so a second install could start beside
+        // it. The wait runs on the driver step's own thread
+        // (`crate::driver_job`), never on the plugin's command loop, so a slow
+        // helper holds up only another driver step, which must wait anyway.
         let process = OwnedHandle(exec.hProcess);
-        let wait = WaitForSingleObject(process.0, 120_000);
-        if wait == WAIT_TIMEOUT {
-            return Err("aokie-driver-helper timed out after 120 seconds".to_string());
+        let started = std::time::Instant::now();
+        let mut wait = WaitForSingleObject(process.0, 120_000);
+        while wait == WAIT_TIMEOUT {
+            eprintln!(
+                "[winusb] aokie-driver-helper still running after {} s: waiting for it to exit",
+                started.elapsed().as_secs()
+            );
+            wait = WaitForSingleObject(process.0, 120_000);
         }
         if wait == WAIT_FAILED {
             return Err(format!(
@@ -1140,7 +1226,7 @@ mod tests {
     #[test]
     fn inf_contains_selected_device_and_winusb_sections() {
         let package =
-            WinusbPackage::new(0x0a5c, 0x21ec, "BCM20702A0").with_driver_ver("04/26/2026,2.2.0.0");
+            WinusbPackage::new(0x0a5c, 0x21ec, "BCM20702A0").with_driver_ver("04/26/2026,2.26.426.0");
         let inf = package.render_inf();
         assert!(inf.contains("USB\\VID_0A5C&PID_21EC"));
         assert!(inf.contains("Include=winusb.inf"));
@@ -1175,6 +1261,24 @@ mod tests {
     }
 
     #[test]
+    fn tells_aokies_packages_in_the_driver_store_from_others() {
+        let rendered = WinusbPackage::new(0x0a5c, 0x21ec, "BCM20702A0").render_inf();
+        assert!(is_aokie_package(rendered.as_bytes()));
+        let shipped = include_bytes!("../../../../drivers/winusb/aokie_winusb_bluetooth.inf");
+        assert!(is_aokie_package(shipped));
+        // A UTF-16 copy reads the same.
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in rendered.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert!(is_aokie_package(&utf16));
+        // Another vendor's WinUSB INF (no Aokie GUID), or one naming the GUID but another provider.
+        assert!(!is_aokie_package(b"[Strings]\nProviderName=\"Zadig\"\n"));
+        let foreign = rendered.replace("ProviderName=\"Aokie\"", "ProviderName=\"Other\"");
+        assert!(!is_aokie_package(foreign.as_bytes()));
+    }
+
+    #[test]
     fn describes_setup_errors_actionably() {
         // Spot-check that the cat-related codes return guidance, not
         // just hex. ERROR_FILE_HASH_NOT_IN_CATALOG was the one Win10/11
@@ -1192,17 +1296,14 @@ mod tests {
     }
 
     #[test]
-    fn default_driver_ver_uses_today() {
+    fn default_driver_ver_is_now_and_readable_by_windows() {
         let package = WinusbPackage::new(0x0a5c, 0x21ec, "BCM20702A0");
         let inf = package.render_inf();
-        // Today's local date gets folded into DriverVer's revision so
-        // each daily build supersedes older driver-store copies.
+        let driver_ver = inf
+            .lines()
+            .find_map(|line| line.strip_prefix("DriverVer="))
+            .expect("the INF has a DriverVer");
         let today = chrono::Local::now().naive_local().date();
-        let expected_year = format!("/{}", today.year());
-        assert!(
-            inf.contains(&expected_year),
-            "DriverVer should embed today's year: inf was {:?}",
-            inf
-        );
+        crate::driver_version::check_job_driver_ver(driver_ver, today).unwrap();
     }
 }

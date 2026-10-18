@@ -11,7 +11,6 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::time::Instant;
 use tokio_tungstenite::{
-    connect_async_with_config,
     tungstenite::{
         client::IntoClientRequest,
         http::{HeaderValue, StatusCode},
@@ -629,7 +628,7 @@ pub async fn realtime_connect(
                 .max_frame_size(Some(MAX_REALTIME_MESSAGE_BYTES));
             match tokio::time::timeout(
                 connect_timeout(),
-                connect_async_with_config(request, Some(websocket_config), false),
+                crate::ws_tls::connect(request, websocket_config),
             )
             .await
             {

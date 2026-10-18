@@ -6,7 +6,7 @@
 //! to Desktop, so a Desktop crash/restart can never lose the record.
 //! Successful emission marks the row `sent`; failures increment
 //! `attempts` with exponential-backoff bookkeeping until
-//! [`MAX_ATTEMPTS`], after which the row goes `dead` (surfaced via
+//! [`MAX_ATTEMPTS`] over [`RETRY_WINDOW_SECS`], after which the row goes `dead` (surfaced via
 //! `dongle.diagnostics`). `idempotency_key` is UNIQUE — re-inserting
 //! the same occurrence is a no-op, matching consumer-side dedupe.
 
@@ -16,8 +16,17 @@ use aokie_core::events::{iso8601_after_secs, now_iso8601, DesktopEvent};
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// After this many failed emission attempts a row goes `dead` and
-/// stays until an operator intervenes (post-MVP: re-drive UI).
+/// stays until an operator intervenes (post-MVP: re-drive UI) — but only
+/// once it is also older than [`RETRY_WINDOW_SECS`]. Eight attempts at a
+/// 1-64 s backoff were over in about two minutes, so a host busy for that
+/// long dead-lettered every event, where the contract says an event is
+/// re-delivered until the host acknowledges it.
 pub const MAX_ATTEMPTS: u32 = 8;
+
+/// How long an unacknowledged row keeps being re-delivered (the backoff
+/// caps at 5 minutes, so about 860 tries) before it may go `dead`: three
+/// days, a long weekend with the host's journal broken.
+pub const RETRY_WINDOW_SECS: i64 = 3 * 86_400;
 
 /// Acknowledged (`sent`) rows older than this are pruned by the replay
 /// loop — the outbox is a delivery ledger, not an archive, and sent rows
@@ -100,7 +109,9 @@ fn platform_protection() -> PayloadProtection {
 
 #[cfg(windows)]
 fn dpapi_protect(plain: &str) -> Result<String, String> {
-    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
     unsafe {
         let mut input = CRYPT_INTEGER_BLOB {
             cbData: plain.len() as u32,
@@ -116,7 +127,8 @@ fn dpapi_protect(plain: &str) -> Result<String, String> {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            0,
+            // Never a dialog: this runs headless, and a prompt nobody sees would hang the call.
+            CRYPTPROTECT_UI_FORBIDDEN,
             &mut out,
         ) == 0
         {
@@ -131,7 +143,9 @@ fn dpapi_protect(plain: &str) -> Result<String, String> {
 
 #[cfg(windows)]
 fn dpapi_unprotect(b64: &str) -> Result<String, String> {
-    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
     let bytes = b64_decode(b64).ok_or_else(|| "payload base64 is corrupt".to_string())?;
     unsafe {
         let mut input = CRYPT_INTEGER_BLOB {
@@ -148,7 +162,8 @@ fn dpapi_unprotect(b64: &str) -> Result<String, String> {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            0,
+            // Never a dialog: this runs headless, and a prompt nobody sees would hang the call.
+            CRYPTPROTECT_UI_FORBIDDEN,
             &mut out,
         ) == 0
         {
@@ -367,9 +382,77 @@ pub struct OutboxCounts {
     pub dead: u64,
 }
 
+/// Whether `e` says the file itself is damaged (not a database, or a
+/// malformed one) rather than busy, locked or out of reach.
+fn is_corrupt_database(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt)
+    )
+}
+
+/// SQLite's quick integrity check; a damaged file is reported as corrupt.
+pub(crate) fn sqlite_quick_check(conn: &Connection) -> rusqlite::Result<()> {
+    let verdict: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if verdict.eq_ignore_ascii_case("ok") {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some(format!("quick_check: {verdict}")),
+        ))
+    }
+}
+
+/// Open a database with `open`; when the file is damaged, move it (and its
+/// WAL and shared-memory files) aside to `<file>.corrupt-<unix time>`, and
+/// open a fresh one in its place. Any other error is returned unchanged.
+pub(crate) fn open_or_quarantine<T>(
+    path: &Path,
+    open: impl Fn(&Path) -> rusqlite::Result<T>,
+) -> Result<(T, Option<std::path::PathBuf>), String> {
+    match open(path) {
+        Ok(db) => Ok((db, None)),
+        Err(e) if is_corrupt_database(&e) => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let aside = |p: &Path| {
+                let mut name = p.as_os_str().to_owned();
+                name.push(format!(".corrupt-{stamp}"));
+                std::path::PathBuf::from(name)
+            };
+            let moved = aside(path);
+            std::fs::rename(path, &moved).map_err(|re| {
+                format!("{} is corrupt ({e}) and could not be set aside: {re}", path.display())
+            })?;
+            for suffix in ["-wal", "-shm"] {
+                let mut side = path.as_os_str().to_owned();
+                side.push(suffix);
+                let side = std::path::PathBuf::from(side);
+                if side.exists() {
+                    let _ = std::fs::rename(&side, aside(&side));
+                }
+            }
+            eprintln!(
+                "[aokie-plugin] {} was corrupt ({e}) — set aside as {} and started fresh",
+                path.display(),
+                moved.display()
+            );
+            let db = open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok((db, Some(moved)))
+        }
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 pub struct Outbox {
     conn: Connection,
     protection: PayloadProtection,
+    /// While the sealing key could not be had: when to ask again, and how
+    /// many times it has failed (see `open_payloads`).
+    key_wait: std::cell::Cell<Option<(std::time::Instant, u32)>>,
 }
 
 impl Outbox {
@@ -391,6 +474,21 @@ impl Outbox {
         let outbox = Self::with_connection(conn, platform_protection())?;
         outbox.migrate_legacy_plaintext();
         Ok(outbox)
+    }
+
+    /// [`open`](Self::open), and when the file is not a database or is
+    /// corrupt (SQLite says so, or its quick check does), set it aside as
+    /// `<file>.corrupt-<unix time>` (with its `-wal`/`-shm`) and start a fresh
+    /// one: a damaged ledger must not stop the plugin from starting every
+    /// time it is launched. Returns where the old file went, to be said in
+    /// health. A busy, locked or unreadable file is NOT set aside (another
+    /// process may hold it): that error is returned as before.
+    pub fn open_or_quarantine(path: &Path) -> Result<(Self, Option<std::path::PathBuf>), String> {
+        open_or_quarantine(path, |p| {
+            let outbox = Self::open(p)?;
+            sqlite_quick_check(&outbox.conn)?;
+            Ok(outbox)
+        })
     }
 
     /// In-memory outbox for tests: DPAPI on Windows (the real path),
@@ -461,7 +559,11 @@ impl Outbox {
                 value TEXT NOT NULL
             );",
         )?;
-        Ok(Outbox { conn, protection })
+        Ok(Outbox {
+            conn,
+            protection,
+            key_wait: std::cell::Cell::new(None),
+        })
     }
 
     /// AOK-DUR-001 item 4: seal legacy plaintext rows in place. Per-row
@@ -704,8 +806,8 @@ impl Outbox {
     }
 
     /// Record an emission failure: increments `attempts`, stores the
-    /// error, and flips to `dead` once [`MAX_ATTEMPTS`] is reached.
-    /// Returns the resulting status.
+    /// error, and flips to `dead` once [`MAX_ATTEMPTS`] is reached and the
+    /// row is older than [`RETRY_WINDOW_SECS`]. Returns the resulting status.
     ///
     /// Guarded (audit AOK-EVENT-001): only `pending`/`failed` rows move —
     /// a raced late failure can never drag an acknowledged (`sent`) row
@@ -724,7 +826,7 @@ impl Outbox {
             "UPDATE aokie_outbox SET
                 attempts = attempts + 1,
                 last_error = ?2,
-                status = CASE WHEN attempts + 1 >= ?3 THEN 'dead' ELSE 'failed' END,
+                status = CASE WHEN attempts + 1 >= ?3 AND created_at < ?7 THEN 'dead' ELSE 'failed' END,
                 updated_at = ?4,
                 next_attempt_at = ?5
              WHERE idempotency_key = ?1
@@ -736,7 +838,8 @@ impl Outbox {
                 MAX_ATTEMPTS,
                 now_iso8601(),
                 next,
-                expected_attempts
+                expected_attempts,
+                Self::retry_window_cutoff()
             ],
         )?;
         Ok(self
@@ -748,7 +851,9 @@ impl Outbox {
     /// host but not yet acknowledged. Increments `attempts` and schedules the
     /// next re-emission with exponential backoff; the row stays `pending`
     /// until the host's `event.ack` marks it `sent` — or goes `dead` after
-    /// [`MAX_ATTEMPTS`] unacknowledged emissions. Returns the new status.
+    /// [`MAX_ATTEMPTS`] unacknowledged emissions over [`RETRY_WINDOW_SECS`]
+    /// (re-delivery is bounded by time, not by how often the backoff came
+    /// round). Returns the new status.
     ///
     /// Same guards as [`mark_failed`](Self::mark_failed): `sent`/`dead` rows
     /// are never touched (previously a late `mark_emitted` on a row the ack
@@ -764,7 +869,7 @@ impl Outbox {
         self.conn.execute(
             "UPDATE aokie_outbox SET
                 attempts = attempts + 1,
-                status = CASE WHEN attempts + 1 >= ?2 THEN 'dead' ELSE 'pending' END,
+                status = CASE WHEN attempts + 1 >= ?2 AND created_at < ?6 THEN 'dead' ELSE 'pending' END,
                 updated_at = ?3,
                 next_attempt_at = ?4
              WHERE idempotency_key = ?1
@@ -775,7 +880,8 @@ impl Outbox {
                 MAX_ATTEMPTS,
                 now_iso8601(),
                 next,
-                expected_attempts
+                expected_attempts,
+                Self::retry_window_cutoff()
             ],
         )?;
         Ok(self
@@ -795,6 +901,12 @@ impl Outbox {
             .unwrap_or(0))
     }
 
+    /// A row created before this instant has been retried for the whole
+    /// [`RETRY_WINDOW_SECS`] and may go `dead`.
+    fn retry_window_cutoff() -> String {
+        iso8601_after_secs(-RETRY_WINDOW_SECS)
+    }
+
     /// Seconds to wait before the attempt AFTER the current count.
     fn next_backoff_secs(attempts: u32) -> i64 {
         Self::backoff_secs(attempts) as i64
@@ -811,13 +923,37 @@ impl Outbox {
     /// (quarantined at write, corrupt, undecryptable) becomes a TYPED dead
     /// letter — `payload_unreadable: …` — and is excluded, so no caller can
     /// ever emit an empty or plaintext replacement (AOK-DUR-001).
+    ///
+    /// A sealing key the system will not give right now (a locked Keychain,
+    /// a Secret Service not yet unlocked after login, a prompt answered
+    /// "Deny") fails every row alike and may pass: then nothing is
+    /// dead-lettered, the rows wait, and the key is asked for again only after
+    /// a growing pause (so the user is not prompted every second). Only a row
+    /// that does not open while sealing works is unreadable for good.
     fn open_payloads(&self, raw: Vec<(OutboxRow, String)>) -> Vec<OutboxRow> {
         let mut out = Vec::with_capacity(raw.len());
+        if let Some((until, _)) = self.key_wait.get() {
+            if std::time::Instant::now() < until {
+                return out;
+            }
+        }
         for (mut row, stored) in raw {
             match unprotect_payload(&stored) {
                 Ok(plain) => {
+                    self.key_wait.set(None);
                     row.payload_json = plain;
                     out.push(row);
+                }
+                Err(e) if self.sealing_key_unavailable(&stored) => {
+                    let tries = self.key_wait.get().map_or(0, |(_, tries)| tries) + 1;
+                    let pause = std::time::Duration::from_secs((15u64 << tries.min(5)).min(300));
+                    self.key_wait
+                        .set(Some((std::time::Instant::now() + pause, tries)));
+                    eprintln!(
+                        "[aokie-plugin] outbox payloads cannot be opened now ({e}): the sealing key is unavailable — the rows wait, asked again in {}s",
+                        pause.as_secs()
+                    );
+                    break;
                 }
                 Err(e) => {
                     eprintln!(
@@ -830,6 +966,16 @@ impl Outbox {
             }
         }
         out
+    }
+
+    /// Whether `stored` failed to open because the key is not to be had (as
+    /// opposed to this one row being damaged): a sealed row, and sealing
+    /// itself fails too. A quarantine marker or a plaintext row is never
+    /// that.
+    fn sealing_key_unavailable(&self, stored: &str) -> bool {
+        let sealed = stored.starts_with(aokie_core::dpapi::KEYCHAIN_PREFIX)
+            || stored.starts_with(DPAPI_PREFIX);
+        sealed && protect_payload(self.protection, "").is_err()
     }
 
     fn fetch_raw(
@@ -906,6 +1052,22 @@ impl Outbox {
             params![cutoff],
         )?;
         Ok(n)
+    }
+
+    /// TEST-ONLY: take the table away, so every write fails as a full disk
+    /// or a lock held past the busy timeout would.
+    #[cfg(test)]
+    pub(crate) fn break_for_tests(&self) {
+        self.conn.execute_batch("DROP TABLE aokie_outbox;").unwrap();
+    }
+
+    /// TEST-ONLY: make a row as old as `secs` seconds, for the retry window.
+    #[cfg(test)]
+    pub(crate) fn age_row_for_tests(&self, idempotency_key: &str, secs: i64) {
+        let _ = self.conn.execute(
+            "UPDATE aokie_outbox SET created_at = ?2 WHERE idempotency_key = ?1",
+            params![idempotency_key, iso8601_after_secs(-secs)],
+        );
     }
 
     /// TEST-ONLY: rewind a row's `next_attempt_at` to the past so retry
@@ -1177,6 +1339,7 @@ mod tests {
         // Dead row: an ack must NOT paper over the failure.
         let dead = event("ack-dead", "aokie.call.ended");
         ob.insert_pending(&dead, TARGET_DESKTOP).unwrap();
+        ob.age_row_for_tests(&dead.idempotency_key, RETRY_WINDOW_SECS + 60);
         for _ in 0..MAX_ATTEMPTS {
             ob.mark_failed(&dead.idempotency_key, "boom", None).unwrap();
         }
@@ -1216,6 +1379,7 @@ mod tests {
         let sent = event("corr-sent", "aokie.call.ended");
         ob.insert_pending(&dead, "desktop").unwrap();
         ob.insert_pending(&sent, "desktop").unwrap();
+        ob.age_row_for_tests(&dead.idempotency_key, RETRY_WINDOW_SECS + 60);
         for _ in 0..MAX_ATTEMPTS {
             ob.mark_failed(&dead.idempotency_key, "boom", None).unwrap();
         }
@@ -1243,6 +1407,7 @@ mod tests {
         let ob = Outbox::open_in_memory().unwrap();
         let ev = event("call_c", "aokie.sms.sent");
         ob.insert_pending(&ev, TARGET_DESKTOP).unwrap();
+        ob.age_row_for_tests(&ev.idempotency_key, RETRY_WINDOW_SECS + 60);
         for attempt in 1..MAX_ATTEMPTS {
             let status = ob
                 .mark_failed(&ev.idempotency_key, "desktop down", None)
@@ -1267,6 +1432,7 @@ mod tests {
         ob.insert_pending(&dying, TARGET_DESKTOP).unwrap();
         ob.mark_failed(&alive.idempotency_key, "once", None)
             .unwrap();
+        ob.age_row_for_tests(&dying.idempotency_key, RETRY_WINDOW_SECS + 60);
         for _ in 0..MAX_ATTEMPTS {
             ob.mark_failed(&dying.idempotency_key, "always", None)
                 .unwrap();
@@ -1324,12 +1490,13 @@ mod tests {
     }
 
     /// A row that is never acknowledged dead-letters after MAX_ATTEMPTS
-    /// emissions instead of re-delivering forever.
+    /// emissions over the retry window instead of re-delivering forever.
     #[test]
     fn unacknowledged_rows_dead_letter_after_max_attempts() {
         let ob = Outbox::open_in_memory().unwrap();
         let ev = event("call_h", "aokie.call.ended");
         ob.insert_pending(&ev, TARGET_DESKTOP).unwrap();
+        ob.age_row_for_tests(&ev.idempotency_key, RETRY_WINDOW_SECS + 60);
         for _ in 0..(MAX_ATTEMPTS - 1) {
             assert_eq!(
                 ob.mark_emitted(&ev.idempotency_key, None).unwrap(),
@@ -1344,6 +1511,77 @@ mod tests {
             ob.due_for_retry(10).unwrap().is_empty(),
             "dead rows never re-emit"
         );
+    }
+
+    /// Review 2026-10: a host that did not ack for two minutes (eight tries at
+    /// 1-64 s) used to dead-letter every event. A young row is re-delivered
+    /// past MAX_ATTEMPTS; only one past the retry window goes dead.
+    #[test]
+    fn a_slow_host_does_not_dead_letter_young_rows() {
+        let ob = Outbox::open_in_memory().unwrap();
+        let ev = event("call_slow", "aokie.call.ended");
+        ob.insert_pending(&ev, TARGET_DESKTOP).unwrap();
+        for _ in 0..(MAX_ATTEMPTS * 3) {
+            assert_eq!(
+                ob.mark_emitted(&ev.idempotency_key, None).unwrap(),
+                OutboxStatus::Pending
+            );
+        }
+        ob.rewind_next_attempt_for_tests(&ev.idempotency_key);
+        assert_eq!(ob.due_for_retry(10).unwrap().len(), 1, "still re-delivered");
+        ob.age_row_for_tests(&ev.idempotency_key, RETRY_WINDOW_SECS + 60);
+        assert_eq!(
+            ob.mark_emitted(&ev.idempotency_key, None).unwrap(),
+            OutboxStatus::Dead
+        );
+    }
+
+    /// A key that cannot be had right now leaves the rows waiting (not dead),
+    /// and is not asked for again at once. A damaged row is still dead.
+    #[test]
+    fn an_unavailable_sealing_key_leaves_rows_pending() {
+        let ob = Outbox::open_in_memory_with_protection(PayloadProtection::Unavailable).unwrap();
+        // A row sealed elsewhere (as the Keychain seals), read while sealing fails.
+        ob.conn
+            .execute(
+                "INSERT INTO aokie_outbox (event_name, correlation_id, idempotency_key, target,
+                     payload_json, status, attempts, created_at, updated_at)
+                 VALUES ('aokie.call.ended', 'c', 'k1', 'desktop', 'keychain1:AAAA', 'pending', 0, ?1, ?1)",
+                params![now_iso8601()],
+            )
+            .unwrap();
+        assert!(ob.due_for_retry(10).unwrap().is_empty());
+        assert_eq!(ob.status_of("k1").unwrap(), Some(OutboxStatus::Pending));
+        assert!(ob.key_wait.get().is_some(), "the next ask waits");
+        // With sealing working, the same unreadable row is damaged for good.
+        let ok = Outbox::open_in_memory_with_protection(PayloadProtection::DevPlaintext).unwrap();
+        ok.conn
+            .execute(
+                "INSERT INTO aokie_outbox (event_name, correlation_id, idempotency_key, target,
+                     payload_json, status, attempts, created_at, updated_at)
+                 VALUES ('aokie.call.ended', 'c', 'k2', 'desktop', 'keychain1:AAAA', 'pending', 0, ?1, ?1)",
+                params![now_iso8601()],
+            )
+            .unwrap();
+        assert!(ok.due_for_retry(10).unwrap().is_empty());
+        assert_eq!(ok.status_of("k2").unwrap(), Some(OutboxStatus::Dead));
+    }
+
+    /// A file that is not a database is set aside and a fresh outbox opens.
+    #[test]
+    fn a_corrupt_outbox_file_is_set_aside_and_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.sqlite");
+        std::fs::write(&path, b"this is not a sqlite database, not at all, not even a header....").unwrap();
+        let (ob, moved) = Outbox::open_or_quarantine(&path).unwrap();
+        let moved = moved.expect("the damaged file was set aside");
+        assert!(moved.exists());
+        assert!(moved.to_string_lossy().contains("outbox.sqlite.corrupt-"));
+        ob.insert_pending(&event("c", "aokie.call.ended"), TARGET_DESKTOP).unwrap();
+        // A healthy file opens as it is.
+        drop(ob);
+        let (_, again) = Outbox::open_or_quarantine(&path).unwrap();
+        assert!(again.is_none());
     }
 
     /// Acked rows past retention are pruned (bounded PII — audit C-06);
@@ -1409,6 +1647,7 @@ mod tests {
         let ob = Outbox::open_in_memory().unwrap();
         let ev = event("corr-dead-old", "aokie.call.ended");
         ob.insert_pending(&ev, "desktop").unwrap();
+        ob.age_row_for_tests(&ev.idempotency_key, RETRY_WINDOW_SECS + 60);
         for _ in 0..MAX_ATTEMPTS {
             ob.mark_failed(&ev.idempotency_key, "boom", None).unwrap();
         }
@@ -1570,6 +1809,7 @@ mod tests {
         // A HEALTHY dead row alongside it still redrives fine.
         let ok = event("call_u2", "aokie.call.ended");
         ob.insert_pending(&ok, TARGET_DESKTOP).unwrap();
+        ob.age_row_for_tests(&ok.idempotency_key, RETRY_WINDOW_SECS + 60);
         for _ in 0..MAX_ATTEMPTS {
             ob.mark_failed(&ok.idempotency_key, "down", None).unwrap();
         }

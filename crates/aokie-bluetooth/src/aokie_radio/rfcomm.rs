@@ -201,6 +201,9 @@ pub struct RfcommState {
     /// week as the AG drops a reply during congested L2CAP windows.
     hfp_in_flight_command_sent_at: Option<Instant>,
     hfp_slc_failed: bool,
+    /// Commands sent once the SLC is up, awaiting OK/ERROR: names what an
+    /// ERROR refused (review 1 #3) and times out what was never answered.
+    hfp_outstanding: hfp::OutstandingCommands,
     hfp_events: Vec<hfp::HfpEvent>,
     /// True after we send our MSC CMD and before the AG sends MSC RSP.
     /// HFP §4.2.1 requires MSC exchange in BOTH directions before AT
@@ -250,6 +253,7 @@ impl Default for RfcommState {
             hfp_in_flight_command: None,
             hfp_in_flight_command_sent_at: None,
             hfp_slc_failed: false,
+            hfp_outstanding: hfp::OutstandingCommands::default(),
             hfp_events: Vec::new(),
             msc_local_pending: false,
             msc_remote_received: false,
@@ -275,6 +279,7 @@ impl RfcommState {
     /// after that point has no effect on the in-flight session.
     pub fn set_wbs_supported(&mut self, wbs_supported: bool) {
         self.wbs_supported = wbs_supported;
+        self.hfp_state.set_wbs_supported(wbs_supported);
     }
 
     /// Phase 4: whether this SLC advertises call waiting / 3-way (BRSF bit 1)
@@ -866,6 +871,34 @@ impl RfcommState {
         for result in hfp::parse_ag_results_buffered(&mut self.hfp_line_carry, payload)? {
             self.hfp_events.extend(self.hfp_state.apply_result(&result));
             match result {
+                hfp::HfpAgResult::Ok
+                    if self.hfp_in_flight_command.is_none()
+                        && self.hfp_state.service_level_ready() =>
+                {
+                    // The answer to a call-control command (or keepalive).
+                    self.hfp_outstanding.answered();
+                }
+                hfp::HfpAgResult::Error if self.hfp_state.service_level_ready() => {
+                    // Review 1 #3: once the SLC is up an ERROR is the phone
+                    // refusing one command — an ATA racing a hang-up, a bad
+                    // number for ATD, a CHLD=2 or AT+BCC it does not do, a
+                    // second AT+CHUP on a call already gone. It never fails
+                    // the connection (the runtime used to disconnect a link
+                    // it had paged over it, mid-call) and is no hardware
+                    // fault.
+                    let command = self
+                        .hfp_in_flight_command
+                        .take()
+                        .map(|c| hfp::at_command_name(&c))
+                        .or_else(|| self.hfp_outstanding.answered())
+                        .unwrap_or("unsolicited");
+                    self.hfp_in_flight_command_sent_at = None;
+                    eprintln!("[AokieRadio] AG refused {command} — the connection stays up");
+                    self.hfp_events.push(hfp::HfpEvent::CommandRejected {
+                        command,
+                        timed_out: false,
+                    });
+                }
                 hfp::HfpAgResult::Ok => {
                     if matches!(
                         self.hfp_in_flight_command,
@@ -886,8 +919,7 @@ impl RfcommState {
                     // the channel in an indeterminate state forever. Drop
                     // the queue, surface a fatal event, and let the
                     // manager tear the RFCOMM channel down. Post-SLC
-                    // ERRORs (e.g. "ATA" while no call is incoming) are
-                    // surfaced too but do not flip the SLC-ready bit.
+                    // ERRORs are the arm above (CommandRejected).
                     //
                     // Phase 4 exception: the call-waiting capability probes
                     // (AT+CHLD=? / AT+CCWA=1) are NON-fatal — a phone that
@@ -919,8 +951,17 @@ impl RfcommState {
                     }
                 }
                 hfp::HfpAgResult::SelectedCodec(codec) => {
-                    responses
-                        .push(self.build_hfp_command_frame(hfp::HfpAtCommand::ConfirmCodec(codec)));
+                    // Review 1 #17: confirm only a codec we offered; for any
+                    // other the answer is our codec list again (HFP
+                    // §4.11.3), and the phone picks from it.
+                    let reply = if self.hfp_state.codec_offered(codec) {
+                        hfp::HfpAtCommand::ConfirmCodec(codec)
+                    } else {
+                        hfp::HfpAtCommand::AvailableCodecs {
+                            wbs_supported: self.wbs_supported,
+                        }
+                    };
+                    responses.push(self.build_hfp_command_frame(reply));
                 }
                 _ => {}
             }
@@ -976,6 +1017,19 @@ impl RfcommState {
     /// channel down. Returns `true` if the stall fired this tick (so
     /// the caller can log once instead of every tick after).
     pub fn tick_hfp_stall(&mut self, now: Instant, timeout: Duration) -> bool {
+        if self.hfp_state.service_level_ready() && self.hfp_in_flight_command_sent_at.is_none() {
+            // Once the SLC is up a command the phone never answered is that
+            // command lost, not the connection (review 1 #3).
+            let Some(command) = self.hfp_outstanding.timed_out(now, timeout) else {
+                return false;
+            };
+            eprintln!("[AokieRadio] AG never answered {command} within {timeout:?} — the connection stays up");
+            self.hfp_events.push(hfp::HfpEvent::CommandRejected {
+                command,
+                timed_out: true,
+            });
+            return true;
+        }
         let Some(sent_at) = self.hfp_in_flight_command_sent_at else {
             return false;
         };
@@ -1004,6 +1058,9 @@ impl RfcommState {
 
     fn build_hfp_command_frame(&mut self, command: hfp::HfpAtCommand) -> Vec<u8> {
         self.hfp_state.mark_command_sent(&command);
+        if self.hfp_state.service_level_ready() {
+            self.hfp_outstanding.sent(&command, Instant::now());
+        }
         build_uih(self.hfp_dlci, true, None, &hfp::build_at_command(command))
     }
 
@@ -1708,25 +1765,7 @@ impl RfcommClientState {
 }
 
 fn describe_at_command(command: &hfp::HfpAtCommand) -> &'static str {
-    match command {
-        hfp::HfpAtCommand::SupportedFeatures { .. } => "AT+BRSF",
-        hfp::HfpAtCommand::AvailableCodecs { .. } => "AT+BAC",
-        hfp::HfpAtCommand::RetrieveIndicators => "AT+CIND=?",
-        hfp::HfpAtCommand::RetrieveIndicatorStatus => "AT+CIND?",
-        hfp::HfpAtCommand::RetrieveCallHoldSupport => "AT+CHLD=?",
-        hfp::HfpAtCommand::EnableCallWaitingNotifications => "AT+CCWA",
-        hfp::HfpAtCommand::CallHold(_) => "AT+CHLD",
-        hfp::HfpAtCommand::ActivateClip(_) => "AT+CLIP",
-        hfp::HfpAtCommand::EnableIndicatorUpdates(_) => "AT+CMER",
-        hfp::HfpAtCommand::EnableAllIndicatorStatusUpdates(_) => "AT+BIA",
-        hfp::HfpAtCommand::DisableNoiseReduction => "AT+NREC",
-        hfp::HfpAtCommand::Answer => "ATA",
-        hfp::HfpAtCommand::RejectOrHangup => "AT+CHUP",
-        hfp::HfpAtCommand::Dial(_) => "ATD",
-        hfp::HfpAtCommand::ConfirmCodec(_) => "AT+BCS",
-        hfp::HfpAtCommand::ListCurrentCalls => "AT+CLCC",
-        hfp::HfpAtCommand::CodecConnection => "AT+BCC",
-    }
+    hfp::at_command_name(command)
 }
 
 pub fn server_channel_dlci(server_channel: u8, initiator_direction: bool) -> u8 {
@@ -2568,6 +2607,74 @@ mod tests {
             .build_call_control_command(hfp::HfpAtCommand::RejectOrHangup)
             .unwrap();
         assert_eq!(parse_frame(&hangup).unwrap().payload, b"AT+CHUP\r");
+    }
+
+    /// Review 1 #3 / #17: once the SLC is up, an ERROR is the phone refusing
+    /// that one command (named, never an SLC failure), a command it never
+    /// answers times out once, and a codec never offered is answered with
+    /// our list instead of being confirmed.
+    #[test]
+    fn after_slc_an_error_refuses_one_command_and_the_link_stays() {
+        let mut state = open_hfp_state();
+        for reply in [
+            "\r\n+BRSF: 871\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\n+CIND: (\"call\",(0,1)),(\"callsetup\",(0-3))\r\nOK\r\n",
+            "\r\n+CIND: 0,0\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+            "\r\nOK\r\n",
+        ] {
+            state
+                .handle_packet(&build_uih(aokie_hfp_dlci(), false, None, reply.as_bytes()))
+                .unwrap();
+        }
+        assert!(state.hfp_state().service_level_ready());
+        state.take_hfp_events();
+
+        // A keepalive answered OK, then a dial the phone refuses.
+        state
+            .build_call_control_command(hfp::HfpAtCommand::RetrieveIndicatorStatus)
+            .unwrap();
+        state
+            .build_call_control_command(hfp::HfpAtCommand::Dial("0491570157".into()))
+            .unwrap();
+        state
+            .handle_packet(&build_uih(aokie_hfp_dlci(), false, None, b"\r\n+CIND: 0,0\r\nOK\r\n"))
+            .unwrap();
+        state
+            .handle_packet(&build_uih(aokie_hfp_dlci(), false, None, b"\r\nERROR\r\n"))
+            .unwrap();
+        let events = state.take_hfp_events();
+        assert_eq!(
+            events,
+            vec![hfp::HfpEvent::CommandRejected {
+                command: "ATD",
+                timed_out: false
+            }]
+        );
+        assert!(state.hfp_state().service_level_ready(), "the link stays");
+
+        // An ATA the phone never answers times out once.
+        state.build_call_control_command(hfp::HfpAtCommand::Answer).unwrap();
+        let later = Instant::now() + Duration::from_secs(11);
+        assert!(state.tick_hfp_stall(later, Duration::from_secs(10)));
+        assert!(!state.tick_hfp_stall(later, Duration::from_secs(10)));
+        assert_eq!(
+            state.take_hfp_events(),
+            vec![hfp::HfpEvent::CommandRejected {
+                command: "ATA",
+                timed_out: true
+            }]
+        );
+
+        // +BCS naming a codec never offered: our list again, not AT+BCS.
+        let responses = state
+            .handle_packet(&build_uih(aokie_hfp_dlci(), false, None, b"\r\n+BCS: 5\r\n"))
+            .unwrap();
+        assert_eq!(parse_frame(&responses[0]).unwrap().payload, b"AT+BAC=1,2\r");
+        assert!(state.take_hfp_events().is_empty());
     }
 
     #[test]

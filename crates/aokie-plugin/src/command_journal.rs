@@ -22,6 +22,10 @@ pub struct CommandJournal {
     conn: Connection,
 }
 
+/// How long a completed command's result is kept (it holds the number that
+/// was texted or rung): long past any retry of the same request.
+pub const RETENTION_DAYS: u32 = 7;
+
 impl CommandJournal {
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
@@ -33,7 +37,47 @@ impl CommandJournal {
         Self::from_connection(conn)
     }
 
+    /// The plugin's open: a journal file that is damaged is set aside
+    /// (`<file>.corrupt-<unix time>`) for a fresh one, as the outbox is, and
+    /// results past [`RETENTION_DAYS`] are pruned. Returns where a damaged
+    /// file went.
+    pub fn open_or_quarantine(path: &Path) -> Result<(Self, Option<std::path::PathBuf>), String> {
+        let (journal, moved) = crate::outbox::open_or_quarantine(path, |p| {
+            let conn = Connection::open(p)?;
+            crate::outbox::sqlite_quick_check(&conn)?;
+            Self::schema(&conn)?;
+            Ok(Self { conn })
+        })?;
+        match journal.prune_completed(RETENTION_DAYS) {
+            Ok(0) => {}
+            Ok(n) => eprintln!("[aokie-plugin] command journal: pruned {n} result(s) past {RETENTION_DAYS} days"),
+            Err(e) => eprintln!("[aokie-plugin] command journal prune failed: {e}"),
+        }
+        Ok((journal, moved))
+    }
+
+    /// Completed results kept no longer than `days` days. A result is there
+    /// for a retry of the same request to be answered with it; host retries
+    /// come within minutes, and each holds the number that was texted or
+    /// rung. An acceptance with no result yet is kept (its outcome is not
+    /// known, and it holds no number).
+    pub fn prune_completed(&self, days: u32) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "DELETE FROM command_journal
+                  WHERE result_json IS NOT NULL
+                    AND completed_at < datetime('now', ?1)",
+                params![format!("-{days} days")],
+            )
+            .map_err(|e| e.to_string())
+    }
+
     fn from_connection(conn: Connection) -> Result<Self, String> {
+        Self::schema(&conn).map_err(|e| e.to_string())?;
+        Ok(Self { conn })
+    }
+
+    fn schema(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
@@ -46,8 +90,6 @@ impl CommandJournal {
                  completed_at TEXT
              );",
         )
-        .map_err(|e| e.to_string())?;
-        Ok(Self { conn })
     }
 
     pub fn prepare(
@@ -207,5 +249,53 @@ mod tests {
             ),
             Ok(Prepare::Pending)
         );
+    }
+
+    /// Review 2026-10: results (each with the number texted or rung) were
+    /// kept for ever. Completed ones past the retention go; an acceptance
+    /// with no result yet stays (its outcome is unknown).
+    #[test]
+    fn completed_results_past_retention_are_pruned() {
+        let mut journal = CommandJournal::open_in_memory().unwrap();
+        journal.prepare("old", "sms.send", &json!({"to": "+61400000000"})).unwrap();
+        journal.complete("old", &json!({"to": "+61400000000"})).unwrap();
+        journal.prepare("new", "sms.send", &json!({"to": "+61400000001"})).unwrap();
+        journal.complete("new", &json!({"to": "+61400000001"})).unwrap();
+        journal.prepare("open", "call.dial", &json!({"number": "+61400000002"})).unwrap();
+        journal
+            .conn
+            .execute(
+                "UPDATE command_journal SET completed_at = datetime('now', '-8 days'),
+                        accepted_at = datetime('now', '-8 days')
+                  WHERE request_id IN ('old', 'open')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(journal.prune_completed(RETENTION_DAYS).unwrap(), 1);
+        assert_eq!(
+            journal.prepare("old", "sms.send", &json!({"to": "+61400000000"})),
+            Ok(Prepare::New),
+            "the pruned result is gone"
+        );
+        assert!(matches!(
+            journal.prepare("new", "sms.send", &json!({"to": "+61400000001"})),
+            Ok(Prepare::Replay(_))
+        ));
+        assert_eq!(
+            journal.prepare("open", "call.dial", &json!({"number": "+61400000002"})),
+            Ok(Prepare::Pending)
+        );
+    }
+
+    /// Review 2026-10: a corrupt journal file stopped the plugin at every
+    /// start. It is set aside and a fresh one opens.
+    #[test]
+    fn a_corrupt_journal_is_set_aside_and_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("command-journal.sqlite3");
+        std::fs::write(&path, vec![0x5a; 4096]).unwrap();
+        let (mut journal, moved) = CommandJournal::open_or_quarantine(&path).unwrap();
+        assert!(moved.expect("set aside").exists());
+        assert_eq!(journal.prepare("r", "sms.send", &json!({})), Ok(Prepare::New));
     }
 }

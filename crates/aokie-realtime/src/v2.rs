@@ -4,21 +4,23 @@
 //! single authenticated endpoint; RTP/SRTP never enters this service.
 
 use super::{header_id, Admission, AdmissionRegistry, AdmissionRole, Gateway, MAX_MESSAGE_BYTES};
+use aokie_protocol::text::sanitize_line;
 use aokie_protocol::v2::{
-    parse_mobile_frame, parse_plugin_frame, tracks_for, AdmissionClaims,
+    parse_mobile_frame, parse_plugin_frame, tracks_for, unknown_frame_kind, AdmissionClaims,
     AdmissionRole as TokenAdmissionRole, AudioLevelSource, AuthoritativeCallSnapshot,
-    EndCallerChallengeFrame, EndCallerOutcome, EndpointChallengeFrame, EndpointPublicKey, Grant,
-    LeaseClaims, LeaseHeartbeatFrame, LeaseMode, LeasePhase, LeaseRequestFrame, LeaseRevokeFrame,
-    MobileAssistanceAnswerFrame, MobileEndCallerChallengeRequestFrame, MobileEndCallerConfirmFrame,
-    MobileHello, MobileIdleSyncFrame, MobileInbound, MobileMicrophoneMuteFrame,
-    MobileOfferAnswerFrame, MobileOfferSurface, MobileRtcSignalFrame, MobileSnapshotFrame,
-    PendingMobileOfferClaims, PluginAssistanceAnswerFrame, PluginAssistanceRequestFrame,
-    PluginClaimDecisionFrame, PluginEndCallerExecuteFrame, PluginEndCallerResultFrame, PluginHello,
-    PluginIdleFrame, PluginInbound, PluginLeaseRevokeFrame, PluginMicrophoneMuteFrame,
+    CallerProjection, Caption, EndCallerChallengeFrame, EndCallerOutcome, EndpointChallengeFrame,
+    EndpointPublicKey, Grant, LeaseClaims, LeaseHeartbeatFrame, LeaseMode, LeasePhase,
+    LeaseRequestFrame, LeaseRevokeFrame, MobileAssistanceAnswerFrame,
+    MobileEndCallerChallengeRequestFrame, MobileEndCallerConfirmFrame, MobileHello,
+    MobileIdleSyncFrame, MobileInbound, MobileMicrophoneMuteFrame, MobileOfferAnswerFrame,
+    MobileOfferSurface, MobileRtcSignalFrame, MobileSnapshotFrame, PendingMobileOfferClaims,
+    PluginAssistanceAnswerFrame, PluginAssistanceRequestFrame, PluginClaimDecisionFrame,
+    PluginEndCallerExecuteFrame, PluginEndCallerResultFrame, PluginHello, PluginIdleFrame,
+    PluginInbound, PluginLeaseRevokeFrame, PluginMicrophoneMuteFrame,
     PluginMicrophoneMuteStatusFrame, PluginRtcSignalFrame, PluginSnapshotFrame,
     ProjectedCallSnapshot, RtcSignal, ServiceMode, SignedHelloProof, SignedPendingMobileOffer,
-    TelephonyState, ENDPOINT_PROOF_MAX_LIFETIME, LEASE_AUDIENCE, MAX_SAFE_INTEGER,
-    MOBILE_OFFER_MAX_LIFETIME, SCHEMA_VERSION,
+    TelephonyState, ENDPOINT_CHALLENGE_LIFETIME, LEASE_AUDIENCE, MAX_CAPTION_BYTES,
+    MAX_SAFE_INTEGER, MOBILE_OFFER_MAX_LIFETIME, SCHEMA_VERSION,
 };
 use axum::{
     extract::{
@@ -51,12 +53,18 @@ const RTC_RATE_LIMIT: u32 = 120;
 const RATE_WINDOW: Duration = Duration::from_secs(10);
 const LEASE_TTL: u64 = 20;
 const MAX_ADMISSION_TTL: u64 = 300;
-const MAX_CLAIMED_ADMISSIONS: usize = 4096;
-const MAX_USED_ENDPOINT_JTIS: usize = 16_384;
+// One-use ids are remembered per app until they expire. The per-app share
+// keeps one tenant (say, a phone flooding signed RTC frames) from filling the
+// relay-wide cache and refusing every other tenant's connections.
+const MAX_CLAIMED_ADMISSIONS: usize = 16_384;
+const MAX_CLAIMED_ADMISSIONS_PER_APP: usize = 1_024;
+const MAX_USED_ENDPOINT_JTIS: usize = 65_536;
+const MAX_USED_ENDPOINT_JTIS_PER_APP: usize = 4_096;
 const MAX_ASSISTANCE_TTL: u64 = 300;
 const END_CALLER_CONFIRM_TTL: u64 = 12;
 const END_CALLER_HISTORY_CAPACITY: usize = 128;
 const PLUGIN_RECONNECT_GRACE: Duration = Duration::from_secs(5);
+const PLUGIN_INBOUND_TIMEOUT: Duration = Duration::from_secs(40);
 const ADMISSION_TOKEN_PREFIX: &str = "aokie-adm-v2";
 const MOBILE_OFFER_TOKEN_PREFIX: &str = "aokie-offer-v2";
 
@@ -65,16 +73,70 @@ pub(crate) struct V2Gateway {
     signer: Option<LeaseSigner>,
     admission_signer: Option<AdmissionTokenSigner>,
     allow_static_admissions: bool,
-    claimed_admissions: Arc<Mutex<HashMap<String, ClaimedAdmission>>>,
-    used_endpoint_jtis: Arc<Mutex<HashMap<String, u64>>>,
+    claimed_admissions: Arc<Mutex<ReplayCache>>,
+    used_endpoint_jtis: Arc<Mutex<ReplayCache>>,
     apps: Arc<Mutex<HashMap<String, V2App>>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct V2Stats {
-    pub apps: usize,
-    pub plugins: usize,
-    pub mobiles: usize,
+/// One-use ids remembered until they expire, kept per app.
+#[derive(Default)]
+struct ReplayCache {
+    by_app: HashMap<String, HashMap<String, u64>>,
+    total: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReplayClaim {
+    Fresh,
+    Replay,
+    AppFull,
+    Full,
+}
+
+impl ReplayCache {
+    fn claim(
+        &mut self,
+        app_id: &str,
+        id: &str,
+        expires_at: u64,
+        now: u64,
+        per_app: usize,
+        total: usize,
+    ) -> ReplayClaim {
+        if let Some(entries) = self.by_app.get_mut(app_id) {
+            let before = entries.len();
+            entries.retain(|_, expiry| *expiry > now);
+            self.total -= before - entries.len();
+            if entries.contains_key(id) {
+                return ReplayClaim::Replay;
+            }
+            if entries.len() >= per_app {
+                // Only this app is refused; an id is never forgotten before
+                // it expires, so replay protection stays whole.
+                return ReplayClaim::AppFull;
+            }
+        }
+        if self.total >= total {
+            self.prune(now);
+            if self.total >= total {
+                return ReplayClaim::Full;
+            }
+        }
+        self.by_app
+            .entry(app_id.to_owned())
+            .or_default()
+            .insert(id.to_owned(), expires_at);
+        self.total += 1;
+        ReplayClaim::Fresh
+    }
+
+    fn prune(&mut self, now: u64) {
+        self.by_app.retain(|_, entries| {
+            entries.retain(|_, expiry| *expiry > now);
+            !entries.is_empty()
+        });
+        self.total = self.by_app.values().map(HashMap::len).sum();
+    }
 }
 
 impl V2Gateway {
@@ -88,8 +150,8 @@ impl V2Gateway {
             admission_signer: admission_secret
                 .and_then(|secret| AdmissionTokenSigner::new(secret).ok()),
             allow_static_admissions,
-            claimed_admissions: Arc::new(Mutex::new(HashMap::new())),
-            used_endpoint_jtis: Arc::new(Mutex::new(HashMap::new())),
+            claimed_admissions: Arc::new(Mutex::new(ReplayCache::default())),
+            used_endpoint_jtis: Arc::new(Mutex::new(ReplayCache::default())),
             apps: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -104,15 +166,6 @@ impl V2Gateway {
 
     pub(crate) fn allows_static_admission(&self) -> bool {
         false
-    }
-
-    pub(crate) async fn stats(&self) -> V2Stats {
-        let apps = self.apps.lock().await;
-        V2Stats {
-            apps: apps.len(),
-            plugins: apps.values().filter(|app| app.plugin.is_some()).count(),
-            mobiles: apps.values().map(|app| app.mobiles.len()).sum(),
-        }
     }
 
     fn signer(&self) -> Result<&LeaseSigner, GatewayError> {
@@ -178,6 +231,7 @@ impl V2Gateway {
 
     async fn claim_admission(
         &self,
+        app_id: &str,
         jti: Option<&str>,
         exp: Option<u64>,
         _connection_id: &str,
@@ -186,22 +240,28 @@ impl V2Gateway {
             return Ok(());
         };
         let now = unix_now()?;
-        let mut claimed = self.claimed_admissions.lock().await;
-        claimed.retain(|_, binding| binding.exp > now);
-        if claimed.contains_key(jti) {
-            return Err(GatewayError::fatal(
+        match self.claimed_admissions.lock().await.claim(
+            app_id,
+            jti,
+            exp,
+            now,
+            MAX_CLAIMED_ADMISSIONS_PER_APP,
+            MAX_CLAIMED_ADMISSIONS,
+        ) {
+            ReplayClaim::Fresh => Ok(()),
+            ReplayClaim::Replay => Err(GatewayError::fatal(
                 "admission_replay",
                 "admission token was already used",
-            ));
-        }
-        if claimed.len() >= MAX_CLAIMED_ADMISSIONS {
-            return Err(GatewayError::fatal(
+            )),
+            ReplayClaim::AppFull => Err(GatewayError::fatal(
+                "capacity",
+                "this application's unexpired admission capacity is exhausted",
+            )),
+            ReplayClaim::Full => Err(GatewayError::fatal(
                 "capacity",
                 "unexpired admission capacity is exhausted",
-            ));
+            )),
         }
-        claimed.insert(jti.to_owned(), ClaimedAdmission { exp });
-        Ok(())
     }
 
     async fn release_admission(&self, jti: Option<&str>, _connection_id: &str) {
@@ -210,30 +270,42 @@ impl V2Gateway {
         // Retain its JTI until expiry so a disconnect, malformed hello or
         // forced fence cannot turn the same bearer into a fresh admission.
         let now = unix_now().unwrap_or_default();
-        self.claimed_admissions
-            .lock()
-            .await
-            .retain(|_, binding| binding.exp > now);
+        self.claimed_admissions.lock().await.prune(now);
     }
 
-    async fn claim_endpoint_jti(&self, jti: &str, exp: u64) -> Result<(), GatewayError> {
+    /// Remember a verified endpoint proof's jti. Callers verify the proof's
+    /// signature AND everything that binds it to this peer (rate limit,
+    /// lease, session nonce) first, so only proofs that would otherwise be
+    /// acted on take a place in the cache.
+    async fn claim_endpoint_jti(
+        &self,
+        app_id: &str,
+        jti: &str,
+        exp: u64,
+    ) -> Result<(), GatewayError> {
         let now = unix_now()?;
-        let mut used = self.used_endpoint_jtis.lock().await;
-        used.retain(|_, expires_at| *expires_at > now);
-        if used.contains_key(jti) {
-            return Err(GatewayError::fatal(
+        match self.used_endpoint_jtis.lock().await.claim(
+            app_id,
+            jti,
+            exp,
+            now,
+            MAX_USED_ENDPOINT_JTIS_PER_APP,
+            MAX_USED_ENDPOINT_JTIS,
+        ) {
+            ReplayClaim::Fresh => Ok(()),
+            ReplayClaim::Replay => Err(GatewayError::fatal(
                 "endpoint_replay",
                 "endpoint proof JTI was already used",
-            ));
-        }
-        if used.len() >= MAX_USED_ENDPOINT_JTIS {
-            return Err(GatewayError::fatal(
+            )),
+            ReplayClaim::AppFull => Err(GatewayError::fatal(
+                "capacity",
+                "this application's endpoint replay cache is full",
+            )),
+            ReplayClaim::Full => Err(GatewayError::fatal(
                 "capacity",
                 "endpoint replay cache capacity is exhausted",
-            ));
+            )),
         }
-        used.insert(jti.to_owned(), exp);
-        Ok(())
     }
 }
 
@@ -246,10 +318,6 @@ struct AuthenticatedAdmission {
     approved_peer_key_thumbprints: Vec<String>,
     peer_roster_revision: Option<u64>,
     peer_roster_hash: Option<String>,
-}
-
-struct ClaimedAdmission {
-    exp: u64,
 }
 
 #[derive(Clone)]
@@ -923,7 +991,12 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
     if let Err(error) = gateway
         .inner
         .v2
-        .claim_admission(admission_jti.as_deref(), admission_exp, &connection_id)
+        .claim_admission(
+            &admission.app_id,
+            admission_jti.as_deref(),
+            admission_exp,
+            &connection_id,
+        )
         .await
     {
         eprintln!(
@@ -972,9 +1045,7 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
         approved_peer_key_thumbprints,
         peer_roster_revision,
         peer_roster_hash,
-        expires_at: admission_exp
-            .unwrap_or(now + ENDPOINT_PROOF_MAX_LIFETIME)
-            .min(now + ENDPOINT_PROOF_MAX_LIFETIME),
+        expires_at: challenge_expiry(admission_exp, now),
     };
     if challenge.validate(now).is_err() {
         let error =
@@ -1051,6 +1122,7 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
                     .inner
                     .v2
                     .claim_endpoint_jti(
+                        &admission.app_id,
                         &hello.endpoint_proof.claims.jti,
                         hello.endpoint_proof.claims.expires_at,
                     )
@@ -1083,6 +1155,7 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
                     .inner
                     .v2
                     .claim_endpoint_jti(
+                        &admission.app_id,
                         &hello.endpoint_proof.claims.jti,
                         hello.endpoint_proof.claims.expires_at,
                     )
@@ -1129,6 +1202,14 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
         admission.app_id, role_label, admission.subject_id, connection_id
     );
 
+    // A Desktop whose link died without a close (sleep, a dropped Wi-Fi)
+    // would otherwise hold its authority until TCP gave up, minutes later,
+    // while every phone kept showing a live receptionist. The plugin pings
+    // every 15 s and republishes state every 10 s, so silence this long
+    // means it is gone.
+    let plugin_silence = tokio::time::sleep(PLUGIN_INBOUND_TIMEOUT);
+    tokio::pin!(plugin_silence);
+    let watch_plugin_silence = matches!(admission.role, AdmissionRole::Plugin);
     let exit_reason = loop {
         let incoming = tokio::select! {
             _ = &mut admission_expiry => {
@@ -1144,11 +1225,20 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
                 let _ = changed;
                 break "fenced";
             }
+            _ = &mut plugin_silence, if watch_plugin_silence => {
+                let _ = tx.try_send(Message::Close(None));
+                break "plugin_silent";
+            }
             incoming = reader.next() => incoming,
         };
         let Some(incoming) = incoming else {
             break "peer_eof";
         };
+        if watch_plugin_silence {
+            plugin_silence
+                .as_mut()
+                .reset(tokio::time::Instant::now() + PLUGIN_INBOUND_TIMEOUT);
+        }
         let result = match incoming {
             Ok(Message::Text(text)) if text.len() <= MAX_MESSAGE_BYTES => match admission.role {
                 AdmissionRole::Mobile => {
@@ -1212,6 +1302,16 @@ async fn handle_socket(gateway: Gateway, authenticated: AuthenticatedAdmission, 
     }
 }
 
+/// When an endpoint challenge minted at `now` expires. It is shorter than
+/// the proof maximum, so a peer whose clock trails ours by a moment does not
+/// read the challenge as dated in the future, and it never outlives the
+/// admission it answers.
+fn challenge_expiry(admission_exp: Option<u64>, now: u64) -> u64 {
+    admission_exp
+        .unwrap_or(now + ENDPOINT_CHALLENGE_LIFETIME)
+        .min(now + ENDPOINT_CHALLENGE_LIFETIME)
+}
+
 /// Graceful early exit (audit AK-09): the queued typed error + Close frame
 /// must actually FLUSH before the writer dies — an immediate `abort()` turned
 /// every early refusal into an opaque EOF, so clients could not distinguish
@@ -1238,26 +1338,31 @@ fn verify_hello_proof(
             "endpoint hello proof is invalid or stale",
         )
     })?;
-    let claims = &proof.claims;
-    if claims.app_id != challenge.app_id
-        || claims.subject_id != challenge.subject_id
-        || claims.role != challenge.role
-        || claims.connection_id != challenge.connection_id
-        || claims.challenge_nonce != challenge.challenge_nonce
-        || claims.admission_jti != challenge.admission_jti
-        || claims.holder_key_thumbprint != challenge.holder_key_thumbprint
-        || claims.expected_peer_key_thumbprint != challenge.expected_peer_key_thumbprint
-        || claims.approved_peer_key_thumbprints != challenge.approved_peer_key_thumbprints
-        || claims.peer_roster_revision != challenge.peer_roster_revision
-        || claims.peer_roster_hash != challenge.peer_roster_hash
-        || claims.expires_at > challenge.expires_at
-    {
+    if !hello_claims_match_challenge(&proof.claims, challenge) {
         return Err(GatewayError::fatal(
             "endpoint_substitution",
             "endpoint hello proof does not match its server challenge",
         ));
     }
     Ok(())
+}
+
+fn hello_claims_match_challenge(
+    claims: &aokie_protocol::v2::HelloProofClaims,
+    challenge: &EndpointChallengeFrame,
+) -> bool {
+    claims.app_id == challenge.app_id
+        && claims.subject_id == challenge.subject_id
+        && claims.role == challenge.role
+        && claims.connection_id == challenge.connection_id
+        && claims.challenge_nonce == challenge.challenge_nonce
+        && claims.admission_jti == challenge.admission_jti
+        && claims.holder_key_thumbprint == challenge.holder_key_thumbprint
+        && claims.expected_peer_key_thumbprint == challenge.expected_peer_key_thumbprint
+        && claims.approved_peer_key_thumbprints == challenge.approved_peer_key_thumbprints
+        && claims.peer_roster_revision == challenge.peer_roster_revision
+        && claims.peer_roster_hash == challenge.peer_roster_hash
+        && claims.expires_at <= challenge.expires_at
 }
 
 async fn register_plugin(
@@ -1279,6 +1384,9 @@ async fn register_plugin(
         ));
     }
     let mut apps = gateway.inner.v2.apps.lock().await;
+    if !apps.contains_key(&admission.app_id) && apps.len() >= MAX_APPS {
+        evict_idle_apps(&mut apps);
+    }
     if !apps.contains_key(&admission.app_id) && apps.len() >= MAX_APPS {
         return Err(GatewayError::fatal(
             "capacity",
@@ -1519,6 +1627,33 @@ async fn register_plugin(
     Ok(())
 }
 
+/// Forget apps nobody is using: no plugin (and its reconnect grace is over),
+/// no phone, no lease and no caller-ending operation. Entries were never
+/// removed, so the relay refused every new app once 1,024 had ever
+/// connected. What is dropped is exactly what the grace-expiry reset
+/// already clears, plus the talk-fence counter, which a gateway restart
+/// resets the same way. One-use ids live in the separate replay caches and
+/// stay remembered until they expire.
+fn evict_idle_apps(apps: &mut HashMap<String, V2App>) {
+    let before = apps.len();
+    apps.retain(|_, app| {
+        let idle = app.plugin.is_none()
+            && app.mobiles.is_empty()
+            && app.leases.is_empty()
+            && app.end_caller_operation.is_none()
+            && app
+                .plugin_disconnected_at
+                .is_none_or(|disconnected_at| disconnected_at.elapsed() >= PLUGIN_RECONNECT_GRACE);
+        !idle
+    });
+    if apps.len() != before {
+        eprintln!(
+            "[aokie-realtime][session] stage=idle_apps_evicted count={}",
+            before - apps.len()
+        );
+    }
+}
+
 async fn register_mobile(
     gateway: &Gateway,
     admission: &Admission,
@@ -1642,12 +1777,18 @@ async fn handle_mobile(
     connection_id: &str,
     encoded: &str,
 ) -> Result<(), GatewayError> {
-    let frame = parse_mobile_frame(encoded).map_err(|_| {
-        GatewayError::fatal(
-            "invalid_frame",
-            "mobile frame is invalid for this direction",
-        )
-    })?;
+    let frame = match parse_mobile_frame(encoded) {
+        Ok(frame) => frame,
+        Err(_) => {
+            if let Some(kind) = unknown_frame_kind(encoded) {
+                return refuse_unknown_kind(gateway, admission, connection_id, &kind).await;
+            }
+            return Err(GatewayError::fatal(
+                "invalid_frame",
+                "mobile frame is invalid for this direction",
+            ));
+        }
+    };
     if matches!(frame, MobileInbound::Hello(_)) {
         return Err(GatewayError::fatal(
             "invalid_frame",
@@ -1692,12 +1833,18 @@ async fn handle_plugin(
     connection_id: &str,
     encoded: &str,
 ) -> Result<(), GatewayError> {
-    let frame = parse_plugin_frame(encoded).map_err(|_| {
-        GatewayError::fatal(
-            "invalid_frame",
-            "plugin frame is invalid for this direction",
-        )
-    })?;
+    let frame = match parse_plugin_frame(encoded) {
+        Ok(frame) => frame,
+        Err(_) => {
+            if let Some(kind) = unknown_frame_kind(encoded) {
+                return refuse_unknown_kind(gateway, admission, connection_id, &kind).await;
+            }
+            return Err(GatewayError::fatal(
+                "invalid_frame",
+                "plugin frame is invalid for this direction",
+            ));
+        }
+    };
     if matches!(frame, PluginInbound::Hello(_)) {
         return Err(GatewayError::fatal(
             "invalid_frame",
@@ -1733,6 +1880,42 @@ async fn handle_plugin(
         }
         PluginInbound::Hello(_) => unreachable!(),
     }
+}
+
+/// A newer endpoint sent a frame kind this gateway does not define. Refuse
+/// that one frame with a non-fatal error and keep the socket: tearing the
+/// session down would strand every not-yet-updated peer the moment one side
+/// adds a kind. The frame still counts against the sender's rate limit.
+async fn refuse_unknown_kind(
+    gateway: &Gateway,
+    admission: &Admission,
+    connection_id: &str,
+    kind: &str,
+) -> Result<(), GatewayError> {
+    eprintln!(
+        "[aokie-realtime][session] stage=unknown_kind_ignored app={} subject={} connection={} kind={}",
+        admission.app_id, admission.subject_id, connection_id, kind
+    );
+    let mut apps = gateway.inner.v2.apps.lock().await;
+    match admission.role {
+        AdmissionRole::Mobile => current_mobile_app_mut(&mut apps, admission, connection_id)?
+            .mobiles
+            .get_mut(&admission.subject_id)
+            .expect("checked mobile")
+            .admit_general()?,
+        AdmissionRole::Plugin => current_plugin_mut(&mut apps, admission, connection_id)?
+            .plugin
+            .as_mut()
+            .expect("checked plugin")
+            .admit_general()?,
+        AdmissionRole::Desktop => {
+            return Err(GatewayError::fatal("wrong_role", "desktop role is v1 only"))
+        }
+    }
+    Err(GatewayError::nonfatal(
+        "unsupported_kind",
+        "this gateway does not support that frame kind",
+    ))
 }
 
 async fn handle_idle(
@@ -3928,13 +4111,6 @@ async fn handle_mobile_rtc(
                 "mobile RTC endpoint signature is invalid or stale",
             )
         })?;
-    if let Some(authentication) = authentication {
-        gateway
-            .inner
-            .v2
-            .claim_endpoint_jti(authentication.jti(), authentication.expires_at())
-            .await?;
-    }
     let claims = gateway.inner.v2.signer()?.verify(&frame.lease_token, now)?;
     let mut apps = gateway.inner.v2.apps.lock().await;
     let app = current_mobile_app_mut(&mut apps, admission, connection_id)?;
@@ -3977,6 +4153,17 @@ async fn handle_mobile_rtc(
                 "mobile RTC signature does not match the admitted lease endpoints",
             ));
         }
+        // Only now, with the rate limit, grant, lease and endpoint binding
+        // all checked, does the proof take a place in the replay cache.
+        gateway
+            .inner
+            .v2
+            .claim_endpoint_jti(
+                &admission.app_id,
+                authentication.jti(),
+                authentication.expires_at(),
+            )
+            .await?;
     }
     advance_signal(
         &mut app
@@ -4080,13 +4267,6 @@ async fn handle_plugin_rtc(
                 "plugin RTC endpoint signature is invalid or stale",
             )
         })?;
-    if let Some(authentication) = authentication {
-        gateway
-            .inner
-            .v2
-            .claim_endpoint_jti(authentication.jti(), authentication.expires_at())
-            .await?;
-    }
     let mut apps = gateway.inner.v2.apps.lock().await;
     let app = current_plugin_mut(&mut apps, admission, connection_id)?;
     let plugin = app.plugin.as_mut().expect("checked plugin");
@@ -4125,6 +4305,15 @@ async fn handle_plugin_rtc(
                     "plugin RTC signature does not match the admitted lease endpoints",
                 ));
             }
+            gateway
+                .inner
+                .v2
+                .claim_endpoint_jti(
+                    &admission.app_id,
+                    authentication.jti(),
+                    authentication.expires_at(),
+                )
+                .await?;
         }
         advance_signal(
             &mut lease.plugin_signal,
@@ -4396,12 +4585,12 @@ fn projected_snapshot(app: &V2App, app_id: &str, peer: &V2Peer) -> Result<String
         remote_consent: snapshot.remote_consent.clone(),
         caller: peer
             .has(Grant::CallerRead)
-            .then(|| snapshot.caller.clone())
+            .then(|| snapshot.caller.as_ref().map(one_line_caller))
             .flatten(),
         captions: (peer.has(Grant::CaptionsRead)
             && remote_consent_is_current(snapshot)
             && snapshot.remote_consent.captions_enabled)
-            .then(|| snapshot.captions.clone()),
+            .then(|| one_line_captions(&snapshot.captions)),
         participants: projected_participants(snapshot, peer),
         audio_levels: projected_audio_levels(snapshot, peer),
         companion_microphone_muted: snapshot.companion_microphone_muted,
@@ -4438,6 +4627,38 @@ fn projected_snapshot(app: &V2App, app_id: &str, peer: &V2Peer) -> Result<String
         grants: peer.grants.clone(),
         snapshot: projected,
     })
+}
+
+/// Phones show captions and the caller as single lines and older phones
+/// refuse a whole snapshot over one control character, while older Desktops
+/// published multi-line turns. Fold each to one line within the wire byte
+/// limits; a caption with nothing left is dropped.
+fn one_line_captions(captions: &[Caption]) -> Vec<Caption> {
+    captions
+        .iter()
+        .filter_map(|caption| {
+            let speaker = sanitize_line(&caption.speaker, 40);
+            let text = sanitize_line(&caption.text, MAX_CAPTION_BYTES);
+            (!speaker.is_empty() && !text.is_empty()).then(|| Caption {
+                speaker,
+                text,
+                ..caption.clone()
+            })
+        })
+        .collect()
+}
+
+fn one_line_caller(caller: &CallerProjection) -> CallerProjection {
+    let line = |value: &Option<String>, maximum: usize| {
+        value
+            .as_deref()
+            .map(|value| sanitize_line(value, maximum))
+            .filter(|value| !value.is_empty())
+    };
+    CallerProjection {
+        label: line(&caller.label, 200),
+        masked_number: line(&caller.masked_number, 40),
+    }
 }
 
 fn broadcast_projected_snapshots(app: &mut V2App, app_id: &str) -> Result<(), GatewayError> {
@@ -4884,12 +5105,21 @@ fn prune_expired(app: &mut V2App, now: u64, app_id: &str) {
 }
 
 fn send_to_mobile(app: &V2App, device_id: &str, encoded: String) -> Result<(), GatewayError> {
-    app.mobiles
-        .get(device_id)
-        .ok_or_else(|| {
-            GatewayError::nonfatal("endpoint_unavailable", "mobile endpoint is unavailable")
-        })?
-        .send(encoded)
+    let peer = app.mobiles.get(device_id).ok_or_else(|| {
+        GatewayError::nonfatal("endpoint_unavailable", "mobile endpoint is unavailable")
+    })?;
+    if peer.send(encoded).is_err() {
+        // A phone whose queue is full (a stalled cellular link) is fenced
+        // here, as the broadcasts do. Its own socket task then unregisters
+        // it and revokes only its leases. Failing the sender instead closed
+        // the DESKTOP's socket whenever a Desktop frame was what overflowed
+        // one phone, and that revoked every phone's session.
+        eprintln!(
+            "[aokie-realtime][session] stage=mobile_fenced device={device_id} reason=outbound_queue_failed"
+        );
+        peer.fence();
+    }
+    Ok(())
 }
 
 fn send_mobile_error(
@@ -6019,7 +6249,18 @@ mod tests {
         assert_eq!(idle.app_id, "app_a");
         assert_eq!(idle.sequence, 1);
         assert!(idle.grants.contains(&Grant::StateRead));
-        assert_eq!(gateway.inner.v2.stats().await.mobiles, 1);
+        assert_eq!(
+            gateway
+                .inner
+                .v2
+                .apps
+                .lock()
+                .await
+                .values()
+                .map(|app| app.mobiles.len())
+                .sum::<usize>(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -6716,6 +6957,7 @@ mod tests {
         );
         gateway
             .claim_admission(
+                "app_a",
                 Some("admission_a"),
                 Some(unix_now().unwrap() + 30),
                 "conn_1",
@@ -6724,6 +6966,7 @@ mod tests {
             .unwrap();
         let replay = gateway
             .claim_admission(
+                "app_a",
                 Some("admission_a"),
                 Some(unix_now().unwrap() + 30),
                 "conn_2",
@@ -6736,6 +6979,7 @@ mod tests {
             .await;
         let disconnected_replay = gateway
             .claim_admission(
+                "app_a",
                 Some("admission_a"),
                 Some(unix_now().unwrap() + 30),
                 "conn_2",
@@ -6744,15 +6988,18 @@ mod tests {
             .unwrap_err();
         assert_eq!(disconnected_replay.code, "admission_replay");
 
-        gateway
+        *gateway
             .claimed_admissions
             .lock()
             .await
-            .get_mut("admission_a")
+            .by_app
+            .get_mut("app_a")
             .unwrap()
-            .exp = 0;
+            .get_mut("admission_a")
+            .unwrap() = 0;
         gateway
             .claim_admission(
+                "app_a",
                 Some("admission_a"),
                 Some(unix_now().unwrap() + 30),
                 "conn_3",
@@ -6770,11 +7017,11 @@ mod tests {
         );
         let expires_at = unix_now().unwrap() + 30;
         gateway
-            .claim_endpoint_jti("endpoint_jti_a", expires_at)
+            .claim_endpoint_jti("app_a", "endpoint_jti_a", expires_at)
             .await
             .unwrap();
         let replay = gateway
-            .claim_endpoint_jti("endpoint_jti_a", expires_at)
+            .claim_endpoint_jti("app_a", "endpoint_jti_a", expires_at)
             .await
             .unwrap_err();
         assert_eq!(replay.code, "endpoint_replay");
@@ -7125,6 +7372,322 @@ mod tests {
         let value: Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(value["snapshot"]["caller"]["maskedNumber"], "***123");
         assert_eq!(value["snapshot"]["captions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn projection_folds_an_older_desktops_multi_line_captions_to_one_line() {
+        let (mut app, _, _) = app_with_peers();
+        let snapshot = app.snapshot.as_mut().unwrap();
+        snapshot.caller.as_mut().unwrap().label = Some("Dr.\nSmith".into());
+        snapshot.captions = vec![
+            Caption {
+                caption_id: "caption_multi".into(),
+                speaker: "caller".into(),
+                text: "first line\r\nsecond\tline".into(),
+                occurred_at: "2026-07-16T00:00:00Z".into(),
+                final_text: true,
+            },
+            Caption {
+                caption_id: "caption_blank".into(),
+                speaker: "caller".into(),
+                text: "\n\n".into(),
+                occurred_at: "2026-07-16T00:00:00Z".into(),
+                final_text: true,
+            },
+            Caption {
+                caption_id: "caption_cjk".into(),
+                speaker: "aokie".into(),
+                text: "語".repeat(MAX_CAPTION_BYTES),
+                occurred_at: "2026-07-16T00:00:00Z".into(),
+                final_text: true,
+            },
+        ];
+        let viewer = app.mobiles.remove("device_a").unwrap();
+        let encoded = projected_snapshot(&app, "app_a", &viewer).unwrap();
+        let value: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["snapshot"]["caller"]["label"], "Dr. Smith");
+        let captions = value["snapshot"]["captions"].as_array().unwrap();
+        assert_eq!(captions.len(), 2, "a caption with no text left is dropped");
+        assert_eq!(captions[0]["text"], "first line second line");
+        let cjk = captions[1]["text"].as_str().unwrap();
+        assert!(cjk.len() <= MAX_CAPTION_BYTES);
+        assert!(!cjk.is_empty());
+    }
+
+    fn mobile_challenge(expires_at: u64) -> EndpointChallengeFrame {
+        EndpointChallengeFrame {
+            kind: "endpoint_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            subject_id: "device_a".into(),
+            role: TokenRole::Mobile,
+            connection_id: "mobile_conn".into(),
+            challenge_nonce: "challenge_mobile".into(),
+            admission_jti: "admission_mobile".into(),
+            holder_key_thumbprint: mobile_key().thumbprint,
+            expected_peer_key_thumbprint: Some(plugin_key().thumbprint),
+            approved_peer_key_thumbprints: vec![],
+            peer_roster_revision: None,
+            peer_roster_hash: None,
+            expires_at,
+        }
+    }
+
+    fn hello_claims_for(challenge: &EndpointChallengeFrame, local_now: u64) -> HelloProofClaims {
+        let (issued_at, expires_at) = challenge.hello_proof_window(local_now);
+        HelloProofClaims {
+            app_id: challenge.app_id.clone(),
+            subject_id: challenge.subject_id.clone(),
+            role: challenge.role,
+            connection_id: challenge.connection_id.clone(),
+            challenge_nonce: challenge.challenge_nonce.clone(),
+            admission_jti: challenge.admission_jti.clone(),
+            session_nonce: "mobile_nonce".into(),
+            holder_key_thumbprint: challenge.holder_key_thumbprint.clone(),
+            expected_peer_key_thumbprint: challenge.expected_peer_key_thumbprint.clone(),
+            approved_peer_key_thumbprints: challenge.approved_peer_key_thumbprints.clone(),
+            peer_roster_revision: challenge.peer_roster_revision,
+            peer_roster_hash: challenge.peer_roster_hash.clone(),
+            nonce: "hello_nonce".into(),
+            jti: "hello_jti".into(),
+            issued_at,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn a_peer_whose_clock_trails_or_leads_the_gateway_still_completes_hello() {
+        let now = unix_now().unwrap();
+        // The challenge never outlives its admission.
+        assert_eq!(challenge_expiry(Some(now + 10), now), now + 10);
+        let challenge = mobile_challenge(challenge_expiry(None, now));
+        assert_eq!(challenge.expires_at, now + ENDPOINT_CHALLENGE_LIFETIME);
+        challenge.validate(now).unwrap();
+        // One second behind used to read a now+30 challenge as dated in the
+        // future; a few seconds ahead used to date the proof in the future.
+        for local_now in [now - 1, now - 5, now + 1, now + 8, now + 20] {
+            challenge.validate(local_now).unwrap_or_else(|_| {
+                panic!(
+                    "challenge refused at offset {}",
+                    local_now as i64 - now as i64
+                )
+            });
+            let claims = hello_claims_for(&challenge, local_now);
+            claims.validate(now).unwrap_or_else(|_| {
+                panic!("proof refused at offset {}", local_now as i64 - now as i64)
+            });
+            assert!(hello_claims_match_challenge(&claims, &challenge));
+        }
+        // A proof that outlives its challenge is still a substitution.
+        let mut stretched = hello_claims_for(&challenge, now);
+        stretched.expires_at = challenge.expires_at + 1;
+        assert!(!hello_claims_match_challenge(&stretched, &challenge));
+    }
+
+    #[tokio::test]
+    async fn a_frame_kind_from_a_newer_peer_is_refused_without_closing_either_socket() {
+        let gateway = gateway();
+        let (app, _plugin_rx, _mobile_rx) = app_with_peers();
+        gateway
+            .inner
+            .v2
+            .apps
+            .lock()
+            .await
+            .insert("app_a".into(), app);
+        let newer = r#"{"kind":"call_notes","schemaVersion":2,"appId":"app_a"}"#;
+
+        let error = handle_mobile(&gateway, &admission("device_a"), "mobile_conn", newer)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "unsupported_kind");
+        assert!(!error.fatal);
+        let error = handle_plugin(&gateway, &plugin_admission(), "plugin_conn", newer)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "unsupported_kind");
+        assert!(!error.fatal);
+
+        // A known kind that fails validation stays fail-closed, and so does a
+        // frame from the opposite direction.
+        let malformed = r#"{"kind":"lease_request","schemaVersion":2}"#;
+        let error = handle_mobile(&gateway, &admission("device_a"), "mobile_conn", malformed)
+            .await
+            .unwrap_err();
+        assert!(error.fatal);
+        let opposite = r#"{"kind":"plugin_idle","schemaVersion":2,"appId":"app_a","eventId":"e"}"#;
+        let error = handle_mobile(&gateway, &admission("device_a"), "mobile_conn", opposite)
+            .await
+            .unwrap_err();
+        assert!(error.fatal);
+
+        // Unknown frames still count against the sender's rate limit.
+        let mut refused_for_rate = false;
+        for _ in 0..=GENERAL_RATE_LIMIT {
+            let error = handle_mobile(&gateway, &admission("device_a"), "mobile_conn", newer)
+                .await
+                .unwrap_err();
+            if error.code == "rate_limited" {
+                refused_for_rate = true;
+                break;
+            }
+        }
+        assert!(refused_for_rate);
+    }
+
+    #[test]
+    fn the_replay_cache_gives_each_app_its_own_share_and_never_forgets_early() {
+        let mut cache = ReplayCache::default();
+        let now = 1_000;
+        assert_eq!(
+            cache.claim("app_a", "jti_1", now + 30, now, 2, 4),
+            ReplayClaim::Fresh
+        );
+        assert_eq!(
+            cache.claim("app_a", "jti_1", now + 30, now, 2, 4),
+            ReplayClaim::Replay
+        );
+        assert_eq!(
+            cache.claim("app_a", "jti_2", now + 30, now, 2, 4),
+            ReplayClaim::Fresh
+        );
+        // app_a has used its share: only app_a is refused, and its ids are
+        // still remembered.
+        assert_eq!(
+            cache.claim("app_a", "jti_3", now + 30, now, 2, 4),
+            ReplayClaim::AppFull
+        );
+        assert_eq!(
+            cache.claim("app_a", "jti_1", now + 30, now, 2, 4),
+            ReplayClaim::Replay
+        );
+        assert_eq!(
+            cache.claim("app_b", "jti_1", now + 30, now, 2, 4),
+            ReplayClaim::Fresh
+        );
+        assert_eq!(
+            cache.claim("app_c", "jti_1", now + 30, now, 2, 4),
+            ReplayClaim::Fresh
+        );
+        // The relay-wide ceiling still holds.
+        assert_eq!(
+            cache.claim("app_d", "jti_1", now + 30, now, 2, 4),
+            ReplayClaim::Full
+        );
+        // Once ids expire they free their space, for their app and overall.
+        let later = now + 31;
+        assert_eq!(
+            cache.claim("app_a", "jti_3", later + 30, later, 2, 4),
+            ReplayClaim::Fresh
+        );
+        assert_eq!(
+            cache.claim("app_d", "jti_1", later + 30, later, 2, 4),
+            ReplayClaim::Fresh
+        );
+        assert_eq!(
+            cache.total,
+            cache.by_app.values().map(HashMap::len).sum::<usize>()
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_apps_are_evicted_when_the_relay_is_full_and_busy_ones_are_kept() {
+        let gateway = gateway();
+        {
+            let mut apps = gateway.inner.v2.apps.lock().await;
+            for index in 0..MAX_APPS {
+                apps.insert(format!("idle_{index}"), V2App::default());
+            }
+            // One app still in its reconnect grace and one with a phone stay.
+            let mut in_grace = V2App::default();
+            in_grace.plugin_disconnected_at = Some(Instant::now());
+            apps.insert("idle_0".into(), in_grace);
+            let (with_phone, _, _) = app_with_peers();
+            let mut with_phone = with_phone;
+            with_phone.plugin = None;
+            apps.insert("idle_1".into(), with_phone);
+        }
+        let (hello, challenge, tx, fenced, _rx) = plugin_registration(
+            "plugin_conn_new",
+            "plugin_nonce_new",
+            vec![mobile_key().thumbprint],
+        );
+        register_plugin(
+            &gateway,
+            &plugin_admission(),
+            "plugin_conn_new",
+            hello,
+            &challenge,
+            tx,
+            fenced,
+        )
+        .await
+        .unwrap();
+        let apps = gateway.inner.v2.apps.lock().await;
+        assert!(apps.contains_key("app_a"));
+        assert!(apps.contains_key("idle_0"));
+        assert!(apps.contains_key("idle_1"));
+        assert_eq!(apps.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_phone_is_fenced_and_never_disconnects_the_desktop() {
+        let (gateway, token, mut plugin_rx, mut mobile_rx) = active_end_caller_gateway().await;
+        handle_end_caller_challenge_request(
+            &gateway,
+            &admission("device_a"),
+            "mobile_conn",
+            end_challenge_request(&token, "stalled"),
+        )
+        .await
+        .unwrap();
+        let challenge: EndCallerChallengeFrame =
+            serde_json::from_value(text_json(&mut mobile_rx).await).unwrap();
+        handle_end_caller_confirm(
+            &gateway,
+            &admission("device_a"),
+            "mobile_conn",
+            end_confirm(&token, &challenge, "stalled"),
+        )
+        .await
+        .unwrap();
+        let _ = text_json(&mut mobile_rx).await;
+        let execute: PluginEndCallerExecuteFrame =
+            serde_json::from_value(text_json(&mut plugin_rx).await).unwrap();
+        // The phone stops reading: its outbound queue fills up.
+        {
+            let apps = gateway.inner.v2.apps.lock().await;
+            let phone = &apps["app_a"].mobiles["device_a"];
+            while phone.tx.try_send(Message::Ping(vec![])).is_ok() {}
+        }
+        let result = PluginEndCallerResultFrame {
+            kind: "end_caller_result".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: execute.app_id.clone(),
+            operation_id: execute.operation_id.clone(),
+            confirmation_id: execute.confirmation_id.clone(),
+            device_id: execute.device_id.clone(),
+            call_id: execute.call_id.clone(),
+            call_epoch: execute.call_epoch,
+            owner_epoch: execute.owner_epoch,
+            switchboard_revision: execute.switchboard_revision,
+            remote_revision: execute.remote_revision,
+            lease_id: execute.lease_id.clone(),
+            fence: execute.fence,
+            outcome: EndCallerOutcome::Completed,
+            code: None,
+            message: None,
+        };
+        // The Desktop's frame is what overflowed the phone; the Desktop's
+        // handler must still succeed, or its socket (and every phone's
+        // session) would be closed.
+        handle_end_caller_result(&gateway, &plugin_admission(), "plugin_conn", result)
+            .await
+            .unwrap();
+        assert_eq!(text_json(&mut plugin_rx).await["kind"], "lease_revoked");
+        let apps = gateway.inner.v2.apps.lock().await;
+        assert!(*apps["app_a"].mobiles["device_a"].fenced.borrow());
+        assert!(apps["app_a"].plugin.is_some());
     }
 
     #[test]

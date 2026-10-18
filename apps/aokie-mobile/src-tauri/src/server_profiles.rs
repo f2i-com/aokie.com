@@ -401,11 +401,35 @@ pub async fn native_forget_server_profile(
 ) -> Result<ForgetServerProfileResponse, String> {
     validate_id(&request.profile_id, "profileId")?;
     let profile_id = request.profile_id;
+    let profile = load_profile(&app, &profile_id).await.ok().flatten();
     let cleanup = managed_forget_profile(&app, managed_auth.inner(), Some(&profile_id))
         .await
         .ok();
     // Local deletion is fail-safe and does not depend on remote availability.
     delete_profile(&app, &profile_id).await?;
+    // Trust and credentials bound to the profile go with it. A re-enrolment
+    // of the same server mints a new device id, and the old Desktop pin used
+    // to refuse it as "another profile binding"; an orphaned refresh token
+    // would sit in secure storage forever.
+    if let Err(message) = crate::peer_trust::forget_peer_pin(&app, &profile_id).await {
+        eprintln!("[AokieCompanion][profiles] Desktop pin was not removed: {message}");
+    }
+    if let Err(message) = crate::desktop_pairing::forget_confirmed_pairing(&app, &profile_id).await
+    {
+        eprintln!("[AokieCompanion][profiles] Desktop pairing was not removed: {message}");
+    }
+    if let Some(profile) = profile {
+        if let Err(message) = crate::managed_auth::forget_profile_refresh(
+            &app,
+            &profile.deployment_id,
+            &profile.origin,
+            &profile.device_id,
+        )
+        .await
+        {
+            eprintln!("[AokieCompanion][profiles] refresh credential was not removed: {message}");
+        }
+    }
     Ok(ForgetServerProfileResponse {
         profile_id,
         forgotten: true,

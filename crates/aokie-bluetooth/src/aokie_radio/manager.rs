@@ -477,7 +477,13 @@ pub fn listen_runtime_controller_with_options(
                 {
                     if *status == 0 {
                         active_sco_handle = Some(*connection_handle);
-                        transport.configure_sco_alt_setting(AOKIE_VOICE_SETTING, 1)?;
+                        // A dongle with nothing to carry the voice now says
+                        // so (an Err): the diagnostic run goes on silent, as
+                        // it did when that was an Ok.
+                        if let Err(e) = transport.configure_sco_alt_setting(AOKIE_VOICE_SETTING, 1)
+                        {
+                            eprintln!("[AokieRadio] diagnostic SCO alt-setting configure failed: {e}");
+                        }
                     }
                 }
                 if let hci::HciEvent::DisconnectionComplete {
@@ -854,6 +860,13 @@ pub enum PairingOutcome {
     /// (accept) or `user_confirmation_request_negative_reply_command`
     /// (reject / timeout) — never silently.
     ConfirmationPending { address: String, numeric_value: u32 },
+    /// The phone's stored link key could not be opened (the sealing key is
+    /// unavailable, or the record is damaged): NO reply has been sent. The
+    /// caller ends the link at once so the phone does not wait out the LMP
+    /// timeout (review 2 #27). A negative reply is deliberately not sent: it
+    /// tells the phone the bond is gone, and a phone told that may forget
+    /// Aokie over a key that opens again a minute later.
+    LinkKeyUnavailable { address: String, reason: String },
 }
 
 fn handle_pairing_event(
@@ -866,7 +879,16 @@ fn handle_pairing_event(
     let logged = |s: String| Ok(Some(PairingOutcome::Logged(s)));
     match event {
         hci::HciEvent::LinkKeyRequest { address } => {
-            if let Some(record) = pairing_store.get(address)? {
+            let record = match pairing_store.get(address) {
+                Ok(record) => record,
+                Err(reason) => {
+                    return Ok(Some(PairingOutcome::LinkKeyUnavailable {
+                        address: address.clone(),
+                        reason,
+                    }))
+                }
+            };
+            if let Some(record) = record {
                 let command = hci::link_key_request_reply_command(address, &record.link_key)?;
                 command_status(
                     transport,
@@ -1040,6 +1062,9 @@ pub(crate) fn handle_diagnostic_hci_event(
         PairingOutcome::ConfirmationPending { address, .. } => {
             format!("pairing confirmation pending for {}", address)
         }
+        PairingOutcome::LinkKeyUnavailable { address, reason } => {
+            format!("link key for {} could not be opened: {}", address, reason)
+        }
     }))
 }
 
@@ -1123,6 +1148,22 @@ fn hfp_event_record(event: hfp::HfpEvent) -> HfpEventRecord {
         hfp::HfpEvent::ServiceLevelConnectionFailed(reason) => HfpEventRecord {
             name: "ServiceLevelConnectionFailed".to_string(),
             summary: format!("HFP SLC failed at {}", reason),
+        },
+        hfp::HfpEvent::CommandRejected { command, timed_out } => HfpEventRecord {
+            name: "CommandRejected".to_string(),
+            summary: if timed_out {
+                format!("{command} never answered")
+            } else {
+                format!("{command} refused")
+            },
+        },
+        hfp::HfpEvent::CallStateCheck => HfpEventRecord {
+            name: "CallStateCheck".to_string(),
+            summary: "second call setup during a call: reading the indicators".to_string(),
+        },
+        hfp::HfpEvent::CallActiveAtConnect => HfpEventRecord {
+            name: "CallActiveAtConnect".to_string(),
+            summary: "a call was already up when the connection came".to_string(),
         },
         hfp::HfpEvent::IncomingCall => HfpEventRecord {
             name: "IncomingCall".to_string(),
@@ -1264,6 +1305,19 @@ pub(crate) fn hfp_call_control_packets_for_event(
                 l2cap_state.build_hfp_call_control_packets(hfp::HfpAtCommand::ListCurrentCalls)?;
             if !packets.is_empty() {
                 report.last_action = Some("sent AT+CLCC caller-id query".to_string());
+            }
+            Ok(packets)
+        }
+        hfp::HfpEvent::CallStateCheck => {
+            // Review 1 #1: a second call setup during a call. The phone's
+            // AT+CIND? answer says whether the first call is still up (a
+            // caller waiting) or its call,0 was lost (a fresh ring) — the
+            // state machine resolves either from the snapshot.
+            let packets = l2cap_state
+                .build_hfp_call_control_packets(hfp::HfpAtCommand::RetrieveIndicatorStatus)?;
+            if !packets.is_empty() {
+                report.last_action =
+                    Some("sent AT+CIND? to settle a second call setup".to_string());
             }
             Ok(packets)
         }

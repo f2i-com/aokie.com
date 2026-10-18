@@ -104,7 +104,7 @@ impl StreamingTtsController {
 
     /// Stop playback immediately (for barge-in)
     pub fn stop_immediately(&self) {
-        println!("[StreamingTTS] STOP - Barge-in detected");
+        eprintln!("[StreamingTTS] STOP - Barge-in detected");
         self.is_cancelled.store(true, Ordering::SeqCst);
         self.is_playing.store(false, Ordering::SeqCst);
         let _ = self.chunk_tx.send(TtsControl::Stop);
@@ -113,7 +113,7 @@ impl StreamingTtsController {
     /// Queue a TTS chunk for playback
     pub fn send_chunk(&self, chunk: TtsChunk) {
         if self.is_cancelled() {
-            println!("[StreamingTTS] Ignoring chunk - cancelled");
+            eprintln!("[StreamingTTS] Ignoring chunk - cancelled");
             return;
         }
 

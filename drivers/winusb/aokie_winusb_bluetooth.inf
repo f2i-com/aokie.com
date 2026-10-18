@@ -6,7 +6,7 @@ Signature="$Windows NT$"
 Class=USBDevice
 ClassGuid={88BAE032-5A81-49f0-BC3D-A4FF138216D6}
 Provider=%ProviderName%
-DriverVer=07/15/2026,2.2.0.20260715
+DriverVer=10/18/2026,2.26.1018.0
 CatalogFile=aokie_winusb_bluetooth.cat
 
 [ClassInstall32]
@@ -23,21 +23,18 @@ HKR,,Icon,,-20
 %BCM21E8%=WinUSB_Install,USB\VID_0A5C&PID_21E8
 %BCM21EC%=WinUSB_Install,USB\VID_0A5C&PID_21EC
 %RTL8771%=WinUSB_Install,USB\VID_0BDA&PID_8771
-%RTLC822%=WinUSB_Install,USB\VID_0BDA&PID_C822
 %CSR0001%=WinUSB_Install,USB\VID_0A12&PID_0001
 
 [AokieDevices.NTamd64]
 %BCM21E8%=WinUSB_Install,USB\VID_0A5C&PID_21E8
 %BCM21EC%=WinUSB_Install,USB\VID_0A5C&PID_21EC
 %RTL8771%=WinUSB_Install,USB\VID_0BDA&PID_8771
-%RTLC822%=WinUSB_Install,USB\VID_0BDA&PID_C822
 %CSR0001%=WinUSB_Install,USB\VID_0A12&PID_0001
 
 [AokieDevices.NTarm64]
 %BCM21E8%=WinUSB_Install,USB\VID_0A5C&PID_21E8
 %BCM21EC%=WinUSB_Install,USB\VID_0A5C&PID_21EC
 %RTL8771%=WinUSB_Install,USB\VID_0BDA&PID_8771
-%RTLC822%=WinUSB_Install,USB\VID_0BDA&PID_C822
 %CSR0001%=WinUSB_Install,USB\VID_0A12&PID_0001
 
 [WinUSB_Install]
@@ -71,5 +68,4 @@ ProviderName="Aokie"
 BCM21E8="Aokie Broadcom BCM20702 Bluetooth Dongle"
 BCM21EC="Aokie Broadcom BCM20702 Bluetooth Dongle"
 RTL8771="Aokie Realtek RTL8761 Bluetooth Dongle"
-RTLC822="Aokie Realtek RTL8821CE Bluetooth Adapter"
 CSR0001="Aokie CSR8510 Bluetooth Dongle"

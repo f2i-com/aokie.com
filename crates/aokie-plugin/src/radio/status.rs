@@ -210,6 +210,12 @@ pub struct RadioStatus {
     /// entries (accepted under their minted id, or promoted under a fresh
     /// id with the same number) are dropped silently.
     pub gave_up_knock: Mutex<Vec<(SwitchboardLeg, std::time::Instant, u64)>>,
+    /// The call the phone link took down with it (review 1 #4): whether the
+    /// receptionist ran it, and when. A reconnect that finds a call still up
+    /// on the phone (`CallActiveAtConnect`) gives it back to the receptionist
+    /// only when it was hers and recent; any other call found up is the
+    /// owner's, observed and never greeted into.
+    pub lost_with_link: Mutex<Option<(bool, std::time::Instant)>>,
 }
 
 /// One non-foreground switchboard leg (waiting or parked) — see

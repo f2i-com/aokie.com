@@ -29,8 +29,21 @@ pub const MAX_ASSISTANCE_CONTEXT_BYTES: usize = 2_000;
 pub const MAX_ASSISTANCE_ANSWER_BYTES: usize = 2_000;
 pub const ENDPOINT_PROOF_MAX_LIFETIME: u64 = 30;
 pub const ENDPOINT_PROOF_CLOCK_SKEW: u64 = 5;
+/// How long a gateway's endpoint challenge lives. It is deliberately shorter
+/// than [`ENDPOINT_PROOF_MAX_LIFETIME`]: a challenge minted at exactly the
+/// maximum read as "too far ahead" to any peer whose clock trailed the
+/// gateway's by even a fraction of a second.
+pub const ENDPOINT_CHALLENGE_LIFETIME: u64 = 25;
 pub const MOBILE_OFFER_MAX_LIFETIME: u64 = 30;
 pub const MAX_PENDING_MOBILE_OFFERS: usize = 8;
+
+/// A fresh identifier for any jti, nonce, signal or request id an endpoint
+/// mints: `prefix` followed by 122 random bits. Gateways keep one replay
+/// cache across every app, and endpoints remember request ids across a
+/// relaunch, so ids must never come from a counter that restarts.
+pub fn unique_id(prefix: &str) -> String {
+    format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+}
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -68,6 +81,54 @@ pub enum Grant {
     ParticipantsRead,
     ParticipantIdentityRead,
     AudioLevelsRead,
+}
+
+impl Grant {
+    /// Every grant, in declaration order. Drift tests compare this list with
+    /// the self-host credential minter and the phone's TypeScript copy.
+    pub const ALL: [Grant; 14] = [
+        Grant::StateRead,
+        Grant::CallerRead,
+        Grant::CaptionsRead,
+        Grant::AssistanceRead,
+        Grant::AssistanceRespond,
+        Grant::Monitor,
+        Grant::Consult,
+        Grant::Takeover,
+        Grant::EndCaller,
+        Grant::ResumeAokie,
+        Grant::RtcSignal,
+        Grant::ParticipantsRead,
+        Grant::ParticipantIdentityRead,
+        Grant::AudioLevelsRead,
+    ];
+
+    /// The grant's wire name, as it appears in admission claims.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Grant::StateRead => "state_read",
+            Grant::CallerRead => "caller_read",
+            Grant::CaptionsRead => "captions_read",
+            Grant::AssistanceRead => "assistance_read",
+            Grant::AssistanceRespond => "assistance_respond",
+            Grant::Monitor => "monitor",
+            Grant::Consult => "consult",
+            Grant::Takeover => "takeover",
+            Grant::EndCaller => "end_caller",
+            Grant::ResumeAokie => "resume_aokie",
+            Grant::RtcSignal => "rtc_signal",
+            Grant::ParticipantsRead => "participants_read",
+            Grant::ParticipantIdentityRead => "participant_identity_read",
+            Grant::AudioLevelsRead => "audio_levels_read",
+        }
+    }
+
+    /// The grant a wire name names, or `None` for a name this build does not
+    /// know. A reader that must stay compatible with newer issuers drops the
+    /// unknown names instead of refusing the whole grant list.
+    pub fn from_wire(name: &str) -> Option<Grant> {
+        Grant::ALL.into_iter().find(|grant| grant.as_str() == name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -205,12 +266,35 @@ impl EndpointChallengeFrame {
             self.peer_roster_hash.as_deref(),
         )?;
         safe_integer("expiresAt", self.expires_at, 1)?;
-        if self.expires_at <= now_unix
-            || self.expires_at.saturating_sub(now_unix) > ENDPOINT_PROOF_MAX_LIFETIME
+        // The expiry comes from the gateway's clock and `now_unix` from this
+        // peer's: allow the protocol's clock skew on both sides.
+        if self.expires_at.saturating_add(ENDPOINT_PROOF_CLOCK_SKEW) <= now_unix
+            || self.expires_at.saturating_sub(now_unix)
+                > ENDPOINT_PROOF_MAX_LIFETIME + ENDPOINT_PROOF_CLOCK_SKEW
         {
             return Err(V2ProtocolError::Expired);
         }
         Ok(())
+    }
+
+    /// The `(issuedAt, expiresAt)` pair a peer signs into its hello proof for
+    /// this challenge, given its own clock.
+    ///
+    /// A peer whose clock runs ahead would otherwise date its proof in the
+    /// gateway's future (refused beyond [`ENDPOINT_PROOF_CLOCK_SKEW`]), so the
+    /// issue time never passes the gateway's own minting time as read from
+    /// the challenge. The expiry never passes the challenge's, and the pair
+    /// never spans more than [`ENDPOINT_PROOF_MAX_LIFETIME`].
+    pub fn hello_proof_window(&self, local_now: u64) -> (u64, u64) {
+        let gateway_minted_at = self
+            .expires_at
+            .saturating_sub(ENDPOINT_CHALLENGE_LIFETIME)
+            .max(1);
+        let issued_at = local_now.min(gateway_minted_at).max(1);
+        let expires_at = self
+            .expires_at
+            .min(issued_at.saturating_add(ENDPOINT_PROOF_MAX_LIFETIME));
+        (issued_at, expires_at)
     }
 }
 
@@ -2755,6 +2839,69 @@ pub fn parse_plugin_frame(encoded: &str) -> Result<PluginInbound, V2ProtocolErro
     }
 }
 
+/// Every frame kind protocol v2 defines, in any direction and on either
+/// carrier (the gateway socket or the hosted relay).
+pub const FRAME_KINDS: &[&str] = &[
+    // Endpoint to gateway.
+    "mobile_hello",
+    "mobile_offer_answer",
+    "lease_request",
+    "lease_heartbeat",
+    "lease_revoke",
+    "rtc_signal",
+    "assistance_answer",
+    "microphone_mute",
+    "end_caller_challenge_request",
+    "end_caller_confirm",
+    "plugin_hello",
+    "plugin_idle",
+    "plugin_snapshot",
+    "claim_decision",
+    "plugin_lease_revoke",
+    "assistance_request",
+    "plugin_microphone_mute",
+    "microphone_mute_status",
+    "end_caller_result",
+    // Gateway to endpoint.
+    "endpoint_challenge",
+    "idle_sync",
+    "snapshot",
+    "assistance_answer_accepted",
+    "end_caller_challenge",
+    "end_caller_submitted",
+    "end_caller_execute",
+    "mobile_offer_accepted",
+    "claim_proposal",
+    "lease_granted",
+    "claim_provisional",
+    "claim_active",
+    "lease_renewed",
+    "lease_revoked",
+    "claim_rejected",
+    "error",
+    // Hosted-relay twins the Desktop authors itself.
+    "plugin_claim_rejected",
+    "plugin_lease_status",
+    "plugin_offer_accepted",
+];
+
+/// The kind of a frame from a newer build: `encoded` is a JSON object whose
+/// `kind` is a well-formed identifier this build does not define.
+///
+/// Receivers ignore such a frame (logging the returned kind) instead of
+/// ending the session, so a Desktop, gateway or phone that adds a frame kind
+/// never strands peers that have not updated yet. Ignoring grants nothing.
+/// Frames of a known kind stay strict, and a malformed frame is not
+/// "unknown": both keep failing closed.
+pub fn unknown_frame_kind(encoded: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(encoded).ok()?;
+    let kind = kind(&value).ok()?;
+    if safe_id("kind", kind).is_err() || FRAME_KINDS.contains(&kind) {
+        return None;
+    }
+    Some(kind.to_owned())
+}
+
 fn parse<T, F>(value: Value, validate: F) -> Result<T, V2ProtocolError>
 where
     T: for<'de> Deserialize<'de>,
@@ -3187,6 +3334,129 @@ mod tests {
             parse_mobile_frame(&extra.to_string()).unwrap_err(),
             V2ProtocolError::Malformed
         );
+    }
+
+    #[test]
+    fn only_a_well_formed_frame_of_an_undefined_kind_reads_as_from_a_newer_peer() {
+        // A newer build's kind is reported so the receiver can ignore it.
+        assert_eq!(
+            unknown_frame_kind(r#"{"kind":"call_notes","schemaVersion":2}"#).as_deref(),
+            Some("call_notes")
+        );
+        // Every kind this build defines, in any direction, stays strict.
+        for kind in FRAME_KINDS {
+            assert_eq!(
+                unknown_frame_kind(&json!({ "kind": kind }).to_string()),
+                None,
+                "{kind}"
+            );
+        }
+        // So do the opposite direction's frames, malformed JSON, a missing or
+        // non-string kind, and a kind that is not an identifier.
+        assert_eq!(unknown_frame_kind(&mobile_hello().to_string()), None);
+        assert_eq!(unknown_frame_kind("{not json"), None);
+        assert_eq!(unknown_frame_kind(r#"{"schemaVersion":2}"#), None);
+        assert_eq!(unknown_frame_kind(r#"{"kind":7}"#), None);
+        assert_eq!(unknown_frame_kind(r#"{"kind":"has space"}"#), None);
+        assert_eq!(unknown_frame_kind(r#"["kind"]"#), None);
+        // The list itself has no duplicates.
+        let unique: HashSet<_> = FRAME_KINDS.iter().collect();
+        assert_eq!(unique.len(), FRAME_KINDS.len());
+    }
+
+    #[test]
+    fn grant_wire_names_match_serde_and_unknown_names_are_dropped_not_fatal() {
+        for grant in Grant::ALL {
+            assert_eq!(serde_json::to_value(grant).unwrap(), json!(grant.as_str()));
+            assert_eq!(Grant::from_wire(grant.as_str()), Some(grant));
+        }
+        let unique: HashSet<_> = Grant::ALL.iter().collect();
+        assert_eq!(unique.len(), Grant::ALL.len());
+        assert_eq!(Grant::from_wire("notes_read"), None);
+        // The declaration order is what `as u8` sorting relies on.
+        for (index, grant) in Grant::ALL.iter().enumerate() {
+            assert_eq!(*grant as usize, index);
+        }
+    }
+
+    #[test]
+    fn minted_ids_never_repeat_and_are_safe_ids() {
+        let ids: HashSet<String> = (0..10_000).map(|_| unique_id("hello_proof")).collect();
+        assert_eq!(ids.len(), 10_000);
+        for id in ids.iter().take(10) {
+            assert!(id.starts_with("hello_proof_"));
+            safe_id("jti", id).unwrap();
+        }
+    }
+
+    fn challenge_expiring_at(expires_at: u64) -> EndpointChallengeFrame {
+        let holder = test_endpoint_key(7).thumbprint;
+        EndpointChallengeFrame {
+            kind: "endpoint_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            subject_id: "device_a".into(),
+            role: AdmissionRole::Mobile,
+            connection_id: "connection_a".into(),
+            challenge_nonce: "challenge_a".into(),
+            admission_jti: "admission_a".into(),
+            holder_key_thumbprint: holder,
+            expected_peer_key_thumbprint: Some("peer_thumbprint_a".into()),
+            approved_peer_key_thumbprints: vec![],
+            peer_roster_revision: None,
+            peer_roster_hash: None,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn a_challenge_survives_clock_skew_in_either_direction() {
+        let minted_at = 1_000_000;
+        // What a current gateway mints, and what an older one minted.
+        for lifetime in [ENDPOINT_CHALLENGE_LIFETIME, ENDPOINT_PROOF_MAX_LIFETIME] {
+            let challenge = challenge_expiring_at(minted_at + lifetime);
+            // A peer that trails the gateway by up to the skew still accepts
+            // it; one second behind used to be refused outright.
+            for behind in 0..=ENDPOINT_PROOF_CLOCK_SKEW {
+                challenge.validate(minted_at - behind).unwrap();
+            }
+            // And one that runs ahead, until the challenge is really stale.
+            for ahead in [1, 10, lifetime] {
+                challenge.validate(minted_at + ahead).unwrap();
+            }
+            assert_eq!(
+                challenge.validate(minted_at + lifetime + ENDPOINT_PROOF_CLOCK_SKEW),
+                Err(V2ProtocolError::Expired)
+            );
+        }
+        // A challenge that claims to live much longer than any gateway mints
+        // is still refused.
+        let too_long =
+            challenge_expiring_at(minted_at + ENDPOINT_PROOF_MAX_LIFETIME + ENDPOINT_PROOF_CLOCK_SKEW + 1);
+        assert_eq!(too_long.validate(minted_at), Err(V2ProtocolError::Expired));
+    }
+
+    #[test]
+    fn the_hello_proof_window_is_accepted_by_the_gateway_whichever_clock_leads() {
+        let minted_at = 1_000_000;
+        for lifetime in [ENDPOINT_CHALLENGE_LIFETIME, ENDPOINT_PROOF_MAX_LIFETIME] {
+            let challenge = challenge_expiring_at(minted_at + lifetime);
+            // The gateway checks the proof a moment after minting, with its
+            // own clock; the peer signs with its clock, `offset` seconds off.
+            let gateway_now = minted_at + 1;
+            for offset in -5_i64..=25 {
+                let local_now = (minted_at as i64 + offset) as u64;
+                if challenge.validate(local_now).is_err() {
+                    continue;
+                }
+                let (issued_at, expires_at) = challenge.hello_proof_window(local_now);
+                assert!(expires_at <= challenge.expires_at, "offset {offset}");
+                validate_signature_window(issued_at, expires_at, gateway_now)
+                    .unwrap_or_else(|_| panic!("offset {offset}, lifetime {lifetime}"));
+                // The peer's own shape check at the issue time also passes.
+                validate_signature_window(issued_at, expires_at, issued_at).unwrap();
+            }
+        }
     }
 
     #[test]

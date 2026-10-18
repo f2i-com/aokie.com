@@ -1130,7 +1130,15 @@ async fn watch_peer(state: NativeMediaState, app: AppHandle, active: ActiveMedia
                     .evidence
                     .connected
                     .store(connected, Ordering::Release);
-                if !connected {
+                // "disconnected" is ICE's transient state: the DTLS session
+                // and the authority data channel survive it, and the channel
+                // never re-opens (so never re-sends its readiness) when ICE
+                // recovers. Disarming here left Talk's microphone off for the
+                // rest of the takeover with no way to re-arm it. Nothing is
+                // sent while ICE is down; the microphone resumes with it.
+                // Failed and closed still disarm and close below.
+                let transient = connection == "disconnected" && !consult_route_lost;
+                if !connected && !transient {
                     active
                         .evidence
                         .microphone_authority_ready
@@ -1775,7 +1783,7 @@ async fn android_permission_call(
                 let result = env
                     .call_method(activity, method, "(I)I", &[JValue::Int(request_id)])
                     .and_then(|value| value.i())
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| crate::android_runtime::jni_failure(env, error));
                 let _ = send.send(result);
             });
         })

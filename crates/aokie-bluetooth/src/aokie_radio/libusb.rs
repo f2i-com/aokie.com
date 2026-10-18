@@ -673,15 +673,20 @@ impl AokieHciTransport {
         voice_setting: u16,
         connection_count: usize,
     ) -> Result<(), String> {
+        // Review 1 #16: every way out that arms nothing is an Err, so the
+        // link is reported as not armed (a silent call the operator is
+        // told about) instead of as ready.
         let Some(asked) = sco_alt_setting_for_voice(voice_setting, connection_count) else {
-            return Ok(());
+            return Err(format!(
+                "no voice alternate setting for voice setting 0x{voice_setting:04x} with {connection_count} link(s)"
+            ));
         };
         let Some((number, available)) = self
             .voice
             .as_ref()
             .map(|voice| (voice.number, voice.usable_alts()))
         else {
-            return Ok(());
+            return Err("the dongle has no voice interface: call audio cannot be carried".to_string());
         };
         // A dongle that lacks the setting asked for carries the link on
         // the first 16-bit one it has; a missing setting must not end the
@@ -700,7 +705,9 @@ impl AokieHciTransport {
                     "[AokieRadio] SCO alt {} not exposed and no 16-bit fallback available (probe={:?}); skipping alt-config",
                     asked, available,
                 );
-                return Ok(());
+                return Err(format!(
+                    "the dongle has no voice setting to carry this link (asked {asked}, has {available:?})"
+                ));
             }
         };
 

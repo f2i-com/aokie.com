@@ -23,6 +23,8 @@
 # Rust calls this narrow native bridge by exact JNI method name. These methods
 # are never JavaScript interfaces, but release R8 must not rename or remove
 # them. The values stay inside Rust/Kotlin and are not exposed to the WebView.
+# A unit test in android_runtime.rs checks every method name Rust calls is
+# listed here, and the post-R8 check in build.gradle.kts reads this block.
 -keepclassmembers class com.aokie.companion.MainActivity {
     public int requestAokieMicrophonePermission(int);
     public int pollAokieMicrophonePermission(int);
@@ -35,7 +37,18 @@
     public int aokieSecureStoreAvailable();
     public java.lang.String aokieRuntimeDiagnostics();
     public int invalidateAokiePushToken();
+    public java.lang.String takeAokieNativeCallAction();
+    public int completeAokieNativeCallAction(java.lang.String, int, java.lang.String);
+    public int presentAokieAuthoritativeOffer(java.lang.String);
+    public int beginAokieCommunicationAudio();
+    public int endAokieCommunicationAudio();
+    public java.lang.String aokieAudioRoutes();
+    public java.lang.String selectAokieAudioRoute(java.lang.String);
+    public int signalAokieLiveTransition();
     public int reconcileAokieOffer(java.lang.String, long, java.lang.String, java.lang.String);
+    # A safety net for a bridge method added later without its own line.
+    public *** *Aokie*(...);
+    public *** aokie*(...);
 }
 
 # libwebrtc's Java runtime is reached only from native code, by class name (JNI FindClass and

@@ -752,7 +752,7 @@ pub(super) fn service_controls(
                 }
                 #[cfg(not(feature = "voice"))]
                 eprintln!(
-                    "[aokie-plugin] operatorSpeak ({} chars) â€” voice feature not built",
+                    "[aokie-plugin] operatorSpeak ({} chars) — voice feature not built",
                     text.chars().count()
                 );
             }
@@ -956,6 +956,45 @@ pub(super) fn service_controls(
                 let _ = reply.send(bt.connected_name());
             }
             Ok(RadioControl::Shutdown { completion }) => {
+                // A call still up when the plugin stops (OAIY quitting or
+                // restarting it, review 2 #11) is closed here, before the
+                // shutdown is acknowledged: its record keeps its real number
+                // and outcome instead of waiting for the next start's
+                // `plugin_restarted`. The call goes on on the phone.
+                if tracker.current().is_some() {
+                    flush_incoming_if_pending(&mut *tracker, outbox, sink);
+                    tracker.note_intent(crate::call_session::TerminationIntent::PluginStopped);
+                    if let Some(ended) = tracker.terminate() {
+                        eprintln!(
+                            "[aokie-plugin] plugin stopping during call {} — its record is closed ({}, plugin_stopped)",
+                            ended.id, ended.outcome
+                        );
+                        emit_call_ended(
+                            &ended,
+                            status.config_version.load(Ordering::Relaxed),
+                            outbox,
+                            sink,
+                        );
+                    }
+                    status.call_active.store(false, Ordering::Relaxed);
+                    *status.current_caller.lock().unwrap() = None;
+                    *status.current_call_id.lock().unwrap() = None;
+                    *status.call_started_at.lock().unwrap() = None;
+                }
+                // A caller on hold is closed the same way.
+                if let Some((held, _held_ctx)) = parked.take() {
+                    let ended = crate::call_session::SessionTracker::terminate_detached(
+                        held,
+                        Some(crate::call_session::TerminationIntent::PluginStopped),
+                    );
+                    emit_call_ended(
+                        &ended,
+                        status.config_version.load(Ordering::Relaxed),
+                        outbox,
+                        sink,
+                    );
+                    *status.parked_call.lock().unwrap() = None;
+                }
                 // `call.ended` may already be visible while one of its
                 // detached transcript corrections is still pending. A
                 // graceful stop must not strand the one-shot barrier that

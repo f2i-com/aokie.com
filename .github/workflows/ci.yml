@@ -12,10 +12,10 @@ on:
   workflow_dispatch:
     inputs:
       bundle:
-        description: 'The release bundle to build: production (needs the Microsoft-signed driver catalog and the Authenticode certificate) or managed-beta (a pre-release without either). A tag whose name contains managed-beta always builds managed-beta.'
+        description: 'The release bundle to build: managed-beta (a pre-release, no Microsoft-signed driver catalog or Authenticode certificate needed) or production (needs both, and neither exists yet, so a production run stops at its first step today). A tag whose name contains managed-beta always builds managed-beta; a managed-beta bundle is never built or published from any other tag.'
         type: choice
-        options: [production, managed-beta]
-        default: production
+        options: [managed-beta, production]
+        default: managed-beta
       attach_macos_to:
         description: "A release's tag (v0.0.2-managed-beta, say) to attach this run's Mac bundle to, for a release made before Aokie had one. Empty: the Mac bundle stays the run's artifact."
         type: string
@@ -33,8 +33,19 @@ on:
 # TRUST-001: least privilege by default — read-only token everywhere; the four
 # jobs that publish release assets (production, managed-beta, and the Mac and
 # Linux bundles' publish-macos and publish-linux) ask for contents:write themselves.
+# No checkout keeps the token in .git (persist-credentials: false): a build script
+# could read it there. Secrets reach only the steps that sign, never a build: a
+# dependency's build script sees the environment of the cargo it runs under, so
+# every cargo build runs in a step without them and the signing steps run the
+# programs already built. Tag names reach scripts through the runner's
+# GITHUB_REF_NAME / GITHUB_REF_TYPE, never pasted into them with ${{ }}.
 permissions:
   contents: read
+
+env:
+  # The package-signing key OAIY pins (fl-aokie-2026a; platform/desktop/src-tauri/resources/trusted-publishers.json
+  # in the OAIY repository). A public key: every bundle's signature is checked against it.
+  PINNED_PACKAGE_KEY: 'n832sELL2yC6UksKhiz4C4UY7P9//mf8JfeFJRcuk5s='
 
 jobs:
   plugin:
@@ -42,6 +53,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
@@ -49,19 +62,21 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
-      # The WHOLE shipping workspace (audit AOK-CI-001): core, bluetooth, db,
-      # audio, dongle, receptionist AND the plugin — the
+      # The WHOLE shipping workspace (audit AOK-CI-001): core, bluetooth,
+      # audio, dongle AND the plugin — the
       # radio/recovery logic lives in crates the old plugin-only run never
       # touched. Contract drift gates, call lifecycle, outbox, endpoint
       # classification and truthful health all ride along.
       - name: Tests (workspace)
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   plugin-voice:
     name: aokie-plugin (test + clippy, voice feature)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
@@ -79,10 +94,10 @@ jobs:
       # this job). --test-threads=2: the synthetic-audio/QuickJS timing tests
       # are a documented flake class under full parallel load.
       - name: Tests (voice)
-        run: cargo test -p aokie-plugin --features voice -- --test-threads=2
+        run: cargo test --locked -p aokie-plugin --features voice -- --test-threads=2
 
       - name: Clippy (voice, deny-level lints)
-        run: cargo clippy -p aokie-plugin --all-targets --features voice
+        run: cargo clippy --locked -p aokie-plugin --all-targets --features voice
 
   # Audit AK-18: the documented SHIPPING combination (voice,managed-beta-driver)
   # compiles as its own gate — a managed-beta-only cfg break used to reach the
@@ -93,13 +108,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       - name: Check plugin (voice,managed-beta-driver)
-        run: cargo check -p aokie-plugin --features voice,managed-beta-driver
+        run: cargo check --locked -p aokie-plugin --features voice,managed-beta-driver
       - name: Check driver helper (managed-beta-driver)
-        run: cargo check -p aokie-dongle --features managed-beta-driver --bins
+        run: cargo check --locked -p aokie-dongle --features managed-beta-driver --bins
 
   # Audit AK-16: the Companion React/TypeScript app ships from this repo but
   # had no CI coverage at all — a TypeScript error or failing Vitest now
@@ -109,6 +126,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
@@ -133,13 +152,81 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
         with:
           components: clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --locked --workspace --all-targets
+
+  # The Mac's and Linux's own builds, tested and linted before either bundle is released (the jobs above run on
+  # Windows, whose radio, driver and sealing are Windows' own): the shipping library crates and the plugin with call
+  # audio. Values are sealed under a throwaway key (AOKIE_SEAL_EPHEMERAL=1): a runner has no login Keychain or
+  # Secret Service to answer, and the manager PIN's tests, which reach a Mac's Keychain, are skipped there.
+  unix-tests:
+    name: tests + clippy (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: macos-arm64
+            skip: --skip manager_pin
+          - os: ubuntu-22.04
+            label: linux-x86_64
+            skip: ''
+    env:
+      AOKIE_SEAL_EPHEMERAL: '1'
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
+        with:
+          components: clippy
+
+      # As the bundles' jobs: libusb and udev, libdbus, ALSA and the X libraries for libwebrtc, and clang 21.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libusb-1.0-0-dev libudev-dev libdbus-1-dev pkg-config cmake \
+            libasound2-dev libssl-dev libglib2.0-dev libx11-dev libxext-dev
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main" | sudo tee /etc/apt/sources.list.d/llvm21.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-21 lld-21 libclang-21-dev
+          {
+            echo "CC=clang-21"
+            echo "CXX=clang++-21"
+            echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib"
+          } >> "$GITHUB_ENV"
+
+      # The echo canceller's bindgen needs this Mac's libclang (.cargo/config.toml names Windows' for every system).
+      - name: The Mac's libclang
+        if: runner.os == 'macOS'
+        run: |
+          developer="$(xcode-select -p)"
+          for dir in "$developer/Toolchains/XcodeDefault.xctoolchain/usr/lib" "$developer/usr/lib" /Library/Developer/CommandLineTools/usr/lib; do
+            if [ -e "$dir/libclang.dylib" ]; then echo "LIBCLANG_PATH=$dir" >> "$GITHUB_ENV"; exit 0; fi
+          done
+          echo "::error::no libclang.dylib on this Mac"; exit 1
+
+      - name: Tests (library crates)
+        run: cargo test --locked -p aokie-core -p aokie-bluetooth -p aokie-dongle -p aokie-protocol -p package-signer -- ${{ matrix.skip }}
+
+      - name: Tests (plugin, voice)
+        run: cargo test --locked -p aokie-plugin --features voice -- --test-threads=2 ${{ matrix.skip }}
+
+      - name: Clippy (plugin, voice, deny-level lints)
+        run: cargo clippy --locked -p aokie-plugin --all-targets --features voice
 
   # Supply-chain gate (audit AOK-CI-001): RustSec advisories fail CI — accept
   # an unavoidable one explicitly via audit.toml with a documented reason.
@@ -153,6 +240,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
@@ -184,6 +273,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
@@ -191,30 +282,37 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
+      # TRUST-001: a PUBLIC TAG RELEASE without the Authenticode cert or the package key is a hard failure — never
+      # an "unsigned flavour"; said here, before anything is built. Only whether each secret is set reaches this
+      # step (the expressions are evaluated by Actions), not the secret itself. Manual dispatch smoke builds may
+      # proceed unsigned (loudly) for pipeline testing.
+      - name: Release signing material is there for a tag
+        shell: pwsh
+        env:
+          HAS_CERT: ${{ secrets.WINDOWS_CERT_PFX_B64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+          HAS_PACKAGE_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY != '' }}
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:HAS_CERT -ne 'true') {
+            throw "TRUST-001: tag releases require WINDOWS_CERT_PFX_B64/WINDOWS_CERT_PASSWORD — refusing to produce an unsigned public release"
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:HAS_PACKAGE_KEY -ne 'true') {
+            throw "TRUST-001: tag releases require the AOKIE_PACKAGE_SIGNING_KEY secret — refusing an unsigned public release"
+          }
+
       # Audit AOK-REL-001: the ONLY correct order is
       #   build helper → SIGN helper → VERIFY signature → hash the SIGNED
       #   bytes → build plugin with that hash pinned → sign plugin → verify →
       #   self-test → package.
-      # The old job hashed the helper BEFORE signing, so a signed release
-      # shipped a plugin whose embedded pin could never match the signed
-      # helper — acknowledged only as a warning. Every verification below is
-      # a hard failure; nothing about integrity is warning-only anymore.
-      - name: Build + sign helper, pin SIGNED hash, build + sign plugin
+      # Each build is a step of its own with no secret in its environment; each
+      # signing step has the certificate and runs signtool on what was built,
+      # never cargo. Every verification below is a hard failure.
+      #
+      # DIST-01 / DRV-02: compile the exact Microsoft-signed driver pair into
+      # the helper's trust decision. This applies to smoke bundles as well as
+      # tags: no assembled release is allowed to omit the driver.
+      - name: Driver package and its digests
         shell: pwsh
-        env:
-          CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
-          CERT_PASS: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
-          # TRUST-001: a PUBLIC TAG RELEASE without the Authenticode cert is a
-          # hard failure — never an "unsigned flavour". Manual dispatch smoke
-          # builds may proceed unsigned (loudly) for pipeline testing.
-          if (-not $env:CERT_B64 -and '${{ github.ref_type }}' -eq 'tag') {
-            throw "TRUST-001: tag releases require WINDOWS_CERT_PFX_B64/WINDOWS_CERT_PASSWORD — refusing to produce an unsigned public release"
-          }
-
-          # DIST-01 / DRV-02: compile the exact Microsoft-signed driver pair
-          # into the helper's trust decision. This applies to smoke bundles as
-          # well as tags: no assembled release is allowed to omit the driver.
           $driverInf = 'drivers/winusb/aokie_winusb_bluetooth.inf'
           $driverCat = 'drivers/winusb/aokie_winusb_bluetooth.cat'
           if (-not (Test-Path -LiteralPath $driverInf -PathType Leaf) -or -not (Test-Path -LiteralPath $driverCat -PathType Leaf)) {
@@ -222,83 +320,98 @@ jobs:
           }
           # The Windows Kits signtool is needed for DRIVER verification on every
           # build (signed or not). Its presence is NOT the signal that this
-          # build signs executables — that is $signingEnabled below (audit AK-01:
-          # the unsigned smoke path used to test the tool variable and then
-          # invoke `signtool sign /f $null`).
+          # build signs executables (audit AK-01).
           $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
           if (-not $signtool) { throw "AK-DIST-01: signtool.exe (Windows Kits) is required to verify the driver catalog" }
           & $signtool verify /kp /c $driverCat $driverInf
           if ($LASTEXITCODE -ne 0) { throw "AK-DIST-01: catalog is not kernel-policy trusted or does not bind the exact INF" }
-          $env:AOKIE_EXPECTED_DRIVER_INF_SHA256 = (Get-FileHash $driverInf -Algorithm SHA256).Hash.ToLower()
-          $env:AOKIE_EXPECTED_DRIVER_CAT_SHA256 = (Get-FileHash $driverCat -Algorithm SHA256).Hash.ToLower()
+          "SIGNTOOL=$signtool" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "AOKIE_EXPECTED_DRIVER_INF_SHA256=$((Get-FileHash $driverInf -Algorithm SHA256).Hash.ToLower())" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "AOKIE_EXPECTED_DRIVER_CAT_SHA256=$((Get-FileHash $driverCat -Algorithm SHA256).Hash.ToLower())" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
-          # The release-build compile gate (installer.rs env!) applies to the
-          # aokie-dongle LIB, which the helper bin itself links. The pin is
-          # meaningless inside the helper (it never dispatches elevation), so
-          # the helper build uses a placeholder; the REAL signed hash is
-          # exported before the plugin build below and cargo's env! tracking
-          # recompiles the lib with it.
+      # The release-build compile gate (installer.rs env!) applies to the
+      # aokie-dongle LIB, which the helper bin itself links. The pin is
+      # meaningless inside the helper (it never dispatches elevation), so the
+      # helper build uses a placeholder; the REAL signed hash is exported before
+      # the plugin build below and cargo's env! tracking recompiles the lib with
+      # it. package-signer is built here too, so the signing steps run it.
+      - name: Build the helper and package-signer (no secrets)
+        shell: pwsh
+        run: |
           $env:AOKIE_EXPECTED_HELPER_SHA256 = 'helper-build-placeholder'
-          cargo build -p aokie-dongle --bin aokie-driver-helper --release
+          cargo build --locked -p aokie-dongle --bin aokie-driver-helper --release
           if ($LASTEXITCODE -ne 0) { throw "helper build failed" }
+          cargo build --locked -p package-signer --release
+          if ($LASTEXITCODE -ne 0) { throw "package-signer build failed" }
 
-          # Signing is gated on an EXPLICIT state — the certificate material
-          # was provided and decoded — never on the driver-verification tool.
-          # The temporary PFX is removed in `finally` even when a later build
-          # or signature check throws (audit AK-01).
+      # Signing is gated on an EXPLICIT state — the certificate material was
+      # provided and decoded — never on the driver-verification tool. The
+      # temporary PFX is removed in `finally` even when a signature check
+      # throws (audit AK-01).
+      - name: Sign the helper
+        shell: pwsh
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
+          CERT_PASS: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
           $signingEnabled = [bool]$env:CERT_B64
-          $pfx = $null
-          $signedExecutables = @()
-          try {
-            if ($signingEnabled) {
-              if (-not $env:CERT_PASS) { throw "TRUST-001: WINDOWS_CERT_PASSWORD is required alongside WINDOWS_CERT_PFX_B64" }
-              $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          if ($signingEnabled) {
+            if (-not $env:CERT_PASS) { throw "TRUST-001: WINDOWS_CERT_PASSWORD is required alongside WINDOWS_CERT_PFX_B64" }
+            $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+            try {
               [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
-              & $signtool sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/aokie-driver-helper.exe
+              & $env:SIGNTOOL sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/aokie-driver-helper.exe
               if ($LASTEXITCODE -ne 0) { throw "helper signing failed" }
-              & $signtool verify /pa target/release/aokie-driver-helper.exe
-              if ($LASTEXITCODE -ne 0) { throw "helper signature verification failed" }
-              $signedExecutables += 'target/release/aokie-driver-helper.exe'
-            } else {
-              Write-Warning "no signing certificate configured — UNSIGNED smoke build (never a tag release)"
+            } finally {
+              if (Test-Path -LiteralPath $pfx) { Remove-Item -LiteralPath $pfx -Force }
             }
-
-            # Hash the FINAL helper bytes (post-sign when a cert exists) and
-            # only now build the plugin, so the embedded pin always matches
-            # what actually ships.
-            $sha = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
-            "final helper sha256 = $sha"
-            $env:AOKIE_EXPECTED_HELPER_SHA256 = $sha
-            # Aokie has no speech of its own (OAIY Voice hears and speaks): no
-            # voice server, speech libraries or model list ship beside it.
-            cargo build -p aokie-plugin --features voice --release
-            if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
-
-            if ($signingEnabled) {
-              foreach ($exe in @('target/release/aokie-plugin.exe')) {
-                & $signtool sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe
-                if ($LASTEXITCODE -ne 0) { throw "signing failed: $exe" }
-                $signedExecutables += $exe
-              }
-              # Verify EVERY intended final executable before any release
-              # metadata is written; the helper's post-sign pin above is
-              # unchanged because signing the plugin never touches the helper.
-              foreach ($exe in @('target/release/aokie-driver-helper.exe', 'target/release/aokie-plugin.exe')) {
-                & $signtool verify /pa $exe
-                if ($LASTEXITCODE -ne 0) { throw "signature verification failed: $exe" }
-              }
-              if ($signedExecutables.Count -ne 2) { throw "expected 2 signed executables, signed $($signedExecutables.Count)" }
-              $packagedHelper = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
-              if ($packagedHelper -ne $sha) { throw "helper bytes changed after its hash was pinned ($sha -> $packagedHelper)" }
-            }
-          } finally {
-            if ($pfx -and (Test-Path -LiteralPath $pfx)) { Remove-Item -LiteralPath $pfx -Force }
+            & $env:SIGNTOOL verify /pa target/release/aokie-driver-helper.exe
+            if ($LASTEXITCODE -ne 0) { throw "helper signature verification failed" }
+          } else {
+            Write-Warning "no signing certificate configured — UNSIGNED smoke build (never a tag release)"
           }
-
-          # Record the pinned hash and the signing state for the packaging
-          # step's cross-check and the release manifest.
-          Set-Content -Encoding ascii pinned-helper-sha.txt $sha
           Set-Content -Encoding ascii signing-state.txt $(if ($signingEnabled) { 'signed' } else { 'unsigned' })
+
+      # Hash the FINAL helper bytes (post-sign when a cert exists) and only now
+      # build the plugin, so the embedded pin always matches what ships. Aokie
+      # has no speech of its own (OAIY Voice hears and speaks): no voice server,
+      # speech libraries or model list ship beside it.
+      - name: Pin the helper's hash and build the plugin (no secrets)
+        shell: pwsh
+        run: |
+          $sha = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
+          "final helper sha256 = $sha"
+          $env:AOKIE_EXPECTED_HELPER_SHA256 = $sha
+          cargo build --locked -p aokie-plugin --features voice --release
+          if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
+          # The pinned hash, for the packaging step's cross-check and the release manifest.
+          Set-Content -Encoding ascii pinned-helper-sha.txt $sha
+
+      - name: Sign the plugin
+        shell: pwsh
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
+          CERT_PASS: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if ((Get-Content signing-state.txt -Raw).Trim() -ne 'signed') { exit 0 }
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
+            & $env:SIGNTOOL sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/aokie-plugin.exe
+            if ($LASTEXITCODE -ne 0) { throw "signing failed: target/release/aokie-plugin.exe" }
+          } finally {
+            if (Test-Path -LiteralPath $pfx) { Remove-Item -LiteralPath $pfx -Force }
+          }
+          # Verify EVERY final executable before any release metadata is
+          # written; signing the plugin never touches the helper, whose pin is
+          # re-checked.
+          foreach ($exe in @('target/release/aokie-driver-helper.exe', 'target/release/aokie-plugin.exe')) {
+            & $env:SIGNTOOL verify /pa $exe
+            if ($LASTEXITCODE -ne 0) { throw "signature verification failed: $exe" }
+          }
+          $pinned = (Get-Content pinned-helper-sha.txt -Raw).Trim()
+          $packagedHelper = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
+          if ($packagedHelper -ne $pinned) { throw "helper bytes changed after its hash was pinned ($pinned -> $packagedHelper)" }
 
       # Audit AOK-REL-002: missing assets FAIL the release, and the
       # pin/signature invariants are re-checked on the exact bytes packaged.
@@ -318,7 +431,7 @@ jobs:
           # Realtek's RTL8761B firmware, its config and their licence, pinned: Aokie loads them into such a dongle at each
           # start (realtek.rs), which a phone does not see on its ROM alone
           ./scripts/fetch-realtek-firmware.ps1 -Destination bundle/firmware/rtl_bt
-          ./scripts/verify-bundle-assets.ps1 -Bundle bundle
+          ./scripts/verify-bundle-assets.ps1 -Bundle bundle -DriverPackage
 
           # Cross-check: the helper bytes being PACKAGED must hash to the pin
           # the plugin was built with — one byte of drift fails the release.
@@ -331,12 +444,11 @@ jobs:
           # executable's signature checked), not merely "a secret existed".
           $signingState = (Get-Content signing-state.txt -Raw).Trim()
           if ($signingState -eq 'signed') {
-            $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
             foreach ($exe in @('bundle/aokie-plugin.exe', 'bundle/aokie-driver-helper.exe')) {
-              & $signtool verify /pa $exe
+              & $env:SIGNTOOL verify /pa $exe
               if ($LASTEXITCODE -ne 0) { throw "packaged executable is not signed although the build reported signed: $exe" }
             }
-          } elseif ('${{ github.ref_type }}' -eq 'tag') {
+          } elseif ($env:GITHUB_REF_TYPE -eq 'tag') {
             throw "TRUST-001: a tag release cannot package an unsigned build"
           }
           $manifest = [ordered]@{
@@ -378,44 +490,48 @@ jobs:
       # not verify. A TAG release without the signing key is a hard failure;
       # dispatch smoke builds warn and stay unsigned. This is the LAST bundle
       # mutation (AK-001) — anything written after it would unsign the tree.
+      # The key reaches only package-signer, built in a step without it; the key
+      # it holds must be the one OAIY pins.
       - name: Sign package manifest (package-signer)
         shell: pwsh
         env:
           AOKIE_PACKAGE_SIGNING_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY }}
         run: |
           if (-not $env:AOKIE_PACKAGE_SIGNING_KEY) {
-            if ('${{ github.ref_type }}' -eq 'tag') {
+            if ($env:GITHUB_REF_TYPE -eq 'tag') {
               throw "TRUST-001: tag releases require the AOKIE_PACKAGE_SIGNING_KEY secret (package-signer keygen seed) — refusing an unsigned public release"
             }
             Write-Warning "AOKIE_PACKAGE_SIGNING_KEY not set — smoke bundle ships WITHOUT a package manifest (Desktop will show it as unsigned)"
             exit 0
           }
-          $version = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { "dev-$env:GITHUB_SHA" }
-          cargo run -p package-signer --release -- sign --dir bundle --name aokie-plugin --version $version --key-id fl-aokie-2026a --key-env AOKIE_PACKAGE_SIGNING_KEY
+          $signer = 'target/release/package-signer.exe'
+          $pub = (& $signer pubkey --key-env AOKIE_PACKAGE_SIGNING_KEY | Select-Object -Last 1).Trim()
+          if ($LASTEXITCODE -ne 0 -or $pub -ne $env:PINNED_PACKAGE_KEY) { throw "the signing key is not fl-aokie-2026a, which OAIY pins" }
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$env:GITHUB_SHA" }
+          & $signer sign --dir bundle --name aokie-plugin --version $version --key-id fl-aokie-2026a --key-env AOKIE_PACKAGE_SIGNING_KEY
           if ($LASTEXITCODE -ne 0) { throw "package signing failed" }
 
       # AK-001: prove the artifact a customer actually receives verifies —
       # zip the final tree, extract it into a FRESH directory, and run the
       # strict verifier over the extraction (catches any post-sign mutation,
-      # archive lossiness, or path-normalisation drift).
+      # archive lossiness, or path-normalisation drift). Against the key OAIY
+      # pins, not one derived from the secret: no secret is needed here.
       - name: Verify the extracted final artifact
         shell: pwsh
-        env:
-          AOKIE_PACKAGE_SIGNING_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY }}
         run: |
           Compress-Archive -Path bundle/* -DestinationPath verify-roundtrip.zip -Force
           Expand-Archive -Path verify-roundtrip.zip -DestinationPath verify-extracted -Force
           # Unsigned smoke artifacts must pass the same reference-closure check.
-          ./scripts/verify-bundle-assets.ps1 -Bundle verify-extracted
-          if (-not $env:AOKIE_PACKAGE_SIGNING_KEY) {
+          ./scripts/verify-bundle-assets.ps1 -Bundle verify-extracted -DriverPackage
+          if (-not (Test-Path -LiteralPath bundle/package-manifest.json -PathType Leaf)) {
+            if ($env:GITHUB_REF_TYPE -eq 'tag') { throw "TRUST-001: a tag release has no package manifest" }
             Write-Warning "asset references verified; unsigned smoke bundle skips signature verification"
             exit 0
           }
-          $pub = (cargo run -p package-signer --release --quiet -- pubkey --key-env AOKIE_PACKAGE_SIGNING_KEY | Select-Object -Last 1).Trim()
-          if ($LASTEXITCODE -ne 0 -or -not $pub) { throw "could not derive the signing public key" }
-          cargo run -p package-signer --release -- verify --dir bundle --pubkey $pub
-          if ($LASTEXITCODE -ne 0) { throw "final bundle tree failed verification" }
-          cargo run -p package-signer --release -- verify --dir verify-extracted --pubkey $pub
+          $signer = 'target/release/package-signer.exe'
+          & $signer verify --dir bundle --pubkey $env:PINNED_PACKAGE_KEY
+          if ($LASTEXITCODE -ne 0) { throw "final bundle tree failed verification against the pinned key" }
+          & $signer verify --dir verify-extracted --pubkey $env:PINNED_PACKAGE_KEY
           if ($LASTEXITCODE -ne 0) { throw "EXTRACTED artifact failed verification — the shipped zip does not match the signed tree" }
           Remove-Item verify-roundtrip.zip -Force
           Remove-Item verify-extracted -Recurse -Force
@@ -437,9 +553,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $zip = "aokie-plugin-windows-${{ github.ref_name }}.zip"
+          $tag = $env:GITHUB_REF_NAME
+          $zip = "aokie-plugin-windows-$tag.zip"
           Compress-Archive -Path bundle/* -DestinationPath $zip
-          gh release create '${{ github.ref_name }}' --verify-tag --title 'Aokie ${{ github.ref_name }}' --notes 'Signed Aokie plugin bundle (plugin + driver helper + manifests + checksums). Aokie has no speech of its own: calls go to OAIY, whose OAIY Voice hears and speaks. Verify with SHA256SUMS.txt and the package-manifest.json publisher signature.' $zip bundle/SHA256SUMS.txt bundle/release-manifest.json bundle/package-manifest.json
+          gh release create $tag --verify-tag --title "Aokie $tag" --notes 'Signed Aokie plugin bundle (plugin + driver helper + manifests + checksums). Aokie has no speech of its own: calls go to OAIY, whose OAIY Voice hears and speaks. Verify with SHA256SUMS.txt and the package-manifest.json publisher signature.' $zip bundle/SHA256SUMS.txt bundle/release-manifest.json bundle/package-manifest.json
           if ($LASTEXITCODE -ne 0) { throw "release publish failed" }
 
   # The managed-beta bundle (README, "Managed-beta driver build"): for administrator-managed pilots while the
@@ -460,6 +577,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
@@ -467,19 +586,31 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
+      # A managed-beta bundle is built and published only from a dispatch on a branch or from a tag whose name says
+      # managed-beta: a dispatch on a production tag that asks for managed-beta stops here, so a pre-release can never
+      # be published (or attached to) under a production tag.
+      - name: A managed-beta bundle never takes a production tag
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and -not $env:GITHUB_REF_NAME.Contains('managed-beta')) {
+            throw "$($env:GITHUB_REF_NAME) is a production tag: a managed-beta bundle is not built from it (dispatch on a branch, or tag it as managed-beta)"
+          }
+
       # The production job's order, less the signing of executables: the helper first, its hash pinned into the plugin
-      # (the release gate of aokie-dongle), then the plugin.
-      - name: Build the managed-beta helper, pin its hash, build the plugin
+      # (the release gate of aokie-dongle), then the plugin. No secret in this step.
+      - name: Build the managed-beta helper, pin its hash, build the plugin and package-signer
         shell: pwsh
         run: |
           $env:AOKIE_EXPECTED_HELPER_SHA256 = 'helper-build-placeholder'
-          cargo build -p aokie-dongle --bin aokie-driver-helper --features managed-beta-driver --release
+          cargo build --locked -p aokie-dongle --bin aokie-driver-helper --features managed-beta-driver --release
           if ($LASTEXITCODE -ne 0) { throw "helper build failed" }
           $sha = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
           "helper sha256 = $sha"
           $env:AOKIE_EXPECTED_HELPER_SHA256 = $sha
-          cargo build -p aokie-plugin --features voice,managed-beta-driver --release
+          cargo build --locked -p aokie-plugin --features voice,managed-beta-driver --release
           if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
+          cargo build --locked -p package-signer --release
+          if ($LASTEXITCODE -ne 0) { throw "package-signer build failed" }
           Set-Content -Encoding ascii pinned-helper-sha.txt $sha
 
       - name: Assemble + verify bundle (fail closed)
@@ -494,6 +625,7 @@ jobs:
           # Realtek's RTL8761B firmware, its config and their licence, pinned: Aokie loads them into such a dongle at each
           # start (realtek.rs), which a phone does not see on its ROM alone
           ./scripts/fetch-realtek-firmware.ps1 -Destination bundle/firmware/rtl_bt
+          # (no driver-package/: this flavour renders and signs the selected dongle's INF on the PC)
           ./scripts/verify-bundle-assets.ps1 -Bundle bundle
 
           $pinned = (Get-Content pinned-helper-sha.txt -Raw).Trim()
@@ -526,42 +658,43 @@ jobs:
           Get-Content SHA256SUMS.txt
 
       # The last bundle mutation, as in the production job: OAIY refuses a bundle whose manifest does not verify against
-      # the pinned fl-aokie-2026a key. A managed-beta TAG without the key fails; a dispatch smoke build warns.
+      # the pinned fl-aokie-2026a key. A managed-beta TAG without the key fails; a dispatch smoke build warns. The key
+      # reaches only package-signer, built in a step without it.
       - name: Sign package manifest (package-signer)
         shell: pwsh
         env:
           AOKIE_PACKAGE_SIGNING_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY }}
         run: |
           if (-not $env:AOKIE_PACKAGE_SIGNING_KEY) {
-            if ('${{ github.ref_type }}' -eq 'tag') {
+            if ($env:GITHUB_REF_TYPE -eq 'tag') {
               throw "TRUST-001: a managed-beta tag requires the AOKIE_PACKAGE_SIGNING_KEY secret — refusing a bundle OAIY could not verify"
             }
             Write-Warning "AOKIE_PACKAGE_SIGNING_KEY not set — smoke bundle ships WITHOUT a package manifest"
             exit 0
           }
-          $version = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { "dev-$env:GITHUB_SHA" }
-          cargo run -p package-signer --release -- sign --dir bundle --name aokie-plugin --version $version --key-id fl-aokie-2026a --key-env AOKIE_PACKAGE_SIGNING_KEY
+          $signer = 'target/release/package-signer.exe'
+          $pub = (& $signer pubkey --key-env AOKIE_PACKAGE_SIGNING_KEY | Select-Object -Last 1).Trim()
+          if ($LASTEXITCODE -ne 0 -or $pub -ne $env:PINNED_PACKAGE_KEY) { throw "the signing key is not fl-aokie-2026a, which OAIY pins" }
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$env:GITHUB_SHA" }
+          & $signer sign --dir bundle --name aokie-plugin --version $version --key-id fl-aokie-2026a --key-env AOKIE_PACKAGE_SIGNING_KEY
           if ($LASTEXITCODE -ne 0) { throw "package signing failed" }
 
+      # Against the key OAIY pins: no secret is needed here.
       - name: Verify the extracted final artifact
         shell: pwsh
-        env:
-          AOKIE_PACKAGE_SIGNING_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY }}
         run: |
           Compress-Archive -Path bundle/* -DestinationPath verify-roundtrip.zip -Force
           Expand-Archive -Path verify-roundtrip.zip -DestinationPath verify-extracted -Force
           ./scripts/verify-bundle-assets.ps1 -Bundle verify-extracted
-          if (-not $env:AOKIE_PACKAGE_SIGNING_KEY) {
+          if (-not (Test-Path -LiteralPath bundle/package-manifest.json -PathType Leaf)) {
+            if ($env:GITHUB_REF_TYPE -eq 'tag') { throw "TRUST-001: a managed-beta tag has no package manifest" }
             Write-Warning "asset references verified; unsigned smoke bundle skips signature verification"
             exit 0
           }
-          $pub = (cargo run -p package-signer --release --quiet -- pubkey --key-env AOKIE_PACKAGE_SIGNING_KEY | Select-Object -Last 1).Trim()
-          if ($LASTEXITCODE -ne 0 -or -not $pub) { throw "could not derive the signing public key" }
-          # The key OAIY pins (platform/desktop/src-tauri/resources/trusted-publishers.json in the OAIY repository).
-          if ($pub -ne 'n832sELL2yC6UksKhiz4C4UY7P9//mf8JfeFJRcuk5s=') { throw "the signing key is not fl-aokie-2026a, which OAIY pins" }
-          cargo run -p package-signer --release -- verify --dir bundle --pubkey $pub
-          if ($LASTEXITCODE -ne 0) { throw "final bundle tree failed verification" }
-          cargo run -p package-signer --release -- verify --dir verify-extracted --pubkey $pub
+          $signer = 'target/release/package-signer.exe'
+          & $signer verify --dir bundle --pubkey $env:PINNED_PACKAGE_KEY
+          if ($LASTEXITCODE -ne 0) { throw "final bundle tree failed verification against the pinned key" }
+          & $signer verify --dir verify-extracted --pubkey $env:PINNED_PACKAGE_KEY
           if ($LASTEXITCODE -ne 0) { throw "EXTRACTED artifact failed verification — the shipped zip does not match the signed tree" }
           Remove-Item verify-roundtrip.zip -Force
           Remove-Item verify-extracted -Recurse -Force
@@ -575,12 +708,13 @@ jobs:
           retention-days: 30
 
       - name: Publish the pre-release (managed-beta tags only)
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' && contains(github.ref_name, 'managed-beta')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:GITHUB_REF_NAME
+          if (-not $tag.Contains('managed-beta')) { throw "$tag is not a managed-beta tag" }
           $zip = "aokie-plugin-windows-$tag.zip"
           Compress-Archive -Path bundle/* -DestinationPath $zip
           $notes = @(
@@ -611,7 +745,8 @@ jobs:
     name: aokie-plugin macOS bundle (Apple silicon)
     runs-on: macos-15
     timeout-minutes: 120
-    needs: [plugin, plugin-voice, clippy, supply-chain, managed-beta, companion]
+    # The Windows gates, and the Mac's own tests and lint (unix-tests).
+    needs: [plugin, plugin-voice, clippy, supply-chain, managed-beta, companion, unix-tests]
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -625,10 +760,16 @@ jobs:
 
       # Aokie has no speech of its own: no ONNX Runtime, speech engine, voice server or model goes in the bundle.
       # (cmake 4 builds older CMake files only with a minimum policy named)
+      # Strict: cargo builds --locked, and a bundle missing anything it should carry (Realtek's firmware) stops here.
       - name: Build and lay out the plugin
         env:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+          AOKIE_BUNDLE_STRICT: '1'
         run: sh scripts/bundle-unix.sh "$PWD/bundle"
+
+      # Built here, without the package key, so the signing step runs it and builds nothing.
+      - name: Build package-signer (no secrets)
+        run: cargo build --locked -p package-signer --release
 
       # Before anything is checked or signed: what is checked is what ships.
       - name: Sign ad hoc
@@ -637,6 +778,18 @@ jobs:
           find bundle -type f \( -perm +111 -o -name '*.dylib' \) -print0 | xargs -0 -n1 codesign --force --sign -
           find bundle -type f \( -perm +111 -o -name '*.dylib' \) -print0 | xargs -0 -n1 codesign --verify --strict
           otool -L bundle/aokie-plugin | grep -E 'libusb|@rpath'
+
+      # The oldest macOS the bundle starts on: the newest minos any program or library in it asks for (LC_BUILD_VERSION).
+      # The release notes say this one, not a number written down once.
+      - name: The macOS the bundle needs
+        run: |
+          set -euo pipefail
+          min=$(find bundle -type f \( -perm +111 -o -name '*.dylib' \) -print | while IFS= read -r f; do
+            otool -l "$f" 2>/dev/null | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/ { c = 1 } c && ($1 == "minos" || $1 == "version") { print $2; c = 0 }'
+          done | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
+          [ -n "$min" ] || { echo "::error::no program in the bundle names a minimum macOS"; exit 1; }
+          echo "$min" > macos-minimum.txt
+          echo "macOS $min or later"
 
       - name: The bundled plugin starts from its folder and answers
         run: python3 scripts/virtual-dongle/plugin_check.py --no-dongle "$PWD/bundle/aokie-plugin"
@@ -678,14 +831,15 @@ jobs:
             fi
             echo "::warning::AOKIE_PACKAGE_SIGNING_KEY not set: the smoke bundle ships WITHOUT a package manifest"; exit 0
           fi
+          pub=$(target/release/package-signer pubkey --key-env AOKIE_PACKAGE_SIGNING_KEY | tail -n 1 | tr -d '[:space:]')
+          [ "$pub" = "$PINNED_PACKAGE_KEY" ] || { echo "::error::the signing key is not fl-aokie-2026a, which OAIY pins"; exit 1; }
           if [ "$GITHUB_REF_TYPE" = tag ]; then version=$GITHUB_REF_NAME; elif [ -n "${ATTACH_TO:-}" ]; then version=$ATTACH_TO; else version="dev-$GITHUB_SHA"; fi
-          cargo run -p package-signer --release -- sign --dir bundle --name aokie-plugin --version "$version" --key-id fl-aokie-2026a --key-env AOKIE_PACKAGE_SIGNING_KEY
+          target/release/package-signer sign --dir bundle --name aokie-plugin --version "$version" --key-id fl-aokie-2026a --key-env AOKIE_PACKAGE_SIGNING_KEY
 
       # The zip keeps each program's executable bit (OAIY's install takes it from there). It is unpacked again and
       # checked as OAIY will have it: signed as built, and starting from that folder.
       - name: Zip, and verify the unpacked zip
         env:
-          AOKIE_PACKAGE_SIGNING_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY }}
           ATTACH_TO: ${{ inputs.attach_macos_to }}
         run: |
           set -euo pipefail
@@ -697,12 +851,12 @@ jobs:
           (cd verify-extracted && unzip -q "../$zip")
           [ -x verify-extracted/aokie-plugin ] || { echo "::error::the unpacked aokie-plugin is not executable"; exit 1; }
           diff -r bundle verify-extracted
-          if [ -n "${AOKIE_PACKAGE_SIGNING_KEY:-}" ]; then
-            pub=$(cargo run -p package-signer --release --quiet -- pubkey --key-env AOKIE_PACKAGE_SIGNING_KEY | tail -n 1 | tr -d '[:space:]')
-            # The key OAIY pins (platform/desktop/src-tauri/resources/trusted-publishers.json in the OAIY repository).
-            [ "$pub" = 'n832sELL2yC6UksKhiz4C4UY7P9//mf8JfeFJRcuk5s=' ] || { echo "::error::the signing key is not fl-aokie-2026a, which OAIY pins"; exit 1; }
-            cargo run -p package-signer --release -- verify --dir bundle --pubkey "$pub"
-            cargo run -p package-signer --release -- verify --dir verify-extracted --pubkey "$pub"
+          # Against the key OAIY pins (no secret needed): a bundle for a release must have its manifest.
+          if [ -f bundle/package-manifest.json ]; then
+            target/release/package-signer verify --dir bundle --pubkey "$PINNED_PACKAGE_KEY"
+            target/release/package-signer verify --dir verify-extracted --pubkey "$PINNED_PACKAGE_KEY"
+          elif [ "$GITHUB_REF_TYPE" = tag ] || [ -n "${ATTACH_TO:-}" ]; then
+            echo "::error::a bundle for a release has no package manifest"; exit 1
           fi
           python3 scripts/virtual-dongle/plugin_check.py --no-dongle "$PWD/verify-extracted/aokie-plugin"
 
@@ -713,6 +867,7 @@ jobs:
           path: |
             aokie-plugin-macos-arm64-*.zip
             aokie-plugin-macos-arm64-*.zip.sha256
+            macos-minimum.txt
           if-no-files-found: error
           retention-days: 30
 
@@ -742,12 +897,14 @@ jobs:
           set -euo pipefail
           zip="aokie-plugin-macos-arm64-$TAG.zip"
           [ -f "$zip" ] && [ -f "$zip.sha256" ] || { echo "::error::$zip is not in the artifact"; ls -la; exit 1; }
+          macos_min=$(tr -d '[:space:]' < macos-minimum.txt)
+          [ -n "$macos_min" ] || { echo "::error::the artifact does not say which macOS the bundle needs"; exit 1; }
           gh release upload "$TAG" "$zip" "$zip.sha256" --repo "$GITHUB_REPOSITORY"
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
           if ! grep -q 'aokie-plugin-macos-arm64' notes.md; then
             cat >> notes.md <<EOF
 
-          **On a Mac (Apple silicon, macOS 11 or later):** $zip is the plugin for macOS, signed with the same package key (fl-aokie-2026a), so OAIY verifies it as Aokie's; $zip.sha256 is its checksum. Install it the same way: in OAIY Desktop, Connections, Plugins, Install a plugin. On a Mac, Aokie opens the USB Bluetooth dongle itself through libusb: no driver is installed, and there is no fallback to the computer's own Bluetooth (docs/HARDWARE.md, macOS). Its programs are signed ad hoc, not with an Apple Developer ID, so the login Keychain asks before Aokie uses its key after each new version. libusb is LGPL-2.1 and comes as a library beside the plugin, with its licence and source in third-party/. Aokie has no speech of its own: calls go to OAIY, whose OAIY Voice hears and speaks, and nothing is downloaded. Built from $GITHUB_SHA.
+          **On a Mac (Apple silicon, macOS $macos_min or later):** $zip is the plugin for macOS, signed with the same package key (fl-aokie-2026a), so OAIY verifies it as Aokie's; $zip.sha256 is its checksum. Install it the same way: in OAIY Desktop, Connections, Plugins, Install a plugin. On a Mac, Aokie opens the USB Bluetooth dongle itself through libusb: no driver is installed, and there is no fallback to the computer's own Bluetooth (docs/HARDWARE.md, macOS). Its programs are signed ad hoc, not with an Apple Developer ID, so the login Keychain asks before Aokie uses its key after each new version. libusb is LGPL-2.1 and comes as a library beside the plugin, with its licence and source in third-party/. Aokie has no speech of its own: calls go to OAIY, whose OAIY Voice hears and speaks, and nothing is downloaded. Built from $GITHUB_SHA.
           EOF
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
           fi
@@ -762,7 +919,8 @@ jobs:
     name: aokie-plugin Linux bundle (x86_64)
     runs-on: ubuntu-22.04
     timeout-minutes: 120
-    needs: [plugin, plugin-voice, clippy, supply-chain, managed-beta, companion]
+    # The Windows gates, and Linux's own tests and lint (unix-tests).
+    needs: [plugin, plugin-voice, clippy, supply-chain, managed-beta, companion, unix-tests]
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -791,10 +949,16 @@ jobs:
             echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib"
           } >> "$GITHUB_ENV"
 
+      # Strict: cargo builds --locked, and a bundle missing anything it should carry (Realtek's firmware) stops here.
       - name: Build and lay out the plugin
         env:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+          AOKIE_BUNDLE_STRICT: '1'
         run: sh scripts/bundle-unix.sh "$PWD/bundle"
+
+      # Built here, without the package key, so the signing step runs it and builds nothing.
+      - name: Build package-signer (no secrets)
+        run: cargo build --locked -p package-signer --release
 
       # The system's libusb, a library of its own (LGPL-2.1: loaded, not built in), and nothing else unresolved.
       - name: What the plugin links
@@ -844,14 +1008,15 @@ jobs:
             fi
             echo "::warning::AOKIE_PACKAGE_SIGNING_KEY not set: the smoke bundle ships WITHOUT a package manifest"; exit 0
           fi
+          pub=$(target/release/package-signer pubkey --key-env AOKIE_PACKAGE_SIGNING_KEY | tail -n 1 | tr -d '[:space:]')
+          [ "$pub" = "$PINNED_PACKAGE_KEY" ] || { echo "::error::the signing key is not fl-aokie-2026a, which OAIY pins"; exit 1; }
           if [ "$GITHUB_REF_TYPE" = tag ]; then version=$GITHUB_REF_NAME; elif [ -n "${ATTACH_TO:-}" ]; then version=$ATTACH_TO; else version="dev-$GITHUB_SHA"; fi
-          cargo run -p package-signer --release -- sign --dir bundle --name aokie-plugin --version "$version" --key-id fl-aokie-2026a --key-env AOKIE_PACKAGE_SIGNING_KEY
+          target/release/package-signer sign --dir bundle --name aokie-plugin --version "$version" --key-id fl-aokie-2026a --key-env AOKIE_PACKAGE_SIGNING_KEY
 
       # The zip keeps each program's executable bit (OAIY's install takes it from there). It is unpacked again and
       # checked as OAIY will have it: signed as built, and starting from that folder.
       - name: Zip, and verify the unpacked zip
         env:
-          AOKIE_PACKAGE_SIGNING_KEY: ${{ secrets.AOKIE_PACKAGE_SIGNING_KEY }}
           ATTACH_TO: ${{ inputs.attach_linux_to }}
         run: |
           set -euo pipefail
@@ -863,12 +1028,12 @@ jobs:
           (cd verify-extracted && unzip -q "../$zip")
           [ -x verify-extracted/aokie-plugin ] || { echo "::error::the unpacked aokie-plugin is not executable"; exit 1; }
           diff -r bundle verify-extracted
-          if [ -n "${AOKIE_PACKAGE_SIGNING_KEY:-}" ]; then
-            pub=$(cargo run -p package-signer --release --quiet -- pubkey --key-env AOKIE_PACKAGE_SIGNING_KEY | tail -n 1 | tr -d '[:space:]')
-            # The key OAIY pins (platform/desktop/src-tauri/resources/trusted-publishers.json in the OAIY repository).
-            [ "$pub" = 'n832sELL2yC6UksKhiz4C4UY7P9//mf8JfeFJRcuk5s=' ] || { echo "::error::the signing key is not fl-aokie-2026a, which OAIY pins"; exit 1; }
-            cargo run -p package-signer --release -- verify --dir bundle --pubkey "$pub"
-            cargo run -p package-signer --release -- verify --dir verify-extracted --pubkey "$pub"
+          # Against the key OAIY pins (no secret needed): a bundle for a release must have its manifest.
+          if [ -f bundle/package-manifest.json ]; then
+            target/release/package-signer verify --dir bundle --pubkey "$PINNED_PACKAGE_KEY"
+            target/release/package-signer verify --dir verify-extracted --pubkey "$PINNED_PACKAGE_KEY"
+          elif [ "$GITHUB_REF_TYPE" = tag ] || [ -n "${ATTACH_TO:-}" ]; then
+            echo "::error::a bundle for a release has no package manifest"; exit 1
           fi
           python3 scripts/virtual-dongle/plugin_check.py --no-dongle "$PWD/verify-extracted/aokie-plugin"
 

@@ -123,9 +123,14 @@ pub(super) fn drain_bluetooth_events(
                 );
             }
         }
+        // The caller's last words are drained on a lost phone link too
+        // (review 1 #4): DeviceDisconnected ends the call just the same.
         #[cfg(feature = "voice")]
-        if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallTerminated)
-            && tracker.current().is_some()
+        if matches!(
+            ev,
+            aokie_dongle::bluetooth::BluetoothEvent::CallTerminated
+                | aokie_dongle::bluetooth::BluetoothEvent::DeviceDisconnected(_)
+        ) && tracker.current().is_some()
         {
             if *stt_had_speech && stt_buf.len() >= 16_000 / 5 {
                 if spec_utterance.take().is_some() {

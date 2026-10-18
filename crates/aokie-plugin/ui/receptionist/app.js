@@ -318,7 +318,7 @@
         return transportMode;
       },
       showDongle: function () {
-        return transportMode === 'dongle';
+        return transportMode !== 'native'; // `auto` uses the dongle when one is plugged in
       },
       update: function (settingsBag) {
         setTransportFromSettings(settingsBag);
@@ -352,7 +352,9 @@
   /** Hide/show the dongle-only tab button; if the Dongle tab is somehow the
    *  active one when it becomes hidden, fall back to the Overview. */
   function applyTransportVisibility() {
-    var showDongle = transportMode === 'dongle';
+    // `auto` uses the USB dongle whenever one is plugged in, so its screens
+    // show for it as for the dongle mode; only `native` has no dongle.
+    var showDongle = transportMode !== 'native';
     var btns = document.querySelectorAll('.rcp-tab-btn');
     for (var i = 0; i < btns.length; i++) {
       if (btns[i].getAttribute('data-tab') === 'dongle') btns[i].hidden = !showDongle;
@@ -374,7 +376,7 @@
     if (!id || id === activeTab || !tabContainer(id)) return;
     // A tab hidden by the transport mode stays unreachable, even
     // programmatically (data-tabgo links, switchTo).
-    if (id === 'dongle' && transportMode !== 'dongle' && !fromSetup) return;
+    if (id === 'dongle' && transportMode === 'native' && !fromSetup) return;
 
     // Leave the old tab.
     if (activeTab === 'overview') {
@@ -602,7 +604,10 @@
         state.phonesError = errMsg(e);
         state.phones = null;
       }
-    ).then(renderPhones);
+    ).then(function () {
+      renderPhones();
+      renderReadiness(); // the bonded count says "Paired, offline"
+    });
   }
 
   function refreshCall() {
@@ -695,25 +700,43 @@
   var slowTimer = null;
   var fastTimer = null;
   var slowTicks = 0;
+  // A tick's reads still out when the next tick comes: that tick is skipped.
+  // A slow radio otherwise piled poll after poll up in the plugin's one
+  // command queue, ahead of Answer and Hang up.
+  var slowBusy = false;
+  var fastBusy = false;
+
+  function settled(promises) {
+    return Promise.all(
+      promises.map(function (p) {
+        return Promise.resolve(p).catch(function () {});
+      })
+    );
+  }
 
   function slowTick() {
-    refreshSnapshot();
-    refreshPhoneStatus();
-    refreshDiag();
-    refreshPhones();
-    if (slowTicks % 6 === 0) refreshSettings(); // every ~30 s (and at start)
+    if (slowBusy) return;
+    slowBusy = true;
+    var reads = [refreshSnapshot(), refreshPhoneStatus(), refreshDiag(), refreshPhones()];
+    if (slowTicks % 6 === 0) reads.push(refreshSettings()); // every ~30 s (and at start)
     if (slowTicks % 3 === 0) {
       // every ~15 s (and at start)
-      refreshSources();
-      refreshOaiyStatus();
+      reads.push(refreshSources());
+      reads.push(refreshOaiyStatus());
     }
     slowTicks += 1;
+    settled(reads).then(function () {
+      slowBusy = false;
+    });
   }
 
   function fastTick() {
     state.now = Date.now();
-    refreshCall();
-    refreshSwitchboard();
+    if (fastBusy) return;
+    fastBusy = true;
+    settled([refreshCall(), refreshSwitchboard()]).then(function () {
+      fastBusy = false;
+    });
   }
 
   function startTimers() {
@@ -839,13 +862,26 @@
         items.push({ icon: ICONS.smartphone, label: 'Phone bridge', value: 'Unavailable', note: state.phoneError || 'phone.status failed', ok: false });
         return;
       }
-      var linked = !!phone.connected && !phone.error && !phone.pairingConfirm;
-      var value = phone.error ? 'Needs attention' : phone.pairingConfirm ? 'Confirm pairing' : linked ? 'Bluetooth linked' : phone.paired ? 'Paired, offline' : 'Not paired';
+      // Linked is what phone.status says of the link: an old error it still
+      // carries is shown, but does not unlink a connected phone. A phone
+      // bonded but not connected now is paired and offline (`paired` is about
+      // the connection; the bonded list says who is paired).
+      var linked = !!phone.connected && !phone.pairingConfirm;
+      var bondedCount = Array.isArray(state.phones) ? state.phones.length : 0;
+      var value = phone.pairingConfirm
+        ? 'Confirm pairing'
+        : linked
+          ? 'Bluetooth linked'
+          : phone.error
+            ? 'Needs attention'
+            : bondedCount > 0 || phone.paired
+              ? 'Paired, offline'
+              : 'Not paired';
       var device = phone.device || null;
-      var note =
-        phone.error ||
-        (device && (device.name || device.address)) ||
-        'pair a phone with "Aokie AI Assistant"';
+      var named = device && (device.name || device.address);
+      var note = linked
+        ? (named || 'phone connected') + (phone.error ? ' · last error: ' + phone.error : '')
+        : phone.error || named || (bondedCount > 0 ? 'the paired phone is not connected' : 'pair a phone with "Aokie AI Assistant"');
       items.push({ icon: ICONS.smartphone, label: 'Phone bridge', value: value, note: note, ok: linked });
     })();
 

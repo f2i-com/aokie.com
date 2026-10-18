@@ -8,7 +8,11 @@ umask 077
 openssl rand -hex 32 > admission-hmac.txt
 openssl rand -hex 32 > lease-hmac.txt
 openssl rand -hex 32 > turn-rest.txt
-chmod 600 admission-hmac.txt lease-hmac.txt turn-rest.txt
+# The gateway reads its files as uid 65532 and coturn as uid 65534, and
+# Docker mounts them with their host owner and mode.
+sudo chown 65532:65532 admission-hmac.txt lease-hmac.txt
+sudo chown 65534:65534 turn-rest.txt
+sudo chmod 0400 admission-hmac.txt lease-hmac.txt turn-rest.txt
 ```
 
 - `admission-hmac.txt` is shared only with the trusted FormLogic/custom

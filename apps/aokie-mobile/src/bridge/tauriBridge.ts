@@ -1,6 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { parseCallSnapshot, parseCommandAck } from "../protocol/codec";
+import { MAX_V2_ASSISTANCE_ANSWER_BYTES, parseCallSnapshot, parseCommandAck, sanitizeLine } from "../protocol/codec";
 import { MAX_JSON_SAFE_INTEGER, type CommandEnvelope } from "../protocol/types";
 import type {
   BridgeEvent,
@@ -1562,9 +1562,13 @@ export class TauriCompanionBridge implements CompanionBridge {
   async answerV2Assistance(requestId: string, answer: string, responseAction: "answer" | "decline" = "answer"): Promise<{ requestId: string; answerId: string }> {
     safeIdentifier(requestId, "assistance request ID");
     if (responseAction !== "answer" && responseAction !== "decline") throw new Error("Invalid assistance response action");
-    if (!answer.trim() || answer.length > 2_000 || /[\u0000-\u001f\u007f]/.test(answer)) throw new Error("Invalid assistance answer");
+    if (typeof answer !== "string") throw new Error("Invalid assistance answer");
+    // One line within the protocol's byte limit: a newline or a long CJK answer
+    // used to be refused here after the owner had typed it.
+    const line = sanitizeLine(answer, MAX_V2_ASSISTANCE_ANSWER_BYTES);
+    if (!line) throw new Error("Invalid assistance answer");
     return parseAssistanceReceipt(await invoke("realtime_v2_answer_assistance", {
-      request: { requestId, responseAction, answer: answer.trim() },
+      request: { requestId, responseAction, answer: line },
     }));
   }
 

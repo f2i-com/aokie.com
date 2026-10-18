@@ -26,23 +26,33 @@ internal object AokieAudioRoutes {
   private val sessionActive = AtomicBoolean(false)
   private val revision = AtomicLong(1)
 
+  @Volatile
+  private var applicationContext: Context? = null
+
   private val callback = object : AudioDeviceCallback() {
     override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
-      revision.incrementAndGet()
+      routesChanged()
     }
 
     override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
-      revision.incrementAndGet()
+      routesChanged()
     }
+  }
+
+  /** A headset came or went, or Android moved the call audio: the proximity lock follows the earpiece. */
+  private fun routesChanged() {
+    revision.incrementAndGet()
+    applicationContext?.let { AokieCommunicationService.refresh(it) }
   }
 
   fun initialize(context: Context) {
     if (!initialized.compareAndSet(false, true)) return
+    applicationContext = context.applicationContext
     val audio = context.applicationContext.getSystemService(AudioManager::class.java)
     audio.registerAudioDeviceCallback(callback, Handler(Looper.getMainLooper()))
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
       audio.addOnCommunicationDeviceChangedListener(context.mainExecutor) {
-        revision.incrementAndGet()
+        routesChanged()
       }
     }
   }
@@ -53,6 +63,8 @@ internal object AokieAudioRoutes {
     audio.mode = AudioManager.MODE_IN_COMMUNICATION
     sessionActive.set(true)
     revision.incrementAndGet()
+    // Keeps the microphone and the process alive with the screen off; a refusal is recorded, not fatal.
+    AokieCommunicationService.start(context)
     1
   }.getOrElse {
     AokieOfferStore.recordDiagnostic(context, "communication_audio_begin_failed")
@@ -60,6 +72,8 @@ internal object AokieAudioRoutes {
   }
 
   fun end(context: Context): Int = runCatching {
+    // Stopped first, so a failure below never leaves the service (and its wake lock) running.
+    AokieCommunicationService.stop(context)
     val audio = context.getSystemService(AudioManager::class.java)
     sessionActive.set(false)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -114,7 +128,15 @@ internal object AokieAudioRoutes {
     }
     check(changed) { "Android rejected the communication route" }
     revision.incrementAndGet()
+    AokieCommunicationService.refresh(context)
     return snapshot(context)
+  }
+
+  /** True while the communication audio plays through the handset earpiece. */
+  fun earpieceSelected(context: Context): Boolean {
+    if (!sessionActive.get()) return false
+    val audio = context.getSystemService(AudioManager::class.java)
+    return selectedRoute(audio, routes(audio))?.kind == "earpiece"
   }
 
   /** Called only for an authoritative native false -> true live-media edge. */

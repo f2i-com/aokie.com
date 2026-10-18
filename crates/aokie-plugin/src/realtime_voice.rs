@@ -32,6 +32,48 @@ const INPUT_BATCH_SAMPLES: usize = 960; // 40 ms at the 24 kHz wire rate
                                         // SCO queue remains independently paced to OUTPUT_LEAD_MS.
 const MAX_OUTPUT_BUFFER_MS: u64 = 30_000;
 pub const OUTPUT_LEAD_MS: u64 = 80;
+/// How long the WebSocket to OAIY may take to open. It is a loopback hop: a
+/// healthy OAIY answers in milliseconds, and one that does not is wedged.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long OAIY may take to say `ready` once the start is sent (it says it
+/// at once, before any model is touched).
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// What may wait in the worker while the radio's event queue is full: OAIY
+/// sends a reply's audio faster than it plays, and a radio busy for a second
+/// or two must not end the call. Thirty seconds of 24 kHz PCM16, the same
+/// bound as the output reservoir.
+const MAX_EVENT_BACKLOG_BYTES: usize = 30 * WIRE_SAMPLE_RATE as usize * 2;
+/// Waiting audio is merged up to one second an event, so a long backlog is
+/// handed over in pieces the radio resamples in one loop turn.
+const MAX_MERGED_PCM_SAMPLES: usize = WIRE_SAMPLE_RATE as usize;
+/// How long a worker that is ending waits for the radio to take what is still
+/// queued, and the reason it ended.
+const CLOSE_HANDOVER: Duration = Duration::from_secs(2);
+/// After OAIY did not answer a connection (or did not say ready) in time, a
+/// fixed line is not tried for this long: each try would hold the radio
+/// thread for its whole deadline. A session that gets ready clears it.
+const UNANSWERED_HOLD: Duration = Duration::from_secs(30);
+
+/// When OAIY last did not answer a connection in time (see
+/// [`oaiy_recently_unanswered`]).
+static LAST_UNANSWERED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+fn note_unanswered(unanswered: bool) {
+    if let Ok(mut last) = LAST_UNANSWERED.lock() {
+        *last = unanswered.then(Instant::now);
+    }
+}
+
+/// OAIY did not answer a connection, or did not say ready, within the last
+/// [`UNANSWERED_HOLD`] and has not answered one since: it is wedged, and a
+/// fixed line in its voice would only hold the radio until its deadline.
+pub fn oaiy_recently_unanswered() -> bool {
+    LAST_UNANSWERED
+        .lock()
+        .ok()
+        .and_then(|last| *last)
+        .is_some_and(|at| at.elapsed() < UNANSWERED_HOLD)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnDetection {
@@ -165,6 +207,11 @@ pub enum RealtimeEventKind {
     },
     Closed {
         reason: String,
+        /// The stream to OAIY failed or ended under the call (it did not
+        /// open in time, it dropped, OAIY closed it), as opposed to a
+        /// protocol violation or a refusal. The radio reconnects once a call
+        /// for these (`radio::realtime_service`).
+        transport: bool,
     },
 }
 
@@ -467,7 +514,13 @@ pub struct RealtimeVoiceSession {
     event_rx: Receiver<RealtimeEvent>,
     input_resampler: StreamingResampler,
     input_batch: VecDeque<i16>,
+    /// Why the worker ended, when the radio's queue had no room for it as it
+    /// ended: read once the queue is drained and the worker gone, so the
+    /// reason is never lost to a full queue.
+    final_event: FinalEvent,
 }
+
+type FinalEvent = std::sync::Arc<std::sync::Mutex<Option<RealtimeEventKind>>>;
 
 impl RealtimeVoiceSession {
     pub fn spawn(config: SessionConfig) -> Result<Self, String> {
@@ -489,32 +542,35 @@ impl RealtimeVoiceSession {
         let (event_tx, event_rx) = mpsc::sync_channel(EVENT_DEPTH);
         let call_id = config.call_id.clone();
         let generation = config.generation;
+        let final_event = FinalEvent::default();
+        let worker_final = final_event.clone();
         std::thread::Builder::new()
             .name("aokie-realtime-voice".to_string())
             .spawn(move || {
-                let result = std::panic::catch_unwind(|| {
+                let mut outlet = EventOutlet::new(event_tx, &config.call_id, config.generation);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                        .map_err(|e| format!("realtime runtime failed: {e}"))?;
+                        .map_err(|e| SocketError::from(format!("realtime runtime failed: {e}")))?;
                     runtime.block_on(run_socket(
-                        config.clone(),
+                        &config,
                         token,
-                        audio_rx,
-                        control_rx,
-                        event_tx.clone(),
+                        &audio_rx,
+                        &control_rx,
+                        &mut outlet,
                     ))
-                });
-                let reason = match result {
-                    Ok(Ok(())) => "Desktop realtime stream closed".to_string(),
-                    Ok(Err(error)) => error,
-                    Err(_) => "Desktop realtime stream panicked".to_string(),
+                }));
+                let (reason, transport) = match result {
+                    Ok(Ok(())) => ("Desktop realtime stream closed".to_string(), false),
+                    Ok(Err(error)) => (error.reason, error.transport),
+                    Err(_) => ("Desktop realtime stream panicked".to_string(), false),
                 };
-                let _ = event_tx.try_send(RealtimeEvent {
-                    call_id: config.call_id,
-                    generation: config.generation,
-                    kind: RealtimeEventKind::Closed { reason },
-                });
+                outlet.close(
+                    RealtimeEventKind::Closed { reason, transport },
+                    &worker_final,
+                    CLOSE_HANDOVER,
+                );
             })
             .map_err(|e| format!("cannot start realtime voice worker: {e}"))?;
         Ok(Self {
@@ -525,6 +581,7 @@ impl RealtimeVoiceSession {
             event_rx,
             input_resampler: StreamingResampler::new(WIRE_SAMPLE_RATE, WIRE_SAMPLE_RATE),
             input_batch: VecDeque::new(),
+            final_event,
         })
     }
 
@@ -659,8 +716,184 @@ impl RealtimeVoiceSession {
             Ok(event) => Ok(Some(event)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
-                Err("Desktop realtime event stream is closed".to_string())
+                // The worker is gone. Why it ended is handed over here when
+                // the queue had no room for it, once.
+                let kind = self.final_event.lock().ok().and_then(|mut slot| slot.take());
+                match kind {
+                    Some(kind) => Ok(Some(RealtimeEvent {
+                        call_id: self.call_id.clone(),
+                        generation: self.generation,
+                        kind,
+                    })),
+                    None => Err("Desktop realtime event stream is closed".to_string()),
+                }
             }
+        }
+    }
+}
+
+/// Why the socket worker ended: the reason the radio is told, and whether it
+/// was the stream to OAIY itself that failed (see `RealtimeEventKind::Closed`).
+#[derive(Debug)]
+struct SocketError {
+    reason: String,
+    transport: bool,
+}
+
+impl From<String> for SocketError {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            transport: false,
+        }
+    }
+}
+
+fn transport_error(reason: String) -> SocketError {
+    SocketError {
+        reason,
+        transport: true,
+    }
+}
+
+/// The worker's side of the radio's event queue.
+///
+/// The queue is short (`EVENT_DEPTH`) and OAIY sends a reply's audio faster
+/// than it plays, so a radio thread that is busy for a second or two would
+/// fill it. What does not fit waits here, in order, with consecutive audio
+/// of one item merged, bounded by bytes (`MAX_EVENT_BACKLOG_BYTES`) rather
+/// than by a count of messages. Only a radio that falls further behind than
+/// that ends the call.
+struct EventOutlet {
+    tx: SyncSender<RealtimeEvent>,
+    call_id: String,
+    generation: u64,
+    backlog: VecDeque<RealtimeEvent>,
+    backlog_bytes: usize,
+}
+
+impl EventOutlet {
+    fn new(tx: SyncSender<RealtimeEvent>, call_id: &str, generation: u64) -> Self {
+        Self {
+            tx,
+            call_id: call_id.to_string(),
+            generation,
+            backlog: VecDeque::new(),
+            backlog_bytes: 0,
+        }
+    }
+
+    /// Roughly what an event holds, for the backlog's bound.
+    fn weight(kind: &RealtimeEventKind) -> usize {
+        match kind {
+            RealtimeEventKind::OutputPcm { samples, .. } => samples.len() * 2,
+            RealtimeEventKind::InputTranscript { text, .. }
+            | RealtimeEventKind::OutputTranscript { text, .. } => text.len() + 64,
+            RealtimeEventKind::Error { message, .. } => message.len() + 64,
+            _ => 64,
+        }
+    }
+
+    fn push(&mut self, kind: RealtimeEventKind) -> Result<(), String> {
+        self.flush()?;
+        let event = RealtimeEvent {
+            call_id: self.call_id.clone(),
+            generation: self.generation,
+            kind,
+        };
+        let event = if self.backlog.is_empty() {
+            match self.tx.try_send(event) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(event)) => event,
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err("Desktop realtime consumer stopped".to_string())
+                }
+            }
+        } else {
+            event
+        };
+        let weight = Self::weight(&event.kind);
+        if let (
+            RealtimeEventKind::OutputPcm { item_id, samples },
+            Some(RealtimeEvent {
+                kind:
+                    RealtimeEventKind::OutputPcm {
+                        item_id: waiting_item,
+                        samples: waiting,
+                    },
+                ..
+            }),
+        ) = (&event.kind, self.backlog.back_mut())
+        {
+            if waiting_item == item_id && waiting.len() + samples.len() <= MAX_MERGED_PCM_SAMPLES {
+                waiting.extend_from_slice(samples);
+                self.backlog_bytes += weight;
+                return self.check_bound();
+            }
+        }
+        self.backlog_bytes += weight;
+        self.backlog.push_back(event);
+        self.check_bound()
+    }
+
+    fn check_bound(&self) -> Result<(), String> {
+        if self.backlog_bytes > MAX_EVENT_BACKLOG_BYTES {
+            return Err(
+                "Desktop realtime output queue overflowed: the radio fell 30 seconds behind"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Hand the radio as much of the backlog as its queue takes now.
+    fn flush(&mut self) -> Result<(), String> {
+        while let Some(event) = self.backlog.pop_front() {
+            let weight = Self::weight(&event.kind);
+            match self.tx.try_send(event) {
+                Ok(()) => self.backlog_bytes = self.backlog_bytes.saturating_sub(weight),
+                Err(TrySendError::Full(event)) => {
+                    self.backlog.push_front(event);
+                    break;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err("Desktop realtime consumer stopped".to_string())
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The worker is ending: what is still waiting goes first, then `last`,
+    /// for up to `within`. Whatever does not fit by then is dropped, except
+    /// `last`, which is left in `slot` for the session to hand over once the
+    /// queue is drained.
+    fn close(mut self, last: RealtimeEventKind, slot: &FinalEvent, within: Duration) {
+        let deadline = Instant::now() + within;
+        let mut last = Some(RealtimeEvent {
+            call_id: self.call_id.clone(),
+            generation: self.generation,
+            kind: last,
+        });
+        while let Some(event) = last.take() {
+            if self.flush().is_err() {
+                return;
+            }
+            if self.backlog.is_empty() {
+                match self.tx.try_send(event) {
+                    Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+                    Err(TrySendError::Full(event)) => last = Some(event),
+                }
+            } else {
+                last = Some(event);
+            }
+            if Instant::now() >= deadline {
+                if let (Some(event), Ok(mut slot)) = (last.take(), slot.lock()) {
+                    *slot = Some(event.kind);
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 }
@@ -690,6 +923,7 @@ impl RealtimeVoiceSession {
                 event_rx,
                 input_resampler: StreamingResampler::new(WIRE_SAMPLE_RATE, WIRE_SAMPLE_RATE),
                 input_batch: VecDeque::new(),
+                final_event: FinalEvent::default(),
             },
             DetachedSession {
                 control_rx,
@@ -770,12 +1004,12 @@ pub(crate) enum SentControl {
 }
 
 async fn run_socket(
-    config: SessionConfig,
+    config: &SessionConfig,
     token: String,
-    audio_rx: Receiver<Command>,
-    control_rx: Receiver<ControlCommand>,
-    event_tx: SyncSender<RealtimeEvent>,
-) -> Result<(), String> {
+    audio_rx: &Receiver<Command>,
+    control_rx: &Receiver<ControlCommand>,
+    outlet: &mut EventOutlet,
+) -> Result<(), SocketError> {
     // Endpoint validation MUST precede token materialisation/attachment.
     validate_endpoint(&config.endpoint)?;
     let mut request = config
@@ -786,18 +1020,192 @@ async fn run_socket(
     let bearer = HeaderValue::from_str(&format!("Bearer {token}"))
         .map_err(|_| "Desktop gateway token is not a valid HTTP header value".to_string())?;
     request.headers_mut().insert(AUTHORIZATION, bearer);
-    let (socket, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| format!("Desktop realtime connection failed: {e}"))?;
+    let mut early = VecDeque::new();
+    let Some((socket, _)) = connect_or_stop(
+        tokio_tungstenite::connect_async(request),
+        control_rx,
+        &mut early,
+        CONNECT_TIMEOUT,
+    )
+    .await?
+    else {
+        // Stopped (the call ended, or the session was dropped) before OAIY
+        // answered: it never heard of this call, so there is nothing to tell.
+        return Ok(());
+    };
     let (mut sink, mut stream) = socket.split();
-    let start = StartEvent::for_session(&config);
+    run_stream(
+        config,
+        &mut sink,
+        &mut stream,
+        audio_rx,
+        control_rx,
+        early,
+        outlet,
+        READY_TIMEOUT,
+    )
+    .await
+}
+
+/// Open the connection, for at most `within`, watching the control queue
+/// while it opens: a Stop (or a session that was dropped) gives up at once
+/// (`Ok(None)`), and anything else is kept in `early` for the stream, in
+/// order. Before this, a wedged OAIY held the worker (and its socket) for as
+/// long as the call lasted, and a call answered meanwhile was dead air.
+async fn connect_or_stop<F, T, E>(
+    connect: F,
+    control_rx: &Receiver<ControlCommand>,
+    early: &mut VecDeque<ControlCommand>,
+    within: Duration,
+) -> Result<Option<T>, SocketError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    tokio::pin!(connect);
+    let deadline = tokio::time::sleep(within);
+    tokio::pin!(deadline);
+    let mut poll = tokio::time::interval(Duration::from_millis(5));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = &mut connect => {
+                return result
+                    .map(Some)
+                    .map_err(|e| transport_error(format!("Desktop realtime connection failed: {e}")));
+            }
+            _ = &mut deadline => {
+                note_unanswered(true);
+                return Err(transport_error(format!(
+                    "Desktop realtime did not answer the connection within {} ms",
+                    within.as_millis()
+                )));
+            }
+            _ = poll.tick() => loop {
+                match control_rx.try_recv() {
+                    Ok(ControlCommand::Stop { .. }) | Err(TryRecvError::Disconnected) => {
+                        return Ok(None)
+                    }
+                    Ok(other) => early.push_back(other),
+                    Err(TryRecvError::Empty) => break,
+                }
+            },
+        }
+    }
+}
+
+/// The next control: one kept while the connection opened first, then the
+/// queue.
+fn next_control(
+    early: &mut VecDeque<ControlCommand>,
+    control_rx: &Receiver<ControlCommand>,
+) -> Result<ControlCommand, TryRecvError> {
+    match early.pop_front() {
+        Some(command) => Ok(command),
+        None => control_rx.try_recv(),
+    }
+}
+
+/// The call's stream, once it is open: the start, then OAIY's events and the
+/// radio's controls until a Stop or a failure.
+///
+/// A failure that is not the stream's own (a protocol violation) leaves the
+/// stream working, so OAIY is still told the call is over on this side: with
+/// the radio's own Stop when one is already queued behind whatever failed
+/// (a handoff must read as a handoff to OAIY, not as the end of the call),
+/// else with the plain reason the radio gives off the OAIY route.
+#[allow(clippy::too_many_arguments)]
+async fn run_stream<Si, St, E>(
+    config: &SessionConfig,
+    sink: &mut Si,
+    stream: &mut St,
+    audio_rx: &Receiver<Command>,
+    control_rx: &Receiver<ControlCommand>,
+    mut early: VecDeque<ControlCommand>,
+    outlet: &mut EventOutlet,
+    ready_within: Duration,
+) -> Result<(), SocketError>
+where
+    Si: futures_util::Sink<Message> + Unpin,
+    Si::Error: std::fmt::Display,
+    St: futures_util::Stream<Item = Result<Message, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let result = drive_stream(
+        config,
+        sink,
+        stream,
+        audio_rx,
+        control_rx,
+        &mut early,
+        outlet,
+        ready_within,
+    )
+    .await;
+    if let Err(error) = &result {
+        // A session the radio has dropped (its control queue is gone) ends as
+        // it always did, with the stream simply closing.
+        let mut queued_stop = None;
+        let mut radio_gone = false;
+        if !error.transport {
+            loop {
+                match next_control(&mut early, control_rx) {
+                    Ok(ControlCommand::Stop { reason }) => {
+                        queued_stop = Some(reason);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        radio_gone = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !error.transport && (queued_stop.is_some() || !radio_gone) {
+            let reason = queued_stop.unwrap_or_else(|| "realtime voice failed".to_string());
+            let event = StopEvent {
+                kind: "formlogic.realtime.stop",
+                call_id: &config.call_id,
+                generation: config.generation,
+                reason: &reason,
+            };
+            let farewell = Message::Text(serde_json::to_string(&event).unwrap().into());
+            let _ = tokio::time::timeout(Duration::from_secs(1), sink.send(farewell)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), sink.close()).await;
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_stream<Si, St, E>(
+    config: &SessionConfig,
+    sink: &mut Si,
+    stream: &mut St,
+    audio_rx: &Receiver<Command>,
+    control_rx: &Receiver<ControlCommand>,
+    early: &mut VecDeque<ControlCommand>,
+    outlet: &mut EventOutlet,
+    ready_within: Duration,
+) -> Result<(), SocketError>
+where
+    Si: futures_util::Sink<Message> + Unpin,
+    Si::Error: std::fmt::Display,
+    St: futures_util::Stream<Item = Result<Message, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let start = StartEvent::for_session(config);
     sink.send(Message::Text(
         serde_json::to_string(&start)
             .map_err(|e| format!("cannot encode realtime start event: {e}"))?
             .into(),
     ))
     .await
-    .map_err(|e| format!("cannot start Desktop realtime stream: {e}"))?;
+    .map_err(|e| transport_error(format!("cannot start Desktop realtime stream: {e}")))?;
+    let ready_by = Instant::now() + ready_within;
+    let mut ready = false;
 
     let mut output_state = OutputParseState::default();
     let mut begun = false;
@@ -806,15 +1214,24 @@ async fn run_socket(
     loop {
         tokio::select! {
             _ = command_poll.tick() => {
+                // Whatever waited for room in the radio's queue goes first.
+                outlet.flush()?;
+                if !ready && Instant::now() >= ready_by {
+                    note_unanswered(true);
+                    return Err(transport_error(format!(
+                        "Desktop realtime did not say ready within {} ms",
+                        ready_within.as_millis()
+                    )));
+                }
                 // Stop/cancel always preempt queued audio.
                 loop {
-                    match control_rx.try_recv() {
+                    match next_control(early, control_rx) {
                         Ok(ControlCommand::Begin {
                             instructions,
                             greeting,
                         }) => {
                             if begun {
-                                return Err("Desktop realtime session was begun more than once".to_string());
+                                return Err("Desktop realtime session was begun more than once".to_string().into());
                             }
                             begun = true;
                             let event = BeginEvent {
@@ -825,11 +1242,14 @@ async fn run_socket(
                                 greeting: greeting.as_deref(),
                             };
                             sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
-                                .map_err(|e| format!("Desktop realtime begin failed: {e}"))?;
+                                .map_err(|e| transport_error(format!("Desktop realtime begin failed: {e}")))?;
                         }
                         Ok(ControlCommand::CancelOutput { item_id, played_ms }) => {
                             if !begun {
-                                return Err("Desktop realtime cancel arrived before begin".to_string());
+                                // Nothing has been said yet, so there is
+                                // nothing to cut: the cancel is dropped.
+                                eprintln!("[aokie-plugin] realtime cancel before begin dropped");
+                                continue;
                             }
                             let event = CancelEvent {
                                 kind: "formlogic.realtime.cancel_output",
@@ -839,13 +1259,21 @@ async fn run_socket(
                                 played_ms,
                             };
                             sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
-                                .map_err(|e| format!("Desktop realtime cancel failed: {e}"))?;
+                                .map_err(|e| transport_error(format!("Desktop realtime cancel failed: {e}")))?;
                             // Raw binary frames carry no item id. Once an
                             // exact item is cancelled, retain its identity in
                             // the parser until Desktop sends the matching
                             // item_done so late PCM can never be mistaken for
-                            // a future response.
-                            output_state.abandon_exact(&item_id)?;
+                            // a future response. A cancel that names some
+                            // other item (the radio's playout tail of an item
+                            // OAIY has already finished, while the next one
+                            // has started) changes nothing here, and OAIY
+                            // ignores a cancel for an item it is not saying:
+                            // it is never a reason to end the call, nor to
+                            // lose the Stop that may follow it.
+                            if let Err(error) = output_state.abandon_exact(&item_id) {
+                                eprintln!("[aokie-plugin] {error}; the stream goes on");
+                            }
                         }
                         Ok(ControlCommand::ToolResult {
                             tool_call_id,
@@ -855,7 +1283,7 @@ async fn run_socket(
                             continue_response,
                         }) => {
                             if !begun {
-                                return Err("Desktop realtime tool result arrived before begin".to_string());
+                                return Err("Desktop realtime tool result arrived before begin".to_string().into());
                             }
                             let event = ToolResultEvent {
                                 kind: "formlogic.realtime.tool_result",
@@ -868,7 +1296,7 @@ async fn run_socket(
                                 continue_response,
                             };
                             sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
-                                .map_err(|e| format!("Desktop realtime tool result failed: {e}"))?;
+                                .map_err(|e| transport_error(format!("Desktop realtime tool result failed: {e}")))?;
                         }
                         Ok(ControlCommand::TransferOutcome { frame }) => {
                             // An outcome is only ever about a call that
@@ -881,7 +1309,7 @@ async fn run_socket(
                                     frame: &frame,
                                 };
                                 sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
-                                    .map_err(|e| format!("Desktop realtime transfer outcome failed: {e}"))?;
+                                    .map_err(|e| transport_error(format!("Desktop realtime transfer outcome failed: {e}")))?;
                             }
                         }
                         Ok(ControlCommand::TransferNotice { frame }) => {
@@ -895,7 +1323,7 @@ async fn run_socket(
                                     frame: &frame,
                                 };
                                 sink.send(Message::Text(serde_json::to_string(&event).unwrap().into())).await
-                                    .map_err(|e| format!("Desktop realtime transfer notice failed: {e}"))?;
+                                    .map_err(|e| transport_error(format!("Desktop realtime transfer notice failed: {e}")))?;
                             }
                         }
                         Ok(ControlCommand::Stop { reason }) => {
@@ -917,10 +1345,10 @@ async fn run_socket(
                     match audio_rx.try_recv() {
                         Ok(Command::Audio(bytes)) => {
                             if !begun {
-                                return Err("caller audio was queued before Desktop realtime begin".to_string());
+                                return Err("caller audio was queued before Desktop realtime begin".to_string().into());
                             }
                             sink.send(Message::Binary(bytes.into())).await
-                                .map_err(|e| format!("Desktop realtime audio send failed: {e}"))?
+                                .map_err(|e| transport_error(format!("Desktop realtime audio send failed: {e}")))?
                         }
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => return Ok(()),
@@ -928,11 +1356,13 @@ async fn run_socket(
                 }
             }
             message = stream.next() => {
-                let Some(message) = message else { return Ok(()); };
-                match message.map_err(|e| format!("Desktop realtime receive failed: {e}"))? {
+                let Some(message) = message else {
+                    return Err(transport_error("Desktop realtime stream ended".to_string()));
+                };
+                match message.map_err(|e| transport_error(format!("Desktop realtime receive failed: {e}")))? {
                     Message::Text(text) => {
                         if text.len() > MAX_TEXT_BYTES {
-                            return Err("Desktop realtime text event exceeded 64 KiB".to_string());
+                            return Err("Desktop realtime text event exceeded 64 KiB".to_string().into());
                         }
                         let kind = parse_server_text(
                             &text,
@@ -942,13 +1372,17 @@ async fn run_socket(
                             &mut output_state,
                         )?;
                         if let Some(kind) = kind {
-                            send_event(&event_tx, &config, kind)?;
+                            if matches!(kind, RealtimeEventKind::Ready { .. }) {
+                                ready = true;
+                                note_unanswered(false);
+                            }
+                            outlet.push(kind)?;
                         }
                     }
                     Message::Binary(bytes) => {
                         if bytes.is_empty() { continue; }
                         if bytes.len() > MAX_BINARY_BYTES || bytes.len() % 2 != 0 {
-                            return Err("Desktop realtime PCM frame is malformed or too large".to_string());
+                            return Err("Desktop realtime PCM frame is malformed or too large".to_string().into());
                         }
                         let Some(item_id) = output_state.pcm_item()? else {
                             // A cancelled or recoverably-failed item remains
@@ -960,15 +1394,15 @@ async fn run_socket(
                             .chunks_exact(2)
                             .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
                             .collect();
-                        send_event(&event_tx, &config, RealtimeEventKind::OutputPcm { item_id, samples })?;
+                        outlet.push(RealtimeEventKind::OutputPcm { item_id, samples })?;
                     }
                     Message::Ping(payload) => sink.send(Message::Pong(payload)).await
-                        .map_err(|e| format!("Desktop realtime pong failed: {e}"))?,
+                        .map_err(|e| transport_error(format!("Desktop realtime pong failed: {e}")))?,
                     Message::Pong(_) | Message::Frame(_) => {}
                     Message::Close(frame) => {
-                        return Err(frame
+                        return Err(transport_error(frame
                             .map(|frame| format!("Desktop realtime closed: {}", frame.reason))
-                            .unwrap_or_else(|| "Desktop realtime closed".to_string()));
+                            .unwrap_or_else(|| "Desktop realtime closed".to_string())));
                     }
                 }
             }
@@ -1078,22 +1512,6 @@ impl OutputParseState {
     }
 }
 
-fn send_event(
-    tx: &SyncSender<RealtimeEvent>,
-    config: &SessionConfig,
-    kind: RealtimeEventKind,
-) -> Result<(), String> {
-    tx.try_send(RealtimeEvent {
-        call_id: config.call_id.clone(),
-        generation: config.generation,
-        kind,
-    })
-    .map_err(|error| match error {
-        TrySendError::Full(_) => "Desktop realtime output queue overflowed".to_string(),
-        TrySendError::Disconnected(_) => "Desktop realtime consumer stopped".to_string(),
-    })
-}
-
 fn parse_server_text(
     text: &str,
     call_id: &str,
@@ -1107,14 +1525,24 @@ fn parse_server_text(
         .get("callId")
         .and_then(Value::as_str)
         .ok_or_else(|| "Desktop realtime event omitted callId".to_string())?;
-    if server_call_id != call_id {
+    // OAIY answers a start it cannot read (`bad_start`) with an error that
+    // names no call (`"callId": ""`, generation 0): it never learned which
+    // call this stream is. It is about this stream all the same, and its
+    // message is the reason the call has no voice, so it is reported as
+    // what it is, never as a stale call id.
+    let unaddressed_error = server_call_id.is_empty()
+        && matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("formlogic.realtime.error" | "error")
+        );
+    if server_call_id != call_id && !unaddressed_error {
         return Err("Desktop realtime event carried a stale call id".to_string());
     }
     let server_generation = value
         .get("generation")
         .and_then(Value::as_u64)
         .ok_or_else(|| "Desktop realtime event omitted generation".to_string())?;
-    if server_generation != generation {
+    if server_generation != generation && !unaddressed_error {
         return Err("Desktop realtime event carried a stale generation".to_string());
     }
     let kind = value
@@ -1253,7 +1681,10 @@ fn parse_server_text(
             }))
         }
         "formlogic.realtime.error" | "error" => {
-            let fatal = value.get("fatal").and_then(Value::as_bool).unwrap_or(true);
+            // An error that names no call is about the stream as a whole:
+            // nothing on it can go on.
+            let fatal = unaddressed_error
+                || value.get("fatal").and_then(Value::as_bool).unwrap_or(true);
             let abandoned_item_id = if !fatal {
                 // Preserve the affected item as a parser tombstone. Desktop
                 // retains it until the provider's exact item_done, and raw
@@ -1296,7 +1727,19 @@ fn parse_server_text(
                 }
             }
         }
-        other => Err(format!("unsupported Desktop realtime event: {other}")),
+        other => {
+            // A kind this plugin does not know is one a newer OAIY added (OAIY
+            // itself ignores the kinds it does not know): it changes nothing
+            // here and never ends the call. The first few are logged.
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                eprintln!(
+                    "[aokie-plugin] ignoring a Desktop realtime event of a kind this plugin does not know: {}",
+                    other.chars().take(64).filter(|c| !c.is_control()).collect::<String>()
+                );
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -1668,6 +2111,7 @@ mod tests {
             event_rx,
             input_resampler: StreamingResampler::new(WIRE_SAMPLE_RATE, WIRE_SAMPLE_RATE),
             input_batch: VecDeque::new(),
+            final_event: FinalEvent::default(),
         };
 
         // Five 8 ms frames become one ordered 40 ms wire command rather than
@@ -2549,5 +2993,382 @@ mod tests {
             pacer.push("current", &[0]),
             Err(OutputPacerPushError::CapacityExceeded)
         );
+    }
+
+    #[test]
+    fn an_error_that_names_no_call_is_reported_with_its_own_message() {
+        // OAIY's answer to a start it cannot read: no call id, generation 0.
+        let mut state = OutputParseState::default();
+        let error = parse_server_text(
+            r#"{"type":"formlogic.realtime.error","callId":"","generation":0,"code":"bad_start","message":"start has no callId","fatal":true}"#,
+            "call_1",
+            7,
+            "https://api.openai.com",
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            error,
+            RealtimeEventKind::Error {
+                code: Some("bad_start".into()),
+                message: "start has no callId".into(),
+                fatal: true,
+                abandoned_item_id: None,
+            }
+        );
+        // Not fatal by its own word, it still cannot be about anything that
+        // goes on: it names no call.
+        state.start("item_1").unwrap();
+        let error = parse_server_text(
+            r#"{"type":"formlogic.realtime.error","callId":"","generation":0,"message":"odd","fatal":false}"#,
+            "call_1",
+            7,
+            "https://api.openai.com",
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(error, RealtimeEventKind::Error { fatal: true, abandoned_item_id: None, .. }));
+        assert_eq!(state.active.as_deref(), Some("item_1"), "nothing was abandoned");
+        // Any other event with no call id is still refused, and an error for
+        // another call too.
+        for stale in [
+            r#"{"type":"formlogic.realtime.ready","callId":"","generation":0,"destinationOrigin":"https://api.openai.com"}"#,
+            r#"{"type":"formlogic.realtime.error","callId":"call_2","generation":7,"message":"x"}"#,
+            r#"{"type":"formlogic.realtime.error","callId":"call_1","generation":6,"message":"x"}"#,
+        ] {
+            assert!(
+                parse_server_text(stale, "call_1", 7, "https://api.openai.com", &mut state).is_err(),
+                "{stale}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_of_a_kind_the_plugin_does_not_know_changes_nothing() {
+        let mut state = OutputParseState::default();
+        state.start("item_1").unwrap();
+        let before = state.clone();
+        assert_eq!(
+            parse_server_text(
+                r#"{"type":"formlogic.realtime.something_newer","callId":"call_1","generation":7,"level":0.4}"#,
+                "call_1",
+                7,
+                "https://api.openai.com",
+                &mut state,
+            ),
+            Ok(None)
+        );
+        assert_eq!(state, before);
+        // The stream goes on: the active item still takes its PCM.
+        assert_eq!(state.pcm_item().unwrap().as_deref(), Some("item_1"));
+    }
+
+    fn pcm(item: &str, samples: usize) -> RealtimeEventKind {
+        RealtimeEventKind::OutputPcm {
+            item_id: item.into(),
+            samples: vec![1; samples],
+        }
+    }
+
+    #[test]
+    fn a_full_radio_queue_holds_audio_in_order_merged_and_bounded_by_bytes() {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let mut outlet = EventOutlet::new(tx, "call_1", 7);
+        // Two fit; the rest waits, the audio of one item merged.
+        outlet.push(pcm("item_1", 480)).unwrap();
+        outlet.push(pcm("item_1", 480)).unwrap();
+        for _ in 0..10 {
+            outlet.push(pcm("item_1", 480)).unwrap();
+        }
+        outlet
+            .push(RealtimeEventKind::OutputItemDone {
+                item_id: "item_1".into(),
+            })
+            .unwrap();
+        outlet.push(pcm("item_2", 480)).unwrap();
+        assert_eq!(outlet.backlog.len(), 3, "item 1's audio, its done, item 2's audio");
+        // The radio takes what it can, a turn at a time; nothing is lost or
+        // reordered.
+        let mut seen: Vec<RealtimeEventKind> = Vec::new();
+        for _ in 0..10 {
+            while let Ok(event) = rx.try_recv() {
+                assert_eq!((event.call_id.as_str(), event.generation), ("call_1", 7));
+                seen.push(event.kind);
+            }
+            outlet.flush().unwrap();
+        }
+        assert!(outlet.backlog.is_empty());
+        assert_eq!(outlet.backlog_bytes, 0);
+        let item_1: usize = seen
+            .iter()
+            .filter_map(|kind| match kind {
+                RealtimeEventKind::OutputPcm { item_id, samples } if item_id == "item_1" => Some(samples.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(item_1, 12 * 480);
+        assert_eq!(seen.len(), 5, "two sent at once, three after: {seen:?}");
+        assert!(matches!(seen[3], RealtimeEventKind::OutputItemDone { .. }));
+        assert!(matches!(&seen[4], RealtimeEventKind::OutputPcm { item_id, .. } if item_id == "item_2"));
+
+        // Merging stops at a second of audio an event.
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let mut outlet = EventOutlet::new(tx, "call_1", 7);
+        outlet.push(pcm("item_1", 1)).unwrap();
+        for _ in 0..3 {
+            outlet.push(pcm("item_1", MAX_MERGED_PCM_SAMPLES / 2)).unwrap();
+        }
+        assert_eq!(outlet.backlog.len(), 2);
+        // A radio that never takes anything ends it only past 30 seconds of it.
+        let mut pushed = 3 * MAX_MERGED_PCM_SAMPLES / 2;
+        let error = loop {
+            match outlet.push(pcm("item_1", 2_400)) {
+                Ok(()) => pushed += 2_400,
+                Err(error) => break error,
+            }
+        };
+        assert!(error.contains("output queue overflowed"), "{error}");
+        assert!(pushed >= 30 * WIRE_SAMPLE_RATE as usize - 2_400, "{pushed}");
+    }
+
+    #[test]
+    fn why_a_worker_ended_is_never_lost_to_a_full_queue() {
+        let (tx, event_rx) = mpsc::sync_channel(1);
+        let final_event = FinalEvent::default();
+        let mut outlet = EventOutlet::new(tx, "call_1", 7);
+        outlet.push(pcm("item_1", 10)).unwrap();
+        outlet.push(pcm("item_1", 10)).unwrap();
+        outlet.close(
+            RealtimeEventKind::Closed {
+                reason: "Desktop realtime receive failed: reset".into(),
+                transport: true,
+            },
+            &final_event,
+            Duration::from_millis(30),
+        );
+        let (audio_tx, _audio_rx) = mpsc::sync_channel(COMMAND_DEPTH);
+        let (control_tx, _control_rx) = mpsc::channel();
+        let session = RealtimeVoiceSession {
+            call_id: "call_1".into(),
+            generation: 7,
+            audio_tx,
+            control_tx,
+            event_rx,
+            input_resampler: StreamingResampler::new(WIRE_SAMPLE_RATE, WIRE_SAMPLE_RATE),
+            input_batch: VecDeque::new(),
+            final_event,
+        };
+        assert!(matches!(session.try_recv().unwrap().unwrap().kind, RealtimeEventKind::OutputPcm { .. }));
+        assert_eq!(
+            session.try_recv().unwrap().unwrap().kind,
+            RealtimeEventKind::Closed {
+                reason: "Desktop realtime receive failed: reset".into(),
+                transport: true,
+            }
+        );
+        assert!(session.try_recv().is_err(), "said once");
+    }
+
+    /// The far end of an in-memory stream: what the plugin wrote to OAIY.
+    fn sent_frames(rx: &mpsc::Receiver<Message>) -> Vec<Value> {
+        let mut frames = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let Message::Text(text) = message {
+                frames.push(serde_json::from_str(&text).unwrap());
+            }
+        }
+        frames
+    }
+
+    fn text(value: Value) -> Result<Message, String> {
+        Ok(Message::Text(value.to_string().into()))
+    }
+
+    /// Run the call's stream against frames OAIY sends, with the radio's
+    /// controls queued by `controls` (a thread, so they can come later).
+    fn run_against(
+        from_oaiy: Vec<Result<Message, String>>,
+        then_silence: bool,
+        ready_within: Duration,
+        queued: Vec<ControlCommand>,
+        controls: impl FnOnce(Sender<ControlCommand>) + Send + 'static,
+    ) -> (Result<(), SocketError>, Vec<Value>, Vec<RealtimeEventKind>) {
+        let config = session_config(CallFacts::default());
+        let (to_oaiy, written) = mpsc::channel::<Message>();
+        let mut sink = Box::pin(futures_util::sink::unfold((), move |(), message: Message| {
+            let to_oaiy = to_oaiy.clone();
+            async move { to_oaiy.send(message).map_err(|_| "closed") }
+        }));
+        let frames = futures_util::stream::iter(from_oaiy);
+        let mut stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Message, String>>>> = if then_silence {
+            Box::pin(frames.chain(futures_util::stream::pending()))
+        } else {
+            Box::pin(frames)
+        };
+        let (_audio_tx, audio_rx) = mpsc::sync_channel(COMMAND_DEPTH);
+        let (control_tx, control_rx) = mpsc::channel();
+        for command in queued {
+            control_tx.send(command).unwrap();
+        }
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_DEPTH);
+        let mut outlet = EventOutlet::new(event_tx, &config.call_id, config.generation);
+        // The radio stays there for the whole run (a session it has dropped
+        // ends the stream at once).
+        let radio = control_tx.clone();
+        let feeder = std::thread::spawn(move || controls(control_tx));
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_stream(
+                &config,
+                &mut sink,
+                &mut stream,
+                &audio_rx,
+                &control_rx,
+                VecDeque::new(),
+                &mut outlet,
+                ready_within,
+            ));
+        feeder.join().unwrap();
+        drop(radio);
+        let events = event_rx.try_iter().map(|event| event.kind).collect();
+        (result, sent_frames(&written), events)
+    }
+
+    fn ready_frame() -> Result<Message, String> {
+        text(serde_json::json!({"type": "formlogic.realtime.ready", "callId": "call_1", "generation": 7, "destinationOrigin": "https://oaiy.localhost"}))
+    }
+
+    #[test]
+    fn no_ready_in_time_ends_the_stream_as_the_stream_failing() {
+        let started = Instant::now();
+        let (result, sent, _) = run_against(Vec::new(), true, Duration::from_millis(60), Vec::new(), |_| {});
+        let error = result.unwrap_err();
+        assert!(error.transport, "{error:?}");
+        assert!(error.reason.contains("did not say ready"), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(sent[0]["type"], "formlogic.realtime.start");
+    }
+
+    #[test]
+    fn the_stream_ending_or_closing_is_the_stream_failing_not_a_clean_stop() {
+        for last in [None, Some(Ok(Message::Close(None)))] {
+            let mut frames = vec![ready_frame()];
+            frames.extend(last);
+            let (result, _, events) = run_against(frames, false, READY_TIMEOUT, Vec::new(), |_| {});
+            let error = result.unwrap_err();
+            assert!(error.transport, "{error:?}");
+            assert!(matches!(events[0], RealtimeEventKind::Ready { .. }));
+        }
+        // A receive error is too.
+        let (result, _, _) = run_against(vec![ready_frame(), Err("reset".into())], false, READY_TIMEOUT, Vec::new(), |_| {});
+        assert!(result.unwrap_err().transport);
+    }
+
+    #[test]
+    fn a_cancel_for_an_item_oaiy_is_not_saying_neither_ends_the_stream_nor_loses_the_stop_behind_it() {
+        let started = text(serde_json::json!({"type": "formlogic.realtime.output_item_started", "callId": "call_1", "generation": 7, "itemId": "item_2"}));
+        let (result, sent, events) = run_against(
+            vec![ready_frame(), started],
+            true,
+            READY_TIMEOUT,
+            Vec::new(),
+            |controls| {
+                controls
+                    .send(ControlCommand::Begin { instructions: None, greeting: None })
+                    .unwrap();
+                // Item 2 has started on OAIY's side; the radio cuts item 1's
+                // playout tail and hands the caller to the owner.
+                std::thread::sleep(Duration::from_millis(150));
+                controls
+                    .send(ControlCommand::CancelOutput { item_id: "item_1".into(), played_ms: 300 })
+                    .unwrap();
+                controls
+                    .send(ControlCommand::Stop { reason: "handoff:takeover".into() })
+                    .unwrap();
+            },
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(matches!(&events[1], RealtimeEventKind::OutputItemStarted { item_id } if item_id == "item_2"));
+        let kinds: Vec<&str> = sent.iter().map(|frame| frame["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "formlogic.realtime.start",
+                "formlogic.realtime.begin",
+                "formlogic.realtime.cancel_output",
+                "formlogic.realtime.stop"
+            ]
+        );
+        assert_eq!(sent[3]["reason"], "handoff:takeover");
+    }
+
+    #[test]
+    fn a_protocol_failure_still_tells_oaiy_the_call_is_over_with_the_stop_already_queued() {
+        // PCM with no item started: a protocol violation, not the stream's.
+        let stray_pcm = Ok(Message::Binary(vec![0u8; 4].into()));
+        let (result, sent, _) = run_against(
+            vec![ready_frame(), stray_pcm.clone()],
+            true,
+            READY_TIMEOUT,
+            vec![ControlCommand::Stop { reason: "handoff:takeover".into() }],
+            |_| {},
+        );
+        // Either the stop was read first (a clean end) or the failure came
+        // first: OAIY hears the radio's own stop both ways.
+        if let Err(error) = &result {
+            assert!(!error.transport, "{error:?}");
+        }
+        assert_eq!(sent.last().unwrap()["type"], "formlogic.realtime.stop");
+        assert_eq!(sent.last().unwrap()["reason"], "handoff:takeover");
+
+        let (result, sent, _) = run_against(vec![ready_frame(), stray_pcm], true, READY_TIMEOUT, Vec::new(), |_| {});
+        let error = result.unwrap_err();
+        assert!(!error.transport);
+        assert!(error.reason.contains("PCM without an active output item"), "{error:?}");
+        assert_eq!(sent.last().unwrap()["type"], "formlogic.realtime.stop");
+        assert_eq!(sent.last().unwrap()["reason"], "realtime voice failed");
+    }
+
+    #[test]
+    fn a_connection_that_does_not_open_in_time_gives_up_and_a_stop_gives_up_at_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_control_tx, control_rx) = mpsc::channel::<ControlCommand>();
+        let mut early = VecDeque::new();
+        let started = Instant::now();
+        let wedged = std::future::pending::<Result<(), String>>();
+        let error = runtime
+            .block_on(connect_or_stop(wedged, &control_rx, &mut early, Duration::from_millis(50)))
+            .unwrap_err();
+        assert!(error.transport && error.reason.contains("did not answer the connection"), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // A stop while it opens: nothing is connected, nothing is kept.
+        let (control_tx, control_rx) = mpsc::channel();
+        control_tx
+            .send(ControlCommand::Begin { instructions: None, greeting: None })
+            .unwrap();
+        control_tx.send(ControlCommand::Stop { reason: "the caller hung up".into() }).unwrap();
+        let started = Instant::now();
+        let wedged = std::future::pending::<Result<(), String>>();
+        let outcome = runtime
+            .block_on(connect_or_stop(wedged, &control_rx, &mut early, Duration::from_secs(30)))
+            .unwrap();
+        assert!(outcome.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(early.front(), Some(ControlCommand::Begin { .. })), "what came before the stop is kept in order");
+
+        // A refused connection is the stream failing too, at once.
+        let refused = std::future::ready(Err::<(), _>("connection refused"));
+        let error = runtime
+            .block_on(connect_or_stop(refused, &control_rx, &mut VecDeque::new(), Duration::from_secs(30)))
+            .unwrap_err();
+        assert!(error.transport && error.reason.contains("connection failed: connection refused"));
     }
 }

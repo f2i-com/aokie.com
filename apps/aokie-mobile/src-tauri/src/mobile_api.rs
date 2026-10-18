@@ -30,6 +30,93 @@ where
     Option::<T>::deserialize(deserializer).map(RequiredNullable)
 }
 
+/// An enum value as a newer server may send it.
+///
+/// A name this build knows becomes `Known`; any other well-formed name is kept
+/// as `Unknown` so the record holding it can be dropped from its list (see
+/// `ValidateResponse::sanitize`) instead of failing the whole response, which
+/// used to take the screen down on every phone that had not updated yet. No
+/// `Unknown` value ever reaches the WebView.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tolerant<T> {
+    Known(T),
+    Unknown(String),
+}
+
+impl<T> Tolerant<T> {
+    fn is_known(&self) -> bool {
+        matches!(self, Self::Known(_))
+    }
+}
+
+impl<'de, T: DeserializeOwned> Deserialize<'de> for Tolerant<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::IntoDeserializer;
+        let name = String::deserialize(deserializer)?;
+        let known: Result<T, serde::de::value::Error> =
+            T::deserialize(name.as_str().into_deserializer());
+        match known {
+            Ok(value) => Ok(Self::Known(value)),
+            Err(_) if validate_id(&name, "enum value").is_ok() && name.len() <= 64 => {
+                Ok(Self::Unknown(name))
+            }
+            Err(_) => Err(serde::de::Error::custom("enum value is malformed")),
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for Tolerant<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Known(value) => value.serialize(serializer),
+            Self::Unknown(name) => name.serialize(serializer),
+        }
+    }
+}
+
+/// A capability list with the names this build does not know dropped: a
+/// newer server's capability is one this build cannot use anyway.
+fn deserialize_known_capabilities<'de, D>(
+    deserializer: D,
+) -> Result<Vec<CompanionCapability>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let names = Vec::<Tolerant<CompanionCapability>>::deserialize(deserializer)?;
+    if names.len() > 64 {
+        return Err(serde::de::Error::custom("capability list is too long"));
+    }
+    Ok(names
+        .into_iter()
+        .filter_map(|name| match name {
+            Tolerant::Known(capability) => Some(capability),
+            Tolerant::Unknown(_) => None,
+        })
+        .collect())
+}
+
+/// Fold display text into one line within its byte limit (see
+/// `aokie_protocol::text`): one multi-line summary used to fail the whole
+/// Calls list, and the WebView refuses control characters too.
+fn display_line(value: &mut String, maximum: usize) {
+    *value = aokie_protocol::text::sanitize_line(value, maximum);
+}
+
+fn optional_display_line(value: &mut RequiredNullable<String>, maximum: usize) {
+    if let Some(text) = value.0.as_mut() {
+        display_line(text, maximum);
+        if text.is_empty() {
+            value.0 = None;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompanionCapability {
@@ -126,6 +213,7 @@ struct CompanionDevice {
     subject_id: String,
     role: MobileRole,
     display_name: String,
+    #[serde(deserialize_with = "deserialize_known_capabilities")]
     grants: Vec<CompanionCapability>,
     approved_at: String,
     last_seen_at: String,
@@ -206,9 +294,9 @@ struct CompanionActivity {
     #[serde(deserialize_with = "deserialize_required_nullable")]
     actor_user_id: RequiredNullable<String>,
     subject_id: String,
-    event_type: ActivityEventType,
+    event_type: Tolerant<ActivityEventType>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
-    mode: RequiredNullable<SessionMode>,
+    mode: RequiredNullable<Tolerant<SessionMode>>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     reason: RequiredNullable<String>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
@@ -225,8 +313,8 @@ struct CompanionSession {
     #[serde(deserialize_with = "deserialize_required_nullable")]
     device_id: RequiredNullable<String>,
     subject_id: String,
-    mode: SessionMode,
-    state: SessionState,
+    mode: Tolerant<SessionMode>,
+    state: Tolerant<SessionState>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     joined_at: RequiredNullable<String>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
@@ -249,6 +337,9 @@ pub struct CompanionHistory {
 enum CallDirection {
     Inbound,
     Outbound,
+    // A direction a newer server names reads as unknown, which the WebView
+    // already shows.
+    #[serde(other)]
     Unknown,
 }
 
@@ -353,10 +444,10 @@ struct PushEndpoint {
     id: String,
     app_id: String,
     device_id: String,
-    kind: PushKind,
-    mode: PushMode,
-    provider: PushProvider,
-    environment: PushEnvironment,
+    kind: Tolerant<PushKind>,
+    mode: Tolerant<PushMode>,
+    provider: Tolerant<PushProvider>,
+    environment: Tolerant<PushEnvironment>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     topic: RequiredNullable<String>,
     fingerprint: String,
@@ -370,6 +461,7 @@ struct PushEndpoint {
 pub struct CompanionBootstrap {
     membership: CompanionMembership,
     device: CompanionDevice,
+    #[serde(deserialize_with = "deserialize_known_capabilities")]
     capabilities: Vec<CompanionCapability>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     availability: RequiredNullable<AvailabilityRecord>,
@@ -404,6 +496,12 @@ struct SetAvailabilityRequest {
 }
 
 trait ValidateResponse {
+    /// Make the response safe to keep before it is validated: fold display
+    /// text into bounded single lines, and drop the list entries a newer
+    /// server added values this build does not know to. Identifiers are never
+    /// rewritten; they stay strict in `validate`.
+    fn sanitize(&mut self) {}
+
     fn validate(&self) -> Result<(), String>;
 }
 
@@ -594,13 +692,22 @@ fn parse_response<T>(bytes: &[u8]) -> Result<T, String>
 where
     T: DeserializeOwned + ValidateResponse,
 {
-    let response: T = serde_json::from_slice(bytes)
+    let mut response: T = serde_json::from_slice(bytes)
         .map_err(|_| "Companion API response did not match its strict schema".to_string())?;
+    response.sanitize();
     response.validate()?;
     Ok(response)
 }
 
 impl ValidateResponse for CompanionBootstrap {
+    fn sanitize(&mut self) {
+        self.device.sanitize();
+        sanitize_groups(&mut self.routing_groups);
+        sanitize_staff(&mut self.staff);
+        self.history.sanitize();
+        self.push_endpoints.retain(PushEndpoint::is_known);
+    }
+
     fn validate(&self) -> Result<(), String> {
         validate_id(&self.membership.app_id, "membership appId")?;
         validate_id(&self.membership.app_slug, "membership appSlug")?;
@@ -637,6 +744,21 @@ impl ValidateResponse for CompanionBootstrap {
 }
 
 impl ValidateResponse for CompanionHistory {
+    fn sanitize(&mut self) {
+        self.activity.retain(|activity| {
+            activity.event_type.is_known()
+                && activity.mode.0.as_ref().is_none_or(Tolerant::is_known)
+        });
+        for activity in &mut self.activity {
+            optional_display_line(&mut activity.reason, 120);
+        }
+        self.sessions
+            .retain(|session| session.mode.is_known() && session.state.is_known());
+        for session in &mut self.sessions {
+            optional_display_line(&mut session.end_reason, 120);
+        }
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.activity.len() > 200 || self.sessions.len() > 200 {
             return Err("Companion history is too large".into());
@@ -652,6 +774,11 @@ impl ValidateResponse for CompanionHistory {
 }
 
 impl ValidateResponse for CompanionRouting {
+    fn sanitize(&mut self) {
+        sanitize_groups(&mut self.routing_groups);
+        sanitize_staff(&mut self.staff);
+    }
+
     fn validate(&self) -> Result<(), String> {
         validate_groups(&self.routing_groups)?;
         validate_staff(&self.staff)?;
@@ -660,6 +787,21 @@ impl ValidateResponse for CompanionRouting {
 }
 
 impl ValidateResponse for CompanionCallRecords {
+    fn sanitize(&mut self) {
+        for record in &mut self.records {
+            record.sanitize();
+        }
+        // One record that still fails (an unsafe id, an unredacted number) is
+        // left out of the list rather than failing every other call in it.
+        self.records.retain(|record| match record.validate() {
+            Ok(()) => true,
+            Err(message) => {
+                eprintln!("[AokieCompanion][calls] call record left out: {message}");
+                false
+            }
+        });
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.records.len() > 100 {
             return Err("Companion call-record response is too large".into());
@@ -679,6 +821,17 @@ impl ValidateResponse for CompanionCallRecords {
 }
 
 impl ValidateResponse for CompanionCallRecordDetail {
+    fn sanitize(&mut self) {
+        self.record.sanitize();
+        for turn in &mut self.transcript {
+            display_line(&mut turn.speaker, 64);
+            display_line(&mut turn.text, 10_000);
+        }
+        for follow_up in &mut self.follow_ups {
+            display_line(&mut follow_up.summary, 2_000);
+        }
+    }
+
     fn validate(&self) -> Result<(), String> {
         self.record.validate()?;
         if self.transcript.len() > 200 || self.follow_ups.len() > 100 {
@@ -721,6 +874,10 @@ impl ValidateResponse for CompanionAvailability {
 }
 
 impl CompanionDevice {
+    fn sanitize(&mut self) {
+        display_line(&mut self.display_name, 120);
+    }
+
     fn validate(&self) -> Result<(), String> {
         for (value, label) in [
             (&self.id, "device id"),
@@ -781,6 +938,11 @@ impl StaffMember {
 }
 
 impl CallRecord {
+    fn sanitize(&mut self) {
+        optional_display_line(&mut self.caller_name, 200);
+        optional_display_line(&mut self.summary, 5_000);
+    }
+
     fn validate(&self) -> Result<(), String> {
         validate_id(&self.id, "call record id")?;
         validate_id(&self.call_id, "call record callId")?;
@@ -860,6 +1022,13 @@ impl CompanionSession {
 }
 
 impl PushEndpoint {
+    fn is_known(&self) -> bool {
+        self.kind.is_known()
+            && self.mode.is_known()
+            && self.provider.is_known()
+            && self.environment.is_known()
+    }
+
     fn validate(&self) -> Result<(), String> {
         validate_id(&self.id, "push endpoint id")?;
         validate_id(&self.app_id, "push endpoint appId")?;
@@ -877,6 +1046,23 @@ impl PushEndpoint {
         }
         validate_optional_timestamp(&self.invalidated_at, "push endpoint invalidatedAt")?;
         validate_timestamp(&self.rotated_at, "push endpoint rotatedAt")
+    }
+}
+
+fn sanitize_groups(groups: &mut [RoutingGroup]) {
+    for group in groups {
+        display_line(&mut group.name, 120);
+        for member in &mut group.members {
+            display_line(&mut member.display_name, 120);
+            optional_display_line(&mut member.role_name, 120);
+        }
+    }
+}
+
+fn sanitize_staff(staff: &mut [StaffMember]) {
+    for member in staff {
+        display_line(&mut member.display_name, 120);
+        display_line(&mut member.role_name, 120);
     }
 }
 
@@ -1106,16 +1292,59 @@ mod tests {
     }
 
     #[test]
-    fn history_rejects_unknown_event_enums() {
+    fn history_leaves_out_entries_whose_kind_comes_from_a_newer_server() {
         let history = br#"{
           "activity":[{
             "id":"row_1","eventId":"event_1","appId":"app_1","sessionRecordId":null,
             "callId":null,"deviceId":null,"actorUserId":null,"subjectId":"device_1",
             "eventType":"caller_transcript","mode":null,"reason":null,"ownerEpoch":null,
             "occurredAt":"2026-07-16 03:00:00"
-          }],"sessions":[]
+          },{
+            "id":"row_2","eventId":"event_2","appId":"app_1","sessionRecordId":null,
+            "callId":null,"deviceId":null,"actorUserId":null,"subjectId":"device_1",
+            "eventType":"monitor_joined","mode":"monitor","reason":"Joined\nfrom the lock screen","ownerEpoch":null,
+            "occurredAt":"2026-07-16 03:00:00"
+          }],"sessions":[{
+            "id":"s_1","sessionId":"session_1","callId":"call_1","deviceId":null,
+            "subjectId":"device_1","mode":"whisper","state":"joined","joinedAt":null,
+            "endedAt":null,"endReason":null,"lastEventId":"event_2","lastEventAt":"2026-07-16 03:00:00"
+          }]
         }"#;
-        assert!(parse_response::<CompanionHistory>(history).is_err());
+        let parsed = parse_response::<CompanionHistory>(history).unwrap();
+        assert_eq!(parsed.activity.len(), 1);
+        assert_eq!(parsed.activity[0].id, "row_2");
+        assert_eq!(
+            parsed.activity[0].reason.0.as_deref(),
+            Some("Joined from the lock screen")
+        );
+        assert!(parsed.sessions.is_empty());
+        // What reaches the WebView carries only names it knows.
+        let encoded = serde_json::to_string(&parsed).unwrap();
+        assert!(!encoded.contains("caller_transcript") && !encoded.contains("whisper"));
+
+        // A malformed enum value is still refused outright.
+        let malformed = String::from_utf8(history.to_vec())
+            .unwrap()
+            .replace("caller_transcript", "caller transcript");
+        assert!(parse_response::<CompanionHistory>(malformed.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn capability_names_from_a_newer_server_are_dropped_not_fatal() {
+        let capabilities = deserialize_known_capabilities(&mut serde_json::Deserializer::from_str(
+            r#"["state_read","notes_read","monitor"]"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            capabilities,
+            vec![CompanionCapability::StateRead, CompanionCapability::Monitor]
+        );
+        assert!(
+            deserialize_known_capabilities(&mut serde_json::Deserializer::from_str(
+                r#"["state_read","not a name"]"#
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1142,10 +1371,17 @@ mod tests {
           }],"access":"full"
         }"#;
         assert!(parse_response::<CompanionCallRecords>(records).is_ok());
+        // An unredacted number never reaches the screen: that record is left
+        // out of the list.
         let unredacted = String::from_utf8(records.to_vec())
             .unwrap()
             .replace("... 782", "+61 491 570 156");
-        assert!(parse_response::<CompanionCallRecords>(unredacted.as_bytes()).is_err());
+        assert!(
+            parse_response::<CompanionCallRecords>(unredacted.as_bytes())
+                .unwrap()
+                .records
+                .is_empty()
+        );
         let secret = String::from_utf8(records.to_vec()).unwrap().replace(
             "\"access\":\"full\"",
             "\"access\":\"full\",\"accessToken\":\"secret\"",
@@ -1155,6 +1391,52 @@ mod tests {
             .unwrap()
             .replace("\"access\":\"full\"", "\"access\":\"none\"");
         assert!(parse_response::<CompanionCallRecords>(denied_with_records.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn one_multi_line_summary_or_bad_record_no_longer_fails_the_calls_list() {
+        let record = |id: &str, number: &str, summary: &str| {
+            serde_json::json!({
+                "id": id, "callId": format!("call_{id}"), "callerName": "Customer\tName",
+                "maskedNumber": number, "status": "completed", "direction": "internal",
+                "summary": summary, "startedAt": "2026-07-16T03:00:00Z",
+                "endedAt": "2026-07-16T03:04:00Z", "durationSeconds": 240,
+                "followUpRequired": false, "submittedAt": "2026-07-16 03:00:00"
+            })
+        };
+        let long_cjk = "予約".repeat(1_500);
+        let body = serde_json::json!({
+            "records": [
+                record("record_1", "... 782", "Booked Friday.\nCall back Thursday."),
+                record("record_2", "+61 491 570 156", "Unredacted number"),
+                record("record_3", "... 123", &long_cjk),
+                record("record_4", "... 456", "\n\n"),
+            ],
+            "access": "full"
+        });
+        let parsed = parse_response::<CompanionCallRecords>(body.to_string().as_bytes()).unwrap();
+        let ids: Vec<_> = parsed
+            .records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        assert_eq!(ids, ["record_1", "record_3", "record_4"]);
+        assert_eq!(
+            parsed.records[0].summary.0.as_deref(),
+            Some("Booked Friday. Call back Thursday.")
+        );
+        assert_eq!(
+            parsed.records[0].caller_name.0.as_deref(),
+            Some("Customer Name")
+        );
+        assert!(matches!(
+            parsed.records[0].direction,
+            CallDirection::Unknown
+        ));
+        let cut = parsed.records[1].summary.0.as_deref().unwrap();
+        assert!(cut.len() <= 5_000 && long_cjk.starts_with(cut));
+        // A summary of nothing but line breaks reads as no summary.
+        assert_eq!(parsed.records[2].summary.0, None);
     }
 
     #[test]

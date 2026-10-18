@@ -46,7 +46,9 @@ pub fn platform_supported() -> bool {
 /// plaintext", never fall back silently.
 #[cfg(windows)]
 pub fn protect(plain: &[u8]) -> Result<String, String> {
-    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
     unsafe {
         let mut input = CRYPT_INTEGER_BLOB {
             cbData: plain.len() as u32,
@@ -62,7 +64,8 @@ pub fn protect(plain: &[u8]) -> Result<String, String> {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            0,
+            // Never a dialog: this runs headless, and a prompt nobody sees would hang the call.
+            CRYPTPROTECT_UI_FORBIDDEN,
             &mut out,
         ) == 0
         {
@@ -96,7 +99,9 @@ pub fn protect(_plain: &[u8]) -> Result<String, String> {
 /// they never substitute an empty secret.
 #[cfg(windows)]
 pub fn unprotect(stored: &str) -> Result<Vec<u8>, String> {
-    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
     let b64 = stored
         .strip_prefix(DPAPI_PREFIX)
         .ok_or_else(|| "value is not DPAPI-sealed".to_string())?;
@@ -116,7 +121,8 @@ pub fn unprotect(stored: &str) -> Result<Vec<u8>, String> {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            0,
+            // Never a dialog: this runs headless, and a prompt nobody sees would hang the call.
+            CRYPTPROTECT_UI_FORBIDDEN,
             &mut out,
         ) == 0
         {

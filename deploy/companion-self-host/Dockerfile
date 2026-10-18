@@ -35,7 +35,7 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=5 \
   CMD health="$(curl --fail --silent --show-error --max-time 2 http://127.0.0.1:18787/health)" \
    && version="$(curl --fail --silent --show-error --max-time 2 http://127.0.0.1:18787/version)" \
    && printf '%s' "$health" | grep --quiet '"status":"ok"' \
-   && printf '%s' "$health" | grep --quiet '"v2Enabled":true' \
+   && printf '%s' "$version" | grep --quiet '"v2Enabled":true' \
    && printf '%s' "$version" | grep --quiet '"v2DynamicAdmission":true' \
    && printf '%s' "$version" | grep --quiet '"v2StaticAdmissionFallback":false' \
    && printf '%s' "$version" | grep --quiet '"signallingOnly":true' \

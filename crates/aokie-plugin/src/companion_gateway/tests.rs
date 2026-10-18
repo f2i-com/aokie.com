@@ -4929,10 +4929,12 @@ fn relay_urls_keep_their_path_and_refuse_unsafe_advertisements() {
     assert!(normalize_relay_url("wss://api.example.test/relay", "framesUrl").is_err());
     assert!(normalize_relay_url("http://public.example.test/relay", "framesUrl").is_err());
 
-    // The live install serves plain http on .local names, so managed-beta
-    // builds accept exactly those and nothing wider.
+    // The live install serves plain http on one exact .local API host, so
+    // managed-beta builds accept exactly that and loopback, nothing wider.
     let local = normalize_relay_url("http://api.formlogic.local/api/relay/frames", "framesUrl");
     let loopback = normalize_relay_url("http://127.0.0.1:17872/api/relay/frames", "framesUrl");
+    let other_local = normalize_relay_url("http://printer.local/api/relay/frames", "framesUrl");
+    let sibling = normalize_relay_url("http://formlogic.local/api/relay/frames", "framesUrl");
     if cfg!(feature = "managed-beta-driver") {
         assert!(local.is_ok());
         assert!(loopback.is_ok());
@@ -4940,6 +4942,23 @@ fn relay_urls_keep_their_path_and_refuse_unsafe_advertisements() {
     } else {
         assert!(local.is_err());
         assert!(loopback.is_err());
+    }
+    // Whoever answers mDNS for any other `.local` name would collect the
+    // bearer, so no build sends it there in plain text.
+    assert!(other_local.is_err());
+    assert!(sibling.is_err());
+    for host in ["127.0.0.1", "[::1]", "localhost", "api.formlogic.local", "API.FormLogic.local"] {
+        assert!(is_managed_beta_plaintext_host(host), "{host}");
+    }
+    for host in [
+        "formlogic.local",
+        "evil.local",
+        "api.formlogic.local.evil.test",
+        "x.api.formlogic.local",
+        "app.localhost",
+        "192.168.1.40",
+    ] {
+        assert!(!is_managed_beta_plaintext_host(host), "{host}");
     }
 }
 
@@ -6965,4 +6984,276 @@ mod transfer_end_to_end {
             None
         );
     }
+}
+
+// --- Per-device refusals on the socket (review: one device's race used to
+// end every device's session) ----------------------------------------------
+
+/// A socket-carrier harness: a live call, and device A holding an active
+/// takeover with its native peer installed.
+fn socket_harness_with_live_takeover() -> RelayHarness {
+    let mut harness = RelayHarness::new();
+    harness.session.relay_carrier = false;
+    install_takeover_route(&mut harness.session, LeasePhase::Active);
+    harness
+}
+
+fn assert_device_a_takeover_intact(session: &GatewaySession) {
+    assert!(session.peers.contains_key("rtc_a"), "device A's peer survives");
+    assert!(session.leases.contains_key("lease_active_jti"));
+    assert!(session.prepared.is_some(), "the takeover is not handed back");
+}
+
+/// What the gateway routes to the plugin: the mobile's signal without its
+/// bearer lease token.
+fn routed_to_plugin(mobile_frame: &str) -> String {
+    let mut value: Value = serde_json::from_str(mobile_frame).unwrap();
+    value.as_object_mut().unwrap().remove("leaseToken");
+    value.to_string()
+}
+
+fn socket_inbound(harness: &mut RelayHarness, encoded: &str) -> Result<Vec<String>, WorkerError> {
+    harness.session.handle_inbound(
+        encoded,
+        &harness.media,
+        &harness.radio,
+        false,
+        None,
+        None,
+        None,
+    )
+}
+
+#[test]
+fn a_stale_peer_frame_from_another_device_is_refused_alone_and_keeps_a_live_takeover() {
+    let mut harness = socket_harness_with_live_takeover();
+    let mut lease_b = takeover_claims(&harness.session, LeasePhase::Active);
+    lease_b.device_id = "device_b".into();
+    lease_b.rtc_session_id = "rtc_b".into();
+    lease_b.jti = "lease_b_jti".into();
+    lease_b.lease_id = "lease_b".into();
+    // Device B's peer closed a moment ago; its last candidate is still in
+    // flight through the gateway.
+    let late = routed_to_plugin(&signed_mobile_ice(
+        &lease_b,
+        "lease-token",
+        "signal_b_late",
+        "endpoint_jti_b_late",
+        2,
+        2,
+    ));
+    let error = socket_inbound(&mut harness, &late).expect_err("the stale frame is refused");
+    assert!(error.is_refusal(), "{:?}: {}", error.kind, error.message);
+    assert_device_a_takeover_intact(&harness.session);
+
+    // The same proof again is a replay: dropped, still only that frame.
+    let error = socket_inbound(&mut harness, &late).expect_err("a replay is refused");
+    assert!(error.is_refusal(), "{}", error.message);
+    assert!(error.message.contains("replayed"), "{}", error.message);
+    assert_device_a_takeover_intact(&harness.session);
+
+    // Device A's own candidate from an older SDP generation is refused too,
+    // without touching the newer route it belongs to.
+    let active = takeover_claims(&harness.session, LeasePhase::Active);
+    let old_generation = routed_to_plugin(&signed_mobile_ice(
+        &active,
+        "lease-token",
+        "signal_a_old",
+        "endpoint_jti_a_old",
+        1,
+        1,
+    ));
+    let error = socket_inbound(&mut harness, &old_generation).expect_err("stale generation");
+    assert!(error.is_refusal(), "{}", error.message);
+    assert!(error.message.contains("stale SDP generation"), "{}", error.message);
+    assert_device_a_takeover_intact(&harness.session);
+}
+
+#[test]
+fn a_forged_signature_or_identity_violation_still_ends_the_socket_session() {
+    let mut harness = socket_harness_with_live_takeover();
+    let mut lease_b = takeover_claims(&harness.session, LeasePhase::Active);
+    lease_b.device_id = "device_b".into();
+    lease_b.rtc_session_id = "rtc_b".into();
+    lease_b.jti = "lease_b_jti".into();
+    let mut forged: Value = serde_json::from_str(&routed_to_plugin(&signed_mobile_ice(
+        &lease_b,
+        "lease-token",
+        "signal_b_forged",
+        "endpoint_jti_b_forged",
+        2,
+        2,
+    )))
+    .unwrap();
+    forged["signal"]["envelope"]["signature"] = json!(URL_SAFE_NO_PAD.encode([7_u8; 64]));
+    let error = socket_inbound(&mut harness, &forged.to_string())
+        .expect_err("a bad signature is refused");
+    assert!(!error.is_refusal(), "a signature violation must not be absorbed");
+    assert_eq!(error.kind, WorkerErrorKind::Reconnect);
+
+    // A frame for another application is an identity violation.
+    let mut foreign: Value = serde_json::from_str(&routed_to_plugin(&signed_mobile_ice(
+        &lease_b,
+        "lease-token",
+        "signal_b_foreign",
+        "endpoint_jti_b_foreign",
+        2,
+        2,
+    )))
+    .unwrap();
+    foreign["appId"] = json!("app_other");
+    let error = socket_inbound(&mut harness, &foreign.to_string()).expect_err("foreign app");
+    assert!(!error.is_refusal());
+    assert_eq!(error.kind, WorkerErrorKind::Rebootstrap);
+}
+
+#[test]
+fn a_second_claimant_on_the_socket_is_rejected_to_the_gateway_not_torn_down() {
+    let mut harness = socket_harness_with_live_takeover();
+    let remote = harness.media.snapshot();
+    let mut lease = takeover_claims(&harness.session, LeasePhase::Prepared);
+    lease.device_id = "device_b".into();
+    lease.rtc_session_id = "rtc_b".into();
+    lease.call_id = "call_a".into();
+    lease.call_epoch = remote.call_epoch;
+    lease.owner_epoch = remote.owner_epoch;
+    lease.jti = "lease_b_prepared_jti".into();
+    lease.lease_id = "lease_b".into();
+    let proposal = serde_json::to_string(&json!({
+        "kind": "claim_proposal",
+        "schemaVersion": SCHEMA_VERSION,
+        "appId": harness.session.app_id,
+        "requestId": "claim_b",
+        "deviceId": "device_b",
+        "leaseToken": "lease-token",
+        "lease": lease,
+    }))
+    .unwrap();
+    let frames = socket_inbound(&mut harness, &proposal)
+        .expect("a losing claimant costs the session nothing");
+    assert_eq!(frames.len(), 1, "the gateway hears the refusal at once");
+    let decision: PluginClaimDecisionFrame = serde_json::from_str(&frames[0]).unwrap();
+    decision.validate().unwrap();
+    assert!(!decision.accepted);
+    assert!(!decision.media_ready);
+    assert_eq!(decision.request_id, "claim_b");
+    assert_eq!(decision.device_id, "device_b");
+    assert!(decision.reason.as_deref().unwrap().contains("second"));
+    assert_device_a_takeover_intact(&harness.session);
+    assert!(!harness.session.leases.contains_key("lease_b_prepared_jti"));
+}
+
+#[test]
+fn per_request_gateway_errors_and_unknown_kinds_do_not_reconnect() {
+    let mut harness = socket_harness_with_live_takeover();
+    let app_id = harness.session.app_id.clone();
+    let error = |code: &str| {
+        json!({
+            "kind": "error",
+            "schemaVersion": SCHEMA_VERSION,
+            "code": code,
+            "message": "refused",
+        })
+        .to_string()
+    };
+
+    // The gateway refused one plugin frame about one lease: logged, kept.
+    for code in ["stale_lease", "stale_state", "stale_request", "stale_end_caller_result"] {
+        assert!(socket_inbound(&mut harness, &error(code)).unwrap().is_empty(), "{code}");
+        assert_device_a_takeover_intact(&harness.session);
+    }
+
+    // A code this build does not know still reconnects, as before.
+    let unknown = socket_inbound(&mut harness, &error("boom")).expect_err("unknown code");
+    assert_eq!(unknown.kind, WorkerErrorKind::Reconnect);
+
+    // A frame kind from a newer gateway is ignored; a known kind that does
+    // not belong on this direction is still refused outright.
+    let newer = json!({"kind": "call_notes", "schemaVersion": SCHEMA_VERSION, "appId": app_id})
+        .to_string();
+    assert!(socket_inbound(&mut harness, &newer).unwrap().is_empty());
+    assert_device_a_takeover_intact(&harness.session);
+    let wrong_direction =
+        json!({"kind": "lease_request", "schemaVersion": SCHEMA_VERSION, "appId": app_id})
+            .to_string();
+    let error_kind = socket_inbound(&mut harness, &wrong_direction)
+        .expect_err("a known kind stays strict")
+        .kind;
+    assert_eq!(error_kind, WorkerErrorKind::Reconnect);
+
+    // `stale_claim` after this plugin decided a claim: the gateway no longer
+    // has it, so exactly that claim fails back to Aokie.
+    assert!(socket_inbound(&mut harness, &error("stale_claim")).unwrap().is_empty());
+    assert!(harness.session.prepared.is_none());
+    assert!(!harness.session.peers.contains_key("rtc_a"));
+    assert!(!harness.session.leases.contains_key("lease_active_jti"));
+}
+
+#[test]
+fn the_hello_proof_is_accepted_whether_the_desktop_clock_leads_or_trails_the_gateway() {
+    let authority = test_authority();
+    let credentials = admission("app_a", "aokie", &authority)
+        .into_credentials(None, "aokie", authority.clone())
+        .unwrap();
+    let gateway_now = unix_now().unwrap();
+    // A current gateway mints 25 s challenges; an older one minted 30 s.
+    for lifetime in [aokie_protocol::v2::ENDPOINT_CHALLENGE_LIFETIME, 30] {
+        let challenge = EndpointChallengeFrame {
+            kind: "endpoint_challenge".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            subject_id: "aokie".into(),
+            role: AdmissionRole::Plugin,
+            connection_id: "connection_skew".into(),
+            challenge_nonce: "challenge_skew".into(),
+            admission_jti: "admission_skew".into(),
+            holder_key_thumbprint: authority.endpoint_key.thumbprint.clone(),
+            expected_peer_key_thumbprint: None,
+            approved_peer_key_thumbprints: authority.approved_thumbprints(),
+            peer_roster_revision: Some(authority.roster_revision),
+            peer_roster_hash: Some(authority.roster_hash.clone()),
+            expires_at: gateway_now + lifetime,
+        };
+        // A Desktop clock up to five seconds behind, or well ahead, of the
+        // gateway. Ahead by more than five used to date the proof in the
+        // gateway's future and every connect failed.
+        for offset in [-5_i64, -1, 0, 1, 6, 12, 20] {
+            let local_now = (gateway_now as i64 + offset) as u64;
+            let (hello, _) = endpoint_hello(&challenge, &credentials, local_now)
+                .unwrap_or_else(|error| panic!("offset {offset}: {}", error.message));
+            let claims = &hello.endpoint_proof.claims;
+            assert!(claims.expires_at <= challenge.expires_at, "offset {offset}");
+            // What the gateway checks, a second later on its own clock.
+            hello
+                .endpoint_proof
+                .verify(gateway_now + 1)
+                .unwrap_or_else(|error| panic!("offset {offset}, lifetime {lifetime}: {error}"));
+        }
+    }
+}
+
+#[test]
+fn status_and_refusal_text_is_one_clean_line_within_its_byte_limit() {
+    // 300 CJK characters are 900 bytes: the old character cut let 720 of
+    // them through to a phone that refuses a claim message over 500 bytes.
+    let long = sanitize_status_message(&"語".repeat(300));
+    assert!(long.len() <= 240, "{}", long.len());
+    assert!(long.chars().all(|c| c == '語'));
+    assert_eq!(
+        sanitize_status_message("first\tline\u{7}\nsecond line"),
+        "first line"
+    );
+    assert_eq!(sanitize_status_message(""), "Companion gateway error");
+    assert_eq!(sanitize_status_message("\n"), "Companion gateway error");
+    let rejection = PluginClaimRejectedFrame {
+        kind: "plugin_claim_rejected".into(),
+        schema_version: SCHEMA_VERSION,
+        app_id: "app_a".into(),
+        device_id: "device_a".into(),
+        request_id: "request_a".into(),
+        code: "refused".into(),
+        message: sanitize_status_message(&"“quoted” 語\t".repeat(100)),
+    };
+    rejection.validate().unwrap();
+    aokie_protocol::text::check_line(&rejection.message, 240).unwrap();
 }

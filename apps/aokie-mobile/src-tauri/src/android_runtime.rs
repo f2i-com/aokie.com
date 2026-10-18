@@ -115,15 +115,15 @@ pub(crate) async fn diagnostics(app: &AppHandle) -> Result<AndroidRuntimeDiagnos
                             "()Ljava/lang/String;",
                             &[],
                         )
-                        .map_err(|error| error.to_string())?
+                        .map_err(|error| jni_failure(env, error))?
                         .l()
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| jni_failure(env, error))?;
                     if value.is_null() {
                         return Err("Android diagnostics returned no value".into());
                     }
                     env.get_string(&JString::from(value))
                         .map(String::from)
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| jni_failure(env, error))
                 })();
                 let _ = send.send(result);
             });
@@ -174,9 +174,9 @@ pub(crate) async fn secure_store_put(
             webview.jni_handle().exec(move |env, activity, _webview| {
                 let result = (|| -> Result<i32, String> {
                     let key =
-                        JObject::from(env.new_string(key).map_err(|error| error.to_string())?);
+                        JObject::from(env.new_string(key).map_err(|error| jni_failure(env, error))?);
                     let value =
-                        JObject::from(env.new_string(value).map_err(|error| error.to_string())?);
+                        JObject::from(env.new_string(value).map_err(|error| jni_failure(env, error))?);
                     env.call_method(
                         activity,
                         "putAokieSecureValue",
@@ -184,7 +184,7 @@ pub(crate) async fn secure_store_put(
                         &[JValue::Object(&key), JValue::Object(&value)],
                     )
                     .and_then(|value| value.i())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| jni_failure(env, error))
                 })();
                 let _ = send.send(result);
             });
@@ -226,7 +226,10 @@ pub(crate) async fn secure_store_get(app: &AppHandle, key: &str) -> Result<Optio
             webview.jni_handle().exec(move |env, activity, _webview| {
                 let result = (|| -> Result<Option<String>, String> {
                     let key =
-                        JObject::from(env.new_string(key).map_err(|error| error.to_string())?);
+                        JObject::from(env.new_string(key).map_err(|error| jni_failure(env, error))?);
+                    // `null` means nothing is stored. A value that exists but cannot be read
+                    // throws (see MainActivity.getAokieSecureValue) and arrives here as an
+                    // error, never as absence: callers must not replace what they cannot read.
                     let value = env
                         .call_method(
                             activity,
@@ -234,16 +237,21 @@ pub(crate) async fn secure_store_get(app: &AppHandle, key: &str) -> Result<Optio
                             "(Ljava/lang/String;)Ljava/lang/String;",
                             &[JValue::Object(&key)],
                         )
-                        .map_err(|error| error.to_string())?
+                        .map_err(|error| {
+                            format!(
+                                "Android secure-store value could not be read ({})",
+                                jni_failure(env, error)
+                            )
+                        })?
                         .l()
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| jni_failure(env, error))?;
                     if value.is_null() {
                         return Ok(None);
                     }
                     env.get_string(&JString::from(value))
                         .map(String::from)
                         .map(Some)
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| jni_failure(env, error))
                 })();
                 let _ = send.send(result);
             });
@@ -279,7 +287,7 @@ pub(crate) async fn secure_store_delete(app: &AppHandle, key: &str) -> Result<()
             webview.jni_handle().exec(move |env, activity, _webview| {
                 let result = (|| -> Result<i32, String> {
                     let key =
-                        JObject::from(env.new_string(key).map_err(|error| error.to_string())?);
+                        JObject::from(env.new_string(key).map_err(|error| jni_failure(env, error))?);
                     env.call_method(
                         activity,
                         "deleteAokieSecureValue",
@@ -287,7 +295,7 @@ pub(crate) async fn secure_store_delete(app: &AppHandle, key: &str) -> Result<()
                         &[JValue::Object(&key)],
                     )
                     .and_then(|value| value.i())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| jni_failure(env, error))
                 })();
                 let _ = send.send(result);
             });
@@ -351,16 +359,16 @@ pub(crate) async fn take_native_call_action(app: &AppHandle) -> Result<Option<St
                             "()Ljava/lang/String;",
                             &[],
                         )
-                        .map_err(|error| error.to_string())?
+                        .map_err(|error| jni_failure(env, error))?
                         .l()
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| jni_failure(env, error))?;
                     if value.is_null() {
                         return Ok(None);
                     }
                     env.get_string(&JString::from(value))
                         .map(String::from)
                         .map(Some)
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| jni_failure(env, error))
                 })();
                 let _ = send.send(result);
             });
@@ -408,10 +416,10 @@ pub(crate) async fn complete_native_call_action(
                 let result = (|| -> Result<i32, String> {
                     let action_id = JObject::from(
                         env.new_string(action_id)
-                            .map_err(|error| error.to_string())?,
+                            .map_err(|error| jni_failure(env, error))?,
                     );
                     let code =
-                        JObject::from(env.new_string(code).map_err(|error| error.to_string())?);
+                        JObject::from(env.new_string(code).map_err(|error| jni_failure(env, error))?);
                     env.call_method(
                         activity,
                         "completeAokieNativeCallAction",
@@ -423,7 +431,7 @@ pub(crate) async fn complete_native_call_action(
                         ],
                     )
                     .and_then(|value| value.i())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| jni_failure(env, error))
                 })();
                 let _ = send.send(result);
             });
@@ -448,6 +456,24 @@ pub(crate) async fn complete_native_call_action(
     _code: &str,
 ) -> Result<(), String> {
     Ok(())
+}
+
+/// The error text of a failed bridge call, after clearing any Java exception it left pending.
+///
+/// A Kotlin method that throws leaves its exception pending in this JNI environment, and wry hands the
+/// environment straight back to Android's main looper: the next JNI call there, or the looper's return
+/// to Java, then aborts the app mid-call. The Kotlin bridge methods catch their own failures, so this is
+/// the backstop; the one expected exception is a secure-store read error, thrown on purpose. Every JNI
+/// call in this file routes its error through here, and so must any new one (media.rs's permission
+/// bridge included).
+#[cfg(target_os = "android")]
+pub(crate) fn jni_failure(env: &mut jni::JNIEnv, error: jni::errors::Error) -> String {
+    if env.exception_check().unwrap_or(false) {
+        // Logs the Java stack trace to logcat; the messages carry no secret values.
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    error.to_string()
 }
 
 fn safe_native_id(value: &str) -> bool {
@@ -530,11 +556,11 @@ pub(crate) async fn reconcile_offer(
             webview.jni_handle().exec(move |env, activity, _webview| {
                 let result = (|| -> Result<i32, String> {
                     let call_id =
-                        JObject::from(env.new_string(call_id).map_err(|error| error.to_string())?);
+                        JObject::from(env.new_string(call_id).map_err(|error| jni_failure(env, error))?);
                     let outcome =
-                        JObject::from(env.new_string(outcome).map_err(|error| error.to_string())?);
+                        JObject::from(env.new_string(outcome).map_err(|error| jni_failure(env, error))?);
                     let reason =
-                        JObject::from(env.new_string(reason).map_err(|error| error.to_string())?);
+                        JObject::from(env.new_string(reason).map_err(|error| jni_failure(env, error))?);
                     env.call_method(
                         activity,
                         "reconcileAokieOffer",
@@ -547,7 +573,7 @@ pub(crate) async fn reconcile_offer(
                         ],
                     )
                     .and_then(|value| value.i())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| jni_failure(env, error))
                 })();
                 let _ = send.send(result);
             });
@@ -683,7 +709,7 @@ async fn call_int_no_args(app: &AppHandle, method: &'static str) -> Result<i32, 
                 let result = env
                     .call_method(activity, method, "()I", &[])
                     .and_then(|value| value.i())
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| jni_failure(env, error));
                 let _ = send.send(result);
             });
         })
@@ -710,7 +736,7 @@ async fn call_int_i32(app: &AppHandle, method: &'static str, argument: i32) -> R
                 let result = env
                     .call_method(activity, method, "(I)I", &[JValue::Int(argument)])
                     .and_then(|value| value.i())
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| jni_failure(env, error));
                 let _ = send.send(result);
             });
         })
@@ -737,15 +763,15 @@ async fn call_string_no_args(app: &AppHandle, method: &'static str) -> Result<St
                 let result = (|| -> Result<String, String> {
                     let value = env
                         .call_method(activity, method, "()Ljava/lang/String;", &[])
-                        .map_err(|error| error.to_string())?
+                        .map_err(|error| jni_failure(env, error))?
                         .l()
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| jni_failure(env, error))?;
                     if value.is_null() {
                         return Err("Android native bridge returned no value".into());
                     }
                     env.get_string(&JString::from(value))
                         .map(String::from)
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| jni_failure(env, error))
                 })();
                 let _ = send.send(result);
             });
@@ -777,7 +803,7 @@ async fn call_int_string(
                 let result = (|| -> Result<i32, String> {
                     let argument = JObject::from(
                         env.new_string(argument)
-                            .map_err(|error| error.to_string())?,
+                            .map_err(|error| jni_failure(env, error))?,
                     );
                     env.call_method(
                         activity,
@@ -786,7 +812,7 @@ async fn call_int_string(
                         &[JValue::Object(&argument)],
                     )
                     .and_then(|value| value.i())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| jni_failure(env, error))
                 })();
                 let _ = send.send(result);
             });
@@ -818,7 +844,7 @@ async fn call_string_string(
                 let result = (|| -> Result<String, String> {
                     let argument = JObject::from(
                         env.new_string(argument)
-                            .map_err(|error| error.to_string())?,
+                            .map_err(|error| jni_failure(env, error))?,
                     );
                     let value = env
                         .call_method(
@@ -827,15 +853,15 @@ async fn call_string_string(
                             "(Ljava/lang/String;)Ljava/lang/String;",
                             &[JValue::Object(&argument)],
                         )
-                        .map_err(|error| error.to_string())?
+                        .map_err(|error| jni_failure(env, error))?
                         .l()
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| jni_failure(env, error))?;
                     if value.is_null() {
                         return Err("Android native bridge returned no value".into());
                     }
                     env.get_string(&JString::from(value))
                         .map(String::from)
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| jni_failure(env, error))
                 })();
                 let _ = send.send(result);
             });
@@ -907,6 +933,229 @@ mod tests {
         assert!(MAIN_ACTIVITY.contains("fun openAokieNotificationSettings(): Int"));
         assert!(PROGUARD.contains("public int openAokieNotificationSettings();"));
         assert!(include_str!("android_runtime.rs").contains("\"openAokieNotificationSettings\""));
+    }
+
+    const KOTLIN_DIR_MAIN_ACTIVITY: &str =
+        include_str!("../gen/android/app/src/main/java/com/aokie/companion/MainActivity.kt");
+    const KOTLIN_SECURE_STORE: &str =
+        include_str!("../gen/android/app/src/main/java/com/aokie/companion/AokieSecureStore.kt");
+    const KOTLIN_NOTIFICATIONS: &str =
+        include_str!("../gen/android/app/src/main/java/com/aokie/companion/AokieCallNotifications.kt");
+    const KOTLIN_CALL_SERVICE: &str = include_str!(
+        "../gen/android/app/src/main/java/com/aokie/companion/AokieIncomingCallService.kt"
+    );
+    const KOTLIN_OFFER_STORE: &str =
+        include_str!("../gen/android/app/src/main/java/com/aokie/companion/AokieOfferStore.kt");
+    const KOTLIN_FCM: &str = include_str!(
+        "../gen/android/app/src/main/java/com/aokie/companion/AokieFirebaseMessagingService.kt"
+    );
+    const KOTLIN_AUDIO_ROUTES: &str =
+        include_str!("../gen/android/app/src/main/java/com/aokie/companion/AokieAudioRoutes.kt");
+    const KOTLIN_COMMUNICATION_SERVICE: &str = include_str!(
+        "../gen/android/app/src/main/java/com/aokie/companion/AokieCommunicationService.kt"
+    );
+    const MANIFEST: &str = include_str!("../gen/android/app/src/main/AndroidManifest.xml");
+    const PROGUARD_RULES: &str = include_str!("../gen/android/app/proguard-rules.pro");
+    const GRADLE: &str = include_str!("../gen/android/app/build.gradle.kts");
+
+    /// The Kotlin methods Rust calls by name through JNI: every string literal in `sources` that is a
+    /// lowerCamelCase identifier naming Aokie (`takeAokieNativeCallAction`, `aokieAudioRoutes`).
+    fn jni_method_names(sources: &[&str]) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for source in sources {
+            let mut rest = *source;
+            while let Some(quote) = rest.find('"') {
+                rest = &rest[quote + 1..];
+                let length = rest
+                    .bytes()
+                    .take_while(u8::is_ascii_alphanumeric)
+                    .count();
+                if length == 0 || rest.as_bytes().get(length) != Some(&b'"') {
+                    continue;
+                }
+                let name = &rest[..length];
+                let bytes = name.as_bytes();
+                let bridge = bytes[0].is_ascii_lowercase()
+                    && (name.contains("Aokie")
+                        || (name.starts_with("aokie")
+                            && bytes.get(5).is_some_and(u8::is_ascii_uppercase)));
+                if bridge {
+                    names.insert(name.to_owned());
+                }
+            }
+        }
+        names
+    }
+
+    /// The body of proguard-rules.pro's keep block for MainActivity's bridge methods.
+    fn bridge_keep_block() -> &'static str {
+        PROGUARD_RULES
+            .split("-keepclassmembers class com.aokie.companion.MainActivity {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("proguard-rules.pro keeps MainActivity's bridge methods")
+    }
+
+    #[test]
+    fn every_kotlin_method_rust_calls_is_declared_and_kept_from_r8() {
+        // Release builds minify with R8, which cannot see JNI use: a bridge method missing from the keep
+        // list is stripped, and the first call to it (the 200 ms native-call poll among them) dies with
+        // NoSuchMethodError.
+        let names = jni_method_names(&[
+            include_str!("android_runtime.rs"),
+            include_str!("media.rs"),
+            include_str!("native_init.rs"),
+            include_str!("realtime_v2.rs"),
+            include_str!("realtime.rs"),
+            include_str!("managed_auth.rs"),
+            include_str!("endpoint_identity.rs"),
+            include_str!("push_registration.rs"),
+            include_str!("lib.rs"),
+        ]);
+        for known in [
+            "takeAokieNativeCallAction",
+            "aokieAudioRoutes",
+            "signalAokieLiveTransition",
+            "requestAokieMicrophonePermission",
+        ] {
+            assert!(names.contains(known), "the scan missed `{known}`");
+        }
+        let keep = bridge_keep_block();
+        for name in &names {
+            assert!(
+                KOTLIN_DIR_MAIN_ACTIVITY.contains(&format!("fun {name}(")),
+                "Rust calls `{name}`, which MainActivity.kt does not declare"
+            );
+            assert!(
+                keep.contains(&format!(" {name}(")),
+                "proguard-rules.pro does not keep MainActivity.{name}: release R8 would strip it"
+            );
+        }
+        // The keep list names nothing MainActivity no longer has.
+        for line in keep
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("public ") && !line.contains('*'))
+        {
+            let name = line
+                .split('(')
+                .next()
+                .and_then(|head| head.rsplit(' ').next())
+                .expect("a kept method has a name");
+            assert!(
+                KOTLIN_DIR_MAIN_ACTIVITY.contains(&format!("fun {name}(")),
+                "proguard-rules.pro keeps `{name}`, which MainActivity.kt does not declare"
+            );
+        }
+        // The post-R8 check reads the same block and also checks members.
+        assert!(GRADLE.contains("val jniBridgeClass = \"com.aokie.companion.MainActivity\""));
+        assert!(GRADLE.contains("usage.txt"));
+    }
+
+    #[test]
+    fn the_name_scan_finds_bridge_calls_and_nothing_else() {
+        let names = jni_method_names(&[
+            r#"call(app, "takeAokieNativeCallAction"); x("aokieAudioRoutes", "AokieProbe")"#,
+            r#""aokie-companion://v2-idle-sync" "plain" "aokiecase" "", "#,
+        ]);
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            ["aokieAudioRoutes", "takeAokieNativeCallAction"]
+        );
+    }
+
+    #[test]
+    fn every_jni_error_path_clears_the_pending_java_exception() {
+        // An exception left pending after a bridge call aborts the app at the next JNI call on the main
+        // looper. Inside a JNI closure (indented past the async function body) an error must go through
+        // `jni_failure`; only the Tauri `with_webview` errors, at the function's own indent, may not.
+        let source = include_str!("android_runtime.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        for (number, line) in production.lines().enumerate() {
+            let indent = line.len() - line.trim_start().len();
+            if indent > 8 && line.contains("error.to_string()") {
+                panic!(
+                    "android_runtime.rs:{} maps a JNI error without clearing the Java exception",
+                    number + 1
+                );
+            }
+        }
+        assert!(production.matches("jni_failure(env, error)").count() >= 30);
+        assert!(production.contains("env.exception_clear()"));
+        // The Kotlin side catches its own failures in every bridge method.
+        for method in [
+            "fun takeAokieNativeCallAction(): String? =\n    runCatching",
+            "fun selectAokieAudioRoute(routeId: String): String? =\n    runCatching",
+            "fun presentAokieAuthoritativeOffer(encoded: String): Int = runCatching",
+            "fun reconcileAokieOffer(callId: String, callEpoch: Long, outcome: String, reason: String): Int = runCatching",
+            "fun aokieRuntimeDiagnostics(): String? = runCatching",
+            "fun requestAokieMicrophonePermission(requestId: Int): Int = runCatching",
+        ] {
+            assert!(
+                KOTLIN_DIR_MAIN_ACTIVITY.contains(method),
+                "MainActivity.kt lost `{method}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_secure_value_that_cannot_be_read_is_an_error_not_absence() {
+        // Rust reads `null` as "nothing stored": returning it for a Keystore or decrypt error made the
+        // caller mint a new identity, sign the user out, or rewrite the profile index.
+        assert!(KOTLIN_SECURE_STORE.contains("fun read(context: Context, logicalKey: String): Result<String?>"));
+        assert!(KOTLIN_SECURE_STORE.contains("if (!target.exists()) return@runCatching null"));
+        assert!(KOTLIN_DIR_MAIN_ACTIVITY.contains("AokieSecureStore.read(this, key).getOrElse {"));
+        assert!(KOTLIN_DIR_MAIN_ACTIVITY.contains("throw IllegalStateException(\"Aokie secure value could not be read\")"));
+        assert!(include_str!("android_runtime.rs")
+            .contains("\"Android secure-store value could not be read ({})\""));
+    }
+
+    #[test]
+    fn the_notification_answer_opens_the_app_and_runs_the_system_answer_claim() {
+        assert!(KOTLIN_NOTIFICATIONS.contains(".setAction(MainActivity.ACTION_ANSWER_OFFER)"));
+        assert!(
+            !KOTLIN_NOTIFICATIONS.contains("AokieIncomingCallService.ACTION_ANSWER, 3)"),
+            "Answer must not be a service PendingIntent: Android 12+ blocks the app launch it needs"
+        );
+        assert!(KOTLIN_DIR_MAIN_ACTIVITY.contains("intent?.action == ACTION_ANSWER_OFFER"));
+        assert!(KOTLIN_DIR_MAIN_ACTIVITY.contains(".setAction(AokieIncomingCallService.ACTION_ANSWER)"));
+        // Both Answer paths share the claim, and the in-app one runs it before Telecom's answer().
+        let local = KOTLIN_CALL_SERVICE
+            .split("is LocalAction.Answer -> {")
+            .nth(1)
+            .and_then(|rest| rest.split("is LocalAction.Won -> {").next())
+            .expect("the service handles a local Answer");
+        let claim = local.find("claimAnswer(offer, fence)").expect("local Answer claims");
+        let answer = local
+            .find("answer(CallAttributesCompat.CALL_TYPE_AUDIO_CALL)")
+            .expect("local Answer answers");
+        assert!(claim < answer);
+        assert!(KOTLIN_CALL_SERVICE.contains("if (!claimAnswer(offer, fence)) {\n      throw"));
+    }
+
+    #[test]
+    fn companion_audio_holds_a_microphone_foreground_service_while_it_runs() {
+        assert!(MANIFEST.contains("android:name=\".AokieCommunicationService\""));
+        assert!(MANIFEST.contains("android:foregroundServiceType=\"microphone|phoneCall\""));
+        assert!(MANIFEST.contains("android.permission.FOREGROUND_SERVICE_MICROPHONE"));
+        assert!(MANIFEST.contains("android.permission.WAKE_LOCK"));
+        assert!(KOTLIN_AUDIO_ROUTES.contains("AokieCommunicationService.start(context)"));
+        assert!(KOTLIN_AUDIO_ROUTES.contains("AokieCommunicationService.stop(context)"));
+        // Started with a plain startService, so a refused foreground start can never crash the app.
+        assert!(!KOTLIN_COMMUNICATION_SERVICE.contains("startForegroundService("));
+        assert!(KOTLIN_COMMUNICATION_SERVICE.contains("PROXIMITY_SCREEN_OFF_WAKE_LOCK"));
+    }
+
+    #[test]
+    fn pushes_never_replace_or_cancel_an_answered_call() {
+        assert!(KOTLIN_OFFER_STORE.contains(
+            "if (!aokiePushMayReplace(current, offer, AokieIncomingCallService.liveOfferId)) return@synchronized false"
+        ));
+        assert!(KOTLIN_FCM.contains("AokieOfferStore.cancelFromPush("));
+        assert!(!KOTLIN_FCM.contains("AokieOfferStore.cancel(this, cancellation.offerId"));
+        assert!(KOTLIN_OFFER_STORE.contains("authoritative_offer_refused_during_live_call"));
+        // The call service publishes which call it runs, so a dead process's won record is recognised.
+        assert!(KOTLIN_CALL_SERVICE.contains("liveOfferId = offer.offerId"));
     }
 
     #[test]

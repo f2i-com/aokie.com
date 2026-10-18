@@ -15,6 +15,7 @@ mod push_registration;
 mod realtime;
 mod realtime_v2;
 mod server_profiles;
+mod ws_tls;
 
 use desktop_pairing::{
     native_confirm_desktop_pairing, native_review_desktop_pairing_offer, DesktopPairingState,
@@ -222,14 +223,54 @@ pub fn run() {
     let app = builder
         .build(tauri::generate_context!())
         .expect("error while running Aokie Companion");
-    app.run(|_app, event| {
+    app.run(|app, event| {
         #[cfg(target_os = "android")]
         if matches!(event, tauri::RunEvent::Exit) {
+            return_companion_lease_before_exit(app);
             process_exit::exit_now();
         }
         #[cfg(not(target_os = "android"))]
-        let _ = event;
+        let _ = (app, event);
     });
+}
+
+/// The longest the Android exit waits for a live Companion lease to go back.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+const EXIT_LEASE_RETURN_WAIT: std::time::Duration = std::time::Duration::from_millis(2_500);
+/// Once the return is queued, the time its transport gets to send it before the process ends.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+const EXIT_LEASE_RETURN_FLUSH: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// Returns a live Companion media lease before the Android process ends.
+///
+/// Swiping the app away from Recents destroys its activity; Tauri's event loop then ends and the process
+/// exits (process_exit.rs), taking the call service and the media with it. Keeping the process up instead
+/// would not keep the call: a later activity gets no WebView (wry recreates one only across a
+/// configuration change), and every native bridge, the call notification's buttons included, needs it.
+/// Without this the Desktop kept the caller waiting on a human until it noticed the lease was gone; now
+/// it takes the caller back at once. With no lease it returns immediately, and it never waits longer than
+/// [`EXIT_LEASE_RETURN_WAIT`].
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn return_companion_lease_before_exit(app: &AppHandle) {
+    use tauri::Manager;
+
+    let (done, finished) = std::sync::mpsc::channel();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let returned = realtime_v2_revoke_lease(
+            app.clone(),
+            app.state::<RealtimeState>(),
+            app.state::<NativeMediaState>(),
+            "companion_app_closed".into(),
+        )
+        .await
+        .is_ok();
+        if returned {
+            tokio::time::sleep(EXIT_LEASE_RETURN_FLUSH).await;
+        }
+        let _ = done.send(returned);
+    });
+    let _ = finished.recv_timeout(EXIT_LEASE_RETURN_WAIT);
 }
 
 // Keep the exported command response types referenced in this module so the

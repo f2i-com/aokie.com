@@ -13,8 +13,6 @@ members = [
     # default-members (like aokie-plugin): built explicitly.
     "crates/aokie-winbt",
     "crates/aokie-audio",
-    "crates/aokie-db",
-    "crates/aokie-receptionist",
     "crates/aokie-plugin",
     # First-party Ed25519 bundle signing (TRUST-001): writes package-manifest.json
     # pinning every release-bundle file's digest; FormLogic Desktop pins the public
@@ -25,14 +23,13 @@ members = [
 # `aokie-plugin` (the FormLogic Desktop JSON-RPC process) is a member
 # but is intentionally kept out of `default-members`: a later task
 # wires its runtime up against these crates. `default-members` keeps a
-# bare `cargo build` scoped to the five native library crates that are
+# bare `cargo build` scoped to the four native library crates that are
 # known-green so the not-yet-wired plugin can't break the default build.
 default-members = [
     "crates/aokie-core",
     "crates/aokie-bluetooth",
     "crates/aokie-dongle",
     "crates/aokie-audio",
-    "crates/aokie-db",
 ]
 
 [workspace.package]

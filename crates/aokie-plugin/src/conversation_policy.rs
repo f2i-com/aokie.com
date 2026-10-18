@@ -53,7 +53,17 @@ pub(crate) fn explicit_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
     let month = c.get(4).or(c.get(7))?.as_str().to_lowercase();
     let month = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"].iter().position(|m| *m == month)? as u32 + 1;
     let day = c.get(5).or(c.get(6))?.as_str().parse().ok()?;
-    NaiveDate::from_ymd_opt(today.year(), month, day)
+    // A month and day with no year is the next one: "January 5th" said on
+    // 20 December is next January, not this year's (which has passed, and
+    // was refused as in the past while the right date was refused as not
+    // what the caller said). 29 February goes to the next year that has it.
+    let this_year = NaiveDate::from_ymd_opt(today.year(), month, day);
+    match this_year {
+        Some(date) if date >= today => Some(date),
+        _ => (1..=8).find_map(|ahead| {
+            NaiveDate::from_ymd_opt(today.year() + ahead, month, day)
+        }),
+    }
 }
 
 fn latest_explicit_date(history: &[Value], today: NaiveDate) -> Option<NaiveDate> {
@@ -116,6 +126,23 @@ mod tests {
         assert!(!context(today, &h, false, false).contains("Latest explicit date in caller speech:"));
         assert!(guard_sentence("September 15th is unavailable; try September 18th.", &h, today, false).is_none());
     }
+    /// Review 2026-10: a month and day said in late December meant this
+    /// year's, already past. It is the next one.
+    #[test]
+    fn a_date_without_a_year_is_the_next_one() {
+        let december = NaiveDate::from_ymd_opt(2026, 12, 20).unwrap();
+        assert_eq!(explicit_date("January 5th please", december), NaiveDate::from_ymd_opt(2027, 1, 5));
+        assert_eq!(explicit_date("the 3rd of January", december), NaiveDate::from_ymd_opt(2027, 1, 3));
+        assert_eq!(explicit_date("December 22nd", december), NaiveDate::from_ymd_opt(2026, 12, 22));
+        assert_eq!(explicit_date("December 20th", december), Some(december), "today is today");
+        // A year said is kept as said.
+        assert_eq!(explicit_date("2026-01-05", december), NaiveDate::from_ymd_opt(2026, 1, 5));
+        // 29 February goes to the next leap year.
+        let march = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        assert_eq!(explicit_date("February 29", march), NaiveDate::from_ymd_opt(2028, 2, 29));
+        assert_eq!(explicit_date("February 30", march), None);
+    }
+
     #[test]
     fn unavailable_team_and_unproven_booking_are_not_promised() {
         let today = NaiveDate::from_ymd_opt(2026, 9, 12).unwrap();

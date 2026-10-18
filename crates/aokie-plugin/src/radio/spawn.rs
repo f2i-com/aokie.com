@@ -59,14 +59,21 @@ pub fn spawn(
             }
             let _finished = ThreadFinished(status_thread.clone());
             // Transport selection (settings.transportMode): the WinUSB dongle
-            // is the proven full-control backend; `native` uses the built-in
-            // Windows Bluetooth stack (aokie-winbt) so no driver install is
-            // needed; `auto` prefers native when a Windows adapter exists.
-            let use_native = match transport_mode {
-                TransportMode::Native => true,
-                TransportMode::Auto => native_adapter_present(),
-                TransportMode::Dongle => false,
-            };
+            // is the proven full-control backend and the only one that
+            // carries call audio; `native` uses the built-in Windows
+            // Bluetooth stack (aokie-winbt) so no driver install is needed,
+            // but its calls carry no audio; `auto` takes the dongle whenever
+            // one bound to WinUSB is plugged in (`picks_native_backend`).
+            let use_native =
+                picks_native_backend(transport_mode, winusb_dongle_present, native_adapter_present);
+            if use_native {
+                eprintln!(
+                    "[aokie-plugin] transportMode={}: Windows' own Bluetooth stack. Calls ring and can be \
+                     answered or ended, but carry no audio: the receptionist cannot hear or speak on them. Texts \
+                     and contacts work. A dongle bound to WinUSB (transportMode=dongle) carries calls.",
+                    transport_mode.as_str()
+                );
+            }
             // Software "virtual replug": on a cold boot the dongle's SCO iso
             // endpoint is dead until the device is re-enumerated (physically
             // unplug/replug). CM_Reenumerate the device before opening it so a
@@ -77,7 +84,7 @@ pub fn spawn(
                 if let Some(hwid) = reenumerate_hwid.as_deref() {
                 match virtual_replug(hwid) {
                     Ok(()) => {
-                        eprintln!("[aokie-plugin] restarted {hwid} (virtual replug: remove + re-add) â€” settling 3s");
+                        eprintln!("[aokie-plugin] restarted {hwid} (virtual replug: remove + re-add) — settling 3s");
                         std::thread::sleep(std::time::Duration::from_millis(3000));
                     }
                     Err(e) => eprintln!("[aokie-plugin] virtual replug {hwid} failed (continuing): {e}"),
@@ -227,7 +234,57 @@ pub fn spawn(
 // What is Windows' own in the radio thread. Each has a twin for the other systems that have the radio, so that the
 // thread's body is one text for all of them.
 
-/// Whether Windows has a Bluetooth adapter of its own (`transportMode=auto` then prefers the native backend).
+/// Which backend `transportMode` starts: true for Windows' own Bluetooth stack. `auto` takes the dongle whenever one
+/// bound to WinUSB is plugged in, since only the dongle carries call audio, and Windows' own stack only when there is
+/// no such dongle and Windows has an adapter (calls then ring and are answered or ended, and nobody hears them). With
+/// neither it is the dongle, whose start then says what is missing. The probes run only for `auto`.
+#[cfg(aokie_radio)]
+fn picks_native_backend(
+    mode: crate::backend::TransportMode,
+    winusb_dongle: impl FnOnce() -> bool,
+    native_adapter: impl FnOnce() -> bool,
+) -> bool {
+    use crate::backend::TransportMode;
+    match mode {
+        TransportMode::Native => true,
+        TransportMode::Dongle => false,
+        TransportMode::Auto => !winusb_dongle() && native_adapter(),
+    }
+}
+
+/// Whether a Bluetooth dongle bound to WinUSB is plugged in: one the catalog names, or, where the operator opted in
+/// to unknown dongles or the build binds unverified ones (managed beta), any device bound to WinUSB whose class is
+/// never denied. Read from the USB device list, so nothing is opened: a dongle another process still holds counts
+/// too, and the dongle's own start says it is busy, rather than `auto` quietly falling back to calls without audio.
+#[cfg(target_os = "windows")]
+fn winusb_dongle_present() -> bool {
+    let known: std::collections::HashSet<(u16, u16)> = aokie_core::dongle_catalog::list_known_dongles()
+        .iter()
+        .map(|d| (d.vid, d.pid))
+        .collect();
+    let unverified_too =
+        aokie_core::dongle_catalog::unknown_dongle_opted_in() || cfg!(feature = "managed-beta-driver");
+    match aokie_dongle::list_devices(true) {
+        Ok(devices) => devices.iter().any(|d| {
+            d.driver.eq_ignore_ascii_case("WinUSB")
+                && (known.contains(&(d.vid, d.pid))
+                    || (unverified_too && !aokie_core::dongle_catalog::class_is_denied(&d.class)))
+        }),
+        Err(e) => {
+            eprintln!("[aokie-plugin] transportMode=auto: the USB device list is unavailable ({e}); taking the dongle");
+            true
+        }
+    }
+}
+
+/// No WinUSB off Windows (and no native backend to fall back to: `auto` means the dongle).
+#[cfg(all(aokie_radio, not(target_os = "windows")))]
+fn winusb_dongle_present() -> bool {
+    false
+}
+
+/// Whether Windows has a Bluetooth adapter of its own (`transportMode=auto` then takes the native backend when no
+/// WinUSB dongle is plugged in).
 #[cfg(target_os = "windows")]
 fn native_adapter_present() -> bool {
     aokie_winbt::runtime::adapter_present()
@@ -282,3 +339,25 @@ fn raise_timer_resolution() {}
 
 #[cfg(all(aokie_radio, not(target_os = "windows")))]
 fn restore_timer_resolution() {}
+
+#[cfg(all(test, aokie_radio))]
+mod transport_choice_tests {
+    use super::picks_native_backend;
+    use crate::backend::TransportMode;
+
+    #[test]
+    fn auto_takes_a_winusb_dongle_over_windows_own_stack() {
+        assert!(!picks_native_backend(TransportMode::Auto, || true, || true));
+        // No dongle: Windows' own stack, when there is an adapter.
+        assert!(picks_native_backend(TransportMode::Auto, || false, || true));
+        // Neither: the dongle, whose start says what is missing.
+        assert!(!picks_native_backend(TransportMode::Auto, || false, || false));
+    }
+
+    #[test]
+    fn the_named_modes_take_their_transport_and_probe_nothing() {
+        let probe = || -> bool { panic!("a named transport mode must not probe") };
+        assert!(picks_native_backend(TransportMode::Native, probe, probe));
+        assert!(!picks_native_backend(TransportMode::Dongle, probe, probe));
+    }
+}

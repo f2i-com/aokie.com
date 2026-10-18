@@ -377,6 +377,26 @@ fn validate_spoken_date(agreement: &str, date: NaiveDate, today: NaiveDate) -> R
             date.format("%A")
         ));
     }
+    // A bare weekday is the coming one (today to six days on); "next" allows
+    // the one after too. Any Thursday a month or a year out matched before.
+    if let Err(weekday) = chosen {
+        let next = speech[..chosen_at].split_whitespace().last() == Some("next");
+        let ahead = (date - today).num_days();
+        let reach = if next { 13 } else { 6 };
+        if !(0..=reach).contains(&ahead) {
+            let gap = (7 + weekday.num_days_from_monday() as i64
+                - today.weekday().num_days_from_monday() as i64)
+                % 7;
+            let coming = today + Duration::days(gap);
+            return Err(format!(
+                "{} is {} days away, but the caller said {}{chosen_word}, which is {}: use that date, or ask them which {chosen_word} they mean, then call this tool again",
+                date,
+                ahead,
+                if next { "next " } else { "" },
+                coming.format("%A %-d %B")
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -654,6 +674,25 @@ mod tests {
 
     fn day() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 7, 20).unwrap()
+    }
+
+    /// Review 2026-10: "Thursday" matched a Thursday a month or a year out.
+    /// It is the coming one; "next Thursday" may be the one after.
+    #[test]
+    fn a_bare_weekday_is_the_coming_one() {
+        let monday = day(); // Monday 20 July 2026
+        let thursday = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        assert!(validate_spoken_date("Thursday at 10", thursday, monday).is_ok());
+        let week_on = thursday + Duration::days(7);
+        let far = validate_spoken_date("Thursday at 10", week_on, monday).unwrap_err();
+        assert!(far.contains("Thursday 23 July"), "{far}");
+        assert!(validate_spoken_date("Thursday at 10", thursday + Duration::days(364), monday).is_err());
+        assert!(validate_spoken_date("next Thursday at 10", week_on, monday).is_ok());
+        assert!(validate_spoken_date("next Thursday at 10", thursday, monday).is_ok());
+        assert!(validate_spoken_date("next Thursday", week_on + Duration::days(7), monday).is_err());
+        // Today's weekday is today.
+        assert!(validate_spoken_date("Monday at 4pm", monday, monday).is_ok());
+        assert!(validate_spoken_date("Monday at 4pm", monday + Duration::days(7), monday).is_err());
     }
 
     fn lance_request() -> Value {

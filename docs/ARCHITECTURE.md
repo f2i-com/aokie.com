@@ -208,11 +208,14 @@ Every essential record event (`call.*`, `sms.*`, `hardware.error`) is written
 to a SQLite outbox **before** emission (`synchronous=FULL`). Delivery is
 ACK-gated: the desktop journals the envelope (fsynced) before sending
 `event.ack`; unacked rows stay pending and a replay thread re-delivers on
-backoff, dead-lettering after the attempt budget. Payloads (transcripts, SMS)
-are **DPAPI-protected at rest with no plaintext fallback** (AOK-DUR-001): a
-protect failure QUARANTINES the event as a typed dead row (metadata kept,
-payload absent, never emitted or redriven), a decrypt failure dead-letters as
-`payload_unreadable` instead of emitting an empty replacement, and legacy
+backoff (capped at 5 minutes) for three days before dead-lettering. Payloads
+(transcripts, SMS) are **DPAPI-protected at rest with no plaintext fallback**
+(AOK-DUR-001): a protect failure QUARANTINES the event as a typed dead row
+(metadata kept, payload absent, never redriven) while the event itself still
+goes to the host live, once; an outbox that cannot take a row at all (disk
+full, lock held) likewise emits it live. A decrypt failure dead-letters as
+`payload_unreadable` instead of emitting an empty replacement, unless the key
+itself is unavailable (a locked Keychain), when the rows wait; and legacy
 plaintext rows are sealed in place at open (verified per row, then vacuumed so
 no plaintext pages survive). A host without `eventAck` is treated as
 incompatible in production: essential events are HELD in the outbox and

@@ -98,6 +98,19 @@ val jniKeptClasses = listOf(
     "livekit.org.jni_zero.JniZero",
     "org.rustls.platformverifier.CertificateVerifier",
 )
+// Rust also calls MainActivity's bridge methods by name. Their names come from the keepclassmembers block in
+// proguard-rules.pro (a unit test in android_runtime.rs checks that block lists every name Rust calls), and the
+// check below fails if R8's mapping shows one renamed or its usage report shows one removed.
+val jniBridgeClass = "com.aokie.companion.MainActivity"
+val jniBridgeMethods: List<String> = run {
+    val rules = file("proguard-rules.pro").readText()
+    val block = Regex("-keepclassmembers class " + Regex.escape(jniBridgeClass) + " \\{([^}]*)\\}").find(rules)
+        ?.groupValues?.get(1)
+        ?: throw GradleException("proguard-rules.pro has no keepclassmembers block for $jniBridgeClass")
+    Regex("^\\s*public\\s+\\S+\\s+([A-Za-z_][A-Za-z0-9_]*)\\(", RegexOption.MULTILINE)
+        .findAll(block).map { it.groupValues[1] }.toList()
+        .ifEmpty { throw GradleException("proguard-rules.pro names no $jniBridgeClass bridge methods") }
+}
 val r8MappingDir = layout.buildDirectory.dir("outputs/mapping")
 tasks.configureEach {
     if (name.startsWith("minify") && name.endsWith("WithR8")) {
@@ -110,6 +123,33 @@ tasks.configureEach {
                     val kept = Regex("^" + Regex.escape(name) + " -> " + Regex.escape(name) + ":\\r?$", RegexOption.MULTILINE)
                     if (!kept.containsMatchIn(text)) {
                         throw GradleException("R8 removed or renamed $name (${mapping.path}); native code finds it by name, see proguard-rules.pro")
+                    }
+                }
+                // A renamed member is listed under its class as `<type> <name>(<args>)[:lines] -> <new name>`.
+                val bridgeBlock = Regex(
+                    "^" + Regex.escape(jniBridgeClass) + " -> [^\\r\\n]*:\\r?$((?:\\r?\\n[ \\t]+[^\\r\\n]*)*)",
+                    RegexOption.MULTILINE,
+                ).find(text)?.groupValues?.get(1).orEmpty()
+                for (method in jniBridgeMethods) {
+                    val renamed = Regex("\\s" + Regex.escape(method) + "\\([^)]*\\)[0-9:]* -> (\\S+)")
+                        .findAll(bridgeBlock).any { it.groupValues[1] != method }
+                    if (renamed) {
+                        throw GradleException("R8 renamed $jniBridgeClass.$method (${mapping.path}); Rust calls it by name, see proguard-rules.pro")
+                    }
+                }
+                // R8's usage report, where it writes one, lists removed members indented under their class.
+                val usage = File(mapping.parentFile, "usage.txt")
+                if (usage.isFile) {
+                    var inBridge = false
+                    for (line in usage.readLines()) {
+                        if (line.isNotEmpty() && !line[0].isWhitespace()) {
+                            inBridge = line.trimEnd() == "$jniBridgeClass:"
+                            continue
+                        }
+                        val removed = jniBridgeMethods.firstOrNull { inBridge && line.contains(" $it(") }
+                        if (removed != null) {
+                            throw GradleException("R8 removed $jniBridgeClass.$removed (${usage.path}); Rust calls it by name, see proguard-rules.pro")
+                        }
                     }
                 }
             }

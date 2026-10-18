@@ -53,3 +53,14 @@ pub fn list_usb_radios() -> Result<Vec<UsbRadioDevice>, String> {
 }
 
 pub mod bluetooth_prefs;
+
+// The WinUSB INF's DriverVer, shared by the dispatcher and the elevated helper. Pure, so it is tested everywhere.
+pub mod driver_version;
+
+// A driver step (WinUSB install or restore, the udev rule) run off the plugin's command loop.
+pub mod driver_job;
+
+/// What became of a Realtek dongle's firmware at the radio's last start (the radio stack's loader records it), for
+/// the dongle screen: a dongle left on its ROM is seen by no phone.
+#[cfg(aokie_radio)]
+pub use aokie_bluetooth::aokie_radio::realtek::{firmware_status as realtek_firmware_status, FirmwareStatus};

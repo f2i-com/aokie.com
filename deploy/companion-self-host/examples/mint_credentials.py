@@ -29,8 +29,12 @@ SCOPES = {
     "monitor",
     "consult",
     "takeover",
+    "end_caller",
     "resume_aokie",
     "rtc_signal",
+    "participants_read",
+    "participant_identity_read",
+    "audio_levels_read",
 }
 MAX_SAFE_INTEGER = (1 << 53) - 1
 MAX_APPROVED_PEERS = 64
@@ -140,9 +144,17 @@ def mint_admission(secret: bytes, args: argparse.Namespace, now: int) -> tuple[s
     return f"aokie-adm-v2.{payload.hex()}.{signature}", claims
 
 
+MIN_TURN_TTL = 60
+# The Aokie endpoints accept TURN credentials up to 24 hours out.
+MAX_TURN_TTL = 24 * 60 * 60
+# coturn checks the username's timestamp on every allocation refresh, so the
+# credential must outlast the call: a short one cuts a relayed call off.
+DEFAULT_TURN_TTL = 12 * 60 * 60
+
+
 def mint_turn(secret: bytes, args: argparse.Namespace, now: int) -> dict:
-    if not 60 <= args.turn_ttl <= 3600:
-        raise ValueError("TURN TTL must be 60..3600 seconds")
+    if not MIN_TURN_TTL <= args.turn_ttl <= MAX_TURN_TTL:
+        raise ValueError(f"TURN TTL must be {MIN_TURN_TTL}..{MAX_TURN_TTL} seconds")
     expiry = now + args.turn_ttl
     username = f"{expiry}:{args.subject_id}"
     credential = base64.b64encode(hmac.new(secret, username.encode(), hashlib.sha1).digest()).decode()
@@ -175,7 +187,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--peer-roster-revision", type=int)
     result.add_argument("--scope", action="append", default=[])
     result.add_argument("--admission-ttl", type=int, default=120)
-    result.add_argument("--turn-ttl", type=int, default=600)
+    result.add_argument("--turn-ttl", type=int, default=DEFAULT_TURN_TTL)
     result.add_argument("--relay-only", action="store_true")
     return result
 

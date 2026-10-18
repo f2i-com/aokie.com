@@ -203,50 +203,6 @@ fn abandoned_realtime_business_lookup_forgets_its_host_request() {
     assert_eq!(host.pending_count(), 0);
 }
 
-#[cfg(all(aokie_radio, feature = "voice"))]
-#[test]
-fn realtime_tool_wait_pcm_is_bounded_coalesced_and_ordered() {
-    const RATE: u32 = 16_000;
-    // Reproduce the live one-second host lookup: ~133 narrow SCO frames
-    // arrive while the function result is outstanding. None is forwarded
-    // to auto-response VAD until the tool fence clears.
-    let mut deferred = DeferredRealtimeInput::default();
-    let mut expected = Vec::new();
-    for frame in 0..133i16 {
-        let samples = vec![frame; 120];
-        expected.extend_from_slice(&samples);
-        deferred.push(&samples, RATE);
-    }
-
-    // Release old audio before new audio and coalesce the tiny 7.5 ms SCO
-    // packets into <=100 ms Realtime commands. The live one-second catch-
-    // up therefore uses ten commands, not 133 entries in a depth-32 queue.
-    let newest = vec![i16::MAX; 120];
-    expected.extend_from_slice(&newest);
-    deferred.push(&newest, RATE);
-    let mut actual = Vec::new();
-    let mut commands = 0;
-    while !deferred.is_empty() {
-        let chunk = deferred.take_flush_chunk(RATE);
-        assert!(chunk.len() <= 1_600);
-        actual.extend(chunk);
-        commands += 1;
-    }
-    assert_eq!(actual, expected);
-    assert_eq!(commands, 11);
-
-    // Overflow keeps the NEWEST audio and never fails the session: a long
-    // tool wait drops the oldest deferred samples instead of killing the
-    // call (the pre-fix behavior returned a session-fatal Err here).
-    let mut bounded = DeferredRealtimeInput::default();
-    bounded.push(&vec![0; RATE as usize * 15], RATE);
-    bounded.push(&[7; 4], RATE);
-    let max_samples = RATE as usize * 15;
-    assert_eq!(bounded.samples.len(), max_samples);
-    let tail: Vec<i16> = bounded.samples.iter().rev().take(4).copied().collect();
-    assert_eq!(tail, vec![7; 4]);
-}
-
 #[cfg(feature = "voice")]
 #[test]
 fn realtime_finish_requires_unchanged_caller_floor_and_an_audible_non_question_goodbye() {
@@ -1274,6 +1230,35 @@ fn reply_side_effect_fence_rejects_an_actual_call_transition() {
         .expect("the replacement Aokie call has its own fence");
     assert!(reply_owner_is_current(&remote, Some(&next)));
     assert!(!reply_owner_is_current(&remote, None));
+}
+
+/// review 1 #2: the no-SCO watchdog acts only on a call the receptionist
+/// runs. The owner's own call (answered on the handset after it was left
+/// ringing, or dialed there) keeps its audio on the earpiece: no AT+BCC, no
+/// dead-air hangup.
+#[test]
+fn no_sco_watchdog_leaves_the_owners_own_calls_alone() {
+    let mut tracker = crate::call_session::SessionTracker::new();
+    tracker.ring("call_left".into(), "2026-10-18T01:00:00Z".into());
+    assert_eq!(dead_air_watch_call(tracker.current()), None, "still ringing");
+    tracker.current_mut().unwrap().left_ringing = true;
+    tracker.answered();
+    assert_eq!(dead_air_watch_call(tracker.current()), None, "the owner answered on the handset");
+    tracker.terminate();
+
+    tracker.dial("call_handset".into(), Some("0400111222".into()), "2026-10-18T01:01:00Z".into(), false);
+    tracker.answered();
+    assert_eq!(dead_air_watch_call(tracker.current()), None, "the owner dialed on the handset");
+    tracker.terminate();
+
+    tracker.ring("call_ours".into(), "2026-10-18T01:02:00Z".into());
+    tracker.answered();
+    assert_eq!(dead_air_watch_call(tracker.current()).as_deref(), Some("call_ours"));
+    tracker.terminate();
+
+    tracker.dial("call_agent".into(), Some("0400111222".into()), "2026-10-18T01:03:00Z".into(), true);
+    tracker.answered();
+    assert_eq!(dead_air_watch_call(tracker.current()).as_deref(), Some("call_agent"));
 }
 
 #[cfg(feature = "voice")]
@@ -3193,6 +3178,191 @@ fn judge_accept_covers_every_topology() {
 }
 
 /// Phase 4 verified swaps: the pure swap-back judge. CLCC numbers name
+/// review 1 #7: the phone dropping during the swap-back settle (the
+/// newcomer's session ended, callheld left stale at 1) must never reach an
+/// arm that parks a session that is not there — the radio thread panicked
+/// on "newcomer was active" and phone service stopped until restart.
+#[cfg(feature = "voice")]
+#[test]
+fn a_swap_back_without_the_newcomer_never_parks_a_missing_session() {
+    use super::{
+        resolve_swap_back_by_indicator, swap_back_verdict_for_tracker, SwapBackVerdict,
+        SwapSnapshot,
+    };
+    let stale = SwapSnapshot {
+        callheld: 1,
+        waiting_id: None,
+        current_alive: false,
+        clcc: None,
+    };
+    assert_eq!(resolve_swap_back_by_indicator(&stale), SwapBackVerdict::AllGone);
+    // With the newcomer still tracked the indicator keeps its old reading.
+    let live = SwapSnapshot {
+        current_alive: true,
+        ..stale
+    };
+    assert_eq!(resolve_swap_back_by_indicator(&live), SwapBackVerdict::Swapped);
+    // Verdicts that work on the newcomer's session map to the same topology
+    // without them; the rest stand.
+    for (verdict, without_newcomer) in [
+        (SwapBackVerdict::Swapped, SwapBackVerdict::SwappedNewcomerGone),
+        (SwapBackVerdict::StayedOnNewcomer, SwapBackVerdict::ActiveDied),
+        (SwapBackVerdict::NewcomerAlone, SwapBackVerdict::AllGone),
+        (SwapBackVerdict::SwappedNewcomerGone, SwapBackVerdict::SwappedNewcomerGone),
+        (SwapBackVerdict::ActiveDied, SwapBackVerdict::ActiveDied),
+        (SwapBackVerdict::AllGone, SwapBackVerdict::AllGone),
+        (SwapBackVerdict::StrangerActive, SwapBackVerdict::StrangerActive),
+    ] {
+        assert_eq!(swap_back_verdict_for_tracker(verdict, true), verdict);
+        assert_eq!(swap_back_verdict_for_tracker(verdict, false), without_newcomer);
+    }
+}
+
+/// review 1 #7: the phone link's end takes the phone's call topology with it.
+#[test]
+fn a_lost_link_clears_the_held_and_waiting_state() {
+    let status = std::sync::Arc::new(RadioStatus::default());
+    let mut tracker = crate::call_session::SessionTracker::new();
+    let mut sink = crate::event_bridge::VecSink::default();
+    status.call_held_state.store(1, Ordering::Relaxed);
+    *status.call_waiting_announced.lock().unwrap() = Some("call_a".into());
+    *status.waiting_call.lock().unwrap() = Some(SwitchboardLeg {
+        call_id: "call_w".into(),
+        from: String::new(),
+        since_iso: "2026-10-18T01:00:00Z".into(),
+    });
+    tracker.ring("call_a".into(), "2026-10-18T01:00:00Z".into());
+    tracker.answered();
+    handle_event(
+        aokie_dongle::bluetooth::BluetoothEvent::DeviceDisconnected("AA:BB:CC:00:00:01".into()),
+        &mut tracker,
+        None,
+        &mut sink,
+        &status,
+    );
+    assert!(tracker.current().is_none());
+    assert_eq!(status.call_held_state.load(Ordering::Relaxed), 0);
+    assert!(status.call_waiting_announced.lock().unwrap().is_none());
+    assert!(status.waiting_call.lock().unwrap().is_none());
+    assert!(
+        status.lost_with_link.lock().unwrap().is_some_and(|(hers, _)| hers),
+        "the receptionist's call is remembered for a reconnect"
+    );
+}
+
+/// review 1 #9: a dial the phone refuses ends its session as failed — it
+/// never sits "dialing", refusing every later call.dial and leaving the next
+/// call to us without a session. Other refusals touch no session.
+#[test]
+fn a_refused_dial_ends_its_session_as_failed() {
+    use aokie_dongle::bluetooth::BluetoothEvent as E;
+    let status = std::sync::Arc::new(RadioStatus::default());
+    let mut tracker = crate::call_session::SessionTracker::new();
+    let mut sink = crate::event_bridge::VecSink::default();
+    tracker.dial("call_out".into(), Some("0491570157".into()), "2026-10-18T01:00:00Z".into(), true);
+    *status.pending_dial.lock().unwrap() = Some(PendingDial {
+        call_id: "call_out".into(),
+        number: "0491570157".into(),
+        at: std::time::Instant::now(),
+    });
+    // A refused AT+CHUP or a dial that merely timed out ends nothing.
+    handle_event(E::CommandRejected { command: "AT+CHUP".into(), timed_out: false }, &mut tracker, None, &mut sink, &status);
+    handle_event(E::CommandRejected { command: "ATD".into(), timed_out: true }, &mut tracker, None, &mut sink, &status);
+    assert!(tracker.current().is_some());
+    handle_event(E::CommandRejected { command: "ATD".into(), timed_out: false }, &mut tracker, None, &mut sink, &status);
+    assert!(tracker.current().is_none(), "the refused dial is over");
+    assert!(status.pending_dial.lock().unwrap().is_none());
+    let ended = sink
+        .lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v.to_string().contains("call.ended"))
+        .expect("call.ended emitted");
+    assert!(ended.to_string().contains("failed"), "{ended}");
+    // No hardware error for a refusal.
+    assert!(!sink.lines.iter().any(|l| l.contains("hardware")));
+}
+
+/// review 2 #11: a call still up when the plugin stops is closed with its
+/// own outcome and the reason "plugin_stopped".
+#[test]
+fn a_call_closed_by_the_plugin_stopping_says_so() {
+    use crate::call_session::{SessionTracker, TerminationIntent};
+    let mut tracker = SessionTracker::new();
+    tracker.ring("call_up".into(), "2026-10-18T01:00:00Z".into());
+    tracker.answered();
+    tracker.note_intent(TerminationIntent::PluginStopped);
+    let ended = tracker.terminate().unwrap();
+    assert_eq!((ended.outcome, ended.reason), ("completed", "plugin_stopped"));
+    tracker.ring("call_ringing".into(), "2026-10-18T01:01:00Z".into());
+    tracker.note_intent(TerminationIntent::PluginStopped);
+    let ended = tracker.terminate().unwrap();
+    assert_eq!((ended.outcome, ended.reason), ("missed", "plugin_stopped"));
+    tracker.dial("call_out".into(), Some("0491570157".into()), "2026-10-18T01:02:00Z".into(), true);
+    tracker.note_intent(TerminationIntent::PluginStopped);
+    let ended = tracker.terminate().unwrap();
+    assert_eq!((ended.outcome, ended.reason), ("failed", "plugin_stopped"));
+}
+
+/// review 1 #9: a cancelled dial the phone sends no edge for is settled by
+/// its call list: listed, the edges will end it; not listed, it ends here.
+#[test]
+fn a_cancelled_dial_with_no_call_on_the_phone_ends_here() {
+    let t0 = std::time::Instant::now();
+    let mut follow_up = DialCancelFollowUp {
+        call_id: "call_out".into(),
+        cancel_sent: t0,
+        calls_asked: None,
+    };
+    let grace = DialCancelFollowUp::CANCEL_GRACE;
+    assert_eq!(follow_up.step(false, t0 + std::time::Duration::from_secs(1)), DialCancelStep::Wait);
+    assert_eq!(follow_up.step(false, t0 + grace), DialCancelStep::AskCalls);
+    follow_up.calls_asked = Some(t0 + grace);
+    let asked = t0 + grace;
+    assert_eq!(follow_up.step(false, asked + std::time::Duration::from_secs(1)), DialCancelStep::Wait);
+    // The phone listed a call: its edges end it, nothing ends here.
+    assert_eq!(
+        follow_up.step(true, asked + DialCancelFollowUp::LIST_GRACE),
+        DialCancelStep::Wait
+    );
+    // It listed none.
+    assert_eq!(
+        follow_up.step(false, asked + DialCancelFollowUp::LIST_GRACE),
+        DialCancelStep::EndHere
+    );
+}
+
+/// review 1 #4: a reconnect that finds a call up on the phone gives it back
+/// to the receptionist only when it was hers when the link dropped; any
+/// other call found up is the owner's, observed and never greeted into.
+#[test]
+fn a_call_found_at_connect_is_the_receptionists_only_if_it_was() {
+    use aokie_dongle::bluetooth::BluetoothEvent as E;
+    let status = std::sync::Arc::new(RadioStatus::default());
+    let mut tracker = crate::call_session::SessionTracker::new();
+    let mut sink = crate::event_bridge::VecSink::default();
+    handle_event(E::DeviceConnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
+    // Nothing was lost with a link: the call is the owner's.
+    handle_event(E::CallActiveAtConnect, &mut tracker, None, &mut sink, &status);
+    let s = tracker.current().expect("tracked");
+    assert!(s.is_active() && !s.receptionist_owns(), "the owner's call");
+    handle_event(E::CallTerminated, &mut tracker, None, &mut sink, &status);
+
+    // The receptionist's call drops with the link, and is up after it.
+    handle_event(E::CallIncoming, &mut tracker, None, &mut sink, &status);
+    handle_event(E::CallAnswered, &mut tracker, None, &mut sink, &status);
+    handle_event(E::DeviceDisconnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
+    assert!(tracker.current().is_none());
+    handle_event(E::DeviceConnected("AA:BB:CC:00:00:01".into()), &mut tracker, None, &mut sink, &status);
+    handle_event(E::CallActiveAtConnect, &mut tracker, None, &mut sink, &status);
+    let s = tracker.current().expect("rebuilt");
+    assert!(s.is_active() && s.receptionist_owns(), "hers again");
+    // A second at-connect announcement on a tracked call changes nothing.
+    let id = s.id.clone();
+    handle_event(E::CallActiveAtConnect, &mut tracker, None, &mut sink, &status);
+    assert_eq!(tracker.call_id(), Some(id.as_str()));
+}
+
 /// WHO is active (the indicator cannot); the indicator is the fallback.
 #[cfg(feature = "voice")]
 #[test]

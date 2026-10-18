@@ -184,7 +184,8 @@ fn pump_loop(
             && last_open_attempt.is_none_or(|t| t.elapsed() >= OPEN_RETRY)
         {
             last_open_attempt = Some(Instant::now());
-            match open_streams() {
+            let phone_name = shared.remote_name.read().ok().and_then(|n| n.clone());
+            match open_streams(phone_name.as_deref()) {
                 Ok((s, codec)) => {
                     shared.sample_rate.store(OUT_RATE_U16, Ordering::Release);
                     // Never let one call's tail bleed into the next call's
@@ -267,19 +268,19 @@ fn pump_loop(
 // Endpoint discovery + stream open
 // ---------------------------------------------------------------------------
 
-fn open_streams() -> Result<(Streams, String), String> {
+fn open_streams(phone_name: Option<&str>) -> Result<(Streams, String), String> {
     // SAFETY: pump_loop initialized COM on this thread before calling.
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
             .map_err(|e| format!("MMDeviceEnumerator: {}", hr(&e)))?;
-    // v1 = SINGLE PHONE: the first Hands-Free endpoint per direction wins.
-    // Multi-phone selection (matching the BTHHF device id to
-    // shared.remote_address) is deferred — the dongle backend has the same
-    // single-call shape, so nothing upstream can exercise it yet.
-    let render_dev = find_hf_endpoint(&enumerator, eRender)
-        .ok_or_else(|| "no Hands-Free render endpoint".to_string())?;
-    let capture_dev = find_hf_endpoint(&enumerator, eCapture)
-        .ok_or_else(|| "no Hands-Free capture endpoint".to_string())?;
+    // Only the paired phone's Hands-Free endpoints, never the first one that
+    // looks hands-free: a headset of the person's own is a hands-free
+    // endpoint too, and the caller would be played into their ears
+    // (select::phone_hands_free_endpoint).
+    let render_dev = find_hf_endpoint(&enumerator, eRender, phone_name)
+        .ok_or_else(|| "no Hands-Free render endpoint for the phone".to_string())?;
+    let capture_dev = find_hf_endpoint(&enumerator, eCapture, phone_name)
+        .ok_or_else(|| "no Hands-Free capture endpoint for the phone".to_string())?;
     let render = open_stream(&render_dev, true)?;
     let capture = match open_stream(&capture_dev, false) {
         Ok(c) => c,
@@ -303,11 +304,17 @@ fn open_streams() -> Result<(Streams, String), String> {
     Ok((Streams { render, capture }, codec))
 }
 
-fn find_hf_endpoint(enumerator: &IMMDeviceEnumerator, flow: EDataFlow) -> Option<IMMDevice> {
+fn find_hf_endpoint(
+    enumerator: &IMMDeviceEnumerator,
+    flow: EDataFlow,
+    phone_name: Option<&str>,
+) -> Option<IMMDevice> {
     // SAFETY: enumerator is live on this thread; returned devices are used
     // only here (COM MTA).
     let coll = unsafe { enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) }.ok()?;
     let count = unsafe { coll.GetCount() }.ok()?;
+    let mut devices = Vec::new();
+    let mut described = Vec::new();
     for i in 0..count {
         let dev = match unsafe { coll.Item(i) } {
             Ok(d) => d,
@@ -317,23 +324,11 @@ fn find_hf_endpoint(enumerator: &IMMDeviceEnumerator, flow: EDataFlow) -> Option
         let name = read_prop(&dev, &PKEY_DeviceInterface_FriendlyName)
             .or_else(|| read_prop(&dev, &PKEY_Device_DeviceDesc))
             .unwrap_or_default();
-        if looks_like_hands_free(&name, &id) {
-            return Some(dev);
-        }
+        devices.push(dev);
+        described.push((name, id));
     }
-    None
-}
-
-/// HF endpoints name themselves "… Hands-Free …" and their device id carries
-/// the BTHHF service class; "headset" is the fallback label some radios use.
-/// Pure string matching (case-insensitive) so it is unit-testable.
-fn looks_like_hands_free(name: &str, id: &str) -> bool {
-    let name = name.to_lowercase();
-    let id = id.to_lowercase();
-    name.contains("hands-free")
-        || id.contains("hands-free")
-        || id.contains("bthhf")
-        || name.contains("headset")
+    let pick = crate::select::phone_hands_free_endpoint(&described, phone_name)?;
+    devices.into_iter().nth(pick)
 }
 
 fn device_id(dev: &IMMDevice) -> String {
@@ -1019,16 +1014,5 @@ mod tests {
         assert_eq!(render_take_16k_convert(100, 0), 0); // rate 0: no divide
     }
 
-    #[test]
-    fn hands_free_matching() {
-        assert!(looks_like_hands_free(
-            "Headset (Pixel 8 Hands-Free)",
-            "anything"
-        ));
-        assert!(looks_like_hands_free("whatever", "{guid}#BTHHF#9&1234"));
-        assert!(looks_like_hands_free("", "SWD\\BTHHF\\123"));
-        assert!(looks_like_hands_free("Jabra Headset", "usb"));
-        assert!(!looks_like_hands_free("Speakers (Realtek)", "HDAUDIO"));
-        assert!(!looks_like_hands_free("Microphone Array", "USB\\VID"));
-    }
+    // Which endpoint is the phone's is tested in select.rs.
 }

@@ -398,6 +398,12 @@ pub(super) fn reconcile_switchboard(
                                     );
                                 }
                             }
+                            // Review 1 #7: never act on the newcomer's
+                            // session when it ended during the settle.
+                            let verdict = swap_back_verdict_for_tracker(
+                                verdict,
+                                tracker.current().is_some(),
+                            );
                             eprintln!(
                                 "[aokie-plugin] SWITCHBOARD: cascade verdict {verdict:?}"
                             );
@@ -405,7 +411,9 @@ pub(super) fn reconcile_switchboard(
                                 SwapBackVerdict::Swapped => {
                                     // Newcomer parked; the longest-waiting
                                     // caller finally gets the line.
-                                    let sess_c = tracker.park().expect("newcomer was active");
+                                    let Some(sess_c) = tracker.park() else {
+                                        unreachable!("swap_back_verdict_for_tracker: Swapped has a newcomer");
+                                    };
                                     let ctx_c = stow_ctx!(CallVoiceContext::fresh(None));
                                     let (sess_b, ctx_b) = parked
                                         .take()

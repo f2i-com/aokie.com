@@ -499,8 +499,21 @@ fn validate_persisted_pairing(binding: &PersistedDesktopPairing) -> Result<(), S
 }
 
 fn pairing_account(binding: &PersistedDesktopPairing) -> String {
-    let digest = Sha256::digest(binding.profile_id.as_bytes());
+    pairing_account_for(&binding.profile_id)
+}
+
+fn pairing_account_for(profile_id: &str) -> String {
+    let digest = Sha256::digest(profile_id.as_bytes());
     format!("aokie-desktop-pairing-v1:{digest:x}")
+}
+
+/// Delete the Desktop pairing a forgotten server profile left behind.
+pub(crate) async fn forget_confirmed_pairing(
+    app: &AppHandle,
+    profile_id: &str,
+) -> Result<(), String> {
+    safe_id("profile id", profile_id)?;
+    crate::endpoint_identity::native_store_delete(app, &pairing_account_for(profile_id)).await
 }
 
 fn validate_profile_binding(

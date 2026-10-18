@@ -68,6 +68,39 @@ class MintCredentialsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not appear"):
             mint_credentials.mint_admission(b"a" * 32, args, 1_000)
 
+    def test_every_protocol_grant_can_be_minted(self) -> None:
+        args = admission_args("mobile")
+        args.scope = [
+            "end_caller",
+            "participants_read",
+            "participant_identity_read",
+            "audio_levels_read",
+        ]
+        _, claims = mint_credentials.mint_admission(b"a" * 32, args, 1_000)
+        self.assertEqual(claims["scopes"], args.scope)
+
+    def test_turn_credentials_outlast_a_long_call_by_default(self) -> None:
+        defaults = mint_credentials.parser().parse_args(
+            [
+                "--admission-secret-file", "a",
+                "--turn-secret-file", "t",
+                "--gateway-url", "wss://signal.example.com/v2/realtime",
+                "--turn-host", "turn.example.com",
+                "--app-id", "app_a",
+                "--subject-id", "device_a",
+                "--role", "mobile",
+                "--holder-key-thumbprint", "mobile_holder_a",
+            ]
+        )
+        self.assertGreaterEqual(defaults.turn_ttl, 12 * 60 * 60)
+        ice = mint_credentials.mint_turn(b"t" * 32, defaults, 1_000)
+        self.assertEqual(ice["expiresAt"], 1_000 + defaults.turn_ttl)
+        self.assertTrue(ice["username"].startswith(f"{1_000 + defaults.turn_ttl}:"))
+
+        defaults.turn_ttl = 24 * 60 * 60 + 1
+        with self.assertRaisesRegex(ValueError, "TURN TTL"):
+            mint_credentials.mint_turn(b"t" * 32, defaults, 1_000)
+
 
 if __name__ == "__main__":
     unittest.main()

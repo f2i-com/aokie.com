@@ -73,7 +73,7 @@ impl Notepad {
         // Japanese, Cyrillic, accented Latin). Real Whisper transcripts
         // can contain any of these.
         let preview: String = trimmed.chars().take(50).collect();
-        println!(
+        eprintln!(
             "[Notepad] Added caller speech{}: \"{}\"",
             if during_bot_speech {
                 " (during bot)"

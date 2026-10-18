@@ -55,7 +55,7 @@ pub(super) fn handle_event(
                 if !paired.iter().any(|d| d.address == addr) {
                     paired.push(PairedDevice {
                         address: addr.clone(),
-                        name: "Paired phone".to_string(),
+                        name: UNNAMED_PHONE.to_string(),
                     });
                 }
             }
@@ -76,7 +76,9 @@ pub(super) fn handle_event(
             // call.current and the operator UI stay "live" on hardware that
             // is gone. A late real CallTerminated lands on an idle tracker
             // and is a no-op (no duplicate terminal event).
-            if tracker.current().is_some() {
+            if let Some(s) = tracker.current() {
+                *status.lost_with_link.lock().unwrap() =
+                    Some((s.is_active() && s.receptionist_owns(), std::time::Instant::now()));
                 flush_incoming_if_pending(tracker, outbox, sink);
                 status.call_active.store(false, Ordering::Relaxed);
                 tracker.note_intent(crate::call_session::TerminationIntent::DeviceLost);
@@ -95,6 +97,15 @@ pub(super) fn handle_event(
                 *status.current_caller.lock().unwrap() = None;
                 *status.current_call_id.lock().unwrap() = None;
                 *status.call_started_at.lock().unwrap() = None;
+            }
+            // The phone's call topology went with the link (review 1 #7): a
+            // held or waiting state left behind made the switchboard judge a
+            // swap against legs that no longer exist, and its "newcomer was
+            // active" expect panicked the radio thread.
+            status.call_held_state.store(0, Ordering::Relaxed);
+            *status.call_waiting_announced.lock().unwrap() = None;
+            if status.waiting_call.lock().unwrap().take().is_some() {
+                status.switchboard_revision.fetch_add(1, Ordering::Relaxed);
             }
             status.connected.store(false, Ordering::Relaxed);
             *status.connected_address.lock().unwrap() = None;
@@ -487,6 +498,82 @@ pub(super) fn handle_event(
             *status.current_caller.lock().unwrap() = None;
             *status.current_call_id.lock().unwrap() = None;
             *status.call_started_at.lock().unwrap() = None;
+        }
+        E::CommandRejected { command, timed_out } => {
+            // Review 1 #3: the phone's answer to one command — never a
+            // hardware fault, never "link setup failed".
+            eprintln!(
+                "[aokie-plugin] the phone {} {command}",
+                if timed_out { "never answered" } else { "refused" }
+            );
+            // Review 1 #9: a dial the phone refused never becomes a call.
+            // Its session would sit "dialing" for good: every call.dial
+            // refused after it, and the next call to us with no session and
+            // no missed-call record. End it as the failed attempt it is.
+            if command == "ATD" && !timed_out {
+                let refused_dial = tracker
+                    .current()
+                    .is_some_and(|s| s.outbound && s.agent_owned && !s.is_active() && !s.alerted);
+                if refused_dial {
+                    if let Some(ended) = tracker.terminate() {
+                        eprintln!(
+                            "[aokie-plugin] dial {} refused by the phone — ended as {}",
+                            ended.id, ended.outcome
+                        );
+                        emit_call_ended(
+                            &ended,
+                            status.config_version.load(Ordering::Relaxed),
+                            outbox,
+                            sink,
+                        );
+                    }
+                    *status.pending_dial.lock().unwrap() = None;
+                    *status.outbound_call_id.lock().unwrap() = None;
+                    status.call_active.store(false, Ordering::Relaxed);
+                    *status.current_caller.lock().unwrap() = None;
+                    *status.current_call_id.lock().unwrap() = None;
+                    *status.call_started_at.lock().unwrap() = None;
+                }
+            }
+        }
+        E::CallActiveAtConnect => {
+            // Review 1 #4: the link came back (or came up) with a call in
+            // progress on the phone. A call the receptionist was running
+            // when the link dropped, moments ago, is hers again: the
+            // CallAnswered recovery below rebuilds her session (the greeting
+            // replays, which tells the caller the line reset). Any other
+            // call is the owner's (they took it, or made it, on the handset
+            // while Aokie was away): tracked so call state stays true, but
+            // the receptionist neither greets nor listens.
+            if tracker.current().is_some() || !status.connected.load(Ordering::Relaxed) {
+                return;
+            }
+            let hers = status
+                .lost_with_link
+                .lock()
+                .unwrap()
+                .take()
+                .is_some_and(|(hers, at)| hers && at.elapsed() < std::time::Duration::from_secs(120));
+            if hers {
+                eprintln!("[aokie-plugin] the receptionist's call is still up after the reconnect — resuming it");
+                handle_event(E::CallAnswered, tracker, outbox, sink, status);
+                return;
+            }
+            let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+            eprintln!(
+                "[aokie-plugin] a call was already up on the phone when it connected ({id}) — the owner's: observed, the receptionist stays out of it"
+            );
+            if let Some(s) = tracker.ring(id, now_iso8601()) {
+                *status.current_caller.lock().unwrap() = None;
+                *status.current_call_id.lock().unwrap() = Some(s.id.clone());
+                *status.call_started_at.lock().unwrap() = Some(s.started_at_iso.clone());
+            }
+            if let Some(s) = tracker.current_mut() {
+                // Left ringing for the owner, then answered: the owner's
+                // call (CallSession::owner_took), with its records in order.
+                s.left_ringing = true;
+            }
+            handle_event(E::CallAnswered, tracker, outbox, sink, status);
         }
         E::AudioConnected {
             codec,

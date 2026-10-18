@@ -8,6 +8,10 @@ pub(super) const SNAPSHOT_POLL: Duration = Duration::from_millis(250);
 pub(super) const SNAPSHOT_REFRESH: Duration = Duration::from_secs(10);
 pub(super) const PING_INTERVAL: Duration = Duration::from_secs(15);
 pub(super) const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest one write to the gateway socket may take before the socket is
+/// treated as gone (see `bounded_ws_send`).
+pub(super) const GATEWAY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const GATEWAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const ADMISSION_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// Begin replacing an admission while this much of its already safety-bounded
 /// lifetime remains. The current carrier stays authoritative throughout the

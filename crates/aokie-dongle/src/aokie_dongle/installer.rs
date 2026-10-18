@@ -32,7 +32,12 @@ use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForS
 /// v5 (AK-DRV-02) adds the adjacent catalog digest. The elevated helper
 /// checks both package hashes against values compiled into the signed helper,
 /// then copies them through non-shareable handles into an admin-only directory.
-const JOB_FORMAT_VERSION: u32 = 5;
+///
+/// v6 adds `driver_ver`: the DriverVer the dispatcher rendered a managed-beta
+/// INF with. The helper renders its trusted copy with that value instead of
+/// reading the clock itself, so a UAC prompt answered after midnight no longer
+/// renders a different INF and refuses the install.
+const JOB_FORMAT_VERSION: u32 = 6;
 
 /// Pin for the helper exe's SHA-256, baked at build time.
 ///
@@ -105,6 +110,10 @@ struct DriverJob<'a> {
     /// runtime opt-in: `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1`, or their acceptance
     /// of this install on the dongle setup screen ([`LocalSigning`]).
     allow_dev_self_sign: bool,
+    /// v6: the DriverVer a rendered (managed-beta / development) INF carries
+    /// (`crate::driver_version`). Empty for the static signed package, whose
+    /// DriverVer is its own, and for the other modes.
+    driver_ver: &'a str,
 }
 
 fn self_sign_policy(debug_build: bool, managed_beta_build: bool, operator_opt_in: bool) -> bool {
@@ -270,7 +279,9 @@ pub fn install_winusb(
     // device so we can pin its exact instance id into the job.
     let device = super::evaluate_present_target(vid, pid, super::allow_unknown_dongle())?;
 
-    let inf_path = super::write_winusb_package(vid, pid, work_dir)?;
+    // Chosen once: the rendered INF and the helper's own copy carry the same value.
+    let driver_ver = crate::driver_version::driver_ver_now();
+    let inf_path = super::write_winusb_package(vid, pid, work_dir, &driver_ver)?;
     // Fingerprint the exact INF bytes the helper is authorised to stage.
     let inf_sha256 = super::sha256_file(&inf_path)?;
     let cat_path = inf_path.with_file_name(super::winusb::CAT_NAME);
@@ -292,6 +303,7 @@ pub fn install_winusb(
         &device.instance_id,
         &inf_sha256,
         &cat_sha256,
+        if cat_sha256.is_empty() { &driver_ver } else { "" },
         work_dir,
         &inf_path,
         &helper_path,
@@ -299,12 +311,63 @@ pub fn install_winusb(
     )
 }
 
+/// The checks an install or a restore makes before anything is staged, run on
+/// the command loop so a refusal (no such dongle plugged in, one Aokie does
+/// not know, a composite or internal adapter, no helper beside the plugin)
+/// answers the command itself; the step then runs as a driver job
+/// (`crate::driver_job`) and makes them again, under the install lock.
+pub fn check_target(vid: u16, pid: u16) -> Result<(), String> {
+    super::evaluate_present_target(vid, pid, super::allow_unknown_dongle())?;
+    helper_path().map(|_| ()).ok_or_else(|| {
+        "could not locate aokie-driver-helper.exe — set AOKIE_WINUSB_HELPER \
+         to override, otherwise it must be present next to the running app exe"
+            .to_string()
+    })
+}
+
 /// AOK-DRIVER-001 restore path: revert a dongle Aokie previously bound to
 /// WinUSB back to its in-box driver (e.g. BTHUSB), so the operator can
 /// undo the rebind without hunting through Device Manager. Elevated
 /// (driver rebind needs admin). Pairs with [`remove_aokie_certs`] for a
 /// full clean-up.
-pub fn restore_original_driver(vid: u16, pid: u16, work_dir: &Path) -> Result<(), String> {
+///
+/// The helper takes Aokie's packages out of the driver store and has PnP
+/// choose again; whether the dongle did leave WinUSB is read back here, from
+/// the service now bound to it, and only that is reported as restored. It
+/// answers with that service (BTHUSB, normally).
+pub fn restore_original_driver(vid: u16, pid: u16, work_dir: &Path) -> Result<String, String> {
+    restore_and_check(vid, pid, work_dir)?;
+    wait_for_inbox_driver(vid, pid)
+}
+
+/// PnP rebinds the dongle after the helper exits: read its service until it is
+/// not WinUSB, for up to 20 s.
+fn wait_for_inbox_driver(vid: u16, pid: u16) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut last = String::new();
+    loop {
+        if let Ok(Some(device)) = super::find_device(vid, pid) {
+            last = device.driver.clone();
+            if !device.driver.is_empty() && !device.driver.eq_ignore_ascii_case("WinUSB") {
+                return Ok(device.driver);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(if last.eq_ignore_ascii_case("WinUSB") {
+                "Aokie's driver package was removed, but the dongle is still on WinUSB: unplug it, plug it back in, \
+                 and check again (Windows then picks its own driver)"
+                    .to_string()
+            } else {
+                "Aokie's driver package was removed, but Windows has not bound a driver of its own to the dongle yet: \
+                 unplug it and plug it back in"
+                    .to_string()
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+fn restore_and_check(vid: u16, pid: u16, work_dir: &Path) -> Result<(), String> {
     let _lock = InstallLock::acquire()?;
     // DRIVER-001: run the unelevated policy gate and pin the exact live
     // instance into the restore job — the helper re-verifies both.
@@ -388,6 +451,7 @@ fn run_helper_install(
     instance_id: &str,
     inf_sha256: &str,
     cat_sha256: &str,
+    driver_ver: &str,
     work_dir: &Path,
     inf_path: &Path,
     helper_path: &Path,
@@ -409,6 +473,7 @@ fn run_helper_install(
         // trust-store path is considered only for a genuinely catalog-less,
         // dynamically rendered package.
         allow_dev_self_sign: cat_sha256.is_empty() && dev_self_sign_allowed(local_signing),
+        driver_ver,
     };
     let job_json = serde_json::to_string_pretty(&job)
         .map_err(|e| format!("could not serialize driver helper job: {}", e))?;
@@ -472,6 +537,7 @@ fn run_helper_remove_certs(work_dir: &Path, helper_path: &Path) -> Result<(), St
         cat_sha256: "",
         hardware_id: "",
         allow_dev_self_sign: false,
+        driver_ver: "",
     };
     let job_json = serde_json::to_string_pretty(&job)
         .map_err(|e| format!("could not serialize cert-removal helper job: {}", e))?;
@@ -526,6 +592,7 @@ fn run_helper_restore(
         cat_sha256: "",
         hardware_id: &hardware_id,
         allow_dev_self_sign: false,
+        driver_ver: "",
     };
     let job_json = serde_json::to_string_pretty(&job)
         .map_err(|e| format!("could not serialize restore-driver helper job: {}", e))?;

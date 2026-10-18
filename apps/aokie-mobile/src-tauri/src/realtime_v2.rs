@@ -6,7 +6,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::future::{pending, Future};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,7 +39,6 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant;
 use tokio_tungstenite::{
-    connect_async_with_config,
     tungstenite::{
         client::IntoClientRequest,
         http::{HeaderValue, StatusCode},
@@ -75,6 +74,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(7);
 // not advance. Two heartbeat intervals leave a full retry opportunity before
 // expiry without churning authority immediately after a claim transition.
 const LEASE_RENEWAL_WINDOW: Duration = Duration::from_secs(HEARTBEAT_INTERVAL.as_secs() * 2);
+// The same moment measured by this phone's monotonic clock from the lease's
+// arrival: 20 s minus the window. It does not depend on the phone's wall
+// clock agreeing with the gateway's.
+const LEASE_RENEWAL_MIN_AGE: Duration = Duration::from_secs(6);
+// A lease younger than this is never renewed: the gateway would mint the
+// renewal in the same second and its expiry would not advance.
+const LEASE_RENEWAL_FRESH_AGE: Duration = Duration::from_secs(2);
 const MAX_RECONNECT_DELAY: u64 = 20;
 // The live signer issues 90-second admissions. Starting a full worst-case
 // OAuth/401 recovery path 83 seconds early would therefore re-admit/re-greet
@@ -109,6 +115,10 @@ const NATIVE_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 // Android's 15-second native-action waiter gives up.
 const NATIVE_HANGUP_TIMEOUT: Duration = Duration::from_secs(12);
 const LEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// A caller-ending operation the Desktop never answers must not leave End
+// "already pending" for the rest of the call. The gateway's confirmation
+// lives 12 s and the Desktop's radio termination takes 8-10 s more.
+const END_CALLER_PENDING_TIMEOUT: Duration = Duration::from_secs(30);
 const REVOKE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(4);
 const MICROPHONE_MUTE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(8);
 // UI confirmation times out quickly, but relay/status delivery can lag across
@@ -601,6 +611,9 @@ impl GatewayShim {
                 if frame.device_id.as_deref() != Some(self.device_id.as_str()) {
                     return Ok(None);
                 }
+                let mut frame = frame;
+                sanitize_captions(&mut frame.snapshot.captions);
+                sanitize_caller(&mut frame.snapshot.caller);
                 frame.validate().map_err(|error| error.to_string())?;
                 self.project(frame)
             }
@@ -1099,7 +1112,6 @@ impl GatewayShim {
 #[derive(Clone, Default)]
 pub(crate) struct V2State {
     inner: Arc<AsyncMutex<ClientState>>,
-    ids: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1220,6 +1232,29 @@ struct ClientState {
     completed_revokes: VecDeque<CompletedRevoke>,
     pending_end_caller: Option<PendingEndCaller>,
     seen_remote_endpoint_jtis: HashSet<String>,
+    // When the current lease's exact jti arrived, by this phone's monotonic
+    // clock. Renewal timing uses it so a phone wall clock that trails or
+    // leads the gateway's cannot let the gateway expire a live lease.
+    lease_received_at: Option<(String, Instant)>,
+    // Lease requests this phone gave up on after LEASE_REQUEST_TIMEOUT, kept
+    // for LOCAL_EXPIRY_TOMBSTONE_TTL. A grant that still arrives for one is
+    // returned with its exact token instead of failing the session.
+    timed_out_lease_requests: VecDeque<(String, Instant)>,
+    // When the current caller-ending operation started; see
+    // clear_stale_end_caller.
+    pending_end_caller_since: Option<Instant>,
+    // Set when the gateway revoked the listen-only lease this phone held
+    // because another device moved the call's owner epoch; see
+    // take_monitor_rejoin.
+    monitor_rejoin: Option<MonitorRejoin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MonitorRejoin {
+    call_id: String,
+    call_epoch: u64,
+    revoked_owner_epoch: u64,
+    deadline: Instant,
 }
 
 fn offer_acceptance_replay_key(request_id: &str) -> String {
@@ -1715,6 +1750,95 @@ fn apply_rotated_admission_grants(
     AdmissionGrantDeescalation { pending, lease }
 }
 
+const MAX_TIMED_OUT_LEASE_REQUESTS: usize = 16;
+
+fn remember_timed_out_lease_request(client: &mut ClientState, request_id: &str, now: Instant) {
+    client
+        .timed_out_lease_requests
+        .retain(|(_, retain_until)| *retain_until > now);
+    if client.timed_out_lease_requests.len() >= MAX_TIMED_OUT_LEASE_REQUESTS {
+        client.timed_out_lease_requests.pop_front();
+    }
+    client
+        .timed_out_lease_requests
+        .push_back((request_id.to_owned(), now + LOCAL_EXPIRY_TOMBSTONE_TTL));
+}
+
+/// A grant (or provisional claim) for a lease request this phone already gave
+/// up on. Treating it as unsolicited failed the whole session and closed live
+/// media, and on the relay carrier the Desktop kept the lease until it
+/// expired. Instead the exact token is returned and the lineage tombstoned
+/// so its late RTC frames are absorbed too; no native media is opened.
+fn contain_late_timed_out_grant(
+    state: &V2State,
+    client: &mut ClientState,
+    frame: &LeaseStatusFrame,
+    replay_key: &str,
+    encoded: &str,
+    now: u64,
+) -> Result<bool, String> {
+    if !matches!(frame.kind.as_str(), "lease_granted" | "claim_provisional") {
+        return Ok(false);
+    }
+    let instant = Instant::now();
+    client
+        .timed_out_lease_requests
+        .retain(|(_, retain_until)| *retain_until > instant);
+    let Some(index) = client
+        .timed_out_lease_requests
+        .iter()
+        .position(|(request_id, _)| *request_id == frame.request_id)
+    else {
+        return Ok(false);
+    };
+    if client
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.request_id == frame.request_id)
+    {
+        return Ok(false);
+    }
+    // The same shape gate a live grant gets; one already past its expiry is
+    // checked inside its own window and needs no return.
+    let expired = match frame.lease.validate(now) {
+        Ok(()) => false,
+        Err(V2ProtocolError::Expired) if frame.lease.expires_at <= now => {
+            frame
+                .lease
+                .validate(frame.lease.expires_at.saturating_sub(1))
+                .map_err(|error| error.to_string())?;
+            true
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    validate_claim_identity(client, &frame.lease)?;
+    if !expired {
+        let lease = ClientLease {
+            request_id: frame.request_id.clone(),
+            token: frame.lease_token.clone(),
+            claims: frame.lease.clone(),
+            session: session_from_claims(&frame.lease, 1, 1)?,
+        };
+        if client.urgent_control_frames.len() >= MAX_URGENT_CONTROL_FRAMES {
+            return Err("urgent lease-revoke queue reached its safety bound".into());
+        }
+        let queued = exact_lease_revocation_frame(state, &lease, "lease_request_timed_out")?;
+        client.urgent_control_frames.push_back(queued);
+        push_local_expiry_tombstone(
+            client,
+            lease,
+            instant + LOCAL_EXPIRY_TOMBSTONE_TTL,
+            true,
+        )?;
+    }
+    client.timed_out_lease_requests.remove(index);
+    remember_applied_relay_frame(client, replay_key.to_owned(), encoded)?;
+    eprintln!(
+        "[AokieCompanion][realtime] returned a lease granted after its request timed out"
+    );
+    Ok(true)
+}
+
 fn queue_exact_lease_revocation(
     state: &V2State,
     client: &mut ClientState,
@@ -2175,6 +2299,41 @@ impl PendingEndCaller {
     }
 }
 
+/// Drop a caller-ending operation that has waited longer than
+/// END_CALLER_PENDING_TIMEOUT, or whose confirmation expired before the
+/// owner confirmed it, and return its request id. A native hang-up keeps its
+/// own, shorter deadline and is left alone. Nothing is sent: an unanswered
+/// request ends nothing, and a result that still arrives is absorbed.
+fn clear_stale_end_caller(client: &mut ClientState, now: Instant, now_unix: u64) -> Option<String> {
+    let pending = client.pending_end_caller.as_ref()?;
+    if client.pending_native_hangup.is_some() {
+        return None;
+    }
+    let confirmation_expired = matches!(
+        pending,
+        PendingEndCaller::AwaitingConfirmation { challenge } if challenge.expires_at <= now_unix
+    );
+    let timed_out = client
+        .pending_end_caller_since
+        .is_some_and(|since| now.saturating_duration_since(since) >= END_CALLER_PENDING_TIMEOUT);
+    if !confirmation_expired && !timed_out {
+        return None;
+    }
+    let request_id = pending.request_id().to_owned();
+    client.pending_end_caller = None;
+    client.pending_end_caller_since = None;
+    Some(request_id)
+}
+
+/// True when no caller-ending operation is waiting for its result, so a
+/// result now is a late reply to one this phone already stopped waiting for.
+fn end_caller_result_is_late(client: &ClientState) -> bool {
+    !matches!(
+        client.pending_end_caller,
+        Some(PendingEndCaller::AwaitingResult { .. })
+    )
+}
+
 fn apply_end_caller_result(
     client: &mut ClientState,
     frame: &PluginEndCallerResultFrame,
@@ -2463,13 +2622,13 @@ impl V2State {
         }
     }
 
+    /// A fresh id for a jti, nonce, signal or request. Random, never a
+    /// counter: the hosted gateway keeps one replay cache across every app and
+    /// the Desktop remembers request ids for minutes, so a counter that
+    /// restarted at 1 on each launch collided with other phones, with this
+    /// phone's tablet twin, and with this phone before a relaunch.
     fn next_id(&self, prefix: &str) -> String {
-        let id = self
-            .ids
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1)
-            .max(1);
-        format!("{prefix}_{id}")
+        aokie_protocol::v2::unique_id(prefix)
     }
 }
 
@@ -3491,6 +3650,7 @@ pub async fn realtime_v2_prepare_end_caller(
         if client.generation == 0 {
             return Err("protocol-v2 realtime is offline".into());
         }
+        clear_stale_end_caller(&mut client, Instant::now(), unix_now()?);
         if client.pending_end_caller.is_some() {
             return Err("a caller-ending confirmation is already pending".into());
         }
@@ -3520,6 +3680,7 @@ pub async fn realtime_v2_prepare_end_caller(
         client.pending_end_caller = Some(PendingEndCaller::AwaitingChallenge {
             request_id: request_id.clone(),
         });
+        client.pending_end_caller_since = Some(Instant::now());
         (frame, request_id)
     };
     let encoded = serde_json::to_string(&frame)
@@ -4269,6 +4430,9 @@ async fn poll_native_call_actions(
     if let Some(outbound) = take_ready_lease_request(state).await? {
         return Ok(Some(outbound));
     }
+    if let Some(outbound) = take_monitor_rejoin(state).await {
+        return Ok(Some(outbound));
+    }
     if let Some(outbound) = progress_native_hangup(app, state).await? {
         return Ok(Some(outbound));
     }
@@ -4370,6 +4534,101 @@ async fn poll_native_call_actions(
     result
 }
 
+/// How long a revoked listen-only lease waits for the new owner epoch's
+/// monitor offer before the phone gives up re-joining.
+const MONITOR_REJOIN_WINDOW: Duration = Duration::from_secs(15);
+
+/// The re-join intent a gateway revocation leaves behind. Only a listen-only
+/// lease revoked because the owner epoch moved (another device prepared,
+/// consulted, took over or returned) re-joins; every other revocation is the
+/// end of listening.
+fn monitor_rejoin_after_revocation(
+    lease: &ClientLease,
+    reason: &str,
+    now: Instant,
+) -> Option<MonitorRejoin> {
+    (lease.claims.mode == LeaseMode::Monitor
+        && matches!(reason, "authoritative_epoch_changed" | "owner_epoch_advanced"))
+    .then(|| MonitorRejoin {
+        call_id: lease.claims.call_id.clone(),
+        call_epoch: lease.claims.call_epoch,
+        revoked_owner_epoch: lease.claims.owner_epoch,
+        deadline: now + MONITOR_REJOIN_WINDOW,
+    })
+}
+
+/// Whether a pending re-join can be answered now: `Some(true)` to answer,
+/// `Some(false)` to drop the intent, `None` to keep waiting.
+fn monitor_rejoin_ready(client: &ClientState, rejoin: &MonitorRejoin, now: Instant) -> Option<bool> {
+    if now >= rejoin.deadline
+        || client.lease.is_some()
+        || client.pending.is_some()
+        || client.pending_revoke.is_some()
+    {
+        // Out of time, or the owner already chose something else.
+        return Some(false);
+    }
+    let snapshot = client.snapshot.as_ref()?;
+    if snapshot.snapshot.call_id != rejoin.call_id
+        || snapshot.snapshot.call_epoch != rejoin.call_epoch
+        || !matches!(snapshot.snapshot.telephony_state, TelephonyState::Active)
+    {
+        return Some(false);
+    }
+    if snapshot.snapshot.owner_epoch <= rejoin.revoked_owner_epoch {
+        return None;
+    }
+    snapshot
+        .snapshot
+        .pending_mobile_offers
+        .iter()
+        .any(|offer| {
+            offer.offer.offered_mode == LeaseMode::Monitor
+                && offer.offer.owner_epoch == snapshot.snapshot.owner_epoch
+        })
+        .then_some(true)
+}
+
+/// Re-request listen-only media once after the owner epoch moved under it.
+/// The gateway revokes every lease, monitors included, whenever the owner
+/// epoch changes; without this the phone stopped hearing the call while its
+/// owner had asked only to listen. One attempt per revocation, through the
+/// same offer answer a tap on Listen sends, so consent, grants and the signed
+/// offer are all checked again; a refusal simply ends listening.
+async fn take_monitor_rejoin(state: &V2State) -> Option<NativeOutbound> {
+    {
+        let mut client = state.inner.lock().await;
+        let rejoin = client.monitor_rejoin.clone()?;
+        match monitor_rejoin_ready(&client, &rejoin, Instant::now()) {
+            None => return None,
+            Some(false) => {
+                client.monitor_rejoin = None;
+                return None;
+            }
+            Some(true) => client.monitor_rejoin = None,
+        }
+    }
+    match prepare_offer_answer(state, LeaseMode::Monitor, None).await {
+        Ok((frame, request_id)) => match serde_json::to_string(&frame) {
+            Ok(encoded) => Some(NativeOutbound {
+                encoded,
+                answer_action_id: None,
+                answer_request_id: Some(request_id),
+                assistance_answer_id: None,
+                revoke_request_id: None,
+            }),
+            Err(_) => {
+                let _ = clear_pending_lease(state, &request_id).await;
+                None
+            }
+        },
+        Err(message) => {
+            eprintln!("[AokieCompanion][realtime] listen-only re-join was not sent: {message}");
+            None
+        }
+    }
+}
+
 async fn take_ready_lease_request(state: &V2State) -> Result<Option<NativeOutbound>, String> {
     let mut client = state.inner.lock().await;
     let Some(pending) = client.pending.as_mut() else {
@@ -4457,6 +4716,7 @@ async fn queue_native_hangup(
     let encoded = serde_json::to_string(&frame)
         .map_err(|_| "could not encode native caller-ending challenge request".to_string())?;
     client.pending_end_caller = Some(PendingEndCaller::AwaitingChallenge { request_id });
+    client.pending_end_caller_since = Some(Instant::now());
     client.pending_native_hangup = Some(PendingNativeHangup {
         action_id: action.action_id,
         deadline: Instant::now() + NATIVE_HANGUP_TIMEOUT,
@@ -4723,7 +4983,14 @@ async fn progress_native_end(
 }
 
 async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
-    let (native_end, native_hangup, pending_revoke, pending_revoke_error, pending_lease) = {
+    let (
+        native_end,
+        native_hangup,
+        pending_revoke,
+        pending_revoke_error,
+        pending_lease,
+        stale_end_caller,
+    ) = {
         let mut client = state.inner.lock().await;
         let now = Instant::now();
         purge_local_expiry_tombstones(&mut client, now);
@@ -4756,6 +5023,9 @@ async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
         };
         let (pending_revoke, pending_revoke_error) =
             take_timed_out_pending_revoke(&mut client, now);
+        let stale_end_caller = unix_now()
+            .ok()
+            .and_then(|now_unix| clear_stale_end_caller(&mut client, now, now_unix));
         let pending_timeout = client
             .pending
             .as_ref()
@@ -4768,6 +5038,9 @@ async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
         });
         if let Some((pending, _)) = pending_lease.as_ref() {
             remember_terminal_offer_acceptance(&mut client, pending);
+            if pending.stage == PendingLeaseStage::LeaseRequested {
+                remember_timed_out_lease_request(&mut client, &pending.request_id, now);
+            }
         }
         (
             native_end,
@@ -4775,12 +5048,26 @@ async fn expire_native_call_actions(app: &AppHandle, state: &V2State) {
             pending_revoke,
             pending_revoke_error,
             pending_lease,
+            stale_end_caller,
         )
     };
 
     if let Some(message) = pending_revoke_error {
         eprintln!(
             "[AokieCompanion][realtime] timed-out lease return lineage could not be retained: {message}"
+        );
+    }
+
+    if let Some(request_id) = stale_end_caller {
+        let _ = app.emit(
+            "aokie-companion://v2-end-caller",
+            EndCallerFailureEvent {
+                kind: "end_caller_failure",
+                schema_version: SCHEMA_VERSION,
+                request_id,
+                code: "end_caller_timed_out".into(),
+                message: "Desktop did not answer the request to end the caller's call. The call is still connected; try again.".into(),
+            },
         );
     }
 
@@ -5122,7 +5409,7 @@ async fn open_overlapping_managed_transport(
         .max_frame_size(Some(MAX_MESSAGE_BYTES));
     let socket = match tokio::time::timeout(
         CONNECT_TIMEOUT,
-        connect_async_with_config(request, Some(websocket_config), false),
+        crate::ws_tls::connect(request, websocket_config),
     )
     .await
     {
@@ -5338,7 +5625,7 @@ pub(crate) fn spawn(
                     .max_frame_size(Some(MAX_MESSAGE_BYTES));
                 match tokio::time::timeout(
                     CONNECT_TIMEOUT,
-                    connect_async_with_config(request, Some(websocket_config), false),
+                    crate::ws_tls::connect(request, websocket_config),
                 )
                 .await
                 {
@@ -6169,7 +6456,10 @@ async fn endpoint_handshake(
     )
     .await?;
 
-    let proof_expiry = challenge.expires_at.min(now.saturating_add(30));
+    // Dated by the gateway's clock as read from the challenge, so a phone
+    // clock that runs a few seconds fast never signs a proof from the
+    // gateway's future.
+    let (proof_issued_at, proof_expiry) = challenge.hello_proof_window(now);
     let proof = endpoint_identity.sign_hello(HelloProofClaims {
         app_id: challenge.app_id.clone(),
         subject_id: challenge.subject_id.clone(),
@@ -6185,7 +6475,7 @@ async fn endpoint_handshake(
         peer_roster_hash: challenge.peer_roster_hash.clone(),
         nonce: state.next_id("hello_nonce"),
         jti: state.next_id("hello_proof"),
-        issued_at: now,
+        issued_at: proof_issued_at,
         expires_at: proof_expiry,
     })?;
     let hello = MobileHello {
@@ -6417,7 +6707,8 @@ async fn handle_gateway_frame(
     }
     match parse_kind(encoded)?.as_str() {
         "idle_sync" => {
-            let frame: MobileIdleSyncFrame = strict_parse(encoded, "idle sync")?;
+            let frame: MobileIdleSyncFrame =
+                strict_parse(&without_unknown_grants(encoded), "idle sync")?;
             validate_idle_sync(&frame, expected_app_id)?;
             let Some(cleanup) = ({
                 let mut client = state.inner.lock().await;
@@ -6462,7 +6753,12 @@ async fn handle_gateway_frame(
                 .map_err(|_| "could not deliver protocol-v2 idle sync".to_string())?;
         }
         "snapshot" => {
-            let mut frame: MobileSnapshotFrame = strict_parse(encoded, "snapshot")?;
+            let mut frame: MobileSnapshotFrame =
+                strict_parse(&without_unknown_grants(encoded), "snapshot")?;
+            if let Some(captions) = frame.snapshot.captions.as_mut() {
+                sanitize_captions(captions);
+            }
+            sanitize_caller(&mut frame.snapshot.caller);
             validate_snapshot(&frame, expected_app_id)?;
             let now = unix_now()?;
             let (
@@ -6505,8 +6801,21 @@ async fn handle_gateway_frame(
                     })
                     .cloned();
                 let mut failed_native_hangup_action_id = None;
-                if grant_revoked_lease.is_some() {
+                if let Some(lease) = grant_revoked_lease.as_ref() {
                     client.lease = None;
+                    // Return the exact token, as an admission de-escalation
+                    // does, so the Desktop's lease book converges now rather
+                    // than when the lease expires on its own.
+                    if let Err(message) = queue_exact_lease_revocation(
+                        state,
+                        &mut client,
+                        lease,
+                        "snapshot_withdrew_media_mode",
+                    ) {
+                        eprintln!(
+                            "[AokieCompanion][realtime] withdrawn lease return could not be queued: {message}"
+                        );
+                    }
                     if client
                         .pending_end_caller
                         .as_ref()
@@ -6926,11 +7235,17 @@ async fn handle_gateway_frame(
             }
         }
         "end_caller_result" => {
-            let frame: PluginEndCallerResultFrame = strict_parse(encoded, "caller-ending result")?;
+            let mut frame: PluginEndCallerResultFrame =
+                strict_parse(encoded, "caller-ending result")?;
             frame.validate().map_err(|error| error.to_string())?;
             if frame.app_id != expected_app_id {
                 return Err("caller-ending result belongs to another application".into());
             }
+            // Shown to the owner as one line; the renderer refuses controls.
+            frame.message = frame
+                .message
+                .as_deref()
+                .map(|message| display_line(message, 500));
             let replay_key = end_caller_result_replay_key(&frame.operation_id);
             let completed = frame.outcome == EndCallerOutcome::Completed;
             let (lease_to_close, native_hangup_action_id) = {
@@ -6938,6 +7253,18 @@ async fn handle_gateway_frame(
                 if client.relay_transport
                     && applied_relay_frame_is_replay(&client, &replay_key, encoded)?
                 {
+                    return Ok(());
+                }
+                if end_caller_result_is_late(&client) {
+                    // The local wait (NATIVE_HANGUP_TIMEOUT) already gave up.
+                    // The Desktop's own snapshot and lease revocation carry
+                    // the outcome; failing here ended the session instead.
+                    eprintln!(
+                        "[AokieCompanion][realtime] ignored a caller-ending result that arrived after its local wait ended"
+                    );
+                    if client.relay_transport {
+                        remember_applied_relay_frame(&mut client, replay_key, encoded)?;
+                    }
                     return Ok(());
                 }
                 apply_end_caller_result(&mut client, &frame)?
@@ -7003,7 +7330,7 @@ async fn handle_gateway_frame(
             apply_claim_rejection(app, state, media_state, expected_app_id, frame, encoded).await?;
         }
         "error" => {
-            let frame: ErrorFrame = strict_parse(encoded, "gateway error")?;
+            let mut frame: ErrorFrame = strict_parse(encoded, "gateway error")?;
             validate_common(
                 &frame.kind,
                 frame.schema_version,
@@ -7011,7 +7338,7 @@ async fn handle_gateway_frame(
                 expected_app_id,
             )?;
             validate_text(&frame.code, 200, "gateway error code")?;
-            validate_text(&frame.message, 500, "gateway error message")?;
+            frame.message = display_line(&frame.message, 500);
             if matches!(
                 frame.code.as_str(),
                 "endpoint_reconnecting" | "renewal_not_due"
@@ -7134,7 +7461,19 @@ async fn handle_gateway_frame(
             }
             emit_error(app, &format!("{} — {}", frame.code, frame.message));
         }
-        _ => return Err("gateway sent an unsupported protocol-v2 message kind".into()),
+        _ => {
+            // A kind this build does not define comes from a newer gateway or
+            // Desktop. Ignoring it grants nothing, and failing here would put
+            // every not-yet-updated phone into a reconnect loop that tears
+            // down live media. Known kinds in the wrong place stay fatal.
+            if let Some(kind) = aokie_protocol::v2::unknown_frame_kind(encoded) {
+                eprintln!(
+                    "[AokieCompanion][realtime] ignored a protocol-v2 frame of a newer kind: {kind}"
+                );
+                return Ok(());
+            }
+            return Err("gateway sent an unsupported protocol-v2 message kind".into());
+        }
     }
     Ok(())
 }
@@ -7211,15 +7550,27 @@ async fn apply_microphone_mute_status(
     if client.relay_transport && applied_relay_frame_is_replay(&client, &replay_key, encoded)? {
         return Ok(None);
     }
-    let pending = client
+    let Some(pending) = client
         .pending_microphone_mute
         .as_ref()
         .filter(|pending| {
             pending.request_id == frame.request_id
                 && pending.stage == PendingMicrophoneMuteStage::AwaitingStatus
         })
-        .ok_or("unsolicited microphone mute status")?
-        .clone();
+        .cloned()
+    else {
+        // Usually a status that outlived MICROPHONE_MUTE_CONFIRM_TIMEOUT: the
+        // handset already disarmed its microphone and the Desktop's next full
+        // snapshot carries the authoritative mute state. Ending the session
+        // over it would drop a live takeover.
+        eprintln!(
+            "[AokieCompanion][realtime] ignored a microphone mute status with no pending request"
+        );
+        if client.relay_transport {
+            remember_applied_relay_frame(&mut client, replay_key, encoded)?;
+        }
+        return Ok(None);
+    };
     let (mut snapshot, lease) = current_microphone_mute_authority(&client, unix_now()?)?;
     if frame.device_id != client.device_id.as_deref().unwrap_or_default()
         || frame.lease_id != pending.lease_id
@@ -7443,6 +7794,7 @@ struct LeaseStatusPlan {
     reconcile_call: Option<(String, u64)>,
     ice_servers: Vec<IceServerConfig>,
     relay_only: bool,
+    received_at: Instant,
 }
 
 impl LeaseStatusPlan {
@@ -7494,6 +7846,7 @@ where
             return Ok(None);
         }
     }
+    let received_at = Instant::now();
     let now = unix_now()?;
     let expired_before_status = {
         let mut client = state.inner.lock().await;
@@ -7532,6 +7885,11 @@ where
             // Return-to-Aokie already closed the native peer. Advance only
             // the exact closed token lineage and queue its renewed descendant
             // for return without recreating media authority.
+            return Ok(None);
+        }
+        if contain_late_timed_out_grant(state, &mut client, &frame, &replay_key, encoded, now)? {
+            // The request had already timed out locally: its lease goes
+            // straight back to the Desktop and no native media is opened.
             return Ok(None);
         }
     }
@@ -7732,6 +8090,7 @@ where
             reconcile_call,
             ice_servers: client.ice_servers.clone(),
             relay_only: client.relay_only,
+            received_at,
         }
     };
 
@@ -7797,6 +8156,7 @@ async fn commit_lease_status(
         LeaseStatusPredecessor::Lease { .. } => {}
     }
     client.lease = Some(plan.proposed.clone());
+    client.lease_received_at = Some((plan.proposed.claims.jti.clone(), plan.received_at));
     client.applying_lease_status = None;
     Ok(AppliedLeaseStatus {
         lease_event: plan.lease_event.clone(),
@@ -8325,7 +8685,8 @@ async fn apply_revocation(
     }
     validate_id(&frame.lease_id, "leaseId")?;
     validate_id(&frame.lease_jti, "leaseJti")?;
-    validate_text(&frame.reason, 500, "lease revoke reason")?;
+    let mut frame = frame;
+    frame.reason = display_line(&frame.reason, 500);
     let (lease, local_media_already_closed, native_action_id, emit_reset) = {
         let mut client = state.inner.lock().await;
         if completed_revoke_frame_is_replay(&mut client, &frame, encoded)? {
@@ -8399,6 +8760,11 @@ async fn apply_revocation(
             remember_completed_revoke(&mut client, completed_revoke_from_frame(&frame, encoded))?;
             client.pending_end_caller = None;
             client.pending_microphone_mute = None;
+            client.monitor_rejoin = monitor_rejoin_after_revocation(
+                client.lease.as_ref().expect("matching current lease was checked"),
+                &frame.reason,
+                Instant::now(),
+            );
             (
                 client
                     .lease
@@ -8412,13 +8778,18 @@ async fn apply_revocation(
             if let Some(pending) = client.pending_revoke.as_ref() {
                 validate_pending_revoke_ack(pending, &frame)?;
                 unreachable!("a successfully validated pending acknowledgement matched above");
-            } else if client.lease.is_some() {
-                return Err("stale lease revocation did not match the current JTI".into());
-            } else if !client.local_expiry_tombstones.is_empty() {
-                return Err("stale lease revocation did not match the local expiry fence".into());
-            } else {
-                return Err("lease revocation did not match a local lease".into());
             }
+            // An authenticated revocation of authority this phone no longer
+            // holds (an older JTI, or a lease already dropped and outlived
+            // by its fence) revokes nothing. Failing here ended the session
+            // and closed whatever media was live; keep the digest so a
+            // redelivery stays a no-op, and keep the current lease, whose
+            // own exact-JTI revocation or renewal refusal still applies.
+            remember_completed_revoke(&mut client, completed_revoke_from_frame(&frame, encoded))?;
+            eprintln!(
+                "[AokieCompanion][realtime] ignored a lease revocation for authority this phone no longer holds"
+            );
+            return Ok(());
         }
     };
     let result = if local_media_already_closed {
@@ -8550,7 +8921,8 @@ async fn apply_claim_rejection(
     )?;
     validate_id(&frame.request_id, "claim requestId")?;
     validate_text(&frame.code, 200, "claim rejection code")?;
-    validate_text(&frame.message, 500, "claim rejection message")?;
+    let mut frame = frame;
+    frame.message = display_line(&frame.message, 500);
     let action = {
         let mut client = state.inner.lock().await;
         prepare_claim_rejection(&mut client, &frame, encoded)?
@@ -8678,7 +9050,12 @@ async fn heartbeat_frame(state: &V2State, app_id: &str) -> Result<Option<String>
         }) {
             return Ok(None);
         }
-        if !lease_heartbeat_due(lease.claims.expires_at, now) {
+        let age = client
+            .lease_received_at
+            .as_ref()
+            .filter(|(jti, _)| *jti == lease.claims.jti)
+            .map(|(_, received_at)| received_at.elapsed());
+        if !lease_renewal_due(lease.claims.expires_at, now, age) {
             return Ok(None);
         }
         (
@@ -8730,8 +9107,31 @@ async fn confirm_urgent_control_frame(
     Ok(())
 }
 
+#[cfg(test)]
 fn lease_heartbeat_due(expires_at: u64, now: u64) -> bool {
-    expires_at > now && expires_at.saturating_sub(now) <= LEASE_RENEWAL_WINDOW.as_secs()
+    lease_renewal_due(expires_at, now, None)
+}
+
+/// Whether the current lease should be renewed on this heartbeat tick.
+///
+/// `expires_at` is on the gateway's clock and `now` on this phone's, so the
+/// remaining time alone is wrong by however far the clocks disagree: a phone
+/// a few seconds slow renewed too late and the gateway expired a live
+/// takeover. When the lease's arrival time is known (`age`, monotonic), it
+/// decides instead: a lease is renewed once it is
+/// [`LEASE_RENEWAL_MIN_AGE`] old (with an accurate clock this is exactly when
+/// it enters [`LEASE_RENEWAL_WINDOW`]), and never within
+/// [`LEASE_RENEWAL_FRESH_AGE`] of arriving, so a fast phone clock cannot
+/// renew in the gateway's same second and get back an expiry that does not
+/// advance.
+fn lease_renewal_due(expires_at: u64, now: u64, age: Option<Duration>) -> bool {
+    let window_due =
+        expires_at > now && expires_at.saturating_sub(now) <= LEASE_RENEWAL_WINDOW.as_secs();
+    match age {
+        None => window_due,
+        Some(age) if age < LEASE_RENEWAL_FRESH_AGE => false,
+        Some(age) => window_due || age >= LEASE_RENEWAL_MIN_AGE,
+    }
 }
 
 /// Remove only authority whose exact current claims have crossed their local
@@ -9162,6 +9562,43 @@ fn is_new_authoritative_sequence(client: &ClientState, sequence: u64) -> bool {
     sequence > client.authoritative_sequence
 }
 
+/// Fold the Desktop's display text into what this phone shows: one line,
+/// within the protocol's byte limits. A caption with a newline, or one an
+/// older Desktop cut at 2,000 characters rather than bytes, used to fail the
+/// whole snapshot, and the Companion reconnected in a loop for the rest of the
+/// call because the caption stayed in every later snapshot. A caption left
+/// empty is dropped.
+fn sanitize_captions(captions: &mut Vec<aokie_protocol::v2::Caption>) {
+    use aokie_protocol::text::sanitize_line;
+    for caption in captions.iter_mut() {
+        caption.speaker = sanitize_line(&caption.speaker, MAX_CAPTION_SPEAKER_BYTES);
+        caption.text = sanitize_line(&caption.text, aokie_protocol::v2::MAX_CAPTION_BYTES);
+    }
+    captions.retain(|caption| !caption.speaker.is_empty() && !caption.text.is_empty());
+}
+
+/// The caller's label and masked number get the same one-line rule as
+/// captions; one that is left empty is dropped.
+fn sanitize_caller(caller: &mut Option<aokie_protocol::v2::CallerProjection>) {
+    use aokie_protocol::text::sanitize_line;
+    if let Some(projection) = caller.as_mut() {
+        projection.label = projection
+            .label
+            .as_deref()
+            .map(|label| sanitize_line(label, MAX_CALLER_LABEL_BYTES))
+            .filter(|label| !label.is_empty());
+        projection.masked_number = projection
+            .masked_number
+            .as_deref()
+            .map(|number| sanitize_line(number, MAX_CALLER_NUMBER_BYTES))
+            .filter(|number| !number.is_empty());
+    }
+}
+
+const MAX_CAPTION_SPEAKER_BYTES: usize = 40;
+const MAX_CALLER_LABEL_BYTES: usize = 200;
+const MAX_CALLER_NUMBER_BYTES: usize = 40;
+
 fn validate_snapshot(frame: &MobileSnapshotFrame, expected_app_id: &str) -> Result<(), String> {
     validate_common(
         &frame.kind,
@@ -9205,10 +9642,10 @@ fn validate_snapshot(frame: &MobileSnapshotFrame, expected_app_id: &str) -> Resu
         .map_err(|_| "snapshot occurredAt is invalid".to_string())?;
     if let Some(caller) = &snapshot.caller {
         if let Some(label) = &caller.label {
-            validate_text(label, 200, "caller label")?;
+            validate_text(label, MAX_CALLER_LABEL_BYTES, "caller label")?;
         }
         if let Some(number) = &caller.masked_number {
-            validate_text(number, 40, "caller maskedNumber")?;
+            validate_text(number, MAX_CALLER_NUMBER_BYTES, "caller maskedNumber")?;
         }
     }
     let consent_current = remote_consent_is_current(&snapshot.remote_consent, unix_now()?);
@@ -9240,8 +9677,12 @@ fn validate_snapshot(frame: &MobileSnapshotFrame, expected_app_id: &str) -> Resu
         }
         for caption in captions {
             validate_id(&caption.caption_id, "captionId")?;
-            validate_text(&caption.speaker, 40, "caption speaker")?;
-            validate_text(&caption.text, 2_000, "caption text")?;
+            validate_text(&caption.speaker, MAX_CAPTION_SPEAKER_BYTES, "caption speaker")?;
+            validate_text(
+                &caption.text,
+                aokie_protocol::v2::MAX_CAPTION_BYTES,
+                "caption text",
+            )?;
             DateTime::parse_from_rfc3339(&caption.occurred_at)
                 .map_err(|_| "caption occurredAt is invalid".to_string())?;
         }
@@ -9276,6 +9717,34 @@ fn parse_kind(encoded: &str) -> Result<String, String> {
         .ok_or_else(|| "protocol-v2 frame omitted kind".to_string())
 }
 
+/// `encoded` with any grant names this build does not know removed from its
+/// top-level `grants` list. A newer gateway may grant a capability this phone
+/// has never heard of; refusing the whole snapshot for it would strand the
+/// phone in a reconnect loop, while dropping it simply leaves that capability
+/// unused. Signed offers keep their own grant lists untouched.
+fn without_unknown_grants(encoded: &str) -> std::borrow::Cow<'_, str> {
+    let Ok(mut value) = serde_json::from_str::<Value>(encoded) else {
+        return encoded.into();
+    };
+    let Some(grants) = value.get_mut("grants").and_then(Value::as_array_mut) else {
+        return encoded.into();
+    };
+    let before = grants.len();
+    grants.retain(|grant| {
+        grant
+            .as_str()
+            .is_none_or(|name| Grant::from_wire(name).is_some())
+    });
+    if grants.len() == before {
+        return encoded.into();
+    }
+    eprintln!(
+        "[AokieCompanion][realtime] ignored {} grant(s) this build does not know",
+        before - grants.len()
+    );
+    serde_json::to_string(&value).map_or(encoded.into(), Into::into)
+}
+
 fn strict_parse<T: for<'de> Deserialize<'de>>(encoded: &str, label: &str) -> Result<T, String> {
     serde_json::from_str(encoded).map_err(|_| format!("gateway {label} frame is invalid"))
 }
@@ -9290,6 +9759,19 @@ fn validate_id(value: &str, label: &str) -> Result<(), String> {
         Err(format!("{label} is invalid"))
     } else {
         Ok(())
+    }
+}
+
+/// A reason or message from the gateway or Desktop, as one display line
+/// within `maximum` bytes. These are shown, never parsed, so a newline or an
+/// over-long message is folded rather than failing (and tearing down) the
+/// whole session; one that folds to nothing reads as a dash.
+fn display_line(value: &str, maximum: usize) -> String {
+    let line = aokie_protocol::text::sanitize_line(value, maximum);
+    if line.is_empty() {
+        "-".into()
+    } else {
+        line
     }
 }
 
@@ -9436,6 +9918,7 @@ fn emit_assistance_reset(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
     use aokie_protocol::v2::{
         tracks_for, CarrierHoldEvidence, MediaTrack, ProjectedCallSnapshot, RemoteCapabilities,
         SecondaryCallObservation, SecondaryCallPolicy, LEASE_AUDIENCE,
@@ -15287,5 +15770,355 @@ mod tests {
         assert!(encoded.contains("\"kind\":\"lease_revoke\""));
         assert!(!encoded.contains("end_caller_confirm"));
         assert!(!encoded.contains("end_caller_challenge"));
+    }
+
+    // ---- review fixes: ids, clock skew, display text, newer peers, late replies ----
+
+    #[test]
+    fn minted_ids_are_random_and_never_repeat_across_a_relaunch() {
+        // Two fresh states stand in for the same phone before and after a
+        // relaunch (or a phone and a tablet): a counter restarted both at 1.
+        let before = V2State::default();
+        let after = V2State::default();
+        let mut seen = HashSet::new();
+        for state in [&before, &after] {
+            for prefix in ["hello_proof", "hello_nonce", "sdp_proof", "signal", "request"] {
+                for _ in 0..200 {
+                    let id = state.next_id(prefix);
+                    assert!(id.starts_with(&format!("{prefix}_")));
+                    validate_id(&id, "minted id").unwrap();
+                    assert!(seen.insert(id), "an id repeated");
+                }
+            }
+        }
+        assert!(!seen.contains("hello_proof_1"));
+        assert!(!seen.contains("request_1"));
+    }
+
+    #[test]
+    fn lease_renewal_follows_the_leases_age_not_a_skewed_wall_clock() {
+        let now = 1_000_000;
+        // Unknown arrival time: the old window rule.
+        assert!(!lease_renewal_due(now + 20, now, None));
+        assert!(lease_renewal_due(now + 14, now, None));
+        // A phone 10 s slow reads a fresh 20 s lease as 30 s long; by the
+        // window rule it renewed only once the gateway had expired it.
+        let slow_view = now + 30;
+        assert!(!lease_renewal_due(slow_view, now, Some(Duration::from_secs(5))));
+        assert!(lease_renewal_due(slow_view, now, Some(LEASE_RENEWAL_MIN_AGE)));
+        assert!(lease_renewal_due(slow_view, now, Some(Duration::from_secs(13))));
+        // A phone 10 s fast reads it as 10 s long: within the window at once,
+        // but a lease that has only just arrived is never renewed, so the
+        // gateway cannot mint a renewal in the same second.
+        let fast_view = now + 10;
+        assert!(!lease_renewal_due(fast_view, now, Some(Duration::from_millis(500))));
+        assert!(lease_renewal_due(fast_view, now, Some(LEASE_RENEWAL_FRESH_AGE)));
+        // With an accurate clock the age rule fires exactly where the window
+        // rule did, so nothing changes for a well-synchronised phone.
+        for age in 0..20_u64 {
+            let remaining = 20 - age;
+            if age >= LEASE_RENEWAL_FRESH_AGE.as_secs() {
+                assert_eq!(
+                    lease_renewal_due(now + remaining, now, Some(Duration::from_secs(age))),
+                    lease_renewal_due(now + remaining, now, None),
+                    "age {age}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_multi_line_or_over_long_caption_is_folded_instead_of_failing_the_snapshot() {
+        let mut source = authoritative_snapshot();
+        source.remote_consent.enabled = true;
+        source.remote_consent.acknowledged = true;
+        source.remote_consent.acknowledged_at = Some(Utc::now().to_rfc3339());
+        source.remote_consent.captions_enabled = true;
+        let caption = |id: &str, speaker: &str, text: String| aokie_protocol::v2::Caption {
+            caption_id: id.into(),
+            speaker: speaker.into(),
+            text,
+            occurred_at: Utc::now().to_rfc3339(),
+            final_text: true,
+        };
+        source.captions = vec![
+            caption("caption_1", "caller", "first line\nsecond\tline".into()),
+            // An older Desktop cut at 2,000 characters: 6,000 bytes of CJK.
+            caption("caption_2", "aokie", "語".repeat(2_000)),
+            caption("caption_3", "caller", "\n\r\t".into()),
+        ];
+        source.caller = Some(aokie_protocol::v2::CallerProjection {
+            label: Some("Jane\nDoe".into()),
+            masked_number: Some("\n".into()),
+        });
+        let encoded = serde_json::to_string(&PluginSnapshotFrame {
+            kind: "plugin_snapshot".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            event_id: "event_1".into(),
+            device_id: Some("device_a".into()),
+            snapshot: source,
+        })
+        .unwrap();
+        let mut shim = GatewayShim::new(
+            "app_a".into(),
+            "device_a".into(),
+            vec![Grant::StateRead, Grant::CaptionsRead, Grant::CallerRead],
+            "desktop_key_thumbprint_1".into(),
+        );
+        shim.peer_verified = true;
+        let translated = shim
+            .translate(&encoded)
+            .expect("an over-long or multi-line caption no longer fails the frame")
+            .expect("a snapshot is a session frame");
+        let mut frame: MobileSnapshotFrame = serde_json::from_str(&translated).unwrap();
+        // The direct gateway path folds the same way before its own gate.
+        if let Some(captions) = frame.snapshot.captions.as_mut() {
+            sanitize_captions(captions);
+        }
+        sanitize_caller(&mut frame.snapshot.caller);
+        validate_snapshot(&frame, "app_a").expect("the folded snapshot passes");
+        let captions = frame.snapshot.captions.expect("captions are exposed");
+        assert_eq!(captions.len(), 2, "a caption that folds to nothing is dropped");
+        assert_eq!(captions[0].text, "first line second line");
+        assert!(captions[1].text.len() <= aokie_protocol::v2::MAX_CAPTION_BYTES);
+        assert_eq!(captions[1].text.chars().count(), 666);
+        let caller = frame.snapshot.caller.expect("caller is exposed");
+        assert_eq!(caller.label.as_deref(), Some("Jane Doe"));
+        assert_eq!(caller.masked_number, None);
+    }
+
+    #[test]
+    fn gateway_messages_are_shown_as_one_line_and_never_empty() {
+        assert_eq!(display_line("lease\nexpired", 500), "lease expired");
+        assert_eq!(display_line("\n\t", 500), "-");
+        assert!(display_line(&"é".repeat(400), 500).len() <= 500);
+    }
+
+    #[test]
+    fn grants_a_newer_gateway_adds_are_dropped_before_the_strict_parse() {
+        let mut client = offered_client(LeaseMode::Takeover, MobileOfferSurface::InApp);
+        let frame = client.snapshot.take().expect("fixture snapshot");
+        let mut value = serde_json::to_value(&frame).unwrap();
+        value["grants"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("call_notes_read"));
+        let encoded = value.to_string();
+        // As-is the snapshot cannot even be parsed by this build.
+        assert!(strict_parse::<MobileSnapshotFrame>(&encoded, "snapshot").is_err());
+        let parsed: MobileSnapshotFrame =
+            strict_parse(&without_unknown_grants(&encoded), "snapshot").unwrap();
+        assert_eq!(parsed.grants, frame.grants);
+        // A frame with only known grants is passed through untouched.
+        let known = serde_json::to_string(&frame).unwrap();
+        assert!(matches!(
+            without_unknown_grants(&known),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // A malformed grant entry is kept, so the frame still fails closed.
+        value["grants"] = serde_json::json!([7]);
+        assert!(strict_parse::<MobileSnapshotFrame>(
+            &without_unknown_grants(&value.to_string()),
+            "snapshot"
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_lease_granted_after_its_request_timed_out_is_returned_without_media() {
+        let state = V2State::default();
+        let (mut client, granted) = lease_status_client(LeaseMode::Monitor, LeasePhase::Active);
+        // The 10 s wait already gave up on request_a.
+        client.pending = None;
+        remember_timed_out_lease_request(&mut client, "request_a", Instant::now());
+        *state.inner.lock().await = client;
+
+        let frame = lease_status_frame("lease_granted", "signed.late.token", granted.clone());
+        let encoded = serde_json::to_string(&frame).unwrap();
+        let native_calls = Arc::new(AtomicU64::new(0));
+        let native_counter = native_calls.clone();
+        let applied = apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame.clone(),
+            &encoded,
+            move |_, _, _, _| {
+                native_counter.fetch_add(1, Ordering::AcqRel);
+                async { Ok(()) }
+            },
+            |_| async {},
+        )
+        .await
+        .expect("a late grant no longer fails the session");
+        assert!(applied.is_none());
+        assert_eq!(native_calls.load(Ordering::Acquire), 0, "no media is opened");
+        {
+            let client = state.inner.lock().await;
+            assert!(client.lease.is_none());
+            let returned = client.urgent_control_frames.back().expect("exact return");
+            assert_eq!(returned.lease_jti, granted.jti);
+            assert!(returned.encoded.contains("signed.late.token"));
+            assert!(client.timed_out_lease_requests.is_empty());
+        }
+        // A redelivery of the same grant stays a no-op.
+        assert!(apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            |_, _, _, _| async { Err("must not run".to_string()) },
+            |_| async {},
+        )
+        .await
+        .unwrap()
+        .is_none());
+
+        // An unrelated grant with no timed-out request is still refused.
+        let state = V2State::default();
+        let (mut client, granted) = lease_status_client(LeaseMode::Monitor, LeasePhase::Active);
+        client.pending = None;
+        *state.inner.lock().await = client;
+        let frame = lease_status_frame("lease_granted", "signed.unsolicited.token", granted);
+        let encoded = serde_json::to_string(&frame).unwrap();
+        assert!(apply_lease_status_transaction(
+            &state,
+            "app_a",
+            frame,
+            &encoded,
+            |_, _, _, _| async { Ok(()) },
+            |_| async {},
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn an_unanswered_caller_ending_operation_expires_and_a_late_result_is_absorbed() {
+        let mut client = ClientState::default();
+        let started = Instant::now();
+        client.pending_end_caller = Some(PendingEndCaller::AwaitingChallenge {
+            request_id: "end_prepare_a".into(),
+        });
+        client.pending_end_caller_since = Some(started);
+        assert_eq!(clear_stale_end_caller(&mut client, started, 1_000), None);
+        assert_eq!(
+            clear_stale_end_caller(&mut client, started + END_CALLER_PENDING_TIMEOUT, 1_000)
+                .as_deref(),
+            Some("end_prepare_a")
+        );
+        assert!(client.pending_end_caller.is_none());
+        // Once nothing waits for a result, a result is a late reply.
+        assert!(end_caller_result_is_late(&client));
+        // A native hang-up keeps its own deadline.
+        client.pending_end_caller = Some(PendingEndCaller::AwaitingChallenge {
+            request_id: "end_prepare_b".into(),
+        });
+        client.pending_end_caller_since = Some(started);
+        client.pending_native_hangup = Some(PendingNativeHangup {
+            action_id: "native_action_b".into(),
+            deadline: started + NATIVE_HANGUP_TIMEOUT,
+        });
+        assert_eq!(
+            clear_stale_end_caller(&mut client, started + END_CALLER_PENDING_TIMEOUT, 1_000),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mute_status_that_outlived_its_wait_is_absorbed() {
+        let state = V2State::default();
+        let mut client = end_caller_client();
+        client.relay_transport = true;
+        let snapshot = client.snapshot.as_ref().unwrap().clone();
+        let lease = client.lease.as_ref().unwrap().clone();
+        // MICROPHONE_MUTE_CONFIRM_TIMEOUT already cleared the pending request.
+        client.pending_microphone_mute = None;
+        let frame = PluginMicrophoneMuteStatusFrame {
+            kind: "microphone_mute_status".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: lease.claims.app_id.clone(),
+            device_id: lease.claims.device_id.clone(),
+            request_id: "microphone_mute_late".into(),
+            lease_id: lease.claims.lease_id.clone(),
+            lease_jti: lease.claims.jti.clone(),
+            rtc_session_id: lease.claims.rtc_session_id.clone(),
+            call_id: lease.claims.call_id.clone(),
+            call_epoch: lease.claims.call_epoch,
+            owner_epoch: lease.claims.owner_epoch,
+            switchboard_revision: snapshot.snapshot.switchboard_revision,
+            remote_revision: snapshot.snapshot.remote_revision + 1,
+            fence: lease.claims.fence,
+            muted: true,
+        };
+        let encoded = serde_json::to_string(&frame).unwrap();
+        *state.inner.lock().await = client;
+        assert!(apply_microphone_mute_status(&state, "app_a", frame, &encoded)
+            .await
+            .expect("a late status no longer ends the session")
+            .is_none());
+        let client = state.inner.lock().await;
+        assert_eq!(client.lease.as_ref(), Some(&lease), "the live lease is kept");
+    }
+
+    #[test]
+    fn a_listen_only_lease_revoked_by_an_epoch_move_rejoins_once_at_the_new_epoch() {
+        let (mut client, monitor) = lease_status_client(LeaseMode::Monitor, LeasePhase::Active);
+        let lease = ClientLease {
+            request_id: "request_a".into(),
+            token: "signed.monitor.token".into(),
+            session: session_from_claims(&monitor, 1, 1).unwrap(),
+            claims: monitor.clone(),
+        };
+        let now = Instant::now();
+        // Only an epoch move re-joins, and only for listen-only media.
+        assert!(monitor_rejoin_after_revocation(&lease, "operator_return", now).is_none());
+        let mut takeover = lease.clone();
+        takeover.claims.mode = LeaseMode::Takeover;
+        assert!(monitor_rejoin_after_revocation(&takeover, "owner_epoch_advanced", now).is_none());
+        let rejoin = monitor_rejoin_after_revocation(&lease, "authoritative_epoch_changed", now)
+            .expect("a monitor revoked by an epoch move re-joins");
+
+        client.pending = None;
+        client.lease = None;
+        let snapshot = client.snapshot.as_mut().expect("fixture snapshot");
+        snapshot.snapshot.call_id = monitor.call_id.clone();
+        snapshot.snapshot.call_epoch = monitor.call_epoch;
+        snapshot.snapshot.telephony_state = TelephonyState::Active;
+        // Still the revoked epoch: keep waiting for the new one.
+        snapshot.snapshot.owner_epoch = monitor.owner_epoch;
+        assert_eq!(monitor_rejoin_ready(&client, &rejoin, now), None);
+        // The new epoch without a monitor offer yet: keep waiting.
+        let snapshot = client.snapshot.as_mut().unwrap();
+        snapshot.snapshot.owner_epoch = monitor.owner_epoch + 1;
+        snapshot.snapshot.pending_mobile_offers.clear();
+        assert_eq!(monitor_rejoin_ready(&client, &rejoin, now), None);
+        // A monitor offer at the new epoch: answer it.
+        let mut offer = offered_client(LeaseMode::Monitor, MobileOfferSurface::InApp)
+            .snapshot
+            .unwrap()
+            .snapshot
+            .pending_mobile_offers
+            .pop()
+            .expect("fixture monitor offer");
+        offer.offer.owner_epoch = monitor.owner_epoch + 1;
+        client
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .pending_mobile_offers = vec![offer];
+        assert_eq!(monitor_rejoin_ready(&client, &rejoin, now), Some(true));
+        // Out of time, another call, or a lease the owner chose meanwhile:
+        // the intent is dropped, never retried.
+        assert_eq!(
+            monitor_rejoin_ready(&client, &rejoin, now + MONITOR_REJOIN_WINDOW),
+            Some(false)
+        );
+        client.lease = Some(lease);
+        assert_eq!(monitor_rejoin_ready(&client, &rejoin, now), Some(false));
+        client.lease = None;
+        client.snapshot.as_mut().unwrap().snapshot.call_epoch += 1;
+        assert_eq!(monitor_rejoin_ready(&client, &rejoin, now), Some(false));
     }
 }

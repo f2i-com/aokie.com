@@ -213,8 +213,9 @@ assert.equal(element('settings-title').textContent, 'Calls go to OAIY');
 
 const settingsSource = await readFile(new URL('tabs/settings.js', base), 'utf8');
 vm.runInContext(settingsSource.replace(/\}\)\(\);\s*$/, `
-  window.testSettings = { settingsPatch, withAokieDefaults, personalGreeting, DEFAULT_GREETING,
-    formFor(bag) { baseline = withAokieDefaults(bag); settings = withAokieDefaults(bag); return formHtml(); } };
+  window.testSettings = { settingsPatch, withAokieDefaults, personalGreeting, DEFAULT_GREETING, shortAllowedText,
+    formFor(bag) { baseline = withAokieDefaults(bag); settings = withAokieDefaults(bag); return formHtml(); },
+    noticeAfterBump(changed) { loaded = true; appManaged = false; configVersion = 1; noteConfigVersion(2, false, changed); return appManagedNoticeHtml(); } };
 })();`), context);
 const settings = window.testSettings;
 // Keys the form no longer shows keep their saved values: an edit to the
@@ -260,10 +261,49 @@ for (const [greeting, name, said] of [
   for (const form of [elsewhere, toOaiy]) {
     assert.doesNotMatch(form, /Conversation tuning|data-num="sttEndpointMs"|data-bool="bargeIn"/);
   }
+  // Review 2026-10 wording: the texts switch says what it does (no text at
+  // all to another number), the allowed list asks for area codes and names
+  // entries too short to match, and with auto-answer off the screen says
+  // the refusals do not apply (calls ring through untouched).
+  assert.match(toOaiy, /Text only these numbers/);
+  assert.doesNotMatch(toOaiy, /Reply to texts only/);
+  assert.match(toOaiy, /with its area code/);
+  assert.match(toOaiy, /Auto-answer is off/);
+  assert.doesNotMatch(settings.formFor({ ...oaiyBag, autoAnswer: true }), /Auto-answer is off/);
+  const shortList = settings.formFor({ ...oaiyBag, allowedNumbers: '0400 111 222\n123\n9876 5432' });
+  assert.match(shortList, /These match nobody: 123\./);
+  assert.match(shortList, /These may miss the caller: 9876 5432\./);
+  assert.match(settings.formFor({ ...oaiyBag, allowedNumbers: '0400 111 222' }), /id="set-allowed-short"[^>]* hidden/);
+  assert.equal(settings.shortAllowedText('+61 432 602 110, +61 421 285 243'), '');
+  // The "changed outside this form" notice: only when the greeting or brief
+  // changed under it, never for a bare version bump (any other tab's write).
+  assert.equal(settings.noticeAfterBump(false), '');
+  assert.match(settings.noticeAfterBump(true), /changed outside this form/);
+  assert.doesNotMatch(settings.noticeAfterBump(true), /FormLogic/);
+}
+// The Consent tab: the plugin's own destinations and verdict decide, and a
+// line paused for consent never reads green (review 2026-10).
+{
+  const consentSource = await readFile(new URL('tabs/consent.js', base), 'utf8');
+  const consentHost = { ...host, consent: { get: async () => null, issue: async () => ({}) } };
+  const consentWindow = { PluginHost: consentHost, __aokieTabs: window.__aokieTabs, addEventListener() {}, setInterval() {}, clearInterval() {} };
+  const consentContext = vm.createContext({ window: consentWindow, document, URL, setTimeout, clearTimeout });
+  vm.runInContext(consentSource.replace(/\}\)\(\);\s*$/, `
+  window.testConsent = { review, uniqueDestinations, setStatus(s) { status = s; } };
+})();`), consentContext);
+  const consent = consentWindow.testConsent;
+  const grant = { version: 3, scopes: { bluetooth: true, destinations: [] } };
+  const good = { grant, requiredVersion: 3, mode: 'enforce', destinations: [], destinationsCovered: true, blocked: null };
+  assert.equal(consent.review(good).ok, true);
+  assert.equal(consent.review({ ...good, blocked: 'transcription consent denied' }).ok, false);
+  assert.equal(consent.review({ ...good, destinationsCovered: false }).ok, false);
+  consent.setStatus({ ...good, destinations: ['OpenAI ChatGPT via Codex'] });
+  assert.equal(JSON.stringify(consent.uniqueDestinations()), JSON.stringify(['OpenAI ChatGPT via Codex']));
 }
 const phoneSource = await readFile(new URL('tabs/phone.js', base), 'utf8');
 vm.runInContext(phoneSource.replace(/\}\)\(\);\s*$/, `
-  window.testPhone = { refreshAll, pairingCardBody, bondedCardBody };
+  window.testPhone = { refreshAll, pairingCardBody, bondedCardBody, confirmedPhoneConnected,
+    accept(address) { confirmed = true; confirmedAddress = address; } };
 })();`), context);
 await window.testPhone.refreshAll();
 assert.match(window.testPhone.pairingCardBody(), /Phone connected/);
@@ -275,6 +315,35 @@ assert.match(window.testPhone.bondedCardBody(), /Host unavailable/);
 failed = false;
 await window.testPhone.refreshAll();
 assert.match(window.testPhone.pairingCardBody(), /Phone connected/);
+// Review 2026-10: an old error the status still carries does not make a
+// connected phone read "Pair a phone", on the Phone tab or the Overview.
+payloads['phone.status'] = { connected: true, paired: true, error: 'an old link error', device: { name: 'Test phone', address: 'AA:BB' } };
+await window.testPhone.refreshAll();
+assert.match(window.testPhone.pairingCardBody(), /Phone connected/);
+assert.match(window.testPhone.pairingCardBody(), /one phone at a time/);
+await app.refreshPhoneStatus();
+assert.match(element('readiness').innerHTML, /Bluetooth linked/);
+assert.match(element('readiness').innerHTML, /last error: an old link error/);
+// A bonded phone that is not connected is paired, offline (not "Not paired").
+payloads['phone.status'] = { connected: false, paired: false, device: null };
+payloads['phone.listPaired'] = { devices: [{ address: 'AA:BB', connected: false }] };
+await Promise.all([app.refreshPhoneStatus(), app.refreshPhones()]);
+assert.match(element('readiness').innerHTML, /Paired, offline/);
+payloads['phone.listPaired'] = { devices: [] };
+await app.refreshPhones();
+assert.match(element('readiness').innerHTML, /Not paired/);
+// "Phone paired" only for the phone whose code was accepted: another bonded
+// phone connecting is not it.
+await window.testPhone.refreshAll();
+window.testPhone.accept('CC:DD');
+payloads['phone.status'] = { connected: true, device: { address: 'AA:BB' } };
+await window.testPhone.refreshAll();
+assert.equal(window.testPhone.confirmedPhoneConnected(), false);
+payloads['phone.status'] = { connected: true, device: { address: 'cc:dd' } };
+await window.testPhone.refreshAll();
+assert.equal(window.testPhone.confirmedPhoneConnected(), true);
+payloads['phone.status'] = { connected: true, paired: true, device: { name: 'Test phone' } };
+payloads['phone.listPaired'] = { devices: [{ address: 'test-device', connected: true }] };
 // An older OAIY Desktop without navigate/oaiyStatus: links read as text and
 // the summary falls back to pointers.
 {

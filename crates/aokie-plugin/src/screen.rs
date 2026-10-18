@@ -335,7 +335,11 @@ impl ScreenPolicy {
     /// one the owner answers is the receptionist's like any other.
     pub fn verdict(&self, caller_id: Option<&str>) -> Option<&'static str> {
         let id = caller_id.unwrap_or("").trim();
-        if id.is_empty() {
+        // A caller id with no digit in it is a hidden number however the
+        // phone words it: `+CLIP: "Restricted"`, "Private", "Unknown",
+        // "Anonymous", "Withheld". It was taken for a number, and got past
+        // rejectPrivate.
+        if id.is_empty() || !id.chars().any(|c| c.is_ascii_digit()) {
             return if self.reject_private {
                 Some("private")
             } else {
@@ -598,6 +602,28 @@ mod tests {
         assert_eq!(p.verdict(Some("0491570156")), None);
         let off = policy("", None, false);
         assert_eq!(off.verdict(None), None);
+    }
+
+    /// Review 2026-10: a phone that words a hidden number (`+CLIP:
+    /// "Restricted"`) gave a caller id with no digits, which rejectPrivate
+    /// took for a number. It is hidden, and screened as one, at the ring too.
+    #[test]
+    fn a_worded_hidden_number_is_private() {
+        use std::time::Duration;
+        let p = policy("", None, true);
+        for worded in ["Restricted", "Private", "Unknown", "Anonymous", "WITHHELD", " restricted "] {
+            assert_eq!(p.verdict(Some(worded)), Some("private"), "{worded}");
+            assert_eq!(
+                p.ring_action(Some(worded), false, Duration::ZERO),
+                RingAction::Refuse("private"),
+                "{worded}"
+            );
+        }
+        let off = policy("", None, false);
+        assert_eq!(off.verdict(Some("Restricted")), None);
+        // Nor does a worded id pass the allowed list.
+        let only = allowing(policy("", None, false), "0400 111 222", false);
+        assert_eq!(only.verdict(Some("Restricted")), Some("not_allowed"));
     }
 
     #[test]

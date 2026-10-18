@@ -167,6 +167,13 @@ pub(super) fn say_in_oaiy_voice(
         said.error = Some("no call audio to say it on".into());
         return said;
     }
+    // OAIY did not answer a connection in time a moment ago: trying again
+    // would hold this radio thread (call controls, the caller's audio) for
+    // the whole deadline, for a line that would not be said either.
+    if crate::realtime_voice::oaiy_recently_unanswered() {
+        said.error = Some("OAIY did not answer a connection a moment ago".into());
+        return said;
+    }
     let sr = u32::from(sample_rate);
     let session = match crate::realtime_voice::RealtimeVoiceSession::spawn(oaiy_say_config(
         config,
@@ -254,7 +261,7 @@ pub(super) fn say_in_oaiy_voice(
                         break 'say Err(message);
                     }
                 }
-                K::Closed { reason } => {
+                K::Closed { reason, .. } => {
                     if !item_done {
                         break 'say Err(reason);
                     }

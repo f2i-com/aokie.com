@@ -117,8 +117,8 @@ pub enum BaseUrlClassification {
     /// Almost always a misconfiguration.
     LinkLocal,
     /// RFC 1918 (10.x, 192.168.x, 172.16-31.x) / RFC 4193 (fc00::/7).
-    /// Probably a homelab / on-LAN endpoint; the Settings UI warns
-    /// that data leaves the host.
+    /// A homelab / on-LAN endpoint: the plugin's `settings.set` refuses
+    /// it for any endpoint that would receive caller data.
     Private,
     /// Anything else — true cloud / WAN, or a hostname an attacker
     /// could be controlling.

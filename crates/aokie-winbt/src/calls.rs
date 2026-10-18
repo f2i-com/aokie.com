@@ -48,6 +48,10 @@ const CALLER_ID_RETRY: Duration = Duration::from_secs(5);
 /// How far back a ringing/incoming history entry may be and still name the
 /// current call (see the caller-id strategy on `resolve_number`).
 const HISTORY_RECENT_SECS: i64 = 30;
+/// How long before the engine first saw a call its ring may have started (the
+/// 1 s poll, an engine started mid-ring). A history entry older than that is
+/// an earlier call's, and its number never names this one.
+const RING_START_SLACK_SECS: i64 = 10;
 /// A newly discovered Dialing call inside this window after our own `dial()`
 /// is claimed as ours (the dongle's `pending_dial` pattern) — `DialedCall()`
 /// occasionally comes back empty even when the dial succeeded.
@@ -287,6 +291,9 @@ struct CallState {
     status_token: Option<i64>,
     absent_ticks: u8,
     last_id_attempt: Option<Instant>,
+    /// When the engine first saw the call, in WinRT ticks: a history entry
+    /// that started well before this is an earlier call's (resolve_number).
+    first_seen_ticks: i64,
 }
 
 struct EngineState {
@@ -486,35 +493,42 @@ impl CallsEngine {
         }
     }
 
-    /// Reject the Incoming call if one is ringing; otherwise end the Talking
-    /// call, then a Dialing (abort our own ring), then any Held call.
+    /// End the Talking call if there is one (with a second caller waiting,
+    /// that is the call the plugin hangs up, and the waiting one keeps
+    /// ringing, as AT+CHUP does on the dongle); otherwise reject the ringing
+    /// call, then end a Dialing (abort our own ring), then any Held call
+    /// (`select::hangup_target`).
     pub(crate) fn reject_or_hangup(&self) -> Result<(), String> {
-        enum Target {
-            Reject(PhoneCall),
-            End(PhoneCall),
-        }
+        use crate::select::{hangup_target, HangupVerb, Leg};
         let target = {
             let st = self.lock_state()?;
             let mut live: Vec<&CallState> = st.calls.values().filter(|c| !c.track.ended).collect();
             live.sort_by(|a, b| a.key.cmp(&b.key));
-            let pick =
-                |s: SimpleStatus| live.iter().find(|c| c.status == s).map(|c| c.call.clone());
-            if let Some(call) = pick(SimpleStatus::Incoming) {
-                Some(Target::Reject(call))
-            } else if let Some(call) = pick(SimpleStatus::Talking) {
-                Some(Target::End(call))
-            } else if let Some(call) = pick(SimpleStatus::Dialing) {
-                Some(Target::End(call))
-            } else {
-                pick(SimpleStatus::Held).map(Target::End)
-            }
+            let legs: Vec<Option<Leg>> = live
+                .iter()
+                .map(|c| match c.status {
+                    SimpleStatus::Incoming => Some(Leg::Incoming),
+                    SimpleStatus::Talking => Some(Leg::Talking),
+                    SimpleStatus::Dialing => Some(Leg::Dialing),
+                    SimpleStatus::Held => Some(Leg::Held),
+                    SimpleStatus::Ended | SimpleStatus::Lost => None,
+                })
+                .collect();
+            let calls: Vec<PhoneCall> = live
+                .iter()
+                .zip(&legs)
+                .filter(|(_, leg)| leg.is_some())
+                .map(|(c, _)| c.call.clone())
+                .collect();
+            let legs: Vec<Leg> = legs.into_iter().flatten().collect();
+            hangup_target(&legs).map(|(i, verb)| (calls[i].clone(), verb))
         };
-        let Some(target) = target else {
+        let Some((call, verb)) = target else {
             return Err("native calls: no call to reject or hang up".to_string());
         };
-        let (result, verb) = match target {
-            Target::Reject(call) => (call.RejectIncoming(), "RejectIncoming"),
-            Target::End(call) => (call.End(), "End"),
+        let (result, verb) = match verb {
+            HangupVerb::Reject => (call.RejectIncoming(), "RejectIncoming"),
+            HangupVerb::End => (call.End(), "End"),
         };
         let status = result.map_err(|e| hr(&format!("native calls: {verb}"), &e))?;
         if status == PhoneCallOperationStatus::Succeeded {
@@ -967,9 +981,11 @@ fn on_line_removed(st: &mut EngineState, id: &windows::core::GUID) {
         if let Ok(mut n) = st.shared.remote_name.write() {
             *n = None;
         }
-        if let Ok(mut a) = st.shared.phone_address.write() {
-            *a = 0;
-        }
+        // `phone_address` stays: it is the bonded phone texts and the
+        // phonebook are fetched from, and Windows drops the hands-free line
+        // whenever it is idle while every MAP op pages the phone up on its
+        // own (worker.rs's seed). Clearing it here stopped texts until the
+        // next call brought the line back.
         st.emit(BluetoothEvent::DeviceDisconnected(addr));
     }
 }
@@ -1056,6 +1072,7 @@ fn refresh_line_calls(st: &mut EngineState, line_key: &str) {
                     status_token,
                     absent_ticks: 0,
                     last_id_attempt: None,
+                    first_seen_ticks: winrt_ticks_now(),
                 },
             );
         } else if let Some(c) = st.calls.get_mut(&key) {
@@ -1229,15 +1246,19 @@ fn retry_caller_ids(st: &mut EngineState) {
 /// 1. `GetPhoneCallInfo().PhoneNumber()` — the line service's own record.
 ///    (The metadata DOES expose this even though `PhoneCall` itself has no
 ///    number property; it is the most authoritative source when populated.)
-/// 2. The history store entry whose id IS this call's `CallId`.
-/// 3. The newest ringing/incoming history entry inside HISTORY_RECENT_SECS
-///    (covers stores that key entries differently from call ids).
+/// 2. The history store entry whose id IS this call's `CallId`. Found with
+///    no number, the caller withheld it: nothing else is looked at.
+/// 3. The newest ringing/incoming history entry that started inside
+///    HISTORY_RECENT_SECS and no earlier than RING_START_SLACK_SECS before
+///    the call was first seen (covers stores that key entries differently
+///    from call ids). Its number or none: never an older entry's, which is
+///    the previous caller's (`select::recent_ring_number`).
 ///
 /// Nothing found = no CallerId at all — the plugin treats that as withheld.
 fn resolve_number(st: &mut EngineState, key: &str) -> Option<String> {
-    let (call, raw_id) = {
+    let (call, raw_id, first_seen) = {
         let c = st.calls.get(key)?;
-        (c.call.clone(), c.raw_call_id.clone())
+        (c.call.clone(), c.raw_call_id.clone(), c.first_seen_ticks)
     };
     if let Ok(info) = call.GetPhoneCallInfo() {
         if let Ok(n) = info.PhoneNumber() {
@@ -1253,34 +1274,29 @@ fn resolve_number(st: &mut EngineState, key: &str) -> Option<String> {
             .GetEntryAsync(&HSTRING::from(raw_id.as_str()))
             .and_then(|op| op.get())
         {
-            if let Some(n) = history_entry_number(&entry) {
-                return Some(n);
-            }
+            return history_entry_number(&entry);
         }
     }
     let reader = store.GetEntryReader().ok()?;
     let batch = reader.ReadBatchAsync().and_then(|op| op.get()).ok()?;
     let now = winrt_ticks_now();
-    let mut best: Option<(i64, String)> = None;
+    let mut recent = Vec::new();
     for entry in batch {
         let entry_id = entry.Id().map(|h| h.to_string_lossy()).unwrap_or_default();
         if !raw_id.is_empty() && entry_id == raw_id {
-            if let Some(n) = history_entry_number(&entry) {
-                return Some(n);
-            }
-            continue;
+            return history_entry_number(&entry);
         }
         let start = entry.StartTime().map(|d| d.UniversalTime).unwrap_or(0);
-        let live_ring = entry.IsRinging().unwrap_or(false) || entry.IsIncoming().unwrap_or(false);
-        if live_ring && ticks_within(start, now, HISTORY_RECENT_SECS) {
-            if let Some(n) = history_entry_number(&entry) {
-                if best.as_ref().is_none_or(|(bt, _)| start > *bt) {
-                    best = Some((start, n));
-                }
-            }
+        if ticks_within(start, now, HISTORY_RECENT_SECS) {
+            recent.push(crate::select::HistoryEntry {
+                start,
+                inbound: entry.IsRinging().unwrap_or(false) || entry.IsIncoming().unwrap_or(false),
+                number: history_entry_number(&entry),
+            });
         }
     }
-    best.map(|(_, n)| n)
+    let earliest = first_seen - RING_START_SLACK_SECS * TICKS_PER_SECOND;
+    crate::select::recent_ring_number(&recent, earliest, now + TICKS_PER_SECOND)
 }
 
 /// Lazy one-shot history-store acquisition. Full-history access needs a
@@ -1410,6 +1426,7 @@ fn upsert_dialed(st: &mut EngineState, line_key: &str, call: &PhoneCall, number:
             status_token,
             absent_ticks: 0,
             last_id_attempt: None,
+            first_seen_ticks: winrt_ticks_now(),
         },
     );
     false

@@ -161,6 +161,36 @@ internal data class AokieVoiceOffer(
   }
 }
 
+/**
+ * True for an answered or won record whose call this process is not running. Only the call service moves a
+ * record past ringing, and the call, its media and its lease all live in this process, so such a record was
+ * left by a process that died mid-call (swiped away, killed, crashed). Won records have no deadline of their
+ * own: left in place, one blocked every later push whose call epoch was not higher, and a Desktop restarts
+ * its epochs at 1.
+ */
+internal fun aokieOfferOrphaned(status: String, offerId: String, liveOfferId: String?): Boolean =
+  status != AokieVoiceOffer.STATUS_RINGING && offerId != liveOfferId
+
+/**
+ * Whether a push's wake hint may take the place of [current], a different offer. A push never replaces an
+ * answered or won call this process is running: that belongs to its call service until it ends. A ringing
+ * offer for the same call (app and call id) gives way only to a later call epoch; one for a different call
+ * also gives way to a push that expires later, since a restarted Desktop counts epochs from 1 again.
+ */
+internal fun aokiePushMayReplace(current: AokieVoiceOffer, push: AokieVoiceOffer, liveOfferId: String?): Boolean =
+  when {
+    current.offerId == push.offerId -> false
+    current.status != AokieVoiceOffer.STATUS_RINGING ->
+      aokieOfferOrphaned(current.status, current.offerId, liveOfferId)
+    current.appId == push.appId && current.callId == push.callId -> push.callEpoch > current.callEpoch
+    else -> push.callEpoch > current.callEpoch || push.expiresAt > current.expiresAt
+  }
+
+/** Whether a push may cancel [current]: only a ringing offer, or an orphaned one (see [aokieOfferOrphaned]). */
+internal fun aokiePushMayCancel(current: AokieVoiceOffer, liveOfferId: String?): Boolean =
+  current.status == AokieVoiceOffer.STATUS_RINGING ||
+    aokieOfferOrphaned(current.status, current.offerId, liveOfferId)
+
 internal object AokieOfferStore {
   private const val PENDING_KEY = "aokie.pending-voice-offer.v1"
   private const val DIAGNOSTIC_KEY = "aokie.runtime-diagnostic.v1"
@@ -170,9 +200,9 @@ internal object AokieOfferStore {
     val current = current(context, clearExpired = true)
     if (current != null) {
       if (current.offerId == offer.offerId) return@synchronized current == offer
-      // A later physical call epoch may replace a stale surface. Same/older
-      // epochs must be cancelled by authoritative fan-out, never by a race.
-      if (offer.callEpoch <= current.callEpoch) return@synchronized false
+      // Same/older epochs of a ringing call must be cancelled by authoritative fan-out, never by a race,
+      // and an answered or won call is never replaced by a push.
+      if (!aokiePushMayReplace(current, offer, AokieIncomingCallService.liveOfferId)) return@synchronized false
       AokieCallNotifications.cancelCall(context, current.offerId)
     }
     AokieSecureStore.put(context, PENDING_KEY, offer.toJson())
@@ -187,6 +217,14 @@ internal object AokieOfferStore {
   fun acceptAuthoritative(context: Context, offer: AokieVoiceOffer): AokieVoiceOffer? = synchronized(lock) {
     if (!offer.authoritative || offer.isExpired()) return@synchronized null
     val current = current(context, clearExpired = true)
+    if (current != null && current.offerId != offer.offerId &&
+      current.status != AokieVoiceOffer.STATUS_RINGING
+    ) {
+      // An answered or won call is live in this process (orphans were cleared just above). Replacing its
+      // record would cancel the live call without returning its lease; the newer offer is refused instead.
+      recordDiagnostic(context, "authoritative_offer_refused_during_live_call")
+      return@synchronized null
+    }
     val committed = if (current?.offerId == offer.offerId) {
       if (current.appId != offer.appId || current.callId != offer.callId ||
         current.callEpoch != offer.callEpoch || current.ownerEpoch != offer.ownerEpoch
@@ -208,9 +246,12 @@ internal object AokieOfferStore {
   fun current(context: Context, clearExpired: Boolean = true): AokieVoiceOffer? = synchronized(lock) {
     val encoded = AokieSecureStore.get(context, PENDING_KEY) ?: return@synchronized null
     val offer = AokieVoiceOffer.fromJson(encoded)
-    if (offer == null || (clearExpired && offer.isExpired())) {
+    val orphaned = clearExpired && offer != null &&
+      aokieOfferOrphaned(offer.status, offer.offerId, AokieIncomingCallService.liveOfferId)
+    if (offer == null || (clearExpired && offer.isExpired()) || orphaned) {
       AokieSecureStore.delete(context, PENDING_KEY)
       offer?.let { AokieCallNotifications.cancelCall(context, it.offerId) }
+      if (orphaned) recordDiagnostic(context, "orphaned_call_offer_cleared")
       return@synchronized null
     }
     offer
@@ -249,6 +290,20 @@ internal object AokieOfferStore {
     AokieCallNotifications.cancelCall(context, current.offerId)
     recordDiagnostic(context, reason)
     current
+  }
+
+  /**
+   * A push's cancellation. It may end only a ringing offer (or an orphaned one): an answered or won call
+   * ends through authoritative v2 state, which also returns its lease, never through an opaque push.
+   */
+  fun cancelFromPush(context: Context, offerId: String, reason: String): AokieVoiceOffer? = synchronized(lock) {
+    val current = current(context, clearExpired = false) ?: return@synchronized null
+    if (current.offerId != offerId) return@synchronized null
+    if (!aokiePushMayCancel(current, AokieIncomingCallService.liveOfferId)) {
+      recordDiagnostic(context, "push_cancel_ignored_for_answered_call")
+      return@synchronized null
+    }
+    cancel(context, current.offerId, reason)
   }
 
   fun cancelByCall(context: Context, callId: String, callEpoch: Long, reason: String): AokieVoiceOffer? = synchronized(lock) {

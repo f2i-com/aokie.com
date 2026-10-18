@@ -1425,3 +1425,37 @@ fn the_start_offers_transfer_only_to_an_inbound_oaiy_call_with_consent_a_host_an
         &crate::remote_media::RemoteConsentGate::default()
     ));
 }
+
+/// review #36: "no problem, bye" over the farewell is a goodbye, not the caller
+/// saying no to it; a real "no" still keeps the line open.
+#[test]
+fn a_goodbye_that_opens_with_no_does_not_take_the_conversation_up_again() {
+    for goodbye in [
+        "No problem, bye!",
+        "No worries, thanks, bye",
+        "no thanks, bye",
+        "No, that's all, thank you",
+        "No, that\u{2019}s it",
+        "No, I'm good, bye",
+        "Okay, no problem, bye bye",
+        "Not a problem, take care",
+    ] {
+        assert!(
+            !realtime_caller_turn_resumes_conversation(goodbye),
+            "a goodbye must not cancel the hangup: {goodbye}"
+        );
+    }
+    for resumed in [
+        "no",
+        "No, wait",
+        "No, hang on",
+        "No problem, but can I ask one more thing",
+        "No, I need to change my booking",
+        "No, that's wrong",
+    ] {
+        assert!(
+            realtime_caller_turn_resumes_conversation(resumed),
+            "a resumed turn must cancel the hangup: {resumed}"
+        );
+    }
+}

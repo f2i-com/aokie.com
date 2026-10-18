@@ -29,6 +29,7 @@ use crate::aokie_radio::manager::{
 use crate::aokie_radio::map_listing::{msg_attribute_pairs, parse_listing};
 use crate::aokie_radio::map_mas::{
     Folder as MasFolder, Operation as MasOperation, CHARSET_UTF8, MSG_TYPE_KEEP_BOTH_SMS_VARIANTS,
+    MSG_TYPE_KEEP_SMS_AND_MMS,
 };
 use crate::aokie_radio::map_mns::{MnsEvent, MnsServer, MnsState};
 use crate::aokie_radio::map_runtime::{MapRuntime, MapRuntimeEvent};
@@ -41,7 +42,8 @@ use crate::aokie_radio::rfcomm::{
 use crate::aokie_radio::sdp::AOKIE_MNS_RFCOMM_CHANNEL;
 use crate::aokie_radio::transport::{self as winusb, AokieHciTransport};
 use crate::aokie_radio::transport_recovery::{
-    RecoveryAction, TransportRecovery, CAUSE_CORRUPTED_STREAM, REOPEN_RETRY_AFTER_GIVE_UP,
+    RecoveryAction, TransportRecovery, UsbHiccups, CAUSE_CORRUPTED_STREAM,
+    REOPEN_RETRY_AFTER_GIVE_UP,
 };
 use crate::aokie_radio::{hci, l2cap, sco, sco_dump};
 use crate::msbc::{H2Decoder, MsbcStreamFramer, MsbcStreamPackager, MSBC_SAMPLES_PER_FRAME};
@@ -88,11 +90,23 @@ pub enum RuntimeEvent {
     AudioDisconnected,
     CallerId(String),
     /// Phase 4: a SECOND caller is knocking while a call is active (+CCWA /
-    /// callsetup-while-active on a call-waiting-negotiated SLC). One per
-    /// waiting episode, plus one upgrade when a number arrives late.
+    /// callsetup-while-active on a call-waiting-negotiated SLC, or one the
+    /// phone's indicators confirmed on any SLC). One per waiting episode,
+    /// plus one upgrade when a number arrives late.
     CallWaiting {
         number: Option<String>,
     },
+    /// The phone refused (or never answered) a command once the hands-free
+    /// link was up: the answer to that one command, the link stays (review 1
+    /// #3). `command` is its name ("ATD", "ATA", "AT+CHUP", ...), never its
+    /// arguments.
+    CommandRejected {
+        command: &'static str,
+        timed_out: bool,
+    },
+    /// The hands-free link came up with a call already in progress on the
+    /// phone: a reconnect in the middle of a call. Nothing else announces it.
+    CallActiveAtConnect,
     /// The waiting episode ended with the active call untouched.
     CallWaitingEnded,
     /// `callheld` indicator transition (0 none / 1 held+active / 2 held only).
@@ -371,8 +385,14 @@ enum PendingMapOp {
     /// MNS EventReport. `queued_at` lets the disconnect handler keep
     /// fresh fetches alive across stage-2 stall recoveries — handles
     /// are persistent on Pixel/Bluedroid, so the same GET works on
-    /// the next MAS session.
-    FetchMessage { handle: String, queued_at: Instant },
+    /// the next MAS session. `attempts` counts failed fetches: the handle
+    /// is marked seen only once its body is in, and given up on (seen,
+    /// logged) after `FETCH_ATTEMPTS`.
+    FetchMessage {
+        handle: String,
+        queued_at: Instant,
+        attempts: u8,
+    },
     /// Push a pre-built bMessage as an outbound SMS. The body is the
     /// full envelope (BEGIN:BMSG ... END:BMSG); see
     /// `bmessage::build_sms_push`.
@@ -388,6 +408,24 @@ enum PendingMapOp {
         bmessage: Vec<u8>,
         recipient_phone: String,
         queued_at: Instant,
+        /// When it was first tried: the retain TTL runs from here, so a
+        /// text queued during a call waits for the call to end.
+        tried_at: Option<Instant>,
+        /// Failed tries so far (the pause before the next grows).
+        attempts: u32,
+        /// Not tried again before this.
+        not_before: Option<Instant>,
+        /// The start of the text, to know it again in the phone's folders.
+        body_head: String,
+    },
+    /// A text whose PUT may have reached the phone before its session
+    /// failed (only the phone's answer was lost): `send` is looked for in
+    /// `folder` (sent, then outbox) before it is sent again, so a lost ack
+    /// never sends a customer the same text twice.
+    VerifySent {
+        send: Box<PendingMapOp>,
+        folder: MasFolder,
+        not_before: Option<Instant>,
     },
     /// Pull the inbox listing as a fallback for missed MNS pushes.
     /// Pixel intermittently swallows NewMessage notifications even when
@@ -428,6 +466,27 @@ impl PendingMapOp {
             }
             PendingMapOp::PollInbox => "PollInbox".to_string(),
             PendingMapOp::CheckSent { folder } => format!("CheckSent({:?})", folder),
+            PendingMapOp::VerifySent { send, folder, .. } => {
+                format!("VerifySent({:?}, {})", folder, send.log_summary())
+            }
+        }
+    }
+
+    /// Whether the op may start now (a retried text waits out its pause).
+    fn ready(&self, now: Instant) -> bool {
+        match self {
+            PendingMapOp::SendReply { not_before, .. }
+            | PendingMapOp::VerifySent { not_before, .. } => not_before.map_or(true, |t| now >= t),
+            _ => true,
+        }
+    }
+
+    /// The text this op carries (a send, or the send a check is for).
+    fn text_id(&self) -> Option<&str> {
+        match self {
+            PendingMapOp::SendReply { message_id, .. } => Some(message_id),
+            PendingMapOp::VerifySent { send, .. } => send.text_id(),
+            _ => None,
         }
     }
 }
@@ -1748,6 +1807,17 @@ fn run_runtime(
     // the auto-answer above so this stays a defensive guard.
     let mut answer_sent_for_call = false;
     let mut selected_codec: Option<(String, u16)> = None;
+    // The codec the voice link that is up actually carries, from the
+    // controller's air mode at SynchronousConnectionComplete (review 1 #17):
+    // what RX decodes and TX encodes. `selected_codec` is only the phone's
+    // last choice, and a link can come up in another.
+    let mut link_codec: Option<(String, u16)> = None;
+    // Voice writes that failed on the link that is up (review 1 #16): the
+    // first is reported, the rest only counted, so a link whose output pipe
+    // never armed does not write ~100 hardware errors a second for a call.
+    let mut sco_tx_error_count: u64 = 0;
+    // Review 1 #19: USB errors ridden out during a call (see UsbHiccups).
+    let mut usb_hiccups = UsbHiccups::default();
     let mut active_sco_handle: Option<u16> = None;
     // MAP/PBAP share the same ACL transport as HFP. Once call setup starts,
     // background profile traffic must stop until the call is over; otherwise
@@ -1831,6 +1901,13 @@ fn run_runtime(
     let mut seen_handles: HashSet<String> = HashSet::new();
     let mut inbox_poll_seeded = false;
     let mut last_inbox_poll: Option<Instant> = None;
+    // The phone the handles above (and the queued MAP work) belong to:
+    // handles are one phone's own, so another phone's inbox starts fresh.
+    let mut map_phone: Option<String> = None;
+    // Every text handed to this run, until the phone takes it or it is
+    // reported failed (TextLedger): one answer each, and none left behind
+    // when the run ends.
+    let mut texts = TextLedger::new(event_tx.clone());
     // Counter incremented every time we queue a PollInbox while
     // inbox_poll_seeded is false. Lets the listing handler tell apart
     // the very first poll (clean app start — seed all, fetch nothing)
@@ -2218,6 +2295,20 @@ fn run_runtime(
                         let _ = event_tx.send(RuntimeEvent::Error(format!("stall drain: {}", e)));
                     }
                 }
+                // Review 1 #3: once the hands-free link is up nothing here is
+                // an SLC failure: what still arrives under that name is an
+                // L2CAP stall or refusal on a MAP or PBAP channel. Never a
+                // reason to drop the phone (mid-call, on a link we paged) or
+                // to report a hardware fault.
+                if let HfpEvent::ServiceLevelConnectionFailed(reason) = &hfp_event {
+                    if l2cap_state.hfp_state().is_some() {
+                        eprintln!(
+                            "[AokieRadio] a profile channel failed while the hands-free link is up ({}) — the link stays",
+                            reason
+                        );
+                        continue;
+                    }
+                }
                 // HARD-001: an SLC failure on a link WE paged is a dead
                 // half-link — tear the ACL down so the UI never shows a
                 // "connected" phone that can't take calls.
@@ -2586,39 +2677,18 @@ fn run_runtime(
                     // SendReply/FetchMessage must be RE-QUEUED, not
                     // dropped (live 2026-07-13: the first kickoff SMS
                     // was silently lost exactly here). Stale SendReplys
-                    // surface as SmsSendFailed so nothing dies quietly.
+                    // surface as SmsSendFailed so nothing dies quietly, and
+                    // a text whose PUT may have reached the phone is looked
+                    // for in its folders before it is sent again.
                     if let Some(op) = active_map_op.take() {
-                        match &op {
-                            PendingMapOp::SendReply {
-                                message_id,
-                                queued_at,
-                                recipient_phone,
-                                ..
-                            } => {
-                                if queued_at.elapsed() < SEND_REPLY_RETAIN_TTL {
-                                    eprintln!(
-                                        "[AokieRadio] MAS stall recovery: re-queueing the in-flight SendReply (queued {:.1}s ago)",
-                                        queued_at.elapsed().as_secs_f32()
-                                    );
-                                    pending_map_ops.push_back(op);
-                                } else {
-                                    let _ = event_tx.send(RuntimeEvent::SmsSendFailed {
-                                        message_id: message_id.clone(),
-                                        recipient_phone: recipient_phone.clone(),
-                                        reason: format!(
-                                            "abandoned after {:.0}s of MAS-stall recovery cycles",
-                                            queued_at.elapsed().as_secs_f32()
-                                        ),
-                                    });
-                                }
-                            }
-                            PendingMapOp::FetchMessage { queued_at, .. } => {
-                                if queued_at.elapsed() < SEND_REPLY_RETAIN_TTL {
-                                    pending_map_ops.push_back(op);
-                                }
-                            }
-                            _ => {}
-                        }
+                        requeue_or_report(
+                            op,
+                            MapStop::InFlight,
+                            "the phone's MAS session stalled",
+                            &mut pending_map_ops,
+                            &mut seen_handles,
+                            &mut texts,
+                        );
                     }
                     map_idle_since = None;
                     if let Ok(mut g) = mns_server.lock() {
@@ -2770,10 +2840,22 @@ fn run_runtime(
                         let _ = event_tx.send(RuntimeEvent::Error(
                             "dial: no open HFP service-level connection".to_string(),
                         ));
+                        // The dial never reached the phone: the consumer ends
+                        // its dial session as failed (review 1 #9), as it
+                        // does for a dial the phone refuses.
+                        let _ = event_tx.send(RuntimeEvent::CommandRejected {
+                            command: "ATD",
+                            timed_out: false,
+                        });
                     }
                     for packet in &packets {
                         if let Err(e) = transport.write_acl(packet) {
                             let _ = event_tx.send(RuntimeEvent::Error(format!("dial: {}", e)));
+                            let _ = event_tx.send(RuntimeEvent::CommandRejected {
+                                command: "ATD",
+                                timed_out: false,
+                            });
+                            break;
                         }
                     }
                 }
@@ -2888,11 +2970,31 @@ fn run_runtime(
                     } else {
                         bmessage::build_sms_push(&recipient_phone, &body)
                     };
+                    texts.open(&message_id, &recipient_phone);
+                    // The PUT goes out as one ACL packet (no fragmenting): one
+                    // larger than the dongle takes never reaches the phone,
+                    // and the send stalled until its time ran out. Refused
+                    // at once, saying why.
+                    let wire = push_wire_len(bmessage.len());
+                    let budget = usize::from(init_report.buffer_size.acl_data_packet_length);
+                    if budget > 0 && wire > budget {
+                        texts.failed(
+                            &message_id,
+                            format!(
+                                "the text is too long for one message through this dongle ({wire} bytes to send, the dongle takes {budget}) — shorten it"
+                            ),
+                        );
+                        continue;
+                    }
                     pending_map_ops.push_back(PendingMapOp::SendReply {
+                        body_head: text_head(&body),
                         message_id,
                         bmessage,
                         recipient_phone,
                         queued_at: Instant::now(),
+                        tried_at: None,
+                        attempts: 0,
+                        not_before: None,
                     });
                     eprintln!(
                         "[AokieRadio] SendSms enqueued ({} pending MAP ops, type={})",
@@ -3139,6 +3241,40 @@ fn run_runtime(
                         continue;
                     }
                 };
+                // Review 1 #6: Aokie serves one phone at a time. A second
+                // phone's link accepted beside the first took over the ACL
+                // handle (the first phone's packets then read as corrupt) and
+                // its later disconnect read as the first phone lost, ending
+                // that phone's live call as device_lost. Refused here, with
+                // the reason the spec has for it; it may connect once the
+                // first phone has gone.
+                if let hci::HciEvent::ConnectionRequest {
+                    address,
+                    link_type: hci::LINK_TYPE_ACL,
+                    ..
+                } = &event
+                {
+                    let connected = connected_remote(&status);
+                    if another_phone_holds_the_link(active_acl_handle, &connected, address) {
+                        eprintln!(
+                            "[AokieRadio] refused {address}'s connection: {connected} is connected and Aokie serves one phone at a time"
+                        );
+                        if let Ok(command) = hci::reject_connection_request_command_with_reason(
+                            address,
+                            hci::REJECT_LIMITED_RESOURCES,
+                        ) {
+                            if let Err(e) = transport.write_command(&command) {
+                                eprintln!("[AokieRadio] connection reject write failed: {e}");
+                            }
+                        }
+                        if status.pairing_window.is_open() {
+                            let _ = event_tx.send(RuntimeEvent::Error(format!(
+                                "another phone ({address}) tried to connect while {connected} is connected — Aokie serves one phone at a time: disconnect {connected} first to pair or use another"
+                            )));
+                        }
+                        continue;
+                    }
+                }
                 let bonds_before = pairing_store.len();
                 match manager::handle_hci_event_with_policy(
                     &transport,
@@ -3186,6 +3322,25 @@ fn run_runtime(
                             numeric_value,
                         });
                     }
+                    Ok(Some(manager::PairingOutcome::LinkKeyUnavailable { address, reason })) => {
+                        // Review 2 #27: the bond's key could not be opened.
+                        // End the link now rather than leave the phone
+                        // waiting out the LMP timeout; it keeps its bond and
+                        // tries again later (see LinkKeyUnavailable for why
+                        // no negative reply).
+                        eprintln!(
+                            "[AokieRadio] link key for {address} could not be opened ({reason}) — ending the link; the phone keeps its bond"
+                        );
+                        if let Some(handle) = active_acl_handle
+                            .filter(|_| connected_remote(&status).eq_ignore_ascii_case(&address))
+                        {
+                            let _ =
+                                transport.write_command(&hci::disconnect_command(handle, 0x13));
+                        }
+                        let _ = event_tx.send(RuntimeEvent::Error(format!(
+                            "the paired phone {address} could not be let in: its stored link key did not open ({reason})"
+                        )));
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         eprintln!("[AokieRadio] HCI event handler error: {} — continuing", e);
@@ -3228,7 +3383,7 @@ fn run_runtime(
                         status.pairing_window.close();
                     }
                 }
-                forward_hci_event(&event, active_sco_handle, &event_tx, &status);
+                forward_hci_event(&event, active_sco_handle, active_acl_handle, &event_tx, &status);
                 if let hci::HciEvent::SynchronousConnectionComplete {
                     status: scstatus,
                     connection_handle,
@@ -3269,14 +3424,25 @@ fn run_runtime(
                         // from `SynchronousConnectionComplete`). On Broadcom 21ec the
                         // pre-arm produced zero-byte iso URBs while the BTStack-bridge
                         // path on the same dongle carried bytes both ways.
-                        let params =
-                            manager::sco_accept_parameters(*link_type, selected_codec.as_ref());
+                        let carried = link_codec_for_air_mode(*air_mode, selected_codec.as_ref());
+                        if selected_codec
+                            .as_ref()
+                            .is_some_and(|(codec, _)| !codec.eq_ignore_ascii_case(&carried.0))
+                        {
+                            eprintln!(
+                                "[AokieRadio] SCO link came up carrying {} (air mode 0x{:02x}) though the phone last chose {} — using what the link carries",
+                                carried.0,
+                                air_mode,
+                                selected_codec.as_ref().map(|(c, _)| c.as_str()).unwrap_or("-"),
+                            );
+                        }
+                        let params = manager::sco_accept_parameters(*link_type, Some(&carried));
                         let alt_result =
                             transport.configure_sco_alt_setting(params.voice_setting, 1);
                         status.call_active.store(true, Ordering::Relaxed);
-                        let (codec, sample_rate) = selected_codec
-                            .clone()
-                            .unwrap_or_else(|| ("CVSD".to_string(), 8000));
+                        let (codec, sample_rate) = carried.clone();
+                        link_codec = Some(carried);
+                        sco_tx_error_count = 0;
                         status.sample_rate.store(sample_rate, Ordering::Relaxed);
                         let cfg = transport.sco_transport_config();
                         // air_mode is the controller's authoritative answer
@@ -3388,7 +3554,23 @@ fn run_runtime(
                     ..
                 } = &event
                 {
-                    if *cstatus == 0 && *link_type == hci::LINK_TYPE_ACL {
+                    if *cstatus == 0
+                        && *link_type == hci::LINK_TYPE_ACL
+                        && another_phone_holds_the_link(
+                            active_acl_handle.filter(|h| h != connection_handle),
+                            &connected_remote(&status),
+                            address,
+                        )
+                    {
+                        // A second phone's link that completed anyway (its
+                        // request crossed ours, or a page): end it, the
+                        // connected phone keeps the line (review 1 #6).
+                        eprintln!(
+                            "[AokieRadio] a second phone ({address}) completed a link beside the connected one — ending it (handle {connection_handle:#06x})"
+                        );
+                        let _ = transport
+                            .write_command(&hci::disconnect_command(*connection_handle, 0x13));
+                    } else if *cstatus == 0 && *link_type == hci::LINK_TYPE_ACL {
                         active_acl_handle = Some(*connection_handle);
                         // Ask the phone for its friendly name/model so Device
                         // Setup can show "Lance's Pixel 8" instead of a bare
@@ -3696,48 +3878,36 @@ fn run_runtime(
                             // handles per phone, so a FetchMessage queued
                             // in the prior session is still valid against
                             // the new MAS session.
-                            let pre_count = pending_map_ops.len();
+                            let queued: Vec<PendingMapOp> = pending_map_ops.drain(..).collect();
+                            let pre_count = queued.len() + usize::from(active_map_op.is_some());
                             // The ACTIVE op joins the retention pass too —
                             // a SendReply mid-PUT when the ACL died is
                             // exactly the reply worth retrying (it was
-                            // silently dropped here before 2026-07-13).
+                            // silently dropped here before 2026-07-13) —
+                            // and one whose PUT may have reached the phone
+                            // is looked for in its folders before it is
+                            // sent again. Aged texts are reported failed: a
+                            // customer was told a text was coming.
                             if let Some(op) = active_map_op.take() {
-                                if matches!(
+                                requeue_or_report(
                                     op,
-                                    PendingMapOp::SendReply { .. }
-                                        | PendingMapOp::FetchMessage { .. }
-                                ) {
-                                    pending_map_ops.push_front(op);
-                                }
+                                    MapStop::InFlight,
+                                    "the phone link dropped mid-operation",
+                                    &mut pending_map_ops,
+                                    &mut seen_handles,
+                                    &mut texts,
+                                );
                             }
-                            pending_map_ops.retain(|op| match op {
-                                PendingMapOp::SendReply {
-                                    message_id,
-                                    queued_at,
-                                    recipient_phone,
-                                    ..
-                                } => {
-                                    if queued_at.elapsed() < SEND_REPLY_RETAIN_TTL {
-                                        true
-                                    } else {
-                                        // Aged out: surface it — a customer
-                                        // was told a text was coming.
-                                        let _ = event_tx.send(RuntimeEvent::SmsSendFailed {
-                                            message_id: message_id.clone(),
-                                            recipient_phone: recipient_phone.clone(),
-                                            reason: format!(
-                                                "abandoned {:.0}s after queueing (ACL lost before the phone acked the send)",
-                                                queued_at.elapsed().as_secs_f32()
-                                            ),
-                                        });
-                                        false
-                                    }
-                                }
-                                PendingMapOp::FetchMessage { queued_at, .. } => {
-                                    queued_at.elapsed() < SEND_REPLY_RETAIN_TTL
-                                }
-                                _ => false,
-                            });
+                            for op in queued {
+                                requeue_or_report(
+                                    op,
+                                    MapStop::NotStarted,
+                                    "the phone link dropped before it was sent",
+                                    &mut pending_map_ops,
+                                    &mut seen_handles,
+                                    &mut texts,
+                                );
+                            }
                             let preserved = pending_map_ops.len();
                             if map_runtime.is_some() || pre_count > 0 {
                                 eprintln!(
@@ -3747,7 +3917,7 @@ fn run_runtime(
                                      plus {} active MAP runtime",
                                     connection_handle,
                                     preserved,
-                                    pre_count - preserved,
+                                    pre_count.saturating_sub(preserved),
                                     if map_runtime.is_some() { 1 } else { 0 }
                                 );
                             }
@@ -3852,9 +4022,22 @@ fn run_runtime(
                             if let Err(e) = transport.disable_sco_alt_setting() {
                                 eprintln!("[AokieRadio] disable_sco_alt failed: {}", e);
                             }
-                            status.call_active.store(false, Ordering::Relaxed);
+                            // Review 1 #4: the audio channel closing is not the
+                            // call ending. The phone moving audio to the
+                            // handset, or rebuilding the audio link, closes it
+                            // (reason 0x13) with the call still up; ending the
+                            // session then left the receptionist deaf when the
+                            // audio came back. The call indicator is the truth:
+                            // while it shows a call, the call goes on.
+                            let call_goes_on = l2cap_state
+                                .hfp_state()
+                                .is_some_and(|hfp| hfp.call_in_progress());
+                            link_codec = None;
+                            if !call_goes_on {
+                                status.call_active.store(false, Ordering::Relaxed);
+                                answer_sent_for_call = false;
+                            }
                             status.sample_rate.store(0, Ordering::Relaxed);
-                            answer_sent_for_call = false;
                             // Keep `selected_codec` sticky across SCO
                             // disconnect. Pixel/Bluedroid caches the
                             // negotiated codec on the AG side and on
@@ -3880,7 +4063,12 @@ fn run_runtime(
                             // remote/operator hangup (observed live
                             // 2026-07-13: mid-call supervision timeout was
                             // recorded as reason remote_or_operator).
-                            if !matches!(*reason, 0x08 | 0x15) {
+                            if call_goes_on {
+                                eprintln!(
+                                    "[AokieRadio] SCO closed (reason 0x{:02x}) while the phone still shows the call — the call goes on (audio on the handset, or the link being rebuilt)",
+                                    reason
+                                );
+                            } else if !matches!(*reason, 0x08 | 0x15) {
                                 let _ = event_tx.send(RuntimeEvent::CallTerminated);
                             }
                         }
@@ -3888,7 +4076,12 @@ fn run_runtime(
                 }
             }
             Err(e) if manager::is_timeout_error(&e) => {}
-            Err(e) => return Err(e),
+            Err(e) => {
+                let call_up = active_sco_handle.is_some() || status.call_active.load(Ordering::Relaxed);
+                if usb_error_ends_run(&mut usb_hiccups, "event read", &e, call_up) {
+                    return Err(e);
+                }
+            }
         }
 
         // 4c) ACL traffic (L2CAP signalling, SDP, RFCOMM/HFP control).
@@ -3913,7 +4106,12 @@ fn run_runtime(
                 last_acl_inbound_at = Instant::now();
             }
             Err(e) if manager::is_timeout_error(&e) => {}
-            Err(e) => return Err(e),
+            Err(e) => {
+                let call_up = active_sco_handle.is_some() || status.call_active.load(Ordering::Relaxed);
+                if usb_error_ends_run(&mut usb_hiccups, "ACL read", &e, call_up) {
+                    return Err(e);
+                }
+            }
         }
 
         loop {
@@ -3972,7 +4170,11 @@ fn run_runtime(
                                     }
                                     acl_buffer.clear();
                                     acl_partial_since = None;
-                                    transport.flush_acl_in_pipe()?;
+                                    if let Err(e) = transport.flush_acl_in_pipe() {
+                                        if usb_error_ends_run(&mut usb_hiccups, "ACL flush", &e, call_up) {
+                                            return Err(e);
+                                        }
+                                    }
                                     // Re-arm the detector so a relapse
                                     // reaches the next step.
                                     acl_corruption_times.clear();
@@ -4060,7 +4262,13 @@ fn run_runtime(
             // mask Pixel-side breakage we want the watchdog to see.
             last_acl_inbound_at = Instant::now();
             for response in &responses {
-                transport.write_acl(response)?;
+                if let Err(e) = transport.write_acl(response) {
+                    let call_up =
+                        active_sco_handle.is_some() || status.call_active.load(Ordering::Relaxed);
+                    if usb_error_ends_run(&mut usb_hiccups, "ACL write", &e, call_up) {
+                        return Err(e);
+                    }
+                }
             }
             // Phase 3e: drive PbapRuntime after every inbound ACL
             // packet so SDP / RFCOMM / OBEX progress lands on the
@@ -4090,7 +4298,7 @@ fn run_runtime(
             // tears MAS down before we get a chance to fetch the
             // body, and (on Pixel) the phone tears down our MNS
             // session in sympathy.
-            drain_mns_events(&mns_server, &mut pending_map_ops, &mut seen_handles);
+            drain_mns_events(&mns_server, &mut pending_map_ops, &active_map_op, &mut seen_handles);
             // Apply HFP call-state changes before MAP is driven below. That
             // ordering is what prevents a PollInbox from starting on the
             // same packet that announced a ring or answered call.
@@ -4108,7 +4316,24 @@ fn run_runtime(
                     &mut hfp_control,
                 )?;
                 for packet in &control_packets {
-                    transport.write_acl(packet)?;
+                    if let Err(e) = transport.write_acl(packet) {
+                        let call_up = active_sco_handle.is_some()
+                            || status.call_active.load(Ordering::Relaxed);
+                        if usb_error_ends_run(&mut usb_hiccups, "ACL write", &e, call_up) {
+                            return Err(e);
+                        }
+                    }
+                }
+                // Review 1 #3: the heartbeat drain's rule — with the
+                // hands-free link up this is a profile channel, not the SLC.
+                if let HfpEvent::ServiceLevelConnectionFailed(reason) = &hfp_event {
+                    if l2cap_state.hfp_state().is_some() {
+                        eprintln!(
+                            "[AokieRadio] a profile channel failed while the hands-free link is up ({}) — the link stays",
+                            reason
+                        );
+                        continue;
+                    }
                 }
                 // HARD-001: same dead-half-link teardown as the heartbeat
                 // drain — SLC failure on a link we paged drops the ACL.
@@ -4190,6 +4415,27 @@ fn run_runtime(
             &transport,
             &event_tx,
         );
+        // Message handles are one phone's: when another bonded phone is the
+        // one connected, its inbox is seeded afresh (the last phone's
+        // handles would let its old texts through as new), the last phone's
+        // fetches go, and a text queued for it is not sent from this one.
+        let phone_now = status
+            .addresses
+            .read()
+            .map(|a| a.remote.to_ascii_uppercase())
+            .unwrap_or_default();
+        if !phone_now.is_empty() && map_phone.as_deref() != Some(phone_now.as_str()) {
+            if map_phone.is_some() {
+                switch_map_phone(
+                    &mut pending_map_ops,
+                    &mut seen_handles,
+                    &mut inbox_poll_seeded,
+                    &mut seed_attempts,
+                    &mut texts,
+                );
+            }
+            map_phone = Some(phone_now);
+        }
         drive_map_runtime(
             active_acl_handle,
             &mut map_runtime,
@@ -4203,10 +4449,13 @@ fn run_runtime(
             &mut inbox_poll_seeded,
             seed_attempts,
             &mut last_send_reply_at,
+            &mut texts,
             &mut l2cap_state,
             &transport,
             &event_tx,
         );
+        // A text no op carries any more is reported, not left queued.
+        texts.sweep(&pending_map_ops, &active_map_op);
 
         // Inbox-poll scheduler. Runs only when MNS RFCOMM is healthy
         // (gating on the same MnsState the idle-disconnect check uses)
@@ -4321,7 +4570,7 @@ fn run_runtime(
 
         // 4d) SCO RX/TX (when the call has an audio channel up).
         if let Some(handle) = active_sco_handle {
-            let is_msbc = selected_codec
+            let is_msbc = link_codec
                 .as_ref()
                 .map(|(codec, _)| codec.eq_ignore_ascii_case("mSBC"))
                 .unwrap_or(false);
@@ -4373,7 +4622,12 @@ fn run_runtime(
                 }
                 Err(e) if manager::is_timeout_error(&e) || e.contains("no HCI SCO in endpoint") => {
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A voice link is up, so a call is.
+                    if usb_error_ends_run(&mut usb_hiccups, "voice read", &e, true) {
+                        return Err(e);
+                    }
+                }
             }
 
             // Outbound pacing. We must drain many packets per loop
@@ -4484,7 +4738,11 @@ fn run_runtime(
                     // speech and evict the signalling trace needed to diagnose
                     // a takeover. Aggregate liveness is reported elsewhere;
                     // retain this detail only when the transport actually fails.
-                    let log_burst = last_err.is_some();
+                    if last_err.is_some() {
+                        sco_tx_error_count += 1;
+                    }
+                    let log_burst = last_err.is_some()
+                        && (sco_tx_error_count == 1 || sco_tx_error_count % 500 == 0);
                     if log_burst {
                         eprintln!(
                             "[AokieRadio] SCO TX: wrote {} packet(s) of {} bytes (queue depth {} samples remain, codec={}, head={:02x?}){}",
@@ -4494,13 +4752,21 @@ fn run_runtime(
                             if is_msbc { "mSBC" } else { "CVSD" },
                             first_packet_head.unwrap_or([0; 8]),
                             match &last_err {
-                                Some(e) => format!(" — write error: {}", e),
+                                Some(e) => format!(
+                                    " — write error: {} (failure {} on this link)",
+                                    e, sco_tx_error_count
+                                ),
                                 None => String::new(),
                             },
                         );
                     }
                     if let Some(e) = last_err {
-                        let _ = event_tx.send(RuntimeEvent::Error(format!("sco write: {}", e)));
+                        if sco_tx_error_count == 1 {
+                            let _ = event_tx.send(RuntimeEvent::Error(format!(
+                                "sco write: {} (further failures on this link are counted in the log, not reported)",
+                                e
+                            )));
+                        }
                     }
                 }
             } else {
@@ -4512,13 +4778,82 @@ fn run_runtime(
     }
 }
 
+/// Review 1 #19: whether a USB error in the loop ends this run (the
+/// supervisor then reopens the dongle) or is a hiccup ridden out during a
+/// call. Logs the ones ridden out.
+fn usb_error_ends_run(hiccups: &mut UsbHiccups, what: &str, error: &str, call_up: bool) -> bool {
+    if hiccups.ride_out(error, call_up, Instant::now()) {
+        eprintln!(
+            "[AokieRadio] USB {what} failed during a call ({error}) — riding it out, the call stays up"
+        );
+        false
+    } else {
+        true
+    }
+}
+
+/// Review 1 #17: the codec a voice link carries, from the controller's air
+/// mode: mSBC rides a transparent link (0x03) and only when the phone chose
+/// it; any other air mode (CVSD, µ-law, A-law) reaches us as linear PCM,
+/// which is the CVSD path. An old-style link arriving while mSBC was the
+/// choice, decoded as mSBC, was noise for the caller and silence for Aokie.
+fn link_codec_for_air_mode(air_mode: u8, selected: Option<&(String, u16)>) -> (String, u16) {
+    let msbc_chosen = selected.is_some_and(|(codec, _)| codec.eq_ignore_ascii_case("mSBC"));
+    if air_mode == 0x03 && msbc_chosen {
+        ("mSBC".to_string(), 16000)
+    } else {
+        ("CVSD".to_string(), 8000)
+    }
+}
+
+/// The connected phone's address ("" when none).
+fn connected_remote(status: &RuntimeStatus) -> String {
+    status
+        .addresses
+        .read()
+        .map(|a| a.remote.clone())
+        .unwrap_or_default()
+}
+
+/// Review 1 #6: `address` is a different phone from the one holding the
+/// link, so it must wait (Aokie serves one phone at a time). The same phone
+/// coming back on a new handle (its old link's end never reported) is let
+/// through.
+fn another_phone_holds_the_link(
+    active_acl_handle: Option<u16>,
+    connected_remote: &str,
+    address: &str,
+) -> bool {
+    active_acl_handle.is_some()
+        && !connected_remote.is_empty()
+        && !connected_remote.eq_ignore_ascii_case(address)
+}
+
 fn forward_hci_event(
     event: &hci::HciEvent,
     active_sco_handle: Option<u16>,
+    active_acl_handle: Option<u16>,
     event_tx: &UnboundedSender<RuntimeEvent>,
     status: &Arc<RuntimeStatus>,
 ) {
     match event {
+        hci::HciEvent::ConnectionComplete {
+            status: cstatus,
+            connection_handle,
+            address,
+            link_type,
+            ..
+        } if *cstatus == 0
+            && *link_type == hci::LINK_TYPE_ACL
+            && another_phone_holds_the_link(
+                active_acl_handle.filter(|h| h != connection_handle),
+                &connected_remote(status),
+                address,
+            ) =>
+        {
+            // A second phone's link: the main loop ends it. The connected
+            // phone's status stays as it is (review 1 #6).
+        }
         hci::HciEvent::ConnectionComplete {
             status: cstatus,
             connection_handle,
@@ -4552,6 +4887,15 @@ fn forward_hci_event(
             // reset, alt-setting teardown) lives on the main loop and
             // runs whether or not we forward here.
             if Some(*connection_handle) == active_sco_handle {
+                return;
+            }
+            // Another link than the phone's (a second phone's, ended by us):
+            // the connected phone is not lost (review 1 #6).
+            if active_acl_handle.is_some_and(|h| h != *connection_handle) {
+                eprintln!(
+                    "[AokieRadio] Disconnection Complete handle {:#06x} reason 0x{:02x} — not the connected phone's link",
+                    connection_handle, reason
+                );
                 return;
             }
             // Track the previous remote address so the event payload
@@ -4922,11 +5266,18 @@ fn drive_map_runtime(
     inbox_poll_seeded: &mut bool,
     seed_attempts: usize,
     last_send_reply_at: &mut Option<Instant>,
+    texts: &mut TextLedger,
     l2cap_state: &mut l2cap::L2capState,
     transport: &AokieHciTransport,
     event_tx: &UnboundedSender<RuntimeEvent>,
 ) {
-    // First, tick the live runtime if any.
+    // No phone, no MAP: queued work waits for the link (a text that has
+    // waited past its time is reported failed).
+    if active_acl_handle.is_none() {
+        expire_waiting_texts(pending_map_ops, texts);
+    }
+    // First, tick the live runtime if any. An op that dies with it is
+    // tried again or reported (it was dropped quietly here before).
     if let Some(runtime) = map_runtime.as_mut() {
         match runtime.tick(l2cap_state) {
             Ok(packets) => {
@@ -4935,7 +5286,16 @@ fn drive_map_runtime(
                         let _ = event_tx
                             .send(RuntimeEvent::Error(format!("MAP tick ACL write: {}", e)));
                         *map_runtime = None;
-                        *active_map_op = None;
+                        if let Some(op) = active_map_op.take() {
+                            requeue_or_report(
+                                op,
+                                MapStop::InFlight,
+                                &format!("MAP tick ACL write: {e}"),
+                                pending_map_ops,
+                                seen_handles,
+                                texts,
+                            );
+                        }
                         *map_idle_since = None;
                         return;
                     }
@@ -4946,7 +5306,16 @@ fn drive_map_runtime(
                 // gracefully; HFP keeps working.
                 eprintln!("[AokieRadio] MAP tick error: {}", e);
                 *map_runtime = None;
-                *active_map_op = None;
+                if let Some(op) = active_map_op.take() {
+                    requeue_or_report(
+                        op,
+                        MapStop::InFlight,
+                        &format!("MAP tick error: {e}"),
+                        pending_map_ops,
+                        seen_handles,
+                        texts,
+                    );
+                }
                 *map_idle_since = None;
             }
         }
@@ -4961,6 +5330,7 @@ fn drive_map_runtime(
                 inbox_poll_seeded,
                 seed_attempts,
                 last_send_reply_at,
+                texts,
                 event_tx,
             );
         }
@@ -4988,7 +5358,8 @@ fn drive_map_runtime(
             // Same gate as the slot-free path: don't issue fresh OBEX on the resting MAS while
             // PBAP is mid-stream — Pixel queues MAS responses behind PBAP body chunks and stalls.
             if fresh_work_allowed && !pbap_busy && !pending_map_ops.is_empty() {
-                if let Some(next_op) = pending_map_ops.pop_front() {
+                // (a retried text waiting out its pause lets the ops behind it go first)
+                if let Some(next_op) = take_ready_op(pending_map_ops).map(mark_tried) {
                     feed_pooled_next_op(
                         runtime,
                         next_op,
@@ -5055,10 +5426,16 @@ fn drive_map_runtime(
         }
     }
     // Slot free? Pull the next pending op — but defer until PBAP
-    // is done (see fn-doc).
-    if map_runtime.is_none() && !pending_map_ops.is_empty() && !pbap_busy && fresh_work_allowed {
-        if let Some(op) = pending_map_ops.pop_front() {
-            start_map_operation(
+    // is done (see fn-doc), and while no phone is connected (an op started
+    // then was dropped with no word: a text lost silently).
+    if map_runtime.is_none()
+        && active_acl_handle.is_some()
+        && !pending_map_ops.is_empty()
+        && !pbap_busy
+        && fresh_work_allowed
+    {
+        if let Some(op) = take_ready_op(pending_map_ops).map(mark_tried) {
+            if let Err((op, why)) = start_map_operation(
                 op,
                 active_acl_handle,
                 map_runtime,
@@ -5066,9 +5443,19 @@ fn drive_map_runtime(
                 l2cap_state,
                 transport,
                 event_tx,
-            );
+            ) {
+                requeue_or_report(op, MapStop::NotDelivered, &why, pending_map_ops, seen_handles, texts);
+            }
         }
     }
+}
+
+/// A text's first try starts its retain time (see `SendReply::tried_at`).
+fn mark_tried(mut op: PendingMapOp) -> PendingMapOp {
+    if let PendingMapOp::SendReply { tried_at, .. } = &mut op {
+        tried_at.get_or_insert_with(Instant::now);
+    }
+    op
 }
 
 /// Phase 4g.d: feed a queued op into a resting pooled runtime. Wraps
@@ -5097,6 +5484,11 @@ fn feed_pooled_next_op(
                 "[AokieRadio] MAP pooled op {} feeding into resting session",
                 next_op.log_summary()
             );
+            // The session drives this op from here, written or not: a write
+            // that failed leaves it stalled, and the stall or the failure
+            // that follows retries or reports it (it was dropped here).
+            *active_map_op = Some(next_op);
+            *map_idle_since = None;
             for packet in &packets {
                 if let Err(e) = transport.write_acl(packet) {
                     let _ = event_tx.send(RuntimeEvent::Error(format!(
@@ -5106,8 +5498,6 @@ fn feed_pooled_next_op(
                     return;
                 }
             }
-            *active_map_op = Some(next_op);
-            *map_idle_since = None;
         }
         Err(e) => {
             eprintln!(
@@ -5151,6 +5541,13 @@ fn pending_op_to_mas_operation(op: &PendingMapOp) -> MasOperation {
             max_list_count: INBOX_POLL_MAX_LIST,
             filter_message_type: MSG_TYPE_KEEP_BOTH_SMS_VARIANTS,
         },
+        // The newest few of the folder, texts and MMS (a reply to an MMS goes
+        // out as one).
+        PendingMapOp::VerifySent { folder, .. } => MasOperation::ListMessages {
+            folder: *folder,
+            max_list_count: INBOX_POLL_MAX_LIST,
+            filter_message_type: MSG_TYPE_KEEP_SMS_AND_MMS,
+        },
         PendingMapOp::PollInbox => MasOperation::ListMessages {
             folder: MasFolder::Inbox,
             max_list_count: INBOX_POLL_MAX_LIST,
@@ -5169,6 +5566,408 @@ fn pending_op_to_mas_operation(op: &PendingMapOp) -> MasOperation {
 /// than the honest `SmsSendFailed` it surfaces as. (Module-level so
 /// both the radio loop and `handle_map_runtime_event` share one TTL.)
 const SEND_REPLY_RETAIN_TTL: Duration = Duration::from_secs(120);
+
+/// How many failed fetches of one message body before its handle is given
+/// up on (marked seen, logged): a body the phone will never serve must not
+/// be asked for on every inbox poll.
+const FETCH_ATTEMPTS: u8 = 3;
+
+/// How long after a send whose PUT may have reached the phone its folders
+/// are looked in: the phone may still be filing it, and Pixel goes silent
+/// on a SETPATH just after a PUT (see `POLL_SKIP_AFTER_REPLY`).
+const VERIFY_SENT_PAUSE: Duration = Duration::from_secs(10);
+
+/// The pause before a text is tried again after `attempts` failed tries.
+fn send_retry_pause(attempts: u32) -> Duration {
+    Duration::from_secs(match attempts {
+        0 | 1 => 2,
+        2 => 5,
+        3 => 15,
+        _ => 30,
+    })
+}
+
+/// The L2CAP payload one text's PushMessage takes on the air: the OBEX PUT
+/// in one RFCOMM UIH frame (address, control, a two-byte length and the
+/// FCS) behind the 4-byte L2CAP header. The whole of it must fit the
+/// dongle's ACL buffer (`acl_data_packet_length`): it is sent as one ACL
+/// packet.
+fn push_wire_len(bmessage_len: usize) -> usize {
+    4 + 5 + crate::aokie_radio::map_mas::push_message_packet_len(bmessage_len)
+}
+
+/// The start of a text, whitespace folded: what the phone's message
+/// listing shows of it as its subject.
+fn text_head(body: &str) -> String {
+    body.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(32)
+        .collect()
+}
+
+/// The texts handed to this radio run and not yet answered: each gets
+/// exactly one `SmsSent` or `SmsSendFailed`, and only through here. A text
+/// still open when the run ends, by any way out of `run_runtime` (a
+/// shutdown, a transport reopen, an error), is reported failed then, as is
+/// one no queued or running op carries any more (`sweep`): no text is ever
+/// left "queued" for ever.
+struct TextLedger {
+    /// (message id, recipient), in the order handed over.
+    open: Vec<(String, String)>,
+    event_tx: UnboundedSender<RuntimeEvent>,
+}
+
+impl TextLedger {
+    fn new(event_tx: UnboundedSender<RuntimeEvent>) -> Self {
+        Self {
+            open: Vec::new(),
+            event_tx,
+        }
+    }
+
+    fn open(&mut self, message_id: &str, recipient_phone: &str) {
+        if !self.open.iter().any(|(id, _)| id == message_id) {
+            self.open
+                .push((message_id.to_string(), recipient_phone.to_string()));
+        }
+    }
+
+    fn is_open(&self, message_id: &str) -> bool {
+        self.open.iter().any(|(id, _)| id == message_id)
+    }
+
+    fn close(&mut self, message_id: &str) -> Option<String> {
+        let at = self.open.iter().position(|(id, _)| id == message_id)?;
+        Some(self.open.remove(at).1)
+    }
+
+    fn sent(&mut self, message_id: &str) {
+        match self.close(message_id) {
+            Some(recipient_phone) => {
+                let _ = self.event_tx.send(RuntimeEvent::SmsSent {
+                    message_id: message_id.to_string(),
+                    recipient_phone,
+                });
+            }
+            None => eprintln!("[AokieRadio] text {message_id} was already answered — not reported again"),
+        }
+    }
+
+    fn failed(&mut self, message_id: &str, reason: String) {
+        match self.close(message_id) {
+            Some(recipient_phone) => {
+                eprintln!("[AokieRadio] text {message_id} failed: {reason}");
+                let _ = self.event_tx.send(RuntimeEvent::SmsSendFailed {
+                    message_id: message_id.to_string(),
+                    recipient_phone,
+                    reason,
+                });
+            }
+            None => eprintln!("[AokieRadio] text {message_id} was already answered — not reported again"),
+        }
+    }
+
+    /// Report failed every open text that no op carries any more: a path
+    /// that dropped one (an error the MAP code did not route here) cannot
+    /// leave it waiting for an answer that never comes.
+    fn sweep(&mut self, pending: &VecDeque<PendingMapOp>, active: &Option<PendingMapOp>) {
+        let carried = |id: &str| {
+            active.as_ref().and_then(PendingMapOp::text_id) == Some(id)
+                || pending.iter().any(|op| op.text_id() == Some(id))
+        };
+        let dropped: Vec<String> = self
+            .open
+            .iter()
+            .filter(|(id, _)| !carried(id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in dropped {
+            self.failed(&id, "the text was dropped before the phone took it".to_string());
+        }
+    }
+}
+
+impl Drop for TextLedger {
+    fn drop(&mut self) {
+        for (message_id, recipient_phone) in std::mem::take(&mut self.open) {
+            let _ = self.event_tx.send(RuntimeEvent::SmsSendFailed {
+                message_id,
+                recipient_phone,
+                reason: "the Bluetooth radio stopped before the phone took the text".to_string(),
+            });
+        }
+    }
+}
+
+/// How far a MAP op got before it stopped short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapStop {
+    /// It was still queued: the link went before it was tried.
+    NotStarted,
+    /// It was tried, and nothing of it reached the phone (its session could
+    /// not be opened): tried again after a pause.
+    NotDelivered,
+    /// It was the op in flight: a text's PUT may have reached the phone.
+    InFlight,
+}
+
+impl MapStop {
+    /// Whether this stop was a try (counted, and paused before the next).
+    fn tried(self) -> bool {
+        self != MapStop::NotStarted
+    }
+}
+
+/// Whether `reason` is the phone answering an OBEX request with an error
+/// code (it answered, so it did not take the text), as opposed to the
+/// session failing under it (it may have).
+fn phone_answered_error(reason: &str) -> bool {
+    reason.contains(": server returned 0x")
+}
+
+/// The one way a MAP op that did not finish is dealt with: tried again
+/// within its time, or reported. A text the phone refused for good (an
+/// OBEX 4xx) is reported failed at once; one that may have reached the
+/// phone is looked for in its folders before it is sent again; any other
+/// is sent again after a growing pause, within `SEND_REPLY_RETAIN_TTL` of
+/// its first try. A body fetch is tried `FETCH_ATTEMPTS` times. Subscribe,
+/// PollInbox and CheckSent are dropped: the radio loop drives them again.
+fn requeue_or_report(
+    op: PendingMapOp,
+    stop: MapStop,
+    reason: &str,
+    pending: &mut VecDeque<PendingMapOp>,
+    seen_handles: &mut HashSet<String>,
+    texts: &mut TextLedger,
+) {
+    let now = Instant::now();
+    match op {
+        PendingMapOp::SendReply {
+            message_id,
+            bmessage,
+            recipient_phone,
+            queued_at,
+            tried_at,
+            attempts,
+            not_before,
+            body_head,
+        } => {
+            if !texts.is_open(&message_id) {
+                return; // already answered
+            }
+            if let Some(code) = crate::aokie_radio::map_mas::push_refusal_code(reason) {
+                texts.failed(
+                    &message_id,
+                    format!("the phone refused the text (OBEX 0x{code:02x}), so it is not sent again: {reason}"),
+                );
+                return;
+            }
+            let since = tried_at.unwrap_or(queued_at);
+            let in_doubt = stop == MapStop::InFlight && !phone_answered_error(reason);
+            if since.elapsed() >= SEND_REPLY_RETAIN_TTL {
+                texts.failed(
+                    &message_id,
+                    if in_doubt {
+                        format!("not confirmed after {:.0}s — the phone may or may not have sent it: {reason}", since.elapsed().as_secs_f32())
+                    } else {
+                        format!("abandoned after {:.0}s: {reason}", since.elapsed().as_secs_f32())
+                    },
+                );
+                return;
+            }
+            let send = PendingMapOp::SendReply {
+                message_id,
+                bmessage,
+                recipient_phone,
+                queued_at,
+                tried_at,
+                attempts: if stop.tried() { attempts + 1 } else { attempts },
+                not_before: if stop.tried() {
+                    Some(now + send_retry_pause(attempts + 1))
+                } else {
+                    not_before
+                },
+                body_head,
+            };
+            if in_doubt {
+                eprintln!(
+                    "[AokieRadio] {} may have reached the phone ({reason}) — looking in its sent folder before sending it again",
+                    send.log_summary()
+                );
+                pending.push_back(PendingMapOp::VerifySent {
+                    send: Box::new(send),
+                    folder: MasFolder::Sent,
+                    not_before: Some(now + VERIFY_SENT_PAUSE),
+                });
+            } else {
+                eprintln!("[AokieRadio] re-queueing {} ({reason})", send.log_summary());
+                pending.push_back(send);
+            }
+        }
+        PendingMapOp::VerifySent { send, folder, not_before } => {
+            let PendingMapOp::SendReply {
+                ref message_id,
+                queued_at,
+                tried_at,
+                ..
+            } = *send
+            else {
+                return;
+            };
+            if !texts.is_open(message_id) {
+                return;
+            }
+            let since = tried_at.unwrap_or(queued_at);
+            if since.elapsed() >= SEND_REPLY_RETAIN_TTL {
+                let id = message_id.clone();
+                texts.failed(
+                    &id,
+                    format!("the phone may or may not have sent it, and its folders could not be read to tell: {reason}"),
+                );
+                return;
+            }
+            pending.push_back(PendingMapOp::VerifySent {
+                send,
+                folder,
+                not_before: if stop.tried() {
+                    Some(now + VERIFY_SENT_PAUSE)
+                } else {
+                    not_before
+                },
+            });
+        }
+        PendingMapOp::FetchMessage {
+            handle,
+            queued_at,
+            attempts,
+        } => {
+            let attempts = if stop.tried() { attempts + 1 } else { attempts };
+            if attempts >= FETCH_ATTEMPTS {
+                eprintln!(
+                    "[AokieRadio] message {handle} could not be fetched after {attempts} tries ({reason}) — given up on"
+                );
+                seen_handles.insert(handle);
+            } else if queued_at.elapsed() >= SEND_REPLY_RETAIN_TTL {
+                // Not seen: the next inbox poll finds it again.
+                eprintln!("[AokieRadio] fetch of message {handle} dropped after {:.0}s ({reason})", queued_at.elapsed().as_secs_f32());
+            } else {
+                pending.push_back(PendingMapOp::FetchMessage {
+                    handle,
+                    queued_at,
+                    attempts,
+                });
+            }
+        }
+        PendingMapOp::Subscribe | PendingMapOp::PollInbox | PendingMapOp::CheckSent { .. } => {}
+    }
+}
+
+/// Another phone is now the connected one: the last phone's message handles
+/// mean nothing on it (its own inbox is seeded afresh, so its old texts are
+/// not taken as new), the last phone's fetches go, and a text queued on the
+/// last phone is reported failed rather than sent from this phone's number.
+fn switch_map_phone(
+    pending: &mut VecDeque<PendingMapOp>,
+    seen_handles: &mut HashSet<String>,
+    inbox_poll_seeded: &mut bool,
+    seed_attempts: &mut usize,
+    texts: &mut TextLedger,
+) {
+    eprintln!("[AokieRadio] a different phone is connected — its inbox is read afresh");
+    seen_handles.clear();
+    *inbox_poll_seeded = false;
+    *seed_attempts = 0;
+    for op in pending.drain(..).collect::<Vec<_>>() {
+        match op.text_id() {
+            Some(id) => texts.failed(
+                id,
+                "a different phone connected before it was sent, and it is not sent from that phone's number"
+                    .to_string(),
+            ),
+            None if matches!(op, PendingMapOp::FetchMessage { .. }) => {}
+            None => pending.push_back(op),
+        }
+    }
+}
+
+/// Take the first queued op that may start now (a retried text waits out
+/// its pause while the ops behind it go ahead).
+fn take_ready_op(pending: &mut VecDeque<PendingMapOp>) -> Option<PendingMapOp> {
+    let now = Instant::now();
+    let at = pending.iter().position(|op| op.ready(now))?;
+    pending.remove(at)
+}
+
+/// While no phone is connected nothing is sent: a queued text past its time
+/// is reported failed rather than kept for a phone that may never come.
+fn expire_waiting_texts(pending: &mut VecDeque<PendingMapOp>, texts: &mut TextLedger) {
+    let expired = |op: &PendingMapOp| match op {
+        PendingMapOp::SendReply { queued_at, tried_at, .. } => {
+            tried_at.unwrap_or(*queued_at).elapsed() >= SEND_REPLY_RETAIN_TTL
+        }
+        PendingMapOp::VerifySent { send, .. } => match send.as_ref() {
+            PendingMapOp::SendReply { queued_at, tried_at, .. } => {
+                tried_at.unwrap_or(*queued_at).elapsed() >= SEND_REPLY_RETAIN_TTL
+            }
+            _ => true,
+        },
+        _ => false,
+    };
+    let mut kept = VecDeque::with_capacity(pending.len());
+    for op in pending.drain(..) {
+        if expired(&op) {
+            if let Some(id) = op.text_id().map(str::to_string) {
+                let reason = if matches!(op, PendingMapOp::VerifySent { .. }) {
+                    "no phone is connected, and the phone may or may not have sent it"
+                } else {
+                    "no phone is connected to send it"
+                };
+                texts.failed(&id, reason.to_string());
+            }
+        } else {
+            kept.push_back(op);
+        }
+    }
+    *pending = kept;
+}
+
+/// Digits of a phone number, its last nine (how screening matches numbers).
+fn number_suffix(number: &str) -> String {
+    let digits: Vec<char> = number.chars().filter(char::is_ascii_digit).collect();
+    digits[digits.len().saturating_sub(9)..].iter().collect()
+}
+
+/// Whether one message-listing entry is the text `send` (to its recipient,
+/// starting as it does, dated no earlier than `since`, the phone's local
+/// time as "YYYYMMDDTHHMMSS"). An entry with no subject or no date is judged
+/// on what it has; a recipient is always needed.
+fn listing_holds_text(entry: &[(String, String)], recipient: &str, head: &str, since: &str) -> bool {
+    let get = |name: &str| {
+        entry
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let want = number_suffix(recipient);
+    if want.len() < 6 || get("recipient_addressing").map(number_suffix).as_deref() != Some(want.as_str()) {
+        return false;
+    }
+    if let Some(subject) = get("subject").map(text_head).filter(|s| !s.is_empty()) {
+        let subject = subject.trim_end_matches("...").trim_end_matches('…').trim_end();
+        let n = subject.chars().count().min(head.chars().count()).min(24);
+        if n == 0
+            || subject.chars().take(n).collect::<String>() != head.chars().take(n).collect::<String>()
+        {
+            return false;
+        }
+    }
+    match get("datetime").and_then(|dt| dt.get(..15)) {
+        Some(at) => at >= since,
+        None => true,
+    }
+}
 
 /// How long after queueing the MAP Subscribe we keep waiting for the
 /// phone's MNS connection before the inbox poll takes over as THE
@@ -5248,6 +6047,7 @@ fn handle_map_runtime_event(
     inbox_poll_seeded: &mut bool,
     seed_attempts: usize,
     last_send_reply_at: &mut Option<Instant>,
+    texts: &mut TextLedger,
     event_tx: &UnboundedSender<RuntimeEvent>,
 ) {
     match event {
@@ -5260,7 +6060,19 @@ fn handle_map_runtime_event(
                 Some(PendingMapOp::FetchMessage { handle, .. }),
                 crate::aokie_radio::map_mas::OperationOutput::Message(bytes),
             ) => {
+                // Seen once its body is in, not when it was queued: a fetch
+                // that failed is fetched again (it was lost before).
+                seen_handles.insert(handle.clone());
                 let parsed = bmessage::parse(&bytes);
+                if !is_inbox_folder(parsed.folder.as_deref()) {
+                    // The owner's own sent text (or a draft) is not a
+                    // message received: no reply goes to whom they wrote to.
+                    eprintln!(
+                        "[AokieRadio] message {handle} is in {:?}, not the inbox — not reported as received",
+                        parsed.folder
+                    );
+                    return;
+                }
                 let _ = event_tx.send(RuntimeEvent::SmsReceived {
                     sender_phone: parsed.sender_addressing.unwrap_or_default(),
                     sender_name: parsed.sender_name,
@@ -5269,19 +6081,62 @@ fn handle_map_runtime_event(
                     msg_type: parsed.msg_type,
                 });
             }
+            (Some(PendingMapOp::SendReply { message_id, .. }), _) => {
+                *last_send_reply_at = Some(Instant::now());
+                texts.sent(message_id);
+            }
             (
-                Some(PendingMapOp::SendReply {
+                Some(PendingMapOp::VerifySent { send, folder, .. }),
+                crate::aokie_radio::map_mas::OperationOutput::Listing(bytes),
+            ) => {
+                let PendingMapOp::SendReply {
                     message_id,
                     recipient_phone,
+                    queued_at,
+                    tried_at,
+                    body_head,
                     ..
-                }),
-                _,
-            ) => {
-                *last_send_reply_at = Some(Instant::now());
-                let _ = event_tx.send(RuntimeEvent::SmsSent {
-                    message_id: message_id.clone(),
-                    recipient_phone: recipient_phone.clone(),
-                });
+                } = send.as_ref()
+                else {
+                    return;
+                };
+                // Since a little before its first try, on the phone's clock
+                // (the phone and this computer share a room and a time zone,
+                // as `entry_is_recent` reckons).
+                let tried = tried_at.unwrap_or(*queued_at);
+                let since = (chrono::Local::now()
+                    - chrono::Duration::from_std(tried.elapsed() + Duration::from_secs(120))
+                        .unwrap_or_else(|_| chrono::Duration::minutes(10)))
+                .format("%Y%m%dT%H%M%S")
+                .to_string();
+                let found = msg_attribute_pairs(&bytes)
+                    .iter()
+                    .any(|entry| listing_holds_text(entry, recipient_phone, body_head, &since));
+                if found {
+                    eprintln!(
+                        "[AokieRadio] {} is in the phone's {:?} folder: the phone has it, so it is not sent again",
+                        send.log_summary(),
+                        folder
+                    );
+                    *last_send_reply_at = Some(Instant::now());
+                    texts.sent(message_id);
+                } else if *folder == MasFolder::Sent {
+                    pending_map_ops.push_front(PendingMapOp::VerifySent {
+                        send: send.clone(),
+                        folder: MasFolder::Outbox,
+                        not_before: None,
+                    });
+                } else {
+                    eprintln!(
+                        "[AokieRadio] {} is in neither the sent nor the outbox folder — sending it again",
+                        send.log_summary()
+                    );
+                    let mut again = send.as_ref().clone();
+                    if let PendingMapOp::SendReply { not_before, .. } = &mut again {
+                        *not_before = None;
+                    }
+                    pending_map_ops.push_front(again);
+                }
             }
             (
                 Some(PendingMapOp::PollInbox),
@@ -5322,36 +6177,47 @@ fn handle_map_runtime_event(
             eprintln!("[AokieRadio] MAP runtime failed: {}", reason);
             // Subscribe/PollInbox failures don't surface — they're
             // best-effort (the SLC handler and the poll timer re-drive
-            // them). A failed SendReply is DIFFERENT: it's a customer's
-            // text. Fresh ones re-queue for the next MAS session
-            // (bounded by SEND_REPLY_RETAIN_TTL, so a deterministic
-            // refusal can't loop forever); aged ones surface as
-            // SmsSendFailed so nothing dies silently.
-            if let Some(op @ PendingMapOp::SendReply { .. }) = active_map_op.as_ref() {
-                let (queued_at, message_id, recipient_phone) = match op {
-                    PendingMapOp::SendReply {
-                        message_id,
-                        queued_at,
-                        recipient_phone,
-                        ..
-                    } => (*queued_at, message_id.clone(), recipient_phone.clone()),
-                    _ => unreachable!(),
-                };
-                if queued_at.elapsed() < SEND_REPLY_RETAIN_TTL {
-                    eprintln!(
-                        "[AokieRadio] re-queueing failed SendReply (queued {:.1}s ago)",
-                        queued_at.elapsed().as_secs_f32()
-                    );
-                    pending_map_ops.push_back(op.clone());
-                } else {
-                    let _ = event_tx.send(RuntimeEvent::SmsSendFailed {
-                        message_id,
-                        recipient_phone,
-                        reason: format!("MAS session failed the send: {}", reason),
-                    });
-                }
+            // them). A failed text or fetch is tried again within its
+            // time, or reported (requeue_or_report): a text the phone
+            // refused for good is not sent again, and one that may have
+            // reached it is looked for in its folders first.
+            if let Some(op) = active_map_op.clone() {
+                requeue_or_report(
+                    op,
+                    MapStop::InFlight,
+                    &reason,
+                    pending_map_ops,
+                    seen_handles,
+                    texts,
+                );
             }
         }
+    }
+}
+
+/// Whether a fetch of `handle` is queued, or is the op in flight.
+fn fetch_queued(
+    pending: &VecDeque<PendingMapOp>,
+    active: Option<&PendingMapOp>,
+    handle: &str,
+) -> bool {
+    pending
+        .iter()
+        .chain(active)
+        .any(|op| matches!(op, PendingMapOp::FetchMessage { handle: h, .. } if h == handle))
+}
+
+/// Whether a message's folder is the inbox (`telecom/msg/inbox`, any case).
+/// A message that names no folder is taken as one, as before: some phones
+/// leave it out.
+fn is_inbox_folder(folder: Option<&str>) -> bool {
+    match folder.map(str::trim).filter(|f| !f.is_empty()) {
+        None => true,
+        Some(f) => f
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .is_some_and(|last| last.eq_ignore_ascii_case("inbox")),
     }
 }
 
@@ -5450,6 +6316,7 @@ fn handle_inbox_listing(
             pending_map_ops.push_back(PendingMapOp::FetchMessage {
                 handle,
                 queued_at: Instant::now(),
+                attempts: 0,
             });
         } else {
             eprintln!(
@@ -5461,7 +6328,8 @@ fn handle_inbox_listing(
     }
     let mut queued = 0;
     for entry in &entries {
-        if seen_handles.insert(entry.handle.clone()) {
+        // (seen once fetched; one already queued is not queued twice)
+        if !seen_handles.contains(&entry.handle) && !fetch_queued(pending_map_ops, None, &entry.handle) {
             eprintln!(
                 "[AokieRadio] inbox poll caught new handle {} (likely a missed MNS push) — queuing fetch",
                 entry.handle
@@ -5469,6 +6337,7 @@ fn handle_inbox_listing(
             pending_map_ops.push_back(PendingMapOp::FetchMessage {
                 handle: entry.handle.clone(),
                 queued_at: Instant::now(),
+                attempts: 0,
             });
             queued += 1;
         }
@@ -5483,7 +6352,9 @@ fn handle_inbox_listing(
 
 /// Construct a `MapRuntime` for a pending op and kick off its first
 /// SDP query. On success, stores the runtime in `map_runtime` and
-/// records the op in `active_map_op`.
+/// records the op in `active_map_op`. On failure the op comes back with
+/// why, for the caller to retry or report: nothing reached the phone
+/// beyond an SDP request, so a text is not in doubt.
 fn start_map_operation(
     op: PendingMapOp,
     active_acl_handle: Option<u16>,
@@ -5492,10 +6363,10 @@ fn start_map_operation(
     l2cap_state: &mut l2cap::L2capState,
     transport: &AokieHciTransport,
     event_tx: &UnboundedSender<RuntimeEvent>,
-) {
+) -> Result<(), (PendingMapOp, String)> {
     let Some(handle) = active_acl_handle else {
-        eprintln!("[AokieRadio] MAP op skipped — no active ACL handle");
-        return;
+        eprintln!("[AokieRadio] MAP op not started — no active ACL handle");
+        return Err((op, "no phone is connected".to_string()));
     };
     let mas_op = pending_op_to_mas_operation(&op);
     let mut runtime = MapRuntime::new(handle, mas_op, MAS_INSTANCE_ID_FOR_SMS);
@@ -5513,14 +6384,16 @@ fn start_map_operation(
                 if let Err(e) = transport.write_acl(packet) {
                     let _ =
                         event_tx.send(RuntimeEvent::Error(format!("MAP start ACL write: {}", e)));
-                    return;
+                    return Err((op, format!("MAP start ACL write: {e}")));
                 }
             }
             *map_runtime = Some(runtime);
             *active_map_op = Some(op);
+            Ok(())
         }
         Err(e) => {
             let _ = event_tx.send(RuntimeEvent::Error(format!("MAP start: {}", e)));
+            Err((op, format!("MAP start: {e}")))
         }
     }
 }
@@ -5532,6 +6405,7 @@ fn start_map_operation(
 fn drain_mns_events(
     mns_server: &Arc<StdMutex<MnsServer>>,
     pending_map_ops: &mut VecDeque<PendingMapOp>,
+    active_map_op: &Option<PendingMapOp>,
     seen_handles: &mut HashSet<String>,
 ) {
     let events = match mns_server.lock() {
@@ -5541,11 +6415,20 @@ fn drain_mns_events(
     for ev in events {
         match ev {
             MnsEvent::NewMessage {
-                handle, msg_type, ..
+                handle, msg_type, folder,
             } => {
-                if !seen_handles.insert(handle.clone()) {
+                // The phone also reports a text the owner sends from it (in
+                // sent or outbox): that is not a message to answer.
+                if !is_inbox_folder(folder.as_deref()) {
                     eprintln!(
-                        "[AokieRadio] MNS NewMessage handle={} type={:?} — already fetched via poll, skipping duplicate",
+                        "[AokieRadio] MNS NewMessage handle={} in {:?} — not the inbox, ignored",
+                        handle, folder
+                    );
+                    continue;
+                }
+                if seen_handles.contains(&handle) || fetch_queued(pending_map_ops, active_map_op.as_ref(), &handle) {
+                    eprintln!(
+                        "[AokieRadio] MNS NewMessage handle={} type={:?} — already fetched or queued, skipping duplicate",
                         handle, msg_type
                     );
                     continue;
@@ -5557,6 +6440,7 @@ fn drain_mns_events(
                 pending_map_ops.push_back(PendingMapOp::FetchMessage {
                     handle,
                     queued_at: Instant::now(),
+                    attempts: 0,
                 });
             }
             MnsEvent::Other { event_type, handle } => {
@@ -5585,6 +6469,20 @@ fn forward_hfp_event(
         HfpEvent::ServiceLevelConnectionFailed(reason) => {
             eprintln!("[AokieRadio] HFP SLC failed at {}", reason);
             let _ = event_tx.send(RuntimeEvent::Error(format!("HFP SLC failed at {}", reason)));
+        }
+        HfpEvent::CommandRejected { command, timed_out } => {
+            // Not a hardware fault and not an SLC failure (review 1 #3): no
+            // Error, so it never lands in health's "last error".
+            let _ = event_tx.send(RuntimeEvent::CommandRejected { command, timed_out });
+        }
+        HfpEvent::CallStateCheck => {
+            // The AT+CIND? went out from hfp_call_control_packets_for_event;
+            // its answer settles the second setup inside the state machine.
+        }
+        HfpEvent::CallActiveAtConnect => {
+            eprintln!("[AokieRadio] HFP: a call was already up on the phone when the link came");
+            status.call_active.store(true, Ordering::Relaxed);
+            let _ = event_tx.send(RuntimeEvent::CallActiveAtConnect);
         }
         HfpEvent::IncomingCall => {
             eprintln!("[AokieRadio] HFP IncomingCall");
@@ -6128,6 +7026,33 @@ fn build_msbc_sco_packet(
 mod tests {
     use super::*;
 
+    /// Review 1 #6: one phone at a time. A second phone waits while another
+    /// holds the link; the same phone back on a new handle is let through.
+    #[test]
+    fn a_second_phone_waits_while_one_holds_the_link() {
+        let a = "AA:BB:CC:00:00:01";
+        let b = "AA:BB:CC:00:00:02";
+        assert!(another_phone_holds_the_link(Some(0x0b), a, b));
+        assert!(!another_phone_holds_the_link(Some(0x0b), a, &a.to_lowercase()));
+        assert!(!another_phone_holds_the_link(None, a, b), "nobody connected");
+        assert!(!another_phone_holds_the_link(Some(0x0b), "", b), "no address known");
+    }
+
+    /// Review 1 #17: the codec comes from the link's air mode, not the
+    /// phone's last choice.
+    #[test]
+    fn a_voice_link_is_decoded_as_what_it_carries() {
+        let msbc = ("mSBC".to_string(), 16000);
+        let cvsd = ("CVSD".to_string(), 8000);
+        assert_eq!(link_codec_for_air_mode(0x03, Some(&msbc)), msbc);
+        // An old-style link while mSBC was the choice is CVSD.
+        assert_eq!(link_codec_for_air_mode(0x02, Some(&msbc)), cvsd);
+        assert_eq!(link_codec_for_air_mode(0x00, Some(&msbc)), cvsd);
+        // No choice yet, or CVSD chosen: CVSD.
+        assert_eq!(link_codec_for_air_mode(0x03, None), cvsd);
+        assert_eq!(link_codec_for_air_mode(0x02, Some(&cvsd)), cvsd);
+    }
+
     #[test]
     fn cvsd_usb_packets_carry_three_milliseconds_of_pcm() {
         let buffers = hci::BufferSize {
@@ -6429,6 +7354,287 @@ mod tests {
         handle_inbox_listing(&listing_with(&[]), &mut pending, &mut seen, &mut seeded, 2);
         assert!(seeded);
         assert!(pending.is_empty(), "nothing to fetch when inbox is empty");
+    }
+
+    // ── Texts and fetches that stop short (review 2026-10) ───────────────
+
+    fn send_op(id: &str, attempts: u32) -> PendingMapOp {
+        PendingMapOp::SendReply {
+            message_id: id.to_string(),
+            bmessage: b"BEGIN:BMSG\r\nEND:BMSG\r\n".to_vec(),
+            recipient_phone: "+61 400 111 222".to_string(),
+            queued_at: Instant::now(),
+            tried_at: Some(Instant::now()),
+            attempts,
+            not_before: None,
+            body_head: text_head("Your  booking is\nconfirmed for Friday at 10"),
+        }
+    }
+
+    fn outcomes(rx: &mut UnboundedReceiver<RuntimeEvent>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                RuntimeEvent::SmsSent { message_id, .. } => out.push(format!("sent {message_id}")),
+                RuntimeEvent::SmsSendFailed { message_id, .. } => out.push(format!("failed {message_id}")),
+                RuntimeEvent::SmsReceived { handle, .. } => out.push(format!("received {handle}")),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Each text gets one answer; a text still open when the run ends, or
+    /// one nothing carries any more, is reported failed (review 1 #5: texts
+    /// stayed "queued" for ever).
+    #[test]
+    fn every_text_gets_exactly_one_answer() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        {
+            let mut texts = TextLedger::new(tx.clone());
+            texts.open("m1", "0400111222");
+            texts.open("m2", "0400111222");
+            texts.open("m3", "0400111222");
+            texts.sent("m1");
+            texts.sent("m1"); // a second answer is not sent
+            let pending: VecDeque<PendingMapOp> = vec![send_op("m3", 0)].into();
+            texts.sweep(&pending, &None); // m2 is carried by nothing
+            assert_eq!(outcomes(&mut rx), vec!["sent m1", "failed m2"]);
+        } // the run ends with m3 still open
+        assert_eq!(outcomes(&mut rx), vec!["failed m3"]);
+    }
+
+    #[test]
+    fn a_failed_text_is_retried_checked_or_reported_by_what_happened() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut texts = TextLedger::new(tx);
+        let mut seen = HashSet::new();
+        let mut pending = VecDeque::new();
+        for id in ["refused", "doubt", "notsent", "queued"] {
+            texts.open(id, "0400111222");
+        }
+        // The phone refused the PUT for good (OBEX 4xx): failed, not resent.
+        requeue_or_report(
+            send_op("refused", 0),
+            MapStop::InFlight,
+            "MAS session failed: MAS PUT: server returned 0xc6 (expected one of [160])",
+            &mut pending,
+            &mut seen,
+            &mut texts,
+        );
+        assert_eq!(outcomes(&mut rx), vec!["failed refused"]);
+        assert!(pending.is_empty());
+        // The session died under the PUT: it may have reached the phone,
+        // so its sent folder is looked in first (review 1 #20).
+        requeue_or_report(send_op("doubt", 0), MapStop::InFlight, "RFCOMM closed mid-MAP session", &mut pending, &mut seen, &mut texts);
+        assert!(matches!(
+            pending.pop_front(),
+            Some(PendingMapOp::VerifySent { folder: MasFolder::Sent, not_before: Some(_), .. })
+        ));
+        // Nothing reached the phone: sent again after a growing pause.
+        requeue_or_report(send_op("notsent", 2), MapStop::NotDelivered, "MAP start: no channel", &mut pending, &mut seen, &mut texts);
+        match pending.pop_front() {
+            Some(PendingMapOp::SendReply { attempts: 3, not_before: Some(t), .. }) => {
+                assert!(t >= Instant::now() + send_retry_pause(3) - Duration::from_millis(50));
+            }
+            other => panic!("expected a paused retry, got {other:?}"),
+        }
+        // A 5xx is the phone answering: not in doubt, resent after a pause.
+        requeue_or_report(
+            send_op("notsent", 0),
+            MapStop::InFlight,
+            "MAS PUT: server returned 0xd3 (expected one of [160])",
+            &mut pending,
+            &mut seen,
+            &mut texts,
+        );
+        assert!(matches!(pending.pop_front(), Some(PendingMapOp::SendReply { attempts: 1, .. })));
+        // Still queued when the link went: kept as it was.
+        requeue_or_report(send_op("queued", 0), MapStop::NotStarted, "link dropped", &mut pending, &mut seen, &mut texts);
+        assert!(matches!(pending.pop_front(), Some(PendingMapOp::SendReply { attempts: 0, not_before: None, .. })));
+        // Past its time: reported.
+        let mut old = send_op("queued", 0);
+        if let PendingMapOp::SendReply { tried_at, .. } = &mut old {
+            *tried_at = Instant::now().checked_sub(SEND_REPLY_RETAIN_TTL + Duration::from_secs(1));
+        }
+        requeue_or_report(old, MapStop::InFlight, "stalled", &mut pending, &mut seen, &mut texts);
+        assert_eq!(outcomes(&mut rx), vec!["failed queued"]);
+        assert!(pending.is_empty());
+        // A fetch is tried FETCH_ATTEMPTS times, then given up on (seen).
+        let mut fetch = PendingMapOp::FetchMessage { handle: "H1".into(), queued_at: Instant::now(), attempts: 0 };
+        for _ in 0..FETCH_ATTEMPTS {
+            requeue_or_report(fetch, MapStop::InFlight, "stalled", &mut pending, &mut seen, &mut texts);
+            match pending.pop_front() {
+                Some(op) => fetch = op,
+                None => break,
+            }
+        }
+        assert!(seen.contains("H1"));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_text_is_known_again_in_the_phones_folders() {
+        let entry = |to: &str, subject: &str, at: &str| -> Vec<(String, String)> {
+            vec![
+                ("handle".into(), "1".into()),
+                ("recipient_addressing".into(), to.into()),
+                ("subject".into(), subject.into()),
+                ("datetime".into(), at.into()),
+            ]
+        };
+        let head = text_head("Your booking is confirmed for Friday at 10");
+        let since = "20261018T100000";
+        assert!(listing_holds_text(&entry("0400111222", "Your booking is confirmed", "20261018T100500"), "+61 400 111 222", &head, since));
+        assert!(listing_holds_text(&entry("+61400111222", "Your booking is...", "20261018T100500+1100"), "0400 111 222", &head, since));
+        // Another number, another text, or an older one: not it.
+        assert!(!listing_holds_text(&entry("0400999888", "Your booking is confirmed", "20261018T100500"), "0400111222", &head, since));
+        assert!(!listing_holds_text(&entry("0400111222", "See you soon", "20261018T100500"), "0400111222", &head, since));
+        assert!(!listing_holds_text(&entry("0400111222", "Your booking is confirmed", "20261018T090000"), "0400111222", &head, since));
+        // No subject or date: judged on the number.
+        let bare = vec![("recipient_addressing".to_string(), "0400111222".to_string())];
+        assert!(listing_holds_text(&bare, "0400111222", &head, since));
+        assert!(!listing_holds_text(&bare, "", &head, since));
+    }
+
+    fn verify_listing(entries: &[(&str, &str)]) -> Vec<u8> {
+        let now = chrono::Local::now().format("%Y%m%dT%H%M%S").to_string();
+        let mut s = String::from("<MAP-msg-listing version=\"1.0\">");
+        for (to, subject) in entries {
+            s.push_str(&format!(
+                "<msg handle=\"9\" subject=\"{subject}\" datetime=\"{now}\" recipient_addressing=\"{to}\" type=\"SMS_GSM\" />"
+            ));
+        }
+        s.push_str("</MAP-msg-listing>");
+        s.into_bytes()
+    }
+
+    fn run_event(
+        event: MapRuntimeEvent,
+        active: Option<PendingMapOp>,
+        pending: &mut VecDeque<PendingMapOp>,
+        seen: &mut HashSet<String>,
+        texts: &mut TextLedger,
+        tx: &UnboundedSender<RuntimeEvent>,
+    ) {
+        let mut seeded = true;
+        let mut last_reply = None;
+        handle_map_runtime_event(event, &active, pending, seen, &mut seeded, 1, &mut last_reply, texts, tx);
+    }
+
+    /// A send in doubt is looked for in sent, then outbox: found, it is
+    /// answered sent (not sent twice); in neither, it is sent again.
+    #[test]
+    fn a_send_in_doubt_is_found_or_sent_again() {
+        use crate::aokie_radio::map_mas::OperationOutput;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut texts = TextLedger::new(tx.clone());
+        let mut seen = HashSet::new();
+        let mut pending = VecDeque::new();
+        texts.open("m1", "0400111222");
+        let verify = |folder| PendingMapOp::VerifySent { send: Box::new(send_op("m1", 1)), folder, not_before: None };
+        // In sent: answered, nothing queued.
+        let listing = verify_listing(&[("0400111222", "Your booking is confirmed")]);
+        run_event(MapRuntimeEvent::OperationCompleted(OperationOutput::Listing(listing)), Some(verify(MasFolder::Sent)), &mut pending, &mut seen, &mut texts, &tx);
+        assert_eq!(outcomes(&mut rx), vec!["sent m1"]);
+        assert!(pending.is_empty());
+        // Not in sent: outbox next; not there either: sent again.
+        texts.open("m1", "0400111222");
+        let other = verify_listing(&[("0400999888", "Something else")]);
+        run_event(MapRuntimeEvent::OperationCompleted(OperationOutput::Listing(other.clone())), Some(verify(MasFolder::Sent)), &mut pending, &mut seen, &mut texts, &tx);
+        assert!(matches!(pending.front(), Some(PendingMapOp::VerifySent { folder: MasFolder::Outbox, .. })));
+        let next = pending.pop_front();
+        run_event(MapRuntimeEvent::OperationCompleted(OperationOutput::Listing(other)), next, &mut pending, &mut seen, &mut texts, &tx);
+        assert!(matches!(pending.front(), Some(PendingMapOp::SendReply { not_before: None, .. })));
+        assert!(outcomes(&mut rx).is_empty(), "no answer yet: it is being sent again");
+    }
+
+    /// Review 1 #22/#23: a body is seen once fetched (not when queued), and
+    /// the owner's own sent text is not a message received.
+    #[test]
+    fn a_fetched_message_is_seen_and_only_the_inbox_is_received() {
+        use crate::aokie_radio::map_mas::OperationOutput;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut texts = TextLedger::new(tx.clone());
+        let mut seen = HashSet::new();
+        let mut pending = VecDeque::new();
+        let body = |folder: &str| {
+            format!(
+                "BEGIN:BMSG\r\nTYPE:SMS_GSM\r\nFOLDER:{folder}\r\nBEGIN:VCARD\r\nTEL:+61400111222\r\nEND:VCARD\r\n\
+BEGIN:BENV\r\nBEGIN:BBODY\r\nBEGIN:MSG\r\nhello\r\nEND:MSG\r\nEND:BBODY\r\nEND:BENV\r\nEND:BMSG\r\n"
+            )
+            .into_bytes()
+        };
+        let fetch = |h: &str| PendingMapOp::FetchMessage { handle: h.into(), queued_at: Instant::now(), attempts: 0 };
+        run_event(MapRuntimeEvent::OperationCompleted(OperationOutput::Message(body("telecom/msg/inbox"))), Some(fetch("IN1")), &mut pending, &mut seen, &mut texts, &tx);
+        run_event(MapRuntimeEvent::OperationCompleted(OperationOutput::Message(body("TELECOM/MSG/SENT"))), Some(fetch("OUT1")), &mut pending, &mut seen, &mut texts, &tx);
+        assert_eq!(outcomes(&mut rx), vec!["received IN1"]);
+        assert!(seen.contains("IN1") && seen.contains("OUT1"));
+        // A failed fetch is not seen: it is fetched again.
+        run_event(MapRuntimeEvent::Failed("RFCOMM closed mid-MAP session".into()), Some(fetch("IN2")), &mut pending, &mut seen, &mut texts, &tx);
+        assert!(!seen.contains("IN2"));
+        assert!(matches!(pending.front(), Some(PendingMapOp::FetchMessage { attempts: 1, .. })));
+        assert!(is_inbox_folder(None) && is_inbox_folder(Some("telecom/msg/inbox/")) && !is_inbox_folder(Some("telecom/msg/outbox")));
+    }
+
+    /// Another phone connected: the last phone's handles and fetches go, its
+    /// queued text is reported failed (not sent from this phone's number).
+    #[test]
+    fn another_phone_starts_its_inbox_afresh() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut texts = TextLedger::new(tx);
+        let mut seen: HashSet<String> = ["A1".to_string()].into();
+        let mut seeded = true;
+        let mut attempts = 3usize;
+        texts.open("m1", "0400111222");
+        let mut pending: VecDeque<PendingMapOp> = vec![
+            send_op("m1", 0),
+            PendingMapOp::FetchMessage { handle: "A2".into(), queued_at: Instant::now(), attempts: 0 },
+            PendingMapOp::Subscribe,
+        ]
+        .into();
+        switch_map_phone(&mut pending, &mut seen, &mut seeded, &mut attempts, &mut texts);
+        assert!(seen.is_empty() && !seeded && attempts == 0);
+        assert!(matches!(pending.iter().collect::<Vec<_>>()[..], [PendingMapOp::Subscribe]));
+        assert_eq!(outcomes(&mut rx), vec!["failed m1"]);
+    }
+
+    /// Review 1 #21: a text too long for the dongle's ACL buffer (1021 bytes
+    /// on a BCM20702) never went. The radio measures it; the plugin's 600-byte
+    /// cap is inside it even with a long number.
+    #[test]
+    fn a_text_is_held_against_the_dongles_packet() {
+        let bcm20702 = 1021;
+        let fits = bmessage::build_sms_push("+61 400 111 222 333", &"x".repeat(600));
+        assert!(push_wire_len(fits.len()) <= bcm20702, "{}", push_wire_len(fits.len()));
+        let long = bmessage::build_sms_push("+61400111222", &"x".repeat(800));
+        assert!(push_wire_len(long.len()) > bcm20702);
+    }
+
+    /// While no phone is connected, a text past its time is reported, and
+    /// one within it waits.
+    #[test]
+    fn waiting_texts_expire_while_no_phone_is_connected() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut texts = TextLedger::new(tx);
+        texts.open("old", "0400111222");
+        texts.open("new", "0400111222");
+        let mut old = send_op("old", 0);
+        if let PendingMapOp::SendReply { tried_at, .. } = &mut old {
+            *tried_at = Instant::now().checked_sub(SEND_REPLY_RETAIN_TTL + Duration::from_secs(1));
+        }
+        let mut pending: VecDeque<PendingMapOp> = vec![old, send_op("new", 0)].into();
+        expire_waiting_texts(&mut pending, &mut texts);
+        assert_eq!(outcomes(&mut rx), vec!["failed old"]);
+        assert_eq!(pending.len(), 1);
+        // A paused retry lets the op behind it go first.
+        let mut paused = send_op("new", 1);
+        if let PendingMapOp::SendReply { not_before, .. } = &mut paused {
+            *not_before = Some(Instant::now() + Duration::from_secs(30));
+        }
+        let mut queue: VecDeque<PendingMapOp> = vec![paused, PendingMapOp::PollInbox].into();
+        assert!(matches!(take_ready_op(&mut queue), Some(PendingMapOp::PollInbox)));
+        assert!(take_ready_op(&mut queue).is_none());
     }
 
     // ── ACL accumulator (pop_acl_frame) regression fixtures ─────────────

@@ -11,13 +11,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-# Cross-platform data/config dir resolution (paths.rs, crashlog.rs).
+# Cross-platform data/config dir resolution (paths.rs).
 dirs = "5.0"
-# consent.rs adds a small random jitter to grace-window timestamps.
-rand = "0.8"
 url = "2"
-# OS-native secret store for provider API keys (secrets.rs). Windows
-# path stays on Win32 APIs (Credential Manager / DPAPI) only.
+# The OS's own secret store, for the key keychain_seal.rs seals under on macOS
+# and Linux. Windows seals with DPAPI (dpapi.rs) instead.
 keyring = { version = "3", default-features = false, features = [
     "apple-native",
     "windows-native",
@@ -35,19 +33,12 @@ keyring = { version = "3", default-features = false, features = [
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 ring = "0.17"
 
-# crashlog.rs redirects native stderr/stdout to a forensic log file via
-# SetStdHandle; all of it is `#[cfg(windows)]`-gated internally.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
-    # CreateFileW's signature references SECURITY_ATTRIBUTES, so the
-    # Storage_FileSystem binding needs Win32_Security enabled too.
-    "Win32_Security",
     # dpapi.rs (PAIR-001): CryptProtectData / CryptUnprotectData for
     # sealing small credentials (Bluetooth link keys) at rest.
     "Win32_Security_Cryptography",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Console",
 ] }
 
 [dev-dependencies]

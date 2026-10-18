@@ -53,7 +53,7 @@ import {
 import AokieCompanion from "./features/shell/AokieCompanion";
 import V2WorkspaceShell, { type CompanionAvailabilityValue } from "./features/live/V2WorkspaceShell";
 import DesktopPairingDialog from "./features/pairing/DesktopPairingDialog";
-import { createCommand, MAX_ASSISTANCE_ANSWER_CHARACTERS } from "./protocol/codec";
+import { createCommand, MAX_ASSISTANCE_ANSWER_CHARACTERS, MAX_V2_ASSISTANCE_ANSWER_BYTES, truncateToUtf8Bytes, utf8ByteLength } from "./protocol/codec";
 import type { CallSnapshot, CommandEnvelope, CommandPayloads, CommandType } from "./protocol/types";
 import { shouldClearAssistanceDraft } from "./state/assistanceDraft";
 import {
@@ -107,6 +107,21 @@ const DEFAULT_DISCOVERY_URL = import.meta.env.VITE_AOKIE_DISCOVERY_URL?.trim()
     : "https://formlogic.example/api/app/my-business/aokie-discovery");
 const DEFAULT_APP_ID = import.meta.env.VITE_AOKIE_APP_ID?.trim()
   || (import.meta.env.DEV ? "app_local" : "app_development");
+
+/**
+ * Whether an admission problem should take the person back to setup. A
+ * managed admission is renewed while the call carries on over the current
+ * connection; a failed renewal there is retried and is not a reason to leave
+ * the call screen, which would hide Mute, Return and Hang up while the lease
+ * and microphone stay live. Only when nothing is connected or held does the
+ * problem need the setup screen.
+ */
+export function admissionStateLeavesLiveCall(
+  transport: "idle" | "connecting" | "connected" | "reconnecting" | "offline",
+  leaseLive: boolean,
+): boolean {
+  return transport !== "connected" && !leaseLive;
+}
 
 export function desktopPairingOpenAfterAdmission(
   currentlyOpen: boolean,
@@ -629,6 +644,7 @@ function App() {
   const [managedAdmission, setManagedAdmission] = useState<ManagedAdmissionState | null>(null);
   const [desktopPairingOpen, setDesktopPairingOpen] = useState(false);
   const [v2Transport, setV2Transport] = useState<"idle" | "connecting" | "connected" | "reconnecting" | "offline">("idle");
+  const v2TransportRef = useRef<"idle" | "connecting" | "connected" | "reconnecting" | "offline">("idle");
   const [v2Failure, v2FailureDispatch] = useReducer(v2RuntimeFailureReducer, null);
   const [v2TakeoverAttempt, setV2TakeoverAttempt] = useState(INITIAL_V2_TAKEOVER_ATTEMPT);
   const [v2AutoArmInFlight, setV2AutoArmInFlight] = useState(false);
@@ -797,6 +813,9 @@ function App() {
       }
       else if (event.type === "managed_admission_state") {
         setManagedAdmission(event.value);
+        // The live connection keeps going while its admission renews; keep
+        // the call controls and show the problem as a banner instead.
+        if (!admissionStateLeavesLiveCall(v2TransportRef.current, v2LeaseRef.current !== null)) return;
         setDesktopPairingOpen((currentlyOpen) => desktopPairingOpenAfterAdmission(
           currentlyOpen,
           event.value.value,
@@ -820,6 +839,7 @@ function App() {
           waiter.resolve(event.value.accepted);
         }
       } else if (event.type === "transport") {
+        v2TransportRef.current = event.value;
         setV2Transport(event.value);
         callDispatch({ type: "transport", value: event.value });
         if (event.value === "connected") {
@@ -1241,6 +1261,7 @@ function App() {
       return withDeviceDialogs(
         <div className="v2-workspace-frame">
           {v2Failure && <V2FailureNotice failure={v2Failure} onDismiss={() => v2FailureDispatch({ type: "dismiss" })} />}
+          {managedAdmission && <V2AdmissionNotice admission={managedAdmission} onDismiss={() => setManagedAdmission(null)} />}
           {v2AssistanceAccepted && <V2AssistanceAcceptedNotice onDismiss={() => setV2AssistanceAccepted(null)} />}
           {v2TakeoverAttempt.requestPending && <V2TakeoverPendingNotice />}
           <V2WorkspaceShell
@@ -1434,6 +1455,9 @@ function SetupScreen({ bridge, runtime, error, connecting, onDemo, onConnect, on
   const realtimeUrl = discovery?.realtimeUrl ?? discovery?.gatewayUrl ?? "";
   const realtimeTransport = setupTransportState(realtimeUrl, "wss:");
   const turnConfigured = discovery?.iceServers.some((server) => server.urls.some((url) => /^turns?:/i.test(url))) ?? false;
+  // A relay-only server keeps TURN credentials out of its public discovery
+  // document and issues them with each signed admission instead.
+  const turnFromAdmission = !turnConfigured && Boolean(discovery?.relayOnly && discovery.admissionEndpoint);
 
   const loadProfiles = useCallback(async () => {
     if (!runtime.tauri || !runtime.secureStorage) return;
@@ -1615,7 +1639,7 @@ function SetupScreen({ bridge, runtime, error, connecting, onDemo, onConnect, on
             <SetupReadinessRow ready label="Signed discovery" detail={`Schema v${discovery.schemaVersion} · ${discovery.deploymentId}`} />
             <SetupReadinessRow ready={discoveryTransport.ready} warning={discoveryTransport.developmentOnly} label="Server transport" detail={discoveryTransport.detail} />
             <SetupReadinessRow ready={realtimeTransport.ready} warning={realtimeTransport.developmentOnly} label="Realtime signalling" detail={realtimeTransport.detail} />
-            <SetupReadinessRow ready={turnConfigured} warning={!turnConfigured} label="TURN fallback" detail={turnConfigured ? "Encrypted relay is advertised for networks where direct WebRTC cannot connect" : "No TURN relay is advertised; direct WebRTC may still work"} />
+            <SetupReadinessRow ready={turnConfigured || turnFromAdmission} warning={!turnConfigured && !turnFromAdmission} label="TURN fallback" detail={turnConfigured ? "Encrypted relay is advertised for networks where direct WebRTC cannot connect" : turnFromAdmission ? "Relay credentials come with each signed admission rather than the public discovery document" : "No TURN relay is advertised; direct WebRTC may still work"} />
             <SetupReadinessRow ready={!isMobilePlatform || runtime.pushRegistration === "registered"} warning={isMobilePlatform && runtime.pushRegistration !== "registered"} label="Background offers" detail={isMobilePlatform ? `Native push: ${runtime.pushRegistration.replace(/_/g, " ")}` : "Foreground Windows endpoint; no mobile push provider required"} />
             <SetupReadinessRow label="Aokie Desktop" detail="Checked through authenticated realtime after this endpoint is approved" />
           </section>
@@ -2404,6 +2428,19 @@ function V2TakeoverPendingNotice() {
   );
 }
 
+function V2AdmissionNotice({ admission, onDismiss }: { admission: ManagedAdmissionState; onDismiss(): void }) {
+  return (
+    <div className={`setup-result ${admission.value === "desktop_unavailable" ? "is-warning" : "is-failed"} v2-runtime-failure`} role="status" aria-live="polite">
+      <AlertTriangle size={19} />
+      <div>
+        <strong>Companion access is being renewed</strong>
+        <small>{admission.message} The current call stays connected while this is retried.</small>
+      </div>
+      <button type="button" onClick={onDismiss} aria-label="Dismiss Companion access notice">Dismiss</button>
+    </div>
+  );
+}
+
 function V2AssistanceAcceptedNotice({ onDismiss }: { onDismiss(): void }) {
   return (
     <div className="setup-result is-success v2-runtime-failure v2-assistance-accepted" role="status" aria-live="polite">
@@ -2474,15 +2511,15 @@ function V2AssistanceRequestCard({ assistance, transferTranscript, remainingSeco
       {enabled ? (
         <>
           <label className="assistance-answer-field" htmlFor="v2-assistance-answer">
-            <span><strong>{assistance.transferOffered ? "Optional message for Aokie to relay to the caller" : "Your private answer"}</strong><small>{answer.length.toLocaleString()} / {MAX_ASSISTANCE_ANSWER_CHARACTERS.toLocaleString()}</small></span>
+            <span><strong>{assistance.transferOffered ? "Optional message for Aokie to relay to the caller" : "Your private answer"}</strong><small>{utf8ByteLength(answer).toLocaleString()} / {MAX_V2_ASSISTANCE_ANSWER_BYTES.toLocaleString()} bytes</small></span>
             <textarea
               id="v2-assistance-answer"
               rows={3}
               value={answer}
-              maxLength={MAX_ASSISTANCE_ANSWER_CHARACTERS}
+              maxLength={MAX_V2_ASSISTANCE_ANSWER_BYTES}
               disabled={awaitingAcknowledgement}
               placeholder={assistance.transferOffered ? "Optional caller-facing message…" : "Type the confirmation or detail Aokie needs…"}
-              onChange={(event) => onAnswerChange(event.target.value)}
+              onChange={(event) => onAnswerChange(truncateToUtf8Bytes(event.target.value, MAX_V2_ASSISTANCE_ANSWER_BYTES))}
             />
           </label>
           {assistance.transferOffered ? (

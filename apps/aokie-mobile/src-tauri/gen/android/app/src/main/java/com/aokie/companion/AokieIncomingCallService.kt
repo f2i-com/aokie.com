@@ -78,6 +78,14 @@ class AokieIncomingCallService : Service() {
     const val EXTRA_OFFER_ID = "aokie_offer_id"
     const val EXTRA_CALL_ID = "aokie_call_id"
     const val EXTRA_CALL_EPOCH = "aokie_call_epoch"
+
+    /**
+     * The offer whose call this process is running right now, if any. An answered or won record for any other
+     * offer was left by a process that died with its call (see [aokieOfferOrphaned]).
+     */
+    @Volatile
+    internal var liveOfferId: String? = null
+      private set
   }
 
   private sealed interface LocalAction {
@@ -140,9 +148,17 @@ class AokieIncomingCallService : Service() {
 
   override fun onBind(intent: Intent?): IBinder? = null
 
+  override fun onTaskRemoved(rootIntent: Intent?) {
+    // Swiping the app away ends its process shortly after (see process_exit.rs); before it goes, Rust
+    // returns any live Companion lease, so the Desktop takes the caller back at once.
+    if (activeFence != null) AokieOfferStore.recordDiagnostic(this, "task_removed_during_call")
+    super.onTaskRemoved(rootIntent)
+  }
+
   override fun onDestroy() {
     expiryJob?.cancel()
     releaseAudioFocus()
+    liveOfferId = null
     actions.close()
     serviceJob.cancel()
     super.onDestroy()
@@ -152,7 +168,8 @@ class AokieIncomingCallService : Service() {
     val offer = AokieOfferStore.current(this, clearExpired = true)
     if (offer == null || offer.offerId != expectedOfferId || !AokieCallNotifications.notificationsAllowed(this)) {
       AokieOfferStore.recordDiagnostic(this, "call_offer_not_presentable")
-      stopSelf()
+      // A stale or duplicate request must never stop the service under a call it is running.
+      if (!callStarted.get()) stopSelf()
       return
     }
     if (!callStarted.compareAndSet(false, true)) {
@@ -177,11 +194,13 @@ class AokieIncomingCallService : Service() {
     hangupStarted.set(false)
     activeOffer = offer
     activeFence = fence
+    liveOfferId = offer.offerId
     startCallForeground(offer, AokieCallNotifications.incoming(this, offer))
     scheduleOfferExpiry(offer, fence)
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
       AokieOfferStore.recordDiagnostic(this, "core_telecom_requires_android_8")
       AokieOfferStore.cancel(this, offer.offerId, "core_telecom_unavailable")
+      liveOfferId = null
       stopSelf()
       return
     }
@@ -219,6 +238,7 @@ class AokieIncomingCallService : Service() {
       if (activeFence == fence) {
         activeOffer = null
         activeFence = null
+        liveOfferId = null
       }
       stopForeground(STOP_FOREGROUND_REMOVE)
       val replacement = replacementOfferId
@@ -249,8 +269,23 @@ class AokieIncomingCallService : Service() {
       }
       when (action) {
         is LocalAction.Answer -> {
-          if (AokieOfferStore.current(this@AokieIncomingCallService)?.offerId != offer.offerId) {
+          val current = AokieOfferStore.current(this@AokieIncomingCallService)
+          if (current == null || current.offerId != offer.offerId) {
             disconnect(DisconnectCause(DisconnectCause.CANCELED))
+            return
+          }
+          if (current.status != AokieVoiceOffer.STATUS_RINGING) {
+            // Already being answered: a second tap, a recreated activity, or a system surface's own Answer.
+            AokieOfferStore.recordDiagnostic(this@AokieIncomingCallService, "duplicate_native_answer_ignored")
+            continue
+          }
+          // The app's own Answer (the notification button) gets no onAnswer callback: Core-Telecom calls that
+          // only for a system surface such as a watch or a car. So it runs the same authoritative claim
+          // itself, before telling Telecom the call is answered; without it the offer stayed ringing until
+          // it expired as missed.
+          if (!claimAnswer(offer, fence)) {
+            AokieOfferStore.cancel(this@AokieIncomingCallService, offer.offerId, "native_answer_not_admitted")
+            disconnect(DisconnectCause(DisconnectCause.ERROR))
             return
           }
           when (answer(CallAttributesCompat.CALL_TYPE_AUDIO_CALL)) {
@@ -360,29 +395,52 @@ class AokieIncomingCallService : Service() {
   }
 
   private suspend fun onSystemAnswer(offer: AokieVoiceOffer, fence: AokieCallFence) {
+    // Throwing refuses the system surface's answer.
+    if (!claimAnswer(offer, fence)) {
+      throw IllegalStateException("Aokie authoritative answer was not admitted")
+    }
+  }
+
+  /**
+   * The authoritative claim behind every Answer, from a system surface or the app's own notification:
+   * mark the offer answer-requested, bring the app up, wait for the signed offer, then hand the Answer
+   * to Rust's v2 client and wait until the lease request is admitted. False when any step fails; a
+   * refused admission also cancels the offer.
+   */
+  private suspend fun claimAnswer(offer: AokieVoiceOffer, fence: AokieCallFence): Boolean {
     if (!aokieCallActionApplies(fence, activeFence)) {
-      throw IllegalStateException("Aokie offer was replaced before answer")
+      AokieOfferStore.recordDiagnostic(this, "answer_offer_replaced")
+      return false
     }
     val answerRequested = AokieOfferStore.markAnswerRequested(this, offer.offerId)
     if (answerRequested == null) {
-      throw IllegalStateException("Aokie offer expired before answer")
+      AokieOfferStore.recordDiagnostic(this, "answer_offer_expired")
+      return false
     }
     scheduleOfferExpiry(answerRequested, fence)
     launchCompanion()
     val pending = awaitAuthoritativeOffer(offer)
-      ?: throw IllegalStateException("Aokie offer was not authenticated before answer")
+    if (pending == null) {
+      AokieOfferStore.recordDiagnostic(this, "answer_offer_not_authenticated")
+      return false
+    }
     if (!aokieCallActionApplies(fence, activeFence)) {
-      throw IllegalStateException("Aokie offer was replaced during answer")
+      AokieOfferStore.recordDiagnostic(this, "answer_offer_replaced")
+      return false
     }
     updateForeground(pending, authoritative = false)
     val actionId = AokieNativeCallActionStore.enqueue(this, pending, AokieNativeCallAction.ANSWER)
-      ?: throw IllegalStateException("Aokie native answer queue is unavailable")
+    if (actionId == null) {
+      AokieOfferStore.recordDiagnostic(this, "native_answer_queue_unavailable")
+      return false
+    }
     val result = AokieNativeCallActionStore.awaitResult(this, actionId)
     if (result?.accepted != true) {
       AokieOfferStore.recordDiagnostic(this, result?.code ?: "native_answer_timed_out")
       AokieOfferStore.cancel(this, offer.offerId, "native_answer_not_admitted")
-      throw IllegalStateException("Aokie authoritative answer was not admitted")
+      return false
     }
+    return true
   }
 
   private suspend fun onSystemDisconnect(

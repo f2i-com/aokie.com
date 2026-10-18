@@ -181,8 +181,197 @@ pub fn parse(input: &[u8]) -> BMessage {
         }
     }
 
+    // An MMS body is a MIME message (headers, boundaries, parts): what was
+    // written is its text parts. A body that is not MIME stays as it is.
+    if out
+        .msg_type
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case("MMS"))
+    {
+        if let Some(text) = mime_text(&body) {
+            body = text;
+        }
+    }
     out.body = body;
     out
+}
+
+/// The text of a MIME message: its `text/plain` parts (a part with no
+/// Content-Type is plain text too, RFC 2045), joined by newlines, with
+/// multipart parts walked into. `None` when `message` has no MIME headers
+/// at all (a phone that sends an MMS's text bare). Pictures and other
+/// attachments are left out: the phone was asked for none (Attachment=0),
+/// and one that sends them anyway has them skipped here.
+pub fn mime_text(message: &str) -> Option<String> {
+    let (headers, content) = mime_split(message);
+    let content_type = mime_header(&headers, "content-type")?;
+    let mut texts = Vec::new();
+    mime_collect(&content_type, &headers, content, &mut texts, 0);
+    Some(texts.join("\n").trim().to_string())
+}
+
+/// Split a MIME entity into its unfolded header lines and its content (after
+/// the first blank line). Lines are '\n'-separated here: `parse` already
+/// took the '\r' off each line.
+fn mime_split(entity: &str) -> (Vec<String>, &str) {
+    let mut headers: Vec<String> = Vec::new();
+    let mut rest = entity;
+    loop {
+        let (line, next) = match rest.find('\n') {
+            Some(at) => (&rest[..at], &rest[at + 1..]),
+            None => (rest, ""),
+        };
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            return (headers, next);
+        }
+        if line.starts_with([' ', '\t']) {
+            if let Some(last) = headers.last_mut() {
+                last.push(' ');
+                last.push_str(line.trim());
+            }
+        } else if line.contains(':') {
+            headers.push(line.to_string());
+        } else {
+            // Not a header: the entity has no header block.
+            return (headers, rest);
+        }
+        if next.is_empty() {
+            return (headers, "");
+        }
+        rest = next;
+    }
+}
+
+fn mime_header(headers: &[String], name: &str) -> Option<String> {
+    headers.iter().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
+}
+
+/// The value of `param` in a header value such as `multipart/mixed;
+/// boundary="abc"`.
+fn mime_param(value: &str, param: &str) -> Option<String> {
+    value.split(';').skip(1).find_map(|part| {
+        let (key, v) = part.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case(param)
+            .then(|| v.trim().trim_matches('"').to_string())
+    })
+}
+
+fn mime_collect(content_type: &str, headers: &[String], content: &str, out: &mut Vec<String>, depth: usize) {
+    let kind = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if kind.starts_with("multipart/") {
+        // (a message nested deeper than this is not a phone's MMS)
+        let Some(boundary) = mime_param(content_type, "boundary").filter(|b| !b.is_empty()) else {
+            return;
+        };
+        if depth > 4 {
+            return;
+        }
+        let open = format!("--{boundary}");
+        let mut part = String::new();
+        let mut inside = false;
+        for line in content.split('\n') {
+            let line = line.trim_end_matches('\r');
+            if line.trim_end() == open || line.trim_end() == format!("{open}--") {
+                if inside {
+                    let (part_headers, part_content) = mime_split(&part);
+                    let part_type = mime_header(&part_headers, "content-type")
+                        .unwrap_or_else(|| "text/plain".to_string());
+                    mime_collect(&part_type, &part_headers, part_content, out, depth + 1);
+                }
+                part.clear();
+                inside = line.trim_end() == open;
+                continue;
+            }
+            if inside {
+                part.push_str(line);
+                part.push('\n');
+            }
+        }
+        return;
+    }
+    if kind != "text/plain" && !kind.is_empty() {
+        return;
+    }
+    let encoding = mime_header(headers, "content-transfer-encoding")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let text = match encoding.as_str() {
+        "base64" => base64_text(content),
+        "quoted-printable" => quoted_printable_text(content),
+        _ => content.to_string(),
+    };
+    let text = text.trim_end().to_string();
+    if !text.is_empty() {
+        out.push(text);
+    }
+}
+
+fn base64_text(content: &str) -> String {
+    let mut bits: u32 = 0;
+    let mut held = 0u32;
+    let mut bytes = Vec::with_capacity(content.len() * 3 / 4);
+    for c in content.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue, // padding, line breaks
+        };
+        bits = (bits << 6) | u32::from(v);
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            bytes.push((bits >> held) as u8);
+            bits &= (1 << held) - 1;
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn quoted_printable_text(content: &str) -> String {
+    let mut bytes = Vec::with_capacity(content.len());
+    let mut lines = content.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let line = line.trim_end_matches('\r');
+        let (line, soft_break) = match line.strip_suffix('=') {
+            Some(rest) => (rest, true),
+            None => (line, false),
+        };
+        let raw = line.as_bytes();
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == b'=' && i + 2 < raw.len() {
+                if let Some(byte) = std::str::from_utf8(&raw[i + 1..i + 3])
+                    .ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok())
+                {
+                    bytes.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+            bytes.push(raw[i]);
+            i += 1;
+        }
+        if !soft_break && lines.peek().is_some() {
+            bytes.push(b'\n');
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Build an outbound bMessage envelope for a single SMS. The phone
@@ -588,6 +777,44 @@ BEGIN:BBODY\r\nBEGIN:MSG\r\nhi\r\nEND:MSG\r\nEND:BBODY\r\nEND:BENV\r\nEND:BMSG\r
             declared_length > 0,
             "LENGTH should reflect a non-empty body"
         );
+    }
+
+    /// An incoming MMS (the shape Android's MAP server writes: headers, a
+    /// preamble, then parts) arrives as its words, not as raw MIME.
+    #[test]
+    fn an_incoming_mms_reads_as_its_text_parts() {
+        let raw = "BEGIN:BMSG\r\nVERSION:1.0\r\nSTATUS:UNREAD\r\nTYPE:MMS\r\nFOLDER:telecom/msg/inbox\r\n\
+BEGIN:VCARD\r\nVERSION:2.1\r\nN:;Sam\r\nTEL:+61400111222\r\nEND:VCARD\r\n\
+BEGIN:BENV\r\nBEGIN:BBODY\r\nCHARSET:UTF-8\r\nLENGTH:400\r\nBEGIN:MSG\r\n\
+From: +61400111222\r\nDate: Sat, 17 Oct 2026 10:00:00 +1100\r\nSubject: \r\n\
+Mime-Version: 1.0\r\nContent-Type: multipart/mixed;\r\n boundary=\"MessageBoundary.42\"\r\n\
+Content-Transfer-Encoding: 8BIT\r\n\r\nThis is a multi-part message in MIME format.\r\n\
+--MessageBoundary.42\r\nContent-Type: image/jpeg\r\nContent-Transfer-Encoding: base64\r\n\r\n/9j/4AAQSkZJRg==\r\n\
+--MessageBoundary.42\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\nContent-Location: text_0.txt\r\n\r\n\
+Can I book for Friday?\r\n\
+--MessageBoundary.42\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\nContent-Transfer-Encoding: base64\r\n\r\nQXQgMTAgcGxlYXNl\r\n\
+--MessageBoundary.42--\r\nEND:MSG\r\nEND:BBODY\r\nEND:BENV\r\nEND:BMSG\r\n";
+        let parsed = parse(raw.as_bytes());
+        assert_eq!(parsed.msg_type.as_deref(), Some("MMS"));
+        assert_eq!(parsed.sender_addressing.as_deref(), Some("+61400111222"));
+        assert_eq!(parsed.body, "Can I book for Friday?\nAt 10 please");
+    }
+
+    #[test]
+    fn an_mms_without_mime_headers_and_an_sms_that_looks_like_one_are_left_alone() {
+        assert_eq!(mime_text("Just the words"), None);
+        assert_eq!(mime_text("Note: bring the dog\n\nThanks"), None);
+        let sms = "BEGIN:BMSG\r\nTYPE:SMS_GSM\r\nBEGIN:BENV\r\nBEGIN:BBODY\r\nBEGIN:MSG\r\n\
+Content-Type: text/plain\r\n\r\nhello\r\nEND:MSG\r\nEND:BBODY\r\nEND:BENV\r\nEND:BMSG\r\n";
+        assert_eq!(parse(sms.as_bytes()).body, "Content-Type: text/plain\n\nhello");
+        // A single-part text MMS, quoted-printable.
+        assert_eq!(
+            mime_text("Content-Type: text/plain\nContent-Transfer-Encoding: quoted-printable\n\ncaf=C3=A9 at 3=\npm").as_deref(),
+            Some("café at 3pm")
+        );
+        // Our own MMS reply reads back as what was written.
+        let now = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        assert_eq!(parse(&build_mms_push_at("+1", "See you then", now)).body, "See you then");
     }
 
     #[test]

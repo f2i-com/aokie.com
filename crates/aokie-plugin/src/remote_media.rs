@@ -24,23 +24,51 @@ use aokie_media::{
     DesktopPeer, IceCandidateSignal, IceServerConfig, MediaMode, OwnedAudioFrame, PeerEvent,
     PeerOptions, RoutePermit, SdpSignal, SessionBinding, MEDIA_SAMPLE_RATE_HZ,
 };
+use aokie_protocol::text::{sanitize_line, truncate_to_bytes};
+use futures_util::FutureExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 pub const MAX_REMOTE_PEERS: usize = 6;
+/// The protocol's byte limits for a caption's speaker and timestamp.
+const MAX_CAPTION_SPEAKER_BYTES: usize = 40;
+const MAX_CAPTION_TIMESTAMP_BYTES: usize = 64;
+/// Encoded bytes of caption history one snapshot may carry, newest kept.
+///
+/// The socket gateway and the phone both refuse a message over 256 KiB, and
+/// 200 captions of up to 2,000 bytes each would be nearly twice that: a long
+/// call used to stop updating the Companion and loop. This leaves the rest of
+/// the snapshot (caller, consent, participants, levels) ample room. The
+/// hosted relay's smaller per-frame ceiling is applied again at that carrier.
+pub const SNAPSHOT_CAPTION_BUDGET_BYTES: usize = 160 * 1024;
+/// Bytes a caption adds to an encoded snapshot beyond its four strings: the
+/// member names, quotes and separators of `{"captionId":..,"speaker":..,
+/// "text":..,"occurredAt":..,"finalText":false}`, rounded up.
+const CAPTION_ENCODING_OVERHEAD_BYTES: usize = 96;
 pub const REMOTE_CONSENT_POLICY_ID: &str = "aokie_remote_access";
 // Lifecycle commands must remain available while negotiation and caller audio
 // are busy. ICE gets its own admitted-burst-sized lane; PCM is deliberately
 // small and lossy because stale audio is less useful than the current frame.
 const ACTOR_QUEUE_CAPACITY: usize = 12;
 const REMOTE_ICE_QUEUE_CAPACITY: usize = 128;
-const CALLER_PCM_QUEUE_CAPACITY: usize = 4;
+/// Caller frames queued per peer. The actor drains the queue whole on every
+/// pass, so the depth adds no delay while it keeps up; it only rides out a
+/// slow pass instead of dropping audio.
+const CALLER_PCM_QUEUE_CAPACITY: usize = 12;
 const REMOTE_ICE_BATCH_SIZE: usize = 8;
+/// Microphone frames or peer events one actor pass takes before it looks at
+/// its control queue again.
+const PEER_DRAIN_BATCH_SIZE: usize = 16;
+/// How long an idle actor sleeps before it polls the peer's own queues again.
+const PEER_ACTOR_IDLE_TICK: Duration = Duration::from_millis(1);
 const MANAGER_QUEUE_CAPACITY: usize = 32;
 const ROUTED_AUDIO_FRAMES: usize = 16;
 const EVENT_QUEUE_CAPACITY: usize = 128;
 const MAX_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a caller waits past [`OPEN_TIMEOUT`] for the reply of a peer the
+/// manager committed at the deadline (one state lock and one channel send).
+const OPEN_COMMIT_GRACE: Duration = Duration::from_secs(2);
 /// An active Talk peer gets only this bounded window to prove real microphone
 /// PCM. Lease heartbeats deliberately cannot extend this preflight deadline.
 const TALK_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -533,8 +561,56 @@ enum ManagerCommand {
     Open {
         request: OpenPeerRequest,
         reply: std_mpsc::Sender<Result<OpenPeerAccepted, String>>,
+        ticket: OpenTicket,
     },
     Shutdown,
+}
+
+/// Who decides the fate of one open: the caller that stopped waiting, or the
+/// manager that finished the answer. Exactly one of them wins.
+///
+/// Without it an answer that finished after the caller's timeout was still
+/// inserted and its actor spawned: a peer the session never learned about,
+/// holding a slot (and, for a prepared claim, the one claimant place) until
+/// its lease ran out.
+const ABANDONED_OPEN: &str = "the open was abandoned before its answer was ready";
+
+#[derive(Clone, Default)]
+struct OpenTicket(Arc<std::sync::atomic::AtomicU8>);
+
+impl OpenTicket {
+    const WAITING: u8 = 0;
+    const ABANDONED: u8 = 1;
+    const COMMITTED: u8 = 2;
+
+    /// The caller gave up. False when the manager already committed the peer,
+    /// in which case its reply is on the way and must be read.
+    fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                Self::ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn is_abandoned(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::ABANDONED
+    }
+
+    /// The manager may insert the peer. False when the caller already left.
+    fn commit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                Self::COMMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 enum ActorCommand {
@@ -727,7 +803,10 @@ impl RemoteMediaHandle {
             quarantined_talk_frames: self.inner.quarantined_talk_frames.load(Ordering::Relaxed),
             dropped_events: self.inner.dropped_events.load(Ordering::Relaxed),
             consent: state.consent.effective(),
-            captions: state.captions.iter().cloned().collect(),
+            captions: newest_captions_within(
+                state.captions.iter().cloned().collect(),
+                SNAPSHOT_CAPTION_BUDGET_BYTES,
+            ),
             participants,
             audio_levels,
         }
@@ -1002,16 +1081,26 @@ impl RemoteMediaHandle {
         }
         IceServerConfig::validate_all(&request.ice_servers).map_err(|error| error.to_string())?;
         let (reply_tx, reply_rx) = std_mpsc::channel();
+        let ticket = OpenTicket::default();
         self.inner
             .manager_tx
             .try_send(ManagerCommand::Open {
                 request,
                 reply: reply_tx,
+                ticket: ticket.clone(),
             })
             .map_err(|error| format!("Companion media queue unavailable: {error}"))?;
-        reply_rx
-            .recv_timeout(OPEN_TIMEOUT)
-            .map_err(|_| "timed out while creating native Desktop WebRTC answer".to_string())?
+        match reply_rx.recv_timeout(OPEN_TIMEOUT) {
+            Ok(reply) => reply,
+            Err(_) if ticket.abandon() => {
+                Err("timed out while creating native Desktop WebRTC answer".to_string())
+            }
+            // The manager committed the peer at the deadline; its reply is a
+            // lock and a send away. Reporting a timeout here would orphan it.
+            Err(_) => reply_rx
+                .recv_timeout(OPEN_COMMIT_GRACE)
+                .map_err(|_| "timed out while creating native Desktop WebRTC answer".to_string())?,
+        }
     }
 
     pub fn add_remote_ice(
@@ -1830,10 +1919,16 @@ fn caller_binding_is_current(
     call_epoch: u64,
     owner_epoch: u64,
 ) -> bool {
+    // A listen-only device never transmits, so who owns the caller has no
+    // bearing on what it may hear: the owner epoch moves whenever ANOTHER
+    // device prepares, consults, takes over or returns, and holding a monitor
+    // to it silenced the monitor for the rest of the call while its screen
+    // still said "listening". Its lease, the call and consent still bound it.
+    let owner_matches = binding.mode == MediaMode::Monitor || binding.owner_epoch == owner_epoch;
     lease_expires_at > now
         && binding.call_id == current_call_id
         && binding.call_epoch == call_epoch
-        && binding.owner_epoch == owner_epoch
+        && owner_matches
         && consent.allows(binding.mode)
 }
 
@@ -2006,42 +2101,61 @@ pub fn publish_caption_globally(
     let Ok(mut state) = inner.state.try_lock() else {
         return;
     };
-    if state.current_call_id.as_deref() != Some(call_id)
-        || !state.consent.is_current()
-        || !state.consent.captions_enabled
-    {
-        return;
-    }
-    let speaker: String = speaker.chars().take(40).collect();
-    let text: String = text.trim().chars().take(2_000).collect();
-    if speaker.trim().is_empty() || text.is_empty() {
-        return;
-    }
-    let caption_id = format!(
-        "caption_{}_{}",
-        state.current_record().map_or(0, |r| r.call_epoch),
-        turn_index
-    );
-    if let Some(existing) = state
-        .captions
-        .iter_mut()
-        .find(|caption| caption.caption_id == caption_id)
-    {
-        existing.speaker = speaker;
-        existing.text = text;
-        existing.occurred_at = occurred_at.chars().take(64).collect();
-        existing.final_text = true;
-        return;
-    }
-    state.captions.push_back(RemoteCaption {
-        caption_id,
-        speaker,
-        text,
-        occurred_at: occurred_at.chars().take(64).collect(),
-        final_text: true,
-    });
-    while state.captions.len() > aokie_protocol::v2::MAX_CAPTIONS {
-        state.captions.pop_front();
+    state.record_caption(call_id, turn_index, speaker, text, occurred_at);
+}
+
+impl RemoteMediaState {
+    fn record_caption(
+        &mut self,
+        call_id: &str,
+        turn_index: u32,
+        speaker: &str,
+        text: &str,
+        occurred_at: &str,
+    ) {
+        let state = self;
+        if state.current_call_id.as_deref() != Some(call_id)
+            || !state.consent.is_current()
+            || !state.consent.captions_enabled
+        {
+            return;
+        }
+        // Every wire limit is in UTF-8 bytes and older phones refuse a caption
+        // with any control character in it, so a long non-English turn or one with
+        // a line break used to fail the whole snapshot on the phone, and the
+        // caption stayed in the list to fail every later one too.
+        let speaker = sanitize_line(speaker, MAX_CAPTION_SPEAKER_BYTES);
+        let text = sanitize_line(text, aokie_protocol::v2::MAX_CAPTION_BYTES);
+        if speaker.is_empty() || text.is_empty() {
+            return;
+        }
+        let occurred_at = truncate_to_bytes(occurred_at, MAX_CAPTION_TIMESTAMP_BYTES);
+        let caption_id = format!(
+            "caption_{}_{}",
+            state.current_record().map_or(0, |r| r.call_epoch),
+            turn_index
+        );
+        if let Some(existing) = state
+            .captions
+            .iter_mut()
+            .find(|caption| caption.caption_id == caption_id)
+        {
+            existing.speaker = speaker;
+            existing.text = text;
+            existing.occurred_at = occurred_at.to_owned();
+            existing.final_text = true;
+            return;
+        }
+        state.captions.push_back(RemoteCaption {
+            caption_id,
+            speaker,
+            text,
+            occurred_at: occurred_at.to_owned(),
+            final_text: true,
+        });
+        while state.captions.len() > aokie_protocol::v2::MAX_CAPTIONS {
+            state.captions.pop_front();
+        }
     }
 }
 
@@ -3633,7 +3747,11 @@ async fn manager_loop(
 ) {
     while let Some(command) = receiver.recv().await {
         match command {
-            ManagerCommand::Open { request, reply } => {
+            ManagerCommand::Open {
+                request,
+                reply,
+                ticket,
+            } => {
                 let binding = request.binding.clone();
                 let expected_switch_epoch = request.expected_switch_epoch;
                 let reserved = state
@@ -3644,6 +3762,11 @@ async fn manager_loop(
                     });
                 if let Err(error) = reserved {
                     let _ = reply.send(Err(error));
+                    continue;
+                }
+                if ticket.is_abandoned() {
+                    // Queued behind a slow open until its caller gave up: do
+                    // not spend another answer on it.
                     continue;
                 }
                 let options = PeerOptions {
@@ -3670,9 +3793,21 @@ async fn manager_loop(
                             .lock()
                             .map_err(|_| "remote media state poisoned".to_string())
                             .and_then(|mut state| {
+                                // Committed under the state lock, so a caller
+                                // that times out from here on waits for this
+                                // exact insert's reply instead of leaving.
+                                if !ticket.commit() {
+                                    return Err(ABANDONED_OPEN.to_string());
+                                }
                                 state.insert_peer_after_switch_epoch(slot, expected_switch_epoch)
                             });
                         if let Err(error) = inserted {
+                            if error == ABANDONED_OPEN {
+                                eprintln!(
+                                    "[aokie-plugin][takeover] stage=peer_open_abandoned call={} mode={:?} rtc={} detail=The answer finished after the session stopped waiting and was closed",
+                                    binding.call_id, binding.mode, binding.rtc_session_id
+                                );
+                            }
                             peer.close();
                             let _ = reply.send(Err(error));
                             continue;
@@ -3779,6 +3914,8 @@ async fn peer_actor(
 ) {
     let binding = peer.binding().clone();
     let mut microphone_pcm_observed = false;
+    let mut remote_ice_closed = false;
+    let mut caller_pcm_closed = false;
     loop {
         let (mut worked, should_close) =
             drain_actor_commands(&mut peer, &mut commands, &binding, &events);
@@ -3797,15 +3934,7 @@ async fn peer_actor(
                 break;
             };
             worked = true;
-            if let Err(error) = peer.add_remote_candidate(candidate).await {
-                events.emit(
-                    &binding,
-                    RemoteMediaEventKind::Error {
-                        operation: "remote_ice".into(),
-                        message: error.to_string(),
-                    },
-                );
-            }
+            add_remote_candidate(&peer, candidate, &binding, &events).await;
         }
 
         let (control_worked, should_close) =
@@ -3814,17 +3943,20 @@ async fn peer_actor(
         if should_close {
             return;
         }
-        if let Ok(samples) = caller_pcm.try_recv() {
+
+        // Every caller frame already queued, not one per pass. The radio
+        // queues a frame every few milliseconds into a short queue, so one per
+        // pass fell behind whenever a pass took longer than a frame (the timed
+        // waits this loop used to make each pass several timer ticks long,
+        // about 15 ms apiece at Windows' default resolution), and the overflow
+        // was dropped: choppy audio for every listening Companion. Bounded by
+        // the queue's depth so control is still looked at between batches.
+        for _ in 0..CALLER_PCM_QUEUE_CAPACITY {
+            let Ok(samples) = caller_pcm.try_recv() else {
+                break;
+            };
             worked = true;
-            if let Err(error) = peer.push_caller_pcm(samples.as_slice()).await {
-                events.emit(
-                    &binding,
-                    RemoteMediaEventKind::Error {
-                        operation: "caller_pcm".into(),
-                        message: error.to_string(),
-                    },
-                );
-            }
+            push_caller_pcm(&peer, &samples, &binding, &events).await;
         }
 
         let (control_worked, should_close) =
@@ -3834,24 +3966,25 @@ async fn peer_actor(
             return;
         }
 
-        let received = match binding.mode {
-            MediaMode::Talk => {
-                tokio::time::timeout(Duration::from_millis(2), peer.recv_caller_microphone())
-                    .await
-                    .ok()
+        // Microphone frames, then peer events: everything ready now, polled
+        // without a timed wait so a pass never sleeps while work is queued.
+        for _ in 0..PEER_DRAIN_BATCH_SIZE {
+            let received = match binding.mode {
+                MediaMode::Talk => peer
+                    .recv_caller_microphone()
+                    .now_or_never()
                     .and_then(Result::ok)
-                    .map(|frame| (frame, &talk_tx))
-            }
-            MediaMode::Consult => {
-                tokio::time::timeout(Duration::from_millis(2), peer.recv_consult_microphone())
-                    .await
-                    .ok()
+                    .map(|frame| (frame, &talk_tx)),
+                MediaMode::Consult => peer
+                    .recv_consult_microphone()
+                    .now_or_never()
                     .and_then(Result::ok)
-                    .map(|frame| (frame, &consult_tx))
-            }
-            MediaMode::Monitor | MediaMode::PreparedConsult | MediaMode::PreparedTalk => None,
-        };
-        if let Some((frame, destination)) = received {
+                    .map(|frame| (frame, &consult_tx)),
+                MediaMode::Monitor | MediaMode::PreparedConsult | MediaMode::PreparedTalk => None,
+            };
+            let Some((frame, destination)) = received else {
+                break;
+            };
             worked = true;
             if binding.mode == MediaMode::Consult && !frame.samples.is_empty() {
                 if let Ok(mut state) = state.lock() {
@@ -3883,31 +4016,107 @@ async fn peer_actor(
             }
         }
 
-        if let Ok(Some(event)) =
-            tokio::time::timeout(Duration::from_millis(1), peer.next_event()).await
-        {
-            worked = true;
-            let kind = match event {
-                PeerEvent::LocalIce(candidate) => RemoteMediaEventKind::LocalIce { candidate },
-                PeerEvent::IceComplete => RemoteMediaEventKind::IceComplete,
-                PeerEvent::ConnectionState(state) => RemoteMediaEventKind::ConnectionState {
-                    state: state.to_string(),
-                },
-                PeerEvent::RemoteAudioReady => RemoteMediaEventKind::RemoteAudioReady,
-                PeerEvent::MicrophoneAuthorityReady => RemoteMediaEventKind::ProtocolViolation {
-                    message: "Desktop received a Companion-only microphone authority event"
-                        .to_string(),
-                },
-                PeerEvent::RemoteMicrophoneReady => RemoteMediaEventKind::RemoteMicrophoneReady,
-                PeerEvent::ProtocolViolation(message) => RemoteMediaEventKind::ProtocolViolation {
-                    message: message.to_string(),
-                },
+        for _ in 0..PEER_DRAIN_BATCH_SIZE {
+            let Some(Some(event)) = peer.next_event().now_or_never() else {
+                break;
             };
-            events.emit(&binding, kind);
+            worked = true;
+            events.emit(&binding, peer_event_kind(event));
         }
+
         if !worked {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            // Nothing was ready. Wake as soon as one of this actor's own
+            // queues has something, or after a short tick so the peer's
+            // microphone and event queues, which only a pass reads, are read
+            // again.
+            let wake = tokio::select! {
+                biased;
+                command = commands.recv() => IdleWake::Command(command),
+                candidate = remote_ice.recv(), if !remote_ice_closed => IdleWake::Ice(candidate),
+                samples = caller_pcm.recv(), if !caller_pcm_closed => IdleWake::CallerPcm(samples),
+                () = tokio::time::sleep(PEER_ACTOR_IDLE_TICK) => IdleWake::Tick,
+            };
+            match wake {
+                IdleWake::Command(Some(command)) => {
+                    if handle_actor_command(&mut peer, command, &binding, &events) {
+                        return;
+                    }
+                }
+                IdleWake::Command(None) => {
+                    peer.close();
+                    return;
+                }
+                IdleWake::Ice(Some(candidate)) => {
+                    add_remote_candidate(&peer, candidate, &binding, &events).await;
+                }
+                IdleWake::Ice(None) => remote_ice_closed = true,
+                IdleWake::CallerPcm(Some(samples)) => {
+                    push_caller_pcm(&peer, &samples, &binding, &events).await;
+                }
+                IdleWake::CallerPcm(None) => caller_pcm_closed = true,
+                IdleWake::Tick => {}
+            }
         }
+    }
+}
+
+/// What woke an idle [`peer_actor`].
+enum IdleWake {
+    Command(Option<ActorCommand>),
+    Ice(Option<IceCandidateSignal>),
+    CallerPcm(Option<Arc<Vec<i16>>>),
+    Tick,
+}
+
+async fn push_caller_pcm(
+    peer: &DesktopPeer,
+    samples: &[i16],
+    binding: &SessionBinding,
+    events: &EventEmitter,
+) {
+    if let Err(error) = peer.push_caller_pcm(samples).await {
+        events.emit(
+            binding,
+            RemoteMediaEventKind::Error {
+                operation: "caller_pcm".into(),
+                message: error.to_string(),
+            },
+        );
+    }
+}
+
+async fn add_remote_candidate(
+    peer: &DesktopPeer,
+    candidate: IceCandidateSignal,
+    binding: &SessionBinding,
+    events: &EventEmitter,
+) {
+    if let Err(error) = peer.add_remote_candidate(candidate).await {
+        events.emit(
+            binding,
+            RemoteMediaEventKind::Error {
+                operation: "remote_ice".into(),
+                message: error.to_string(),
+            },
+        );
+    }
+}
+
+fn peer_event_kind(event: PeerEvent) -> RemoteMediaEventKind {
+    match event {
+        PeerEvent::LocalIce(candidate) => RemoteMediaEventKind::LocalIce { candidate },
+        PeerEvent::IceComplete => RemoteMediaEventKind::IceComplete,
+        PeerEvent::ConnectionState(state) => RemoteMediaEventKind::ConnectionState {
+            state: state.to_string(),
+        },
+        PeerEvent::RemoteAudioReady => RemoteMediaEventKind::RemoteAudioReady,
+        PeerEvent::MicrophoneAuthorityReady => RemoteMediaEventKind::ProtocolViolation {
+            message: "Desktop received a Companion-only microphone authority event".to_string(),
+        },
+        PeerEvent::RemoteMicrophoneReady => RemoteMediaEventKind::RemoteMicrophoneReady,
+        PeerEvent::ProtocolViolation(message) => RemoteMediaEventKind::ProtocolViolation {
+            message: message.to_string(),
+        },
     }
 }
 
@@ -3921,12 +4130,43 @@ fn validate_ttl(ttl_ms: u64) -> Result<Duration, String> {
 }
 
 fn sanitize_reason(reason: &str) -> String {
-    let trimmed = reason.trim();
-    if trimmed.is_empty() {
+    // Reasons reach phones in revoke and status frames: one line, in bytes.
+    let line = sanitize_line(reason, 160);
+    if line.is_empty() {
         "requested".into()
     } else {
-        trimmed.chars().take(160).collect()
+        line
     }
+}
+
+/// The newest captions whose encoded size fits `budget` bytes, oldest first.
+///
+/// `captions` is in arrival order. Each one is measured as it would encode
+/// (JSON escaping included), so the budget holds for any text.
+pub fn newest_captions_within(
+    mut captions: Vec<RemoteCaption>,
+    budget: usize,
+) -> Vec<RemoteCaption> {
+    let mut used = 0_usize;
+    let mut start = captions.len();
+    for (index, caption) in captions.iter().enumerate().rev() {
+        let size = encoded_caption_bytes(caption);
+        if used.saturating_add(size) > budget {
+            break;
+        }
+        used += size;
+        start = index;
+    }
+    captions.split_off(start)
+}
+
+fn encoded_caption_bytes(caption: &RemoteCaption) -> usize {
+    let encoded = |value: &str| serde_json::to_string(value).map_or(value.len() * 6, |s| s.len());
+    encoded(&caption.caption_id)
+        + encoded(&caption.speaker)
+        + encoded(&caption.text)
+        + encoded(&caption.occurred_at)
+        + CAPTION_ENCODING_OVERHEAD_BYTES
 }
 
 fn companion_participant_id(binding: &SessionBinding) -> String {
@@ -5253,5 +5493,202 @@ mod tests {
         assert!(state.active_route.is_none());
         assert!(!state.allows_talk(&prepared, Instant::now()));
         assert!(RoutePermit::new(prepared, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn a_monitor_keeps_hearing_the_call_after_another_device_takes_the_caller() {
+        let state = active_state();
+        let now = Instant::now();
+        let slot = |mode, owner_epoch, suffix| PeerSlot {
+            binding: binding(mode, owner_epoch, 0, suffix),
+            lease_expires_at: now + Duration::from_secs(30),
+            actor_tx: actor(),
+            remote_ice_tx: remote_ice(),
+            caller_pcm_tx: caller_pcm(),
+        };
+        // Opened at owner epoch 0; another device has since prepared, taken
+        // over and returned, so the call's owner epoch is now 3.
+        let monitor = slot(MediaMode::Monitor, 0, "monitor");
+        assert!(routes_caller_ingress(
+            &state.consent,
+            &monitor,
+            now,
+            "call_a",
+            1,
+            3
+        ));
+        assert!(routes_caller_output(
+            &state.consent,
+            &monitor,
+            now,
+            "call_a",
+            1,
+            3
+        ));
+
+        // Everything else that bounds a monitor still does.
+        assert!(!routes_caller_ingress(
+            &state.consent,
+            &monitor,
+            now,
+            "call_b",
+            1,
+            3
+        ));
+        assert!(!routes_caller_ingress(
+            &state.consent,
+            &monitor,
+            now,
+            "call_a",
+            2,
+            3
+        ));
+        let lapsed = PeerSlot {
+            lease_expires_at: now - Duration::from_millis(1),
+            ..slot(MediaMode::Monitor, 0, "lapsed")
+        };
+        assert!(!routes_caller_ingress(
+            &state.consent,
+            &lapsed,
+            now,
+            "call_a",
+            1,
+            3
+        ));
+        let mut withdrawn = state.consent.clone();
+        withdrawn.monitor_enabled = false;
+        assert!(!routes_caller_ingress(
+            &withdrawn, &monitor, now, "call_a", 1, 3
+        ));
+
+        // A device that can talk or is preparing to stays bound to the exact
+        // owner epoch it was admitted under.
+        for mode in [MediaMode::PreparedTalk, MediaMode::Talk] {
+            let stale = slot(mode, 0, "stale");
+            assert!(!routes_caller_ingress(
+                &state.consent,
+                &stale,
+                now,
+                "call_a",
+                1,
+                3
+            ));
+            let current = slot(mode, 3, "current");
+            assert!(routes_caller_ingress(
+                &state.consent,
+                &current,
+                now,
+                "call_a",
+                1,
+                3
+            ));
+        }
+    }
+
+    #[test]
+    fn a_caption_is_published_as_one_line_within_the_protocols_byte_limits() {
+        let mut state = active_state();
+        // About 670 CJK characters already fill 2,000 bytes; the old cut at
+        // 2,000 characters let 6,000 bytes through.
+        let long_turn = format!("“Hello”\n{}", "語".repeat(2_000));
+        state.record_caption(
+            "call_a",
+            1,
+            "Caller\n(mobile)",
+            &long_turn,
+            "2026-07-16T00:00:00Z",
+        );
+        state.record_caption("call_a", 2, "Aokie", "  \n\t ", "2026-07-16T00:00:01Z");
+        state.record_caption(
+            "call_a",
+            3,
+            "😀".repeat(20).as_str(),
+            "fine",
+            "2026-07-16T00:00:02Z",
+        );
+
+        let captions: Vec<_> = state.captions.iter().cloned().collect();
+        assert_eq!(
+            captions.len(),
+            2,
+            "a turn with no text left publishes nothing"
+        );
+        let first = &captions[0];
+        assert!(first.text.len() <= aokie_protocol::v2::MAX_CAPTION_BYTES);
+        assert!(first.text.starts_with("“Hello” 語"));
+        assert_eq!(first.speaker, "Caller (mobile)");
+        for caption in &captions {
+            aokie_protocol::text::check_line(&caption.text, aokie_protocol::v2::MAX_CAPTION_BYTES)
+                .unwrap();
+            aokie_protocol::text::check_line(&caption.speaker, MAX_CAPTION_SPEAKER_BYTES).unwrap();
+        }
+        // Ten four-byte emoji fit the 40-byte speaker limit; half of one
+        // never does.
+        assert_eq!(captions[1].speaker, "😀".repeat(10));
+    }
+
+    #[test]
+    fn snapshot_captions_keep_the_newest_that_fit_the_byte_budget() {
+        let caption = |index: usize, text: String| RemoteCaption {
+            caption_id: format!("caption_1_{index}"),
+            speaker: "Caller".into(),
+            text,
+            occurred_at: "2026-07-16T00:00:00Z".into(),
+            final_text: true,
+        };
+        // A 15-minute call of ordinary turns (200 of them, ~300 bytes each)
+        // fits whole.
+        let ordinary: Vec<_> = (0..200)
+            .map(|index| caption(index, "word ".repeat(60)))
+            .collect();
+        assert_eq!(
+            newest_captions_within(ordinary.clone(), SNAPSHOT_CAPTION_BUDGET_BYTES),
+            ordinary
+        );
+
+        // 200 maximal CJK turns would be ~400 KB: only the newest are kept,
+        // as one contiguous run ending at the latest turn.
+        let long: Vec<_> = (0..200)
+            .map(|index| caption(index, "語".repeat(666)))
+            .collect();
+        let kept = newest_captions_within(long.clone(), SNAPSHOT_CAPTION_BUDGET_BYTES);
+        assert!(!kept.is_empty() && kept.len() < long.len());
+        assert_eq!(kept.last(), long.last());
+        assert_eq!(kept, long[long.len() - kept.len()..].to_vec());
+        let encoded = serde_json::to_string(&kept).unwrap();
+        assert!(
+            encoded.len() <= SNAPSHOT_CAPTION_BUDGET_BYTES,
+            "{}",
+            encoded.len()
+        );
+
+        // Escaping counts: quotes and backslashes take two bytes encoded.
+        let quoted = vec![caption(0, "\"\\".repeat(1_000))];
+        assert!(newest_captions_within(quoted, 2_000).is_empty());
+        assert!(newest_captions_within(Vec::new(), 10).is_empty());
+    }
+
+    #[test]
+    fn an_open_is_decided_by_exactly_one_of_the_caller_and_the_manager() {
+        // The caller gave up first: the late answer must not be inserted.
+        let ticket = OpenTicket::default();
+        assert!(ticket.abandon());
+        assert!(ticket.is_abandoned());
+        assert!(!ticket.commit());
+
+        // The manager committed first: the caller must wait for its reply
+        // rather than report a timeout and orphan the peer.
+        let ticket = OpenTicket::default();
+        assert!(ticket.commit());
+        assert!(!ticket.abandon());
+        assert!(!ticket.is_abandoned());
+    }
+
+    #[test]
+    fn reasons_are_one_line_in_bytes() {
+        assert_eq!(sanitize_reason("  "), "requested");
+        assert_eq!(sanitize_reason("lease\nexpired"), "lease expired");
+        let long = sanitize_reason(&"é".repeat(200));
+        assert!(long.len() <= 160 && long.chars().all(|c| c == 'é'));
     }
 }

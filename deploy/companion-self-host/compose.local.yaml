@@ -3,6 +3,12 @@ name: aokie-companion-local
 # Loopback-only development profile. It intentionally uses ws:// and TURN
 # without TLS so it works without DNS or an ACME account. Release clients must
 # use the public compose.yaml profile, which exposes signalling only as WSS.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   gateway:
     image: aokie-realtime-self-host:${AOKIE_IMAGE_TAG:-local}
@@ -12,6 +18,8 @@ services:
       args:
         RUST_VERSION: ${RUST_VERSION:-1.92.0}
     restart: unless-stopped
+    init: true
+    logging: *logging
     environment:
       AOKIE_GATEWAY_BIND: 0.0.0.0:18787
       AOKIE_GATEWAY_ALLOW_PUBLIC_HTTP: "1"
@@ -35,6 +43,8 @@ services:
   coturn:
     image: coturn/coturn:4.14.0-r0@sha256:0c0e8fc0c263b85a134e9e4242b5e46e1f4c077c5029633511191c05b5c2c814
     restart: unless-stopped
+    init: true
+    logging: *logging
     entrypoint: [/bin/sh, /opt/aokie/coturn-entrypoint.sh]
     environment:
       TURN_SECRET_FILE: /run/secrets/turn_rest

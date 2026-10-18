@@ -61,6 +61,13 @@ struct DriverJob {
     /// shipped signed catalog and never mints a certificate.
     #[serde(default)]
     allow_dev_self_sign: bool,
+    /// v6: the DriverVer the dispatcher rendered a self-signed INF with. The
+    /// helper renders its trusted copy with it (checked to be today's, in the
+    /// form Aokie renders) rather than reading the clock again: a prompt
+    /// answered after midnight no longer renders another INF than the one
+    /// approved. Empty for the static signed package and the other modes.
+    #[serde(default)]
+    driver_ver: String,
 }
 
 fn default_job_version() -> u32 {
@@ -71,6 +78,8 @@ fn default_job_mode() -> String {
     "install".to_string()
 }
 
+/// v6: `driver_ver` carries the DriverVer of a rendered (self-signed) INF.
+///
 /// v5 (AK-DRV-02): `cat_sha256` binds the signed catalog, and install
 /// package bytes move through locked handles into an admin-only directory.
 ///
@@ -78,7 +87,7 @@ fn default_job_mode() -> String {
 /// install, `hardware_id` + `allow_dev_self_sign` were added, restore
 /// jobs pin the instance id, and exact package checks fail CLOSED. Exact
 /// version match — a stale helper or stale dispatcher refuses to run.
-const SUPPORTED_JOB_VERSION: u32 = 5;
+const SUPPORTED_JOB_VERSION: u32 = 6;
 
 #[cfg(all(not(debug_assertions), not(feature = "managed-beta-driver")))]
 const EXPECTED_INF_SHA256: Option<&str> = Some(env!(
@@ -433,6 +442,13 @@ fn validate_install_job_fields(job: &DriverJob) -> Result<(), String> {
         ));
     }
     let self_sign = authorized_self_sign(job)?;
+    if self_sign {
+        aokie_dongle::driver_version::check_job_driver_ver(
+            &job.driver_ver,
+            chrono::Local::now().date_naive(),
+        )
+        .map_err(|e| format!("install job's driver_ver refused: {}", e))?;
+    }
     let cat_hash = job.cat_sha256.trim();
     if !self_sign && (cat_hash.len() != 64 || !cat_hash.bytes().all(|b| b.is_ascii_hexdigit())) {
         return Err(
@@ -776,6 +792,7 @@ fn run_install(job: &DriverJob, job_path: &Path) -> Result<(), String> {
         let supplied = read_locked(&job.inf_path, 4 * 1024 * 1024)?;
         let expected =
             aokie_dongle::winusb::WinusbPackage::new(job.vid, job.pid, &device.description)
+                .with_driver_ver(&job.driver_ver)
                 .render_inf();
         if supplied != expected.as_bytes() {
             return Err(
@@ -920,9 +937,14 @@ fn run_restore(job: &DriverJob) -> Result<(), String> {
         "restore-driver",
         &format!("restoring in-box driver: instance={}", device.instance_id),
     );
-    aokie_dongle::winusb::restore_inbox_driver(job.vid, job.pid)?;
+    let removed = aokie_dongle::winusb::restore_inbox_driver(job.vid, job.pid)?;
+    transaction_log(
+        "restore-driver",
+        &format!("removed from the driver store: {:?}", removed),
+    );
     log_line!(
-        "[aokie-driver-helper] restored in-box driver for {}",
+        "[aokie-driver-helper] removed Aokie's driver package(s) {:?} and had Windows choose a driver for {} again",
+        removed,
         device.instance_id
     );
     Ok(())
@@ -1200,9 +1222,9 @@ mod tests {
         assert!(!inf_hash_matches("", "anything"));
     }
 
-    fn v5_job(instance_id: &str, inf_sha256: &str, hardware_id: &str) -> DriverJob {
+    fn v6_job(instance_id: &str, inf_sha256: &str, hardware_id: &str) -> DriverJob {
         serde_json::from_str(&format!(
-            r#"{{"version":5,"mode":"install","vid":2652,"pid":8684,
+            r#"{{"version":6,"mode":"install","vid":2652,"pid":8684,
                 "inf_path":"C:\\x\\aokie_winusb_bluetooth.inf",
                 "instance_id":{:?},"inf_sha256":{:?},"cat_sha256":{:?},"hardware_id":{:?}}}"#,
             instance_id, inf_sha256, GOOD_SHA, hardware_id
@@ -1213,25 +1235,31 @@ mod tests {
     const GOOD_SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
-    fn v5_install_job_requires_every_exact_target_field() {
+    fn v6_install_job_requires_every_exact_target_field() {
         // DRIVER-001 acceptance: missing fields abort before mutation.
         let hwid = aokie_dongle::winusb::hardware_id(2652, 8684);
-        let good = v5_job("USB\\VID_0A5C&PID_21EC\\00198600226C", GOOD_SHA, &hwid);
+        let good = v6_job("USB\\VID_0A5C&PID_21EC\\00198600226C", GOOD_SHA, &hwid);
         validate_install_job_fields(&good).unwrap();
         assert!(!good.allow_dev_self_sign, "self-signing defaults OFF");
 
-        let mut managed = v5_job("USB\\VID_0A5C&PID_21EC\\00198600226C", GOOD_SHA, &hwid);
+        let mut managed = v6_job("USB\\VID_0A5C&PID_21EC\\00198600226C", GOOD_SHA, &hwid);
         managed.allow_dev_self_sign = true;
         managed.cat_sha256.clear();
+        // A self-signed install renders with the job's DriverVer: today's, in Aokie's form.
+        let err = validate_install_job_fields(&managed).unwrap_err();
+        assert!(err.contains("driver_ver"), "got: {}", err);
+        managed.driver_ver = aokie_dongle::driver_version::driver_ver_now();
         validate_install_job_fields(&managed).unwrap();
+        managed.driver_ver = "07/15/2026,2.2.0.20260715".to_string();
+        assert!(validate_install_job_fields(&managed).is_err());
 
-        let err = validate_install_job_fields(&v5_job("", GOOD_SHA, &hwid)).unwrap_err();
+        let err = validate_install_job_fields(&v6_job("", GOOD_SHA, &hwid)).unwrap_err();
         assert!(err.contains("no device instance id"), "got: {}", err);
 
-        let err = validate_install_job_fields(&v5_job("USB\\X\\1", "deadbeef", &hwid)).unwrap_err();
+        let err = validate_install_job_fields(&v6_job("USB\\X\\1", "deadbeef", &hwid)).unwrap_err();
         assert!(err.contains("not a 64-hex SHA-256"), "got: {}", err);
 
-        let err = validate_install_job_fields(&v5_job("USB\\X\\1", GOOD_SHA, "")).unwrap_err();
+        let err = validate_install_job_fields(&v6_job("USB\\X\\1", GOOD_SHA, "")).unwrap_err();
         assert!(
             err.contains("does not match the id derived"),
             "got: {}",
@@ -1239,7 +1267,7 @@ mod tests {
         );
 
         let err =
-            validate_install_job_fields(&v5_job("USB\\X\\1", GOOD_SHA, "USB\\VID_1234&PID_5678"))
+            validate_install_job_fields(&v6_job("USB\\X\\1", GOOD_SHA, "USB\\VID_1234&PID_5678"))
                 .unwrap_err();
         assert!(
             err.contains("does not match the id derived"),
@@ -1251,7 +1279,7 @@ mod tests {
     #[test]
     fn stale_v3_job_is_rejected_by_the_version_gate() {
         // Serde still parses older versions (so the error is a clean version
-        // message, not a parse failure) — but run() refuses anything != v4.
+        // message, not a parse failure) — but run() refuses anything but v6.
         let json = r#"{"version":3,"mode":"install","vid":2652,"pid":8684,
                        "inf_path":"C:\\x\\aokie_winusb_bluetooth.inf",
                        "instance_id":"USB\\VID_0A5C&PID_21EC\\00198600226C",
@@ -1262,16 +1290,18 @@ mod tests {
     }
 
     #[test]
-    fn v5_job_round_trips_the_new_fields() {
-        let json = r#"{"version":5,"mode":"install","vid":2652,"pid":8684,
+    fn v6_job_round_trips_the_new_fields() {
+        let json = r#"{"version":6,"mode":"install","vid":2652,"pid":8684,
                        "inf_path":"C:\\x\\aokie_winusb_bluetooth.inf",
                        "instance_id":"USB\\VID_0A5C&PID_21EC\\00198600226C",
                        "inf_sha256":"deadbeef",
                        "cat_sha256":"feedface",
                        "hardware_id":"USB\\VID_0A5C&PID_21EC",
-                       "allow_dev_self_sign":true}"#;
+                       "allow_dev_self_sign":true,
+                       "driver_ver":"10/18/2026,2.26.1018.2359"}"#;
         let job: DriverJob = serde_json::from_str(json).unwrap();
-        assert_eq!(job.version, 5);
+        assert_eq!(job.version, 6);
+        assert_eq!(job.driver_ver, "10/18/2026,2.26.1018.2359");
         assert_eq!(job.cat_sha256, "feedface");
         assert_eq!(job.hardware_id, "USB\\VID_0A5C&PID_21EC");
         assert!(job.allow_dev_self_sign);

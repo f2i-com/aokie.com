@@ -100,28 +100,200 @@ const STORE: &str = "Keychain";
 #[cfg(target_os = "linux")]
 const STORE: &str = "Secret Service (the desktop's keyring)";
 
-/// The data key, from the user's login Keychain; made and stored there the
-/// first time. Asked of the Keychain once per process: the user is not
-/// prompted over and over, and a key that was good at start stays the key
-/// for every value this process seals.
-///
-/// One lock is held from the look to the store. Two threads that both
-/// found no key would each make one and each store it (a store replaces):
-/// the process would go on with the first while the Keychain kept the
-/// second, and after a restart nothing sealed in that run would open.
+/// How long, counted from when the store was asked, a seal or an open waits
+/// for its answer. The store may be showing the user a prompt, and the
+/// threads that seal are the ones a call runs on (the radio's, the command
+/// loop's): past this a caller is told the key is not here yet and fails
+/// closed, as it does when the store refuses, while the store goes on being
+/// waited on in the background. The wait is one for the whole process, not
+/// one per caller, so a prompt left open stalls a call once, not each event.
+const KEY_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// After the store did not give the key: how long before it is asked again,
+/// doubled after each failure up to [`KEY_RETRY_MAX`]. Until then a seal or
+/// an open is refused at once with the store's last answer, so a locked
+/// Keychain or a refused prompt does not ask the user again on every event.
+const KEY_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(30);
+const KEY_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Where the asking for the data key is.
+enum KeyState {
+    /// Not asked yet in this process.
+    Unasked,
+    /// A thread of its own is asking the store, since `since`.
+    Asking {
+        since: std::time::Instant,
+        failures: u32,
+    },
+    Ready([u8; KEY_LEN]),
+    /// The store did not give it: what was said, and when to ask again.
+    Failed {
+        error: String,
+        failures: u32,
+        retry_at: std::time::Instant,
+    },
+}
+
+/// The data key and the asking for it. The store is asked on a thread of its
+/// own and only one at a time: two threads that both found no key would each
+/// make one and each store it (a store replaces), the process would go on
+/// with the first while the store kept the second, and after a restart
+/// nothing sealed in that run would open. A key that was good once stays the
+/// key for every value this process seals.
+struct KeyCell {
+    state: std::sync::Mutex<KeyState>,
+    answered: std::sync::Condvar,
+    wait: std::time::Duration,
+    retry_first: std::time::Duration,
+    retry_max: std::time::Duration,
+}
+
+/// What asks the store for the key (made and stored there the first time).
+type FetchKey = fn() -> Result<[u8; KEY_LEN], String>;
+
+impl KeyCell {
+    const fn new(
+        wait: std::time::Duration,
+        retry_first: std::time::Duration,
+        retry_max: std::time::Duration,
+    ) -> Self {
+        KeyCell {
+            state: std::sync::Mutex::new(KeyState::Unasked),
+            answered: std::sync::Condvar::new(),
+            wait,
+            retry_first,
+            retry_max,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, KeyState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Start asking the store, unless the key is here, it is being asked
+    /// for, or the last failure is too recent. Does not wait.
+    fn ask(&'static self, fetch: FetchKey) {
+        let mut state = self.lock();
+        self.begin(&mut state, fetch);
+    }
+
+    fn begin(&'static self, state: &mut KeyState, fetch: FetchKey) {
+        let failures = match state {
+            KeyState::Unasked => 0,
+            KeyState::Failed {
+                failures, retry_at, ..
+            } if std::time::Instant::now() >= *retry_at => *failures,
+            _ => return,
+        };
+        *state = KeyState::Asking {
+            since: std::time::Instant::now(),
+            failures,
+        };
+        let spawned = std::thread::Builder::new()
+            .name("aokie-sealing-key".into())
+            .spawn(move || {
+                let answer = fetch();
+                self.answer(answer);
+            });
+        if let Err(e) = spawned {
+            *state = self.failed(format!("the sealing key could not be asked for: {e}"), failures);
+        }
+    }
+
+    fn answer(&self, answer: Result<[u8; KEY_LEN], String>) {
+        let mut state = self.lock();
+        let failures = match *state {
+            KeyState::Asking { failures, .. } => failures,
+            _ => 0,
+        };
+        *state = match answer {
+            Ok(key) => KeyState::Ready(key),
+            Err(error) => self.failed(error, failures),
+        };
+        self.answered.notify_all();
+    }
+
+    fn failed(&self, error: String, failures_before: u32) -> KeyState {
+        let failures = failures_before.saturating_add(1);
+        let backoff = self
+            .retry_first
+            .saturating_mul(1u32 << (failures - 1).min(16))
+            .min(self.retry_max);
+        KeyState::Failed {
+            error,
+            failures,
+            retry_at: std::time::Instant::now() + backoff,
+        }
+    }
+
+    /// The key: at once when it is here, or the store's last refusal while
+    /// it is too soon to ask again; else the store is asked (once, on its
+    /// own thread) and waited on until [`KeyCell::wait`] after it was asked.
+    fn get(&'static self, fetch: FetchKey) -> Result<[u8; KEY_LEN], String> {
+        let mut state = self.lock();
+        loop {
+            let deadline = match &*state {
+                KeyState::Ready(key) => return Ok(*key),
+                KeyState::Failed {
+                    error, retry_at, ..
+                } => {
+                    let now = std::time::Instant::now();
+                    if now < *retry_at {
+                        return Err(format!(
+                            "{error} (asked again in {} s)",
+                            retry_at.duration_since(now).as_secs().max(1)
+                        ));
+                    }
+                    None
+                }
+                KeyState::Unasked => None,
+                KeyState::Asking { since, .. } => Some(*since + self.wait),
+            };
+            let Some(deadline) = deadline else {
+                self.begin(&mut state, fetch);
+                continue;
+            };
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(
+                    "the sealing key has not come yet: its store is still being asked for it (it may be waiting on the user)"
+                        .to_string(),
+                );
+            }
+            state = self
+                .answered
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+}
+
+/// The process's data key (see [`KeyCell`]).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static DATA_KEY: KeyCell = KeyCell::new(KEY_WAIT, KEY_RETRY_FIRST, KEY_RETRY_MAX);
+
+/// The data key, from the user's login Keychain (or Secret Service).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn data_key() -> Result<[u8; KEY_LEN], String> {
+    DATA_KEY.get(fetch_data_key)
+}
+
+/// Start asking the store for the data key now, on its own thread, so that
+/// a prompt it shows comes at start and not at the first call, and the
+/// seals and opens that follow find the key here. Does not wait.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn prefetch_data_key() {
+    DATA_KEY.ask(fetch_data_key);
+}
+
+/// Ask the store for the data key; made and stored there the first time.
 ///
 /// macOS ties "always allow" to the program's code signature. A program
 /// rebuilt without a stable signature is a new program to the Keychain,
 /// which then asks again. (The Secret Service gives an unlocked
 /// collection's items to the user's programs without asking.)
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn data_key() -> Result<[u8; KEY_LEN], String> {
-    use std::sync::Mutex;
-    static KEY: Mutex<Option<[u8; KEY_LEN]>> = Mutex::new(None);
-    let mut held = KEY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(key) = *held {
-        return Ok(key);
-    }
+fn fetch_data_key() -> Result<[u8; KEY_LEN], String> {
     // A test run must neither put a key into the developer's Keychain nor
     // wait on its prompt (every test program is a new program to it). A
     // debug build started with AOKIE_SEAL_EPHEMERAL set seals under a key
@@ -133,7 +305,6 @@ fn data_key() -> Result<[u8; KEY_LEN], String> {
         SystemRandom::new()
             .fill(&mut fresh)
             .map_err(|_| "the system gave no random bytes for a key".to_string())?;
-        *held = Some(fresh);
         return Ok(fresh);
     }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
@@ -163,7 +334,6 @@ fn data_key() -> Result<[u8; KEY_LEN], String> {
             read(&entry)?.ok_or_else(|| format!("the {STORE} lost the sealing key"))?
         }
     };
-    *held = Some(key);
     Ok(key)
 }
 
@@ -236,6 +406,77 @@ mod tests {
         // Cut short, it is refused, not read past.
         let cut = format!("{KEYCHAIN_PREFIX}{}", b64_encode(&raw[..NONCE_LEN + 3]));
         assert!(open_with_key(&KEY, &cut).is_err());
+    }
+
+    fn leaked_cell(wait_ms: u64, retry_ms: u64) -> &'static KeyCell {
+        let ms = std::time::Duration::from_millis;
+        Box::leak(Box::new(KeyCell::new(ms(wait_ms), ms(retry_ms), ms(retry_ms * 4))))
+    }
+
+    #[test]
+    fn the_store_is_asked_once_and_its_key_kept() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static ASKED: AtomicU32 = AtomicU32::new(0);
+        fn fetch() -> Result<[u8; KEY_LEN], String> {
+            ASKED.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            Ok(KEY)
+        }
+        let cell = leaked_cell(2_000, 1_000);
+        cell.ask(fetch);
+        let callers: Vec<_> = (0..4)
+            .map(|_| std::thread::spawn(move || cell.get(fetch)))
+            .collect();
+        for caller in callers {
+            assert_eq!(caller.join().unwrap(), Ok(KEY));
+        }
+        assert_eq!(cell.get(fetch), Ok(KEY));
+        assert_eq!(ASKED.load(Ordering::SeqCst), 1, "the store was asked more than once");
+    }
+
+    #[test]
+    fn a_store_that_does_not_answer_holds_a_caller_only_so_long() {
+        fn fetch() -> Result<[u8; KEY_LEN], String> {
+            // A prompt the user takes a while over.
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok(KEY)
+        }
+        let cell = leaked_cell(60, 1_000);
+        let started = std::time::Instant::now();
+        let first = cell.get(fetch);
+        assert!(first.is_err(), "the key cannot be here yet");
+        assert!(started.elapsed() < std::time::Duration::from_millis(300));
+        // Past the wait, a caller is not held again while the store is still asked.
+        let again = std::time::Instant::now();
+        assert!(cell.get(fetch).is_err());
+        assert!(again.elapsed() < std::time::Duration::from_millis(30));
+        // The answer still comes, and is kept.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(cell.get(fetch), Ok(KEY));
+    }
+
+    #[test]
+    fn a_refusal_is_not_asked_again_until_its_backoff_is_over() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static ASKED: AtomicU32 = AtomicU32::new(0);
+        fn fetch() -> Result<[u8; KEY_LEN], String> {
+            ASKED.fetch_add(1, Ordering::SeqCst);
+            Err("the user refused".to_string())
+        }
+        let cell = leaked_cell(1_000, 150);
+        let refused = cell.get(fetch).unwrap_err();
+        assert!(refused.contains("the user refused"), "got: {refused}");
+        for _ in 0..5 {
+            assert!(cell.get(fetch).unwrap_err().contains("asked again in"));
+        }
+        assert_eq!(ASKED.load(Ordering::SeqCst), 1, "a refusal was asked again at once");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(cell.get(fetch).is_err());
+        assert_eq!(ASKED.load(Ordering::SeqCst), 2, "the store was not asked again after the backoff");
+        // The second failure waits twice as long.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(cell.get(fetch).is_err());
+        assert_eq!(ASKED.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -830,4 +830,166 @@ const noDriverList = { connected: [libusbDongle], driverModel: 'none', driverSig
   assert.match(html(), /<li class="is-done".*<li class="is-current" aria-current="step">.*Install its driver/);
 }
 
+// ---- driver steps run in the plugin: answered `accepted`, then dongle.list's driverJob ----
+
+/** Run the tab's last timer (its dongle.list poll), as the browser would. */
+async function fireTimer(page) {
+  const timer = page.timeouts.pop();
+  assert.ok(timer, 'a poll is waiting');
+  timer.fn();
+  await settle();
+}
+
+const runningInstall = { kind: 'install', vid: unboundDongle.vid, pid: unboundDongle.pid, state: 'running', startedAt: '2026-10-18T10:00:00Z' };
+
+{
+  // The install runs in the plugin: the tab waits on driverJob (Install off however long the prompt takes; a second
+  // click asks for nothing), then checks that the dongle came back on WinUSB.
+  let listed = { connected: [unboundDongle], driverModel: 'winusb', driverJob: null };
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioDown,
+      'dongle.list': () => listed,
+      'dongle.installDriver': () => {
+        listed = { ...listed, driverJob: runningInstall };
+        return { accepted: true, installed: false, job: runningInstall };
+      },
+    },
+  });
+  const html = () => page.el('tab-dongle').innerHTML;
+  await pickDongle(page, unboundDongle);
+  await page.click('dongle', 'dg-continue');
+  await page.click('dongle', 'dg-install');
+  assert.match(html(), /data-act="dg-install" disabled/);
+  assert.match(html(), /this waits for it to finish/);
+  await fireTimer(page);
+  assert.match(html(), /data-act="dg-install" disabled/, 'still running: still off');
+  await page.click('dongle', 'dg-install');
+  assert.equal(installs(page).length, 1, 'no second install while the first runs');
+  // The dongle rebinds (off the list a while: the step keeps it), then comes back on WinUSB.
+  listed = { connected: [], driverModel: 'winusb', driverJob: runningInstall };
+  await fireTimer(page);
+  assert.match(html(), /Broadcom BCM20702/, 'the device the step is for, while the rebind takes it off the list');
+  listed = { connected: [boundDongle], driverModel: 'winusb', driverJob: { ...runningInstall, state: 'done', result: { installed: true } } };
+  await fireTimer(page);
+  assert.match(html(), /is bound to WinUSB and ready/);
+}
+
+{
+  // The host gives up after 20 s while the plugin still runs the install: the tab finds the step and waits for it
+  // (Install is not offered again); the step then fails (the prompt declined) and says why.
+  let listed = { connected: [unboundDongle], driverModel: 'winusb', driverJob: null };
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioDown,
+      'dongle.list': () => listed,
+      'dongle.installDriver': () => {
+        listed = { ...listed, driverJob: runningInstall };
+        return new Error('The desktop did not respond. The outcome may be unknown; check its status before trying the action again.');
+      },
+    },
+  });
+  const html = () => page.el('tab-dongle').innerHTML;
+  await pickDongle(page, unboundDongle);
+  await page.click('dongle', 'dg-continue');
+  await page.click('dongle', 'dg-install');
+  assert.match(html(), /data-act="dg-install" disabled/);
+  assert.doesNotMatch(html(), /did not respond/);
+  listed = { ...listed, driverJob: { ...runningInstall, state: 'failed', error: 'Driver install cancelled — the elevation prompt was declined.' } };
+  await fireTimer(page);
+  assert.match(html(), /the elevation prompt was declined/);
+  assert.doesNotMatch(html(), /data-act="dg-install" disabled/);
+}
+
+{
+  // A refusal the plugin answers at once (no step started) is the command's error, as before.
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioDown,
+      'dongle.list': { connected: [unboundDongle], driverModel: 'winusb', driverJob: null },
+      'dongle.installDriver': new Error('WinUSB driver install failed: no 0a5c:21ec device is plugged in'),
+    },
+  });
+  await pickDongle(page, unboundDongle);
+  await page.click('dongle', 'dg-continue');
+  await page.click('dongle', 'dg-install');
+  assert.match(page.el('tab-dongle').innerHTML, /no 0a5c:21ec device is plugged in/);
+  assert.doesNotMatch(page.el('tab-dongle').innerHTML, /data-act="dg-install" disabled/);
+}
+
+{
+  // Opening the tab while an install runs (begun before the tab was left): it waits for it again, Install off.
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioDown,
+      'dongle.list': { connected: [unboundDongle], driverModel: 'winusb', driverJob: runningInstall },
+    },
+  });
+  assert.match(page.el('tab-dongle').innerHTML, /data-act="dg-install" disabled/);
+  assert.match(page.el('tab-dongle').innerHTML, /this waits for it to finish/);
+  assert.deepEqual(installs(page), []);
+}
+
+{
+  // Restore: done only once the plugin reads the dongle back on another driver, which the toast names.
+  const runningRestore = { kind: 'restore', vid: boundDongle.vid, pid: boundDongle.pid, state: 'running', startedAt: '2026-10-18T10:00:00Z' };
+  let listed = { connected: [boundDongle], driverModel: 'winusb', driverJob: null };
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioDown,
+      'dongle.list': () => listed,
+      'dongle.restoreDriver': () => {
+        listed = { ...listed, driverJob: runningRestore };
+        return { accepted: true, restored: false, job: runningRestore };
+      },
+    },
+  });
+  const html = () => page.el('tab-dongle').innerHTML;
+  await pickDongle(page, boundDongle);
+  assert.match(html(), /data-act="dg-restore-arm" data-pick="2652:8684"/);
+  await page.click('dongle', 'dg-restore-arm', { 'data-pick': '2652:8684' });
+  await page.click('dongle', 'dg-restore', { 'data-pick': '2652:8684' });
+  assert.match(html(), /data-act="dg-restore-arm" data-pick="2652:8684" disabled/, 'off while the restore runs');
+  await fireTimer(page);
+  assert.match(html(), /data-act="dg-restore-arm" data-pick="2652:8684" disabled/);
+  listed = { connected: [boundDongle], driverModel: 'winusb', driverJob: { ...runningRestore, state: 'done', result: { restored: true, driver: 'BTHUSB' } } };
+  await fireTimer(page);
+  assert.ok(page.log.some((l) => l[0] === 'toast' && /on BTHUSB again/.test(l[2])), 'the toast names the driver read back');
+  assert.doesNotMatch(html(), /data-act="dg-restore-arm" data-pick="2652:8684" disabled/);
+}
+
+{
+  // A Realtek dongle left on its ROM: the tab says why, and what to do.
+  const setup = setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' });
+  const page = await openScreen({
+    setup,
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioDown,
+      'dongle.list': {
+        connected: [boundDongle],
+        driverModel: 'winusb',
+        firmware: { chip: 'RTL8761BU', state: 'missing', detail: 'rtl8761bu_fw.bin and rtl8761bu_config.bin were looked for in C:\\\\Aokie\\\\firmware and are not there' },
+      },
+    },
+  });
+  assert.match(page.el('tab-dongle').innerHTML, /could not load the RTL8761BU firmware when it last started: its firmware files are not there/);
+  assert.match(page.el('tab-dongle').innerHTML, /phones do not see it when pairing/);
+}
+
 console.log('Receptionist setup-mode checks passed (isolated host; no live commands).');

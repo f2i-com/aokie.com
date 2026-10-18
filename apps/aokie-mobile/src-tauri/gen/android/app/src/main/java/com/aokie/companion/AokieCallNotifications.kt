@@ -22,6 +22,8 @@ internal object AokieCallNotifications {
   // rather than retaining the original generic notification sound.
   const val CALL_CHANNEL = "aokie_voice_offers_v2"
   const val INFORMATION_CHANNEL = "aokie_information"
+  /** The quiet ongoing notification of AokieCommunicationService. */
+  const val LIVE_AUDIO_CHANNEL = "aokie_live_audio"
 
   fun createChannels(context: Context) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -53,6 +55,18 @@ internal object AokieCallNotifications {
       ).apply {
         description = "Informational Aokie call and assistance updates"
         lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+      },
+    )
+    manager.createNotificationChannel(
+      NotificationChannel(
+        LIVE_AUDIO_CHANNEL,
+        "Aokie live audio",
+        NotificationManager.IMPORTANCE_LOW,
+      ).apply {
+        description = "Shown while Companion audio is on, so it keeps working with the screen off"
+        lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+        setShowBadge(false)
+        setSound(null, null)
       },
     )
   }
@@ -101,7 +115,18 @@ internal object AokieCallNotifications {
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
     )
     val decline = serviceIntent(context, offer.offerId, AokieIncomingCallService.ACTION_DECLINE, 2)
-    val answer = serviceIntent(context, offer.offerId, AokieIncomingCallService.ACTION_ANSWER, 3)
+    // Answer opens the app itself, which then asks the call service to claim the call. A service-bound
+    // Answer could not bring the app up on Android 12 and later (no activity starts from a service a
+    // notification started), and the claim needs the app's live v2 session.
+    val answer = PendingIntent.getActivity(
+      context,
+      requestCode(offer.offerId, 3),
+      Intent(context, MainActivity::class.java)
+        .setAction(MainActivity.ACTION_ANSWER_OFFER)
+        .putExtra(AokieIncomingCallService.EXTRA_OFFER_ID, offer.offerId)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
     val builder = NotificationCompat.Builder(context, CALL_CHANNEL)
       .setSmallIcon(android.R.drawable.sym_call_incoming)
       .setContentTitle(if (transfer) "Aokie is transferring a caller" else "Aokie voice offer")

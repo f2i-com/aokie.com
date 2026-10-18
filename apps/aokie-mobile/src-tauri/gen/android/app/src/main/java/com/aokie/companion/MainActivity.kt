@@ -86,6 +86,22 @@ class MainActivity : TauriActivity() {
   }
 
   private fun handleWakeIntent(intent: Intent?) {
+    if (intent?.action == ACTION_ANSWER_OFFER) {
+      // The call notification's Answer button opens this activity directly: Android 12 and later refuse an
+      // activity start from a service that a notification started, so the claim used to run with no app on
+      // screen and no way to bring it up. The service now runs the same claim as a system answer.
+      val offerId = intent.getStringExtra(AokieIncomingCallService.EXTRA_OFFER_ID)
+      // Consumed once: a recreated activity must not answer again.
+      setIntent(Intent(this, MainActivity::class.java).setAction(Intent.ACTION_MAIN))
+      runCatching {
+        startService(
+          Intent(this, AokieIncomingCallService::class.java)
+            .setAction(AokieIncomingCallService.ACTION_ANSWER)
+            .putExtra(AokieIncomingCallService.EXTRA_OFFER_ID, offerId),
+        )
+      }.onFailure { AokieOfferStore.recordDiagnostic(this, "notification_answer_forward_failed") }
+      return
+    }
     if (shouldWakeForAuthoritativeTransfer(intent?.action)) {
       // The intent contains no assistance content. Bringing the authenticated
       // app forward is the action; v2 sync supplies current authoritative data.
@@ -107,60 +123,75 @@ class MainActivity : TauriActivity() {
     }
   }
 
+  /*
+   * Every method below is called by Rust through JNI. None may throw: an exception left pending across that
+   * call aborts the app at the next JNI call on the main thread (Rust also clears one if it slips through).
+   * Each failure becomes the method's own failure value. The one deliberate exception is a secure-store read
+   * error (see getAokieSecureValue), which Rust clears and reports as an error.
+   */
+
   /**
    * Called only by the native media manager after a consult/talk lease is
    * exact and current. Monitor creation never reaches this method.
    *
    *  1 = granted, 0 = system dialog pending, -1 = denied.
    */
-  fun requestAokieMicrophonePermission(requestId: Int): Int {
+  fun requestAokieMicrophonePermission(requestId: Int): Int = runCatching {
     if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
       microphonePermissionResults[requestId] = 1
-      return 1
+      // A session that began before the grant now needs its microphone service type.
+      AokieCommunicationService.refresh(this)
+      return@runCatching 1
     }
-    if (microphonePermissionResults[requestId] == 0) return 0
+    if (microphonePermissionResults[requestId] == 0) return@runCatching 0
     microphonePermissionResults[requestId] = 0
     requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), requestId)
-    return 0
+    0
+  }.getOrElse {
+    microphonePermissionResults.remove(requestId)
+    -1
   }
 
-  fun pollAokieMicrophonePermission(requestId: Int): Int {
+  fun pollAokieMicrophonePermission(requestId: Int): Int = runCatching {
     if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
       microphonePermissionResults[requestId] = 1
-      return 1
+      return@runCatching 1
     }
     val previous = microphonePermissionResults[requestId]
     if (previous == 1) microphonePermissionResults[requestId] = -1
-    return microphonePermissionResults[requestId] ?: -1
-  }
+    microphonePermissionResults[requestId] ?: -1
+  }.getOrDefault(-1)
 
   /** Notification permission is requested separately from microphone access. */
-  fun requestAokieNotificationPermission(requestId: Int): Int {
+  fun requestAokieNotificationPermission(requestId: Int): Int = runCatching {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
       ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
     ) {
       notificationPermissionResults[requestId] = 1
-      return 1
+      return@runCatching 1
     }
-    if (notificationPermissionResults[requestId] == 0) return 0
+    if (notificationPermissionResults[requestId] == 0) return@runCatching 0
     notificationPermissionResults[requestId] = 0
     notificationRationaleBefore = shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)
     notificationRequestedAtMs = SystemClock.elapsedRealtime()
     requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), requestId)
-    return 0
+    0
+  }.getOrElse {
+    notificationPermissionResults.remove(requestId)
+    -1
   }
 
-  fun pollAokieNotificationPermission(requestId: Int): Int {
+  fun pollAokieNotificationPermission(requestId: Int): Int = runCatching {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
       ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
     ) {
       notificationPermissionResults[requestId] = 1
-      return 1
+      return@runCatching 1
     }
     val previous = notificationPermissionResults[requestId]
     if (previous == 1) notificationPermissionResults[requestId] = -1
-    return notificationPermissionResults[requestId] ?: -1
-  }
+    notificationPermissionResults[requestId] ?: -1
+  }.getOrDefault(-1)
 
   /**
    * Opens this app's notification settings, where the user can allow notifications once Android no longer
@@ -178,25 +209,36 @@ class MainActivity : TauriActivity() {
 
   /** Narrow JNI surface. Values never enter WebView storage or callbacks. */
   fun putAokieSecureValue(key: String, value: String): Int =
-    if (AokieSecureStore.put(this, key, value)) 1 else -1
+    if (runCatching { AokieSecureStore.put(this, key, value) }.getOrDefault(false)) 1 else -1
 
-  fun getAokieSecureValue(key: String): String? = AokieSecureStore.get(this, key)
+  /**
+   * `null` only when nothing is stored under [key]. A value that exists but cannot be read (a Keystore
+   * hiccup, a damaged file) throws instead: Rust clears the exception and reports a read error, so the
+   * caller keeps its identity, session and profiles rather than replacing what it took to be missing.
+   */
+  fun getAokieSecureValue(key: String): String? =
+    AokieSecureStore.read(this, key).getOrElse {
+      throw IllegalStateException("Aokie secure value could not be read")
+    }
 
   fun deleteAokieSecureValue(key: String): Int =
-    if (AokieSecureStore.delete(this, key)) 1 else -1
+    if (runCatching { AokieSecureStore.delete(this, key) }.getOrDefault(false)) 1 else -1
 
-  fun aokieSecureStoreAvailable(): Int = if (AokieSecureStore.isAvailable(this)) 1 else -1
+  fun aokieSecureStoreAvailable(): Int =
+    if (runCatching { AokieSecureStore.isAvailable(this) }.getOrDefault(false)) 1 else -1
 
-  fun aokieRuntimeDiagnostics(): String = AokieRuntimeDiagnostics.snapshot(this)
+  /** `null` when the snapshot cannot be taken; Rust reports diagnostics as unavailable. */
+  fun aokieRuntimeDiagnostics(): String? = runCatching { AokieRuntimeDiagnostics.snapshot(this) }.getOrNull()
 
   /** Invalidates both the local provider token and its server-registration marker. */
-  fun invalidateAokiePushToken(): Int = AokiePushRegistration.invalidate(this)
+  fun invalidateAokiePushToken(): Int = runCatching { AokiePushRegistration.invalidate(this) }.getOrDefault(-1)
 
   /** Core-Telecom actions cross this JNI-only queue and never enter the WebView. */
-  fun takeAokieNativeCallAction(): String? = AokieNativeCallActionStore.takeEncoded(this)
+  fun takeAokieNativeCallAction(): String? =
+    runCatching { AokieNativeCallActionStore.takeEncoded(this) }.getOrNull()
 
   fun completeAokieNativeCallAction(actionId: String, accepted: Int, code: String): Int =
-    if (AokieNativeCallActionStore.complete(this, actionId, accepted > 0, code)) 1 else -1
+    if (runCatching { AokieNativeCallActionStore.complete(this, actionId, accepted > 0, code) }.getOrDefault(false)) 1 else -1
 
   /**
    * Presents only a signed offer already revalidated by the native Rust v2
@@ -204,42 +246,50 @@ class MainActivity : TauriActivity() {
    * enters WebView state. An opaque push can wake the app, but cannot populate
    * the transfer request binding accepted by Answer or Decline.
    */
-  fun presentAokieAuthoritativeOffer(encoded: String): Int {
-    val offer = AokieVoiceOffer.fromAuthoritativeJson(encoded) ?: return -1
-    val committed = AokieOfferStore.acceptAuthoritative(this, offer) ?: return -1
-    if (!AokieCallNotifications.notificationsAllowed(this)) return -1
+  fun presentAokieAuthoritativeOffer(encoded: String): Int = runCatching {
+    val offer = AokieVoiceOffer.fromAuthoritativeJson(encoded) ?: return@runCatching -1
+    val committed = AokieOfferStore.acceptAuthoritative(this, offer) ?: return@runCatching -1
+    if (!AokieCallNotifications.notificationsAllowed(this)) return@runCatching -1
     val intent = Intent(this, AokieIncomingCallService::class.java)
       .setAction(AokieIncomingCallService.ACTION_PRESENT)
       .putExtra(AokieIncomingCallService.EXTRA_OFFER_ID, committed.offerId)
-    return runCatching {
+    runCatching {
       ContextCompat.startForegroundService(this, intent)
       1
     }.getOrElse {
       AokieOfferStore.cancel(this, committed.offerId, "authoritative_offer_foreground_start_failed")
       -1
     }
-  }
+  }.getOrDefault(-1)
 
   /** System-owned communication routes; no Bluetooth address crosses JNI. */
-  fun beginAokieCommunicationAudio(): Int = AokieAudioRoutes.begin(this)
+  fun beginAokieCommunicationAudio(): Int = runCatching { AokieAudioRoutes.begin(this) }.getOrDefault(-1)
 
-  fun endAokieCommunicationAudio(): Int = AokieAudioRoutes.end(this)
+  fun endAokieCommunicationAudio(): Int = runCatching { AokieAudioRoutes.end(this) }.getOrDefault(-1)
 
-  fun aokieAudioRoutes(): String = AokieAudioRoutes.snapshot(this)
+  /** `null` when the routes cannot be read; Rust reports the route list as unavailable. */
+  fun aokieAudioRoutes(): String? = runCatching { AokieAudioRoutes.snapshot(this) }.getOrNull()
 
-  fun selectAokieAudioRoute(routeId: String): String = AokieAudioRoutes.select(this, routeId)
+  /**
+   * `null` when Android refuses the route (it vanished, the session ended, Android rejected it): the route
+   * picker reports the failure. A headset that drops while the user picks it must not crash the call.
+   */
+  fun selectAokieAudioRoute(routeId: String): String? =
+    runCatching { AokieAudioRoutes.select(this, routeId) }
+      .onFailure { AokieOfferStore.recordDiagnostic(this, "communication_route_select_failed") }
+      .getOrNull()
 
-  fun signalAokieLiveTransition(): Int = AokieAudioRoutes.signalLiveTransition(this)
+  fun signalAokieLiveTransition(): Int = runCatching { AokieAudioRoutes.signalLiveTransition(this) }.getOrDefault(-1)
 
   /**
    * Reconciles a native ringing surface with current v2 authority. "won" is
    * accepted only for the exact pending call epoch. Any other outcome closes
    * only the Companion leg and cannot control the cellular call.
    */
-  fun reconcileAokieOffer(callId: String, callEpoch: Long, outcome: String, reason: String): Int {
-    val current = AokieOfferStore.current(this, clearExpired = true) ?: return 0
-    if (current.callId != callId || current.callEpoch != callEpoch) return 0
-    return when (outcome) {
+  fun reconcileAokieOffer(callId: String, callEpoch: Long, outcome: String, reason: String): Int = runCatching {
+    val current = AokieOfferStore.current(this, clearExpired = true) ?: return@runCatching 0
+    if (current.callId != callId || current.callEpoch != callEpoch) return@runCatching 0
+    when (outcome) {
       "won" -> {
         startService(
           Intent(this, AokieIncomingCallService::class.java)
@@ -251,7 +301,7 @@ class MainActivity : TauriActivity() {
         1
       }
       "cancel" -> {
-        val cancelled = AokieOfferStore.cancelByCall(this, callId, callEpoch, reason) ?: return 0
+        val cancelled = AokieOfferStore.cancelByCall(this, callId, callEpoch, reason) ?: return@runCatching 0
         startService(
           Intent(this, AokieIncomingCallService::class.java)
             .setAction(AokieIncomingCallService.ACTION_CANCEL)
@@ -261,13 +311,19 @@ class MainActivity : TauriActivity() {
       }
       else -> -1
     }
+  }.getOrElse {
+    // Android refused the service start (it can while the app is in the background). A cancel has already
+    // removed the record; a refused "won" leaves the offer to its own setup deadline, which returns the lease.
+    AokieOfferStore.recordDiagnostic(this, "offer_reconcile_service_start_failed")
+    -1
   }
 
   override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
     super.onRequestPermissionsResult(requestCode, permissions, grantResults)
     if (permissions.any { it == Manifest.permission.RECORD_AUDIO }) {
-      microphonePermissionResults[requestCode] =
-        if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) 1 else -1
+      val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+      microphonePermissionResults[requestCode] = if (granted) 1 else -1
+      if (granted) AokieCommunicationService.refresh(this)
     }
     if (permissions.any { it == Manifest.permission.POST_NOTIFICATIONS }) {
       val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
@@ -290,6 +346,8 @@ class MainActivity : TauriActivity() {
   companion object {
     const val ACTION_REFRESH_AUTHORITATIVE_ASSISTANCE =
       "com.aokie.companion.action.REFRESH_AUTHORITATIVE_ASSISTANCE"
+    /** The call notification's Answer button; carries [AokieIncomingCallService.EXTRA_OFFER_ID]. */
+    const val ACTION_ANSWER_OFFER = "com.aokie.companion.action.ANSWER_FROM_NOTIFICATION"
   }
 }
 

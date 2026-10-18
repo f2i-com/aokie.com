@@ -13,6 +13,12 @@ pub const HF_FEATURE_ESCO_S4: u32 = 1 << 9;
 /// HFP §4.35.1 AG bit 0: "Three-way calling" — the phone-side half of the
 /// call-waiting capability gate.
 pub const AG_FEATURE_THREE_WAY_CALLING: u32 = 1 << 0;
+/// AG bit 1: "EC and/or NR function". AT+NREC is only defined for a phone
+/// that has one to turn off.
+pub const AG_FEATURE_EC_NR: u32 = 1 << 1;
+/// AG bit 9: "Codec negotiation". AT+BAC is only defined for a phone that
+/// negotiates codecs; one that does not carries CVSD alone.
+pub const AG_FEATURE_CODEC_NEGOTIATION: u32 = 1 << 9;
 
 // HF_FEATURE_HF_INDICATORS is intentionally NOT advertised. Per HFP
 // §4.2.1.6, advertising it commits us to the AT+BIND / AT+BIND=? /
@@ -163,8 +169,28 @@ pub enum HfpEvent {
     /// AG returned ERROR for one of the SLC commands. Carries a short
     /// description of which command failed so callers/log lines can tell
     /// `BRSF` from `CIND` failures. The SLC must be torn down — there's
-    /// no "retry the queue" path that's safe to take.
+    /// no "retry the queue" path that's safe to take. Only ever raised
+    /// while the connection is being set up: see `CommandRejected`.
     ServiceLevelConnectionFailed(String),
+    /// The phone refused (ERROR) or never answered a command sent after the
+    /// service-level connection was up. It is the phone's answer to that one
+    /// command — an ATA racing a hang-up, a number it will not dial, a CHLD
+    /// or AT+BCC it does not do — never a broken connection: nothing may
+    /// tear the link down over it, and it is not a hardware fault.
+    CommandRejected {
+        command: &'static str,
+        timed_out: bool,
+    },
+    /// Read the phone's indicators again (AT+CIND?): a second call setup
+    /// arrived while a call was up, on a connection without negotiated call
+    /// waiting. Either the first call ended and its `call,0` was lost, or a
+    /// second caller is knocking; only the phone can say which, and until it
+    /// has, neither call is ended, answered or refused.
+    CallStateCheck,
+    /// The connection came up with a call already in progress (the setup's
+    /// AT+CIND? read showed `call` on): the phone reconnected in the middle
+    /// of a call. Nothing else will announce that call.
+    CallActiveAtConnect,
     IncomingCall,
     /// `callsetup,3` — an OUTBOUND (mobile-originated) call is alerting at
     /// the remote end. MT calls never produce callsetup 3, so this has
@@ -260,6 +286,25 @@ pub struct HfpHandsFreeState {
     /// within ~8s of a quiet line) or a fresh callsetup resolves it as the
     /// abandon and emits the terminate then.
     terminate_pending: bool,
+    /// A second call setup (callsetup=1, or a RING) arrived while a call was
+    /// up, on a connection without negotiated call waiting, and the phone has
+    /// been asked for its indicators (`CallStateCheck`). Until its answer
+    /// lands nothing is ended or announced: the old code took the setup as
+    /// "the last call's call,0 was lost", ended the live call and let
+    /// auto-answer ATA the newcomer, which on Android answers them and leaves
+    /// the first caller on hold (review 1 #1).
+    second_setup_unverified: bool,
+    /// We sent AT+CHUP while the call was still setting up (a screened ring
+    /// refused, a dial cancelled). Its `callsetup,0` is then no ambiguous edge
+    /// to hold a verdict over — we refused the call, it was not answered — so
+    /// it ends the call at once (review 1 #3: held, the consumer still saw a
+    /// ringing call and sent a second CHUP, then an ATA, into a call that was
+    /// gone).
+    setup_refused: bool,
+    /// The dongle can carry wide-band speech, so mSBC is offered in AT+BAC.
+    /// A +BCS naming a codec we never offered is answered with our list
+    /// again, never confirmed (HFP §4.11.3).
+    wbs_supported: bool,
     selected_codec: Option<u8>,
 }
 
@@ -287,6 +332,9 @@ impl Default for HfpHandsFreeState {
             incoming_call: false,
             outgoing_setup: false,
             terminate_pending: false,
+            second_setup_unverified: false,
+            setup_refused: false,
+            wbs_supported: false,
             selected_codec: None,
         }
     }
@@ -331,6 +379,22 @@ impl HfpHandsFreeState {
         self.call_waiting_enabled
     }
 
+    /// Whether mSBC is on offer (the dongle has a setting for it). Set
+    /// before the SLC, from the same flag that picks AT+BAC's list.
+    pub fn set_wbs_supported(&mut self, supported: bool) {
+        self.wbs_supported = supported;
+    }
+
+    /// The codec is one AT+BAC offers: CVSD always, mSBC when the dongle
+    /// carries it. A +BCS naming anything else must not be confirmed.
+    pub fn codec_offered(&self, codec: u8) -> bool {
+        codec == HFP_CODEC_CVSD || (codec == HFP_CODEC_MSBC && self.wbs_supported)
+    }
+
+    fn ag_lacks(&self, feature: u32) -> bool {
+        self.ag_features.is_some_and(|f| f & feature == 0)
+    }
+
     /// The AG advertised three-way calling in +BRSF. False until the BRSF
     /// response has been parsed.
     pub fn ag_supports_three_way(&self) -> bool {
@@ -340,24 +404,48 @@ impl HfpHandsFreeState {
 
     /// True when this SLC command should be silently dropped instead of
     /// sent: the call-waiting probes are only spec-legal (and only useful)
-    /// when both sides advertise three-way calling.
+    /// when both sides advertise three-way calling; AT+BAC only when the
+    /// phone negotiates codecs, AT+NREC only when it has echo cancelling or
+    /// noise reduction to turn off (review 1 #18: a phone that does neither
+    /// may answer ERROR). Before the phone's +BRSF has come (it always comes
+    /// first) nothing is dropped.
     pub fn should_skip_slc_command(&self, command: &HfpAtCommand) -> bool {
         match command {
             HfpAtCommand::RetrieveCallHoldSupport
             | HfpAtCommand::EnableCallWaitingNotifications => {
                 !(self.call_waiting_enabled && self.ag_supports_three_way())
             }
+            HfpAtCommand::AvailableCodecs { .. } => self.ag_lacks(AG_FEATURE_CODEC_NEGOTIATION),
+            HfpAtCommand::DisableNoiseReduction => self.ag_lacks(AG_FEATURE_EC_NR),
             _ => false,
         }
     }
 
-    /// The two capability probes are NON-FATAL on ERROR (the Phase-4 review's
-    /// first bug): an AG refusing AT+CHLD=? / AT+CCWA=1 merely lacks call
-    /// waiting — it must not cost the whole HFP connection. Returns true when
-    /// the failed command was one of them, in which case the pump continues
-    /// the SLC queue exactly as if the command had succeeded.
+    /// The optional SLC commands are NON-FATAL on ERROR (the Phase-4 review's
+    /// first bug, then review 1 #18): an AG refusing AT+CHLD=? / AT+CCWA=1
+    /// merely lacks call waiting, one refusing AT+BAC carries CVSD alone, and
+    /// AT+CLIP, AT+BIA and AT+NREC=0 are refinements a call works without —
+    /// none of them may cost the whole HFP connection. Returns true when the
+    /// failed command was one of them, in which case the pump continues the
+    /// SLC queue exactly as if the command had succeeded.
     pub fn note_slc_probe_error(&mut self, command: &HfpAtCommand) -> bool {
         match command {
+            HfpAtCommand::AvailableCodecs { .. } => {
+                self.wbs_supported = false;
+                eprintln!(
+                    "[AokieRadio] AG refused AT+BAC — no codec negotiation on this phone, calls carry CVSD (SLC continues)"
+                );
+                true
+            }
+            HfpAtCommand::ActivateClip(_)
+            | HfpAtCommand::EnableAllIndicatorStatusUpdates(_)
+            | HfpAtCommand::DisableNoiseReduction => {
+                eprintln!(
+                    "[AokieRadio] AG refused {} — optional, the connection does without it (SLC continues)",
+                    at_command_name(command)
+                );
+                true
+            }
             HfpAtCommand::RetrieveCallHoldSupport => {
                 self.chld_modes = None;
                 self.probe_refused = Some("AT+CHLD=?");
@@ -456,6 +544,13 @@ impl HfpHandsFreeState {
                     // of the held caller.
                     return Vec::new();
                 }
+                if self.call_active {
+                    // A RING while a call is up is a second caller's (or the
+                    // first call's call,0 was lost): never an IncomingCall
+                    // that auto-answer or screening would act on against the
+                    // live call. Same check as a second callsetup=1.
+                    return self.second_setup_while_active();
+                }
                 self.incoming_call = true;
                 vec![HfpEvent::IncomingCall, HfpEvent::Ringing]
             }
@@ -465,7 +560,18 @@ impl HfpHandsFreeState {
             }
             HfpAgResult::IndicatorUpdate { index, value } => self.apply_indicator(*index, *value),
             HfpAgResult::IndicatorStatus(values) => self.apply_indicator_status(values),
-            HfpAgResult::CallerId(number) => vec![HfpEvent::CallerId(number.clone())],
+            HfpAgResult::CallerId(number) => {
+                if self.call_active && (self.call_waiting || self.second_setup_unverified) {
+                    // A +CLIP while a call is up and a second one sets up is
+                    // the newcomer's number: stamped on the live call it
+                    // would relabel that caller's record.
+                    eprintln!(
+                        "[AokieRadio] +CLIP during a second call setup — not the live caller's number, ignored"
+                    );
+                    return Vec::new();
+                }
+                vec![HfpEvent::CallerId(number.clone())]
+            }
             HfpAgResult::SupportedFeatures(features) => {
                 self.ag_features = Some(*features);
                 Vec::new()
@@ -508,6 +614,14 @@ impl HfpHandsFreeState {
                 events
             }
             HfpAgResult::SelectedCodec(codec) => {
+                if !self.codec_offered(*codec) {
+                    // The pump answers with our codec list again (HFP
+                    // §4.11.3); the selection stands as it was.
+                    eprintln!(
+                        "[AokieRadio] AG selected codec {codec}, which we never offered — answering with our list instead of confirming it"
+                    );
+                    return Vec::new();
+                }
                 self.selected_codec = Some(*codec);
                 vec![codec_event(*codec)]
             }
@@ -536,6 +650,12 @@ impl HfpHandsFreeState {
                 self.incoming_call = false;
                 self.call_active = false;
                 self.outgoing_setup = true;
+                self.setup_refused = false;
+            }
+            HfpAtCommand::RejectOrHangup => {
+                if (self.incoming_call || self.outgoing_setup) && !self.call_active {
+                    self.setup_refused = true;
+                }
             }
             _ => {}
         }
@@ -543,6 +663,13 @@ impl HfpHandsFreeState {
 
     pub fn call_active(&self) -> bool {
         self.call_active
+    }
+
+    /// The phone's indicators show a call: up, ringing, being dialed, or
+    /// ending with its verdict still held. While this is true the audio
+    /// channel closing is not the call ending (review 1 #4).
+    pub fn call_in_progress(&self) -> bool {
+        self.call_active || self.incoming_call || self.outgoing_setup || self.terminate_pending
     }
 
     pub fn incoming_call(&self) -> bool {
@@ -638,13 +765,24 @@ impl HfpHandsFreeState {
     /// to emit user-visible call events.
     fn apply_indicator_status(&mut self, values: &[i32]) -> Vec<HfpEvent> {
         let mut events = Vec::new();
+        let ringing_now =
+            indicator_status_value(values, self.callsetup_indicator_index) == Some(&1);
         if let Some(call) = indicator_status_value(values, self.call_indicator_index) {
             let active = *call != 0;
-            // The snapshot stays silent EXCEPT to resolve a held ring
-            // verdict (see `terminate_pending`): the `+CIEV: call` edge that
-            // would decide answer-vs-abandon may have been lost, and the
-            // consumer is owed exactly one resolution. The ACL-keepalive
-            // AT+CIND? poll makes this land within ~8s of a quiet line.
+            // The snapshot stays silent EXCEPT to resolve what an edge left
+            // open, which the consumer is owed exactly once:
+            // * a held ring verdict (see `terminate_pending`): the
+            //   `+CIEV: call` edge that would decide answer-vs-abandon may
+            //   have been lost. The ACL-keepalive AT+CIND? poll makes this
+            //   land within ~8s of a quiet line;
+            // * a call we hold for live that the phone says is over: its
+            //   `call,0` was lost. A waiting or unverified second caller
+            //   still ringing is announced as a normal ring, as the edge
+            //   would have (update_call_state);
+            // * a second setup awaiting this very read (`CallStateCheck`)
+            //   with the first call still up: a second caller is knocking;
+            // * the setup's read finding a call already up: a reconnect in
+            //   the middle of a call (`CallActiveAtConnect`).
             if self.terminate_pending {
                 self.terminate_pending = false;
                 if active && !self.call_active {
@@ -652,6 +790,35 @@ impl HfpHandsFreeState {
                 } else if !active {
                     events.push(HfpEvent::CallTerminated);
                 }
+            } else if !active && self.call_active {
+                eprintln!(
+                    "[AokieRadio] CIND snapshot shows no call while one was live — its call,0 was lost; ending it"
+                );
+                self.call_active = false;
+                if self.call_waiting {
+                    self.call_waiting = false;
+                    self.waiting_number_known = false;
+                    events.push(HfpEvent::CallWaitingEnded);
+                    self.second_setup_unverified = ringing_now;
+                }
+                events.push(HfpEvent::CallTerminated);
+                if self.second_setup_unverified && ringing_now {
+                    self.incoming_call = true;
+                    events.push(HfpEvent::IncomingCall);
+                }
+                self.second_setup_unverified = false;
+            } else if active && self.second_setup_unverified {
+                self.second_setup_unverified = false;
+                if ringing_now && !self.call_waiting {
+                    eprintln!(
+                        "[AokieRadio] CIND snapshot: the first call is still up — the second setup is a caller waiting"
+                    );
+                    self.call_waiting = true;
+                    self.waiting_number_known = false;
+                    events.push(HfpEvent::CallWaiting(None));
+                }
+            } else if active && !self.call_active && !self.service_level_ready {
+                events.push(HfpEvent::CallActiveAtConnect);
             }
             self.call_active = active;
             if active {
@@ -721,6 +888,25 @@ impl HfpHandsFreeState {
                     self.waiting_number_known = false;
                     return vec![HfpEvent::CallWaitingEnded];
                 }
+                if self.second_setup_unverified {
+                    // The second setup ended before the phone's indicators
+                    // were read: nothing was announced, nothing to undo. The
+                    // read still lands and settles the first call either way.
+                    self.second_setup_unverified = false;
+                    return Vec::new();
+                }
+                if (self.incoming_call || self.outgoing_setup)
+                    && !self.call_active
+                    && std::mem::take(&mut self.setup_refused)
+                {
+                    // We refused this setup (AT+CHUP): it ended, it was not
+                    // answered. A `call,1` after all (the owner answering on
+                    // the handset at that very moment) still arrives as a
+                    // CallAnswered, which the consumer recovers.
+                    self.incoming_call = false;
+                    self.outgoing_setup = false;
+                    return vec![HfpEvent::CallTerminated];
+                }
                 if (self.incoming_call || self.outgoing_setup) && !self.call_active {
                     // AMBIGUOUS: the setup phase ends on BOTH abandon and
                     // answer, and `call,1` may arrive AFTER this (observed
@@ -737,30 +923,37 @@ impl HfpHandsFreeState {
             }
             1 => {
                 // A fresh incoming-call setup while the AG `call` indicator
-                // is still active means the previous call's `+CIEV: call,0`
-                // was lost or coalesced — e.g. back-to-back / call-waiting
-                // calls where `call` never returned to 0, or an SCO drop
-                // whose CallTerminated never drove this state machine. Since
-                // CallAnswered is edge-triggered on call 0->1 (see
-                // update_call_state), a stuck-true call_active would swallow
-                // the next answer's CallAnswered. The consumer clears its
-                // per-call state (conversation history, greeting, call id)
-                // ONLY on CallAnswered, so the previous call's conversation
-                // would leak into this one. Synthesize the missed terminate
-                // here so the upcoming answer is a genuine 0->1 edge and the
-                // full per-call reset runs. Aokie serves one call at a time,
-                // so a fresh incoming setup is an unambiguous prior-call
-                // boundary; emitting CallTerminated first also lets the
-                // stranded prior call finish its post-call processing.
+                // is still active is one of two things, and the edge alone
+                // cannot tell them apart:
                 //
-                // Phase 4 carve-out: when call waiting is NEGOTIATED on this
-                // connection, callsetup=1 during an active call is a REAL
-                // second caller knocking — the lost-call,0 recovery below
-                // would kill the live conversation mid-sentence and try to
-                // ATA the waiting call (which plain ATA cannot answer). The
-                // episode usually starts at the +CCWA (which carries the
-                // number and beats this edge on Android); this arm covers a
-                // callsetup-first ordering with an anonymous start.
+                // * the previous call's `+CIEV: call,0` was lost or coalesced
+                //   (back-to-back calls, or an SCO drop whose CallTerminated
+                //   never drove this state machine). Since CallAnswered is
+                //   edge-triggered on call 0->1 (see update_call_state), a
+                //   stuck-true call_active would swallow the next answer's
+                //   CallAnswered, and the consumer clears its per-call state
+                //   (conversation history, greeting, call id) ONLY on
+                //   CallAnswered — the previous call's conversation would
+                //   leak into this one;
+                // * a second caller knocking on a live call. Taking that for
+                //   the first case (as this arm once did) ended the live call
+                //   mid-sentence and let auto-answer ATA the newcomer, which
+                //   on Android answers them and leaves the first caller on
+                //   hold; a screening refusal's AT+CHUP would hang up the
+                //   live call instead (review 1 #1).
+                //
+                // So nothing is ended or announced here: the phone is asked
+                // for its indicators (`CallStateCheck` → AT+CIND?), and its
+                // snapshot decides — call=0 ends the old call and announces
+                // this one as a normal ring, call=1 makes it a waiting
+                // caller (see apply_indicator_status). A `call,0` edge first
+                // promotes it the same way (update_call_state).
+                //
+                // When call waiting is NEGOTIATED on this connection the
+                // edge is a second caller by definition: the episode usually
+                // starts at the +CCWA (which carries the number and beats
+                // this edge on Android); this arm covers a callsetup-first
+                // ordering with an anonymous start.
                 if self.call_active && self.three_way_negotiated() {
                     if !self.call_waiting {
                         self.call_waiting = true;
@@ -769,18 +962,19 @@ impl HfpHandsFreeState {
                     }
                     return Vec::new();
                 }
+                if self.call_active {
+                    return self.second_setup_while_active();
+                }
                 let mut events = Vec::new();
                 if self.terminate_pending {
                     // A NEW ring while the previous ring's verdict was still
                     // held: nothing ever answered it — that ring is over.
                     self.terminate_pending = false;
                     events.push(HfpEvent::CallTerminated);
-                } else if self.call_active {
-                    self.call_active = false;
-                    events.push(HfpEvent::CallTerminated);
                 }
                 self.incoming_call = true;
                 self.outgoing_setup = false;
+                self.setup_refused = false;
                 events.push(HfpEvent::IncomingCall);
                 events
             }
@@ -816,6 +1010,7 @@ impl HfpHandsFreeState {
     }
 
     fn update_call_state(&mut self, active: bool) -> Vec<HfpEvent> {
+        self.setup_refused = false;
         if active {
             // Resolves a held callsetup-drop: it was the ANSWER transition
             // (the AG just sent `callsetup,0` before `call,1`).
@@ -862,14 +1057,102 @@ impl HfpHandsFreeState {
                 HfpEvent::CallTerminated,
                 HfpEvent::IncomingCall,
             ]
+        } else if self.second_setup_unverified {
+            // The live call ended while the second setup (never announced,
+            // see update_callsetup) still rings: it is a normal ring now.
+            self.second_setup_unverified = false;
+            self.incoming_call = true;
+            vec![HfpEvent::CallTerminated, HfpEvent::IncomingCall]
         } else {
             vec![HfpEvent::CallTerminated]
         }
+    }
+
+    /// A second call setup while a call is up (callsetup=1 or a RING), on a
+    /// connection without negotiated call waiting: ask the phone, once, and
+    /// wait for its answer (see `second_setup_unverified`).
+    fn second_setup_while_active(&mut self) -> Vec<HfpEvent> {
+        if self.three_way_negotiated() || self.call_waiting || self.second_setup_unverified {
+            return Vec::new();
+        }
+        self.second_setup_unverified = true;
+        eprintln!(
+            "[AokieRadio] a second call setup while a call is up — reading the phone's indicators before ending or answering anything"
+        );
+        vec![HfpEvent::CallStateCheck]
     }
 }
 
 fn indicator_status_value(values: &[i32], indicator_index: u8) -> Option<&i32> {
     values.get(usize::from(indicator_index.checked_sub(1)?))
+}
+
+/// The command's name for logs and events: no number or other argument,
+/// so a refused ATD names "ATD", never the number dialed.
+pub fn at_command_name(command: &HfpAtCommand) -> &'static str {
+    match command {
+        HfpAtCommand::SupportedFeatures { .. } => "AT+BRSF",
+        HfpAtCommand::AvailableCodecs { .. } => "AT+BAC",
+        HfpAtCommand::RetrieveIndicators => "AT+CIND=?",
+        HfpAtCommand::RetrieveIndicatorStatus => "AT+CIND?",
+        HfpAtCommand::RetrieveCallHoldSupport => "AT+CHLD=?",
+        HfpAtCommand::EnableCallWaitingNotifications => "AT+CCWA",
+        HfpAtCommand::CallHold(_) => "AT+CHLD",
+        HfpAtCommand::ActivateClip(_) => "AT+CLIP",
+        HfpAtCommand::EnableIndicatorUpdates(_) => "AT+CMER",
+        HfpAtCommand::EnableAllIndicatorStatusUpdates(_) => "AT+BIA",
+        HfpAtCommand::DisableNoiseReduction => "AT+NREC",
+        HfpAtCommand::Answer => "ATA",
+        HfpAtCommand::RejectOrHangup => "AT+CHUP",
+        HfpAtCommand::Dial(_) => "ATD",
+        HfpAtCommand::ConfirmCodec(_) => "AT+BCS",
+        HfpAtCommand::ListCurrentCalls => "AT+CLCC",
+        HfpAtCommand::CodecConnection => "AT+BCC",
+    }
+}
+
+/// Commands sent after the service-level connection is up, still waiting
+/// for their final result. AT answers in order (one OK or ERROR per
+/// command), so a result belongs to the oldest one; this is what names the
+/// command an ERROR refused, and what times out one the phone never
+/// answered. Bounded: a phone that drops answers cannot grow it.
+#[derive(Debug, Default)]
+pub struct OutstandingCommands {
+    queue: std::collections::VecDeque<(&'static str, std::time::Instant)>,
+}
+
+impl OutstandingCommands {
+    const MAX: usize = 8;
+
+    pub fn sent(&mut self, command: &HfpAtCommand, now: std::time::Instant) {
+        if self.queue.len() >= Self::MAX {
+            self.queue.pop_front();
+        }
+        self.queue.push_back((at_command_name(command), now));
+    }
+
+    /// A final result (OK or ERROR) arrived: the oldest command's.
+    pub fn answered(&mut self) -> Option<&'static str> {
+        self.queue.pop_front().map(|(name, _)| name)
+    }
+
+    /// The oldest command, when it has waited `timeout` with no answer:
+    /// taken off, so it is reported once.
+    pub fn timed_out(
+        &mut self,
+        now: std::time::Instant,
+        timeout: std::time::Duration,
+    ) -> Option<&'static str> {
+        let (_, sent_at) = self.queue.front()?;
+        if now.saturating_duration_since(*sent_at) < timeout {
+            return None;
+        }
+        self.queue.pop_front().map(|(name, _)| name)
+    }
+
+    pub fn clear(&mut self) {
+        self.queue.clear();
+    }
 }
 
 pub fn build_at_command(command: HfpAtCommand) -> Vec<u8> {
@@ -981,7 +1264,9 @@ fn parse_ag_result_line(line: &str) -> Option<HfpAgResult> {
     if line == "OK" {
         return Some(HfpAgResult::Ok);
     }
-    if line == "ERROR" {
+    if line == "ERROR" || line.starts_with("+CME ERROR") {
+        // +CME ERROR: <n> is the extended form of the same final result
+        // (some phones send it whether or not AT+CMEE asked for it).
         return Some(HfpAgResult::Error);
     }
     if line == "RING" {
@@ -1349,17 +1634,34 @@ mod tests {
 
     #[test]
     fn cind_status_with_active_call_clears_incoming_flag() {
-        // If the AG reports an already-active call at SLC time
-        // (call=1), the snapshot is silent but we still want
-        // incoming_call to be false so a subsequent CallTerminated
-        // doesn't double up.
+        // If the AG reports an already-active call at SLC time (call=1),
+        // incoming_call must be false so a subsequent CallTerminated
+        // doesn't double up — and the call is announced once as found at
+        // connect (review 1 #4: a reconnect in the middle of a call has
+        // nothing else to announce it).
         let mut state = HfpHandsFreeState::new();
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 1, 0, 0, 4, 0, 5])),
+            vec![HfpEvent::CallActiveAtConnect]
+        );
+        assert!(state.call_active());
+        assert!(!state.incoming_call());
+        // Later snapshots of the same call are silent; its end is an edge.
+        state.mark_service_level_ready();
         assert_eq!(
             state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 1, 0, 0, 4, 0, 5])),
             Vec::<HfpEvent>::new()
         );
-        assert!(state.call_active());
-        assert!(!state.incoming_call());
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 }),
+            vec![HfpEvent::CallTerminated]
+        );
+        // Once the SLC is up, a snapshot showing a call we did not know of
+        // stays silent (only the setup's read announces one).
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 1, 0, 0, 4, 0, 5])),
+            Vec::<HfpEvent>::new()
+        );
     }
 
     #[test]
@@ -1371,8 +1673,10 @@ mod tests {
         // edge guard in update_call_state and NO CallAnswered fires. The
         // consumer clears per-call conversation state only on CallAnswered,
         // so the prior call's conversation leaks into the new call. A fresh
-        // incoming-call setup must synthesize the missed terminate so the
-        // upcoming answer is a genuine 0->1 edge.
+        // incoming-call setup must still end the stale call so the upcoming
+        // answer is a genuine 0->1 edge — once the phone's indicators confirm
+        // it is gone (review 1 #1: the same edge is a second caller knocking
+        // when it is not).
         let mut state = HfpHandsFreeState::new();
         // Call A is answered (call=1, default call indicator index 2).
         assert_eq!(
@@ -1381,10 +1685,22 @@ mod tests {
         );
         assert!(state.call_active());
         // Call A's `call,0` never arrives. Call B rings: callsetup=1
-        // (default callsetup indicator index 3). The stale active call must
-        // be torn down first so the next answer is a clean edge.
+        // (default callsetup indicator index 3). Nothing is ended yet: the
+        // phone is asked.
         assert_eq!(
             state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 }),
+            vec![HfpEvent::CallStateCheck]
+        );
+        assert!(state.call_active());
+        // Its RING and +CLIP while that is open announce nothing either.
+        assert_eq!(state.apply_result(&HfpAgResult::Ring), Vec::<HfpEvent>::new());
+        assert_eq!(
+            state.apply_result(&HfpAgResult::CallerId("0491570157".into())),
+            Vec::<HfpEvent>::new()
+        );
+        // The phone says no call is up: call A ended; call B is a ring.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 0, 1])),
             vec![HfpEvent::CallTerminated, HfpEvent::IncomingCall]
         );
         assert!(!state.call_active());
@@ -1396,6 +1712,159 @@ mod tests {
             vec![HfpEvent::CallAnswered]
         );
         assert!(state.call_active());
+    }
+
+    /// Review 1 #1: a second caller on a connection without negotiated call
+    /// waiting. The live call is never ended, nothing is announced for
+    /// auto-answer or screening to act on, and the newcomer is a caller
+    /// waiting once the phone confirms the first call is still up.
+    #[test]
+    fn a_second_caller_without_call_waiting_never_ends_the_live_call() {
+        let mut state = HfpHandsFreeState::new();
+        state.mark_service_level_ready();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 }),
+            vec![HfpEvent::CallStateCheck]
+        );
+        // A repeat of the edge, a RING and the newcomer's +CLIP: silent.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 }),
+            Vec::<HfpEvent>::new()
+        );
+        assert_eq!(state.apply_result(&HfpAgResult::Ring), Vec::<HfpEvent>::new());
+        assert_eq!(
+            state.apply_result(&HfpAgResult::CallerId("0491570157".into())),
+            Vec::<HfpEvent>::new()
+        );
+        // The phone: the first call is still up — a caller waiting.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 1, 1])),
+            vec![HfpEvent::CallWaiting(None)]
+        );
+        assert!(state.call_active());
+        assert!(!state.incoming_call());
+        // The newcomer gives up: the live call is untouched.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
+            vec![HfpEvent::CallWaitingEnded]
+        );
+        assert!(state.call_active());
+
+        // Another one knocks, and this time the first call ends while they
+        // still ring: then (and only then) they are a normal ring.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 }),
+            vec![HfpEvent::CallStateCheck]
+        );
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 }),
+            vec![HfpEvent::CallTerminated, HfpEvent::IncomingCall]
+        );
+        assert!(state.incoming_call());
+        // The late snapshot finds nothing left to settle.
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 0, 1])),
+            Vec::<HfpEvent>::new()
+        );
+
+        // A second setup that ends before the snapshot: nothing to undo,
+        // and a snapshot that still shows the first call stays silent.
+        let mut quick = HfpHandsFreeState::new();
+        quick.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
+        quick.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
+        assert_eq!(
+            quick.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
+            Vec::<HfpEvent>::new()
+        );
+        assert_eq!(
+            quick.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 1, 0])),
+            Vec::<HfpEvent>::new()
+        );
+        assert!(quick.call_active());
+    }
+
+    /// Review 1 #3: a setup we refused (AT+CHUP on a ring, or a cancelled
+    /// dial) ends at its callsetup,0 — no held verdict for a ringing call that
+    /// is gone, which drew a second CHUP and an ATA.
+    #[test]
+    fn a_refused_setup_ends_at_its_callsetup_drop() {
+        let mut state = HfpHandsFreeState::new();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
+        state.mark_command_sent(&HfpAtCommand::RejectOrHangup);
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
+            vec![HfpEvent::CallTerminated]
+        );
+        assert!(!state.call_in_progress());
+        // The next ring, not refused, keeps the held verdict.
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 });
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
+            Vec::<HfpEvent>::new()
+        );
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 }),
+            vec![HfpEvent::CallAnswered]
+        );
+        // A hang-up of an answered call is no setup refusal: its end is call,0.
+        state.mark_command_sent(&HfpAtCommand::RejectOrHangup);
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 0 }),
+            vec![HfpEvent::CallTerminated]
+        );
+        // A cancelled dial too.
+        state.mark_command_sent(&HfpAtCommand::Dial("0491570157".into()));
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 2 });
+        state.mark_command_sent(&HfpAtCommand::RejectOrHangup);
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 0 }),
+            vec![HfpEvent::CallTerminated]
+        );
+    }
+
+    /// Review 1 #4: a call whose call,0 was lost ends when a snapshot shows
+    /// no call — without waiting for the next call's ring.
+    #[test]
+    fn a_snapshot_showing_no_call_ends_a_call_whose_end_was_lost() {
+        let mut state = HfpHandsFreeState::new();
+        state.mark_service_level_ready();
+        state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
+        assert!(state.call_in_progress());
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 0, 0])),
+            vec![HfpEvent::CallTerminated]
+        );
+        assert!(!state.call_in_progress());
+    }
+
+    /// Review 1 #3: once the SLC is up, AT answers name the command they
+    /// answer, in order, and a command never answered times out once.
+    #[test]
+    fn outstanding_commands_name_what_an_answer_answers() {
+        let t0 = std::time::Instant::now();
+        let mut outstanding = OutstandingCommands::default();
+        outstanding.sent(&HfpAtCommand::RetrieveIndicatorStatus, t0);
+        outstanding.sent(&HfpAtCommand::Dial("0491570157".into()), t0);
+        assert_eq!(outstanding.answered(), Some("AT+CIND?"));
+        assert_eq!(outstanding.answered(), Some("ATD"));
+        assert_eq!(outstanding.answered(), None);
+        outstanding.sent(&HfpAtCommand::Answer, t0);
+        let wait = std::time::Duration::from_secs(10);
+        assert_eq!(outstanding.timed_out(t0 + std::time::Duration::from_secs(9), wait), None);
+        assert_eq!(outstanding.timed_out(t0 + wait, wait), Some("ATA"));
+        assert_eq!(outstanding.timed_out(t0 + wait, wait), None);
+        // A phone that drops answers cannot grow it.
+        for _ in 0..100 {
+            outstanding.sent(&HfpAtCommand::ListCurrentCalls, t0);
+        }
+        let mut n = 0;
+        while outstanding.answered().is_some() {
+            n += 1;
+        }
+        assert!(n <= 8);
+        // +CME ERROR is an ERROR.
+        assert_eq!(parse_ag_results(b"\r\n+CME ERROR: 30\r\n").unwrap(), vec![HfpAgResult::Error]);
     }
 
     #[test]
@@ -1831,9 +2300,58 @@ mod tests {
         assert!(state.note_slc_probe_error(&HfpAtCommand::RetrieveCallHoldSupport));
         assert!(state.note_slc_probe_error(&HfpAtCommand::EnableCallWaitingNotifications));
         assert!(!state.three_way_negotiated());
-        // Everything else keeps the fatal policy.
+        // The SLC's core keeps the fatal policy.
         assert!(!state.note_slc_probe_error(&HfpAtCommand::RetrieveIndicators));
-        assert!(!state.note_slc_probe_error(&HfpAtCommand::ActivateClip(true)));
+        assert!(!state.note_slc_probe_error(&HfpAtCommand::RetrieveIndicatorStatus));
+        assert!(!state.note_slc_probe_error(&HfpAtCommand::EnableIndicatorUpdates(true)));
+    }
+
+    /// Review 1 #18: AT+BAC, AT+CLIP, AT+BIA and AT+NREC=0 are refinements a
+    /// call works without — a phone refusing one keeps its connection — and
+    /// AT+BAC / AT+NREC go only to a phone that advertises codec negotiation
+    /// / echo cancelling.
+    #[test]
+    fn optional_slc_commands_are_gated_and_their_refusal_is_not_fatal() {
+        let mut state = HfpHandsFreeState::new();
+        state.set_wbs_supported(true);
+        // Before +BRSF nothing is dropped.
+        assert!(!state.should_skip_slc_command(&HfpAtCommand::AvailableCodecs { wbs_supported: true }));
+        assert!(!state.should_skip_slc_command(&HfpAtCommand::DisableNoiseReduction));
+        // An old phone: no EC/NR, no codec negotiation.
+        state.apply_result(&HfpAgResult::SupportedFeatures(0b0110_0001));
+        assert!(state.should_skip_slc_command(&HfpAtCommand::AvailableCodecs { wbs_supported: true }));
+        assert!(state.should_skip_slc_command(&HfpAtCommand::DisableNoiseReduction));
+        assert!(!state.should_skip_slc_command(&HfpAtCommand::EnableAllIndicatorStatusUpdates(true)));
+        // A phone that has both gets both.
+        let mut modern = HfpHandsFreeState::new();
+        modern.apply_result(&HfpAgResult::SupportedFeatures(AG_FEATURE_EC_NR | AG_FEATURE_CODEC_NEGOTIATION));
+        assert!(!modern.should_skip_slc_command(&HfpAtCommand::AvailableCodecs { wbs_supported: true }));
+        assert!(!modern.should_skip_slc_command(&HfpAtCommand::DisableNoiseReduction));
+        // Refusals continue the SLC; a refused AT+BAC leaves CVSD alone.
+        for command in [
+            HfpAtCommand::ActivateClip(true),
+            HfpAtCommand::EnableAllIndicatorStatusUpdates(true),
+            HfpAtCommand::DisableNoiseReduction,
+            HfpAtCommand::AvailableCodecs { wbs_supported: true },
+        ] {
+            assert!(modern.note_slc_probe_error(&command), "{command:?} must not be fatal");
+        }
+        assert!(modern.codec_offered(HFP_CODEC_CVSD));
+        assert!(!modern.codec_offered(HFP_CODEC_MSBC));
+    }
+
+    /// Review 1 #17: a +BCS naming a codec never offered is not confirmed
+    /// and selects nothing.
+    #[test]
+    fn a_codec_never_offered_is_not_selected() {
+        let mut state = HfpHandsFreeState::new();
+        // CVSD-only dongle: mSBC was never offered.
+        assert_eq!(state.apply_result(&HfpAgResult::SelectedCodec(HFP_CODEC_MSBC)), Vec::<HfpEvent>::new());
+        assert_eq!(state.apply_result(&HfpAgResult::SelectedCodec(7)), Vec::<HfpEvent>::new());
+        assert_eq!(
+            state.apply_result(&HfpAgResult::SelectedCodec(HFP_CODEC_CVSD)),
+            vec![HfpEvent::CodecSelected { codec: "CVSD".to_string(), sample_rate: 8000 }]
+        );
     }
 
     // ── Phase 4: waiting-episode state machine ──────────────────────────
@@ -1970,18 +2488,23 @@ mod tests {
     }
 
     #[test]
-    fn without_negotiation_a_second_setup_keeps_the_legacy_recovery() {
+    fn without_negotiation_a_second_setup_asks_the_phone_first() {
         // Setting ON but the AG never negotiated (e.g. CHLD probe refused):
-        // callsetup=1 while active must keep the lost-call,0 recovery —
-        // exactly the pre-Phase-4 behaviour.
+        // callsetup=1 while active is settled by the phone's indicators
+        // (review 1 #1), and a lost call,0 still resolves from them.
         let mut state = HfpHandsFreeState::new();
         state.set_call_waiting_enabled(true);
         state.apply_result(&HfpAgResult::SupportedFeatures(0x0FFF));
         state.apply_result(&HfpAgResult::IndicatorUpdate { index: 2, value: 1 });
         assert_eq!(
             state.apply_result(&HfpAgResult::IndicatorUpdate { index: 3, value: 1 }),
+            vec![HfpEvent::CallStateCheck]
+        );
+        assert_eq!(
+            state.apply_result(&HfpAgResult::IndicatorStatus(vec![1, 0, 1])),
             vec![HfpEvent::CallTerminated, HfpEvent::IncomingCall]
         );
+        assert!(!state.call_active());
         // A +CCWA arriving with no negotiated episode support (call not
         // active here) stays silent.
         assert_eq!(
@@ -2023,6 +2546,7 @@ mod tests {
     #[test]
     fn state_maps_ring_clip_and_codec_events() {
         let mut state = HfpHandsFreeState::new();
+        state.set_wbs_supported(true);
         assert_eq!(
             state.apply_result(&HfpAgResult::Ring),
             vec![HfpEvent::IncomingCall, HfpEvent::Ringing]

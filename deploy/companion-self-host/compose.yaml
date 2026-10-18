@@ -1,5 +1,13 @@
 name: aokie-companion
 
+# Bounded logs for every service: Docker's default json-file driver never
+# rotates, so a long-running relay would otherwise fill the disk.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   gateway:
     image: aokie-realtime-self-host:${AOKIE_IMAGE_TAG:-local}
@@ -9,6 +17,10 @@ services:
       args:
         RUST_VERSION: ${RUST_VERSION:-1.92.0}
     restart: unless-stopped
+    # A minimal init as PID 1 forwards signals and reaps children, so a stop
+    # is prompt and clean instead of waiting out Docker's kill timeout.
+    init: true
+    logging: *logging
     environment:
       AOKIE_GATEWAY_BIND: 0.0.0.0:18787
       # This listener is private on the Docker network. Traefik is the only
@@ -38,6 +50,8 @@ services:
   coturn:
     image: coturn/coturn:4.14.0-r0@sha256:0c0e8fc0c263b85a134e9e4242b5e46e1f4c077c5029633511191c05b5c2c814
     restart: unless-stopped
+    init: true
+    logging: *logging
     entrypoint: [/bin/sh, /opt/aokie/coturn-entrypoint.sh]
     environment:
       TURN_SECRET_FILE: /run/secrets/turn_rest
@@ -90,6 +104,7 @@ services:
 
   edge-config:
     image: traefik:v3.7.7@sha256:1cb3845d7a05e1473c9086351426597e911db49db382b6e4769f9b0744962ac8
+    logging: *logging
     entrypoint: [/bin/sh, /templates/render-traefik-config.sh]
     environment:
       SIGNAL_HOST: ${SIGNAL_HOST:?set SIGNAL_HOST in .env}
@@ -108,6 +123,8 @@ services:
   edge:
     image: traefik:v3.7.7@sha256:1cb3845d7a05e1473c9086351426597e911db49db382b6e4769f9b0744962ac8
     restart: unless-stopped
+    init: true
+    logging: *logging
     command: [--configFile=/etc/traefik/traefik.yml]
     depends_on:
       edge-config:

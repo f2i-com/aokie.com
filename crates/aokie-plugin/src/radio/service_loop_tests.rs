@@ -842,3 +842,105 @@ fn a_caller_left_ringing_for_the_owner_reaches_oaiy_only_once_the_owner_hands_th
     taken.pass();
     assert_eq!(taken.sessions(), 0, "the owner's call is not given to OAIY");
 }
+
+/// A call begun with OAIY, nothing negotiated.
+fn begun() -> Loop {
+    let mut l = Loop::new();
+    l.pass();
+    l.ready(&[]);
+    l.pass();
+    assert!(l.lane.as_ref().unwrap().begun);
+    l.sent();
+    l
+}
+
+/// review #14: OAIY's stream dropping under a live call (OAIY restarted) is
+/// reconnected once, with a fresh session for the same call; a second drop
+/// on that call takes the fail-safe (the apology and the hang-up).
+#[test]
+fn oaiys_stream_dropping_mid_call_reconnects_once_and_a_second_drop_takes_the_fail_safe() {
+    let mut l = begun();
+    l.oaiy(RealtimeEventKind::Closed {
+        reason: "Desktop realtime receive failed: connection reset".into(),
+        transport: true,
+    });
+    l.pass();
+    assert!(l.lane.is_none());
+    assert_eq!(l.resume.as_deref(), Some(CALL), "the call waits for a fresh session");
+    assert!(l.midcall.is_none(), "no apology and no hang-up");
+    l.pass();
+    assert_eq!(l.sessions(), 2, "a fresh session for the same call");
+    let start = l.start(1);
+    assert_eq!(start.call_id, CALL);
+    assert!(start.resume.is_none(), "it follows no handoff");
+    assert!(l.lane.as_ref().unwrap().resumed, "it does not greet the caller a second time");
+    l.ready(&[]);
+    l.pass();
+    assert!(l.lane.as_ref().unwrap().begun);
+
+    l.oaiy(RealtimeEventKind::Closed {
+        reason: "Desktop realtime stream ended".into(),
+        transport: true,
+    });
+    l.pass();
+    assert!(l.resume.is_none(), "one reconnect a call");
+    assert_eq!(l.midcall.as_ref().map(|failure| failure.0.as_str()), Some(CALL));
+}
+
+/// Only the stream failing is reconnected: a session that ended for what OAIY
+/// sent (a protocol violation) takes the fail-safe at once, as before.
+#[test]
+fn a_session_that_failed_for_what_oaiy_sent_is_not_reconnected() {
+    let mut l = begun();
+    l.oaiy(RealtimeEventKind::Closed {
+        reason: "Desktop realtime sent PCM without an active output item".into(),
+        transport: false,
+    });
+    l.pass();
+    assert!(l.resume.is_none());
+    assert!(l.midcall.is_some());
+    assert_eq!(l.sessions(), 1);
+}
+
+/// review #36: a goodbye is no longer refused for noise (a breath, echo: any
+/// energy bumped the activity revision), only for a caller who took the
+/// conversation up again after the model asked to finish.
+#[test]
+fn a_goodbye_is_refused_for_a_turn_that_takes_the_conversation_up_again_and_not_for_noise() {
+    let finish = |events: &dyn Fn(&Loop)| {
+        let mut l = begun();
+        l.agent_hangup = true;
+        l.tool("finish_1", "finish_call", json!({}));
+        events(&l);
+        l.pass();
+        let (ok, output) = tool_result(&l.sent(), "finish_1").expect("finish_call is answered");
+        (ok, output)
+    };
+    // Noise after the ask: the caller made a sound, said nothing.
+    let (ok, output) = finish(&|l| l.oaiy(RealtimeEventKind::SpeechStarted));
+    assert!(ok, "noise does not refuse a goodbye: {output}");
+    // A courtesy over it.
+    let (ok, output) = finish(&|l| {
+        l.oaiy(RealtimeEventKind::SpeechStarted);
+        l.oaiy(RealtimeEventKind::InputTranscript { item_id: None, text: "No problem, bye".into() });
+    });
+    assert!(ok, "a courtesy does not refuse a goodbye: {output}");
+    // The late transcript of the turn the goodbye answers, with nothing heard
+    // since the ask.
+    let (ok, output) = finish(&|l| {
+        l.oaiy(RealtimeEventKind::InputTranscript {
+            item_id: None,
+            text: "That is everything I needed for today".into(),
+        });
+    });
+    assert!(ok, "a late transcript of the turn before is not a new turn: {output}");
+    // The caller takes it up again.
+    let (ok, output) = finish(&|l| {
+        l.oaiy(RealtimeEventKind::SpeechStarted);
+        l.oaiy(RealtimeEventKind::InputTranscript {
+            item_id: None,
+            text: "Wait, I have another question".into(),
+        });
+    });
+    assert!(!ok, "a resumed turn refuses the goodbye: {output}");
+}

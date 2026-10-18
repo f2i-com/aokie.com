@@ -20,6 +20,11 @@
 # Nothing is installed and nothing is signed: the last lines say where OAIY Desktop looks for a plugin and that it
 # will ask you to trust this one, as it asks for any plugin that is not signed.
 #
+# AOKIE_BUNDLE_STRICT=1 (the release jobs and unix-bundle.yml set it): a bundle for others. Cargo builds --locked
+# (Cargo.lock as committed, nothing resolved anew), and anything the bundle should carry and does not (Realtek's
+# firmware that could not be fetched, AOKIE_FETCH_REALTEK=0) stops it, where a bundle for this computer only warns.
+# Either way the bundle is checked file by file before the script says it is laid out.
+#
 # Run on a Mac (Apple silicon, macOS 27; cmake from PyPI will do, with CMAKE_POLICY_VERSION_MINIMUM=3.5 for cmake 4).
 # What it does there that Linux cannot check: libusb is a .dylib, found by the plugin through its own folder
 # (crates/aokie-plugin/build.rs gives the program that run path).
@@ -30,6 +35,13 @@ repo=$(cd "$here/.." && pwd)
 out=${1:-"$repo/target/aokie-plugin-bundle"}
 features=${AOKIE_FEATURES-voice}
 target=${CARGO_TARGET_DIR:-"$repo/target"}
+strict=${AOKIE_BUNDLE_STRICT:-0}
+locked=""
+[ "$strict" = 1 ] && locked="--locked"
+fetch_realtek=${AOKIE_FETCH_REALTEK:-1}
+if [ "$fetch_realtek" != 1 ] && [ "$strict" = 1 ]; then
+  echo "AOKIE_FETCH_REALTEK=0 with AOKIE_BUNDLE_STRICT=1: a bundle for others carries Realtek's firmware"; exit 1
+fi
 
 case "$(uname -s)" in
   Darwin) data="$HOME/Library/Application Support/com.oaiy.app" ;;
@@ -121,9 +133,9 @@ fi
 cd "$repo"
 echo "building the plugin${features:+ (features: $features)}"
 if [ -n "$features" ]; then
-  cargo build --release -p aokie-plugin --features "$features" ${libusb_config:+--config "$libusb_config"}
+  cargo build $locked --release -p aokie-plugin --features "$features" ${libusb_config:+--config "$libusb_config"}
 else
-  cargo build --release -p aokie-plugin ${libusb_config:+--config "$libusb_config"}
+  cargo build $locked --release -p aokie-plugin ${libusb_config:+--config "$libusb_config"}
 fi
 
 rm -rf "$out"
@@ -189,8 +201,8 @@ fi
 # Realtek's RTL8761B (USB) firmware, its config and their licence (pinned, as scripts/fetch-realtek-firmware.ps1
 # pins them): Aokie loads them into such a dongle at each start (realtek.rs), which a phone does not see on its ROM
 # alone. Linux has them in /lib/firmware/rtl_bt already where linux-firmware is installed; a Mac has nowhere else.
-# AOKIE_FETCH_REALTEK=0: none.
-if [ "${AOKIE_FETCH_REALTEK:-1}" = 1 ]; then
+# AOKIE_FETCH_REALTEK=0: none (refused above for a strict bundle, which must carry them).
+if [ "$fetch_realtek" = 1 ]; then
   rtl_commit=afabaf773c4c2e2c841429933a6a084a5af4d14d
   mkdir -p "$out/firmware/rtl_bt"
   for entry in \
@@ -204,6 +216,7 @@ if [ "${AOKIE_FETCH_REALTEK:-1}" = 1 ]; then
     else
       rm -f "$dest"
       echo "Realtek's $path could not be fetched (no network?): an RTL8761B dongle runs its ROM, which phones do not see"
+      [ "$strict" = 1 ] && { echo "AOKIE_BUNDLE_STRICT=1: a bundle without it is not laid out"; exit 1; }
     fi
   done
 fi
@@ -219,9 +232,36 @@ done
 links=$(find "$out" -type l)
 [ -z "$links" ] || { echo "the bundle has links in it, which OAIY Desktop refuses to install: $links"; exit 1; }
 
+# The files the bundle carries beyond the manifest's, each there and not empty: the program and its manifest; on a
+# Mac libusb with its licence and source (LGPL-2.1: no bundle without them); Realtek's firmware where it was fetched
+# (and a strict bundle always fetches it). Any missing one stops the bundle here, never as a warning.
+required="aokie-plugin manifest.json"
+if [ -n "$libusb_config" ]; then
+  required="$required libusb-1.0.0.dylib third-party/libusb-$libusb_version/COPYING third-party/libusb-$libusb_version/AUTHORS"
+  required="$required third-party/libusb-$libusb_version/README.md third-party/libusb-$libusb_version/libusb-$libusb_version.tar.bz2"
+fi
+if [ "$fetch_realtek" = 1 ] && { [ "$strict" = 1 ] || [ -d "$out/firmware/rtl_bt" ]; }; then
+  for f in rtl8761bu_fw.bin rtl8761bu_config.bin LICENCE.rtlwifi_firmware.txt; do
+    if [ "$strict" = 1 ] || [ -f "$out/firmware/rtl_bt/$f" ]; then required="$required firmware/rtl_bt/$f"; fi
+  done
+fi
+for file in $required; do
+  [ -s "$out/$file" ] || { echo "MISSING from the bundle (or empty): $file"; missing=$((missing + 1)); }
+done
+[ "$missing" = 0 ] || exit 1
+
+# On a Mac: the oldest macOS every program and library in the bundle starts on (each one's LC_BUILD_VERSION minos;
+# the release notes say this one).
+if [ "$(uname -s)" = Darwin ]; then
+  macos_min=$(find "$out" -type f \( -perm +111 -o -name '*.dylib' \) -print | while IFS= read -r f; do
+    otool -l "$f" 2>/dev/null | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/ { c = 1 } c && ($1 == "minos" || $1 == "version") { print $2; c = 0 }'
+  done | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
+fi
+
 echo
 echo "the bundle: $out"
 echo "  $(find "$out" -type f | wc -l | tr -d ' ') files, $(du -sh "$out" | cut -f1 | tr -d ' '): no speech of Aokie's own (OAIY Voice hears and speaks), nothing to download"
+[ -n "${macos_min:-}" ] && echo "  macOS $macos_min or later (the newest any program or library in it asks for)"
 if [ "$(uname -s)" = Linux ]; then
   echo "  On Linux the plugin uses the system's libusb (libusb-1.0.so.0: Debian and Ubuntu's libusb-1.0-0, which a"
   echo "  desktop install has). Where it is missing the plugin does not start, and its log says which library."

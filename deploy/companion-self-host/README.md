@@ -36,8 +36,9 @@ Prerequisites:
 - `SIGNAL_HOST` and `TURN_HOST` A/AAAA records pointing at the host;
 - inbound TCP 80, 443, 3478 and 5349;
 - inbound UDP 3478;
-- inbound TCP and UDP for the configured relay range (49160-49200 by default),
-  with one-to-one port mapping;
+- inbound UDP for the configured relay range (49160-49200 by default), with
+  one-to-one port mapping (TCP relay allocations are disabled, so the TCP
+  mappings of that range carry nothing);
 - working Docker IPv6 plus routed/firewalled IPv6 before setting
   `TURN_EXTERNAL_IPV6` or publishing an AAAA record.
 
@@ -52,9 +53,23 @@ umask 077
 openssl rand -hex 32 > admission-hmac.txt
 openssl rand -hex 32 > lease-hmac.txt
 openssl rand -hex 32 > turn-rest.txt
-chmod 600 *.txt
+# Each container reads its secrets as its own unprivileged user, and Docker
+# mounts the files with their host owner and mode. Give each file to the
+# container that reads it: the gateway runs as uid 65532, coturn as the
+# image's nobody user, uid 65534.
+sudo chown 65532:65532 admission-hmac.txt lease-hmac.txt
+sudo chown 65534:65534 turn-rest.txt
+sudo chmod 0400 admission-hmac.txt lease-hmac.txt turn-rest.txt
 cd ..
 ```
+
+Without the `chown` the entrypoints stop with "secret is not readable" on a
+Linux host (Docker Desktop on a Mac or Windows hides the problem). To confirm
+coturn's uid for the pinned image, run
+`docker run --rm --entrypoint id coturn/coturn:4.14.0-r0`. With rootless
+Docker or `userns-remap`, chown to the host uid those container uids map to.
+Keep the copies the issuer needs in your secret manager, not by loosening
+these files.
 
 The example IPs/domains are documentation values and will not produce a usable
 deployment. Check config, build, then start:
@@ -69,8 +84,10 @@ curl --fail "https://${SIGNAL_HOST}/version"
 
 Expected `/version` invariants are `v2Enabled: true`,
 `v2DynamicAdmission: true`, `v2StaticAdmissionFallback: false`,
-`signallingOnly: true`, and `mediaBridge: false`. The gateway has no published
-container port; only Traefik reaches its private HTTP listener. Public
+`signallingOnly: true`, and `mediaBridge: false`. The public `/health`
+answers only `{"status":"ok"}`: it no longer counts connected Desktops and
+phones, which told anyone watching when the owner was online. The gateway has
+no published container port; only Traefik reaches its private HTTP listener. Public
 signalling is WSS at `wss://$SIGNAL_HOST/v2/realtime`; the edge exposes neither
 v1 realtime nor a generic command API.
 
@@ -166,7 +183,8 @@ encoding the claim:
   replay is rejected);
 - scopes are unique and least-privilege: `state_read`, `caller_read`,
   `captions_read`, `assistance_read`, `assistance_respond`, `monitor`,
-  `consult`, `takeover`, `resume_aokie`, `rtc_signal`.
+  `consult`, `takeover`, `end_caller`, `resume_aokie`, `rtc_signal`,
+  `participants_read`, `participant_identity_read`, `audio_levels_read`.
 
 Sign the exact JSON bytes with HMAC-SHA256. The bearer token is:
 
@@ -175,16 +193,23 @@ aokie-adm-v2.<lowercase hex of JSON bytes>.<lowercase hex HMAC>
 ```
 
 Clients send it as `Authorization: Bearer <token>` on the WSS upgrade. Never
-put admissions in query strings, discovery documents or logs. A managed
-FormLogic issuer should return the deployment's WSS URL and token from its
+put admissions or TURN credentials in query strings, discovery documents or
+logs: a discovery document is public, and TURN credentials in it would let
+anyone use this host as a relay. A managed FormLogic issuer should return the deployment's WSS URL and token from its
 authenticated Companion-admission endpoint; a custom issuer can return the
 same fields. Grant `consult` only when both deployed endpoints support it.
 
 ## Expiring TURN REST credentials
 
 The trusted issuer also reads the same bytes as `secrets/turn-rest.txt`. After
-authorization it chooses a short expiry (600 seconds is a useful default,
-never beyond coturn's 3600-second maximum allocation lifetime) and creates:
+authorization it chooses an expiry that outlasts the longest call it expects:
+12 hours is the reference default and 24 hours the maximum the Aokie endpoints
+accept. coturn checks the timestamp in the username on every authenticated
+request, including the refreshes that keep an allocation alive, so a call
+relayed with a 10-minute credential is cut about 10 minutes in; the endpoints
+do not yet restart ICE with fresh credentials mid-call. (`max-allocate-lifetime`
+only bounds one allocation's lifetime between refreshes.) The issuer then
+creates:
 
 ```text
 username   = <expiry Unix seconds>:<authorized device id>
@@ -257,8 +282,13 @@ token.
   authorized issuer. The lease secret never leaves the gateway.
 - Static v2 admissions are forcibly disabled by the image entrypoint. coturn
   uses time-limited REST auth, per-user/total quotas, bandwidth limits,
-  unauthorized-response rate limiting, no CLI/admin plane, and public-profile
-  peer deny ranges that block access to internal networks.
+  unauthorized-response rate limiting, no CLI/admin plane, no TCP relay
+  allocations, and public-profile peer deny ranges that block access to
+  internal networks.
+- coturn does not deny peers on the host's own public address: two endpoints
+  that both relay through this server reach each other there. A credential
+  holder can therefore send UDP to services listening on the public address,
+  so keep the host firewall closed to everything but the ports above.
 - Rate-limit the issuer per user/device/app, record issuance metadata (never
   tokens/secrets), and revoke the underlying device authorization. Tickets
   naturally expire; close active sockets when immediate revocation is needed.

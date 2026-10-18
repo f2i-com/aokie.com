@@ -165,19 +165,9 @@ pub(super) fn pump_audio_and_reply(
                                 // bridge tolerates a VAD-created response
                                 // during a pending tool, so the caller is
                                 // never met with a frozen, deaf line while
-                                // a lookup runs. The deferred buffer only
-                                // drains a residue left by an earlier
-                                // withholding build.
-                                let input_result = if !lane.deferred_input.is_empty() {
-                                    // Preserve old-before-new ordering and
-                                    // coalesce the catch-up into one bounded
-                                    // 100 ms command per incoming SCO frame.
-                                    lane.deferred_input.push(&cleaned, rate);
-                                    let chunk = lane.deferred_input.take_flush_chunk(rate);
-                                    lane.session.send_input(&chunk, rate)
-                                } else {
-                                    lane.session.send_input(&cleaned, rate)
-                                };
+                                // a lookup runs. (Nothing is withheld, so
+                                // there is no backlog to replay either.)
+                                let input_result = lane.session.send_input(&cleaned, rate);
                                 if let Err(error) = input_result {
                                     if let Some(owner) = lane.owner.clone() {
                                         input_failure =

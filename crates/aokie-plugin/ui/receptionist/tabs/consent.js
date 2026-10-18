@@ -276,6 +276,16 @@
    *  to. Generic loopback processing is local; the two exact Codex broker
    *  routes disclose their stable OpenAI destination instead of a local URL. */
   function uniqueDestinations() {
+    // The plugin says where the saved settings send call data (consent.get
+    // `destinations`), as it enforces it: this screen's own reading once
+    // knew two of the four Codex routes and one of the two Desktop ports, so
+    // the grant it issued missed what the plugin then refused. The reading
+    // below is only for an older plugin that does not say.
+    if (status && Array.isArray(status.destinations)) {
+      return status.destinations.filter(function (d) {
+        return typeof d === 'string' && d.length > 0;
+      });
+    }
     // (sttEndpoint and ttsEndpoint were Aokie's own speech servers: nothing
     // is sent to them now.)
     var keys = [
@@ -301,11 +311,47 @@
     return out;
   }
 
+  // The operator was told a call on the line would end, and pressed Accept
+  // again to go ahead.
+  var callWarned = false;
+
+  /** Accept: a grant without Bluetooth or transcription takes the phone line
+   *  down at once (the plugin stops the radio, which ends a call on it), so
+   *  with a call on the line that is said first, and a second press goes on. */
   function accept() {
     if (submitting) return;
+    var takesLineDown = !scopes.bluetooth || !scopes.transcription;
     submitting = true;
     error = null;
     render();
+    var liveCall =
+      takesLineDown && !callWarned
+        ? HOST.command('call.current').then(
+            function (d) {
+              var c = d && d.call;
+              return !!(c && c.state && c.state !== 'ended');
+            },
+            function () {
+              return false;
+            }
+          )
+        : Promise.resolve(false);
+    liveCall.then(function (live) {
+      if (live) {
+        submitting = false;
+        callWarned = true;
+        error =
+          'A call is on the line, and without ' + (!scopes.bluetooth ? 'the Bluetooth phone link' : 'live call transcription') +
+          ' the receptionist stops at once, which ends it. Press Accept & enforce again to go ahead, or wait for the call to end.';
+        render();
+        return;
+      }
+      callWarned = false;
+      issueAndEnforce();
+    });
+  }
+
+  function issueAndEnforce() {
     var grantScopes = {
       bluetooth: !!scopes.bluetooth,
       contacts: !!scopes.contacts,
@@ -320,25 +366,43 @@
       retentionDays: retentionDays,
       destinations: consentDestinations(),
     };
+    var issued = null;
     HOST.consent
       .issue({
         version: (status && status.requiredVersion) || 1,
         scopes: grantScopes,
         expiresDays: 365,
       })
-      .then(function () {
+      .then(function (result) {
+        issued = result || null;
         // Production posture from here on: enforcement, not warnings.
         return HOST.command('settings.set', { consentMode: 'enforce' });
       })
       .then(
-        function () {
-          HOST.toast(
-            'success',
-            'Consent recorded — enforcement is on; denied scopes are refused at the point of capture.'
-          );
+        function (saved) {
           wizardOpen = false;
           submitting = false;
-          return load();
+          // Recorded is not the same as running: the plugin may hold the
+          // line paused (a destination not granted, transcription denied on
+          // the OAIY route). Say which, from what it reports now.
+          var said = function (v) {
+            return v && typeof v.blocked === 'string' ? v.blocked.trim() : '';
+          };
+          var blockedNow = said(saved) || said(issued);
+          return load().then(function () {
+            var paused = (status && typeof status.blocked === 'string' && status.blocked) || blockedNow;
+            if (paused) {
+              HOST.toast(
+                'error',
+                'Consent recorded, but the phone line is paused: ' + paused + '. The receptionist answers no calls until this is resolved.'
+              );
+            } else {
+              HOST.toast(
+                'success',
+                'Consent recorded — enforcement is on; denied scopes are refused at the point of capture.'
+              );
+            }
+          });
         },
         function (e) {
           error = errMsg(e);
@@ -356,7 +420,10 @@
     var grant = s.grant || null;
     var enforced = s.mode === 'enforce';
     var destinationCurrent = false;
-    if (grant && grant.scopes) {
+    if (grant && typeof s.destinationsCovered === 'boolean') {
+      // The plugin's own verdict (consent.get), the one it enforces.
+      destinationCurrent = s.destinationsCovered;
+    } else if (grant && grant.scopes) {
       var granted = Array.isArray(grant.scopes.destinations) ? grant.scopes.destinations : [];
       var required = uniqueDestinations();
       destinationCurrent = true;
@@ -374,12 +441,15 @@
         }
       }
     }
+    // A radio paused for consent (`blocked`) needs action too: the badge
+    // read green, "Consent v3 · enforced", while the phone line was off.
     var needsAction =
       !grant ||
       grant.version !== s.requiredVersion ||
       !enforced ||
       !destinationCurrent ||
-      !!s.note;
+      !!s.note ||
+      !!s.blocked;
     return {
       grant: grant,
       enforced: enforced,

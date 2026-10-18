@@ -37,6 +37,10 @@ const MAX_CALLBACK_BYTES: usize = 16 * 1024;
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_ADMISSION_RESPONSE_BYTES: usize = 64 * 1024;
 const REFRESH_EARLY_SECONDS: u64 = 45;
+// The longest admission the server issues, and how far its clock may lead
+// this phone's when it stamps the absolute expiry.
+const MAX_ADMISSION_TTL_SECONDS: u64 = 300;
+const ADMISSION_CLOCK_SKEW_SECONDS: u64 = 30;
 #[cfg(target_os = "windows")]
 const KEYRING_SERVICE: &str = "Aokie Companion OAuth";
 const SESSION_INDEX_ACCOUNT: &str = "managed-session-active-v1";
@@ -58,22 +62,6 @@ const MANAGED_REQUESTED_SCOPES: &[&str] = &[
     "aokie:end_caller",
     "offline_access",
 ];
-const MANAGED_ADMISSION_GRANTS: &[&str] = &[
-    "state_read",
-    "caller_read",
-    "captions_read",
-    "assistance_read",
-    "assistance_respond",
-    "monitor",
-    "consult",
-    "takeover",
-    "resume_aokie",
-    "end_caller",
-    "rtc_signal",
-    "participants_read",
-    "participant_identity_read",
-    "audio_levels_read",
-];
 
 #[derive(Clone, Default)]
 pub struct ManagedAuthState {
@@ -89,6 +77,7 @@ struct ManagedSession {
     deployment_id: String,
     gateway_url: String,
     oauth_token_url: String,
+    oauth_revocation_url: Option<String>,
     oauth_resource: String,
     admission_endpoint: String,
     client_id: String,
@@ -229,14 +218,32 @@ pub(crate) struct ManagedForgetOutcome {
     pub(crate) remote_cleanup_succeeded: bool,
 }
 
+/// An OAuth token response, read as RFC 6749 §5.1 asks: members this build
+/// does not know are ignored, `scope` may be left out when it equals the
+/// request, and a refresh response may leave out `refresh_token` (the one we
+/// hold stays valid). Refusing either used to sign the person out AFTER the
+/// server had already rotated the refresh family.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 struct TokenResponse {
     access_token: String,
     token_type: String,
     expires_in: u64,
-    refresh_token: String,
-    scope: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+impl TokenResponse {
+    /// The scopes this response grants: its own `scope`, or the request's
+    /// when the server left it out.
+    fn granted_scopes(&self, requested: &[String]) -> Vec<String> {
+        match &self.scope {
+            Some(scope) => scope.split_ascii_whitespace().map(str::to_owned).collect(),
+            None => requested.to_vec(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,6 +322,91 @@ impl ManagedAuthState {
     async fn store_session(&self, session: ManagedSession) {
         let profile_id = session.profile_id.clone();
         self.sessions.lock().await.insert(profile_id, session);
+    }
+
+    /// Everything a push registration is bound to: the signed-in profile, its
+    /// deployment, app and OAuth device. The registration marker hashes this
+    /// with the provider token, so a new server, or a device the server
+    /// re-created, registers again instead of being skipped as done.
+    #[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
+    pub(crate) async fn active_registration_binding(
+        &self,
+        app: &AppHandle,
+    ) -> Result<Option<String>, String> {
+        let Some((app_id, oauth_device_id)) = self.active_binding(app).await? else {
+            return Ok(None);
+        };
+        let persisted = load_persisted_session(app)
+            .await?
+            .ok_or("managed sign-in disappeared while reading its binding")?;
+        if persisted.app_id != app_id
+            || persisted.oauth_device_id.as_deref() != Some(oauth_device_id.as_str())
+        {
+            return Err("managed sign-in changed while reading its binding".into());
+        }
+        Ok(Some(format!(
+            "{}\n{}\n{}\n{}\n{}",
+            persisted.discovery_url,
+            persisted.deployment_id,
+            persisted.profile_id,
+            app_id,
+            oauth_device_id
+        )))
+    }
+
+    /// Retire the session a sign-in to a DIFFERENT profile just replaced.
+    ///
+    /// Only one profile is ever restorable, so the replaced one can never be
+    /// used again: its push endpoint would keep alerting this phone from the
+    /// old server, and its refresh credential would sit orphaned in secure
+    /// storage. Everything here is best effort and never fails the new
+    /// sign-in.
+    async fn retire_replaced_session(
+        &self,
+        app: &AppHandle,
+        previous: PersistedSession,
+        current_refresh_account: &str,
+    ) {
+        let session = self.sessions.lock().await.remove(&previous.profile_id);
+        #[cfg(target_os = "android")]
+        {
+            let mut unregistered = false;
+            if let Some(mut session) = session.clone() {
+                if session.access_expires_at <= unix_now().unwrap_or(u64::MAX) {
+                    if let Ok(refreshed) = refresh_access_token(app, session.clone()).await {
+                        session = refreshed;
+                    }
+                }
+                if let Some(oauth_device_id) = session.oauth_device_id.clone() {
+                    let route = format!(
+                        "/api/aokie-companion/mobile/devices/{oauth_device_id}/push-endpoints/fcm"
+                    );
+                    if let Ok(url) = mobile_api_url(&session.oauth_resource, &route, &[]) {
+                        unregistered = send_mobile_api_request(
+                            &session,
+                            Method::DELETE,
+                            url,
+                            None,
+                            &[StatusCode::OK, StatusCode::NOT_FOUND],
+                        )
+                        .await
+                        .is_ok();
+                    }
+                }
+            }
+            if !unregistered {
+                // The old server may still hold this phone's FCM token. A new
+                // token makes the old endpoint dead whatever the server does;
+                // the push watcher registers the new token with the new server.
+                let _ = crate::android_runtime::invalidate_push_token(app).await;
+            }
+        }
+        if previous.refresh_account != current_refresh_account {
+            if let Some(session) = session.as_ref() {
+                revoke_refresh_in_background(app, session, &previous.refresh_account).await;
+            }
+            let _ = delete_refresh(app, &previous.refresh_account).await;
+        }
     }
 
     #[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
@@ -500,7 +592,10 @@ impl ManagedAuthState {
         if active {
             self.stop_push_watcher();
         }
-        self.sessions.lock().await.remove(profile_id);
+        let removed = self.sessions.lock().await.remove(profile_id);
+        if let Some(session) = removed.as_ref() {
+            revoke_refresh_in_background(app, session, refresh_account).await;
+        }
         let _ = delete_refresh(app, refresh_account).await;
         if active {
             let _ = delete_persisted_session(app).await;
@@ -710,14 +805,20 @@ pub(crate) async fn managed_authorize_profile(
     )
     .await?;
     validate_token_response(&token, &requested_scopes)?;
+    // `offline_access` was requested, so the first exchange must issue one.
+    let issued_refresh = token
+        .refresh_token
+        .as_deref()
+        .ok_or("OAuth sign-in did not issue a refresh credential")?;
     let refresh_account = refresh_account(&discovery, &device_id)?;
-    store_refresh(app, &refresh_account, &token.refresh_token).await?;
+    store_refresh(app, &refresh_account, issued_refresh).await?;
     let now = unix_now()?;
     let session = ManagedSession {
         profile_id: profile_id.clone(),
         deployment_id: discovery.deployment_id.clone(),
         gateway_url: discovery.gateway_url.clone().expect("validated gateway"),
         oauth_token_url: discovery.oauth_token_url.clone(),
+        oauth_revocation_url: discovery.oauth_revocation_url.clone(),
         oauth_resource: discovery
             .oauth_resource
             .clone()
@@ -730,16 +831,19 @@ pub(crate) async fn managed_authorize_profile(
         app_id: selected_app_id.clone(),
         device_id: device_id.clone(),
         oauth_device_id: None,
+        scopes: token.granted_scopes(&requested_scopes),
         access_token: token.access_token,
         access_expires_at: now.saturating_add(token.expires_in),
-        scopes: token
-            .scope
-            .split_ascii_whitespace()
-            .map(str::to_owned)
-            .collect(),
         discovery_relay_only: discovery.relay_only,
         refresh_account: refresh_account.clone(),
     };
+    // The sign-in this one replaces, if it was for a different profile. A
+    // read failure only means nothing is retired.
+    let replaced = load_persisted_session(app)
+        .await
+        .ok()
+        .flatten()
+        .filter(|previous| previous.profile_id != profile_id);
     state.store_session(session).await;
     let persisted = PersistedSession {
         schema_version: 2,
@@ -761,6 +865,15 @@ pub(crate) async fn managed_authorize_profile(
     }
     let config = connect_config(&discovery, selected_app_id, device_id, profile_id);
     drop(_lifecycle);
+    if let Some(previous) = replaced {
+        let state = state.clone();
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            state
+                .retire_replaced_session(&app, previous, &refresh_account)
+                .await;
+        });
+    }
     state.start_push_watcher(app);
     Ok(config)
 }
@@ -816,6 +929,7 @@ pub(crate) async fn managed_restore_profile(
         deployment_id: persisted.deployment_id.clone(),
         gateway_url: discovery.gateway_url.clone().expect("validated gateway"),
         oauth_token_url: discovery.oauth_token_url.clone(),
+        oauth_revocation_url: discovery.oauth_revocation_url.clone(),
         oauth_resource: discovery
             .oauth_resource
             .clone()
@@ -1175,22 +1289,92 @@ async fn refresh_access_token(
     validate_token_response(&token, &session.scopes)?;
     // Public-client refresh rotation retires the old token server-side. The
     // new token must reach Credential Manager before it becomes authoritative
-    // in memory; a storage failure is surfaced immediately.
-    if store_refresh(app, &session.refresh_account, &token.refresh_token)
-        .await
-        .is_err()
-    {
-        let _ = delete_refresh(app, &session.refresh_account).await;
-        return Err("managed refresh rotation could not be persisted; sign in again".into());
+    // in memory; a storage failure is surfaced immediately. A server that did
+    // not rotate leaves out `refresh_token`, and the one we hold stays valid.
+    if let Some(rotated) = token.refresh_token.as_deref() {
+        if store_refresh(app, &session.refresh_account, rotated)
+            .await
+            .is_err()
+        {
+            let _ = delete_refresh(app, &session.refresh_account).await;
+            return Err("managed refresh rotation could not be persisted; sign in again".into());
+        }
     }
+    session.scopes = token.granted_scopes(&session.scopes);
     session.access_token = token.access_token;
     session.access_expires_at = unix_now()?.saturating_add(token.expires_in);
-    session.scopes = token
-        .scope
-        .split_ascii_whitespace()
-        .map(str::to_owned)
-        .collect();
     Ok(session)
+}
+
+/// Revoke a refresh credential at the server (RFC 7009) when signed discovery
+/// named a revocation endpoint. It runs in the background and never blocks or
+/// fails the local forget, which deletes the credential either way. Without
+/// an advertised endpoint nothing is sent: guessing one would hand the token
+/// to whatever answers there.
+async fn revoke_refresh_in_background(
+    app: &AppHandle,
+    session: &ManagedSession,
+    refresh_account: &str,
+) {
+    let Some(url) = session.oauth_revocation_url.clone() else {
+        return;
+    };
+    let Ok(Some(refresh)) = load_refresh(app, refresh_account).await else {
+        return;
+    };
+    let client_id = session.client_id.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(message) = revoke_token(&url, &refresh, &client_id).await {
+            eprintln!("[AokieCompanion][oauth] refresh revocation failed: {message}");
+        }
+    });
+}
+
+async fn revoke_token(url: &str, token: &str, client_id: &str) -> Result<(), String> {
+    let client = native_client()?;
+    let response = client
+        .post(url)
+        .header("accept", "application/json")
+        .form(&[
+            ("token", token),
+            ("token_type_hint", "refresh_token"),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await
+        .map_err(|_| "OAuth revocation endpoint is unavailable")?;
+    // RFC 7009 §2.2: a revoked or already-invalid token both answer 200.
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "OAuth revocation endpoint returned HTTP {}",
+            response.status()
+        ))
+    }
+}
+
+/// Delete the refresh credential a forgotten server profile left behind.
+///
+/// The profile may never have been restored in this process, so it is found
+/// by the same name `refresh_account` gives it. The active sign-in's
+/// credential is never touched here, and an unreadable active sign-in means
+/// nothing is deleted.
+pub(crate) async fn forget_profile_refresh(
+    app: &AppHandle,
+    deployment_id: &str,
+    issuer_origin: &str,
+    device_id: &str,
+) -> Result<(), String> {
+    let account = refresh_account_name(deployment_id, issuer_origin, device_id)?;
+    let active = load_persisted_session(app).await?;
+    if active
+        .as_ref()
+        .is_some_and(|persisted| persisted.refresh_account == account)
+    {
+        return Ok(());
+    }
+    delete_refresh(app, &account).await
 }
 
 async fn token_request(url: &str, form: &[(&str, &str)]) -> Result<TokenResponse, String> {
@@ -1219,24 +1403,28 @@ async fn token_request(url: &str, form: &[(&str, &str)]) -> Result<TokenResponse
 }
 
 fn validate_token_response(token: &TokenResponse, allowed_scopes: &[String]) -> Result<(), String> {
-    if token.token_type != "Bearer"
+    let refresh_valid = token.refresh_token.as_ref().is_none_or(|refresh| {
+        refresh.len() >= 16
+            && refresh.len() <= MAX_TOKEN_BYTES
+            && !refresh.chars().any(char::is_control)
+    });
+    // The token type is case-insensitive (RFC 6749 §5.1).
+    if !token.token_type.eq_ignore_ascii_case("Bearer")
         || token.access_token.len() < 16
         || token.access_token.len() > MAX_TOKEN_BYTES
         || token.access_token.chars().any(char::is_control)
-        || token.refresh_token.len() < 16
-        || token.refresh_token.len() > MAX_TOKEN_BYTES
-        || token.refresh_token.chars().any(char::is_control)
+        || !refresh_valid
         || token.expires_in == 0
         || token.expires_in > 3_600
     {
         return Err("OAuth token response contains invalid credentials or expiry".into());
     }
-    let scopes: Vec<_> = token.scope.split_ascii_whitespace().collect();
+    let scopes = token.granted_scopes(allowed_scopes);
     if scopes.is_empty()
         || scopes
             .iter()
             .any(|scope| !allowed_scopes.iter().any(|allowed| allowed == scope))
-        || !scopes.contains(&"aokie:state")
+        || !scopes.iter().any(|scope| scope == "aokie:state")
     {
         return Err("OAuth token response contains unexpected scopes".into());
     }
@@ -1307,12 +1495,13 @@ async fn request_admission(
         .map_err(|_| AdmissionFailure::Other("managed admission response is invalid".into()))?;
     let ice_servers = validate_admission(session, &admission, holder_key_thumbprint)
         .map_err(AdmissionFailure::Other)?;
+    let now = unix_now().map_err(AdmissionFailure::Other)?;
     Ok(ManagedAdmission {
         oauth_device_id: admission.device.id.clone(),
         expected_peer_key_thumbprint: admission.expected_peer_key_thumbprint,
         gateway_url: admission.gateway_url,
         access_token: admission.access_token,
-        expires_at: admission.expires_at,
+        expires_at: local_admission_expiry(now, admission.expires_in, admission.expires_at),
         ice_servers,
         relay_only: admission.relay_only,
         grants: admission_grants(&admission.scopes),
@@ -1320,6 +1509,14 @@ async fn request_admission(
         // failed admission, and never so as to fail one.
         relay: admission.relay.and_then(usable_relay_endpoints),
     })
+}
+
+/// The admission's expiry on THIS phone's clock, which every refresh deadline
+/// is measured against. `expiresIn` is relative and so free of clock skew;
+/// `expiresAt` is the server's absolute stamp. The earlier of the two is never
+/// later than the real expiry, whichever clock leads.
+fn local_admission_expiry(now: u64, expires_in: u64, expires_at: u64) -> u64 {
+    now.saturating_add(expires_in).min(expires_at)
 }
 
 async fn read_admission_body(
@@ -1381,9 +1578,13 @@ fn validate_admission(
         || admission.access_token.len() < 16
         || admission.access_token.len() > MAX_TOKEN_BYTES
         || admission.expires_in == 0
-        || admission.expires_in > 300
+        || admission.expires_in > MAX_ADMISSION_TTL_SECONDS
         || admission.expires_at <= now
-        || admission.expires_at > now.saturating_add(300)
+        // `expiresAt` is stamped by the server's clock: one that leads this
+        // phone's by a second used to make every full-length admission look
+        // too long-lived.
+        || admission.expires_at
+            > now.saturating_add(MAX_ADMISSION_TTL_SECONDS + ADMISSION_CLOCK_SKEW_SECONDS)
         || admission.gateway_url != session.gateway_url
         || admission.app_id != session.app_id
         || admission.subject_id != session.device_id
@@ -1414,12 +1615,17 @@ fn validate_admission(
     {
         return Err("managed admission device record is inconsistent".into());
     }
+    // A grant name this build does not know comes from a newer server; it is
+    // dropped (see `admission_grants`) rather than failing the admission and
+    // with it every not-yet-updated phone. Names must still be well-formed
+    // and bounded, and `state_read` is still required.
     if admission.scopes.is_empty()
+        || admission.scopes.len() > 64
         || !admission.scopes.iter().any(|grant| grant == "state_read")
         || admission
             .scopes
             .iter()
-            .any(|grant| !MANAGED_ADMISSION_GRANTS.contains(&grant.as_str()))
+            .any(|grant| validate_id(grant, "admission grant").is_err())
     {
         return Err("managed admission contains invalid grants".into());
     }
@@ -1502,22 +1708,23 @@ fn normalize_relay_url(raw: &str, label: &str) -> Result<Url, String> {
 
 /// Map the admission's granted scopes onto the protocol enum.
 ///
-/// [`validate_admission`] has already refused anything outside
-/// [`MANAGED_ADMISSION_GRANTS`], so an unmapped name cannot reach here; it is
-/// dropped rather than guessed at, because a grant this build does not know is
-/// a capability it cannot honour anyway.
+/// A name this build does not know (a newer server's grant) is dropped rather
+/// than guessed at: it is a capability this build cannot honour anyway, and
+/// refusing the whole admission over it would strand every phone that has not
+/// updated yet. Repeats collapse to one.
 fn admission_grants(scopes: &[String]) -> Vec<Grant> {
-    scopes
-        .iter()
-        .filter_map(|scope| {
-            serde_json::from_value::<Grant>(serde_json::Value::String(scope.clone())).ok()
-        })
-        .collect()
+    let mut grants = Vec::with_capacity(scopes.len());
+    for grant in scopes.iter().filter_map(|scope| Grant::from_wire(scope)) {
+        if !grants.contains(&grant) {
+            grants.push(grant);
+        }
+    }
+    grants
 }
 
 fn native_client() -> Result<reqwest::Client, String> {
     crate::native_init::ensure_https_ready()?;
-    reqwest::Client::builder()
+    crate::discovery::endpoint_client_settings(reqwest::Client::builder())
         .redirect(Policy::none())
         .timeout(HTTP_TIMEOUT)
         .build()
@@ -1679,9 +1886,17 @@ fn mobile_failure_message(error: MobileHttpFailure) -> String {
 }
 
 fn refresh_account(discovery: &DiscoveryDocument, device_id: &str) -> Result<String, String> {
-    let issuer = Url::parse(&discovery.issuer).map_err(|_| "verified issuer became invalid")?;
+    refresh_account_name(&discovery.deployment_id, &discovery.issuer, device_id)
+}
+
+fn refresh_account_name(
+    deployment_id: &str,
+    issuer: &str,
+    device_id: &str,
+) -> Result<String, String> {
+    let issuer = Url::parse(issuer).map_err(|_| "verified issuer became invalid")?;
     let host = issuer.host_str().ok_or("verified issuer omitted host")?;
-    let account = format!("{}:{host}:{device_id}", discovery.deployment_id);
+    let account = format!("{deployment_id}:{host}:{device_id}");
     if account.len() > 512 || account.chars().any(char::is_control) {
         return Err("managed refresh account is invalid".into());
     }
@@ -1692,12 +1907,10 @@ fn refresh_account(discovery: &DiscoveryDocument, device_id: &str) -> Result<Str
 async fn native_store_put(_app: &AppHandle, account: &str, value: &str) -> Result<(), String> {
     let account = account.to_owned();
     let value = value.to_owned();
+    // Split across several credentials when longer than one holds: a refresh
+    // token may reach 16 KiB, a Windows credential 1,280 UTF-16 units.
     tauri::async_runtime::spawn_blocking(move || {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
-            .map_err(|error| format!("Credential Manager entry: {error}"))?;
-        entry
-            .set_password(&value)
-            .map_err(|error| format!("Credential Manager write: {error}"))
+        crate::endpoint_identity::windows_credential_put(KEYRING_SERVICE, &account, &value)
     })
     .await
     .map_err(|_| "Credential Manager write task failed".to_string())?
@@ -1717,13 +1930,7 @@ async fn native_store_put(_app: &AppHandle, _account: &str, _value: &str) -> Res
 async fn native_store_get(_app: &AppHandle, account: &str) -> Result<Option<String>, String> {
     let account = account.to_owned();
     tauri::async_runtime::spawn_blocking(move || {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
-            .map_err(|error| format!("Credential Manager entry: {error}"))?;
-        match entry.get_password() {
-            Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(format!("Credential Manager read: {error}")),
-        }
+        crate::endpoint_identity::windows_credential_get(KEYRING_SERVICE, &account)
     })
     .await
     .map_err(|_| "Credential Manager read task failed".to_string())?
@@ -1743,12 +1950,7 @@ async fn native_store_get(_app: &AppHandle, _account: &str) -> Result<Option<Str
 async fn native_store_delete(_app: &AppHandle, account: &str) -> Result<(), String> {
     let account = account.to_owned();
     tauri::async_runtime::spawn_blocking(move || {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
-            .map_err(|error| format!("Credential Manager entry: {error}"))?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(format!("Credential Manager delete: {error}")),
-        }
+        crate::endpoint_identity::windows_credential_delete(KEYRING_SERVICE, &account)
     })
     .await
     .map_err(|_| "Credential Manager delete task failed".to_string())?
@@ -2021,10 +2223,14 @@ mod tests {
             admission_grants(&["state_read".into(), "monitor".into()]),
             vec![Grant::StateRead, Grant::Monitor]
         );
-        // validate_admission already refuses unknown grants; an unmapped name
-        // is dropped rather than guessed at.
+        // A name this build does not know is dropped rather than guessed at,
+        // and a repeat collapses.
         assert_eq!(
-            admission_grants(&["state_read".into(), "not_a_grant".into()]),
+            admission_grants(&[
+                "state_read".into(),
+                "not_a_grant".into(),
+                "state_read".into()
+            ]),
             vec![Grant::StateRead]
         );
     }
@@ -2044,8 +2250,8 @@ mod tests {
             access_token: "a".repeat(32),
             token_type: "Bearer".into(),
             expires_in: 600,
-            refresh_token: "r".repeat(32),
-            scope: "aokie:state aokie:takeover".into(),
+            refresh_token: Some("r".repeat(32)),
+            scope: Some("aokie:state aokie:takeover".into()),
         };
         assert!(validate_token_response(&token, &["aokie:state".into()]).is_err());
     }
@@ -2056,10 +2262,63 @@ mod tests {
             access_token: format!("{}\n", "a".repeat(31)),
             token_type: "Bearer".into(),
             expires_in: 600,
-            refresh_token: "r".repeat(32),
-            scope: "aokie:state".into(),
+            refresh_token: Some("r".repeat(32)),
+            scope: Some("aokie:state".into()),
         };
         assert!(validate_token_response(&token, &["aokie:state".into()]).is_err());
+    }
+
+    #[test]
+    fn token_responses_are_read_leniently_as_rfc_6749_asks() {
+        let requested: Vec<String> = vec!["aokie:state".into(), "offline_access".into()];
+        // Unknown members are ignored, the token type is case-insensitive, and
+        // a refresh may leave out both `refresh_token` and `scope`.
+        let token: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "a".repeat(32),
+            "token_type": "bearer",
+            "expires_in": 600,
+            "id_token": "ignored",
+            "refresh_expires_in": 86_400
+        }))
+        .unwrap();
+        validate_token_response(&token, &requested).unwrap();
+        assert_eq!(token.refresh_token, None);
+        assert_eq!(token.granted_scopes(&requested), requested);
+
+        // A present but unsafe refresh token is still refused.
+        let token: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "a".repeat(32),
+            "token_type": "Bearer",
+            "expires_in": 600,
+            "refresh_token": "short",
+            "scope": "aokie:state"
+        }))
+        .unwrap();
+        assert!(validate_token_response(&token, &requested).is_err());
+
+        // A granted scope still narrows the session, and must be a subset.
+        let token: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "a".repeat(32),
+            "token_type": "Bearer",
+            "expires_in": 600,
+            "refresh_token": "r".repeat(32),
+            "scope": "aokie:state"
+        }))
+        .unwrap();
+        validate_token_response(&token, &requested).unwrap();
+        assert_eq!(
+            token.granted_scopes(&requested),
+            vec!["aokie:state".to_owned()]
+        );
+    }
+
+    #[test]
+    fn admission_expiry_tolerates_a_server_clock_that_leads_ours() {
+        let now = 1_800_000_000;
+        // The server's absolute stamp is the earlier bound when its clock
+        // trails ours, the relative lifetime when it leads.
+        assert_eq!(local_admission_expiry(now, 300, now + 302), now + 300);
+        assert_eq!(local_admission_expiry(now, 300, now + 290), now + 290);
     }
 
     #[test]
@@ -2139,6 +2398,7 @@ mod tests {
             deployment_id: "deployment_shared".into(),
             gateway_url: "wss://issuer-a.example/v2/realtime".into(),
             oauth_token_url: "https://issuer-a.example/oauth/token".into(),
+            oauth_revocation_url: None,
             oauth_resource: "https://issuer-a.example".into(),
             admission_endpoint: "https://issuer-a.example/admission".into(),
             client_id: "aokie-companion".into(),
@@ -2201,6 +2461,7 @@ mod tests {
             deployment_id: "deployment_1".into(),
             gateway_url: "wss://formlogic.example/realtime".into(),
             oauth_token_url: "https://formlogic.example/oauth/token".into(),
+            oauth_revocation_url: None,
             oauth_resource: "https://formlogic.example".into(),
             admission_endpoint: "https://formlogic.example/admission".into(),
             client_id: "aokie-companion".into(),
@@ -2216,9 +2477,9 @@ mod tests {
             discovery_relay_only: false,
             refresh_account: "deployment:app_1:device_1".into(),
         };
-        let grants = MANAGED_ADMISSION_GRANTS
+        let grants = Grant::ALL
             .iter()
-            .map(|grant| (*grant).to_owned())
+            .map(|grant| grant.as_str().to_owned())
             .collect::<Vec<_>>();
         let mut admission = AdmissionResponse {
             access_token: "b".repeat(32),
@@ -2258,8 +2519,28 @@ mod tests {
         admission.relay_only = true;
         assert!(validate_admission(&session, &admission, "mobile_key_thumbprint_1").is_err());
         admission.relay_only = false;
-        admission.scopes.push("dongle_control".into());
-        admission.device.grants.push("dongle_control".into());
+        // A server a little ahead of this phone stamps a full-length
+        // admission past `now + 300`; that is clock skew, not a bad token.
+        admission.expires_in = 300;
+        admission.expires_at = now + 300 + 5;
+        validate_admission(&session, &admission, "mobile_key_thumbprint_1").unwrap();
+        admission.expires_at = now + 300 + ADMISSION_CLOCK_SKEW_SECONDS + 1;
+        assert!(validate_admission(&session, &admission, "mobile_key_thumbprint_1").is_err());
+        admission.expires_at = now;
+        assert!(validate_admission(&session, &admission, "mobile_key_thumbprint_1").is_err());
+        admission.expires_in = 120;
+        admission.expires_at = now + 120;
+        // A grant this build does not know (a newer server's) is dropped,
+        // not fatal; a malformed one, or a list without state_read, still is.
+        admission.scopes.push("notes_read".into());
+        admission.device.grants.push("notes_read".into());
+        validate_admission(&session, &admission, "mobile_key_thumbprint_1").unwrap();
+        assert_eq!(admission_grants(&admission.scopes), Grant::ALL.to_vec());
+        admission.scopes.push("bad grant".into());
+        admission.device.grants.push("bad grant".into());
+        assert!(validate_admission(&session, &admission, "mobile_key_thumbprint_1").is_err());
+        admission.scopes = vec!["monitor".into()];
+        admission.device.grants = vec!["monitor".into()];
         assert!(validate_admission(&session, &admission, "mobile_key_thumbprint_1").is_err());
     }
 

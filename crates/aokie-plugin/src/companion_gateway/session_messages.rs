@@ -17,9 +17,14 @@ impl GatewaySession {
         // A relay peer is not the gateway.
         //
         // On the socket every frame was minted by trusted gateway
-        // infrastructure, so a protocol violation means this session is
-        // genuinely broken and tearing it down is the correct fail-closed
-        // response. On the relay the frame was posted by an
+        // infrastructure, so an identity, schema or signature violation means
+        // this session is genuinely broken and tearing it down is the correct
+        // fail-closed response. The ordinary races of a multi-device call (a
+        // peer that just closed, an old ICE generation, a claim that lost to
+        // another owner, a late or replayed proof) are not violations: they
+        // are refused frame by frame (`WorkerError::refused`) so one device
+        // cannot drop every other device's peers or end an active takeover.
+        // On the relay the frame was posted by an
         // approved-but-untrusted Companion; honouring its content as a
         // lifecycle signal hands any roster member a one-frame kill switch.
         //
@@ -54,7 +59,25 @@ impl GatewaySession {
         match envelope.kind.as_str() {
             "claim_proposal" => {
                 let notice: LeaseNotice = parse_gateway_frame(encoded)?;
-                self.handle_claim_proposal(notice, media, radio, None)
+                match self.handle_claim_proposal(notice.clone(), media, radio, None) {
+                    Err(error) if error.is_refusal() => {
+                        eprintln!(
+                            "[aokie-plugin][takeover] stage=claim_refused device={} call={} fence={} detail={}",
+                            sanitize_gateway_code(&notice.device_id),
+                            sanitize_gateway_code(&notice.lease.call_id),
+                            notice.lease.fence,
+                            sanitize_status_message(&error.message)
+                        );
+                        // Answer the gateway so it releases this one claimant
+                        // and tells its device why, instead of the device
+                        // waiting out a claim nobody will decide.
+                        Ok(self
+                            .claim_rejection(&notice, &error.message, media, radio)
+                            .into_iter()
+                            .collect())
+                    }
+                    other => other,
+                }
             }
             "lease_granted" => {
                 let notice: LeaseNotice = parse_gateway_frame(encoded)?;
@@ -74,7 +97,7 @@ impl GatewaySession {
             "rtc_signal" => {
                 let frame: PluginRtcSignalFrame = parse_gateway_frame(encoded)?;
                 frame.validate_routed_mobile().map_err(|_| {
-                    WorkerError::reconnect("Companion RTC signal failed contract validation")
+                    WorkerError::refused("Companion RTC signal failed contract validation")
                 })?;
                 self.handle_rtc_signal(frame, media, radio)?;
                 Ok(Vec::new())
@@ -82,7 +105,7 @@ impl GatewaySession {
             "assistance_answer" => {
                 let frame: PluginAssistanceAnswerFrame = parse_gateway_frame(encoded)?;
                 frame.validate().map_err(|_| {
-                    WorkerError::reconnect("Companion assistance answer is invalid")
+                    WorkerError::refused("Companion assistance answer is invalid")
                 })?;
                 if frame.app_id != self.app_id {
                     return Err(WorkerError::rebootstrap(
@@ -102,19 +125,19 @@ impl GatewaySession {
                     || remote.remote_revision != frame.remote_revision
                     || radio.switchboard_revision() != frame.switchboard_revision
                 {
-                    return Err(WorkerError::reconnect(
+                    return Err(WorkerError::refused(
                         "Companion assistance answer failed consent or call fencing",
                     ));
                 }
                 self.assistance.accept(frame).map_err(|_| {
-                    WorkerError::reconnect("Companion assistance answer was refused")
+                    WorkerError::refused("Companion assistance answer was refused")
                 })?;
                 Ok(Vec::new())
             }
             "plugin_microphone_mute" => {
                 let frame: PluginMicrophoneMuteFrame = parse_gateway_frame(encoded)?;
                 frame.validate().map_err(|_| {
-                    WorkerError::reconnect("Companion microphone command is invalid")
+                    WorkerError::refused("Companion microphone command is invalid")
                 })?;
                 if frame.app_id != self.app_id {
                     return Err(WorkerError::rebootstrap(
@@ -196,7 +219,7 @@ impl GatewaySession {
             "end_caller_execute" => {
                 let frame: PluginEndCallerExecuteFrame = parse_gateway_frame(encoded)?;
                 frame.validate().map_err(|_| {
-                    WorkerError::reconnect("Companion caller-ending command is invalid")
+                    WorkerError::refused("Companion caller-ending command is invalid")
                 })?;
                 self.handle_end_caller_execute(frame, radio)
             }
@@ -208,15 +231,84 @@ impl GatewaySession {
                     &notice.message,
                     &notice.request_id,
                 );
-                Err(WorkerError::reconnect(format!(
-                    "Companion gateway reported {}",
+                if !gateway_error_is_per_request(&notice.code) {
+                    return Err(WorkerError::reconnect(format!(
+                        "Companion gateway reported {}",
+                        sanitize_gateway_code(&notice.code)
+                    )));
+                }
+                // The gateway refused one frame this plugin sent about one
+                // device's lease or request, and keeps the socket open (a
+                // fatal refusal is always followed by its close). Reconnecting
+                // would drop every other device for nothing.
+                eprintln!(
+                    "[aokie-plugin][companion] stage=gateway_refused code={}",
                     sanitize_gateway_code(&notice.code)
-                )))
+                );
+                if notice.code == "stale_claim" {
+                    // The claim this plugin decided no longer exists at the
+                    // gateway, so the caller must not stay on soft hold for a
+                    // takeover that will never be granted.
+                    if let Some(lease_id) = self
+                        .prepared
+                        .as_ref()
+                        .filter(|prepared| prepared.decision_sent)
+                        .map(|prepared| prepared.provisional.lease_id.clone())
+                    {
+                        self.revoke_relay_lease_by_id(&lease_id, "gateway_stale_claim", media);
+                    }
+                }
+                Ok(Vec::new())
             }
-            _ => Err(WorkerError::reconnect(
-                "Companion gateway sent an unsupported frame",
-            )),
+            _ => {
+                if let Some(kind) = aokie_protocol::v2::unknown_frame_kind(encoded) {
+                    // A newer gateway's frame. Ignoring it grants nothing;
+                    // ending the session over it would strand this build.
+                    eprintln!(
+                        "[aokie-plugin][companion] stage=unknown_frame_ignored kind={}",
+                        sanitize_gateway_code(&kind)
+                    );
+                    return Ok(Vec::new());
+                }
+                Err(WorkerError::reconnect(
+                    "Companion gateway sent an unsupported frame",
+                ))
+            }
         }
+    }
+
+    /// The `claim_decision` that refuses one proposed claim, or `None` when it
+    /// cannot be stated (no request id to answer).
+    pub(super) fn claim_rejection(
+        &self,
+        notice: &LeaseNotice,
+        detail: &str,
+        media: &RemoteMediaHandle,
+        radio: &RadioHandle,
+    ) -> Option<String> {
+        let request_id = notice.request_id.clone()?;
+        let reason = aokie_protocol::text::sanitize_line(
+            &format!("Aokie Desktop refused the claim: {detail}"),
+            200,
+        );
+        let decision = PluginClaimDecisionFrame {
+            kind: "claim_decision".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: self.app_id.clone(),
+            request_id,
+            device_id: notice.device_id.clone(),
+            call_id: notice.lease.call_id.clone(),
+            call_epoch: notice.lease.call_epoch,
+            fence: notice.lease.fence,
+            accepted: false,
+            media_ready: false,
+            confirmed_owner_epoch: notice.lease.owner_epoch,
+            switchboard_revision: radio.switchboard_revision(),
+            remote_revision: media.snapshot().remote_revision,
+            reason: Some(reason),
+        };
+        decision.validate().ok()?;
+        serde_json::to_string(&decision).ok()
     }
 
     /// Everything a Companion posts directly to this plugin over the relay.
@@ -1380,4 +1472,23 @@ impl GatewaySession {
         );
         vec![encoded_status]
     }
+}
+
+/// Gateway error codes that refuse one plugin frame about one lease, claim or
+/// request while the socket stays open. Anything else (a code this build does
+/// not know, or one that names the whole connection) still reconnects.
+pub(super) fn gateway_error_is_per_request(code: &str) -> bool {
+    matches!(
+        code,
+        "stale_claim"
+            | "stale_lease"
+            | "stale_state"
+            | "stale_request"
+            | "stale_assistance"
+            | "stale_end_caller_result"
+            | "stale_offer"
+            | "invalid_lease"
+            | "consent_required"
+            | "assistance_pending"
+    )
 }

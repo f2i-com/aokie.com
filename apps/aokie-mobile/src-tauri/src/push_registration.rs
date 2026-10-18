@@ -204,11 +204,19 @@ pub(crate) async fn reconcile_android_fcm(
         .ok_or("FCM registration token is pending")?;
     validate_provider_token(&token)?;
     let fingerprint = token_fingerprint(&token);
-    if crate::android_runtime::secure_store_get(app, ANDROID_FCM_REGISTRATION_KEY)
+    let binding = auth
+        .active_registration_binding(app)
         .await?
-        .as_deref()
-        == Some(fingerprint.as_str())
-    {
+        .ok_or("managed sign-in is required for push registration")?;
+    let marker = registration_marker(&fingerprint, &binding);
+    // The marker only saves a repeat registration. An unreadable one (the
+    // store now reports read errors instead of "absent") is treated as
+    // missing: registering again is harmless and rewrites it, while
+    // failing here would never register this phone at all.
+    let recorded = crate::android_runtime::secure_store_get(app, ANDROID_FCM_REGISTRATION_KEY)
+        .await
+        .unwrap_or(None);
+    if recorded.as_deref() == Some(marker.as_str()) {
         return Ok(());
     }
     let registered = register_managed_push_endpoint(
@@ -220,9 +228,27 @@ pub(crate) async fn reconcile_android_fcm(
         None,
     )
     .await?;
-    // The marker is only a SHA-256 fingerprint. The token remains in Android
+    if registered != fingerprint {
+        return Err("push registration answered for a different provider token".into());
+    }
+    // The marker is only a SHA-256 digest. The token remains in Android
     // Keystore and never crosses a renderer command or event.
-    crate::android_runtime::secure_store_put(app, ANDROID_FCM_REGISTRATION_KEY, &registered).await
+    crate::android_runtime::secure_store_put(app, ANDROID_FCM_REGISTRATION_KEY, &marker).await
+}
+
+/// What the registration marker records: this provider token registered
+/// with THIS server, deployment, profile, app and OAuth device. A marker of
+/// the token alone made a sign-in to another server, or a device the server
+/// re-created, look already registered, so background calls never alerted.
+/// Markers written by earlier builds (the bare fingerprint) never match, so
+/// each phone registers once more after the update.
+fn registration_marker(token_fingerprint: &str, binding: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"aokie/push-registration-marker/v2\0");
+    digest.update(token_fingerprint.as_bytes());
+    digest.update(b"\0");
+    digest.update(binding.as_bytes());
+    format!("v2:{:x}", digest.finalize())
 }
 
 fn endpoint_route(oauth_device_id: &str, kind: NativePushKind) -> Result<String, String> {
@@ -325,6 +351,26 @@ mod tests {
         assert_eq!(encoded["token"], token);
         assert_eq!(fingerprint.len(), 64);
         assert!(!fingerprint.contains(token));
+    }
+
+    #[test]
+    fn the_registration_marker_changes_with_the_server_or_device_not_only_the_token() {
+        let fingerprint = token_fingerprint("provider-token-that-stays-native");
+        let server_a = "https://a.example/.well-known/aokie-companion\ndeployment_1\nprofile_a\napp_1\noauth_device_1";
+        let server_b = "https://b.example/.well-known/aokie-companion\ndeployment_2\nprofile_b\napp_1\noauth_device_1";
+        let recreated = "https://a.example/.well-known/aokie-companion\ndeployment_1\nprofile_a\napp_1\noauth_device_2";
+        let marker = registration_marker(&fingerprint, server_a);
+        assert_eq!(marker, registration_marker(&fingerprint, server_a));
+        assert_ne!(marker, registration_marker(&fingerprint, server_b));
+        assert_ne!(marker, registration_marker(&fingerprint, recreated));
+        assert_ne!(
+            marker,
+            registration_marker(&token_fingerprint("a-rotated-provider-token"), server_a)
+        );
+        // An earlier build's marker (the bare fingerprint) never matches, and
+        // the marker reveals neither the token nor the binding.
+        assert_ne!(marker, fingerprint);
+        assert!(!marker.contains("oauth_device_1") && !marker.contains(&fingerprint));
     }
 
     #[test]

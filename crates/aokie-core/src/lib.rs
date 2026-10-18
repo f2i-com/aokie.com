@@ -1,8 +1,11 @@
 //! # aokie-core
 //!
 //! Tauri-free native foundation shared by the other Aokie crates
-//! (`aokie-bluetooth`, `aokie-dongle`, `aokie-audio`, `aokie-db`) and,
-//! later, the FormLogic Desktop plugin (`crates/aokie-plugin`).
+//! (`aokie-bluetooth`, `aokie-dongle`, `aokie-winbt`) and the FormLogic
+//! Desktop plugin (`crates/aokie-plugin`). Only what one of them uses is
+//! kept here: the legacy app's consent record, retention config, crash
+//! log, model-verify cache, API-key store and time stretch were never
+//! linked by the plugin and are gone.
 //!
 //! These modules were lifted verbatim out of the legacy Aokie Tauri
 //! app (`aokie-desktop/src-tauri/src`); the only edits made while
@@ -15,21 +18,15 @@
 //! code-level path/attribute reference in any source file. (Prose
 //! mentions of Tauri are fine; the guard matches the code tokens only.)
 
-pub mod consent;
-pub mod crashlog;
 pub mod dongle_catalog;
 pub mod dpapi;
 // The Mac's and Linux's half of `dpapi`: the cipher is tested on every system, the key store is theirs.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub mod keychain_seal;
 pub mod events;
-pub mod model_verify_cache;
 pub mod paths;
 pub mod redact;
-pub mod retention;
-pub mod secrets;
 pub mod speech;
-pub mod time_stretch;
 pub mod url_classification;
 
 /// CI-style guard: this crate must stay tauri-free so downstream

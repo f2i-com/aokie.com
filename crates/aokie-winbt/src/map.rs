@@ -271,7 +271,7 @@ impl MapLoop {
             self.seed_attempts,
             epoch_secs_now(),
         );
-        for handle in to_fetch {
+        for (at, handle) in to_fetch.iter().cloned().enumerate() {
             let msg_out = self.with_mas(
                 phone,
                 Operation::GetMessage {
@@ -280,15 +280,23 @@ impl MapLoop {
                     charset: map_mas::CHARSET_UTF8,
                 },
             );
-            let bytes = match msg_out {
-                Ok(OperationOutput::Message(bytes)) => bytes,
-                Ok(other) => return Err(format!("get-message op returned {other:?}")),
+            let failure = match msg_out {
+                Ok(OperationOutput::Message(bytes)) => Ok(bytes),
+                Ok(other) => Err(format!("get-message op returned {other:?}")),
+                Err(e) => Err(e),
+            };
+            let bytes = match failure {
+                Ok(bytes) => bytes,
                 Err(e) => {
-                    // Un-see the handle so the NEXT poll retries the
-                    // fetch — the dongle re-queues fetches across stall
-                    // recoveries for the same reason (a stranded customer
-                    // reply must not be lost to one transient failure).
-                    self.seen_handles.remove(&handle);
+                    // Un-see this handle AND every one after it, so the
+                    // NEXT poll retries them — the dongle re-queues fetches
+                    // across stall recoveries for the same reason (a
+                    // stranded customer reply must not be lost to one
+                    // transient failure). Only this one was un-seen before:
+                    // the rest of the batch was marked seen, never fetched.
+                    for left in &to_fetch[at..] {
+                        self.seen_handles.remove(left);
+                    }
                     return Err(e);
                 }
             };

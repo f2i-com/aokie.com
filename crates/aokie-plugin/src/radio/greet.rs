@@ -288,7 +288,10 @@ pub(super) fn play_tone_and_greet(
             }
             if let Some(expected) = screened_owner.as_ref() {
                 match remote_media.with_aokie_owner(expected, || {
-                    tracker.note_intent(crate::call_session::TerminationIntent::AgentHangup);
+                    // Screened, not a handled call: the record says the rule
+                    // ended it (`screened`), so after-call flows do not take
+                    // a blocked caller for a customer (it read agent_hangup).
+                    tracker.note_intent(crate::call_session::TerminationIntent::Screened);
                     bt.flush_tx_audio();
                     bt.hangup()
                 }) {
