@@ -10907,7 +10907,7 @@ mod tests {
         plugin
             .dispatch_command(
                 "settings.set",
-                &json!({"consentMode": "warn", "allowedNumbers": "+61 432 602 110\n0400 111 222", "textsAllowedOnly": true}),
+                &json!({"consentMode": "warn", "allowedNumbers": "+61 491 570 156\n0400 111 222", "textsAllowedOnly": true}),
                 &mut sink,
             )
             .unwrap();
@@ -10924,7 +10924,7 @@ mod tests {
         let ev = sms_refusal_event(&sink, "msg-other-1");
         assert_eq!(ev["data"]["reason"], json!(err.message));
         // A listed number gets as far as it did before: there is no radio here.
-        for (to, id) in [("0432 602 110", "msg-listed-1"), ("+61400111222", "msg-listed-2")] {
+        for (to, id) in [("0491 570 156", "msg-listed-1"), ("+61400111222", "msg-listed-2")] {
             let err = plugin
                 .dispatch_command("sms.send", &json!({"to": to, "body": "Hello", "messageId": id}), &mut sink)
                 .unwrap_err();

@@ -525,10 +525,10 @@ mod tests {
     #[test]
     fn the_allowed_list_answers_its_numbers_and_leaves_or_refuses_the_rest() {
         use std::time::Duration;
-        let p = allowing(policy("", None, false), "+61 400 111 222\n0432 602 110", true);
+        let p = allowing(policy("", None, false), "+61 400 111 222\n0491 570 156", true);
         assert!(p.is_active());
         assert!(p.is_allowed(Some("0400111222")));
-        assert!(p.is_allowed(Some("+61432602110")));
+        assert!(p.is_allowed(Some("+61491570156")));
         assert!(!p.is_allowed(Some("0283901963")));
         assert!(!p.is_allowed(None));
         let now = Duration::ZERO;

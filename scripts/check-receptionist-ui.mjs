@@ -282,7 +282,7 @@ for (const [greeting, name, said] of [
   assert.match(shortList, /These match nobody: 123\./);
   assert.match(shortList, /These may miss the caller: 9876 5432\./);
   assert.match(settings.formFor({ ...oaiyBag, allowedNumbers: '0400 111 222' }), /id="set-allowed-short"[^>]* hidden/);
-  assert.equal(settings.shortAllowedText('+61 432 602 110, +61 421 285 243'), '');
+  assert.equal(settings.shortAllowedText('+61 491 570 156, +61 491 570 157'), '');
   // The "changed outside this form" notice: only when the greeting or brief
   // changed under it, never for a bare version bump (any other tab's write).
   assert.equal(settings.noticeAfterBump(false), '');
