@@ -129,9 +129,9 @@ mod tests {
 
     #[test]
     fn address_round_trips_dongle_style() {
-        assert_eq!(format_address(0x04C8B0E13FF3), "02:5A:1C:77:88:99");
-        assert_eq!(parse_address("02:5A:1C:77:88:99"), Some(0x04C8B0E13FF3));
-        assert_eq!(parse_address("04c8b0e13ff3"), Some(0x04C8B0E13FF3));
+        assert_eq!(format_address(0x025A1C778899), "02:5A:1C:77:88:99");
+        assert_eq!(parse_address("02:5A:1C:77:88:99"), Some(0x025A1C778899));
+        assert_eq!(parse_address("025a1c778899"), Some(0x025A1C778899));
         assert_eq!(parse_address("not an address"), None);
         assert_eq!(parse_address("04:C8:B0"), None);
     }
