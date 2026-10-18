@@ -133,7 +133,7 @@ function AokieMark({ compact = false }: { compact?: boolean }) {
 }
 
 function AppHeader({ eyebrow, title, action }: { eyebrow?: string; title: string; action?: ReactNode }) {
-  return <header className="app-header"><div>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<h1>{title}</h1></div>{action ?? <button className="avatar-button" aria-label="Open profile">LB</button>}</header>;
+  return <header className="app-header"><div>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<h1>{title}</h1></div>{action ?? <button className="avatar-button" aria-label="Open profile">ST</button>}</header>;
 }
 
 function HomeScreen({ state, dispatch }: { state: PrototypeState; dispatch: AppDispatch }) {
