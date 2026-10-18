@@ -1774,7 +1774,7 @@ pub(super) fn service_realtime_lane(
                         {
                             // The session connected at RING with the
                             // global persona/greeting; the personalize-
-                            // caller overlay ("Hi Lance!") usually lands
+                            // caller overlay ("Hi Sam!") usually lands
                             // between ring and answer. Begin carries the
                             // freshest call-scoped values so the spoken
                             // greeting is the personalized one.

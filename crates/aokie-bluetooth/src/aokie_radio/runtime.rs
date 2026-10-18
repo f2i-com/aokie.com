@@ -3573,7 +3573,7 @@ fn run_runtime(
                     } else if *cstatus == 0 && *link_type == hci::LINK_TYPE_ACL {
                         active_acl_handle = Some(*connection_handle);
                         // Ask the phone for its friendly name/model so Device
-                        // Setup can show "Lance's Pixel 8" instead of a bare
+                        // Setup can show "Sam's Pixel 8" instead of a bare
                         // MAC (disambiguates multiple bonded phones). Best
                         // effort — a failure just leaves the address showing.
                         // Clear any stale name from a previous peer first.
@@ -7190,18 +7190,18 @@ mod tests {
         status.connected.store(true, Ordering::Relaxed);
         status.call_active.store(true, Ordering::Relaxed);
         if let Ok(mut a) = status.addresses.write() {
-            a.remote = "04:C8:B0:E1:3F:F3".to_string();
+            a.remote = "02:5A:1C:77:88:99".to_string();
             a.remote_name = Some("Pixel".to_string());
         }
         assert_eq!(
             mark_transport_down(&status, &tx).as_deref(),
-            Some("04:C8:B0:E1:3F:F3"),
+            Some("02:5A:1C:77:88:99"),
             "the lost phone is the one the next run pages back"
         );
         assert_eq!(
             rx.try_recv().ok(),
             Some(RuntimeEvent::DeviceDisconnected(
-                "04:C8:B0:E1:3F:F3".to_string()
+                "02:5A:1C:77:88:99".to_string()
             ))
         );
         assert!(!status.initialized.load(Ordering::Relaxed));
@@ -7228,7 +7228,7 @@ mod tests {
             .unwrap();
         control_tx
             .send(ControlCommand::Connect {
-                address: "04:C8:B0:E1:3F:F3".to_string(),
+                address: "02:5A:1C:77:88:99".to_string(),
                 reply: reply_tx,
             })
             .unwrap();

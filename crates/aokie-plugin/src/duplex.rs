@@ -880,7 +880,7 @@ mod tests {
             "no",
             "yeah",
             "do you open on Saturdays",
-            "it's Lance",
+            "it's Sam",
             "",
             "   ",
         ] {

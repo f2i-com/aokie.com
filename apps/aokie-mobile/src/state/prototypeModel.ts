@@ -133,7 +133,7 @@ function stateForScenario(scenario: Scenario): Pick<
         scenario,
         serviceMode: "human_active",
         viewerMode: "talker",
-        talkOwner: { kind: "user", userId: "lance", deviceId: "iphone-15" },
+        talkOwner: { kind: "user", userId: "sam", deviceId: "iphone-15" },
         pendingStep: 4,
         recoveryCountdown: 3,
         callEnded: false,
@@ -283,7 +283,7 @@ export function prototypeReducer(state: PrototypeState, action: PrototypeAction)
           scenario: "human",
           serviceMode: "human_active",
           viewerMode: "talker",
-          talkOwner: { kind: "user", userId: "lance", deviceId: "iphone-15" },
+          talkOwner: { kind: "user", userId: "sam", deviceId: "iphone-15" },
           pendingStep: 4,
           toast: "You are live to the caller.",
         };

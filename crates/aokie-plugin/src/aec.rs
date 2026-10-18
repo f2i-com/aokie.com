@@ -112,7 +112,7 @@ impl EchoCanceller {
             if !echo_active {
                 // When Aokie is silent there is no echo to remove. Applying
                 // the residual gate here erased quiet consonants: a controlled
-                // Parakeet test changed "Lance" to "Lan". Keep the original
+                // Parakeet test changed "Liam" to "Lia". Keep the original
                 // microphone samples, including soft word endings and onsets.
                 out.extend_from_slice(&rec);
             } else if self.raw_floor > 0.0 && frame_rms(&rec) < self.raw_floor {

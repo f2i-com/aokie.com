@@ -39,7 +39,7 @@ struct StoredLinkKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_sealed: Option<String>,
     key_type: u8,
-    /// The device's user-friendly name / model (e.g. "Lance's Pixel 8"),
+    /// The device's user-friendly name / model (e.g. "Sam's Pixel 8"),
     /// captured via HCI Remote Name Request on connection. NOT a credential
     /// (plaintext), so the "avoid confusion between multiple phones" list can
     /// show it. `None` for records bonded before this field existed (serde
@@ -359,32 +359,32 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let mut store = AokiePairingStore::load(&path).unwrap();
-        store.put("04:c8:b0:e1:3f:f3", [0x11; 16], 0x05).unwrap();
+        store.put("02:5a:1c:77:88:99", [0x11; 16], 0x05).unwrap();
         // No name yet → the list shows the bare address.
         assert_eq!(store.list_devices()[0].name, None);
 
         // Capture the name (Remote Name Request result); it persists.
         assert!(store
-            .set_name("04:C8:B0:E1:3F:F3", "Lance's Pixel 8")
+            .set_name("02:5A:1C:77:88:99", "Sam's Pixel 8")
             .unwrap());
         // A redundant set is a no-op (never rewrites the file).
         assert!(!store
-            .set_name("04:c8:b0:e1:3f:f3", "Lance's Pixel 8")
+            .set_name("02:5a:1c:77:88:99", "Sam's Pixel 8")
             .unwrap());
         // Naming an unbonded device is a no-op, not an error.
         assert!(!store.set_name("aa:bb:cc:dd:ee:ff", "Ghost").unwrap());
 
         let reloaded = AokiePairingStore::load(&path).unwrap();
         let dev = &reloaded.list_devices()[0];
-        assert_eq!(dev.address, "04:C8:B0:E1:3F:F3");
-        assert_eq!(dev.name.as_deref(), Some("Lance's Pixel 8"));
+        assert_eq!(dev.address, "02:5A:1C:77:88:99");
+        assert_eq!(dev.name.as_deref(), Some("Sam's Pixel 8"));
 
         // Re-pairing the SAME phone keeps its name.
         let mut reloaded = reloaded;
-        reloaded.put("04:C8:B0:E1:3F:F3", [0x22; 16], 0x06).unwrap();
+        reloaded.put("02:5A:1C:77:88:99", [0x22; 16], 0x06).unwrap();
         assert_eq!(
             reloaded.list_devices()[0].name.as_deref(),
-            Some("Lance's Pixel 8"),
+            Some("Sam's Pixel 8"),
             "a re-bond must not blank the captured name"
         );
 

@@ -159,7 +159,7 @@ describe("server-backed Companion workspace", () => {
     expect(html).toContain("mic/speaker endpoint");
     expect(html).not.toContain("Mia");
     expect(html).not.toContain("Coastal Auto Care");
-    expect(html).not.toContain("Lance");
+    expect(html).not.toContain("Sam Taylor");
   });
 
   it("persists an assistance card with the server-provided question", () => {

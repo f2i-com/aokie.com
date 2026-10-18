@@ -468,7 +468,7 @@ pub fn create_connection_command(
 }
 
 /// HCI Remote Name Request (Core Spec v5.4 Vol 4 Part E §7.1.19): ask a
-/// reachable device for its user-friendly name (e.g. "Lance's Pixel 8"). We
+/// reachable device for its user-friendly name (e.g. "Sam's Pixel 8"). We
 /// issue this right after a phone's ACL comes up so the Device Setup UI can
 /// show the phone MODEL instead of a bare MAC — the `RemoteNameRequestComplete`
 /// event carries the name back. Page-scan-repetition-mode R1 + unknown clock
@@ -1550,11 +1550,11 @@ mod tests {
 
     #[test]
     fn create_connection_command_packs_address_and_defaults_in_le_order() {
-        let bytes = create_connection_command_default("04:C8:B0:CB:B9:D1").unwrap();
+        let bytes = create_connection_command_default("02:5A:1C:44:55:66").unwrap();
         // Opcode 0x0405 little-endian, then param length 13.
         assert_eq!(&bytes[0..3], &[0x05, 0x04, 0x0d]);
         // BD_ADDR is reversed for the wire: lowest byte first.
-        assert_eq!(&bytes[3..9], &[0xd1, 0xb9, 0xcb, 0xb0, 0xc8, 0x04]);
+        assert_eq!(&bytes[3..9], &[0x66, 0x55, 0x44, 0x1c, 0x5a, 0x02]);
         // Packet type 0xCC18 little-endian.
         assert_eq!(&bytes[9..11], &[0x18, 0xcc]);
         // Page Scan Repetition Mode R1.
@@ -1569,11 +1569,11 @@ mod tests {
 
     #[test]
     fn remote_name_request_command_packs_address_and_defaults() {
-        let bytes = remote_name_request_command("04:C8:B0:E1:3F:F3").unwrap();
+        let bytes = remote_name_request_command("02:5A:1C:77:88:99").unwrap();
         // Opcode 0x0419 little-endian, then param length 10.
         assert_eq!(&bytes[0..3], &[0x19, 0x04, 0x0a]);
         // BD_ADDR little-endian.
-        assert_eq!(&bytes[3..9], &[0xf3, 0x3f, 0xe1, 0xb0, 0xc8, 0x04]);
+        assert_eq!(&bytes[3..9], &[0x99, 0x88, 0x77, 0x1c, 0x5a, 0x02]);
         assert_eq!(bytes[9], 0x01); // PSRM R1
         assert_eq!(bytes[10], 0x00); // reserved
         assert_eq!(&bytes[11..13], &[0x00, 0x00]); // clock offset unknown
@@ -1592,11 +1592,11 @@ mod tests {
 
     #[test]
     fn switch_role_command_packs_address_and_role_byte() {
-        let bytes = switch_role_command("04:C8:B0:CB:B9:D1", 0x01).unwrap();
+        let bytes = switch_role_command("02:5A:1C:44:55:66", 0x01).unwrap();
         // Opcode 0x080b little-endian, then param length 7.
         assert_eq!(&bytes[0..3], &[0x0b, 0x08, 0x07]);
         // BD_ADDR reversed for the wire.
-        assert_eq!(&bytes[3..9], &[0xd1, 0xb9, 0xcb, 0xb0, 0xc8, 0x04]);
+        assert_eq!(&bytes[3..9], &[0x66, 0x55, 0x44, 0x1c, 0x5a, 0x02]);
         // Role byte: 0x01 = become slave.
         assert_eq!(bytes[9], 0x01);
     }

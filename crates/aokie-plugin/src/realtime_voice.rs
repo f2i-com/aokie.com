@@ -2764,7 +2764,7 @@ mod tests {
         );
 
         let appointment = parse_server_text(
-            r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"tool_appointment","name":"request_appointment","arguments":{"callerName":"Lance","service":"Lawn mowing","date":"2026-07-22","time":"10:00","agreementPhrase":"Wednesday at 10."}}"#,
+            r#"{"type":"formlogic.realtime.tool_call","callId":"call_1","generation":7,"toolCallId":"tool_appointment","name":"request_appointment","arguments":{"callerName":"Sam","service":"Lawn mowing","date":"2026-07-22","time":"10:00","agreementPhrase":"Wednesday at 10."}}"#,
             "call_1",
             7,
             "https://api.openai.com",
@@ -2778,7 +2778,7 @@ mod tests {
                 tool_call_id: "tool_appointment".into(),
                 name: "request_appointment".into(),
                 arguments: serde_json::json!({
-                    "callerName": "Lance",
+                    "callerName": "Sam",
                     "service": "Lawn mowing",
                     "date": "2026-07-22",
                     "time": "10:00",

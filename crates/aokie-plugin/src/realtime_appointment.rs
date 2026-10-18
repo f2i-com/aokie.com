@@ -697,7 +697,7 @@ mod tests {
 
     fn lance_request() -> Value {
         json!({
-            "callerName": "Lance",
+            "callerName": "Sam",
             "service": "Lawn mowing",
             "date": "2026-07-22",
             "time": "10:00",
@@ -713,13 +713,13 @@ mod tests {
             Some((6, "I'll be Wednesday at 10 o'clock.")),
             &[
                 "Hi, I'd like to make an appointment, please.".into(),
-                "Lawn mowing, my name is Lance as well.".into(),
+                "Lawn mowing, my name is Sam as well.".into(),
                 "I'll be Wednesday at 10 o'clock.".into(),
             ],
             day(),
         )
         .unwrap();
-        assert_eq!(request.caller_name, "Lance");
+        assert_eq!(request.caller_name, "Sam");
         assert_eq!(request.date, "2026-07-22");
         assert_eq!(request.time, "10:00");
         assert_eq!(request.agreement_turn, 6);
@@ -732,7 +732,7 @@ mod tests {
         // A live call (Sun 11 Oct 2026): the caller cancels Thursday's and asks for Friday at 10 in one turn, then
         // agrees. Two weekdays in that turn read as "Thursday or Friday" and the booking was refused.
         let sunday = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
-        let request = json!({"callerName": "Lance", "service": "Lawn mowing", "date": "2026-10-16", "time": "10:00", "agreementPhrase": "Yes, please, that'd be great actually."});
+        let request = json!({"callerName": "Sam", "service": "Lawn mowing", "date": "2026-10-16", "time": "10:00", "agreementPhrase": "Yes, please, that'd be great actually."});
         let history = [
             "Hi, I'd like to make a lawn mowing appointment, please.".to_string(),
             "Actually, I'd like to cancel my other appointment, which was on the Thursday at 2pm and make it a Friday at 10am.".to_string(),
@@ -829,7 +829,7 @@ mod tests {
         // call_051404a179974eb59f6685b0011db6aa turn 12: refused live with
         // "not a clear appointment agreement" before slot proposals counted.
         let tomorrow = json!({
-            "callerName": "Lance",
+            "callerName": "Sam",
             "service": "Lawn mowing",
             "date": "2026-07-21",
             "time": "10:00",
@@ -847,7 +847,7 @@ mod tests {
 
         // Turn 14: "book one" was outside the needle list.
         let thursday = json!({
-            "callerName": "Lance",
+            "callerName": "Sam",
             "service": "Lawn mowing",
             "date": "2026-07-23",
             "time": "10:00",
@@ -868,7 +868,7 @@ mod tests {
         // The provider quotes its own hearing; the trusted transcript comes
         // from a different transcription model. Formatting must not refuse.
         let request = json!({
-            "callerName": "Lance",
+            "callerName": "Sam",
             "service": "Lawn mowing",
             "date": "2026-07-22",
             "time": "10:00",
@@ -885,7 +885,7 @@ mod tests {
 
         // A fragment of the turn is an acceptable quote.
         let fragment = json!({
-            "callerName": "Lance",
+            "callerName": "Sam",
             "service": "Lawn mowing",
             "date": "2026-07-22",
             "time": "10:00",
@@ -902,7 +902,7 @@ mod tests {
 
         // Words the caller never said still fail closed.
         let fabricated = json!({
-            "callerName": "Lance",
+            "callerName": "Sam",
             "service": "Lawn mowing",
             "date": "2026-07-22",
             "time": "10:00",
@@ -1020,7 +1020,7 @@ mod tests {
     fn relative_day_phrases_validate_against_the_resolved_date() {
         // day() is Monday 2026-07-20: "this Thursday" resolves to 2026-07-23.
         let request = json!({
-            "callerName": "Lance",
+            "callerName": "Sam",
             "service": "Lawn mowing",
             "date": "2026-07-23",
             "time": "14:00",
@@ -1037,7 +1037,7 @@ mod tests {
 
         // The wrong weekday for the resolved date still fails closed.
         let mut wrong = json!({
-            "callerName": "Lance",
+            "callerName": "Sam",
             "service": "Lawn mowing",
             "date": "2026-07-24",
             "time": "14:00",
@@ -1066,7 +1066,7 @@ mod tests {
     #[test]
     fn availability_exploration_stays_read_only() {
         let exploration = json!({
-            "callerName": "Lance",
+            "callerName": "Sam",
             "service": "Lawn mowing",
             "date": "2026-07-22",
             "time": "10:00",
@@ -1082,7 +1082,7 @@ mod tests {
         .is_err());
 
         let anything = json!({
-            "callerName": "Lance",
+            "callerName": "Sam",
             "service": "Lawn mowing",
             "date": "2026-07-22",
             "time": "10:00",
@@ -1163,7 +1163,7 @@ mod tests {
         // the agent read the exact slot back and the caller said "Yeah.".
         let request = validate_with_readback(
             &json!({
-                "callerName": "Lance",
+                "callerName": "Sam",
                 "service": "Lawn mowing",
                 "date": "2026-07-30",
                 "time": "15:00",
@@ -1190,7 +1190,7 @@ mod tests {
     fn an_affirmation_without_a_slot_readback_never_books() {
         assert!(validate_with_readback(
             &json!({
-                "callerName": "Lance",
+                "callerName": "Sam",
                 "service": "Lawn mowing",
                 "date": "2026-07-30",
                 "time": "15:00",
@@ -1214,7 +1214,7 @@ mod tests {
         // The tool asks for 4 PM but the agent only ever read back 3 PM.
         assert!(validate_with_readback(
             &json!({
-                "callerName": "Lance",
+                "callerName": "Sam",
                 "service": "Lawn mowing",
                 "date": "2026-07-30",
                 "time": "16:00",
@@ -1238,7 +1238,7 @@ mod tests {
         // service often scrolls past three turns of date/time fragments.
         let request = validate(
             &json!({
-                "callerName": "Lance",
+                "callerName": "Sam",
                 "service": "Lawn mowing",
                 "date": "2026-07-30",
                 "time": "15:00",

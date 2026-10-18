@@ -30,7 +30,7 @@ fn realtime_appointment_request_is_minimal_essential_and_durable() {
     let mut sink = crate::event_bridge::VecSink::default();
     let request = crate::realtime_appointment::ValidatedAppointmentRequest {
         request_id: "appt_0123456789abcdef0123456789abcdef".into(),
-        caller_name: "Lance".into(),
+        caller_name: "Sam".into(),
         service: "Lawn mowing".into(),
         date: "2026-07-22".into(),
         time: "10:00".into(),
@@ -2721,7 +2721,7 @@ fn unfinished_number_heuristic() {
     // Finished turns must flush immediately — no added latency.
     assert!(!ends_with_unfinished_number("I'd like to book a haircut"));
     assert!(!ends_with_unfinished_number("yes that's right"));
-    assert!(!ends_with_unfinished_number("my name is Lance"));
+    assert!(!ends_with_unfinished_number("my name is Sam"));
     assert!(!ends_with_unfinished_number(""));
     assert!(!ends_with_unfinished_number("   "));
     // A word after the digits releases the hold.

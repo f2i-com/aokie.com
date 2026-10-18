@@ -122,7 +122,7 @@ pub(super) fn play_tone_and_greet(
                 // agent's reply to that turn already opened the call, and
                 // a greeting after it is a SECOND hello (live call
                 // 2122425933: generic reply-greeting at turn 2, then the
-                // late overlay's "Hi Lance!" greeting at turn 3). Any
+                // late overlay's "Hi Sam!" greeting at turn 3). Any
                 // assistant turn in this call's history means the
                 // conversation is underway — mark greeted, never speak.
                 #[cfg(feature = "voice")]
@@ -343,7 +343,7 @@ pub(super) fn play_tone_and_greet(
             // Phase 3 manager line: a manager-number caller is greeted AS
             // the manager line, beating the personalize overlay's customer
             // greeting (live call 085ce239: the restored Customers record
-            // made the overlay greet the manager with 'Hi Lance! …').
+            // made the overlay greet the manager with 'Hi Sam! …').
             let manager_line = tracker
                 .current()
                 .filter(|s| s.id == corr && !s.outbound)

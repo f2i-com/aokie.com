@@ -831,10 +831,10 @@ mod tests {
                 "We open at nine, ten on Sundays.",
             ]
         );
-        // Short openers ("Hi Lance, ...") never split at the comma.
+        // Short openers ("Hi Sam, ...") never split at the comma.
         assert_eq!(
-            chunks("Hi Lance, welcome back to the diner today!", 3),
-            vec!["Hi Lance, welcome back to the diner today!"]
+            chunks("Hi Sam, welcome back to the diner today!", 3),
+            vec!["Hi Sam, welcome back to the diner today!"]
         );
         // Digits around ':' / ',' stay intact.
         assert_eq!(

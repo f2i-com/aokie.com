@@ -6478,11 +6478,11 @@ mod tests {
         let mut settings = Map::new();
         settings.insert(
             "greeting".to_string(),
-            json!("G'day, you've reached Lance."),
+            json!("G'day, you've reached Sam."),
         );
         assert_eq!(
             greeting_from_settings(&settings).as_deref(),
-            Some("G'day, you've reached Lance.")
+            Some("G'day, you've reached Sam.")
         );
     }
 

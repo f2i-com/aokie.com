@@ -98,7 +98,7 @@ export const callHistory = [
 ];
 
 export const teamMembers = [
-  { id: "lance", initials: "LB", name: "Lance Baker", role: "Owner", status: "Available", group: "Primary", alert: true },
+  { id: "sam", initials: "ST", name: "Sam Taylor", role: "Owner", status: "Available", group: "Primary", alert: true },
   { id: "priya", initials: "PS", name: "Priya Shah", role: "Supervisor", status: "Available", group: "Primary", alert: true },
   { id: "jordan", initials: "JL", name: "Jordan Lee", role: "Receptionist", status: "Quiet until 6:30 pm", group: "Primary", alert: true },
   { id: "mei", initials: "MC", name: "Mei Chen", role: "Advisor", status: "Help requests", group: "Escalation", alert: true },

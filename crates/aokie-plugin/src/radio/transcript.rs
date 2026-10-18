@@ -493,8 +493,8 @@ mod echo_response_tests {
     }
     #[test]
     fn still_rejects_verbatim_leaked_speech() {
-        assert!(looks_like_echo("Can you hear me clearly?", "Hi Lance. Can you hear me clearly?"));
-        assert!(looks_like_echo("I'm calling to test our outbound conversation", "Hi Lance. I'm calling to test our outbound conversation. Can you hear me clearly?"));
+        assert!(looks_like_echo("Can you hear me clearly?", "Hi Sam. Can you hear me clearly?"));
+        assert!(looks_like_echo("I'm calling to test our outbound conversation", "Hi Sam. I'm calling to test our outbound conversation. Can you hear me clearly?"));
         assert!(!looks_like_echo("yeah", "yeah"));
     }
 }
