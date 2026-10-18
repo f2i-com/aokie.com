@@ -2441,6 +2441,34 @@ fn auto_answer_waits_one_ring_for_personalization() {
     assert!(!hold_auto_answer(true, true, D3::from_millis(100)));
 }
 
+/// Who takes a call to us that still rings, for OAIY's session: the
+/// receptionist only when she will answer it (auto-answer on, the screening
+/// and the allowed list say answer, the consent grant current), or the owner
+/// handed it to her in Aokie. Decided once the number is known or the answer
+/// stopped waiting for one; the owner's ring and the expiry come first.
+#[cfg(feature = "voice")]
+#[test]
+fn a_ringing_call_is_the_receptionists_only_when_she_will_answer_it() {
+    use crate::screen::RingAction::{Answer, Leave, Refuse, Wait};
+    use RingResponder::{Owner, Receptionist, Screened, Undecided};
+    // (action, auto_answer, consent_expired, handed_over, screened, identity_known, id_wait_over)
+    let r = ring_responder;
+    assert_eq!(r(Answer, true, false, false, false, true, false), Receptionist, "the number is known: at once");
+    assert_eq!(r(Answer, true, false, false, false, false, false), Undecided, "a number may still come");
+    assert_eq!(r(Answer, true, false, false, false, false, true), Receptionist, "none came: as the answer goes");
+    assert_eq!(r(Answer, false, false, false, false, true, false), Owner, "auto-answer off: the owner answers");
+    assert_eq!(r(Answer, false, false, true, false, true, false), Receptionist, "handed over in Aokie");
+    assert_eq!(r(Leave, true, false, false, false, true, false), Owner, "left ringing for the owner");
+    assert_eq!(r(Leave, true, false, true, false, true, false), Receptionist, "the owner handed it over");
+    assert_eq!(r(Wait, true, false, false, false, false, true), Owner, "the allowed list waits for the number");
+    assert_eq!(r(Answer, true, true, false, false, true, false), Owner, "past the consent grant's expiry");
+    assert_eq!(r(Answer, true, true, true, false, true, false), Receptionist, "handed over before it expired");
+    assert_eq!(r(Refuse("blocked"), true, false, false, true, true, false), Screened, "refused while it rings");
+    assert_eq!(r(Answer, true, false, false, true, true, false), Screened, "answered and refused at the greeting");
+    assert_eq!(r(Refuse("blocked"), false, false, false, true, true, false), Screened, "with auto-answer off too");
+    assert_eq!(r(Answer, true, true, false, true, true, false), Owner, "the expiry first: it rings for the owner");
+}
+
 /// §9.3: the greeting hold waits for the overlay only while the caller
 /// id is known, the overlay is missing, and the bounded cap has time left.
 /// Live call 085ce239: a PIN said digit by digit split across STT turns

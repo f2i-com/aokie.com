@@ -1349,6 +1349,7 @@ pub(super) fn run_loop(
             &agent_persona,
             &mut answer_hold_started,
             &screen_policy,
+            auto_answer,
             agent_hangup,
             &mut promote_greet_for,
             &mut aec,

@@ -596,6 +596,46 @@ pub(super) fn carry_call_context(
 #[cfg(all(aokie_radio, feature = "voice"))]
 pub(super) const AUDIO_ON_HANDSET_SETTLE: std::time::Duration = std::time::Duration::from_millis(2_000);
 
+/// Who takes `call`, a call to us that still rings ([`ring_responder`]), read
+/// from the same screening, allowed list, consent grant and auto-answer the
+/// radio loop answers it by. `hold_elapsed` is the answer's hold so far
+/// (`answer_hold_started`), which also bounds the wait for a number.
+#[cfg(all(aokie_radio, feature = "voice"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ringing_call_responder(
+    call: &crate::call_session::CallSession,
+    screen_policy: &crate::screen::ScreenPolicy,
+    status: &RadioStatus,
+    oaiy_route: bool,
+    auto_answer: bool,
+    overlay_ready: bool,
+    hold_elapsed: Duration,
+) -> RingResponder {
+    let caller_id_known = call.caller_id.as_deref().is_some_and(|id| !id.trim().is_empty());
+    let identity_known = caller_id_known || call.caller_withheld;
+    let action = ring_action_for(
+        screen_policy.ring_action(
+            call.caller_id.as_deref(),
+            call.caller_withheld,
+            Duration::from_millis(call.ringing_for_ms() as u64),
+        ),
+        auto_answer,
+        identity_known,
+        screen_policy.verdict(call.caller_id.as_deref()),
+    );
+    let screened = screen_policy.verdict(call.caller_id.as_deref()).is_some()
+        || manager_line_is_local(oaiy_route, screen_policy.is_manager(call.caller_id.as_deref()));
+    ring_responder(
+        action,
+        auto_answer,
+        status.consent_expired(),
+        call.handed_over,
+        screened,
+        identity_known,
+        !hold_auto_answer(caller_id_known, overlay_ready, hold_elapsed),
+    )
+}
+
 #[cfg(all(aokie_radio, feature = "voice"))]
 thread_local! {
     /// The call that has had its one reconnect after OAIY's stream dropped
@@ -635,6 +675,7 @@ pub(super) fn service_realtime_lane(
     agent_persona: &String,
     answer_hold_started: &mut Option<std::time::Instant>,
     screen_policy: &crate::screen::ScreenPolicy,
+    auto_answer: bool,
     agent_hangup: bool,
     promote_greet_for: &mut Option<String>,
     aec: &mut Option<crate::aec::EchoCanceller>,
@@ -776,17 +817,86 @@ pub(super) fn service_realtime_lane(
                 }
             }
         }
-        // Decide the call's responder only after the same bounded caller-id
-        // and personalization window used by auto-answer. Manager,
-        // screened, switched, already-active and handset-observed calls
-        // stay on the proven legacy path; Realtime serves fresh normal
-        // inbound callers AND agent-placed outbound dials (`call.dial` —
-        // the opening line rides the overlay greeting into the Realtime
-        // session exactly like a personalized inbound greeting). On the
-        // OAIY route only screened callers (refused) and the owner's own
-        // handset dials stay off it: Aokie's own voice is not there, so
-        // managers, already-answered and promoted callers go to OAIY too.
-        // An agent dial whose session cannot start is ended there instead.
+
+        // A session opened while the phone rang waits, not begun, for the
+        // receptionist's answer. It is closed, never begun, once she will
+        // not take the call after all: the call ended; while it still
+        // rings, the screening, the allowed list or the consent grant now
+        // say otherwise; answered, the owner took it on the phone, or its
+        // audio stayed on the handset past a link rebuild (the caller is
+        // taken up when it comes back, as on a begun call). OAIY made a
+        // greeting and nothing else: no call began there. The call is then
+        // decided again below, as one that never had a session.
+        let early_close = realtime_lane
+            .as_ref()
+            .filter(|lane| lane.while_ringing && !lane.begun)
+            .and_then(|lane| {
+                let call = tracker.current().filter(|call| call.id == lane.call_id);
+                let why = match call {
+                    None => "the call ended before it was answered",
+                    Some(call) if !call.is_active() => {
+                        let overlay_ready = ctx
+                            .call_agent_overlay
+                            .as_ref()
+                            .is_some_and(|overlay| overlay.call_id == call.id);
+                        let responder = ringing_call_responder(
+                            call,
+                            screen_policy,
+                            status,
+                            oaiy_route,
+                            auto_answer,
+                            overlay_ready,
+                            answer_hold_started.map_or(Duration::ZERO, |started| started.elapsed()),
+                        );
+                        match responder {
+                            RingResponder::Owner => "the call is left to the owner",
+                            RingResponder::Screened => "the call is screened",
+                            RingResponder::Undecided | RingResponder::Receptionist => return None,
+                        }
+                    }
+                    Some(call) if !call.receptionist_owns() => {
+                        "the owner answered the call on the phone"
+                    }
+                    Some(call) if call.audio_on_handset_for(AUDIO_ON_HANDSET_SETTLE) => {
+                        "the call's audio is on the handset"
+                    }
+                    Some(_) => return None,
+                };
+                let take_up_later = call.is_some_and(|call| call.is_active() && call.receptionist_owns());
+                Some((why, take_up_later))
+            });
+        if let Some((why, take_up_later)) = early_close {
+            if let Some(lane) = realtime_lane.take() {
+                eprintln!(
+                    "[aokie-plugin] OAIY's session for call {} closed before it began: {why}",
+                    lane.call_id
+                );
+                lane.session.stop(why);
+                status.realtime_ready.store(false, Ordering::Relaxed);
+                if take_up_later {
+                    *realtime_resume_call = Some(lane.call_id.clone());
+                } else {
+                    ctx.desktop_realtime_responder = false;
+                }
+            }
+        }
+
+        // Decide the call's responder. A call to us that still rings is
+        // decided as soon as its caller's number is known (or the phone
+        // said it is hidden; a number that has not come is waited for as
+        // the answer waits for it), and OAIY's session is opened then if
+        // the receptionist will answer it: OAIY makes the greeting while
+        // the answer's own hold waits for the personalization (run_loop:
+        // hold_auto_answer). Manager, screened, switched, already-active
+        // and handset-observed calls stay on the proven legacy path;
+        // Realtime serves fresh normal inbound callers AND agent-placed
+        // outbound dials (`call.dial` — the opening line rides the overlay
+        // greeting into the Realtime session exactly like a personalized
+        // inbound greeting). On the OAIY route only screened callers
+        // (refused) and the owner's own handset dials stay off it: Aokie's
+        // own voice is not there, so managers, already-answered and
+        // promoted callers go to OAIY too. An agent dial whose session
+        // cannot start is ended there instead.
         let mut end_outbound_dial: Option<(String, String)> = None;
         if realtime_lane.is_none()
             && realtime_legacy_call.is_none()
@@ -812,32 +922,39 @@ pub(super) fn service_realtime_lane(
                         .is_some_and(|overlay| overlay.call_id == call.id);
                     let started = *answer_hold_started.get_or_insert_with(Instant::now);
                     // A call already answered (only the OAIY route gets
-                    // here with one) has no ring left to personalize in:
+                    // here with one) has no ring left to prepare in:
                     // screening still gates `begin` on the settled identity.
-                    // Nor for a call the allowed list is still deciding
-                    // about, or leaves ringing for the owner: OAIY would be
-                    // told a call began that the receptionist may never
-                    // answer. One the owner answers in Aokie is prepared then.
-                    let left_to_owner = !call.is_active()
-                        && !call.outbound
-                        && (matches!(
-                            screen_policy.ring_action(
-                                call.caller_id.as_deref(),
-                                call.caller_withheld,
-                                std::time::Duration::from_millis(call.ringing_for_ms() as u64),
-                            ),
-                            crate::screen::RingAction::Wait | crate::screen::RingAction::Leave
+                    // An agent's dial is started at once (its opening line
+                    // is set at the dial), as before. A call to us that
+                    // rings waits until its responder is known: nothing is
+                    // started for a call the allowed list is still deciding
+                    // about, leaves ringing for the owner, or that only the
+                    // owner can answer (auto-answer off), nor past the
+                    // consent grant's expiry (review 3 #6): OAIY would be
+                    // told of a call the receptionist may never answer. One
+                    // the owner answers in Aokie is prepared then.
+                    let wait_for_identity = if call.is_active() {
+                        false
+                    } else if call.outbound {
+                        hold_auto_answer(
+                            call.caller_id.as_deref().is_some_and(|id| !id.is_empty()),
+                            overlay_ready,
+                            started.elapsed(),
                         )
-                            // Review 3 #6: past the consent grant's expiry
-                            // the call is left ringing for the owner.
-                            || (status.consent_expired() && !call.handed_over));
-                    let wait_for_identity = left_to_owner
-                        || (!call.is_active()
-                            && hold_auto_answer(
-                                call.caller_id.as_deref().is_some_and(|id| !id.is_empty()),
+                    } else {
+                        !matches!(
+                            ringing_call_responder(
+                                call,
+                                screen_policy,
+                                status,
+                                oaiy_route,
+                                auto_answer,
                                 overlay_ready,
                                 started.elapsed(),
-                            ));
+                            ),
+                            RingResponder::Receptionist | RingResponder::Screened
+                        )
+                    };
                     if !wait_for_identity {
                         let is_manager = screen_policy.is_manager(call.caller_id.as_deref());
                         let legacy = manager_line_is_local(oaiy_route, is_manager)
@@ -928,6 +1045,7 @@ pub(super) fn service_realtime_lane(
                                     );
                                     let mut lane = RealtimeCallLane::new(session);
                                     lane.allow_transfer_sent = allow_transfer;
+                                    lane.while_ringing = !call.is_active() && !call.outbound;
                                     *realtime_lane = Some(lane);
                                     *status.realtime_error.lock().unwrap() = None;
                                 }
@@ -1800,6 +1918,10 @@ pub(super) fn service_realtime_lane(
                                         oaiy_route,
                                         screen_policy.is_manager(call.caller_id.as_deref()),
                                     )
+                                    // Not while its audio is on the handset:
+                                    // the owner has the caller there (a link
+                                    // only being rebuilt is back in a moment).
+                                    && !call.audio_on_handset()
                             }
                     }) && identity_settled;
                     if can_begin && !bt.realtime_call_audio_supported() {
@@ -1815,12 +1937,14 @@ pub(super) fn service_realtime_lane(
                     } else if can_begin && bt.get_sample_rate() > 0 {
                         if let Some(owner) = aokie_owner_for_call(&remote_media, &lane.call_id)
                         {
-                            // The session connected at RING with the
-                            // global persona/greeting; the personalize-
+                            // The session was opened while the phone rang,
+                            // as soon as the caller's number was known, with
+                            // the global persona/greeting; the personalize-
                             // caller overlay ("Hi Sam!") usually lands
-                            // between ring and answer. Begin carries the
+                            // between that and the answer. Begin carries the
                             // freshest call-scoped values so the spoken
-                            // greeting is the personalized one. OAIY takes
+                            // greeting is the personalized one (OAIY makes it
+                            // again only where its words changed). OAIY takes
                             // begin's instructions in place of the start's,
                             // so a session resuming after OAIY's stream
                             // dropped says its note again (review 4 #5).

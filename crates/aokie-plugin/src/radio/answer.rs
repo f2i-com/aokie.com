@@ -30,6 +30,61 @@ pub(super) fn hold_auto_answer(
     elapsed < ANSWER_OVERLAY_WAIT
 }
 
+/// Who takes a call to us that still rings, as far as OAIY's session for it
+/// goes ([`ring_responder`]).
+#[cfg(feature = "voice")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RingResponder {
+    /// Not known yet: its number may still come, and the answer waits for it.
+    Undecided,
+    /// The owner: left ringing for them (the allowed list, the expired
+    /// consent grant), or auto-answer is off and nobody has answered it.
+    Owner,
+    /// The screening's own way: a screened caller, a manager's line that
+    /// needs Aokie's own voice. No OAIY session.
+    Screened,
+    /// The receptionist answers it: OAIY's session is opened now, so OAIY
+    /// makes the greeting while the phone still rings.
+    Receptionist,
+}
+
+/// Who takes a call to us that still rings, from what the radio loop answers
+/// it by: `action` (`ring_action_for`), auto-answer, the consent grant, and
+/// whether the owner handed it to the receptionist (Answer in Aokie, which
+/// wins over the allowed list and an expiry that came after). `screened` is
+/// a screening verdict or a manager's line kept to Aokie's own voice. Until
+/// the number is known (or the phone said it is hidden) only an answer that
+/// stopped waiting for one (`id_wait_over`, ANSWER_ID_WAIT) decides it, as
+/// before: a number that comes late may still be screened. Pure for tests.
+#[cfg(feature = "voice")]
+pub(super) fn ring_responder(
+    action: crate::screen::RingAction,
+    auto_answer: bool,
+    consent_expired: bool,
+    handed_over: bool,
+    screened: bool,
+    identity_known: bool,
+    id_wait_over: bool,
+) -> RingResponder {
+    use crate::screen::RingAction;
+    if !handed_over
+        && (matches!(action, RingAction::Wait | RingAction::Leave) || consent_expired)
+    {
+        return RingResponder::Owner;
+    }
+    if !identity_known && !id_wait_over {
+        return RingResponder::Undecided;
+    }
+    if screened {
+        return RingResponder::Screened;
+    }
+    if handed_over || (auto_answer && action == RingAction::Answer) {
+        RingResponder::Receptionist
+    } else {
+        RingResponder::Owner
+    }
+}
+
 /// What the screening does with a call to us while it rings (review 3 #21).
 /// With auto-answer on, a screened caller with a message to hear is answered
 /// and told it at the greeting, as before; with it off nobody answers to say

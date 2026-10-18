@@ -911,6 +911,10 @@ pub(super) struct RealtimeCallLane {
     /// This session resumes a call the caller was already greeted on (a
     /// return from the owner or from hold, a reconnect).
     pub(super) resumed: bool,
+    /// This session was opened while the call to us still rang, before the
+    /// receptionist answered it: closed, never begun, should she not take
+    /// the call after all.
+    pub(super) while_ringing: bool,
     /// The day this session began, as its instructions name it ("Today is
     /// …"; OAIY's call note names its call's start day too): a booking's
     /// "tomorrow" is checked against it, not against a clock that has since
@@ -979,6 +983,7 @@ impl RealtimeCallLane {
             resuming_caller_turns: 0,
             tool_intake_resuming_turns: 0,
             resumed: false,
+            while_ringing: false,
             today: chrono::Local::now().date_naive(),
             reconnect_note: None,
         }

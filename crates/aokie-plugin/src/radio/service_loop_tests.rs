@@ -125,6 +125,7 @@ struct Loop {
     deferred: Option<(String, String)>,
     ctx: CallVoiceContext,
     agent_hangup: bool,
+    auto_answer: bool,
     /// Every session the loop started: what its start said, and OAIY's end of it.
     started: RefCell<Vec<(SessionConfig, DetachedSession)>>,
 }
@@ -178,6 +179,7 @@ impl Loop {
                 ctx
             },
             agent_hangup: false,
+            auto_answer: true,
             started: RefCell::new(Vec::new()),
         }
     }
@@ -218,6 +220,7 @@ impl Loop {
             &self.persona,
             &mut self.answer_hold_started,
             &self.screen,
+            self.auto_answer,
             self.agent_hangup,
             &mut self.promote_greet_for,
             &mut self.aec,
@@ -1131,4 +1134,331 @@ fn a_goodbye_is_refused_for_a_turn_that_takes_the_conversation_up_again_and_not_
         });
     });
     assert!(!ok, "a resumed turn refuses the goodbye: {output}");
+}
+
+// --- OAIY's session is opened while the phone rings ----------------------------
+//
+// OAIY makes the greeting from the start, so the start goes as soon as the
+// caller's number is known and the receptionist will answer the call, and the
+// begin when she has answered it. The answer keeps its own hold (run_loop:
+// hold_auto_answer), which these do not run: they answer the call by hand.
+
+impl Loop {
+    /// A call to us that still rings, its number known, with auto-answer on:
+    /// the answer's hold has not begun.
+    fn ringing() -> Self {
+        Self::ringing_from(Some("0491 570 006"))
+    }
+
+    /// A call to us that still rings, from `number` (`None`: none has come).
+    fn ringing_from(number: Option<&str>) -> Self {
+        let mut this = Self::new();
+        this.tracker = crate::call_session::SessionTracker::new();
+        this.tracker.ring(CALL.into(), aokie_core::events::now_iso8601());
+        if let Some(number) = number {
+            this.tracker.caller_id(number.into());
+        }
+        this
+    }
+
+    /// A ringing call whose session was started and said `ready`.
+    fn ringing_and_ready() -> Self {
+        let mut this = Self::ringing();
+        this.pass();
+        assert_eq!(this.sessions(), 1, "started while the phone rings");
+        this.ready(&[]);
+        this.pass();
+        assert!(this.lane.as_ref().unwrap().ready && !this.lane.as_ref().unwrap().begun);
+        this
+    }
+
+    /// The phone says something about the call, as the radio loop hears it.
+    fn phone(&mut self, event: BluetoothEvent) {
+        handle_event(event, &mut self.tracker, None, &mut self.sink, &self.status);
+    }
+}
+
+#[test]
+fn oaiys_session_starts_as_the_number_is_known_and_begins_once_the_call_is_answered() {
+    let mut l = Loop::ringing();
+    l.pass();
+    assert_eq!(l.sessions(), 1, "started at once, not after the answer's hold");
+    let start = l.start(0);
+    assert_eq!(start.call_id, CALL);
+    assert_eq!(start.call.from.as_deref(), Some("0491 570 006"), "the start says who rings");
+    assert_eq!(start.greeting, DEFAULT_GREETING, "no personalization has come yet");
+    assert!(l.lane.as_ref().unwrap().while_ringing);
+    assert!(l.answer_hold_started.unwrap().elapsed() < ANSWER_ID_WAIT, "the hold had only begun");
+
+    // Ready while it rings: nothing is begun, and nothing more is started.
+    l.ready(&[]);
+    for _ in 0..3 {
+        l.pass();
+    }
+    let lane = l.lane.as_ref().unwrap();
+    assert!(lane.ready && !lane.begun, "ready, so the answer may go; not begun");
+    assert!(!l.sent().contains(&SentControl::Begin));
+
+    // The personalization lands after the start, before the answer.
+    l.ctx.call_agent_overlay = Some(CallAgentOverlay {
+        call_id: CALL.into(),
+        persona: Some("Greet Sam by name.".into()),
+        greeting: Some("Hi Sam!".into()),
+    });
+    l.pass();
+    assert_eq!(l.sessions(), 1);
+    assert!(!l.sent().contains(&SentControl::Begin));
+
+    // Answered: begun at once, and the begin carries the personalization.
+    l.phone(BluetoothEvent::CallAnswered);
+    l.pass();
+    assert!(l.sent().contains(&SentControl::Begin));
+    assert!(l.lane.as_ref().unwrap().begun);
+    let (instructions, greeting) = l.started.borrow()[0].1.begun_with().expect("begun");
+    assert!(instructions.expect("the overlay's brief").starts_with("Greet Sam by name."));
+    assert_eq!(greeting.as_deref(), Some("Hi Sam!"));
+    assert_eq!(l.sessions(), 1, "one session for the call");
+}
+
+#[test]
+fn a_number_still_to_come_is_waited_for_and_a_hidden_one_starts_at_once() {
+    // No number yet: nothing until it comes.
+    let mut l = Loop::ringing_from(None);
+    l.pass();
+    l.pass();
+    assert_eq!(l.sessions(), 0, "a number may still come and be screened");
+    l.phone(BluetoothEvent::CallerId("0491 570 006".into()));
+    l.pass();
+    assert_eq!(l.sessions(), 1, "started as the number came");
+
+    // The phone said the number is hidden: started then.
+    let mut hidden = Loop::ringing_from(None);
+    hidden.pass();
+    assert_eq!(hidden.sessions(), 0);
+    hidden.tracker.caller_withheld();
+    hidden.pass();
+    assert_eq!(hidden.sessions(), 1);
+
+    // A number that never comes: started when the answer stops waiting for
+    // it (ANSWER_ID_WAIT), as before.
+    let mut late = Loop::ringing_from(None);
+    late.answer_hold_started = Instant::now().checked_sub(ANSWER_ID_WAIT);
+    late.pass();
+    assert_eq!(late.sessions(), 1);
+}
+
+#[test]
+fn a_caller_who_hangs_up_while_it_rings_has_the_session_closed_never_begun() {
+    let mut l = Loop::ringing_and_ready();
+    l.sent();
+    l.phone(BluetoothEvent::CallTerminated);
+    l.pass();
+    assert!(l.lane.is_none(), "closed");
+    let sent = l.sent();
+    assert!(!sent.contains(&SentControl::Begin), "{sent:?}");
+    assert_eq!(stop_reasons(&sent), vec!["the call ended before it was answered".to_string()]);
+    assert!(!l.status.realtime_ready.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(l.failed.is_none() && l.resume.is_none() && l.midcall.is_none(), "no failure, nothing to resume");
+    // The call's record is the missed call it was: the session changes nothing of it.
+    let ended: Value = l
+        .sink
+        .lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|v| v["params"]["event"]["name"] == json!(crate::contract::events::CALL_ENDED))
+        .expect("the call's end is recorded");
+    assert_eq!(ended["params"]["event"]["data"]["outcome"], "missed");
+    l.pass();
+    assert_eq!(l.sessions(), 1, "nothing more is started");
+}
+
+/// The owner answered on the phone: its audio on the handset (review 3 #1).
+/// Not begun while it is there; past a link rebuild's settle the session is
+/// closed, and the caller is taken up when the audio comes back.
+#[test]
+fn the_owner_answering_on_the_handset_closes_the_session_never_begun() {
+    let mut l = Loop::ringing_and_ready();
+    l.sent();
+    l.phone(BluetoothEvent::CallAnswered);
+    l.phone(BluetoothEvent::AudioOnHandset);
+    l.pass();
+    assert!(!l.sent().contains(&SentControl::Begin), "not while its audio is on the handset");
+    assert!(l.lane.is_some(), "a link being rebuilt keeps its session");
+
+    // The audio stays there: closed, and the call waits for it to come back.
+    l.tracker.current_mut().unwrap().audio_on_handset_since =
+        Instant::now().checked_sub(AUDIO_ON_HANDSET_SETTLE + std::time::Duration::from_millis(100));
+    l.pass();
+    assert!(l.lane.is_none());
+    let sent = l.sent();
+    assert!(!sent.contains(&SentControl::Begin), "{sent:?}");
+    assert_eq!(stop_reasons(&sent), vec!["the call's audio is on the handset".to_string()]);
+    assert_eq!(l.resume.as_deref(), Some(CALL));
+    assert!(l.midcall.is_none() && l.terminal.is_none(), "no apology, no hang-up");
+    l.pass();
+    assert_eq!(l.sessions(), 1, "nothing starts while the audio is on the handset");
+
+    // Back on the dongle: a fresh session takes the caller up.
+    l.phone(BluetoothEvent::AudioConnected { codec: "CVSD".into(), sample_rate: 8_000, armed: true });
+    l.pass();
+    assert_eq!(l.sessions(), 2);
+    assert!(l.lane.as_ref().unwrap().resumed);
+}
+
+/// A call the run loop left ringing for the owner after the start (here the
+/// consent grant expired while it rang) that the owner then answers on the
+/// phone: the owner's, and nothing is begun or started for it.
+#[test]
+fn a_call_the_owner_answers_on_the_phone_is_closed_and_not_given_to_oaiy() {
+    // Left ringing and answered on the phone before the loop looks again.
+    let mut l = Loop::ringing_and_ready();
+    l.sent();
+    l.tracker.current_mut().unwrap().left_ringing = true;
+    l.phone(BluetoothEvent::CallAnswered);
+    assert!(l.tracker.current().unwrap().owner_took);
+    l.pass();
+    assert!(l.lane.is_none());
+    let sent = l.sent();
+    assert!(!sent.contains(&SentControl::Begin), "{sent:?}");
+    assert_eq!(stop_reasons(&sent), vec!["the owner answered the call on the phone".to_string()]);
+    assert_eq!(l.legacy.as_deref(), Some(CALL), "the owner's call: observed");
+    assert!(l.resume.is_none());
+    l.pass();
+    assert_eq!(l.sessions(), 1);
+
+    // The consent grant expires while it rings: closed then, left ringing.
+    let mut l = Loop::ringing_and_ready();
+    l.sent();
+    l.status.consent_expires_at.store(1, std::sync::atomic::Ordering::Relaxed);
+    l.pass();
+    assert!(l.lane.is_none());
+    assert_eq!(stop_reasons(&l.sent()), vec!["the call is left to the owner".to_string()]);
+    assert!(l.legacy.is_none(), "nothing decided: it rings for the owner");
+    assert!(!l.ctx.desktop_realtime_responder, "no responder for it, as before the start");
+    l.tracker.current_mut().unwrap().left_ringing = true;
+    l.phone(BluetoothEvent::CallAnswered);
+    l.pass();
+    l.pass();
+    assert_eq!(l.sessions(), 1, "the owner's call is not given to OAIY");
+}
+
+/// A screened caller is never started: refused while it rings, or answered
+/// and refused at the greeting, the screening's own way is decided as early.
+/// Nor a call left ringing, past the consent grant's expiry, or with
+/// auto-answer off until the owner hands it over in Aokie.
+#[test]
+fn nothing_is_started_for_a_call_the_receptionist_will_not_answer() {
+    let not_started = |setup: &dyn Fn(&mut Loop)| {
+        let mut l = Loop::ringing();
+        setup(&mut l);
+        for _ in 0..3 {
+            l.pass();
+        }
+        assert_eq!(l.sessions(), 0);
+        l
+    };
+    // Blocked, nothing to say: refused while it rings.
+    let l = not_started(&|l| {
+        l.screen.block_number("0491 570 006");
+    });
+    assert_eq!(l.legacy.as_deref(), Some(CALL), "the screening's way, decided at the number");
+    // Blocked with a message: answered and told it.
+    let l = not_started(&|l| {
+        l.screen.block_number("0491 570 006");
+        l.screen.blocked_message = "This number cannot reach us.".into();
+    });
+    assert_eq!(l.legacy.as_deref(), Some(CALL));
+    // Not on the allowed list, left ringing for the owner.
+    let l = not_started(&|l| l.screen = crate::screen::ScreenPolicy::allowing_only("02 8390 1963", true));
+    assert!(l.legacy.is_none());
+    // Past the consent grant's expiry.
+    let l = not_started(&|l| l.status.consent_expires_at.store(1, std::sync::atomic::Ordering::Relaxed));
+    assert!(l.legacy.is_none());
+
+    // Auto-answer off: the owner answers. Handed to the receptionist in
+    // Aokie, it is started then, and begun when answered.
+    let mut l = not_started(&|l| l.auto_answer = false);
+    assert!(l.legacy.is_none());
+    l.tracker.hand_to_receptionist();
+    l.pass();
+    assert_eq!(l.sessions(), 1, "answered in Aokie: the receptionist's");
+    l.ready(&[]);
+    l.phone(BluetoothEvent::CallAnswered);
+    l.pass();
+    assert!(l.sent().contains(&SentControl::Begin));
+}
+
+/// The screening changed after the start (a block applied while it rang):
+/// the session is closed, never begun, and the call goes the screening's way.
+#[test]
+fn a_screening_change_while_it_rings_closes_the_session_never_begun() {
+    let mut l = Loop::ringing_and_ready();
+    l.sent();
+    l.screen.block_number("0491 570 006");
+    l.screen.blocked_message = "This number cannot reach us.".into();
+    l.pass();
+    assert!(l.lane.is_none());
+    assert_eq!(stop_reasons(&l.sent()), vec!["the call is screened".to_string()]);
+    assert_eq!(l.legacy.as_deref(), Some(CALL), "decided again: screened");
+    l.phone(BluetoothEvent::CallAnswered);
+    l.pass();
+    l.pass();
+    assert_eq!(l.sessions(), 1, "nothing more is started");
+    assert!(!l.sent().contains(&SentControl::Begin));
+}
+
+/// A second caller knocking during a call never opens a session: the call
+/// that has the line keeps its own, untouched.
+#[test]
+fn a_knock_never_opens_a_session() {
+    let mut l = begun();
+    l.phone(BluetoothEvent::CallWaiting { number: Some("02 8390 1963".into()) });
+    assert!(l.status.waiting_call.lock().unwrap().is_some(), "the knock is there");
+    for _ in 0..3 {
+        l.pass();
+    }
+    assert_eq!(l.sessions(), 1);
+    assert!(l.lane.as_ref().unwrap().begun);
+    assert!(stop_reasons(&l.sent()).is_empty());
+}
+
+/// An agent's dial is started as before: at once (its opening line is set at
+/// the dial), and it is not a session opened while a call to us rings.
+#[test]
+fn an_agent_dial_is_started_as_before() {
+    let mut l = Loop::outbound();
+    l.tracker = crate::call_session::SessionTracker::new();
+    l.tracker.dial(CALL.into(), Some("0491 570 156".into()), aokie_core::events::now_iso8601(), true);
+    l.ctx.call_agent_overlay = Some(CallAgentOverlay {
+        call_id: CALL.into(),
+        persona: None,
+        greeting: Some("Hi, it's the salon calling about Friday.".into()),
+    });
+    l.pass();
+    assert_eq!(l.sessions(), 1);
+    assert!(!l.lane.as_ref().unwrap().while_ringing);
+    assert_eq!(l.start(0).greeting, "Hi, it's the salon calling about Friday.");
+    l.ready(&[]);
+    l.pass();
+    assert!(!l.sent().contains(&SentControl::Begin), "not before the callee answers");
+    l.phone(BluetoothEvent::CallAnswered);
+    l.pass();
+    assert!(l.sent().contains(&SentControl::Begin));
+}
+
+/// OAIY's stream dropping before the call is answered rings the call through,
+/// as a session that failed before the answer always did, and does not spend
+/// the one reconnect the call has once it is live.
+#[test]
+fn a_session_lost_while_it_rings_rings_through_and_keeps_the_calls_reconnect() {
+    let mut l = Loop::ringing_and_ready();
+    l.oaiy(RealtimeEventKind::Closed {
+        reason: "Desktop realtime receive failed: connection reset".into(),
+        transport: true,
+    });
+    l.pass();
+    assert!(l.lane.is_none());
+    assert_eq!(l.failed.as_ref().map(|(id, _)| id.as_str()), Some(CALL), "rings through");
+    assert!(l.resume.is_none());
+    assert!(claim_transport_reconnect(CALL), "the call's one reconnect is still there");
 }
